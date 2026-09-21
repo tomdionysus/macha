@@ -20,6 +20,9 @@
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "metadata.hpp"
+#include "namespace_tree.hpp"
+
+#include <algorithm>
 
 #include <fstream>
 #include <functional>
@@ -70,17 +73,25 @@ void print(const Frame& frame, const std::string& note = {}) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] [--all] [--stats]\n";
+        std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] "
+                     "[--all] [--stats] [--tree]\n";
         return 2;
     }
     bool all = false;
     bool stats = false;
+    bool tree = false;
     std::string heads_path;
     for (int i = 3; i < argc; ++i) {
         if (std::string(argv[i]) == "--all")
             all = true;
         else if (std::string(argv[i]) == "--stats")
             stats = true;
+        else if (std::string(argv[i]) == "--tree") {
+            // Implies --stats: the tree is built from the materialised head,
+            // which is what --stats already produces.
+            tree = true;
+            stats = true;
+        }
         else
             heads_path = argv[i];
     }
@@ -295,6 +306,58 @@ int main(int argc, char** argv) {
                   << " node_status=" << node_status_bytes << " other="
                   << (full - entry_bytes - garbage_bytes - conflict_bytes - node_status_bytes)
                   << '\n';
+        if (tree) {
+            // Stage B of the Merkle plan, measured against a real namespace
+            // rather than a generated one. Everything here is offline and
+            // read-only: the tree is built in memory from the head that
+            // --stats just materialised, and nothing is written to the record,
+            // the history or the control store.
+            MemoryNamespaceNodeStore nodes;
+            const auto root = build_namespace_tree(snapshot.entries, nodes);
+            const auto shape = namespace_tree_stats(root, nodes);
+            std::cout << "  tree: root=" << to_string(root).substr(0, 16)
+                      << " nodes=" << nodes.nodes() << " bytes=" << nodes.bytes()
+                      << " leaves=" << shape.leaves << " branches=" << shape.branches
+                      << " extent_nodes=" << shape.extent_nodes << " depth=" << shape.depth
+                      << " largest_node=" << shape.largest_node_bytes << '\n';
+
+            // The number the whole plan turns on: what one ordinary write
+            // costs. Today it is the entire library -- re-serialised,
+            // re-hashed and replicated -- because the record payload IS the
+            // namespace and its identity is a hash over those bytes.
+            //
+            // Pick a real file rather than a synthetic one, and pick the
+            // median by extent count so the answer is not flattered by a
+            // one-extent file or distorted by the largest.
+            std::vector<std::pair<size_t, std::string>> by_extents;
+            for (const auto& [path, value] : snapshot.entries)
+                if (value.type != EntryType::directory)
+                    by_extents.emplace_back(value.extents.size(), path);
+            if (!by_extents.empty()) {
+                std::sort(by_extents.begin(), by_extents.end());
+                const auto& median = by_extents[by_extents.size() / 2];
+                auto touched = snapshot.entries;
+                auto found = touched.find(median.second);
+                if (found != touched.end()) {
+                    // An mtime bump: the commonest namespace write there is,
+                    // and a value change on an existing path, which is the
+                    // case key-only boundaries exist to keep cheap.
+                    found->second.mtime_ns += 1;
+                    nodes.forget_written();
+                    const auto after = build_namespace_tree(touched, nodes);
+                    uint64_t dirty_bytes = 0;
+                    for (const auto& id : nodes.written())
+                        if (auto body = nodes.get(id)) dirty_bytes += body->size();
+                    std::cout << "  tree: one mtime change on a median file ("
+                              << median.first << " extents) rewrote "
+                              << nodes.written().size() << " nodes, " << dirty_bytes
+                              << " bytes; root " << (after == root ? "UNCHANGED (bug)" : "moved")
+                              << '\n';
+                    std::cout << "  tree: today the same write re-serialises and re-hashes "
+                              << full << " bytes, the whole namespace\n";
+                }
+            }
+        }
         // Encoded bytes are what replication and the journal carry; resident
         // bytes are what every node holds while it is running. They are
         // different numbers and the second one is the larger, so report both
