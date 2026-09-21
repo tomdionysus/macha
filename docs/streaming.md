@@ -229,11 +229,22 @@ Reports enablement, current session/transcode counts, media-engine backend/versi
 A client must bound its own attempt on a node against the budgets that node enforces, and it needs them for every node it might fail over to, not only the one it is playing from. Those two facts decide where they are published: on the **per-node entries of `GET /api/v1/status`**, beside `runtime`, in a `playback` object.
 
 ```json
-"playback": { "startup_timeout_ms": 15000, "segment_timeout_ms": 6000 }
+"playback": {
+  "startup_timeout_ms": 15000,
+  "segment_timeout_ms": 6000,
+  "pipeline_idle_ms": 60000,
+  "session_idle_ms": 1800000,
+  "max_sessions_per_account": 32
+}
 ```
 
 - **`startup_timeout_ms`** — how long this node may take to bring a transformed generation's first fragment up (`streaming.startup_timeout_ms`).
 - **`segment_timeout_ms`** — how long it holds a request for a fragment that is not ready yet (`streaming.segment_timeout_ms`).
+- **`pipeline_idle_ms`** — how long a physical remux/transcode pipeline survives without valid current-generation traffic (`streaming.pipeline_idle_ms`).
+- **`session_idle_ms`** — how long a logical session survives without control or valid stream activity (`streaming.session_idle_ms`). This is also how long a session abandoned on an unreachable node keeps its slot.
+- **`max_sessions_per_account`** — the per-account cap, described under [what one account may hold](#what-one-account-may-hold-on-one-node). The limit only; the live count is never here.
+
+The last three arrived in 0.48.0. Clients had been holding private copies of the first two, hardcoded against this node's defaults, which is exactly the failure `look_ahead_ms` was added to stop.
 
 These are each node's statement about **itself**, relayed like `load1` and `cpu_cores`. No node computes or reports a cluster-wide figure: it has no data to do so, since telemetry carries no peer's streaming configuration. A client that needs a worst case across the nodes it might use composes it from these, because only the client knows which nodes those are.
 
@@ -255,17 +266,23 @@ Authorization: Bearer <session token>
 
 Use either `item_id` or `media_id`. `item_id` allows the resolver to choose among every media representation attached to the catalogue item. `path:/logical/file` is also accepted as a media identity.
 
-**A session belongs to the bearer token that created it, and a token has at
-most one.** The server keys a playback session on the authenticated API
-session — the token from `POST /api/v1/session` — and nothing else. A second
-`POST /api/v1/playback/sessions` on the same token **supersedes whatever that
-token was already playing, across all media**: the new session keeps the old
-session's `session_id` and stream capability, increments `generation`, and the
-previous generation's pipeline is stopped.
+**A playback session is a resource, not a property of the bearer.** A `POST`
+to the collection creates a member, every time. Two `POST`s on one bearer
+token yield two live sessions with different ids, both streaming, neither
+disturbing the other. The response is `201` with a `Location` header naming
+the new session.
 
-A client that needs two concurrent generations on one node therefore needs two
-separate API sessions. There is no request field that separates them: the
-server reads no viewer-session header and no `viewer_session_id` body field.
+This changed in 0.48.0 and it breaks what came before. Until then the server
+keyed a playback session on the authenticated API session and a token had at
+most one, so a second `POST` silently superseded whatever that token was
+already playing. A client that needed two concurrent generations needed two
+API sessions. Both of those facts are gone: hold as many as you need, within
+the per-account cap below.
+
+**The server mints the id.** There is no request field that proposes one, no
+viewer-session header, and no `viewer_session_id` body field — `idempotency_key`
+is a request token, not an identifier. A client that loses an id recovers it
+from the collection listing rather than reconstructing it.
 
 **Idempotency is a separate mechanism** and is a **query parameter**, not a
 header:
@@ -280,11 +297,45 @@ capability and `generation` rather than creating another. The same key with a
 *different* request returns `409 idempotency_conflict`. The key is 1 to 256
 visible ASCII characters; anything else is `400 bad_idempotency_key`. The
 fingerprint includes the bearer token, so a key cannot replay across API
-sessions. The response reports `X-Macha-Idempotency: created|replayed`.
+sessions. Keys are scoped per account, so one account cannot occupy another's
+key and turn its legitimate retry into a conflict. The response reports
+`X-Macha-Idempotency: created|replayed`.
 
-Omitting the key makes each POST a distinct creation — which still supersedes,
-because supersession is decided by the token, not by the key. Idempotency
-prevents a *duplicate* session; it does not let you hold two.
+Omitting the key makes each `POST` a distinct creation, which now means a
+distinct session. Idempotency prevents a *duplicate* session on a retry; it is
+not what lets you hold two, and it is not needed for that.
+
+### What one account may hold on one node
+
+```json
+"account": { "sessions": 3, "max_sessions": 32 }
+```
+
+Creation and the collection listing both carry this block: what this account
+holds on this node right now, and what it may hold. Over the cap, creation is
+refused with `429` and code **`account_session_limit`**, stating both numbers,
+with `scope: request` and `node_healthy: true`.
+
+**Those two fields matter as much as the status.** An account-scoped refusal
+is identical on every node, so a client must not walk the cluster looking for
+one that will accept — and must not charge the refusing node's health for it.
+That is the difference between this and the node-wide `max_sessions`, whose
+`429` is node-scoped and *is* worth taking elsewhere.
+
+The count is deliberately absent from `GET /api/v1/status`, which clients
+cache. It is the most perishable number this API carries — it moves whenever
+anyone on the account starts or stops anything, on a device neither end can
+see — so it appears only where it is computed live: on creation, on the
+listing, and on the refusal. The **limit** is on `/api/v1/status` for every
+node, because a client planning a failover needs it about nodes it has not
+talked to yet.
+
+Budget for it honestly. A coordinator-driven client holds a live session plus
+a standby per viewer and transiently three during a failover; a client that
+adopts a session through the listing holds two by design; and an abandoned
+session cannot always be deleted, because the `DELETE`'s target is often the
+node that just became unreachable — that session holds its slot until
+`session_idle_ms` expires it.
 
 Session admission first reads the immutable media profile from cluster metadata,
 which requires no media-object reads. A miss never produces a client-visible
@@ -298,19 +349,26 @@ timeout or disconnect.
 ### Generations, and what supersession does to a client
 
 A **generation** is one produced stream for a session. A seek, a quality or
-track change, a media switch, or a second `POST` on the same token all end the
-current generation and begin a new one. The generation number is in the stream
-path, so every URL a client holds belongs to exactly one:
+track change, and a media switch each end the current generation and begin a
+new one. (A second `POST` no longer does: it makes a separate session.) The
+generation number is in the stream path, so every URL a client holds belongs
+to exactly one:
 
 ```text
-/api/v1/playback/stream/<session_id>/<capability>/<generation>/segment-000042.m4s
+/api/v1/playback/sessions/<session_id>/stream/<capability>/<generation>/segment-000042.m4s
 ```
+
+**The stream is a subresource of the session it belongs to.** The capability
+sits immediately before the part it authorises, and it stays in the path
+rather than moving to a header because it is a capability, not a credential —
+media players fetch segments without application headers. The top-level
+`/api/v1/playback/stream/...` route was removed in 0.48.0.
 
 When a generation is superseded its producing pipeline is stopped and its
 segments stop resolving. **Every URL the client still holds for that
-generation answers `404 not_found` ("stream generation not found")**, usually
-within about a second, including requests already queued or in flight. The
-`session_id` and the stream capability survive; only the generation changes.
+generation answers `410 generation_superseded`**, usually within about a
+second, including requests already queued or in flight. The `session_id` and
+the stream capability survive; only the generation changes.
 
 So the effect on a client is: any read-ahead it had queued against the old
 generation fails, and it must take the new `stream.url` from the response that
@@ -318,12 +376,25 @@ caused the supersession and resume from there. Content is not lost — the new
 generation contains the position that was asked for — but the client's own
 buffer of pending requests is invalidated and must be reissued.
 
-**A `404` here means "replaced or never existed", and the two are not
-distinguished.** That is the opposite convention to a fragment that is merely
-not ready yet, which is a retryable `500 segment_not_ready` and deliberately
-never a `404`. So on the stream path: `500` means wait and retry, `404` means
-this generation is gone — re-read the session and use the new URL. Do not
-retry a `404`.
+**The three statuses on the stream path mean three different things, and a
+client must not collapse them:**
+
+- **`500 segment_not_ready`** — the fragment exists in this generation but is
+  not produced yet. Wait and retry. Deliberately never a `404`.
+- **`410 generation_superseded`** — the generation existed here and was
+  replaced. Permanent. Stop retrying, re-read the session, use the new
+  `stream.url`. The refusal carries `scope: request`, `node_healthy: true` and
+  `alternative_may_succeed: true`: **this node is healthy and a different
+  request against it will work.** Do not walk the cluster — no other node has
+  this session, so a walk collects the same refusal from every node it tries
+  and charges each one for it.
+- **`404 not_found`** — nothing here ever produced that: a generation above
+  the current one, an unknown session, or a bad capability.
+
+`410` arrived in 0.48.0. Before it, a superseded generation and a segment that
+never existed shared one `404`, which made every regenerate — and a regenerate
+is routine — indistinguishable from a fault, and left a client reasonably
+retrying something that would never come back.
 
 Minimal request:
 
@@ -401,7 +472,7 @@ The response separates requested preferences, resolved playback, original source
     "audio": { "source_stream": 1, "transform": "transcode", "codec": "aac", "channels": 2, "sample_rate": 48000, "bitrate": 192000 }
   },
   "stream": {
-    "url": "/api/v1/playback/stream/...",
+    "url": "/api/v1/playback/sessions/<session_id>/stream/<capability>/<generation>/master.m3u8",
     "mime_type": "application/vnd.apple.mpegurl",
     "look_ahead_ms": 32000,
     "subtitle_url": null,
@@ -452,13 +523,31 @@ The mode is never substituted. A remux request stays remux, including when its k
 
 The baseline is never a keyframe *after* the request. Aligning forward would leave the content between the request and that keyframe in no generation at all, unrecoverable by any client: a skipped scene on a viewer seek, and deleted content on the reaped-session recovery path, which rebuilds a generation at a position a viewer has actually reached.
 
-## Inspect, change and stop a session
+## List, inspect, change and stop a session
 
 ```text
+GET    /api/v1/playback/sessions          the caller's live sessions
 GET    /api/v1/playback/sessions/{id}
 PATCH  /api/v1/playback/sessions/{id}
 DELETE /api/v1/playback/sessions/{id}
 ```
+
+**The collection `GET` is how a client finds a session it has lost the id
+for**, and it is what makes handover between clients on one account possible:
+it answers under `items`, like every other collection here, plus the `account`
+block. It lists exactly the caller's own sessions on this node and nothing
+else. There is no cluster-wide listing — a session is a resource of the node
+producing it, and no node can enumerate another's.
+
+**A session belongs to one account, and the control routes enforce it.** An
+id belonging to another account answers **`404`, not `403`**, on `GET`,
+`PATCH` and `DELETE`: whether an id exists on this node is not something one
+account gets to learn about another. This matters more than it used to, since
+the listing now hands ids out.
+
+`DELETE` tears down that one session and leaves the caller's others running.
+Delete sessions you have finished with: an undeleted one holds its slot
+against the per-account cap until it idles out.
 
 `PATCH` keeps the same logical session ID and capability but may replace the underlying media-engine generation. A PATCH naming `mode` restates the whole transform: `video`, `audio`, `max_height` and `max_bitrate` are cleared unless that same PATCH restates them, so `{"mode":"direct"}` means direct rather than direct-plus-whatever-the-session-was-created-with. Name every field you mean in the same request; a PATCH that names both a mode and a per-stream transform sets both. A PATCH that changes only `subtitle_stream` and/or `subtitle_language` is special: it keeps the active A/V generation and stream URL unchanged and updates only the external segmented-WebVTT resource. Explicit stream indexes are validated; an invalid selection is rejected rather than falling back silently. `options.modes`, `options.quality_heights`, `options.audio_streams` and `options.subtitle_streams` are generated by negotiating each candidate against the current source/capabilities/preferences, so clients should render those arrays rather than inventing controls locally. Every PATCH response is the authoritative new session state.
 
@@ -499,7 +588,7 @@ A direct MP4 can be assigned directly to a normal HTML `<video>` element. For tr
 
 ## Resource limits and cleanup
 
-`max_sessions`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. Transcode limits count logical viewer entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through Direct/Remux/Transcode changes and physical idle-pipeline reclamation, then releases it exactly once on DELETE or session expiry. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429. Malformed/incompatible playback requests return 400, missing media/session state returns 404, and media-engine failures return 503. Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` in the JSON body, and return the same trace in `X-Macha-Playback-Trace` for correlation with `playback[trace]` server logs.
+`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements are per logical viewer and share the cap's key, so splitting one viewer across several sessions does not multiply them. Transcode limits count logical viewer entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through Direct/Remux/Transcode changes and physical idle-pipeline reclamation, then releases it exactly once on DELETE or session expiry. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429. Malformed/incompatible playback requests return 400, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503. Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` in the JSON body, and return the same trace in `X-Macha-Playback-Trace` for correlation with `playback[trace]` server logs.
 
 Logical sessions expire after `session_idle_ms` without control or valid
 current-generation stream activity. Expiry cancels the in-process pipeline and
@@ -516,9 +605,9 @@ player is never subject to the shorter clock.
 
 Physical remux/transcode pipelines have a shorter independent
 `pipeline_idle_ms` lease (60 seconds by default). Valid current-generation
-playlist, fragment and subtitle requests renew it. Obsolete-generation and
-otherwise invalid stream requests do not, so a client retry loop cannot retain
-an abandoned encoder. Reclamation is event-driven, never interrupts an active
+playlist, fragment and subtitle requests renew it. Superseded-generation
+(`410`) and otherwise invalid stream requests do not, so a client retry loop
+cannot retain an abandoned encoder. Reclamation is event-driven, never interrupts an active
 stream HTTP request, and leaves the logical session available until
 `session_idle_ms` for client reconciliation. `GET /api/v1/playback/status`
 reports `pipeline_idle_ms` and the cumulative `idle_pipelines_reclaimed` count.

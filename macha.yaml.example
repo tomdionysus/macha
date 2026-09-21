@@ -573,7 +573,31 @@ torrent:
 streaming:
   enabled: true
   # temp_path: /var/lib/macha/tmp/playback  # spill only; active fragments are in memory
-  max_sessions: 8
+  # Node-wide, every account together. This has to sit ABOVE
+  # max_sessions_per_account below or that cap can never be reached -- see the
+  # note there for why reaching it matters.
+  max_sessions: 64
+  # How many playback sessions one account may hold on this node at once.
+  # Zero disables the per-account bound, leaving only max_sessions.
+  #
+  # A playback session is a resource rather than a property of the bearer, so
+  # one account may hold several; before that, one-session-per-bearer bounded
+  # accounts by accident, and removing it without this is how a rogue client
+  # launches a media DoS.
+  #
+  # Set it generously. The scarce resource is not this -- a session is a map
+  # entry, a transcode is a core, and max_video_transcodes below is 1. A
+  # coordinator-driven client holds a live session plus a standby per viewer
+  # and transiently three during a failover; four viewers on one account is
+  # twelve in a disturbance; a session abandoned on an unreachable node cannot
+  # be deleted and holds its slot for the whole of session_idle_ms. Set too
+  # low this does not present as a cap -- it presents as seamless failover
+  # quietly ceasing to work at the moment it fires.
+  #
+  # Keep it BELOW max_sessions above, or it can never be reached: the
+  # node-wide limit refuses first, and its 429 is node-scoped, which sends a
+  # client walking the cluster instead of telling it to stop.
+  max_sessions_per_account: 32
   max_video_transcodes: 1
   max_audio_transcodes: 4
   # Decoder threads per video transcode (1-16). max_video_transcodes bounds the
