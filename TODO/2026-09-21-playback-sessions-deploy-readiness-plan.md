@@ -118,10 +118,12 @@ visible and so the brief goes out with the right content.
   every node's cap limit is on `/api/v1/status`; `410` if decision 1 is yes;
   and the expected A85 "plays, no sound" on Direct Play, which predates all
   of this.
-- [ ] **Core publishes the `410` tolerance to npm.** Latest on the registry
-  is 0.14.0 (2026-09-19T08:58Z); the tolerance was built on core's `develop`
-  on 2026-09-21, so no published version carries it. Needs the operator's
-  word.
+- [ ] **The clients are consuming a core that carries the `410` tolerance.**
+  **Not a registry release — the clients test against a direct link to the
+  package** (operator, 2026-09-21). Do not treat "not on npm" as a gate, do
+  not wait on a publish, and do not quote registry versions as evidence of
+  anything: the only question is whether each client is on a core with the
+  tolerance in it.
 - [ ] **The web client builds a bundle against that core** with its own
   `410` branch in the segment classifier (the plan records that hls.js
   raises the status one layer below core).
