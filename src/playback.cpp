@@ -1461,6 +1461,47 @@ struct PlaybackManager::Impl {
         return {video, audio};
     }
 
+    // True when no session other than this one shares its logical viewer.
+    // Checked with only `mutex` held, deliberately: asking whether a sibling
+    // still has a running engine would mean taking that sibling's
+    // pipeline_mutex while holding this one's, and the answer is not worth a
+    // lock-ordering hazard in a background loop. Presence is the conservative
+    // proxy -- a sibling that exists keeps the entitlement, even if idle.
+    bool sole_session_for_logical_locked(const Session& keep) const {
+        for (const auto& [id, other] : sessions) {
+            if (other.get() == &keep) continue;
+            if (other->logical_session == keep.logical_session) return false;
+        }
+        return true;
+    }
+
+    // A physical pipeline is reclaimed because no stream request arrived for
+    // pipeline_idle -- the node has already concluded nobody is watching.
+    // Until 2026-09-21 that evidence was not permitted to release the
+    // transcode entitlement, which then outlived it by session_idle: thirty
+    // minutes against sixty seconds. On a node admitting one transcode that
+    // meant a single abandoned session denied transcoding to everybody, which
+    // is exactly what three client sessions hit on fi-1 the day 0.48.0
+    // shipped -- 57 session creates, zero DELETEs, and seven refusals in half
+    // an hour to a viewer nobody was competing with.
+    //
+    // Released per session and never as a node-wide sweep: this clears what
+    // this logical viewer holds and touches no other session and no other
+    // account. The entitlement is reacquired on resume like any other and may
+    // be refused then, which trades a certain half-hour outage for a possible
+    // refusal at the moment someone comes back -- and a refusal at resume is
+    // visible, attributable and recoverable, which the outage was not.
+    void release_transcode_entitlements_locked(Session& session) {
+        if (!session.logical_session) return;
+        const bool held = session.logical_session->video_transcode_entitled ||
+                          session.logical_session->audio_transcode_entitled;
+        if (!held) return;
+        session.logical_session->video_transcode_entitled = false;
+        session.logical_session->audio_transcode_entitled = false;
+        Log::info("playback transcode entitlement released on pipeline reclaim session=" +
+                  session.id);
+    }
+
     void commit_resources_locked(const ResourceReservation& reservation) {
         if (reservation.video && reserved_video_transcodes) --reserved_video_transcodes;
         if (reservation.audio && reserved_audio_transcodes) --reserved_audio_transcodes;
@@ -3101,6 +3142,8 @@ struct PlaybackManager::Impl {
                                     idle_pipelines.emplace_back(
                                         it->second, std::move(it->second->engine_session));
                                     ++idle_pipelines_reclaimed;
+                                    if (sole_session_for_logical_locked(*it->second))
+                                        release_transcode_entitlements_locked(*it->second);
                                 } else if (!next_expiry || pipeline_expires < *next_expiry) {
                                     next_expiry = pipeline_expires;
                                 }
@@ -3306,7 +3349,31 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         root["error"] = std::move(error);
         return http_json(429, Json(std::move(root)).dump());
     } catch (const ResourceLimitError& e) {
-        return http_error(429, "resource_limit", e.what());
+        // Node-scoped: this node is full, another may not be. It carried no
+        // axes at all until 2026-09-21, which left the one refusal a client
+        // can actually act on as the one saying least -- the account cap
+        // beside it states scope, health and its own limit.
+        //
+        // The axes differ by path, and the difference is real rather than
+        // cosmetic. On create no session exists yet, so trying another node
+        // costs nothing and is right: scope=node, walk.
+        //
+        // On update the session already exists HERE and is still serving its
+        // current generation. Walking means abandoning something that works to
+        // rebuild it elsewhere -- a failover, not a retry -- and the client
+        // cannot take the session with it, because a session is a resource of
+        // the node producing it. So the update refusal says do not walk, the
+        // same way the account cap does and for the same reason: the remedy is
+        // the caller's, not another node's. Here the remedy is a different
+        // instruction against this node -- remux instead of transcode, a lower
+        // height -- which is what alternative_may_succeed is for. The viewer's
+        // current playback is untouched either way.
+        const bool updating = request.method == "PATCH";
+        FailureAxes axes;
+        axes.scope = updating ? FailureScope::request : FailureScope::node;
+        axes.node_healthy = true;
+        axes.alternative_may_succeed = true;
+        return http_error(429, "resource_limit", e.what(), {}, axes);
     } catch (const PlaybackStageError& e) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
         Log::warn("playback[" + e.trace() + "] request failed stage=" + e.stage() +

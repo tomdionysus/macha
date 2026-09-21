@@ -2068,8 +2068,14 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
 
     REQUIRE(wait_until([&] {
         auto status = playback_status();
+        // The logical session survives reclamation -- sessions stays 1 -- but
+        // its transcode entitlement does not, so video_transcodes drops to 0
+        // with it. Those two numbers meaning different things is the point of
+        // reporting both: one counts who still holds a session, the other
+        // counts who still holds a slot, and after 2026-09-21 they diverge
+        // exactly here.
         return status.find("sessions")->asUInt64() == 1 &&
-               status.find("video_transcodes")->asUInt64() == 1 &&
+               status.find("video_transcodes")->asUInt64() == 0 &&
                status.find("running_video_transcode_pipelines")->asUInt64() == 0 &&
                status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
                !status.find("heap_reclaim_pending")->asBool() &&
@@ -2077,11 +2083,39 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
                status.find("heap_reclaim_runs")->asUInt64() >= 1;
     }, 1s));
 
-    // Physical reclamation does not surrender the persistent viewer's logical
-    // entitlement: otherwise an ordinary resume/seek could be rejected after
-    // another viewer slipped into the transient idle gap.
+    // Physical reclamation NOW surrenders the logical entitlement, and this
+    // assertion is the inverse of what it was before 2026-09-21.
+    //
+    // The old reasoning was real and is worth keeping: an ordinary resume or
+    // seek can now be rejected if another viewer took the slot during the idle
+    // gap. What overruled it is what that guarantee cost. A pipeline is
+    // reclaimed because no stream request arrived for pipeline_idle -- the
+    // node has already decided nobody is watching -- and holding a scarce
+    // entitlement for a further session_idle on that evidence let one
+    // abandoned session deny transcoding to an entire node for thirty
+    // minutes. Measured on fi-1 the day 0.48.0 shipped: 57 session creates,
+    // zero DELETEs, and three separate client sessions refused a transcode by
+    // a node nobody was competing for.
+    //
+    // So the trade is a certain half-hour outage for a possible refusal at
+    // resume -- and a refusal at resume is visible, attributable and
+    // recoverable, which the outage was not.
     auto second = playback.handle(create);
-    REQUIRE(second.status == 429);
+    REQUIRE(second.status == 201);
+
+    // And the slot really moved rather than being double-issued: the node
+    // admits one video transcode, so a third concurrent create is refused.
+    auto third = playback.handle(create);
+    REQUIRE(third.status == 429);
+    auto third_json = Json::parse(std::string(third.body.begin(), third.body.end()));
+    auto third_error = third_json.find("error");
+    REQUIRE(third_error != nullptr);
+    CHECK(third_error->find("code")->asString() == "resource_limit");
+    // Node-scoped on the create path: no session exists yet, so trying
+    // another node costs nothing and is the right move.
+    CHECK(third_error->find("scope")->asString() == "node");
+    CHECK(third_error->find("node_healthy")->asBool());
+    CHECK(third_error->find("alternative_may_succeed")->asBool());
 
     HttpRequest remove;
     remove.method = "DELETE";
@@ -2089,8 +2123,6 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
                   first_json.find("session_id")->asString();
     remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     REQUIRE(playback.handle(remove).status == 204);
-    second = playback.handle(create);
-    REQUIRE(second.status == 201);
 
     playback.stop();
     service.stop();

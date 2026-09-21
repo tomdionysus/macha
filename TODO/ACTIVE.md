@@ -287,6 +287,35 @@ three live nodes run 8.
 - [ ] Expect "plays, no sound" on the A85 Direct Play — it has no AC-3 or
   E-AC-3 decoder while claiming both, and it predates all of this.
 
+## P0 — `test_durability_barrier_reports_objects_a_restarted_peer_lost` fails half the time on macOS (measured 2026-09-21)
+
+Not a footnote and not a known flake to be lived with. **Measured, not
+recalled:** `./build/macha-tests --filter
+'test_durability_barrier_reports_objects_a_restarted_peer_lost' --repeat 20`
+on the macOS laptop at `f1d1548` fails **10 times in 20**. It fails at
+`tests/test_storage_v18.cpp:1385`, `REQUIRE(unsatisfiable.size() == 1)`.
+
+The same tree is **484/484 on es-1**, so this is the platform split again
+rather than a defect the cluster is running. Its sibling
+`test_durability_barrier_rederives_placement_after_peer_restart` behaves the
+same way — it failed a full local run and passed on es-1 in the same hour.
+
+**Why this was nearly missed, which is the part worth keeping.** Small samples
+lied in both directions. The case passed 6/6 at HEAD and failed 1/3 with an
+unrelated change in the tree, which reads as "the change broke it". Twenty runs
+said the opposite: 10/20 at HEAD, 1/10 with the change. At a true rate near
+50%, three runs are worth nothing and six are worth little. **Use `--repeat 20`
+before attributing an intermittent failure to a change**, and never attribute
+one on a single run.
+
+- [ ] Root-cause it. A 50% failure rate on any platform is a defect, either in
+  the test's synchronisation or in the barrier's reporting under a timing the
+  Pi never hits. The suite is green on the nodes, so it is not urgent for the
+  cluster — but it is corrosive, because a test that fails half the time on the
+  machine where code is written trains everyone to ignore a red suite.
+- [ ] Decide whether the two durability-barrier cases share one cause. They
+  have the same shape, the same platform split and adjacent assertions.
+
 ## P0 — The first-fragment timeout is a supersession defect, not a slow node (opened 2026-09-21)
 
 **Eight first-fragment timeouts on fi-1 on the day of the 0.48.0 cutover.
