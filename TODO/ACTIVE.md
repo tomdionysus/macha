@@ -2382,6 +2382,27 @@ P-1 above, in two other subsystems. They now have plans of their own —
 
 ## P2 — Code health and error-handling consistency (found 2026-09-05)
 
+- [ ] **The node-scoped session refusal carries no failure axes, while the
+  account-scoped one does** (found by the web client session via core,
+  2026-09-21, verified against source). `ResourceLimitError` answers
+  `http_error(429, "resource_limit", e.what())` with no `FailureAxes` at all,
+  whereas the account cap at `src/playback.cpp:3290` states `scope`,
+  `node_healthy` and `alternative_may_succeed`. The comment at
+  `src/playback.cpp:3287` says `scope: request` is what tells an axes-reading
+  client not to walk — this is the other half of that sentence: **until the
+  node-scoped path carries axes too, codes are the only complete signal**, and
+  a client reading axes rather than codes gets nothing on the node-scoped
+  refusal.
+  Smaller than it looks today, and the reason is worth keeping: core does not
+  read the axes at all, it keys on codes
+  (`ACCOUNT_SCOPED_FAILURE_CODES`, one string, `resource_limit` deliberately
+  excluded with the reason written beside it), so every client going through
+  core is insulated. Only a client reading axes directly is exposed.
+  Related trap, same source: the cap refusal and the `410` carry **opposite**
+  `alternative_may_succeed` — `false` and `true` — on the same `scope:
+  request` and `node_healthy: true`. Both are correct; the pair misleads
+  anyone reading the axes as a set.
+
 Not urgent, but real debt worth chipping away at opportunistically. No design
 work needed for any of these.
 
