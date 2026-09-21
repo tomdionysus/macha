@@ -1,5 +1,58 @@
 # Current release
 
+## 0.48.2 — Things a node can say about itself (development)
+
+**Timestamps in the journal are UTC and say so.** Every line now reads
+`2026-09-21 18:45:44Z` instead of node-local time with no offset. This cluster
+spans timezones by design — es-1 on CEST, fi-1 on EEST, gbni-1 on BST — so
+every cross-node correlation is a subtraction between two journals, done by
+hand, usually during an incident. On 2026-09-21 that cost an hour: `18:45:44`
+on es-1 and `19:45:44` on a client's screen were the same instant, and only a
+recognisable event sequence made it cheap to spot. The operator's ruling the
+same day: *"Macha absolutely needs to handle multiple timezones across sites.
+They WILL be in different timezones. We should be using hard Zulu, UTC."* The
+wire was already unambiguous — everything on it is `*_unix_ms` — so this is
+the half people read catching up.
+
+**The block cache reports what it has done, not only how full it is.** `hits`,
+`misses` and `evictions` join `used` and `capacity` on the per-node `cache`
+block of `GET /api/v1/status`.
+
+Until now `blocks()` was the entire observable surface of that cache and it
+counts writes alone, so a cache that had never returned a single byte reported
+identically to one working perfectly — on telemetry, on the status API and in
+the logs alike. Answering "is it serving anything?" took an hour of manual
+measurement against a live node. It matters most where there is least to see:
+on a node with `hosts_extents: false` the block cache is the only reason it can
+serve media at all, and a dead one there is the difference between an edge node
+and a proxy with extra steps.
+
+A read that throws counts as a miss, deliberately: the caller got nothing and
+goes to the network either way, and counting it as neither would make a cache
+failing every read look idle rather than broken.
+
+The counters are read from the live telemetry sample only, never the persisted
+fallback that capacity and usage fall back to. They are monotonic since the
+sending process started, so republishing a durable value after a restart would
+be a count from a process that no longer exists, and a consumer diffing two
+reads would watch them go backwards. Absent is the honest answer when there is
+no fresh sample. They are also deliberately **not** summed into the cluster
+rollup: an aggregate hit rate lets two healthy storage nodes drown a
+storage-less edge node sitting at zero, and that node is the one the number
+exists to expose.
+
+**`GET /api/v1/status` names the node that answered it.** `node_id` on the
+root, matching the `id` already in `nodes[]`. A client configured with one
+address polls this and gets a cluster snapshot in which nothing says which of
+those nodes produced the response, so a machine reached by two addresses is
+counted as two nodes — live on this cluster, `http://10.44.1.50:7438` and
+`https://macnessa.macha.network` are both gbni-1. Anything grouping by node
+double-counts it, a failover can "move" to the machine it just left, and a node
+selector offers the same box twice. `api_endpoint` cannot serve the purpose,
+because it is the node's own advertised name, which by definition differs from
+the address the client used in exactly the case that matters.
+
+
 ## 0.48.1 — What testing 0.48.0 found (development)
 
 Every item here is a defect in 0.48.0 that its own testing exposed, found in
