@@ -26,17 +26,20 @@ external gates are open.
 
 Taken on the recommendations, on the operator's instruction to execute this
 plan. Each is now recorded in the release rather than living here: (1) `410`
-is bundled and shipped; (2) the example config and reference pair 64 node-wide
-with 32 per account, and the live nodes still need raising; (3) the
-`playback/status` disclosure is accepted and stated in the 0.48.0 changelog.
+is shipped, and is **mandatory on both the server and core before deploy** —
+restated by the operator on 2026-09-21 and not subject to reopening; (2) the
+example config and reference pair 64 node-wide with 32 per account, and the
+live nodes still need raising; (3) the `playback/status` disclosure is
+accepted and stated in the 0.48.0 changelog.
 
-1. **`410 generation_superseded`: bundle it, or hold it for a second flag
-   day?** The code still answers `404` (`src/playback.cpp:2073`) with the
-   held-pending-tolerance note. The resource plan says bundle; the deploy
-   checklist expects to observe a real `410` in the joint test, which the
-   current code cannot produce. *Recommendation: bundle.* Gate 2 below has to
-   be met for this release anyway, and it is the release that already breaks
-   every client on purpose.
+1. ~~**`410 generation_superseded`: bundle it, or hold it for a second flag
+   day?**~~ **SETTLED, AND NOT REOPENABLE (operator, 2026-09-21): `410` is
+   required on both the server and core before this deploys.** It is not
+   conditional on any client's readiness to classify it, and no finding about
+   a client is grounds for reverting it to `404`. Both halves are in place:
+   the server implements it, and core's tolerance is in the tree the clients
+   link. The original question, kept for the record, was whether to bundle it
+   here or hold it for a second flag day.
 2. **Node-wide `max_sessions` on each node.** All three run `8`; the
    per-account default is `32`. As configured the account cap is unreachable:
    the node-scoped refusal fires first every time, and core walks the cluster
@@ -141,11 +144,12 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   `{status, error}` with a message string and no code. Its only status logic
   is session creation (`policy.ts:125`). So a superseded generation reaches
   mobile opaque — but it reaches it opaque **today**, as a `404`, for the same
-  reason. **Asked of core 2026-09-21 and unanswered at the time of writing:**
-  whether `410` behaves any differently from `404` down that path, which is
-  the difference between a pre-existing gap to file and a regression that
-  should hold `410` back to `404` for this release. Client work either way,
-  not the server's.
+  reason. **This does not hold `410` back** (see the decision above): it is
+  client work to be scheduled, not a reason to ship a lesser server. Asked of
+  core 2026-09-21 and unanswered at the time of writing: whether `410` travels
+  any differently from `404` down that path. If it does, mobile gets worse at
+  cutover and that goes in front of the operator beforehand as an accepted
+  cost rather than a surprise a viewer finds.
 
 ## Phase C: cluster preparation (can overlap Phase B)
 
