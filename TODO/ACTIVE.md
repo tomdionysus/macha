@@ -316,7 +316,66 @@ one on a single run.
 - [ ] Decide whether the two durability-barrier cases share one cause. They
   have the same shape, the same platform split and adjacent assertions.
 
-## P0 — The first-fragment timeout is a supersession defect, not a slow node (opened 2026-09-21)
+## P0 — Copying (E-)AC-3 into fragmented MP4 never produces a first fragment (opened 2026-09-21)
+
+**Supersedes the supersession theory below, which was wrong.** A controlled
+experiment from the web client, relayed by core, split it cleanly: on one node,
+minutes apart, both created in `direct` and switched by `PATCH`:
+
+- **H.264 + AAC stereo → remux with audio COPIED: works.** Plays, `FMP4`,
+  `generation-update-ready`.
+- **H.264 + AC-3 stereo → remux with audio COPIED: never plays.**
+  `readyState` 0, position 0, six non-fatal hls errors over ~35 s, two fatal
+  at ~59 s.
+
+So remux is not broken and the `PATCH` path is not broken. **Copying (E-)AC-3
+into fMP4 is what does not complete.** The phone sees the same family at
+*create* — `503 playback_pipeline_start_failed`, "timed out waiting for first
+fragmented-MP4 segment", four attempts across **two different nodes**, every
+one AC-3 or E-AC-3 (2010 AC3 5.1, Avatar EAC3 5.1). Two nodes matters: it
+retires the WAN-contention hypothesis, since one of them owns its extents.
+
+**The mechanism is in a comment this repository already carries.**
+`src/media_containers.cpp:93-96` states it: *"(E-)AC-3 needs the muxer to parse
+a packet before it can write the dac3/dec3 sample-entry box, which is what
+`delay_moov` does. Measured on this libavformat: without it the header write
+fails 'Invalid argument' (the 503s of 2026-09-07)."* And
+`src/media_engine.cpp:1358-1366` sets `delay_moov` on **every** fMP4 output,
+not only for those codecs.
+
+So for an AC-3 **copy** there is no decoder and no parse step of our own, the
+muxer defers `moov` until it can fill `dac3`/`dec3` from a parsed packet, and
+if that never happens the init segment is never written — no init, no first
+fragment, and `wait_ready(startup_timeout)` returns false. That matches the
+throw site exactly: `src/playback.cpp:1578` is reached only when the wait
+failed **and** `state.error` is empty **and** the pipeline is still running.
+Not a mux rejection, which would have said "libav pipeline failed before first
+fragment"; not an exit, which would have said "ended before first fragment".
+Alive, no error, no fragment.
+
+- [ ] Reproduce on a node with an AC-3 source and a copy plan, and find out
+  whether `moov` is ever written. That is the whole question.
+- [ ] If the muxer needs a parsed frame we are not giving it, attach a parser
+  or a bitstream filter on the AC-3 copy path.
+- [ ] **Second, separable defect: plan selection is not deterministic.** The
+  same Remux request produced `VIDEO COPY` + `AUDIO TRANSCODE · AC3 → AAC`
+  once and a true `REMUX · ENG · AC3` copy minutes later on the same node —
+  and **the one that played is the one that declined to copy**. If declining
+  is correct, the bug may be that it sometimes does not decline.
+  `max_audio_transcodes` is 4 on these nodes and the entitlement is per logical
+  viewer, so slot availability differs between two attempts seconds apart and
+  is a candidate for what selects between the plans.
+- [ ] Until then, `carriage_facts` claims `ac3`/`eac3` are fMP4-copyable
+  (`src/media_containers.cpp:115-116`) and `docs/streaming.md` repeats it. If
+  the copy cannot be made to work, that claim is what is wrong and MPEG-TS is
+  the documented route for those codecs.
+
+**Ruled out and worth not re-chasing:** the web client's two remux *seek*
+failures carrying the same message were `VIDEO COPY` + `AUDIO TRANSCODE` on
+HEVC + E-AC-3 — audio not copied — so they are a poor match and probably a
+separate fault.
+
+## P0 — The first-fragment timeout on PATCH: LARGELY SUPERSEDED, see the AC-3 item above (opened 2026-09-21)
 
 **Eight first-fragment timeouts on fi-1 on the day of the 0.48.0 cutover.
 All eight on `PATCH`. None on create**, on a node that served 18 successful
