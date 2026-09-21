@@ -423,10 +423,36 @@ each node's listing at start — is the right shape and covers force-stop, crash
 OOM and background reaping; reinstall, cleared storage and non-our clients are
 what the node's timers are for.
 
-## P0 — The block cache cannot be observed, and may never have served a read (opened 2026-09-21)
+## P1 — The block cache works, and still cannot be observed (opened 2026-09-21, falsified and downgraded the same day)
 
-**Not "the cache is broken" — "nothing in this system could tell us if it
-were."** The entire observable surface of `PersistentBlockCache` is a function
+**FALSIFIED 2026-09-21 by the cheap test this item asked for first: the cache
+works.** Measured on fi-1, which owns no extents, so the only local copy of
+anything is the block cache. 40 MB reads through the mount, page cache dropped
+before every one:
+
+| region | result |
+|---|---|
+| offset 100M, already cached | **24 ms**, and 24 ms again, and 24 ms again |
+| offset 5000M, never read | **2131 ms** cold, then **23 ms**, then 24 ms |
+| offset 9000M, never read | **2082 ms** cold, then 4905 ms, then **22-24 ms** stable |
+
+So a cached region is served at about **1.7 GB/s** and a cold one at about
+**19 MB/s** — an 88x difference, with the page cache dropped between every
+read, which leaves macha's own cache as the only thing that can account for it.
+**A cold read populates the cache and the cache then serves it.**
+
+**Downgraded from P0 to P1 on that evidence.** The crisis this was filed as —
+that every edge-node read since the cache was introduced might have been going
+to the WAN — is not happening.
+
+**One real observation from the same run, worth keeping:** the 4905 ms on an
+immediate repeat of a just-read region, settling to 22-24 ms afterwards. That
+is consistent with population being **asynchronous** — `enqueue_fetched` queues
+a `LocalCopyJob` rather than writing through — so a re-read issued immediately
+after a cold read can race the write and go to the WAN a second time. One
+observation, not chased further.
+
+**What stands, and is the whole of what is left:** The entire observable surface of `PersistentBlockCache` is a function
 of writes. `blocks()` is the only accessor, `cache_used` in telemetry is
 `blocks() * extent_size` (`src/cluster.cpp:1614-1619`), no test asserts a
 read-back from it, and the one log line that would show a hit only fires for
@@ -458,10 +484,10 @@ afternoon on the one node that owns no extents, which is what moves this from
 the only thing standing between a seek on fi-1 and a WAN round trip, and we
 cannot see whether it works.
 
-- [ ] **Falsify it cheaply first**, before any code: read one media file twice
-  through FUSE on fi-1 and compare wall-clock. Same speed twice means the
-  cache has never served, and the blast radius is every edge-node read since
-  it was introduced. One command, and it decides the urgency of the rest.
+- [x] **Falsified 2026-09-21** — the cache serves reads at 88x the cold path.
+  This is why the item is P1 and not P0. Putting it first was right: it cost
+  ten minutes and it stopped an instrumentation project being started on a
+  premise that was false.
 - [ ] Counters on `PersistentBlockCache` — hits, misses, evictions, entries.
   The materialisation cache already has exactly these and they are what made
   the 2026-09-20 rejoin failure diagnosable. Mirror them.
