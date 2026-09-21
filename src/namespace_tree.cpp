@@ -288,12 +288,26 @@ std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const Namespac
         break;
     }
     case ExtentForm::external: {
-        const auto count = reader.u64();
+        // The count is a hint from the node and nothing here can check it:
+        // unlike every other reserve in this file, the extents live in OTHER
+        // nodes, so `reader.remaining()` is not a bound on them.
+        //
+        // It used to be reserved directly, capped at 10,000,000 — which is
+        // 560 MB at the 56 bytes an ExtentRef occupies on aarch64, sized from
+        // an unvalidated integer in a node that may be corrupt or forged. That
+        // is exactly the pathology Stage A removed from `entry(Reader&)`, and
+        // a fixed cap is a guess with an expiry date besides: the whole live
+        // cluster holds 445,959 extents, so 10,000,000 was never a bound on
+        // anything real.
+        //
+        // It is simply dropped. `read_extent_sequence` reserves per chunk
+        // against that chunk's own remaining bytes, so growth is already
+        // bounded by data that exists, and the only thing the outer reserve
+        // bought was a few reallocations.
+        (void)reader.u64();
         ObjectId root{reader.fixed<32>()};
-        if (load_extents) {
-            entry.extents.reserve(static_cast<size_t>(std::min<uint64_t>(count, 10000000)));
+        if (load_extents)
             read_extent_sequence(root, store, entry.extents);
-        }
         break;
     }
     default:
@@ -319,6 +333,11 @@ std::optional<Bytes> MemoryNamespaceNodeStore::get(const ObjectId& id) const {
     if (found == nodes_.end())
         return {};
     return found->second;
+}
+
+void MemoryNamespaceNodeStore::put_at(const ObjectId& id, Bytes node) {
+    bytes_ += node.size();
+    nodes_[id] = std::move(node);
 }
 
 ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,

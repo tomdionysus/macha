@@ -470,6 +470,74 @@ the plan:
 | largest node, with a 12,500-extent film present | **< 64 KB** (that file's extent list is 612 KB inline today) |
 | point lookup | a path from the root, never the namespace |
 
+## Does the projection justify the work? (2026-09-21)
+
+Asked directly by the operator, and worth answering in numbers rather than by
+repeating the headline ratio.
+
+**First, what has actually been gained so far: almost nothing, and it is
+important not to pretend otherwise.** The tree is unreachable — nothing in the
+running system writes to it or reads from it — so no viewer and no node has
+benefited from Stage B. The 2,096x is a *projection*: it measures what a commit
+would cost if Stage C rewired the commit path, on a structure nothing yet
+commits to. It is trustworthy as a projection because it was measured against
+the live head rather than a generated namespace, but it is not a gain.
+
+The one shipped gain from this programme is **Stage A's**, not Stage B's: the
+allocator-slack fix, 36.2 MB -> 25.8 MB decoded, about 640 MB per node at
+target scale, one line, deployed. That is banked and real.
+
+### The projection is not a speedup, it is a cliff
+
+Stage A measured **15.9 MB decoded per TiB**, with encoded running about 80% of
+decoded (21 MB encoded against 26 MB decoded at 1.618 TiB). Extrapolated:
+
+| | today, 1.6 TiB | target, 100 TB |
+|---|---|---|
+| encoded snapshot | 22.5 MB | **~1.25 GB** |
+| cost of **one** file touch | re-serialise + SHA-256 22.5 MB, then replicate it | re-serialise + SHA-256 **~1.25 GB**, then replicate it |
+| the same write through the tree | 10,745 bytes, measured | ~10-20 KB, since it is O(log n) |
+
+At target, touching one file re-serialises and re-hashes **1.25 GB** and ships
+it to two peers. On Pi-class hardware that is seconds of CPU and gigabytes of
+network **per file touched**. That is not slow, it is inoperable — which is why
+this sits at P-1 rather than among the performance items, and why no amount of
+tuning reaches it: the record payload *is* the namespace and its identity is a
+hash over those bytes.
+
+### And there is a present-day cost, which earlier notes under-sold
+
+The cost is paid **per write**, so a bulk ingest of N files pays it N times
+against a namespace that is growing as it goes. Importing 100 files into
+today's library is roughly 2.25 GB of re-serialisation and re-hashing, plus the
+same again twice over in replication. That is quadratic in library size during
+ingest, today, on hardware that browns out under load.
+
+**So the projections justify the work, and not marginally.**
+
+### The cost worth pricing is blast radius, not hours
+
+Stage B's remainder — SM14 and the stat-only path — is small and safe, because
+it stays dead code until something points at it. **Stage C is the dangerous
+one.** It turns `metadata_namespace_signature` and `cache_record`'s
+`entries != entries` witness (`src/metadata_manager.cpp:228`) into root
+comparisons. Get that wrong and nodes report divergence that does not exist,
+which is precisely the failure that produced the 2026-09-06 quarantines.
+
+**Stage C should therefore get the treatment the seek contract got: the
+invariant written down as a contract before any code is changed**, and
+history-independence tested adversarially rather than assumed. Today supplied
+the argument for that — six tests over generated namespaces missed a
+1-in-65,536 condition that the real head hit on the first attempt.
+
+### The measurement that would sharpen this, and has not been taken
+
+**What a real namespace commit costs on a node today.** If it is 200 ms, the
+ingest argument above is a present-tense problem and the work pays immediately.
+If it is 20 ms, this is purely an investment against the scale target and can
+reasonably sit behind the P0s. Nobody has measured it, and every argument about
+urgency rather than necessity rests on it.
+
 ## Stage B measured against the live namespace (2026-09-21)
 
 **The `macha-metadata-dump --tree` mode is built and the figures below are off

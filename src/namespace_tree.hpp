@@ -82,6 +82,12 @@ class MemoryNamespaceNodeStore final : public NamespaceNodeStore {
   public:
     ObjectId put(std::span<const uint8_t> node) override;
     std::optional<Bytes> get(const ObjectId& id) const override;
+    // Stores bytes under an id they do NOT hash to. Only a corruption test
+    // wants this: it is how damaged content is made reachable from a parent
+    // that still points at the original address, which is what a corrupt
+    // control-store object looks like from here. Nothing in the build or read
+    // path uses it.
+    void put_at(const ObjectId& id, Bytes node);
 
     size_t nodes() const {
         return nodes_.size();
