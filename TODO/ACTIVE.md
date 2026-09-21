@@ -335,6 +335,45 @@ fragmented-MP4 segment", four attempts across **two different nodes**, every
 one AC-3 or E-AC-3 (2010 AC3 5.1, Avatar EAC3 5.1). Two nodes matters: it
 retires the WAN-contention hypothesis, since one of them owns its extents.
 
+**RETRACTED 2026-09-21, by experiment, before any code was changed. The
+`delay_moov` mechanism below is WRONG and is kept only so nobody re-derives
+it.** Two controlled experiments on es-1, against the same libavformat 61 the
+server links:
+
+1. **ffmpeg CLI, macha's exact movflags.** AAC copy into fMP4 with
+   `delay_moov`: works. **AC-3 copy into fMP4 with `delay_moov`: works**,
+   2.3 MB of output. AC-3 copy *without* `delay_moov`: fails with
+   `"Cannot write moov atom before AC3 packets. Set the delay_moov flag to fix
+   this."` — which confirms the comment is correct and the flag is doing its
+   job.
+2. **A probe replicating macha's muxer configuration exactly** — `delay_moov`
+   **and** `frag_custom` and a custom `AVIOContext`, which is the part the CLI
+   cannot reproduce. Both AAC and AC-3 wrote zero bytes at
+   `avformat_write_header` (identical, so the deferred moov is not
+   codec-specific) and both produced a first fragment on the first explicit
+   flush: AAC 3,797 bytes, AC-3 1,296 bytes.
+
+**So AC-3 muxes into fragmented MP4 correctly in macha's own configuration,
+and the mux path is not where this fails.** Core independently reached the
+same conclusion from the source, pointing out that the mechanism contradicted
+the very comments it cited: if an AC-3 copy never produced a parsed packet,
+the 2026-09-07 fix could not have worked, because it works by waiting for
+exactly that packet.
+
+**What the experiments do NOT rule out**, stated so the next attempt starts in
+the right place: both read a file from local disk rather than through macha's
+own source IO, and both used a substitute AC-3 title rather than the two that
+actually failed (2010, AC3 5.1; Avatar: Fire and Ash, EAC3 5.1), which are not
+on the node tested. A 5.1 layout, or the DHT-backed read path, remain
+untested.
+
+**The symptom is solid; only the explanation was not.** Three clients
+reproduced AAC-copy-works against AC-3-copy-stalls on one node within minutes,
+and the television measured `elapsedMs 15051.5` against that node's advertised
+15,000 ms budget — `wait_for_initial_fragment` timing out exactly.
+
+The superseded reasoning follows.
+
 **The mechanism is in a comment this repository already carries.**
 `src/media_containers.cpp:93-96` states it: *"(E-)AC-3 needs the muxer to parse
 a packet before it can write the dac3/dec3 sample-entry box, which is what
@@ -387,8 +426,14 @@ bug itself:**
 - [ ] Establish what a second session for one media waits on when an earlier
   session for that media is still live. Retained memory first.
 
-- [ ] Reproduce on a node with an AC-3 source and a copy plan, and find out
-  whether `moov` is ever written. That is the whole question.
+- [x] ~~Find out whether `moov` is ever written.~~ Done by experiment: it is,
+  for both codecs, in macha's exact configuration. Not the question.
+- [ ] Reproduce with the **actual failing media** — a 5.1 (E-)AC-3 title —
+  and through **macha's own source IO** rather than a local file. Both were
+  substituted in the experiments above and both are untested.
+- [ ] Then instrument the pipeline rather than the muxer: if libav writes a
+  fragment when driven directly, the question is what macha's cut logic or
+  first-fragment wait does differently on these sources.
 - [ ] If the muxer needs a parsed frame we are not giving it, attach a parser
   or a bitstream filter on the AC-3 copy path.
 - [ ] **Second, separable defect: plan selection is not deterministic.** The
