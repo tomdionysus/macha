@@ -1614,9 +1614,14 @@ void NodeRuntime::refresh_telemetry() {
     uint64_t cache_capacity = 0;
     uint64_t cache_used = 0;
     uint32_t storage_backends_online = 0;
+    CacheActivity cache_activity;
     if (ready(ready_cache) && cache_) {
         cache_capacity = static_cast<uint64_t>(cfg_.cache.max_blocks) * cfg_.extent_size;
         cache_used = static_cast<uint64_t>(cache_->blocks()) * cfg_.extent_size;
+        const auto stats = cache_->stats();
+        cache_activity.hits = stats.hits;
+        cache_activity.misses = stats.misses;
+        cache_activity.evictions = stats.evictions;
     }
     if (ready(ready_data_storage) && local_)
         storage_backends_online = static_cast<uint32_t>(local_->online_backends());
@@ -1684,7 +1689,7 @@ void NodeRuntime::refresh_telemetry() {
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
                              peers_active > 0 ? peers_active - 1 : 0, phase,
-                             std::move(api_endpoint), playback);
+                             std::move(api_endpoint), playback, cache_activity);
 }
 
 void NodeRuntime::signal_telemetry_refresh() {
