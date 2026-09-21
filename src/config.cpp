@@ -569,6 +569,9 @@ void parse_streaming(const YAML::Node& root, Config& c) {
         c.streaming.temp_path = std::filesystem::path(streaming["temp_path"].as<std::string>());
     if (streaming["max_sessions"])
         c.streaming.max_sessions = streaming["max_sessions"].as<size_t>();
+    if (streaming["max_sessions_per_account"])
+        c.streaming.max_sessions_per_account =
+            streaming["max_sessions_per_account"].as<size_t>();
     if (streaming["max_video_transcodes"])
         c.streaming.max_video_transcodes = streaming["max_video_transcodes"].as<size_t>();
     if (streaming["max_audio_transcodes"])

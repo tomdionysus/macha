@@ -1489,6 +1489,7 @@ MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) 
     HttpRequest remove;
     remove.method = "DELETE";
     remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
+    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove).status == 204);
     auto reused_after_delete = playback.handle(conflicting);
     REQUIRE(reused_after_delete.status == 201);
@@ -2086,6 +2087,7 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     remove.method = "DELETE";
     remove.path = "/api/v1/playback/sessions/" +
                   first_json.find("session_id")->asString();
+    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     REQUIRE(playback.handle(remove).status == 204);
     second = playback.handle(create);
     REQUIRE(second.status == 201);
@@ -2579,6 +2581,7 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
     HttpRequest remove_direct;
     remove_direct.method = "DELETE";
     remove_direct.path = "/api/v1/playback/sessions/" + direct_json.find("session_id")->asString();
+    remove_direct.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_direct).status == 204);
 
     // A remux session advertises direct unconditionally and honours an
@@ -2606,6 +2609,7 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
     HttpRequest switch_direct;
     switch_direct.method = "PATCH";
     switch_direct.path = "/api/v1/playback/sessions/" + remux_json.find("session_id")->asString();
+    switch_direct.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     switch_direct.body.assign(switch_text.begin(), switch_text.end());
     auto switched = playback.handle(switch_direct);
     REQUIRE(switched.status == 200);
@@ -2617,6 +2621,7 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
     HttpRequest remove_switched;
     remove_switched.method = "DELETE";
     remove_switched.path = "/api/v1/playback/sessions/" + switched_json.find("session_id")->asString();
+    remove_switched.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_switched).status == 204);
 
     playback.stop();
@@ -2795,13 +2800,31 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     HttpRequest remove;
     remove.method = "DELETE";
     remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
+    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove).status == 204);
 
     playback.stop();
     service.stop();
 }
 
-MACHA_TEST("media_playback", test_logical_viewer_keeps_one_transcode_entitlement_across_replacements) {
+MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_entitlement) {
+    // This case used to assert the opposite, and the name it had --
+    // "logical viewer keeps one transcode entitlement across replacements" --
+    // described the defect rather than a requirement. A playback session was a
+    // property of the bearer: a second POST on one auth session superseded the
+    // first, returned the same session_id, and handed back the same transcode
+    // entitlement. That is why the Web Client could not hand over, and it is
+    // not what POST to a collection means.
+    //
+    // Now each create is a member of the collection. Distinct ids, distinct
+    // logical viewers, and an entitlement per session rather than one retained
+    // across replacements.
+    //
+    // THE CONSEQUENCE WORTH KNOWING, asserted at the end: a client that
+    // re-POSTs a transcode without releasing its previous session now takes a
+    // SECOND slot and is refused, where it used to get its own session back.
+    // Core is clear of this -- regenerate releases before it creates -- but any
+    // client that does not release first sees a 429 it never saw before.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2834,12 +2857,10 @@ MACHA_TEST("media_playback", test_logical_viewer_keeps_one_transcode_entitlement
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
-    auto create = [&](std::string mode, std::string viewer, std::string attempt,
-                      std::optional<int64_t> seek_ms = {}) {
+    auto create = [&](std::string mode, std::string viewer, std::string attempt) {
         Json::Object preferences{{"mode", std::move(mode)}};
         Json::Object root{{"media_id", media_id},
                           {"preferences", Json(std::move(preferences))}};
-        if (seek_ms) root["seek_ms"] = *seek_ms;
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
         request.method = "POST";
@@ -2857,77 +2878,53 @@ MACHA_TEST("media_playback", test_logical_viewer_keeps_one_transcode_entitlement
         REQUIRE(response.status == 200);
         return Json::parse(std::string(response.body.begin(), response.body.end()));
     };
+    auto session_id_of = [](const HttpResponse& response) {
+        auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+        return body.find("session_id")->asString();
+    };
 
-    auto first = create("transcode", "ui-player-1", "logical-attempt-1");
+    auto first = create("transcode", "ui-player-1", "attempt-1");
     REQUIRE(first.status == 201);
-    auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
-    const auto session_id = first_json.find("session_id")->asString();
+    const auto first_id = session_id_of(first);
     CHECK(status().find("video_transcodes")->asUInt64() == 1);
-
-    HttpResponse concurrent_direct, concurrent_remux;
-    std::jthread replace_a([&] {
-        concurrent_direct =
-            create("direct", "ui-player-1", "logical-concurrent-direct");
-    });
-    std::jthread replace_b([&] {
-        concurrent_remux =
-            create("remux", "ui-player-1", "logical-concurrent-remux");
-    });
-    replace_a.join();
-    replace_b.join();
-    REQUIRE(concurrent_direct.status == 201);
-    REQUIRE(concurrent_remux.status == 201);
-    for (const auto* response : {&concurrent_direct, &concurrent_remux}) {
-        auto body = Json::parse(std::string(response->body.begin(), response->body.end()));
-        CHECK(body.find("session_id")->asString() == session_id);
-    }
     CHECK(status().find("sessions")->asUInt64() == 1);
+
+    // A second create on the SAME bearer is a second session, not a
+    // replacement. This is the whole change.
+    auto second = create("direct", "ui-player-1", "attempt-2");
+    REQUIRE(second.status == 201);
+    const auto second_id = session_id_of(second);
+    CHECK(second_id != first_id);
+    CHECK(status().find("sessions")->asUInt64() == 2);
+    // Direct needs no encoder, so the first session's slot is untouched --
+    // entitlements are per session and are not multiplied by splitting a
+    // viewer into several.
     CHECK(status().find("video_transcodes")->asUInt64() == 1);
 
-    // A replacement POST is a new request attempt in the same persistent UI
-    // session. It keeps the server session identity and entitlement even while
-    // the selected representation temporarily requires no encoder.
-    auto direct = create("direct", "ui-player-1", "logical-attempt-2");
-    REQUIRE(direct.status == 201);
-    auto direct_json = Json::parse(std::string(direct.body.begin(), direct.body.end()));
-    CHECK(direct_json.find("session_id")->asString() == session_id);
-    CHECK(direct_json.find("mode")->asString() == "direct");
-    auto direct_status = status();
-    CHECK(direct_status.find("sessions")->asUInt64() == 1);
-    CHECK(direct_status.find("video_transcodes")->asUInt64() == 1);
-
-    // Another logical viewer cannot steal the retained slot during that Direct
-    // interval, but the original viewer can switch back and seek repeatedly.
-    CHECK(create("transcode", "ui-player-2", "other-attempt").status == 429);
-    auto remux = create("remux", "ui-player-1", "logical-attempt-3");
-    REQUIRE(remux.status == 201);
-    auto remux_json = Json::parse(std::string(remux.body.begin(), remux.body.end()));
-    CHECK(remux_json.find("session_id")->asString() == session_id);
-    CHECK(remux_json.find("mode")->asString() == "remux");
-    CHECK(status().find("video_transcodes")->asUInt64() == 1);
-
-    auto transcoded = create("transcode", "ui-player-1", "logical-attempt-4", 10'000);
-    REQUIRE(transcoded.status == 201);
-    auto transcoded_json =
-        Json::parse(std::string(transcoded.body.begin(), transcoded.body.end()));
-    CHECK(transcoded_json.find("session_id")->asString() == session_id);
-    CHECK(status().find("video_transcodes")->asUInt64() == 1);
-
-    for (int64_t seek_ms : {20'000, 30'000, 40'000}) {
-        Json::Object patch_root{{"seek_ms", seek_ms}};
-        auto text = Json(std::move(patch_root)).dump();
-        HttpRequest patch;
-        patch.method = "PATCH";
-        patch.path = "/api/v1/playback/sessions/" + session_id;
-        patch.body.assign(text.begin(), text.end());
-        auto response = playback.handle(patch);
-        REQUIRE(response.status == 200);
-        CHECK(status().find("video_transcodes")->asUInt64() == 1);
+    // Both are addressable, independently, by their own ids.
+    for (const auto& id : {first_id, second_id}) {
+        HttpRequest get;
+        get.method = "GET";
+        get.path = "/api/v1/playback/sessions/" + id;
+        get.session = SessionIdentity{.id = "ui-player-1", .roles = {"anonymous"}};
+        CHECK(playback.handle(get).status == 200);
     }
 
+    // The single transcode slot is still a node-wide bound: another viewer
+    // cannot take it while it is held.
+    CHECK(create("transcode", "ui-player-2", "other-attempt").status == 429);
+
+    // ... and neither can the account that already holds it. This is the
+    // behaviour change a client feels: previously this returned 201 with the
+    // caller's own session_id, by retaining the entitlement across the
+    // replacement.
+    CHECK(create("transcode", "ui-player-1", "attempt-3").status == 429);
+
+    // Releasing the session that holds the slot frees it for anyone.
     HttpRequest remove;
     remove.method = "DELETE";
-    remove.path = "/api/v1/playback/sessions/" + session_id;
+    remove.path = "/api/v1/playback/sessions/" + first_id;
+    remove.session = SessionIdentity{.id = "ui-player-1", .roles = {"anonymous"}};
     REQUIRE(playback.handle(remove).status == 204);
     CHECK(status().find("video_transcodes")->asUInt64() == 0);
     CHECK(create("transcode", "ui-player-2", "other-attempt-2").status == 201);
@@ -3032,6 +3029,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest fast_seek;
     fast_seek.method = "PATCH";
     fast_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
+    fast_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     fast_seek.body.assign(fast_seek_text.begin(), fast_seek_text.end());
     auto fast_seek_response = playback.handle(fast_seek);
     REQUIRE(fast_seek_response.status == 200);
@@ -3054,6 +3052,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest redundant_seek;
     redundant_seek.method = "PATCH";
     redundant_seek.path = fast_seek.path;
+    redundant_seek.session = fast_seek.session;
     redundant_seek.body.assign(redundant_seek_text.begin(), redundant_seek_text.end());
     auto redundant_seek_response = playback.handle(redundant_seek);
     REQUIRE(redundant_seek_response.status == 200);
@@ -3069,6 +3068,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest remove_initial_seek;
     remove_initial_seek.method = "DELETE";
     remove_initial_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
+    remove_initial_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_initial_seek).status == 204);
 
     // Reopening the same immutable media with the same transformed plan should
@@ -3087,6 +3087,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     remove_reopened_seek.method = "DELETE";
     remove_reopened_seek.path = "/api/v1/playback/sessions/" +
                                 reopened_seek_json.find("session_id")->asString();
+    remove_reopened_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_reopened_seek).status == 204);
 
     Json::Object create_root{{"media_id", media_id},
@@ -3157,6 +3158,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest subtitle_only;
     subtitle_only.method = "PATCH";
     subtitle_only.path = "/api/v1/playback/sessions/" + session_id;
+    subtitle_only.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     subtitle_only.body.assign(subtitle_only_text.begin(), subtitle_only_text.end());
     auto subtitle_only_response = playback.handle(subtitle_only);
     REQUIRE(subtitle_only_response.status == 200);
@@ -3204,6 +3206,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest subtitle_off;
     subtitle_off.method = "PATCH";
     subtitle_off.path = "/api/v1/playback/sessions/" + session_id;
+    subtitle_off.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     subtitle_off.body.assign(subtitle_off_text.begin(), subtitle_off_text.end());
     auto subtitle_off_response = playback.handle(subtitle_off);
     REQUIRE(subtitle_off_response.status == 200);
@@ -3219,6 +3222,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest bitmap_subtitle;
     bitmap_subtitle.method = "PATCH";
     bitmap_subtitle.path = "/api/v1/playback/sessions/" + session_id;
+    bitmap_subtitle.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     bitmap_subtitle.body.assign(bitmap_subtitle_text.begin(), bitmap_subtitle_text.end());
     CHECK(playback.handle(bitmap_subtitle).status == 400);
 
@@ -3228,6 +3232,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest bad_track;
     bad_track.method = "PATCH";
     bad_track.path = "/api/v1/playback/sessions/" + session_id;
+    bad_track.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     bad_track.body.assign(bad_track_text.begin(), bad_track_text.end());
     CHECK(playback.handle(bad_track).status == 400);
 
@@ -3241,6 +3246,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest quality;
     quality.method = "PATCH";
     quality.path = "/api/v1/playback/sessions/" + session_id;
+    quality.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     quality.body.assign(quality_text.begin(), quality_text.end());
     auto quality_response = playback.handle(quality);
     REQUIRE(quality_response.status == 200);
@@ -3268,6 +3274,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest restore;
     restore.method = "PATCH";
     restore.path = "/api/v1/playback/sessions/" + session_id;
+    restore.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     restore.body.assign(restore_text.begin(), restore_text.end());
     auto restore_response = playback.handle(restore);
     REQUIRE(restore_response.status == 200);
@@ -3304,6 +3311,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest patch;
     patch.method = "PATCH";
     patch.path = "/api/v1/playback/sessions/" + session_id;
+    patch.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     patch.body.assign(patch_text.begin(), patch_text.end());
     auto patched = playback.handle(patch);
     REQUIRE(patched.status == 200);
@@ -3361,6 +3369,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest transformed_subtitle_off;
     transformed_subtitle_off.method = "PATCH";
     transformed_subtitle_off.path = "/api/v1/playback/sessions/" + session_id;
+    transformed_subtitle_off.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     transformed_subtitle_off.body.assign(transformed_subtitle_off_text.begin(), transformed_subtitle_off_text.end());
     auto transformed_subtitle_off_response = playback.handle(transformed_subtitle_off);
     REQUIRE(transformed_subtitle_off_response.status == 200);
@@ -3384,6 +3393,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest remove;
     remove.method = "DELETE";
     remove.path = "/api/v1/playback/sessions/" + session_id;
+    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove).status == 204);
 
     // A playback lease is a snapshot, not a pathname alias. Replacing the file
@@ -3421,6 +3431,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     HttpRequest remove_path;
     remove_path.method = "DELETE";
     remove_path.path = "/api/v1/playback/sessions/" + path_session_id;
+    remove_path.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_path).status == 204);
 
     // Session creation must wake an otherwise indefinitely-blocked cleanup
@@ -3770,6 +3781,7 @@ MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
     HttpRequest patch;
     patch.method = "PATCH";
     patch.path = "/api/v1/playback/sessions/" + remux.find("session_id")->asString();
+    patch.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     patch.body.assign(patch_text.begin(), patch_text.end());
     auto patch_response = playback.handle(patch);
     REQUIRE(patch_response.status == 200);
