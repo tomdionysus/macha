@@ -5052,6 +5052,56 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
 // black-hole advertised address (192.0.2.1, TEST-NET-1) and a short connect
 // timeout, so no OS firewall is needed: any dial to it would hang and fail,
 // and the assertions below are that nobody ever makes one.
+MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_liveness_budget) {
+    // A peer is live only while it has been observed inside dead_after, and
+    // health_loop's CONTROL ping is what observes it. Each probe round was
+    // built with deadline = started + dead_after_, and call_async_known
+    // carries no no-progress deadline of its own -- so a ping that *hung*
+    // (rather than failed, which has always had a 50 ms retry path) occupied
+    // the entire liveness budget in a single attempt, and the peer expired at
+    // the instant the probe proving it alive was abandoned. On es-1/fi-1 that
+    // was a ten-second read-only window with both ends healthy, fatal to any
+    // ingest whose commit landed in it (2026-09-19/20).
+    //
+    // The stall fixture holds every `ping` this node sends to the peer and
+    // never answers, and `stalled_calls_for_tests()` counts the attempts, so
+    // the retry behaviour is directly observable: one attempt per liveness
+    // window before the fix, one per third of it after.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "probe-budget-n1", cluster.keyfile(), p1,
+                         {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "probe-budget-n2", cluster.keyfile(), p2,
+                         {{"127.0.0.1", p1}});
+    // Three seconds of liveness budget derives a one-second attempt budget,
+    // so a working retry path gets three attempts inside one window.
+    c1.dead_after = c2.dead_after = 3s;
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() >= 2 &&
+               s2.node().membership().active().size() >= 2;
+    }));
+
+    const auto peer = s2.node().node_id();
+    s1.node().stall_peer_for_tests(peer, MessageType::ping);
+    const auto started = std::chrono::steady_clock::now();
+    // Before the fix this sat at one for the whole three seconds: the single
+    // attempt was held until the round deadline, which *is* dead_after.
+    const bool retried =
+        wait_until([&] { return s1.node().stalled_calls_for_tests() >= 3; }, 3s);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    s1.node().release_peer_for_tests(peer);
+
+    CHECK(retried);
+    CHECK(elapsed < c1.dead_after);
+}
+
 MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_own_sessions) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
