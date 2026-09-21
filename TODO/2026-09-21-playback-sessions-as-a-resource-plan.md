@@ -511,8 +511,10 @@ an un-updated host would read `410` as unhandled and condemn a healthy node,
 which is the exact failure the tolerance exists to prevent. Three tests, two
 verified red against the branch.
 
-**It is not published to npm, and that needs the operator's word.** The route
-move here is gated on the clients being on a published core that carries it.
+**Corrected 2026-09-21 (operator): publishing is not a gate.** The clients
+test against a direct link to the package rather than a registry release, so
+the route move here is gated on the clients *consuming* a core that carries
+the tolerance — not on anything appearing on npm.
 
 **`410 generation_superseded` should be bundled into this release.** It is
 already held pending exactly this tolerance, and a coordinated route break is
