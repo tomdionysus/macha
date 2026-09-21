@@ -3076,7 +3076,20 @@ Build once, ship the artefacts. Build on es-1 (or fi-1), run the full suite
 there, stage with `DESTDIR`, and ship the tarball — `bin/macha`,
 `lib/macha/libmacha_core.*` and `lib/macha/plugins/` together, never the
 executable alone. Verify `uname -m`, `ldd --version` and the tarball hash on
-each target. Never compile on gbni-1. When a release adds a `NodeTelemetry`
-field, upgrade every node together rather than rolling. (Until 2026-09-20 this
+each target. Never compile on gbni-1.
+
+**Adding a `NodeTelemetry` field no longer forces an all-at-once cutover.**
+That rule was written for the positional format, where an added field made a
+mixed-version cluster misparse every multi-node telemetry set it exchanged.
+TEL3 is tagged and length-delimited, so an older node skips a field it does not
+know by that field's own length. **Proven in the field on 2026-09-21**: 0.48.1
+added two fields and was rolled one node at a time, and fi-1 on 0.48.1 peered
+with two nodes on 0.48.0 across control and data lanes, writable at generation
+33191, with no telemetry warning on any of them.
+
+What still forces an all-at-once cutover is a change to the *format itself*, as
+0.48.0's move to TEL3 did: a node speaking the old one refuses the set outright
+rather than misreading it, which is intended and is why that release was not
+rolled. (Until 2026-09-20 this
 said "build nodes in parallel", contradicting the practice recorded in every
 deploy note above it; it was also a checkbox that could never be ticked.)
