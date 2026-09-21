@@ -225,6 +225,15 @@ mobile (confirmed 2026-09-21) and drives the sequence.
     rather than a version number, because a link resolves a working tree and
     not a commit. Worth keeping when this is deployed.
 
+  **DONE 2026-09-21 13:34** (each node's local time; 11:34 UTC). The web
+  client session deployed `index-NDVfpduh.js` to all three nodes, two minutes
+  before the server cutover at :36 — so the ordering came out as intended,
+  bundle first and routes second. All three `index.html` now reference it.
+  Verified served: `index.html` is `Cache-Control: no-cache` and the bundle
+  name is content-hashed, so a client picks it up on the next load; the
+  deployed service worker holds no Cache API entries (zero `caches`
+  references), so it cannot serve a stale shell.
+
   **Owner, confirmed by core 2026-09-21: the web client session builds it and
   the operator authorises the deploy. Not the server session, and not core.**
   The procedure is in macha-client's own notes: `npm run build`, then rsync
@@ -234,17 +243,44 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   2026-09-20. Core has passed all of this to the web client session directly,
   including that its `develop`-only `410` branch is absent from the released
   0.17.3.
-- [ ] **Config on all three nodes** per decision 2: `max_sessions` raised,
+- [x] **Config on all three nodes — DONE 2026-09-21 13:34, by this session,
+  immediately before the cutover.** All three now carry `max_sessions: 64` and
+  `max_sessions_per_account: 32` explicitly, backed up as
+  `macha.yaml.bak-0.47.0` (the backups show the old `max_sessions: 8` and no
+  per-account key, which is the proof these are set values and not defaults or
+  the example). Independently re-verified by the web client session against
+  three distinct file sizes, hashes and line ranges, none matching
+  `macha.yaml.example`. **`account_session_limit` is reachable today.**
+  Original item: `max_sessions` raised,
   `max_sessions_per_account` written explicitly rather than left to the
   default, so the two numbers sit together in the file. Back up each as
   `macha.yaml.bak-0.47.0` first. These reload live and can go in before the
   cutover; a 0.47.0 binary ignores the unknown key. Confirm that with a
   `reload_config` on one node before touching the other two.
-- [ ] **Confirm the tarball targets**: `uname -m` and `ldd --version` on
-  fi-1 and gbni-1 match es-1 (`aarch64`, glibc 2.41). They did for 0.47.0;
-  check anyway.
+- [x] **Tarball targets confirmed**: `aarch64` and glibc 2.41 on all three.
 
-## Phase D: cutover (after A, B and C are all ticked)
+## Phase D: cutover — DONE 2026-09-21, all three nodes together
+
+Executed on the operator's instruction. Built on es-1 from the tagged tree,
+staged with `DESTDIR`, tarball `/tmp/macha-0.48.0.tgz` (3,293,529 bytes, md5
+`89d88eb5a1a1cb6341d944810e5dabb0`) shipped to fi-1 and gbni-1 and md5-verified
+on each. Zero playback traffic on any node beforehand. All three stopped,
+installed and started within the same minute — not rolling, because TEL3
+excludes a straggler from gossip rather than misreading it.
+
+Verified after: all three report `0.48.0`; **exactly one** `persisted telemetry
+ignored: bad telemetry set` per node, never repeated, which is the documented
+self-healing discard; es-1 peered with both on control and data lanes;
+metadata writable at generation **33038**, `replicas=3/3 required=2`. A
+15-minute watch found zero errors and no drift.
+
+One item from the list below was **not** done: verifying the new per-node
+`playback` fields through `GET /api/v1/status`, because that route needs a
+bearer token and the anonymous account no longer carries `view_status`. TEL3
+is flowing — the nodes converged and gossip is healthy — but the field-level
+proof was not taken. Worth doing during the joint test.
+
+Original checklist:
 
 Build once, ship the artefacts, every node together. This is the standing
 rule and TEL3 makes it mandatory rather than advisable: a node left behind is
@@ -284,16 +320,16 @@ live cluster. Reading the code does not count.
 - [ ] **Ownership.** One account's id, presented by another account, answers
   `404` on `GET`, `PATCH` and `DELETE`, and its stream URL answers nothing
   useful with or without the token.
-- [ ] **The account cap, observed. DO NOT RUN THIS BEFORE `max_sessions` IS
-  RAISED.** With `max_sessions` at 8 against a per-account cap of 32, the only
-  `429` any client can provoke is the **node-scoped** one — and the mobile
-  client's `classifyCreateRefusal` deliberately treats that as fatal. So a cap
-  test run before the raise **will look like mobile's cap handling is broken
-  when it is behaving exactly as designed** (mobile session, via core,
-  2026-09-21). That is a false bug report waiting to be filed against a client
-  that is correct, and it is the second reason the Phase C config raise is
-  sequenced before this.
-  Once raised: drop `max_sessions_per_account` to `2` on fi-1 alone, live
+- [ ] **The account cap, observed. The blocker that was here is LIFTED** —
+  the raise happened at 13:34 on 2026-09-21, before the cutover, and all three
+  nodes run 64/32. This test can run whenever the joint test runs.
+  *Kept because the trap recurs whenever a node is rebuilt from bare
+  defaults:* at `max_sessions: 8` under a per-account cap of 32 the only `429`
+  provokable is the **node-scoped** one, and the mobile client's
+  `classifyCreateRefusal` treats that as fatal by design — so the test would
+  look like mobile's cap handling failing when it is correct. Check both
+  numbers on the node before running it.
+  Method: drop `max_sessions_per_account` to `2` on fi-1 alone, live
   reload, and have one client create three. The third is `429
   account_session_limit` with limit and count, a second account on the same
   node is unaffected, and core does *not* mark fi-1 failed. Restore the number
