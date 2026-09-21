@@ -210,14 +210,23 @@ A cap that counts those refuses the create that the failover depends on, during
 an outage, which is the worst moment and the hardest case to provoke
 deliberately. It presents as "failover works in testing and fails in anger".
 
-**Two caveats that bound how bad it is, both worth stating because they change
-the mitigation.** A node that truly dies loses its sessions with it: the
+**One caveat bounds how bad it is; the second one I offered was wrong and is
+corrected here.** A node that truly dies loses its sessions with it: the
 session map is in-memory, so a restart clears them. The case that actually
-strands is a node that is *alive but unreachable from that client* — a
-partition, a CGNAT path, a proxy fault — where the node is fine and still
-counting. And because the cap is per node, a cascade strands one session per
-node rather than N on one node; it exhausts a cap only when a client returns to
-a node it previously abandoned.
+strands is a node *alive but unreachable from that client* — a partition, a
+CGNAT path, a proxy fault — where the node is fine and still counting. The web
+client demonstrated exactly that by isolating a node **inside the browser**:
+the process never died, the map stayed intact, and because the session had been
+*playing*, the 120 s unused-idle never applied and it held its slot for the
+full `session_idle_ms`.
+
+**The second caveat was wrong. I claimed a cascade strands at most one session
+per node, so the cap would only bite on a client returning to a node it had
+abandoned. `ramaroja` is an haproxy front**, so two entries in a client's
+endpoint registry can be the same node under two names. A cascade can strand
+**two sessions on one node**, and no client can detect that they are the same
+node. Any cap reasoning that assumes one-strand-per-node is unsound; this one
+did.
 
 **The live numbers make this urgent rather than theoretical, and they are a
 finding about the system as it stands today, not about this change.** On es-1:
@@ -294,6 +303,34 @@ The default therefore has to clear a plausible household's transient peak by a
 wide margin, and the stranded-session case above means it must also survive a
 failover cascade returning to a node. **Operator's number to set.**
 
+**The number is 32, and the default carries its own arithmetic** (set
+2026-09-21; the cap is the node's and configurable as
+`streaming.max_sessions_per_account`). Four viewers before any standby exists;
+two per viewer steady and three transiently during a failover, so four viewers
+in disturbance is twelve; strands hold a slot for the whole of `session_idle`
+and a cascade can leave more than one on the same node. Twelve plus a
+cascade's worth of strands is what it has to clear **on the worst day**, not
+the average one. Zero disables the bound.
+
+**Strands are normal, not exceptional**, and the cap has to be chosen that way
+(web client, relayed 2026-09-21): *a client that cannot reach a node cannot
+release its session, by construction.* That is not a client defect awaiting a
+fix — it is what failover **is**. The node you are walking away from is the one
+you cannot talk to.
+
+**Where the limit and the count live.** The limit is configuration and appears
+on `GET /api/v1/playback/status`, which clients already read and cache per
+node. The count is state, and it is the most perishable number this API
+carries — it moves whenever anyone on the account starts or stops anything,
+from a device neither end can see. So the count appears **only on surfaces
+computed live at the moment of the response**: the creation payload, the
+collection listing, and the refusal. It is deliberately **absent from
+`playback/status`**, because that is the surface clients cache, and a count
+that can only arrive fresh cannot be read stale. Core asked for an age on the
+count instead; an age measured at emission is always zero, and what actually
+ages is the client's own copy, which the client knows better than this node
+does.
+
 **Publish the limit, do not make core discover it by refusal.** Core would
 rather read the cap and the current count before it plans than learn them by
 being refused at the worst possible moment. Given it, core stops preparing
@@ -349,6 +386,94 @@ the four items I expected to break are no-ops:
 
 So the client-visible cost of this change is far lower than it looked when the
 plan was written. What is left is the cap, and the sequencing below.
+
+## Security review of /api/v1/playback (2026-09-21)
+
+Asked for by the operator once the routes started moving. Every route under the
+prefix, against authentication, authorisation, input validation, information
+disclosure and resource exhaustion.
+
+### Fixed in this change
+
+**1. No ownership check on the session control routes.** `get_session`,
+`update_session` and `erase_session` looked a session up by id and acted on it
+without asking who was calling — `get_session` and `erase_session` did not even
+receive the request. Any authenticated account that learned an id could read,
+re-seek or **delete another viewer's session mid-film**, and the per-account cap
+would have meant nothing because a stranger could free your slots.
+
+Pre-existing, but latent: under one-session-per-bearer an id was only ever known
+to the client that made it. This change makes sessions plural, long-lived and
+**enumerable through a listing that hands ids out**, which turns it from latent
+into practical. All three now check ownership and answer **404, not 403** —
+whether an id exists on this node is not something one account gets to learn
+about another.
+
+**2. Ownership was silently dropped by every session replacement.** A session
+is replaced wholesale on a subtitle change, a fast-path seek and a mode change,
+each copying fields one at a time — and the new `account` field was copied by
+none of them at first. The consequence is worse than a 404 on the owner's next
+request: a replaced session **stops counting against the per-account cap**, so
+a subtitle change becomes a way to launder sessions past the limit. Caught by
+an existing test rather than by inspection. All three replacement paths now
+carry it.
+
+**3. The authentication exemption and the router disagreed about what a stream
+URL is.** The exemption matched `/stream/` anywhere after the session id while
+the router required it as the exact next segment. A path that is exempt from
+the bearer but routed somewhere other than the stream handler is an
+authentication bypass, and two spellings of "is this a stream request" is how
+that arrives. Both now call one `parse_stream_route`. The old predicate was a
+bare `starts_with` on the old top-level prefix, which was safe only because the
+stream lived at a root of its own; nested under the session it is not.
+
+**4. Idempotency keys were a global namespace.** `idempotent_creations` was
+keyed on the client-chosen key alone, so any authenticated account could occupy
+another's key and turn that account's legitimate retry into a
+`409 idempotency_conflict`. Keys are often predictable (`retry-1`). Not a
+takeover — `creation_fingerprint` includes the auth session id, so a stolen key
+conflicts rather than replaying someone else's session — but a targeted denial
+of the retry path, which is the path a client is on when something has already
+gone wrong. Now scoped per account.
+
+### Checked and clean
+
+- **Path traversal on the stream object name.** `..` is rejected, and any `/`
+  is rejected before the store lookup, so an absolute name cannot reach a
+  filesystem join. The subtitle branch parses an index rather than building a
+  path.
+- **Cross-account idempotency replay.** The fingerprint carries the auth
+  session id, so a replay attempt conflicts rather than handing over another
+  account's session id and token.
+- **Token strength.** HMAC-SHA256 under the cluster auth key, 256 bits, hex.
+- **Idempotency map growth.** Bounded by live sessions: entries are erased on
+  the creation error path and when their session is erased.
+- **Role mapping.** Everything under the prefix requires `media_viewer`
+  (`src/service.cpp:235`), including creation.
+
+### Open, not fixed, with a recommendation
+
+- **The stream token is compared with `!=` on a `std::string`**
+  (`src/playback.cpp`, `session_stream_response`), which is not constant time.
+  It is a capability, so the comparison is a secret-dependent branch. Remote
+  timing exploitation across a network against a 256-bit hex token is not a
+  practical attack, which is why this is recorded rather than rushed — but a
+  constant-time compare is two lines and removes the question.
+- **`GET /api/v1/playback/status` exposes node aggregates to any
+  `media_viewer`**: session count, transcode load, cached probe bytes, and now
+  `max_sessions_per_account`. A viewer learns how busy the node is and how many
+  sessions other people hold in total. Defensible for a household system and
+  useful to clients; flagged because it is a deliberate disclosure rather than
+  an accident, and the operator should say so rather than discover it.
+
+### A note on shape, per the operator
+
+**No new headers and no protocol extensions.** Everything added here is a field
+in the existing JSON envelope: the cap on the listing and on `playback/status`,
+the limit and count inside the existing `error` object on the refusal. Status
+codes are the standard ones — 201 with `Location`, 429 for the cap, 404 for an
+id the caller does not own, 409 for an idempotency conflict. The two
+`X-Macha-*` headers on creation predate this work and are unchanged.
 
 ## Sequencing (core drives; agreed 2026-09-21)
 

@@ -500,6 +500,44 @@ struct StreamingConfig {
     // generated fragments; active publication is in memory.
     std::optional<std::filesystem::path> temp_path;
     size_t max_sessions{8};
+    // How many playback sessions one account may hold on this node at once.
+    // Zero disables the per-account bound, leaving only max_sessions.
+    //
+    // This exists because a playback session stopped being a property of the
+    // bearer: before that, one-session-per-bearer was bounding accounts by
+    // accident, and removing it without this is how a rogue client launches a
+    // media DoS. The number has to clear a household's transient peak by a
+    // wide margin -- a coordinator-driven client holds a live session plus
+    // standbys and transiently three during a failover, two televisions, a
+    // phone and a browser is four viewers before any standby exists, and a
+    // client adopting a session through the collection listing holds two by
+    // design. It also has to survive a failover cascade returning to a node:
+    // an abandoned session cannot be deleted (the DELETE's target is the node
+    // that just failed) and holds its slot for session_idle.
+    //
+    // Deliberately generous, because the scarce resource is not this. A
+    // session is a map entry; a transcode is a core, and max_video_transcodes
+    // is 1. This bounds cheap records against a runaway client while the
+    // expensive resource stays bounded separately and per viewer.
+    // 32, arrived at rather than guessed. A household is four viewers before
+    // any standby exists -- two televisions, a phone, a browser, one account.
+    // A coordinator-driven client holds two per viewer and transiently three
+    // during a failover, so four viewers in disturbance is twelve. A stranded
+    // session holds its slot for the whole of session_idle (thirty minutes by
+    // default) because a paused viewer and an abandoned one look identical
+    // from here, and a cascade can strand more than one on the same node --
+    // an haproxy front appears in a client's registry under two names, so
+    // "one strand per node" is not true. Twelve plus a cascade's worth of
+    // strands is the number this has to clear without being felt, and it has
+    // to clear it on the worst day rather than the average one.
+    //
+    // Set too low, this does not present as a cap. It presents as seamless
+    // failover ceasing to work at the moment it fires: silent, intermittent,
+    // only under failover, and from a sofa indistinguishable from a freeze.
+    // That is the worst failure signature on this surface, so the default errs
+    // hard towards permissive and leaves the node protected by the resource
+    // that is actually scarce.
+    size_t max_sessions_per_account{32};
     size_t max_video_transcodes{1};
     size_t max_audio_transcodes{4};
     // Per transformed video. Combined with max_video_transcodes this is a

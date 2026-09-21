@@ -91,6 +91,53 @@ class PlaybackCapabilityError final : public std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+// The account cap refuses differently from every other limit here, and the
+// difference is not cosmetic. A client recovering from a refusal decides
+// whether another node is worth trying; a node-wide or transcode limit is a
+// property of this node, and an account cap is identical on every node in the
+// cluster. Core walks on the former and must not on the latter -- charging
+// every healthy node it passes turns one account at its limit into a cluster
+// core believes is failing. So this carries its own code, and the limit and
+// the current count, rather than sharing the generic resource_limit envelope.
+class AccountSessionLimitError final : public std::runtime_error {
+public:
+    AccountSessionLimitError(size_t held, size_t limit)
+        : std::runtime_error("account playback session limit reached: holding " +
+                             std::to_string(held) + " of " + std::to_string(limit) +
+                             " on this node"),
+          held_(held), limit_(limit) {}
+    size_t held() const noexcept { return held_; }
+    size_t limit() const noexcept { return limit_; }
+
+private:
+    size_t held_;
+    size_t limit_;
+};
+
+// The single parse of a stream URL, used by BOTH the router and the
+// authentication exemption. They must never disagree: a path the exemption
+// calls a stream request but the router sends somewhere else is an
+// authentication bypass, and keeping two spellings of "is this a stream
+// request" is exactly how that happens. The exemption used to be a bare
+// starts_with on the old top-level prefix, which was safe only because the
+// stream lived at a root of its own; nested under the session it is not.
+struct StreamRoute {
+    std::string_view session_id;
+    std::string_view stream_path;
+};
+
+std::optional<StreamRoute> parse_stream_route(std::string_view path) {
+    constexpr std::string_view prefix = "/api/v1/playback/sessions/";
+    if (!path.starts_with(prefix)) return std::nullopt;
+    const auto rest = path.substr(prefix.size());
+    const auto slash = rest.find('/');
+    if (slash == std::string_view::npos || slash == 0) return std::nullopt;
+    constexpr std::string_view segment = "stream/";
+    const auto tail = rest.substr(slash + 1);
+    if (!tail.starts_with(segment)) return std::nullopt;
+    return StreamRoute{rest.substr(0, slash), tail.substr(segment.size())};
+}
+
 class ResourceLimitError final : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -639,6 +686,11 @@ struct PlaybackManager::Impl {
         bool stream_served{false};
         size_t active_stream_requests{};
         std::shared_ptr<LogicalViewerSession> logical_session;
+        // The account this session is held against: what the collection
+        // listing filters on and what the per-account cap counts. Sessions
+        // stopped belonging to a bearer, so the owner has to be recorded
+        // rather than re-derived from whoever is asking.
+        std::string account;
     };
 
     FileSystem& fs;
@@ -665,6 +717,9 @@ struct PlaybackManager::Impl {
     // ownership. Weak values ensure an expired/deleted logical session leaves
     // no permanent server-side playback state.
     std::map<std::string, std::weak_ptr<LogicalViewerSession>, std::less<>> logical_sessions;
+    // In-flight creations per account, so concurrent creates cannot race past
+    // the cap. Guarded by `mutex`, emptied as each create settles.
+    std::map<std::string, size_t, std::less<>> pending_by_account;
     std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
     size_t probe_cache_bytes{};
     static constexpr size_t max_probe_cache_entries = 512;
@@ -831,7 +886,12 @@ struct PlaybackManager::Impl {
     }
 
     std::string public_stream_prefix(const Session& session) const {
-        return "/api/v1/playback/stream/" + session.id + "/" + session.token;
+        // The stream is a subresource of the session it belongs to, and the
+        // token sits immediately before the part it authorises: this session,
+        // proven by this token, this generation, this object. The token stays
+        // in the path because it is a capability, not a credential -- media
+        // players fetch segments without application headers.
+        return "/api/v1/playback/sessions/" + session.id + "/stream/" + session.token;
     }
 
     std::pair<std::string, std::string> deterministic_session_credentials(
@@ -877,6 +937,15 @@ struct PlaybackManager::Impl {
                                    std::string_view idempotency_status = {}) const {
         auto payload = session_json(session);
         payload["trace_id"] = trace;
+        // What this account may hold here and what it holds now, so a client
+        // can plan against the cap instead of discovering it by refusal at the
+        // worst moment. Counted live, under the lock, at the instant of the
+        // response: this is the most perishable number the API carries -- it
+        // moves whenever anyone on the account starts or stops anything, from
+        // a device neither end can see -- so it is deliberately absent from
+        // /api/v1/playback/status, which clients cache. A count that can only
+        // arrive fresh cannot be read stale.
+        payload["account"] = account_state_json(session.account);
         auto response = http_json(201, payload.dump());
         response.headers["Location"] = "/api/v1/playback/sessions/" + session.id;
         response.headers["X-Macha-Playback-Trace"] = std::move(trace);
@@ -897,6 +966,23 @@ struct PlaybackManager::Impl {
             else
                 ++it;
         }
+    }
+
+    // THE KEY. Everything account-scoped in this file goes through here: the
+    // cap counts it and the collection listing filters on it.
+    //
+    // Per account, not per viewer, and that is the whole point: the threat is
+    // a rogue client launching a media DoS, and a per-viewer bound is no
+    // defence at all against a client that simply claims more viewers. The
+    // cost of the choice is that it also bounds a household, which is why the
+    // default is generous -- see max_sessions_per_account.
+    //
+    // An anonymous session has no user_id, so it is bounded as itself rather
+    // than joining every other anonymous caller in one bucket.
+    static std::string account_key(const SessionIdentity& identity) {
+        if (!identity.user_id.empty())
+            return identity.user_id;
+        return "session:" + identity.id;
     }
 
     std::shared_ptr<LogicalViewerSession> logical_session_for(std::string client_key) {
@@ -1263,16 +1349,45 @@ struct PlaybackManager::Impl {
         bool audio{};
     };
 
-    void reserve_session_slot() {
+    void reserve_session_slot(std::string_view account) {
         std::lock_guard lock(mutex);
         if (sessions.size() + pending_sessions >= config.max_sessions)
             throw ResourceLimitError("playback session limit reached");
+        if (config.max_sessions_per_account) {
+            const auto held = sessions_held_by_locked(account);
+            if (held >= config.max_sessions_per_account)
+                throw AccountSessionLimitError(held, config.max_sessions_per_account);
+        }
         ++pending_sessions;
+        ++pending_by_account[std::string(account)];
     }
 
-    void release_session_slot() {
+    void release_session_slot(std::string_view account) {
         std::lock_guard lock(mutex);
         if (pending_sessions) --pending_sessions;
+        release_pending_account_locked(account);
+    }
+
+    // Live sessions plus this account's in-flight creations. Counting only
+    // live ones would let a burst of concurrent creates walk straight past the
+    // cap, which is exactly the shape a rogue client would use.
+    size_t sessions_held_by_locked(std::string_view account) const {
+        size_t held = 0;
+        for (const auto& [_, session] : sessions)
+            if (session->account == account) ++held;
+        if (auto pending = pending_by_account.find(account); pending != pending_by_account.end())
+            held += pending->second;
+        return held;
+    }
+
+    void release_pending_account_locked(std::string_view account) {
+        auto pending = pending_by_account.find(account);
+        if (pending == pending_by_account.end())
+            return;
+        if (pending->second > 1)
+            --pending->second;
+        else
+            pending_by_account.erase(pending);
     }
 
     ResourceReservation reserve_resources(Session& session, std::string_view excluding = {}) {
@@ -1594,6 +1709,7 @@ struct PlaybackManager::Impl {
         session->generation = old.generation;
         session->touched = Clock::now();
         session->logical_session = old.logical_session;
+        session->account = old.account;
         Log::info("playback[" + std::string(trace) + "] seek fast-path media=" +
                   session->source.media_id + " requested_ms=" +
                   std::to_string(requested_seek.count()) + " seek_ms=" +
@@ -1636,6 +1752,12 @@ struct PlaybackManager::Impl {
         session->stream_url = old.stream_url;
         session->subtitle_cache = old.subtitle_cache;
         session->logical_session = old.logical_session;
+        // Ownership travels with the session, not with the object. A
+        // replacement that drops it becomes unreachable to the account that
+        // made it -- 404 on its own GET, absent from its own listing -- and,
+        // worse, stops counting against the per-account cap, which turns a
+        // subtitle change into a way to launder sessions past the limit.
+        session->account = old.account;
         if (session->plan.subtitle_stream >= 0) {
             session->subtitle_url = public_stream_prefix(*session) + "/" +
                                     std::to_string(session->generation) + "/subtitle-" +
@@ -1900,17 +2022,14 @@ struct PlaybackManager::Impl {
                                });
     }
 
-    HttpResponse public_stream_response(const HttpRequest& request) {
-        constexpr std::string_view prefix = "/api/v1/playback/stream/";
-        auto rest = std::string_view(request.path).substr(prefix.size());
+    HttpResponse session_stream_response(const HttpRequest& request, std::string_view session_id,
+                                         std::string_view stream_path) {
+        auto rest = stream_path;
         auto slash1 = rest.find('/');
         if (slash1 == std::string_view::npos) return http_error(404, "not_found", "stream not found");
-        auto id = std::string(rest.substr(0, slash1));
+        auto id = std::string(session_id);
+        auto token = std::string(rest.substr(0, slash1));
         rest.remove_prefix(slash1 + 1);
-        auto slash2 = rest.find('/');
-        if (slash2 == std::string_view::npos) return http_error(404, "not_found", "stream not found");
-        auto token = std::string(rest.substr(0, slash2));
-        rest.remove_prefix(slash2 + 1);
         std::shared_ptr<Session> session;
         {
             std::lock_guard lock(mutex);
@@ -2224,6 +2343,7 @@ struct PlaybackManager::Impl {
             if (!seek_ms) return http_error(400, "bad_seek", "seek_ms must be non-negative");
         }
         auto media = media_id.empty() ? item_media(item_id) : std::vector<std::string>{media_id};
+        const auto account = account_key(*request.session);
         std::string idempotency_key;
         if (auto it = request.query.find("idempotency_key"); it != request.query.end())
             idempotency_key = it->second;
@@ -2235,14 +2355,25 @@ struct PlaybackManager::Impl {
                               "idempotency_key must be 1..256 visible ASCII characters");
 
         std::string fingerprint;
+        // Declared out here because the error path below erases by it.
+        std::string idempotency_scope;
         std::shared_ptr<IdempotentCreation> idempotent;
         bool idempotent_owner = false;
         if (!idempotency_key.empty()) {
             fingerprint = creation_fingerprint(item_id, media_id, prefs, seek_ms,
                                                request.session->id);
+            // Scoped to the account. The key is client-chosen and often
+            // predictable ("retry-1"), and the map was global: any
+            // authenticated account could occupy another's key and turn that
+            // account's legitimate retry into a 409 idempotency_conflict.
+            // Not a takeover -- the fingerprint carries the auth session id,
+            // so a stolen key conflicts rather than replaying someone else's
+            // session -- but a targeted denial of the retry path, which is
+            // the path a client is on when something has already gone wrong.
+            idempotency_scope = account + '\0' + idempotency_key;
             {
                 std::lock_guard lock(mutex);
-                auto it = idempotent_creations.find(idempotency_key);
+                auto it = idempotent_creations.find(idempotency_scope);
                 if (it != idempotent_creations.end() &&
                     it->second->fingerprint != fingerprint)
                     return http_error(409, "idempotency_conflict",
@@ -2250,7 +2381,7 @@ struct PlaybackManager::Impl {
                 if (it == idempotent_creations.end()) {
                     idempotent = std::make_shared<IdempotentCreation>();
                     idempotent->fingerprint = fingerprint;
-                    idempotent_creations.emplace(idempotency_key, idempotent);
+                    idempotent_creations.emplace(idempotency_scope, idempotent);
                     idempotent_owner = true;
                 } else {
                     idempotent = it->second;
@@ -2285,23 +2416,20 @@ struct PlaybackManager::Impl {
                 return creation_response(*existing, trace, "replayed");
             }
         }
-        auto logical_session = logical_session_for(request.session->id);
+        // A POST to a collection creates a member, every time. There is no
+        // "previous" to supersede: one bearer may hold many sessions now, and
+        // what bounds that is the per-account cap rather than a hidden slot of
+        // one. Each session is its own logical viewer, so two viewers sharing
+        // a login do not share a transcode entitlement -- the cap and the
+        // entitlement share the account key instead.
+        auto logical_session = std::make_shared<LogicalViewerSession>();
         std::unique_lock logical_operation(logical_session->operation_mutex);
-        std::shared_ptr<Session> previous;
-        {
-            std::lock_guard lock(mutex);
-            previous = session_for_logical_locked(logical_session);
-        }
-        const bool session_slot_reserved = !previous;
-        if (session_slot_reserved) reserve_session_slot();
+        reserve_session_slot(account);
         ResourceReservation resource_reservation;
         std::shared_ptr<Session> session;
         try {
             std::string deterministic_id, deterministic_token;
-            if (previous) {
-                deterministic_id = previous->id;
-                deterministic_token = previous->token;
-            } else if (idempotent) {
+            if (idempotent) {
                 auto credentials = deterministic_session_credentials(idempotency_key, fingerprint);
                 deterministic_id = std::move(credentials.first);
                 deterministic_token = std::move(credentials.second);
@@ -2309,24 +2437,17 @@ struct PlaybackManager::Impl {
             session = resolve_session(item_id, std::move(media), std::move(prefs), trace,
                                       std::move(deterministic_id), std::move(deterministic_token));
             session->logical_session = logical_session;
-            if (previous) session->generation = previous->generation;
+            session->account = account;
             if (seek_ms) session->plan.request_seek(std::chrono::milliseconds(*seek_ms));
             prepare_transformed_vod(*session, trace);
-            resource_reservation = reserve_resources(*session,
-                                                     previous ? previous->id : std::string_view{});
+            resource_reservation = reserve_resources(*session);
             start_pipeline(*session, trace);
-            if (previous) stop_pipeline(*previous);
             {
                 std::lock_guard lock(mutex);
-                if (previous) {
-                    auto current = sessions.find(previous->id);
-                    if (current == sessions.end() || current->second != previous)
-                        throw std::runtime_error(
-                            "playback logical session changed during replacement");
-                }
                 sessions[session->id] = session;
                 signal_cleanup_locked();
-                if (session_slot_reserved && pending_sessions) --pending_sessions;
+                if (pending_sessions) --pending_sessions;
+                release_pending_account_locked(account);
                 commit_resources_locked(resource_reservation);
                 resource_reservation = {};
             }
@@ -2335,7 +2456,7 @@ struct PlaybackManager::Impl {
             if (session) stop_pipeline(*session);
             if (session && (resource_reservation.video || resource_reservation.audio))
                 rollback_resources(*session, resource_reservation);
-            if (session_slot_reserved) release_session_slot();
+            release_session_slot(account);
             if (idempotent) {
                 {
                     std::lock_guard lock(idempotent->mutex);
@@ -2344,7 +2465,7 @@ struct PlaybackManager::Impl {
                 }
                 idempotent->cv.notify_all();
                 std::lock_guard lock(mutex);
-                auto it = idempotent_creations.find(idempotency_key);
+                auto it = idempotent_creations.find(idempotency_scope);
                 if (it != idempotent_creations.end() && it->second == idempotent)
                     idempotent_creations.erase(it);
             }
@@ -2371,20 +2492,75 @@ struct PlaybackManager::Impl {
                        ? " target_height=" + std::to_string(*session->plan.target_height)
                        : std::string{}) +
                   " elapsed_ms=" + std::to_string(elapsed));
-        if (previous && !previous->generation_dir.empty() &&
-            previous->generation_dir != session->generation_dir) {
-            std::error_code ec;
-            std::filesystem::remove_all(previous->generation_dir, ec);
-        }
         return creation_response(*session, trace, idempotent ? "created" : "");
     }
 
-    HttpResponse get_session(std::string_view id) {
+    // A playback session is now addressable by an id that outlives the request
+    // that made it, several may exist per account, and a listing hands the ids
+    // out. So the control routes have to check who is asking: without this,
+    // any authenticated account that learns an id can read, re-seek or DELETE
+    // another viewer's session mid-film, and the per-account cap means nothing
+    // because a stranger can free your slots. Under one-session-per-bearer the
+    // gap was masked -- an id was only ever known to the client that made it.
+    //
+    // A mismatch answers 404 rather than 403: whether an id exists on this
+    // node is not something one account gets to learn about another.
+    bool caller_owns(const Session& session, const HttpRequest& request) const {
+        return request.session && session.account == account_key(*request.session);
+    }
+
+    Json account_state_json(std::string_view account) const {
+        Json::Object out;
+        {
+            std::lock_guard lock(mutex);
+            out["sessions"] = static_cast<uint64_t>(sessions_held_by_locked(account));
+        }
+        out["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
+        return Json(std::move(out));
+    }
+
+    HttpResponse list_sessions(const HttpRequest& request) {
+        if (!request.session)
+            return http_error(401, "unauthorized", "a valid session bearer token is required");
+        // Node-local, by decision rather than omission. A playback session
+        // owns a generation directory, a transcode slot and a live pipeline on
+        // *this* node, so an id only means anything here; a client wanting the
+        // account's sessions cluster-wide asks each node it knows, and thereby
+        // learns which node each one came from. That provenance is what a
+        // client needs to probe, regenerate or release an adopted session, and
+        // per-node listing hands it over for free.
+        const auto account = account_key(*request.session);
+        Json::Array out;
+        {
+            std::lock_guard lock(mutex);
+            for (const auto& [_, session] : sessions) {
+                if (session->account != account) continue;
+                out.push_back(session_json(*session));
+            }
+        }
+        Json::Object body;
+        const auto held = out.size();
+        body["items"] = std::move(out);
+        // The cap is the node's and a client does not get a vote, but it does
+        // get to know. Stating it here means a client can plan against it --
+        // decline to prepare a standby it knows will be refused, and say "at
+        // the session limit" rather than showing a failover that merely
+        // failed -- instead of discovering it by refusal at the worst moment.
+        Json::Object account_info;
+        account_info["sessions"] = static_cast<uint64_t>(held);
+        account_info["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
+        body["account"] = std::move(account_info);
+        return http_json(200, Json(std::move(body)).dump());
+    }
+
+    HttpResponse get_session(std::string_view id, const HttpRequest& request) {
         std::shared_ptr<Session> session;
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
+            if (!caller_owns(*it->second, request))
+                return http_error(404, "not_found", "playback session not found");
             session = it->second;
             session->touched = Clock::now();
             signal_cleanup_locked();
@@ -2406,6 +2582,8 @@ struct PlaybackManager::Impl {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
+            if (!caller_owns(*it->second, request))
+                return http_error(404, "not_found", "playback session not found");
             old = it->second;
         }
         if (!old->logical_session)
@@ -2485,6 +2663,10 @@ struct PlaybackManager::Impl {
             replacement = resolve_session(old->item_id, std::move(media), prefs,
                                           trace, old->id, old->token);
             replacement->logical_session = old->logical_session;
+            // Same rule as the subtitle and seek replacements: ownership
+            // travels with the session. A mode change must not hand the
+            // caller back a session it no longer owns.
+            replacement->account = old->account;
             replacement->generation = old->generation;
             if (seek_ms) replacement->plan.request_seek(std::chrono::milliseconds(*seek_ms));
             prepare_transformed_vod(*replacement, trace);
@@ -2534,12 +2716,14 @@ struct PlaybackManager::Impl {
         return http_json(200, session_json(*replacement).dump());
     }
 
-    HttpResponse erase_session(std::string_view id) {
+    HttpResponse erase_session(std::string_view id, const HttpRequest& request) {
         std::shared_ptr<Session> session;
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
+            if (!caller_owns(*it->second, request))
+                return http_error(404, "not_found", "playback session not found");
             session = it->second;
         }
         std::unique_lock logical_operation(session->logical_session->operation_mutex);
@@ -2629,6 +2813,8 @@ struct PlaybackManager::Impl {
                          {"enabled", config.enabled},
                          {"sessions", static_cast<uint64_t>(session_count)},
                          {"max_sessions", static_cast<uint64_t>(config.max_sessions)},
+                         {"max_sessions_per_account",
+                          static_cast<uint64_t>(config.max_sessions_per_account)},
                          {"video_transcodes", static_cast<uint64_t>(video_transcodes)},
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
@@ -2773,19 +2959,32 @@ struct PlaybackManager::Impl {
 
     HttpResponse handle_api(const HttpRequest& request) {
         if (request.path == "/api/v1/playback/status" && request.method == "GET") return status();
-        if (request.path == "/api/v1/playback/sessions" && request.method == "POST") return create(request);
+        if (request.path == "/api/v1/playback/sessions") {
+            // A POST to a collection creates a member. Every time: a session
+            // is a resource, not a property of the bearer that asked for it.
+            if (request.method == "POST") return create(request);
+            if (request.method == "GET") return list_sessions(request);
+            return http_error(405, "method", "GET or POST required");
+        }
         constexpr std::string_view sessions_prefix = "/api/v1/playback/sessions/";
         if (request.path.starts_with(sessions_prefix)) {
-            auto id = std::string_view(request.path).substr(sessions_prefix.size());
-            if (id.empty() || id.find('/') != std::string_view::npos) return http_error(404, "not_found", "endpoint not found");
-            if (request.method == "GET") return get_session(id);
-            if (request.method == "PATCH") return update_session(id, request);
-            if (request.method == "DELETE") return erase_session(id);
-            return http_error(405, "method", "GET, PATCH or DELETE required");
+            auto rest = std::string_view(request.path).substr(sessions_prefix.size());
+            const auto slash = rest.find('/');
+            const auto id = rest.substr(0, slash);
+            if (id.empty()) return http_error(404, "not_found", "endpoint not found");
+            if (slash == std::string_view::npos) {
+                if (request.method == "GET") return get_session(id, request);
+                if (request.method == "PATCH") return update_session(id, request);
+                if (request.method == "DELETE") return erase_session(id, request);
+                return http_error(405, "method", "GET, PATCH or DELETE required");
+            }
+            auto stream = parse_stream_route(request.path);
+            if (!stream)
+                return http_error(404, "not_found", "endpoint not found");
+            return session_stream_response(request, stream->session_id, stream->stream_path);
         }
         if (request.path == "/api/v1/playback/media" && request.method == "GET")
             return media_facts(request);
-        if (request.path.starts_with("/api/v1/playback/stream/")) return public_stream_response(request);
         return http_error(404, "not_found", "endpoint not found");
     }
 
@@ -2989,6 +3188,7 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     // Backend, probe, buffering and temp-path changes require a service restart.
     // Policy limits and playback timing apply to subsequent sessions immediately.
     impl_->config.max_sessions = config.max_sessions;
+    impl_->config.max_sessions_per_account = config.max_sessions_per_account;
     impl_->config.max_video_transcodes = config.max_video_transcodes;
     impl_->config.max_audio_transcodes = config.max_audio_transcodes;
     impl_->config.session_idle = config.session_idle;
@@ -3033,6 +3233,28 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         return http_error(400, "bad_playback_request", e.what(), {}, axes);
     } catch (const std::out_of_range& e) {
         return http_error(404, "not_found", e.what());
+    } catch (const AccountSessionLimitError& e) {
+        // Distinct from resource_limit on purpose. A node-wide or transcode
+        // limit is this node's property and a client is right to try another;
+        // an account cap is identical on every node in the cluster, so a
+        // client that walks collects N identical refusals and charges N
+        // healthy nodes on the way through. scope=request is what says "do not
+        // walk" to a client that reads the axes rather than our error codes:
+        // every node would refuse this the same way. It is the closest honest
+        // value -- the request is not malformed, but the remedy is the
+        // caller's, not another node's. A fourth `account` scope has been
+        // proposed; it cannot ship before clients tolerate an unknown scope,
+        // or the tolerance creates the condemnation it exists to prevent.
+        Json::Object error{{"code", std::string("account_session_limit")},
+                           {"message", std::string(e.what())},
+                           {"scope", std::string("request")},
+                           {"node_healthy", true},
+                           {"alternative_may_succeed", false},
+                           {"sessions", static_cast<uint64_t>(e.held())},
+                           {"max_sessions", static_cast<uint64_t>(e.limit())}};
+        Json::Object root;
+        root["error"] = std::move(error);
+        return http_json(429, Json(std::move(root)).dump());
     } catch (const ResourceLimitError& e) {
         return http_error(429, "resource_limit", e.what());
     } catch (const PlaybackStageError& e) {
@@ -3084,7 +3306,10 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
 }
 
 bool PlaybackManager::capability_request(const HttpRequest& request) const {
-    return request.path.starts_with("/api/v1/playback/stream/");
+    // The stream subresource authorises itself with the session token in its
+    // path, so it is exempt from the bearer every other route requires. Same
+    // parse the router uses, deliberately: see parse_stream_route.
+    return parse_stream_route(request.path).has_value();
 }
 
 } // namespace macha
