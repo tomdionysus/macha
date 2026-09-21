@@ -188,6 +188,64 @@ So: 429, a distinct code (`account_session_limit`), and the refusal carries the
 limit and the caller's current count. If the three-valued `scope` field lands,
 `account` is the value this needs — core names this as its forcing case.
 
+### An abandoned session cannot be deleted, and the node keeps counting it
+
+**This is the finding that most constrains the number** (core, from a web
+client failover measured against a node killed at the socket, 2026-09-21).
+
+```
+source-failover-start
+session-stop                DELETE /api/v1/playback/sessions/{id}
+session-stop-failed         TypeError: Failed to fetch
+failed-session-close-retry  endpointId=http://10.35.1.50:7438 attempts=1
+```
+
+The session being abandoned lives on the node that just failed, so **the
+cleanup's target is the thing that failed**. Not bad luck — the defining shape
+of failover. Core retries on a ladder, gives up, and the session stays live
+from that node's point of view. One twenty-minute run left sessions on fi-1,
+es-1, gbni-1 and via ramaroja: a cascade strands one on every node it abandons.
+
+A cap that counts those refuses the create that the failover depends on, during
+an outage, which is the worst moment and the hardest case to provoke
+deliberately. It presents as "failover works in testing and fails in anger".
+
+**Two caveats that bound how bad it is, both worth stating because they change
+the mitigation.** A node that truly dies loses its sessions with it: the
+session map is in-memory, so a restart clears them. The case that actually
+strands is a node that is *alive but unreachable from that client* — a
+partition, a CGNAT path, a proxy fault — where the node is fine and still
+counting. And because the cap is per node, a cascade strands one session per
+node rather than N on one node; it exhausts a cap only when a client returns to
+a node it previously abandoned.
+
+**The live numbers make this urgent rather than theoretical, and they are a
+finding about the system as it stands today, not about this change.** On es-1:
+
+```
+max_sessions: 8             # node-wide, every account together
+max_video_transcodes: 1
+session_idle_ms: 1800000    # 30 minutes
+```
+
+`session_unused_idle` is 120 s, but that applies only to a session that never
+served an object. **An abandoned session that was playing holds its slot for
+the full 30 minutes**, because a paused viewer and an abandoned one are
+indistinguishable from the server's side — which is precisely why the 30
+minutes exists. So a node-wide budget of 8 can be consumed by stranded
+sessions, today, before this change adds standbys to the picture.
+
+**`max_sessions: 8` on es-1 needs revisiting in the same breath as the new
+cap.** This change raises consumption per viewer, so the node-wide number and
+the per-account one have to be chosen together.
+
+**The scarce resource is not the session record.** A session is a map entry; a
+transcode is a core. es-1 admits **one** video transcode. That reframes the
+cap's job: it exists to stop a rogue client minting unbounded cheap records,
+while the expensive resource is already bounded separately and per viewer. A
+cap whose job is bounding cheap records can afford to be generous — which is
+what dissolves the tension in the next section.
+
 ### The cap number has a floor, and it is not small (core, 2026-09-21)
 
 **Core holds more than one session per account by design.** `alternateSessions`
@@ -203,9 +261,38 @@ present as a cap; it would present as seamless failover mysteriously ceasing to
 work at the moment it is needed — a silent break in the feature this is all in
 service of.
 
-The default therefore has to clear the transient-failover peak for a plausible
-household by a wide margin. **Operator's number to set; the floor is 3 per
-active viewer and nothing near it is safe.**
+**Corrected the same day: 3 is one client's floor, not anyone's ceiling.** The
+phone client holds **1, transiently 2** — no standby; both warm-standby
+attempts were tried and reverted. So a cap justified as "core needs 3" must not
+be set at 3. And **adoption through the new collection listing costs budget by
+design**: a client that adopts a session while holding its own is 2, even if it
+otherwise looks like a client that holds 1. The handover feature this plan
+exists to enable is itself a consumer of the cap.
+
+**A per-account cap is a cap on a household.** From the Android TV client's
+seat: two televisions, a phone, and whoever is on the web client — four viewers
+on one account before a single standby exists, and comfortably into double
+figures during any disturbance once core's standby discipline applies to the
+coordinator-driven ones. That session reads anything under 8 as tight and would
+rather the limit were per viewer-session than per account.
+
+**The key is an open decision for the operator** (raised 2026-09-21, not
+settled). The plan already says the cap and the transcode entitlement must
+share a key; "which key" is the same question:
+
+- **Per account** is the only thing that answers the stated threat — *"a rogue
+  client cannot under any circumstances launch a media DoS"*. A per-viewer cap
+  is no defence at all, because a rogue client simply claims more viewers.
+- **Per account also caps a family**, which is the objection, and it is a real
+  one at four viewers before standbys.
+- The reframing above is what reconciles them: the cap bounds *cheap records*,
+  and the expensive resource — transcodes, one on es-1 — is bounded separately
+  and per viewer. A generous per-account cap plus the existing transcode
+  admission gives the rogue-client protection without capping the household.
+
+The default therefore has to clear a plausible household's transient peak by a
+wide margin, and the stranded-session case above means it must also survive a
+failover cascade returning to a node. **Operator's number to set.**
 
 **Publish the limit, do not make core discover it by refusal.** Core would
 rather read the cap and the current count before it plans than learn them by
@@ -234,13 +321,21 @@ is expressible only once the cap exists.
 Core checked this against its own source rather than estimating, and three of
 the four items I expected to break are no-ops:
 
-1. **Stream URLs: no-op.** Core builds none — `grep -rn "playback/stream" src`
-   finds only the barrel export. `MachaPlaybackResolver.streamUrl()` absolutises
-   whatever the server returns and never composes a path, and `hlsWalk` resolves
-   playlist-relative references against that URL, which is ordinary HLS and
-   follows the move. **This holds for every client that takes `source.url` from
-   core, which is three of the four.** The route move is mechanical to the point
-   of invisible for them.
+1. **Stream URLs: no-op, and now verified in all four repositories.** Core
+   builds none — `grep -rn "playback/stream" src` finds only the barrel export.
+   `MachaPlaybackResolver.streamUrl()` absolutises whatever the server returns
+   and never composes a path, and `hlsWalk` resolves playlist-relative
+   references against that URL, which is ordinary HLS and follows the move.
+   Every repository was then grepped for composed playback paths: web has four
+   hits, all test fixtures; phone has only relative module imports and one
+   composed URL built from core's exported `LIVENESS_PATH`; Android TV has two
+   comments and no code, Kotlin engine and scripts included. **No client builds
+   one.** The URL half of this break costs the fleet some test fixtures.
+
+   **The condition, now core's written commitment: core keeps handing back
+   absolute, server-supplied URLs.** Every downstream consumer feeds a native
+   player or a downloader rather than a `fetch`, so a relative URL would break
+   all of them at once, and silently.
 2. **Re-`POST` to reset: no-op.** `regenerate` already releases the old session
    before creating — the DELETE-then-create this plan prescribes — and
    `failover`/`prepareAlternate` create on a different node.
@@ -260,14 +355,29 @@ plan was written. What is left is the cap, and the sequencing below.
 **Core ships tolerance first, the clients take it, then the nodes move.** This
 is the standing rule in this pair of repos and it has been broken twice.
 
-1. Core releases tolerance for: `410 generation_superseded`, the cap status, and
-   adoption provenance. `410` tolerance is **still not shipped** — `0.15.0` went
-   out on the morning of 2026-09-21 without it, and
-   `playbackFailureKindForStatus` still routes `410` to `unknown`, which core
-   reads as endpoint evidence. A node moving ahead of that charges a healthy
-   node and builds a standby that cannot help.
-2. The clients take that core release. Core briefs all three and co-ordinates.
+1. **Core and the web client** release tolerance for `410
+   generation_superseded`, the cap status, and adoption provenance. Corrected
+   by the web client on 2026-09-21: *a `410` on a segment never reaches core as
+   a status.* hls.js raises it and the web client's own classifier sorts it
+   first — `500` is a hold, `404` is not-found, and everything else falls to a
+   network-degradation branch reported as `stream`, which is evidence against
+   the endpoint. Same failure mode as core's, one layer lower, and it needs its
+   own `410` branch.
+2. The clients take that release. Core briefs all three and co-ordinates.
 3. The routes move here.
+
+**Core's `410` tolerance is built on its `develop`** (2026-09-21). It maps
+`SOURCE_SUPERSEDED_STATUS = 410` to the existing `not-found` kind rather than a
+new one, deliberately: the required action is identical — the object is gone,
+the node is fine, ask the session route — and `not-found` already carries the
+obligation that an adapter must not tear the presentation down. A seventh kind
+would put that obligation behind a value existing hosts meet as `default`, so
+an un-updated host would read `410` as unhandled and condemn a healthy node,
+which is the exact failure the tolerance exists to prevent. Three tests, two
+verified red against the branch.
+
+**It is not published to npm, and that needs the operator's word.** The route
+move here is gated on the clients being on a published core that carries it.
 
 **`410 generation_superseded` should be bundled into this release.** It is
 already held pending exactly this tolerance, and a coordinated route break is
