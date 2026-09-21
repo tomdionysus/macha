@@ -305,6 +305,16 @@ and currently indistinguishable from a cache that never hits.
 Full write-up, evidence and remedy: [the block cache cannot be
 observed](2026-09-21-the-block-cache-cannot-be-observed.md).
 
+**Second and third occurrences of the fi-1 first-segment timeout, same day.**
+A client smoke test of the deployed build hit "timed out waiting for first
+fragmented-MP4 segment" from fi-1 **twice** on large scrubber seeks against a
+remux stream, both on the seek path rather than startup, both recovered (once
+unaided, via the client's own failover). That is three occurrences in one
+afternoon on the one node that owns no extents, which is what moves this from
+"a slow seek happened" to a property of the node's architecture. The cache is
+the only thing standing between a seek on fi-1 and a WAN round trip, and we
+cannot see whether it works.
+
 - [ ] **Falsify it cheaply first**, before any code: read one media file twice
   through FUSE on fi-1 and compare wall-clock. Same speed twice means the
   cache has never served, and the blast radius is every edge-node read since
@@ -2448,6 +2458,22 @@ P-1 above, in two other subsystems. They now have plans of their own —
   node-scoped path carries axes too, codes are the only complete signal**, and
   a client reading axes rather than codes gets nothing on the node-scoped
   refusal.
+  **Observed in the field 2026-09-21, hours after 0.48.0 deployed**, in a
+  smoke test of the deployed build: a mode switch to Transcode on a node whose
+  single video-transcode slot is taken answers `429 resource_limit`, the
+  refusal is shown to the viewer, the chosen mode is not applied, **and the
+  client does not walk to a node that could serve it** — though node-scoped is
+  exactly the case where walking is right. A fresh session takes the slot and
+  transcodes first time, so it is specific to the mode-switch path. Part of
+  that is a client question, but the server half is this item: the refusal
+  carries nothing that says "node-scoped, try elsewhere".
+  With `max_video_transcodes: 1` on these nodes this is not an edge case —
+  any second concurrent transcode, including a mode switch, hits it routinely.
+  Note the refusal itself is correct: `reserve_resources`
+  (`src/playback.cpp:1443-1456`) only demands a slot when the logical session
+  is not already entitled, so this is a genuine second transcode being refused,
+  not a session double-counting itself. What is wrong is how little the
+  refusal says.
   Smaller than it looks today, and the reason is worth keeping: core does not
   read the axes at all, it keys on codes
   (`ACCOUNT_SCOPED_FAILURE_CODES`, one string, `resource_limit` deliberately
