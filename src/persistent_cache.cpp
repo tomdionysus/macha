@@ -157,6 +157,7 @@ void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& stor
             lru_index_.erase(*victim);
             lru_.pop_front();
             block_count_.store(lru_.size(), std::memory_order_relaxed);
+            evictions_.fetch_add(1, std::memory_order_relaxed);
         }
 
         // LocalStore serialises physical mutations internally. Cache mode is
@@ -206,6 +207,14 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
                 lru_index_.erase(*victim);
                 lru_.pop_front();
                 block_count_.store(lru_.size(), std::memory_order_relaxed);
+                // Counted here as well as in trim_to_limit, because THIS is
+                // the eviction that happens in normal operation: put() makes
+                // its own slot inline and never calls trim_to_limit, which
+                // only runs on reconfigure. Instrumenting trim alone reported
+                // almost no evictions on a cache evicting constantly, which is
+                // worse than no counter -- it would have made a thrashing
+                // cache look calm.
+                evictions_.fetch_add(1, std::memory_order_relaxed);
             }
             (void)store->remove(*victim);
         }
@@ -245,8 +254,12 @@ std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
 
     try {
         auto data = store->get(id);
-        if (data)
+        if (data) {
+            hits_.fetch_add(1, std::memory_order_relaxed);
             mark_used(store, id);
+        } else {
+            misses_.fetch_add(1, std::memory_order_relaxed);
+        }
         return data;
     } catch (const std::exception& error) {
         Log::debug("persistent cache read: " + std::string(error.what()));
@@ -259,6 +272,10 @@ std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
             std::lock_guard lock(state_mutex_);
             current = store_ == store;
         }
+        // A read that threw is a miss like any other: the caller got nothing
+        // and will go to the network. Counting it as neither would make a
+        // cache failing every read look idle rather than broken.
+        misses_.fetch_add(1, std::memory_order_relaxed);
         if (current) {
             (void)store->remove(id);
             std::lock_guard lock(state_mutex_);
@@ -311,6 +328,13 @@ bool PersistentBlockCache::remove(const ObjectId& id) {
 
 size_t PersistentBlockCache::blocks() const {
     return block_count_.load(std::memory_order_relaxed);
+}
+
+PersistentBlockCache::Stats PersistentBlockCache::stats() const {
+    return Stats{hits_.load(std::memory_order_relaxed),
+                 misses_.load(std::memory_order_relaxed),
+                 evictions_.load(std::memory_order_relaxed),
+                 block_count_.load(std::memory_order_relaxed)};
 }
 
 std::filesystem::path PersistentBlockCache::metadata_path(const CacheConfig& config) {

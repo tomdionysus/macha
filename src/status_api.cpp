@@ -296,8 +296,34 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         telemetry_available
             ? bytes_pair(effective.storage_used, effective.storage_capacity)
             : unavailable_bytes(member ? std::optional<uint64_t>(member->capacity) : std::nullopt);
-    node["cache"] =
-        telemetry_available ? bytes_pair(effective.cache_used, effective.cache_capacity) : unavailable_bytes();
+    {
+        auto cache = telemetry_available
+                         ? bytes_pair(effective.cache_used, effective.cache_capacity).asObject()
+                         : unavailable_bytes().asObject();
+        // What the cache has DONE, beside how full it is. `used` is a function
+        // of writes alone, so a cache that has never returned a byte reports
+        // the same as one working perfectly -- which is exactly the state this
+        // cluster could not distinguish until 2026-09-21, when answering it
+        // took an hour of manual measurement against a live node.
+        //
+        // Monotonic and diffed by the consumer, which is why they are safe on
+        // this payload while an instantaneous count is not. Deliberately NOT
+        // summed into the cluster rollup: an aggregate hit rate lets two
+        // healthy storage nodes drown a storage-less edge node sitting at
+        // zero, and that node is the one the number exists to expose.
+        // From the LIVE sample only, never the persisted fallback that
+        // `effective` uses for capacity and usage. These are monotonic since
+        // the sending process started, so a durable value republished after a
+        // restart would be a count from a process that no longer exists --
+        // and a consumer diffing two reads would see it go backwards. Absent
+        // is the honest answer when there is no fresh sample.
+        if (live && !stale) {
+            cache["hits"] = static_cast<uint64_t>(live->cache_hits);
+            cache["misses"] = static_cast<uint64_t>(live->cache_misses);
+            cache["evictions"] = static_cast<uint64_t>(live->cache_evictions);
+        }
+        node["cache"] = Json(std::move(cache));
+    }
     node["storage_backends_online"] =
         telemetry_available ? Json(static_cast<uint64_t>(effective.storage_backends_online)) : Json(nullptr);
 
@@ -840,6 +866,24 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     startup["error"] = readiness.error.empty() ? Json(nullptr) : Json(readiness.error);
 
     Json::Object root;
+    // Which node produced this response. Requested by the operator via the
+    // core client session, 2026-09-21, and it is not decoration: a client
+    // configured with one address polls this and gets a cluster snapshot in
+    // which nothing says which of the nodes[] entries answered it.
+    //
+    // api_endpoint cannot serve the purpose, because it is the node's own
+    // advertised name -- which by definition differs from the address the
+    // client used in precisely the case that matters. Live on this cluster,
+    // http://10.44.1.50:7438 and https://macnessa.macha.network are both
+    // gbni-1 and a client counts them as two nodes: grouping double-counts,
+    // a failover can "move" to the machine it just left, and a node selector
+    // offers the same box twice. Core declined to guess that a LAN address
+    // and a DNS name are one machine, correctly -- guessing would merge two
+    // genuinely different nodes, which is worse than the bug.
+    //
+    // Matches the `id` in nodes[], so a client joins on it and attaches the
+    // node identity to whichever address it actually reached.
+    root["node_id"] = to_string(node_.node_id());
     root["cluster"] = std::move(cluster);
     root["startup"] = std::move(startup);
     root["nodes"] = std::move(nodes);

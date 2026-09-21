@@ -58,10 +58,24 @@ void ConsoleLogger::log(LogLevel level, const std::string& message) {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
     std::tm tm{};
-    localtime_r(&time, &tm);
+    // UTC, and it says so. This cluster spans timezones by design -- es-1 runs
+    // CEST, fi-1 EEST, gbni-1 BST -- and every cross-node correlation anyone
+    // does is a subtraction between two journals, by hand, usually during an
+    // incident. Local time with no offset makes that a skill rather than a
+    // lookup, and on 2026-09-21 it cost an hour: `18:45:44` on es-1 and
+    // `19:45:44` on a client's screen were the same instant, and only a
+    // recognisable event sequence made it cheap to spot.
+    //
+    // The operator's ruling the same day: "Macha absolutely needs to handle
+    // multiple timezones across sites. They WILL be in different timezones.
+    // We should be using hard Zulu, UTC."
+    //
+    // The API was already unambiguous -- everything on the wire is
+    // `*_unix_ms`. This is the human-readable half catching up.
+    gmtime_r(&time, &tm);
 
     std::lock_guard lock(mutex_);
-    std::cerr << std::put_time(&tm, "%F %T") << ' ' << log_level_name(level) << ' ' << message
+    std::cerr << std::put_time(&tm, "%F %TZ") << ' ' << log_level_name(level) << ' ' << message
               << '\n';
 }
 

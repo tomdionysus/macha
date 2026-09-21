@@ -32,6 +32,19 @@ class PersistentBlockCache {
     std::list<ObjectId> lru_;
     std::map<ObjectId, std::list<ObjectId>::iterator> lru_index_;
     std::atomic_size_t block_count_{};
+    // Hits, misses and evictions since this process started. Monotonic and
+    // never reset, because a consumer diffs two reads rather than reading one
+    // absolutely -- which is also what makes them safe to publish on a payload
+    // clients cache, unlike an instantaneous count.
+    //
+    // Until 2026-09-21 the only observable thing about this cache was
+    // block_count_, which is a function of writes alone: a cache that had
+    // never returned a byte reported identically to one working perfectly, on
+    // telemetry, on the status API and in the logs. Answering "is it serving
+    // anything?" took an hour of manual measurement against a live node.
+    std::atomic_uint64_t hits_{};
+    std::atomic_uint64_t misses_{};
+    std::atomic_uint64_t evictions_{};
 
     void open_locked();
     void rebuild_lru_locked();
@@ -48,6 +61,16 @@ class PersistentBlockCache {
     bool has(const ObjectId&) const;
     bool remove(const ObjectId&);
     size_t blocks() const;
+    // Cumulative since start; entries is instantaneous. A sustained zero-hit,
+    // high-eviction cache is a defect condition -- see the cache-sizing
+    // invariant in TODO/ACTIVE.md -- and nothing can notice it without these.
+    struct Stats {
+        uint64_t hits{};
+        uint64_t misses{};
+        uint64_t evictions{};
+        uint64_t entries{};
+    };
+    Stats stats() const;
     void remember_metadata(const MetadataRecord&);
     std::optional<MetadataRecord> metadata() const;
 };

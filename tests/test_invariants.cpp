@@ -790,6 +790,24 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     // node stays on the polled route.
     for (const auto* key : {"cluster", "nodes", "startup", "subsystems", "connectivity"})
         CHECK(root.find(key) != nullptr);
+    // The response says which node produced it, and the value joins to an
+    // entry in nodes[]. Without this a client configured with one address gets
+    // a cluster snapshot in which nothing identifies the node that answered,
+    // so a machine reached by two addresses -- a LAN address and a DNS name --
+    // is counted as two nodes. api_endpoint cannot serve the purpose: it is
+    // the node's own advertised name, which differs from the address the
+    // client used in exactly the case that matters.
+    REQUIRE(root.find("node_id") != nullptr);
+    const auto answering = root.find("node_id")->asString();
+    CHECK(!answering.empty());
+    {
+        const auto* listed = root.find("nodes");
+        REQUIRE(listed != nullptr);
+        bool found = false;
+        for (const auto& entry : listed->asArray())
+            if (entry.find("id") && entry.find("id")->asString() == answering) found = true;
+        CHECK(found);
+    }
     // And the expensive tree is gone from it.
     CHECK(root.find("diagnostics") == nullptr);
     REQUIRE(root.find("diagnostics_endpoint") != nullptr);
@@ -2528,6 +2546,29 @@ MACHA_TEST("invariants", test_persistent_cache_is_explicitly_ephemeral) {
     track_fsync = false;
 
     CHECK(cache.blocks() == 2);
+
+    // The cache reports what it has DONE, not only how full it is. Before
+    // 2026-09-21 `blocks()` was the entire observable surface and it is a
+    // function of writes alone, so a cache that had never returned a byte
+    // reported identically to one working perfectly -- on telemetry, on the
+    // status API and in the logs alike.
+    {
+        const auto before = cache.stats();
+        CHECK(before.entries == 2);
+        // Three puts into a two-block cache: one eviction.
+        CHECK(before.evictions == 1);
+
+        // A miss for something never stored.
+        CHECK(!cache.get(object_id(pattern(1024, 99))));
+        CHECK(cache.stats().misses == before.misses + 1);
+        CHECK(cache.stats().hits == before.hits);
+
+        // And a hit for something still resident. `c` was the last put, so it
+        // survived the eviction that took `a`.
+        REQUIRE(cache.get(object_id(c)));
+        CHECK(cache.stats().hits == before.hits + 1);
+        CHECK(cache.stats().misses == before.misses + 1);
+    }
     CHECK(fsync_calls.load(std::memory_order_relaxed) == 0);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 0);
 #else

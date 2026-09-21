@@ -129,6 +129,9 @@ enum TelemetryFieldId : uint16_t {
     field_playback_max_sessions_per_account = 32,
     field_playback_max_sessions = 33,
     field_playback_transcode_entitlement_idle_ms = 34,
+    field_cache_hits = 35,
+    field_cache_misses = 36,
+    field_cache_evictions = 37,
 };
 
 void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
@@ -209,6 +212,9 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     put_uint(body, field_playback_max_sessions, value.playback_max_sessions);
     put_uint(body, field_playback_transcode_entitlement_idle_ms,
              value.playback_transcode_entitlement_idle_ms);
+    put_uint(body, field_cache_hits, value.cache_hits);
+    put_uint(body, field_cache_misses, value.cache_misses);
+    put_uint(body, field_cache_evictions, value.cache_evictions);
 
     // The record's own length, so a reader that understood none of the above
     // still knows exactly where the next record begins.
@@ -349,6 +355,15 @@ NodeTelemetry decode(Reader& reader) {
             value.playback_transcode_entitlement_idle_ms = static_cast<uint32_t>(
                 field_uint(payload, 4, "playback_transcode_entitlement_idle_ms"));
             break;
+        case field_cache_hits:
+            value.cache_hits = field_uint(payload, 8, "cache_hits");
+            break;
+        case field_cache_misses:
+            value.cache_misses = field_uint(payload, 8, "cache_misses");
+            break;
+        case field_cache_evictions:
+            value.cache_evictions = field_uint(payload, 8, "cache_evictions");
+            break;
         default:
             // A field this build does not know. Skipped by its own length,
             // which is the entire point.
@@ -451,7 +466,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     uint32_t storage_backends_online, uint32_t peers_known, uint32_t peers_active,
     uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
     uint64_t rpc_connections_canonical, NodePhase phase, std::string api_endpoint,
-    PlaybackBudgets playback) {
+    PlaybackBudgets playback, CacheActivity cache) {
     const auto now = Clock::now();
     const auto cpu_now = std::clock();
     const auto wall_seconds = std::chrono::duration<double>(now - previous_cpu_wall_).count();
@@ -496,6 +511,9 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.playback_session_idle_ms = playback.session_idle_ms;
     telemetry.playback_max_sessions_per_account = playback.max_sessions_per_account;
     telemetry.playback_max_sessions = playback.max_sessions;
+    telemetry.cache_hits = cache.hits;
+    telemetry.cache_misses = cache.misses;
+    telemetry.cache_evictions = cache.evictions;
     telemetry.playback_transcode_entitlement_idle_ms = playback.transcode_entitlement_idle_ms;
     observe(telemetry, true);
     return telemetry;

@@ -39,6 +39,18 @@ struct NodeTelemetry {
     uint64_t storage_used{};
     uint64_t cache_capacity{};
     uint64_t cache_used{};
+    // What the block cache has actually DONE, as opposed to how full it is.
+    // Monotonic since start and diffed by a consumer rather than read
+    // absolutely, which is what makes them safe on a payload clients cache.
+    //
+    // cache_used above is a function of writes alone, so until 2026-09-21 a
+    // cache that had never returned a byte reported identically to one working
+    // perfectly. On a node with hosts_extents false the block cache is the
+    // only reason it can serve media at all, so "is it serving?" is not a
+    // curiosity there -- it is the difference between an edge node and a proxy.
+    uint64_t cache_hits{};
+    uint64_t cache_misses{};
+    uint64_t cache_evictions{};
     uint64_t metadata_generation{};
     uint64_t uptime_ms{};
     uint64_t rss_bytes{};
@@ -139,6 +151,15 @@ struct PlaybackBudgets {
     uint32_t transcode_entitlement_idle_ms{};
 };
 
+// Grouped for the same reason as PlaybackBudgets below it: refresh_local's
+// signature is already long, and three more adjacent uint64_ts is precisely
+// where a transposition is silent and survives review.
+struct CacheActivity {
+    uint64_t hits{};
+    uint64_t misses{};
+    uint64_t evictions{};
+};
+
 struct TelemetryView {
     NodeTelemetry telemetry;
     std::chrono::milliseconds age{};
@@ -176,7 +197,8 @@ class TelemetryStore {
                                 uint32_t peers_known, uint32_t peers_active,
                                 uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
                                 uint64_t rpc_connections_canonical, NodePhase phase,
-                                std::string api_endpoint, PlaybackBudgets playback = {});
+                                std::string api_endpoint, PlaybackBudgets playback = {},
+                                CacheActivity cache = {});
     void observe(NodeTelemetry, bool direct = false);
     void apply_identity_reset(const IdentityAssociationReset&);
     std::optional<NodeTelemetry> local() const;
