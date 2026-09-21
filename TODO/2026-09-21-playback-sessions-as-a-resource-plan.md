@@ -511,10 +511,11 @@ an un-updated host would read `410` as unhandled and condemn a healthy node,
 which is the exact failure the tolerance exists to prevent. Three tests, two
 verified red against the branch.
 
-**Corrected 2026-09-21 (operator): publishing is not a gate.** The clients
-test against a direct link to the package rather than a registry release, so
-the route move here is gated on the clients *consuming* a core that carries
-the tolerance — not on anything appearing on npm.
+**Corrected 2026-09-21 (operator): the core package is not a gate at all.**
+The clients link the local core working tree directly, so they already compile
+against the tolerance. Nothing here waits on a publish or on a client release.
+`410` ships and the clients test against the direct link — which is the only
+arrangement in which joint testing means anything.
 
 **`410 generation_superseded` should be bundled into this release.** It is
 already held pending exactly this tolerance, and a coordinated route break is
