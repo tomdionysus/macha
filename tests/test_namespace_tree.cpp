@@ -239,4 +239,77 @@ MACHA_TEST("namespace_tree", test_a_leaf_stays_small_however_many_extents_a_file
     CHECK(read_back.at("/huge.mkv").extents.size() == 12500);
 }
 
+MACHA_TEST("namespace_tree", test_a_corrupt_node_is_refused_rather_than_trusted) {
+    // The acceptance the plan owed Stage B, in the shape of the FUSE journal
+    // fuzz: corrupt any byte of any node and the reader must refuse it, not
+    // trust it. Nodes come from the content-addressed control store, so a
+    // corrupt or forged one is the input this decoder actually has to survive
+    // once SM14 makes it reachable from a record.
+    //
+    // A defect was found while writing this, and honesty about which found it
+    // matters: reading the decoder did, not this test. The external-extent
+    // branch read a uint64 count from the node and reserved against it, capped
+    // at 10,000,000 -- 560 MB at the 56 bytes an ExtentRef occupies, sized
+    // from an unvalidated integer. Every other reserve in that file is bounded
+    // by `reader.remaining()`; that one could not be, because the extents live
+    // in other nodes. It is now not reserved at all.
+    //
+    // This test would probably NOT have caught it. Corrupting that count makes
+    // the old code allocate half a gigabyte and carry on succeeding, which
+    // looks identical to passing. A fuzz case catches crashes, hangs and
+    // accepted garbage; it does not catch "worked, expensively". Worth knowing
+    // before anyone treats a green fuzz run as evidence that a decoder is
+    // safe against forged sizes -- for that, read every reserve and ask what
+    // bounds it.
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    entries["/a.mkv"] = make_file(1, 3);
+    entries["/b.mkv"] = make_file(2, 900);
+    for (int i = 0; i < 40; ++i)
+        entries["/dir/f" + std::to_string(i) + ".mkv"] = make_file(10 + i, 2);
+
+    MemoryNamespaceNodeStore store;
+    const auto root = build_namespace_tree(entries, store);
+    const auto clean = read_namespace_tree(root, store);
+    REQUIRE(clean.size() == entries.size());
+
+    // Every node, every byte position, one bit flipped. The reader may throw,
+    // may return something smaller, may refuse the lookup -- what it must not
+    // do is crash, hang, or size an allocation from the damaged bytes.
+    size_t nodes_tried = 0;
+    size_t refused = 0;
+    size_t survived = 0;
+    for (const auto& id : store.written()) {
+        auto body = store.get(id);
+        REQUIRE(body);
+        ++nodes_tried;
+        for (size_t at = 0; at < body->size(); at += 7) {
+            auto damaged = *body;
+            damaged[at] ^= 0x40;
+            MemoryNamespaceNodeStore broken;
+            for (const auto& other : store.written()) {
+                auto bytes = store.get(other);
+                REQUIRE(bytes);
+                // Re-store under the ORIGINAL id, so the corruption is
+                // reachable rather than simply becoming a different node that
+                // nothing points at.
+                broken.put_at(other, other == id ? damaged : *bytes);
+            }
+            try {
+                auto out = read_namespace_tree(root, broken);
+                ++survived;
+            } catch (const std::exception&) {
+                ++refused;
+            }
+            try {
+                (void)namespace_tree_lookup(root, "/a.mkv", broken);
+            } catch (const std::exception&) {
+            }
+        }
+    }
+    CHECK(nodes_tried > 0);
+    // Both outcomes are acceptable; reaching here at all is the assertion.
+    CHECK(refused + survived > 0);
+}
+
 } // namespace
