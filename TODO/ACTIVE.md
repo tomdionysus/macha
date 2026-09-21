@@ -2454,6 +2454,20 @@ P-1 above, in two other subsystems. They now have plans of their own —
 
 ## P2 — Code health and error-handling consistency (found 2026-09-05)
 
+- [ ] **Node-wide `max_sessions` is not on the wire, while
+  `max_sessions_per_account` is** (Android TV session, measured against the
+  live cluster 2026-09-21, verified here against source). The per-node
+  `playback` block of `GET /api/v1/status` carries five fields —
+  `startup_timeout_ms`, `segment_timeout_ms`, `pipeline_idle_ms`,
+  `session_idle_ms`, `max_sessions_per_account` (`src/status_api.cpp:362-380`,
+  `src/telemetry.hpp:94-113`). The node-wide cap is absent. **0.48.0 added
+  three of the four and missed this one**, which is how the asymmetry got in.
+  Put it on the same telemetry block. It is additive under TEL3 and costs
+  nothing.
+  The client consequence, in that session's words: a client that wants to tell
+  a viewer *"another screen on this account is playing"* versus *"this node is
+  full"* can state the per-account number and cannot state the other.
+
 - [ ] **The node-scoped session refusal carries no failure axes, while the
   account-scoped one does** (found by the web client session via core,
   2026-09-21, verified against source). `ResourceLimitError` answers
@@ -2490,6 +2504,16 @@ P-1 above, in two other subsystems. They now have plans of their own —
   `alternative_may_succeed` — `false` and `true` — on the same `scope:
   request` and `node_healthy: true`. Both are correct; the pair misleads
   anyone reading the axes as a set.
+
+  **Taken together with the missing `max_sessions` above, the asymmetry runs
+  the wrong way round.** The *account*-scoped refusal — where walking the
+  cluster is pointless, because every node answers identically — carries full
+  axes, states its limit and its live count in the refusal, and publishes its
+  limit for every node on `/api/v1/status`. The *node*-scoped refusal — the
+  one case where walking is exactly right — carries no axes at all and its
+  limit appears nowhere on the wire. A client is best equipped in the case it
+  can do nothing about, and worst equipped in the case it could act on. Fixing
+  either half alone leaves that backwards; they want doing together.
 
 Not urgent, but real debt worth chipping away at opportunistically. No design
 work needed for any of these.
