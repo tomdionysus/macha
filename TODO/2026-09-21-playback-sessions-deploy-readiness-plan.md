@@ -106,8 +106,8 @@ Everything here is in-tree, needs no one else, and can be done today.
 
 ## Phase B: the client side (core drives; this repository waits)
 
-None of this is the server session's to do. It is listed so the gate is
-visible and so the brief goes out with the right content.
+None of this is the server session's to do. Core is briefing Android TV and
+mobile (confirmed 2026-09-21) and drives the sequence.
 
 - [ ] **Brief the four client sessions** from the rewritten
   `docs/streaming.md`, before anything is published. The brief must name:
@@ -118,26 +118,54 @@ visible and so the brief goes out with the right content.
   every node's cap limit is on `/api/v1/status`; `410` if decision 1 is yes;
   and the expected A85 "plays, no sound" on Direct Play, which predates all
   of this.
-- [ ] **The clients are consuming a core that carries the `410` tolerance.**
-  **Not a registry release — the clients test against a direct link to the
-  package** (operator, 2026-09-21). Do not treat "not on npm" as a gate, do
-  not wait on a publish, and do not quote registry versions as evidence of
-  anything: the only question is whether each client is on a core with the
-  tolerance in it.
+- [x] **Core tolerance — NOT A GATE, and never was.** The clients link the
+  local core working tree directly (`file:../macha-ts`), so they compile
+  against the tolerance the moment it is in that tree, which core confirms it
+  is. There is no publish, no version pin and no client release to wait for;
+  that direct link is what makes joint testing possible at all. `410` goes
+  out and the clients test against it. This entry is kept, ticked, only
+  because two earlier drafts of this plan wrote it as a blocker in two
+  different wordings and both were wrong.
 - [ ] **The web client builds a bundle against that core** with its own
   `410` branch in the segment classifier (the plan records that hls.js
   raises the status one layer below core).
-- [ ] **Android TV and mobile take the release.** Both need at least the
-  route change; the cap semantics matter most to Android TV (the household
-  objection came from there).
+- [x] **Android TV: nothing owed.** Core, 2026-09-21: the route change costs
+  it nothing (`playback/stream` appears nowhere in its `src`; it takes
+  `stream.url` off the session), and `ExoPlayerAdapter.ts:68` feeds the media3
+  `httpStatus` straight into core's `playbackFailureKindForStatus`, so `410`
+  arrives classified on its next build with no client change.
+- [ ] **Mobile cannot classify a fragment status at all, and this release
+  does not cause that.** Core reports macha-client-rn has no
+  `playbackFailureKindForStatus` and no httpStatus plumbing at the player
+  layer; playback errors arrive through expo-video's `statusChange` as
+  `{status, error}` with a message string and no code. Its only status logic
+  is session creation (`policy.ts:125`). So a superseded generation reaches
+  mobile opaque — but it reaches it opaque **today**, as a `404`, for the same
+  reason. **Asked of core 2026-09-21 and unanswered at the time of writing:**
+  whether `410` behaves any differently from `404` down that path, which is
+  the difference between a pre-existing gap to file and a regression that
+  should hold `410` back to `404` for this release. Client work either way,
+  not the server's.
 
 ## Phase C: cluster preparation (can overlap Phase B)
 
-- [ ] **Web bundle to `/etc/macha/web` on all three nodes.** All three
-  serve `index-BGrNH6KR.js` today. Not the server session's to deploy, but
-  it is the first line of the deploy checklist and the cutover does not
-  start without it. Verify with a fetch of `index.html` on each node and a
-  grep of the referenced bundle for the `410` handling.
+- [ ] **Web bundle to `/etc/macha/web` on all three nodes.** This one is
+  real, and it is the one place where a *built artefact* lags the linked
+  source tree — do not confuse it with the core package above, which is not
+  a gate. Core's account, 2026-09-21:
+  - The deployed `index-BGrNH6KR.js` is the 0.17.2 bundle and has no `410`
+    handling.
+  - The hls.js-level branch exists on macha-client `develop` only
+    (`WebHlsPolicy.ts`, commit `2a0b95f`). It is **not** on `main`, so the
+    released 0.17.3 bundle does not have it either.
+  - Exactly one tolerant artefact exists: `dist/assets/index-NDVfpduh.js`,
+    624,128 bytes, built 2026-09-21 12:12 from develop against the linked
+    core. `dist/` is gitignored, so it is in no commit and no tag — a local
+    file on one machine. It is also already behind core by five commits,
+    including the 30 s to 10 s floor change, so its hash will move again.
+  - Therefore a **fresh build from develop against current core** is what
+    should reach the nodes, not that artefact. Owner to be confirmed with
+    core; **not the server session's to build or deploy.**
 - [ ] **Config on all three nodes** per decision 2: `max_sessions` raised,
   `max_sessions_per_account` written explicitly rather than left to the
   default, so the two numbers sit together in the file. Back up each as

@@ -264,11 +264,6 @@ three live nodes run 8.
   generation stops being exotic — every regenerate, mode switch and rebuilding
   seek makes one — so the deployed bundle would turn a routine event into
   evidence against a healthy node. **Not the server session's to deploy.**
-- [ ] **The clients on a `@machafoundation/core` carrying the `410`
-  tolerance.** The nodes emit `410` from this release, so this gate is
-  load-bearing rather than precautionary. **It is not a publishing gate:** the
-  clients test against a direct link to the package, not a registry release
-  (operator, 2026-09-21).
 - [ ] Build once on es-1, ship the tarball, all three nodes together. The
   telemetry format is TEL3 with no compatibility, so a node left behind is
   excluded from gossip rather than misreading it — which is the intended
