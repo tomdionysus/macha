@@ -364,6 +364,21 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_segment_timeout_ms)
             playback["segment_timeout_ms"] =
                 static_cast<uint64_t>(live->playback_segment_timeout_ms);
+        if (live->playback_pipeline_idle_ms)
+            playback["pipeline_idle_ms"] =
+                static_cast<uint64_t>(live->playback_pipeline_idle_ms);
+        if (live->playback_session_idle_ms)
+            playback["session_idle_ms"] =
+                static_cast<uint64_t>(live->playback_session_idle_ms);
+        // The limit only; the current count is deliberately not here. This
+        // payload is cached by its consumers, and the count is the most
+        // perishable number the API carries -- it moves whenever anyone on the
+        // account starts or stops anything, from a device neither end can see.
+        // It appears only where it is computed live: the creation payload, the
+        // collection listing, and the refusal.
+        if (live->playback_max_sessions_per_account)
+            playback["max_sessions_per_account"] =
+                static_cast<uint64_t>(live->playback_max_sessions_per_account);
     }
     node["playback"] = std::move(playback);
     node["identity_association_reset"] =
