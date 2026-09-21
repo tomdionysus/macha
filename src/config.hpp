@@ -499,7 +499,20 @@ struct StreamingConfig {
     // libav is linked into Macha. temp_path is only an overflow store for old
     // generated fragments; active publication is in memory.
     std::optional<std::filesystem::path> temp_path;
-    size_t max_sessions{8};
+    // Node-wide, every account together. **This must stay above
+    // max_sessions_per_account below**, or that cap can never be reached:
+    // reserve_session_slot checks node-wide first, four lines earlier, so the
+    // node limit refuses every time and the account cap becomes dead code --
+    // and the two refusals mean opposite things to a client, so losing the
+    // account one costs the distinction rather than just a number.
+    //
+    // It was 8 against a per-account 32 until 2026-09-21, which was exactly
+    // that contradiction shipped as the default. Three separate client
+    // sessions found it independently on the day 0.48.0 went out. These are
+    // values an operator configures; the defaults exist so that a node with no
+    // yaml is coherent, and they now match macha.yaml.example rather than
+    // contradicting it.
+    size_t max_sessions{64};
     // How many playback sessions one account may hold on this node at once.
     // Zero disables the per-account bound, leaving only max_sessions.
     //
