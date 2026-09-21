@@ -1,7 +1,7 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-20 evening, after the 0.47.0 deploy (rationalised
-against 0.43.0-0.47.0 and the live cluster)
+Last updated: 2026-09-21 late evening, after 0.48.0, 0.48.1 and 0.48.2 all
+shipped and deployed the same day.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -9,19 +9,34 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.** Read, in order:
 
-**The playback-session resource work is what is being built right now**
-(operator, 2026-09-21). It sits at the top because it is active, agreed and
-breaking: it is the section immediately below this preamble. The two P-1
-sections come next — they are invariants and structural properties rather than
-defects in features, and everything under P0 is worth doing without changing
-either.
+**What is being built right now is the namespace Merkle work, Stage B**
+(operator, 2026-09-21 evening). The playback-session programme that occupied
+most of 2026-09-21 is **shipped and deployed** — 0.48.0 moved the routes,
+0.48.1 fixed what testing it found, and 0.48.2 added what a node could not
+previously say about itself. All three nodes run 0.48.2.
 
-0. **The playback-session resource work**, immediately below. Agreed with the
-   operator on 2026-09-21 and specified in
-   [its own plan](2026-09-21-playback-sessions-as-a-resource-plan.md).
-1. **The two P-1 sections after it.** The cache invariant is new on
-   2026-09-20 and generalises a failure that has now cost this project twice;
-   the namespace scale target is the long-running structural one.
+**Read this before trusting anything below about a client.** Four client
+sessions spent the afternoon testing 0.48.0 against the live cluster and
+reported sixteen findings. Six were real and are recorded; the rest were
+retracted, several of them client self-diagnoses that did not survive
+measurement. The headline — that the server could not copy (E-)AC-3 into
+fragmented MP4, which three clients independently concluded — **was wrong**,
+and is archived in `COMPLETED.md` with the instrumented reproduction that
+killed it: 48 ms to first fragment, and a browser that would not open a
+SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
+for it died the same way. **A client's account of itself is evidence about the
+client, not a fact.**
+
+0. **The namespace Merkle work**, the P-1 below, Stage B. The substrate is
+   built, measured against the live head, and owes only the SM14 record shape
+   and `decode_snapshot` dispatch. See
+   [the plan](2026-09-17-namespace-merkle-root-plan.md), which now carries the
+   arithmetic for whether it is worth doing at all: **56 ms of CPU per
+   namespace write today, ~3.1 s at the 100 TB target.** Not urgent today,
+   painful at 10x, inoperable at target.
+1. **The other P-1, the cache-sizing invariant.** Still open, and note that
+   the block-cache item under it was falsified and downgraded on 2026-09-21 —
+   the cache works, it just could not be observed, and now can be.
 2. **The metadata-stall P0.** Its read-only blink was root-caused and fixed on
    2026-09-21 (a hung health probe was given the whole liveness budget); the
    stall that provokes it is still unexplained, and making an ingest survive a
