@@ -1,5 +1,77 @@
 # Current release
 
+## 0.48.1 — What testing 0.48.0 found (development)
+
+Every item here is a defect in 0.48.0 that its own testing exposed, found in
+one afternoon of four client sessions exercising the new routes against the
+live cluster. 0.48.0 itself is unchanged and stays as released.
+
+
+**A transcode entitlement is released after five minutes with no stream
+activity, instead of being held until the session is erased.** This one
+predates 0.48.0 and was merely found by testing it: the entitlement outlived
+its own pipeline by `session_idle_ms` — thirty minutes against sixty
+seconds — so on a node where `max_video_transcodes` is 1, one client that
+crashed, was force-stopped or was reaped in the background closed that node to
+transcoding for everybody for half an hour. Measured on fi-1 on 2026-09-21: 57
+session creates, zero deletes, and three separate client sessions refused a
+transcode by a node nobody was competing for.
+
+The new `streaming.transcode_entitlement_idle_ms` is clamped into
+`[pipeline_idle, session_idle]` rather than merely read. Below the floor it
+would fire the instant the engine went; at or above the ceiling the session
+outlives it and it never fires at all.
+
+**It is keyed on stream activity, not on control traffic, and that is the
+contract clients need.** Polling a session keeps the session alive and is
+deliberately not evidence that anyone still wants media, which is the question
+the entitlement answers. So: **to hold a transcode slot across a pause, ask for
+a stream object inside the window — fetching the playlist is enough and costs
+no media bytes.** A viewer paused for longer loses the entitlement and
+reacquires it on resume, where it may be refused. The session itself is
+untouched: id, position, plan and capability all survive to `session_idle_ms`.
+A long pause risks the slot, not the place.
+
+The trade is deliberate and was taken on the operator's decision: a possible
+refusal after a long pause, instead of a certain half-hour outage after any
+unclean exit. A refusal at resume is visible, attributable and recoverable;
+that outage was none of those.
+
+**`resource_limit` carries failure axes at last, and they differ by path.** It
+carried none at all, which left the one refusal a client can act on as the one
+saying least — the account cap beside it states scope, health and its own
+limit. On **create** it is now `scope: node`: no session exists yet, so trying
+another node costs nothing and is right. On **update** it is `scope: request`,
+because the session already exists here and is still serving its current
+generation — walking would mean abandoning something that works to rebuild it
+elsewhere, and a client cannot take a session with it. Both carry
+`node_healthy: true` and `alternative_may_succeed: true`; on the update path
+the alternative is a different instruction against this same node, a remux
+instead of a transcode or a lower height.
+
+**Two more fields reach the per-node `playback` block of
+`GET /api/v1/status`.** `transcode_entitlement_idle_ms`, so a client can time
+its keep-alive against the node it is actually on rather than a hardcoded
+guess. And `max_sessions`, the node-wide cap — 0.48.0 published the per-account
+half and not this one, which left a client able to say "another screen on this
+account is playing" and unable to say "this node is full". Both are additive
+under TEL3 and an older node simply omits them.
+
+**The compiled default for `max_sessions` moves 8 to 64**, so it stops
+contradicting `max_sessions_per_account` at 32. The two caps are enforced four
+lines apart in `reserve_session_slot`, node-wide first, so a per-account cap
+above the node-wide one can never fire and `account_session_limit` was dead
+code on any node running bare defaults. Three separate client sessions found
+that independently on the day 0.48.0 shipped. These are values an operator
+configures; the defaults now match `macha.yaml.example` rather than
+contradicting it.
+
+**Keep `max_sessions` above `max_sessions_per_account` on every node.**
+Otherwise the node-wide limit refuses first and the distinction between the two
+429s — which mean opposite things to a client — is lost in the one case it
+exists for.
+
+
 ## 0.48.0 — A playback session is a resource (development)
 
 **This release breaks the client contract on purpose, and there is no
