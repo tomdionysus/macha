@@ -494,9 +494,14 @@ really does mean zero bytes moved, and that part is still open.
 
 - [x] Root-cause the read-only blink. Done 2026-09-21: a hung health probe was
   given the whole liveness budget, so it expired the peer it was proving alive.
-- [ ] **Regression test for the probe budget.** The fix went in without one:
-  the stall fixture holds a message type, and a hung `ping` inside
-  `health_loop` needs a different hook. Owed before this item closes.
+- [x] Regression test for the probe budget. Done 2026-09-21:
+  `rpc_cluster/test_a_hung_health_probe_is_retried_inside_the_liveness_budget`.
+  The stall fixture *does* reach the probe — `call_async_known` consults it
+  (`src/net.cpp:2231-2235`) and `health_loop` dials through that path — so
+  holding `MessageType::ping` hangs the probe exactly as the field did, and
+  `stalled_calls_for_tests()` counts the attempts. Three attempts inside one
+  liveness window with the fix, one without: verified failing against
+  `401cd04^`.
 - [ ] **The stall itself is still unexplained.** Establish why an exchange
   moves zero bytes for tens of seconds on a link measured at 13.8 MB/s with 0%
   loss. It is now a latency question, not an availability one: the blink is
