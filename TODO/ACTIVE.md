@@ -140,7 +140,12 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
-## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, IN PROGRESS)
+## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, BUILT AND GREEN, NOT DEPLOYED)
+
+**Server side is complete and committed on `develop`; nothing is deployed.**
+The cutover is all three nodes at once, on the operator's word (2026-09-21),
+and it is gated on a current web bundle reaching `/etc/macha/web` — see the
+deploy checklist at the end of this section.
 
 **This is the active work.** Agreed with the operator on 2026-09-21. Full
 specification: [playback sessions as a
@@ -200,6 +205,48 @@ GET    /api/v1/playback/sessions/{id}/stream/{token}/direct
 **Supersedes** item 2 of the seamless-handover P0 below, which said a
 *client-supplied* session key should go in the route as a *query parameter*.
 That was wrong on both counts and is corrected there.
+
+### What is built, and where
+
+- Routes, collection `GET`, stream as a subresource: `src/playback.cpp`.
+- Per-account cap, `streaming.max_sessions_per_account`, default **32** with
+  its arithmetic in the config comment (`src/config.hpp`). Refuses `429` with
+  code `account_session_limit`, `scope: request`, `node_healthy: true`, and
+  the limit and count stated.
+- The cap **limit** also rides `NodeTelemetry` into the per-node `playback`
+  block of `GET /api/v1/status`, so a client learns it about every node it
+  might fail over to — not only the one it asked. The **count** is deliberately
+  absent from that payload, which consumers cache; it appears only where it is
+  computed live (creation, listing, refusal).
+- `pipeline_idle_ms` and `session_idle_ms` ride the same block, so clients stop
+  holding private copies of this node's configuration.
+- Security review of the whole prefix, four fixes, two findings left open with
+  a recommendation. See the plan.
+
+Commits: `9408794` (routes, cap, security), `b821808` (telemetry format),
+`4d8312e` (codec). Full suite green on es-1 at 483 cases.
+
+### Deploy checklist — none of this is done
+
+- [ ] **A current web bundle to `/etc/macha/web` on all three nodes, first or
+  with the cutover.** The nodes serve `index-BGrNH6KR.js`, which core reports
+  contains no `410` at all in 614,717 bytes. Under this change a superseded
+  generation stops being exotic — every regenerate, mode switch and rebuilding
+  seek makes one — so the deployed bundle would turn a routine event into
+  evidence against a healthy node. **Not the server session's to deploy.**
+- [ ] Build once on es-1, ship the tarball, all three nodes together. The
+  telemetry format is TEL3 with no compatibility, so a node left behind is
+  excluded from gossip rather than misreading it — which is the intended
+  behaviour, and the reason the cutover is not rolling.
+- [ ] Decide `max_sessions` node-wide alongside the new per-account cap: es-1
+  currently runs 8 for every account together, and this change raises
+  consumption per viewer.
+- [ ] Joint test with the clients afterwards, co-ordinated by core. One thing
+  worth getting: a mode switch on a moved node, watched from a client, to make
+  a real `410 generation_superseded` and see it classified. No amount of
+  reading produces that observation.
+- [ ] Expect "plays, no sound" on the A85 Direct Play — it has no AC-3 or
+  E-AC-3 decoder while claiming both, and it predates all of this.
 
 ## P-1 — A cache must never be smaller than its own working set (opened 2026-09-20)
 

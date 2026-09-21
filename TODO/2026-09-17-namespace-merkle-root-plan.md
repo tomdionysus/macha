@@ -367,6 +367,59 @@ single snapshot exhausts the historical-materialisation budget is at roughly
 4.6 TiB -- close enough to es-1's present 1.6 TiB that it is a near-term event,
 not a target-scale one.
 
+## The ownership boundary, and why demand-loading only pays if it moves (2026-09-21)
+
+**We pay for the namespace bytes twice, and the second payment is avoidable.**
+Raised by the operator on 2026-09-21 while reviewing an unrelated codec change;
+the numbers below are Stage A's, not new measurements.
+
+`MetadataRecord::payload` is a `SharedBytes` (`src/metadata.hpp:134-160`) — a
+`shared_ptr<const Bytes>` over immutable backing storage, existing precisely so
+that copying a record does not duplicate "hundreds of megabytes on large media
+namespaces". Then `MetadataManager` holds `cache_`, the record with its payload,
+**and** `decoded_cache_`, the fully-owned snapshot, at the same time
+(`src/metadata_manager.cpp:224-229`).
+
+Stage A measured what that costs: at 1.618 TiB of library one materialisation
+is **47 MB — 26 MB decoded plus a 21 MB encoded payload resident alongside
+it**, 97% of it extent references. The decoded form owns copies of bytes that
+are already resident, already refcounted and already immutable three fields
+away in the same object.
+
+**The boundary is drawn in the wrong place.** Today it is "bytes in, owned
+objects out". But a metadata record is immutable and content-addressed — its
+identity *is* the SHA-256 over those exact bytes — so the bytes are the
+authoritative resident form. The natural boundary is **"a record owns its
+bytes; a decoded view is a projection over them"**, with lifetime held by the
+existing `SharedBytes` refcount rather than by copying. The anchor this needs
+is already built and already in the struct.
+
+**This is why it belongs to Stage D rather than beside it.** Stage D is
+"demand-loaded extent nodes on the `RetainedMemoryLedger`". Demand-loading only
+pays if the loaded form *projects over* retained bytes; if it still copies out
+of them, the ledger bounds a number that was double what it needed to be. The
+two are the same work from opposite ends, and both want the same flag day.
+
+What makes it genuinely hard, recorded so it is not underestimated:
+
+- **`entries` is a `std::map<std::string, FsEntry>`.** Keys as views need a
+  transparent comparator, but the real difficulty is that not every entry comes
+  from a payload: every mutation builds new ones, so a snapshot becomes a
+  mixture of borrowed and owned keys and something has to own that distinction.
+- **`mutate_delta` rebases.** A view over payload *N* must survive becoming
+  payload *N+1*, or be rebuilt — and rebuilding per commit is the cost this
+  plan exists to remove.
+- **The keepalive becomes load-bearing.** The payload is retained incidentally
+  today. Under borrowing it is retained *because something points into it*, so
+  a stale snapshot pins a superseded payload. That is exactly the shape of the
+  P-1 cache invariant: a bound that silently holds more than whoever sized it
+  believed. It must be counted against the ledger, not exempt from it.
+
+- [ ] Stage D carries this explicitly: decoded structures project over the
+  retained payload rather than copying out of it, with the `SharedBytes`
+  refcount as the lifetime anchor and the retained payload counted against
+  `RetainedMemoryLedger` rather than held outside it.
+
 ## Stages
 
 **Stage A — establish the real numbers. DONE 2026-09-17. See "Stage A results".**
