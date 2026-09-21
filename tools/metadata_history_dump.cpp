@@ -23,6 +23,7 @@
 #include "namespace_tree.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 #include <fstream>
 #include <functional>
@@ -307,6 +308,34 @@ int main(int argc, char** argv) {
                   << (full - entry_bytes - garbage_bytes - conflict_bytes - node_status_bytes)
                   << '\n';
         if (tree) {
+            // What one namespace write costs TODAY, which is the measurement
+            // the plan says every urgency argument rests on. `mutate_impl`
+            // re-encodes the whole snapshot and re-hashes the result on every
+            // commit, because the record payload IS the namespace and its
+            // identity is a hash over those bytes. Timed here on the real head
+            // rather than estimated.
+            //
+            // This is CPU only. It excludes the decode on the way in, the
+            // element-wise entries comparison, and the replication of the
+            // result to peers -- so it is a floor on the real cost, not the
+            // whole of it.
+            {
+                const auto encode_started = std::chrono::steady_clock::now();
+                const auto payload = encode_snapshot(snapshot);
+                const auto encoded_at = std::chrono::steady_clock::now();
+                const auto digest = sha256(payload);
+                const auto hashed_at = std::chrono::steady_clock::now();
+                (void)digest;
+                const auto ms = [](auto from, auto to) {
+                    return std::chrono::duration<double, std::milli>(to - from).count();
+                };
+                std::cout << "  commit cost today: encode="
+                          << ms(encode_started, encoded_at) << "ms hash="
+                          << ms(encoded_at, hashed_at) << "ms total="
+                          << ms(encode_started, hashed_at) << "ms over "
+                          << payload.size() << " bytes, per namespace write\n";
+            }
+
             // Stage B of the Merkle plan, measured against a real namespace
             // rather than a generated one. Everything here is offline and
             // read-only: the tree is built in memory from the head that
