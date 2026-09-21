@@ -334,11 +334,19 @@ libav up on fi-1, the web client created a session, abandoned it without a
 `DELETE` (fetch and sendBeacon neutered, tab closed — a genuine orphan), then
 created again for the same media on the same node. **The second create
 succeeded in 0 ms**, so nothing reproduced. But that client then never
-exercised the read path at all — its own `currentSrc` fallback bug pointed the
-element at the node's raw URL instead of its read-ahead proxy, so a
-moov-at-the-end MP4 never started. The node recorded both sessions as
-`reclaimed without ever being streamed`. So the run neither reproduces nor
-clears this.
+exercised the read path at all: the node recorded both sessions as `reclaimed
+without ever being streamed`, which is the short 120 s clock that only ever
+applies to a session that has served no stream object of any kind. So the run
+neither reproduces nor clears this.
+
+*(That client first attributed its own stall to a `currentSrc` fallback
+pointing at the raw node URL, and this file recorded it. It then retracted
+that — it had grepped for the wrong path segment and the element **is** on its
+proxy. Its actual fault is its Service Worker never answering an open-ended
+`Range: bytes=0-`, which is exactly a media element's first request; a bounded
+range returns 206 in 244 ms. Theirs to fix. Recorded as a caution: a client's
+self-diagnosis is evidence about the client, not a finding, until it is
+measured.)*
 
 - [ ] Reproduce with a client that can complete a read. The shape is: play,
   abandon without DELETE, immediately re-create for the same media on the same
@@ -355,11 +363,40 @@ clears this.
 segment" to anything without first checking the node for a live session on the
 same media.**
 
-## HANDED OFF — No client sends DELETE (to core as a P0, 2026-09-21)
+## HANDED OFF AND FIXED — DELETEs were being swallowed inside core (2026-09-21)
 
-**Not this repository's to fix, recorded so nobody re-measures it.** Handed to
-the `@machafoundation/core` session as a P0 on the operator's instruction,
-2026-09-21, with the evidence and the server-side contract.
+**Cause found and fixed the same evening, and it was one bug in core rather
+than four clients each failing to clean up.** `ClusterPlaybackResolver.stop()`
+looked the session id up in an in-process map and **returned silently when the
+entry was missing** — no request, no log, a resolved promise. Every client's
+cleanup was being thrown away one layer below it. Core `61e4d74`, 1000/1000.
+
+It was the ordinary case rather than an edge: the map is in-process, so nothing
+survives a reload, a relaunch or a crash, and a failover or a move replaces the
+entry. It was also caching something the id already states, since core mints
+`${endpoint.id}::${nodeSessionId}`, so `stop()` now recovers the node from the
+id and issues the DELETE.
+
+**Correction to what this file said before.** It recorded "every client, by a
+different route", which was wrong and is exactly the hazard of writing down a
+client's self-diagnosis as a finding. The web client's UI stops **were** real
+and were being discarded downstream — it said so at the time ("if those stops
+are not expiring sessions on the node that is a finding in itself") and it was
+right. The 24 creates with zero expiries on fi-1 were its sessions, and it had
+been blaming its own teardown for them.
+
+**What it does not fix, so the server's half stays justified:** a client that
+never calls stop at all, a reinstall, cleared storage, a crash before an id was
+persisted, or any client that is not ours. The `transcode_entitlement_idle`
+release and the node's own timers remain the backstop for those and should not
+be weakened on the strength of this.
+
+- [ ] **Verify from this side once live runs resume**: `DELETE` requests should
+  start appearing on the nodes, and creates should stop outrunning expiries.
+  Nothing has been confirmed in the field — the fix was handed to the clients
+  with instructions to run suites only, no device and no live-cluster runs.
+
+Original handoff, with the evidence that produced it:
 
 Measured on fi-1, not inferred: **24 session creates in three hours and zero
 expiries**; **zero `DELETE` requests to `/api/v1/playback/sessions/{id}` in the
