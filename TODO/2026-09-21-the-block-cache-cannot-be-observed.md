@@ -121,9 +121,9 @@ consulted successfully.
    The materialisation cache already has exactly these and they are what made
    the 2026-09-20 rejoin failure diagnosable at all. Mirror them. This is the
    whole fix for the observability gap and everything below depends on it.
-2. **Surface them where an operator will meet them**, not only in a
-   diagnostics blob. `cache_used` beside a hit rate is honest; `cache_used`
-   alone is misleading, because it looks like health.
+2. **The Status API must carry the counts, per node.** See the section below;
+   this is half the fix, not a follow-up. `cache_used` beside a hit rate is
+   honest; `cache_used` alone is misleading, because it looks like health.
 3. **Make a sustained zero-hit, high-eviction cache a reportable condition**,
    per the standing P-1's first bullet. A 100%-full cache with a 0% hit rate
    is a defect state and should say so in `cluster.conditions`.
@@ -135,6 +135,60 @@ consulted successfully.
    `read_ahead` and `current_file` engines and logged **nothing** in 40
    minutes, which is either silence by design or a second dead mechanism. With
    sizing ruled out, prefetch is the remaining lever on WAN latency.
+
+## The counters must reach `GET /api/v1/status`, for every node
+
+Counters that exist only inside the process repeat the mistake in a smaller
+room. The numbers have to arrive where an operator already looks, which is the
+Status API, and they have to arrive **about every node rather than only the
+one answering**.
+
+**Where.** `src/status_api.cpp:299` builds the per-node block today:
+
+```cpp
+node["cache"] = bytes_pair(effective.cache_used, effective.cache_capacity);
+```
+
+That is the place. It becomes used, capacity, **hits, misses, evictions,
+entries** — the same four the materialisation cache already keeps. They ride
+`NodeTelemetry` exactly as `cache_capacity` and `cache_used` do now
+(`src/cluster.cpp:1614-1619`).
+
+**Why every node, not just the local one.** The same argument that put the
+playback budgets on the per-node block in 0.48.0, and it is stronger here.
+fi-1 is the node whose cache matters most and it is behind CGNAT — it cannot
+be reached directly, and an operator will be looking at es-1. A cache-health
+figure that is only ever about the node you happened to ask is no use for the
+node you actually need to know about.
+
+**Why a cached payload is the right home for these, when the account session
+count was deliberately kept off it.** 0.48.0 set what looks like the opposite
+precedent and someone will cite it, so the distinction goes on the record:
+
+- The account session **count** is *instantaneous*. Read stale, it is simply
+  wrong, and it moves whenever anyone on the account starts anything from a
+  device neither end can see. That is why it appears only where it is computed
+  live.
+- Cache hits, misses and evictions are **cumulative**. Nobody reads them
+  absolutely; they are diffed across two reads. Staleness shifts the window
+  slightly, it does not produce a false statement. `entries` is instantaneous
+  but bounded and slow-moving, exactly like `cache_used` beside it.
+
+The rule worth carrying: **an instantaneous count must not go on a cached
+payload; a monotonic counter is fine there.**
+
+**Why this is cheap now and was not two days ago.** TEL3 is tagged and
+length-delimited, and a default-valued field is omitted entirely. Adding four
+counters is additive, an older node skips what it does not know by length
+rather than misparsing the rest of the set, and absence already means "this
+node does not say" to every consumer. Before 0.48.0 the same four fields would
+have cost a flag-day cutover.
+
+**Do not aggregate the hit rate cluster-wide.** `src/status_api.cpp:589-665`
+rolls cache bytes up across nodes, and the obvious next step is a cluster hit
+rate. It would hide the entire finding: two storage nodes serving well would
+drown a storage-less edge node at 0%, which is precisely the node the number
+exists to expose. Sum bytes if useful; keep hit rates per node.
 
 ## A cheap falsification before any code changes
 

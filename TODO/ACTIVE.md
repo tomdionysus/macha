@@ -312,7 +312,16 @@ observed](2026-09-21-the-block-cache-cannot-be-observed.md).
 - [ ] Counters on `PersistentBlockCache` — hits, misses, evictions, entries.
   The materialisation cache already has exactly these and they are what made
   the 2026-09-20 rejoin failure diagnosable. Mirror them.
-- [ ] Surface them beside `cache_used`, which alone looks like health.
+- [ ] **Surface them on `GET /api/v1/status`, per node** — the per-node
+  `cache` block at `src/status_api.cpp:299`, which is `bytes_pair(used,
+  capacity)` today, gains hits/misses/evictions/entries. **For every node, not
+  only the one answering**: fi-1 is where the cache matters and it is behind
+  CGNAT, so the operator will be looking at es-1. Cheap now and not before —
+  TEL3 is tagged and length-delimited, so four added fields are additive and an
+  older node skips them by length. Monotonic counters are safe on this cached
+  payload in a way the live account session count is not: they are diffed, not
+  read absolutely. **Do not roll a hit rate up cluster-wide** — it would drown
+  the one storage-less node the number exists to expose.
 - [ ] A sustained zero-hit, high-eviction cache becomes a reportable
   condition, per the P-1 below.
 - [ ] A test that pins a block-cache read-back. Nothing currently fails if
