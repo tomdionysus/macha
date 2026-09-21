@@ -191,13 +191,19 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   - Exactly one tolerant artefact exists: `dist/assets/index-NDVfpduh.js`,
     624,128 bytes, built 2026-09-21 12:12 from develop against the linked
     core. `dist/` is gitignored, so it is in no commit and no tag — a local
-    file on one machine. It is also already behind core by five commits,
-    including the 30 s to 10 s floor change, so its hash will move again.
-  - Therefore a **fresh build from develop against current core** is what
-    should reach the nodes, not that artefact. Rebuilding also re-resolves the
-    link, so the hash moves again; the client's practice is to record the core
-    SHA and the `dist` hash rather than a version number, because a link
-    resolves a working tree and not a commit.
+    file on one machine.
+  - **It is current, and a rebuild is NOT required** (core, correcting itself
+    2026-09-21 after first reporting it five commits stale). It was built
+    against core `5aa3f6f` and carries the 10 s floor: the web client session
+    re-ran the build against core's current tree and got a **byte-identical**
+    output — same name, same 624,128 bytes, `cmp` clean — and core verified
+    the other half independently, `macha-ts/dist/playback/PlaybackCoordinator.js`
+    built 12:10 from src at 12:09 carrying `ALTERNATE_RECOVERY_WINDOW_MS =
+    10_000` with the 8 s transcode window beside it. So the 12:12 client build
+    consumed core's 12:10 dist, not the earlier tree.
+  - The client's practice is to record the **core SHA and the `dist` hash**
+    rather than a version number, because a link resolves a working tree and
+    not a commit. Worth keeping when this is deployed.
 
   **Owner, confirmed by core 2026-09-21: the web client session builds it and
   the operator authorises the deploy. Not the server session, and not core.**
@@ -258,15 +264,30 @@ live cluster. Reading the code does not count.
 - [ ] **Ownership.** One account's id, presented by another account, answers
   `404` on `GET`, `PATCH` and `DELETE`, and its stream URL answers nothing
   useful with or without the token.
-- [ ] **The account cap, observed.** Drop `max_sessions_per_account` to `2`
-  on fi-1 alone, live reload, and have one client create three: the third is
-  `429 account_session_limit` with limit and count, a second account on the
-  same node is unaffected, and core does *not* mark fi-1 failed. Restore the
-  number afterwards. This is the only way to see the refusal that decision 2
-  otherwise makes unreachable.
+- [ ] **The account cap, observed. DO NOT RUN THIS BEFORE `max_sessions` IS
+  RAISED.** With `max_sessions` at 8 against a per-account cap of 32, the only
+  `429` any client can provoke is the **node-scoped** one — and the mobile
+  client's `classifyCreateRefusal` deliberately treats that as fatal. So a cap
+  test run before the raise **will look like mobile's cap handling is broken
+  when it is behaving exactly as designed** (mobile session, via core,
+  2026-09-21). That is a false bug report waiting to be filed against a client
+  that is correct, and it is the second reason the Phase C config raise is
+  sequenced before this.
+  Once raised: drop `max_sessions_per_account` to `2` on fi-1 alone, live
+  reload, and have one client create three. The third is `429
+  account_session_limit` with limit and count, a second account on the same
+  node is unaffected, and core does *not* mark fi-1 failed. Restore the number
+  afterwards.
 - [ ] **`410` classified on the web client**: a mode switch on a node the
   client has moved to yields a real `generation_superseded`, and the client
-  resumes from the new `stream.url` without charging the node.
+  resumes from the new `stream.url` without charging the node. Expected to
+  pass: core reports the web client does not walk and does not mark the node,
+  because `isSourceGoneStatus` asks
+  `playbackFailureKindForStatus(status) === 'not-found'` rather than testing a
+  status list, so the HLS and Direct Play read-ahead paths both read `410` as
+  "ask for a new generation", and `isHlsNetworkDegradation` keeps it out of
+  node-health evidence. 78 tests green. This observes it rather than
+  re-deriving it.
 - [ ] **`410` in front of expo-video on a real device.** Nobody has done this;
   core's mobile verdict is reasoned from disassembled media3 bytecode and
   client code, not measured. Provoke a superseded generation on mobile and
