@@ -7,6 +7,68 @@ The 2026-09-08 entries below were ledgered by a pruning pass over
 0.24.1–0.35.0 is not otherwise ledgered here yet — see the documentation
 hygiene item in `ACTIVE.md`.
 
+## A telemetry set cannot carry an optional field safely — fixed in 0.48.0 as TEL3, not yet deployed
+
+Opened 2026-09-18, closed 2026-09-21 by `b821808`. Every field is now tagged
+and length-delimited inside a length-delimited record, so a record's optional
+fields are bounded by the record rather than by the payload, and an unknown
+field is skipped by its own length. Both open items are answered: the
+length-delimiting itself, and the compatibility story, which is a new magic
+(`TEL3`) rather than a version byte — a node speaking the old positional
+format refuses the set outright instead of misreading it, and every node moves
+at once. The third item, "treat adding a telemetry field as requiring both
+nodes to be upgraded together", survives as the standing deployment rule and
+is no longer a workaround for this defect: TEL3 makes a straggler's set
+*refused* rather than *misparsed*, which is the outcome that item wanted.
+
+One claim in the original entry was corrected when the fix was built: the
+format was **not** broken between peers of the same version. A sender writes
+every field, so a same-version reader consumed exactly one record. Reverting
+the framing and re-running the test said so. The real case — a set whose first
+record carries a field this build has never heard of, where the record after it
+must still decode — is now pinned by a test.
+
+The worry the entry ended on ("the set that does not drop") is retired by
+construction: a known field at the wrong width is now corruption rather than a
+version difference, and is refused.
+
+Original entry, unchanged:
+
+## P1 — A telemetry set cannot carry an optional field safely (opened 2026-09-18)
+
+`encode_telemetry_set` writes a magic, a count, and then the records
+back-to-back with **no per-record length**. `decode` reads its optional
+trailing fields by asking `reader.remaining()`, which in a multi-record set is
+non-zero because the *next record* follows. So a decoder that knows about a
+field the sender did not write consumes the next record's bytes as that field,
+and the whole set fails to decode.
+
+Gossip sends up to 64 records per set (`src/cluster.cpp:1146`), so this fires
+during any rolling upgrade that adds a telemetry field, in both directions,
+until every node matches. It has been true of every telemetry field added so
+far -- `phase`, `api_endpoint`, `cpu_cores`, `memory_total_bytes` -- and the
+comments on those fields claim a rolling-upgrade safety the format does not
+provide for sets. It is only genuinely safe for a single-record set.
+
+Found on 2026-09-18 by adding the playback budgets in 0.46.2, which produced
+`persisted telemetry ignored: blob too large` on each node's first start (the
+persisted cache is the reliably multi-record case). That is self-healing -- the
+cache is rewritten in the new format -- and both nodes were upgraded together
+to close the wire window, so nothing is currently degraded.
+
+**The worry is not the dropped set, it is the set that does not drop.** A
+misparse usually throws, because a length prefix read from the wrong offset is
+absurd. It is not guaranteed to: a record could decode into plausible-looking
+garbage and be believed. Nobody has looked for that case.
+
+- [ ] Length-delimit each record inside a telemetry set, so a record's optional
+  fields are bounded by the record rather than by the payload.
+- [ ] Decide the compatibility story for the format change itself, which has
+  the same one-upgrade cost it is fixing. A version byte in the set header is
+  the obvious shape.
+- [ ] Until then, treat "add a telemetry field" as requiring both nodes to be
+  upgraded together, and say so wherever that pattern is documented.
+
 ## The HTTP server without a thread per connection — 0.43.0, cluster UAT passed 2026-09-20
 
 Plan: [the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).

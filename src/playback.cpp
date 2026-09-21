@@ -126,6 +126,56 @@ struct StreamRoute {
     std::string_view stream_path;
 };
 
+// A generation the client asked for is not the one this session is producing.
+// Two different facts share that shape and a client must act differently on
+// each, so they get different statuses.
+//
+// Below the current generation, the generation existed here and was replaced:
+// a seek, a track or quality change, a media switch, or a rebuilding seek.
+// That is 410 -- the object is permanently gone, the node is producing
+// perfectly, and the client must stop retrying and take the new stream.url
+// from the session route. 404 made a routine event (every regenerate makes
+// one) indistinguishable from a segment index that never existed, which a
+// client reasonably retries, and worse, indistinguishable from a node in
+// trouble.
+//
+// Above it, the generation never existed: nothing here has produced that far.
+// That stays 404. Generations only ever increment (one ++ site), so the
+// comparison is the whole test.
+//
+// Held back from 0.47.0 deliberately (operator, 2026-09-20) until
+// macha-client-core shipped tolerance: core maps an unrecognised fragment
+// status to `unknown` and treats `unknown` as evidence against the endpoint,
+// so emitting this early would have charged a healthy node and built a standby
+// that could not help. Core's tolerance maps 410 onto its existing `not-found`
+// kind -- same required action, and an obligation existing hosts already meet
+// -- and ships with the release that moves these routes.
+// The axes matter more than the status here. `request` says do not walk the
+// cluster: no other node has this session, so a walk collects a stale URL's
+// refusal N times and charges N healthy nodes for it. `node_healthy` says this
+// node is fine, which is the correction the status exists to make.
+// `alternative_may_succeed` is the instruction to the client in one field --
+// a different request, the new stream.url, succeeds on this same node.
+HttpResponse generation_gone(uint64_t requested, uint64_t current) {
+    if (requested < current)
+        return http_error(410, "generation_superseded", "stream generation superseded",
+                          "the generation was replaced; take stream.url from the session",
+                          FailureAxes{FailureScope::request, true, true});
+    return http_error(404, "not_found", "stream generation not found");
+}
+
+// The stream token is a capability, so comparing it with std::string's == is a
+// secret-dependent branch: it returns at the first differing character. Remote
+// timing exploitation across a network against 256 bits of hex is not a
+// practical attack, which is why this was recorded rather than rushed -- but
+// the compare costs the same either way and there is then no question to
+// answer. Lengths are allowed to differ; a length mismatch is not secret.
+bool stream_token_matches(const std::string& expected, const std::string& provided) {
+    return constant_time_equal(
+        {reinterpret_cast<const uint8_t*>(expected.data()), expected.size()},
+        {reinterpret_cast<const uint8_t*>(provided.data()), provided.size()});
+}
+
 std::optional<StreamRoute> parse_stream_route(std::string_view path) {
     constexpr std::string_view prefix = "/api/v1/playback/sessions/";
     if (!path.starts_with(prefix)) return std::nullopt;
@@ -2034,7 +2084,7 @@ struct PlaybackManager::Impl {
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
-            if (it == sessions.end() || it->second->token != token)
+            if (it == sessions.end() || !stream_token_matches(it->second->token, token))
                 return http_error(404, "not_found", "stream not found");
             session = it->second;
         }
@@ -2062,27 +2112,27 @@ struct PlaybackManager::Impl {
         uint64_t generation = 0;
         auto generation_text = rest.substr(0, slash3);
         auto [end, ec] = std::from_chars(generation_text.data(), generation_text.data() + generation_text.size(), generation);
-        if (ec != std::errc{} || end != generation_text.data() + generation_text.size() || generation != session->generation)
+        if (ec != std::errc{} || end != generation_text.data() + generation_text.size())
             return http_error(404, "not_found", "stream generation not found");
+        if (generation != session->generation)
+            return generation_gone(generation, session->generation);
         auto name = std::string(rest.substr(slash3 + 1));
         if (name.empty() || name == "." || name == ".." || name.find("..") != std::string::npos)
             return http_error(400, "bad_path", "invalid stream object");
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
-            // NOTE: this should be 410 generation_superseded, not 404 -- the
-            // generation existed here and was replaced, which is a different
-            // fact from a segment index that never existed, and a client must
-            // not retry it. Held back deliberately (operator, 2026-09-20):
-            // macha-client-core maps an unrecognised fragment status to
-            // `unknown` and treats `unknown` as endpoint evidence, so a node
-            // emitting 410 before core ships tolerance would charge a node
-            // that is producing perfectly and build a standby that cannot
-            // help. Core ships tolerance first, then this becomes a 410.
-            // See TODO/ACTIVE.md.
-            if (it == sessions.end() || it->second != session ||
-                session->generation != generation)
+            // The session going away entirely is not-found: there is nothing
+            // to ask about any more. The session record being replaced is
+            // supersession by another name -- a subtitle change, a fast-path
+            // seek and a mode change each swap the record wholesale, and the
+            // generation the client holds went with the old one.
+            if (it == sessions.end())
                 return http_error(404, "not_found", "stream generation not found");
+            if (it->second != session)
+                return generation_gone(generation, it->second->generation);
+            if (session->generation != generation)
+                return generation_gone(generation, session->generation);
             const auto now = Clock::now();
             session->touched = now;
             session->stream_touched = now;

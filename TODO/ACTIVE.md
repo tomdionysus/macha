@@ -140,12 +140,15 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
-## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, BUILT AND GREEN, NOT DEPLOYED)
+## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, RELEASE READY AS 0.48.0, NOT DEPLOYED)
 
-**Server side is complete and committed on `develop`; nothing is deployed.**
-The cutover is all three nodes at once, on the operator's word (2026-09-21),
-and it is gated on a current web bundle reaching `/etc/macha/web` — see the
-deploy checklist at the end of this section.
+**Server side is complete, documented and tagged `0.48.0` on `develop`;
+nothing is deployed.** The cutover is all three nodes at once, on the
+operator's word (2026-09-21), and it is gated on two things outside this
+repository: a published `@machafoundation/core` carrying `410` tolerance, and
+a current web bundle reaching `/etc/macha/web`. Readiness plan, with the
+ordered remainder: [what stands between these routes and the
+cluster](2026-09-21-playback-sessions-deploy-readiness-plan.md).
 
 **This is the active work.** Agreed with the operator on 2026-09-21. Full
 specification: [playback sessions as a
@@ -223,8 +226,33 @@ That was wrong on both counts and is corrected there.
 - Security review of the whole prefix, four fixes, two findings left open with
   a recommendation. See the plan.
 
+- `410 generation_superseded` on a superseded generation, carrying
+  `scope: request`, `node_healthy: true`, `alternative_may_succeed: true`. A
+  generation *above* the current one stays `404`. Held since 2026-09-20 and
+  released here because a coordinated route break is the right release to
+  carry it, rather than holding it for a second flag day.
+- The stream token compare goes through `constant_time_equal`, closing the
+  first of the two open security findings. The second — `playback/status`
+  aggregates visible to any `media_viewer` — is accepted rather than fixed,
+  on the record in the changelog.
+- `docs/streaming.md` rewritten for the resource model: it described
+  one-session-per-bearer, supersession by `POST`, and the retired stream
+  route. This is what the clients are briefed from, so it was on the critical
+  path rather than hygiene. `max_sessions_per_account` added to
+  `docs/configuration.md` and `macha.yaml.example`.
+
 Commits: `9408794` (routes, cap, security), `b821808` (telemetry format),
-`4d8312e` (codec). Full suite green on es-1 at 483 cases.
+`4d8312e` (codec), plus the 0.48.0 release commit (version, changelog, `410`,
+constant-time compare, docs).
+
+**`max_sessions` must be raised above `max_sessions_per_account` or the cap is
+unreachable.** The compiled defaults are 8 node-wide and 32 per account, so on
+a default config the node-wide limit always refuses first — and its `429` is
+node-scoped, which sends a client walking the cluster instead of telling it to
+stop. That is the exact misclassification the account-scoped code exists to
+prevent, so shipping the cap without raising `max_sessions` leaves it dead.
+The example config and the configuration reference now pair 64 with 32; all
+three live nodes run 8.
 
 ### Deploy checklist — none of this is done
 
@@ -234,13 +262,19 @@ Commits: `9408794` (routes, cap, security), `b821808` (telemetry format),
   generation stops being exotic — every regenerate, mode switch and rebuilding
   seek makes one — so the deployed bundle would turn a routine event into
   evidence against a healthy node. **Not the server session's to deploy.**
+- [ ] **A published `@machafoundation/core` carrying the `410` tolerance.**
+  Latest on npm is 0.14.0 (2026-09-19); the tolerance is on core's `develop`.
+  The nodes now emit `410`, so this gate is load-bearing rather than
+  precautionary. Needs the operator's word to publish.
 - [ ] Build once on es-1, ship the tarball, all three nodes together. The
   telemetry format is TEL3 with no compatibility, so a node left behind is
   excluded from gossip rather than misreading it — which is the intended
   behaviour, and the reason the cutover is not rolling.
-- [ ] Decide `max_sessions` node-wide alongside the new per-account cap: es-1
-  currently runs 8 for every account together, and this change raises
-  consumption per viewer.
+- [ ] Raise `max_sessions` node-wide on all three nodes, above
+  `max_sessions_per_account`, and write both numbers explicitly into each
+  config. All three run 8 today, which makes the account cap unreachable. The
+  keys reload live and a 0.47.0 binary ignores the unknown one, so this can go
+  in before the cutover.
 - [ ] Joint test with the clients afterwards, co-ordinated by core. One thing
   worth getting: a mode switch on a moved node, watched from a client, to make
   a real `410 generation_superseded` and see it classified. No amount of
@@ -1770,41 +1804,6 @@ leaving clients to discover it with a 403 the server does not even log.
   the role gating lives (`service.cpp:199-216`), so the document can state
   which role each route requires rather than leaving clients to discover it
   with a 403.
-
-## P1 — A telemetry set cannot carry an optional field safely (opened 2026-09-18)
-
-`encode_telemetry_set` writes a magic, a count, and then the records
-back-to-back with **no per-record length**. `decode` reads its optional
-trailing fields by asking `reader.remaining()`, which in a multi-record set is
-non-zero because the *next record* follows. So a decoder that knows about a
-field the sender did not write consumes the next record's bytes as that field,
-and the whole set fails to decode.
-
-Gossip sends up to 64 records per set (`src/cluster.cpp:1146`), so this fires
-during any rolling upgrade that adds a telemetry field, in both directions,
-until every node matches. It has been true of every telemetry field added so
-far -- `phase`, `api_endpoint`, `cpu_cores`, `memory_total_bytes` -- and the
-comments on those fields claim a rolling-upgrade safety the format does not
-provide for sets. It is only genuinely safe for a single-record set.
-
-Found on 2026-09-18 by adding the playback budgets in 0.46.2, which produced
-`persisted telemetry ignored: blob too large` on each node's first start (the
-persisted cache is the reliably multi-record case). That is self-healing -- the
-cache is rewritten in the new format -- and both nodes were upgraded together
-to close the wire window, so nothing is currently degraded.
-
-**The worry is not the dropped set, it is the set that does not drop.** A
-misparse usually throws, because a length prefix read from the wrong offset is
-absurd. It is not guaranteed to: a record could decode into plausible-looking
-garbage and be believed. Nobody has looked for that case.
-
-- [ ] Length-delimit each record inside a telemetry set, so a record's optional
-  fields are bounded by the record rather than by the payload.
-- [ ] Decide the compatibility story for the format change itself, which has
-  the same one-upgrade cost it is fixing. A version byte in the set header is
-  the obvious shape.
-- [ ] Until then, treat "add a telemetry field" as requiring both nodes to be
-  upgraded together, and say so wherever that pattern is documented.
 
 ## P1 — A generation can be reclaimed between its playlist and its first fragment (opened 2026-09-18)
 

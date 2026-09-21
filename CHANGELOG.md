@@ -1,5 +1,150 @@
 # Current release
 
+## 0.48.0 — A playback session is a resource (development)
+
+**This release breaks the client contract on purpose, and there is no
+dual-serve window.** Every node is under our control, there is no fallback to
+an older version, and the cutover is all three nodes at once. A client that has
+not taken the matching release will not work against a node running this one.
+
+**A playback session stopped being a property of the bearer token.** A `POST`
+to `/api/v1/playback/sessions` creates a member every time, and returns `201`
+with a `Location`. Two `POST`s on one token are now two live sessions with
+different ids, both streaming. Before, the server keyed a session on the
+authenticated API session and a second `POST` silently superseded whatever that
+token was playing — which is not what `POST` to a collection means, and is why
+a client could not hand a viewer's playback from one device to another.
+
+**`GET /api/v1/playback/sessions` lists the caller's own sessions**, under
+`items`. This is the piece that unblocks handover: it did not exist, and
+without it a client that lost an id could not find its own session again. It
+lists that caller's sessions on that node and nothing else — there is no
+cluster-wide listing, because a session is a resource of the node producing it.
+
+**The stream moved under the session it belongs to.**
+
+```text
+GET /api/v1/playback/sessions/{id}/stream/{token}/{generation}/{name}
+GET /api/v1/playback/sessions/{id}/stream/{token}/direct
+```
+
+`GET /api/v1/playback/stream/...` is **removed**. The capability stays in the
+path rather than moving to a header because it is a capability, not a
+credential: media players fetch fragments without application headers.
+`playback/status` and `playback/media` are different resources and did not
+change.
+
+**The per-account cap ships in the same release, not after it.**
+`streaming.max_sessions_per_account` (default 32) bounds what one account may
+hold on one node; over it, creation is refused `429` with code
+**`account_session_limit`**, `scope: request`, `node_healthy: true`, and both
+the limit and the caller's live count stated. This is not an optional extra.
+`max_sessions` is node-wide only, and the one-session-per-bearer rule had been
+doing the per-account job by accident — removing it without a cap is exactly
+the media DoS that governs this design. Transcode entitlements share the cap's
+key, so splitting one viewer into several sessions does not multiply them.
+
+**An account-scoped refusal is deliberately distinguishable from a node-scoped
+one.** A client classifies failures by scope: a node-scoped refusal makes it
+walk the cluster, and an account-scoped refusal is identical on every node it
+would walk to. Charging every healthy node it tries turns one account hitting
+its own cap into a cluster that looks like it is failing.
+
+**Keep `max_sessions` above `max_sessions_per_account`.** Otherwise the
+node-wide limit refuses first and the account cap can never be reached — which
+loses the distinction above in the one case it exists for. The shipped example
+config now pairs 64 node-wide with 32 per account; the compiled defaults are 8
+and 32, so a node running the default `max_sessions` must raise it.
+
+**A superseded generation answers `410 generation_superseded`.** It carries
+`scope: request`, `node_healthy: true` and `alternative_may_succeed: true` —
+this node is healthy, and a different request against this same node works.
+Held back from 0.47.0 until macha-client-core shipped tolerance, because core
+maps an unrecognised fragment status to `unknown` and reads `unknown` as
+evidence against the endpoint, so emitting it early would have charged a node
+that was producing perfectly. It ships with the release that moves the routes,
+so no client is ever pointed at a node whose statuses it cannot classify.
+
+Before this, a replaced generation and a segment index that never existed
+shared one `404`. Under the new routes a superseded generation stops being
+exotic — every regenerate, mode switch and rebuilding seek makes one — so the
+old behaviour would have turned a routine event into evidence against a healthy
+node. A generation *above* the current one still answers `404`: nothing here
+ever produced it.
+
+**Telemetry stops being a positional format.** Every field is now tagged and
+length-delimited inside a length-delimited record, the magic moves to `TEL3`,
+and there is deliberately no compatibility with what came before: a node
+speaking the old format refuses the set outright rather than misreading it.
+**Every node must move together.** Each node logs one `persisted telemetry
+ignored` warning on first start as the old cache is discarded and rewritten;
+it is self-healing and does not recur.
+
+The format it replaces worked between peers of one version and broke across
+two, which is the only time a wire format matters. Fields were appended in
+order and optional trailing ones were detected by asking whether any bytes
+remained — which, in a set of up to 64 records on the gossip path, is the next
+record. One added field cost a mixed-version cluster every multi-node telemetry
+set it exchanged. Tags also buy smaller packets, since a default-valued field
+is now omitted entirely.
+
+**Three fields ride the new format into the per-node `playback` block of
+`GET /api/v1/status`**: `max_sessions_per_account`, `pipeline_idle_ms` and
+`session_idle_ms`. A client learns them about every node it might fail over to
+rather than only the one it is talking to, and stops holding private copies of
+this node's configuration. The account's live **count** is deliberately not
+there — it is the most perishable number this API carries and that payload is
+cached — so it appears only where it is computed live: on creation, on the
+listing, and on the refusal.
+
+**Security review of the whole `/api/v1/playback` prefix**, with four fixes:
+
+- **The session control routes had no ownership check.** `GET`, `PATCH` and
+  `DELETE` looked a session up by id and acted on it without asking who was
+  calling, so any authenticated account that learned an id could read, re-seek
+  or delete another viewer's session mid-film — and free their cap slots.
+  Latent before, because an id was only ever known to the client that made it;
+  practical now that a listing hands ids out. All three check ownership and
+  answer **404, not 403**: whether an id exists here is not something one
+  account learns about another.
+- **Ownership was silently dropped by every session replacement.** A subtitle
+  change, a fast-path seek and a mode change each replace the session record
+  field by field, and none carried the new `account`. A replaced session
+  stopped counting against the cap, so a subtitle change was a way to launder
+  sessions past it.
+- **The authentication exemption and the router disagreed about what a stream
+  URL is.** The exemption matched `/stream/` anywhere after the session id
+  while the router required it as the next segment — a path exempt from the
+  bearer but routed elsewhere is an authentication bypass. Both now call one
+  `parse_stream_route`.
+- **Idempotency keys were a global namespace.** Any account could occupy
+  another's key (`retry-1` is not hard to guess) and turn its legitimate retry
+  into a `409` — a targeted denial of the retry path, which is the path a
+  client is on when something has already gone wrong. Keys are now scoped per
+  account.
+
+**The stream token is compared in constant time.** It is a capability, so
+`std::string`'s `==` was a secret-dependent branch. Remote timing exploitation
+across a network against 256 bits of hex is not a practical attack, which is
+why this was recorded rather than rushed, but the compare costs the same either
+way.
+
+**`GET /api/v1/playback/status` exposes node aggregates to any `media_viewer`**
+— session count, transcode load, cached probe bytes, and now the cap limit.
+This is a deliberate disclosure, accepted for a household system and useful to
+clients, recorded here so it is a decision rather than a discovery.
+
+**The shared codec stops copying what it only reads.** `view()` and
+`view_bytes()` return a borrowed span rather than a `Bytes`; `raw()` and
+`bytes()` keep copying, because plenty of callers hand the result onwards and
+a span into an RPC payload must not outlive the decode — the borrow is opt-in
+at the call site that knows its own lifetime. `string()` went through an
+intermediate `Bytes` and copied twice, which is not free across the thousands
+of names in a metadata snapshot. Telemetry decode now borrows throughout: at
+up to 64 records, one allocation per record became none. What owns its storage
+and outlives the buffer still copies once, into the thing that owns it.
+
+
 ## 0.47.0 — How fast this node is actually producing (development)
 
 **A client can now tell whether a handover would close the gap before the

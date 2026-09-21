@@ -285,9 +285,12 @@ figures during any disturbance once core's standby discipline applies to the
 coordinator-driven ones. That session reads anything under 8 as tight and would
 rather the limit were per viewer-session than per account.
 
-**The key is an open decision for the operator** (raised 2026-09-21, not
-settled). The plan already says the cap and the transcode entitlement must
-share a key; "which key" is the same question:
+**Settled 2026-09-21: the key is the account, and it shipped that way.** The
+reasoning below stands as recorded; what follows it is what the code does. The
+cap and the transcode entitlement share the account key, so splitting one
+viewer into several sessions does not multiply entitlements. The household
+objection is answered by the number rather than by the key — the default is 32
+and the scarce resource stays bounded separately and per viewer:
 
 - **Per account** is the only thing that answers the stated threat — *"a rogue
   client cannot under any circumstances launch a media DoS"*. A per-viewer cap
@@ -465,6 +468,13 @@ gone wrong. Now scoped per account.
   sessions other people hold in total. Defensible for a household system and
   useful to clients; flagged because it is a deliberate disclosure rather than
   an accident, and the operator should say so rather than discover it.
+  **Accepted by the operator 2026-09-21** and recorded in the 0.48.0 changelog
+  entry, so it is a decision on the record rather than a later discovery.
+
+- **The stream token compare is fixed, not open** (2026-09-21): it goes
+  through `constant_time_equal`, the same helper the session, user and RPC
+  paths use. The item above is left in place because the reasoning for why it
+  was recorded rather than rushed is worth keeping.
 
 ### A note on shape, per the operator
 

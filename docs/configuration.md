@@ -374,7 +374,8 @@ The remaining FUSE worker/timeout fields bound local kernel-facing work. They do
 ```yaml
 streaming:
   enabled: true
-  max_sessions: 8
+  max_sessions: 64
+  max_sessions_per_account: 32
   max_video_transcodes: 1
   max_audio_transcodes: 4
   video_decoder_threads: 2
