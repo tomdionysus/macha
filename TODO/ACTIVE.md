@@ -316,7 +316,7 @@ one on a single run.
 - [ ] Decide whether the two durability-barrier cases share one cause. They
   have the same shape, the same platform split and adjacent assertions.
 
-## P0 — A stale session for the same media may produce a 503 on the next create (opened 2026-09-21, n=1, UNREPRODUCED)
+## P0 — A stale session for the same media may produce a 503 on the next create (opened 2026-09-21, n=1, DISCONFIRMED ONCE, still unexplained)
 
 **All that survives of the day's "AC-3 stalls the node" affair.** The AC-3
 finding is closed as not-a-server-defect (see `COMPLETED.md`); this one is not,
@@ -364,6 +364,41 @@ measured.)*
 **Do not attribute an instance of "timed out waiting for first fragmented-MP4
 segment" to anything without first checking the node for a live session on the
 same media.**
+
+**DELIBERATE REPRODUCTION ATTEMPT, 2026-09-21 evening: it did not reproduce,
+and the attempt was a good one.** Run on es-1 immediately after the 0.48.1
+restart left it with zero sessions — the cleanest state it had all day — with
+an AAC title the browser can decode, so no codec was involved anywhere.
+
+```
+18:50:38  session A created, mode=direct
+18:50:59  first fragment ready 553 ms      <- A PATCHed to remux, streaming
+18:51:28  first fragment ready 777 ms
+18:52:45  session B created, same media    <- orphan A STILL LIVE
+18:52:50  A's pipeline reclaimed, idle 60s <- five seconds AFTER B
+18:53:40  first fragment ready 247 ms      <- B's remux, succeeded
+18:57:41  session create complete mode=transcode elapsed_ms=1323
+```
+
+**The orphan was genuinely present**: A's pipeline was not reclaimed until five
+seconds after B was created, so the precondition held. B succeeded anyway. No
+503, no WARN, no ERROR in the window. And the last line is the television's
+exact shape — a transform chosen **at create** rather than by PATCH — which
+also succeeded, contrary to what that client believed its own code could even
+do.
+
+**So the orphan theory is disconfirmed as a general mechanism**, and it was the
+leading explanation for both this item and the AC-3 split. It is recorded as
+disconfirmed rather than hedged. What that leaves:
+
+- The television's n=1 is still unexplained and is now harder, not easier: the
+  obvious mechanism has been tested and does not hold.
+- The hypothesis below is correspondingly weakened. If an orphan for the same
+  media does not produce this error, then "AC-3 was retried all day against a
+  dirty cluster" loses the mechanism that made it attractive.
+- What has NOT been reproduced in any controlled run, by anyone, is the
+  original failure itself. Every deliberate attempt on a clean node has
+  succeeded, including the AC-3 one at 48 ms.
 
 **The best hypothesis anyone has produced on this, from core, 2026-09-21: the
 AC-3 codec split may be confounded with retry count.** No `DELETE` reached any
