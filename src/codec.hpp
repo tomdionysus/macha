@@ -59,6 +59,15 @@ class Reader {
     Bytes bytes(size_t maximum = 256 * 1024 * 1024);
     std::string string(size_t maximum = 65536);
 
+    // The same reads without the copy. A Reader is a span and a position, so
+    // scalars and fixed<N> never allocated; these are for the cases that did.
+    // The span borrows the caller's buffer, so it is valid only while that
+    // buffer is, and must not be stored anywhere that outlives the decode --
+    // which is why raw()/bytes() keep their copying behaviour for the callers
+    // that hand the result onwards.
+    std::span<const uint8_t> view(size_t);
+    std::span<const uint8_t> view_bytes(size_t maximum = 256 * 1024 * 1024);
+
     template <size_t N> std::array<uint8_t, N> fixed() {
         need(N);
         std::array<uint8_t, N> out{};
