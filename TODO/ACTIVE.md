@@ -353,6 +353,40 @@ Not a mux rejection, which would have said "libav pipeline failed before first
 fragment"; not an exit, which would have said "ended before first fragment".
 Alive, no error, no fragment.
 
+**THERE IS A SECOND, UNRELATED CAUSE OF THE IDENTICAL MESSAGE, and it is a
+confound for the evidence above** (Android TV, 2026-09-21). That session
+force-stopped its app mid-playback, leaving an orphaned session on
+`10.35.1.50` for `tmdb:movie:583`. Relaunching and playing **the same title on
+the same node** then failed with the same error — `POST` this time,
+`elapsedMs 15026.8`, `503`, "timed out waiting for first fragmented-MP4
+segment" — on a plan of **video copy + audio transcode**. No AC-3, no remux, no
+audio copy anywhere in it. Deleting the orphan and replaying the same title on
+the same node succeeded immediately.
+
+n=1 each way and that session claims no mechanism. Neither do I, but one
+candidate is ruled out already: **it is not the probe coalescing path**, which
+throws its own distinct "timed out waiting for concurrent media inspection"
+(`src/playback.cpp:1225`) rather than this message. What an orphaned session
+holds that a *second session for the same media* then waits on is the open
+question — retained memory held by a pipeline that was not yet reclaimed is a
+candidate worth eliminating first, since it would stall without recording an
+error, which is what the throw site requires.
+
+**Consequences for the AC-3 investigation, which matter more than the second
+bug itself:**
+- The phone's four AC-3 failures are not clean evidence until it is known
+  whether they left orphans behind — that is exactly how the television
+  produced this one. Ask before treating four attempts as four data points.
+- "Timed out waiting for first fragmented-MP4 segment" is now known to have at
+  least two causes. Do not attribute an instance to `delay_moov` without
+  checking the node for a live session on the same media.
+- It is the same family as the entitlement work above: an orphan holding
+  resources for one media, rather than an orphan holding the node's only
+  transcode slot.
+
+- [ ] Establish what a second session for one media waits on when an earlier
+  session for that media is still live. Retained memory first.
+
 - [ ] Reproduce on a node with an AC-3 source and a copy plan, and find out
   whether `moov` is ever written. That is the whole question.
 - [ ] If the muxer needs a parsed frame we are not giving it, attach a parser
