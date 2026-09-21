@@ -9,35 +9,42 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.** Read, in order:
 
-**Tier and position agree: the two P-1 sections come first.** They are
-invariants and structural properties rather than defects in features, and
-everything under P0 is worth doing without changing either.
+**The playback-session resource work is what is being built right now**
+(operator, 2026-09-21). It sits at the top because it is active, agreed and
+breaking: it is the section immediately below this preamble. The two P-1
+sections come next — they are invariants and structural properties rather than
+defects in features, and everything under P0 is worth doing without changing
+either.
 
-0. **The two P-1 sections immediately below.** The cache invariant is new on
+0. **The playback-session resource work**, immediately below. Agreed with the
+   operator on 2026-09-21 and specified in
+   [its own plan](2026-09-21-playback-sessions-as-a-resource-plan.md).
+1. **The two P-1 sections after it.** The cache invariant is new on
    2026-09-20 and generalises a failure that has now cost this project twice;
    the namespace scale target is the long-running structural one.
-1. **The metadata-stall P0.** It is live, it is failing real ingests today, and
-   it is not root-caused. This is the thing to actually pick up first if you
-   are looking for work: two agreed sessions rank it top of the P0s.
-2. The **rejoin/cache P0** after it — worked around on all three nodes on
+2. **The metadata-stall P0.** Its read-only blink was root-caused and fixed on
+   2026-09-21 (a hung health probe was given the whole liveness budget); the
+   stall that provokes it is still unexplained, and making an ingest survive a
+   read-only window is still owed.
+3. The **rejoin/cache P0** after it — worked around on all three nodes on
    2026-09-20, not fixed, and the concrete instance of the first P-1.
-3. The **loader-I/O P0**. The node starves its own viewer I/O with loader
+4. The **loader-I/O P0**. The node starves its own viewer I/O with loader
    work: one ingest took es-1 to 91% iowait and aborted twelve client requests
    at ~8 s. Governing law 1 is violated on the DATA backend, and no
    configuration available prevents it. **Its reproduction is blocked** — read
    that item's first bullet before attempting one.
-4. The **P0 cluster section**. The live cluster is **three** nodes as of
+5. The **P0 cluster section**. The live cluster is **three** nodes as of
    2026-09-20 evening, **all on 0.47.0** and converged at generation 31663:
    es-1, fi-1 and gbni-1. gbni-2 is defunct and the operator expects it to stay
    that way for some months (2026-09-20) — do not include it in a deploy, do
    not wait for it, and do not treat its absence as an incident. Removing a
    node is something the system does not really support, and that is the first
    item there.
-5. **"What the client sessions now depend on"** near the end of this file.
+6. **"What the client sessions now depend on"** near the end of this file.
    These are API contracts settled in conversation with the four client
    sessions and they exist nowhere else in this repository. Breaking one breaks
    clients that cannot be fixed from here.
-6. **"Cluster and repository state as of 2026-09-13"**, which records node
+7. **"Cluster and repository state as of 2026-09-13"**, which records node
    addresses, what is deployed, what access works, and where the branches and
    tags stand.
 
@@ -132,6 +139,67 @@ The governing laws are:
 2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
+
+## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, IN PROGRESS)
+
+**This is the active work.** Agreed with the operator on 2026-09-21. Full
+specification: [playback sessions as a
+resource](2026-09-21-playback-sessions-as-a-resource-plan.md) — read that
+before touching `src/playback.cpp`.
+
+**It breaks the client contract on purpose.** Every node is under our control,
+there is no fallback to an old version, and there is no dual-serve window. Two
+operator constraints govern the design: **no identifier in this system is
+client-generated** (the server mints ids; `idempotency_key` is a request token,
+not an identifier), and **backward compatibility is not a design input**.
+
+The defect is that a playback session belongs to the bearer rather than
+existing as a resource. `create` resolves the logical viewer from the auth
+session id (`logical_session_for(request.session->id)`,
+`src/playback.cpp:2288`), and `session_for_logical_locked`
+(`src/playback.cpp:916-921`) returns *the* session of a viewer, singular. One
+bearer therefore has one playback session and a second `POST` supersedes the
+first — which is why the Web Client cannot hand over, and is not what `POST` to
+a collection means.
+
+The shape:
+
+```
+POST   /api/v1/playback/sessions                                201 + Location
+GET    /api/v1/playback/sessions                                the caller's live sessions
+GET    /api/v1/playback/sessions/{id}
+PATCH  /api/v1/playback/sessions/{id}
+DELETE /api/v1/playback/sessions/{id}
+GET    /api/v1/playback/sessions/{id}/stream/{token}/{generation}/{name}
+GET    /api/v1/playback/sessions/{id}/stream/{token}/direct
+```
+
+`GET /api/v1/playback/stream/...` is removed. `playback/status` and
+`playback/media` are different resources and do not change.
+
+- [ ] `POST` to the collection creates a member every time; the logical viewer
+  stops being keyed on the bearer.
+- [ ] `GET` on the collection, under `items`. **This is the piece that unblocks
+  handover** — it does not exist today, and without it a client that loses its
+  id cannot find its own session.
+- [ ] The stream moves under the session; the token stays in the path, because
+  it is a capability and media players send no application headers.
+- [ ] **The per-account cap ships in the same change, not after it.**
+  `reserve_session_slot` (`src/playback.cpp:1266-1271`) is node-wide only, and
+  the one-session-per-bearer rule was doing the per-account job by accident.
+  Removing it without a cap is exactly the media DoS the operator named as the
+  governing constraint. Transcode entitlements
+  (`reserve_resources`, `src/playback.cpp:1278+`) are per logical viewer and
+  must share the cap's key, or splitting a viewer into many sessions multiplies
+  them.
+- [ ] Supersession becomes an explicit refusal against that cap rather than a
+  silent replacement. This also absorbs the direct-session exemption item from
+  the seamless-handover P0.
+- [ ] Brief the four client sessions **before** the release, not after.
+
+**Supersedes** item 2 of the seamless-handover P0 below, which said a
+*client-supplied* session key should go in the route as a *query parameter*.
+That was wrong on both counts and is corrected there.
 
 ## P-1 — A cache must never be smaller than its own working set (opened 2026-09-20)
 
@@ -284,7 +352,7 @@ interlock is the most dangerous single piece of the work.
 - [ ] Stage E: the migration and its interlock.
 - [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
-## P0 — es-1 and fi-1 stall metadata RPCs at each other, and it is failing real ingests (opened 2026-09-20, NOT root-caused)
+## P0 — es-1 and fi-1 stall metadata RPCs at each other, and it is failing real ingests (opened 2026-09-20, READ-ONLY BLINK ROOT-CAUSED 2026-09-21; the stall itself is not)
 
 **This is breaking production work right now and it outranks everything below,
 including the loader-I/O P0 above it.** Agreed with the Android TV client
@@ -346,15 +414,108 @@ the time:
   public address `37.136.124.32`, which is expected for an inbound-incapable
   node that dials out.
 
-- [ ] Establish whether the stalling RPCs are being written into a half-dead
-  socket, and why neither end tears it down inside the RPC deadline.
-- [ ] **Do not treat a 30 s no-progress cancel as the bug.** That is
-  discipline 2 working: the deadline fires instead of waiting forever. The bug
-  is whatever makes 1.5 s of work take longer than 30 s.
+**Root cause of the read-only windows, found 2026-09-21. The stall was never
+the whole story: the cluster had no margin to absorb one.** A peer counts as
+live only while it has been observed inside `dead_after`
+(`src/membership.cpp:292,315`). The mechanism that refreshes that observation
+is `RpcClient::health_loop` (`src/net.cpp:2694`): every `heartbeat` it pings
+each peer's CONTROL lane and, on an `ok`, calls `peer_observer_(reply.peer)` →
+`members_.observe(peer, true)` (`src/net.cpp:2812`, `src/cluster.cpp:264,305`).
+A membership exchange from `NodeRuntime::loop` also observes, but the probe is
+the primary path.
+
+**Each probe round is given exactly `dead_after` to succeed in**: the probes
+are constructed with `deadline = started + dead_after_` (`src/net.cpp:2755-2758`),
+and the abandon message says so — `"health could not be established before
+dead_after"`. A probe that *fails* is fine: `next_attempt = now + 50 ms` retries
+it for the rest of the window. A probe that **hangs** is not, because
+`call_async_known` carries no no-progress deadline of its own, so the one
+attempt sat there until the round deadline — and the round deadline is the
+liveness budget. **The peer expired at the instant the probe proving it alive
+was abandoned, with no retry able to land first, by construction.** That
+dropped `online` below `required` (`src/metadata_manager.cpp:99-111`), took
+metadata read-only, and killed any commit in the window.
+
+That explains what this item called unexplained: both ends healthy, link
+measured clean, nothing actually unhealthy. The apparent six heartbeats of
+margin (5 s heartbeat, 30 s budget) never existed for a hung probe.
+
+**Fixed 2026-09-21 (unreleased), in the probe, not the config.** Each probe
+attempt now carries its own budget of `dead_after / 3` (floor 100 ms). Past it
+the attempt is cancelled and handed to the existing 50 ms retry path, so a
+ping that answers on the second or third attempt no longer costs the peer its
+membership, and a peer that is genuinely gone is still declared dead at
+`dead_after` as before.
+
+**A first attempt at this aimed at the wrong path and is recorded so it is not
+repeated.** It read the *membership exchange* as the sole liveness path, gave
+`members`/`members_reply` a derived `membership_no_progress_deadline`, and left
+`health_loop` untouched — so it would not have fixed the blink. It was dropped.
+
+**Two suite cases on es-1 are load-sensitive and this is now a P0 of its own
+(2026-09-21).** A full run of that attempt reported 477/479 —
+`hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
+(on `metadata replica set forming: waiting for bootstrap checkpoint survey`)
+and `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`
+— and **a second full run of the same tree reported 479/479**. Both pass in
+isolation; the catalogue case passed 5/5, the ingest case failed 1/5 under
+`--repeat`, which interleaves in parallel slots. They fail under suite load,
+not from any change. Per the operator's 2026-09-15 rule this is P0 work, not a
+footnote: see the deterministic-suite plan.
+
+**A methodology note worth keeping.** The two runs above were first read as
+"baseline green, change red", which was wrong: the supposedly pristine tree
+still carried the change's own two test cases, proven afterwards by their names
+appearing in the baseline log (`macha-tests --list` gives 477 for HEAD, and the
+baseline run announced 479). **Compare `--list` counts before trusting a
+before/after suite comparison on a node**, because rsync into a shared tree is
+not a checkout.
+
+**This is the P-1 cache invariant in another currency.** A bound declared as a
+fixed number, chosen when the thing it bounded was smaller, that cannot admit
+one unit of the work it exists to serve — here one stalled-and-retried
+exchange — and fails silently rather than degrading. The audit list in that
+P-1 is byte counts; **it should be extended to every timeout that is a budget
+for another timeout.** `health_loop`'s round deadline was the instance; the
+same question should be put to every other `dead_after_`-sized window.
+
+**Socket evidence above is superseded (re-read 2026-09-21).** The `SYN-SENT` to
+`78.149.248.154:7437` was es-1 bootstrap-dialling **gbni-1** (`macnessa`, its
+only bootstrap entry) while gbni-1 was down — the ~8 s period is exactly
+`connect_timeout_ms: 2500` + `heartbeat_ms: 5000`, not a stuck loop, and it is
+gone now gbni-1 is back and `ESTAB`. It was never gbni-2. There is no
+`FIN-WAIT-1` in es-1's socket table any more, and **zero no-progress cancels
+since the 0.47.0 restart at 21:46:57 on 2026-09-20** (40 that day before it,
+247 on 2026-09-19). Progress accounting was audited and is sound in both
+directions — `touch()` fires per partial write from the writer and the reader,
+odd/even request ids handled symmetrically on the dialled and accepted paths
+(`src/net.cpp:1492`, `:1574`, `:3330-3337`, `:4143-4149`) — so a 30 s idle
+really does mean zero bytes moved, and that part is still open.
+
+- [x] Root-cause the read-only blink. Done 2026-09-21: a hung health probe was
+  given the whole liveness budget, so it expired the peer it was proving alive.
+- [ ] **Regression test for the probe budget.** The fix went in without one:
+  the stall fixture holds a message type, and a hung `ping` inside
+  `health_loop` needs a different hook. Owed before this item closes.
+- [ ] **The stall itself is still unexplained.** Establish why an exchange
+  moves zero bytes for tens of seconds on a link measured at 13.8 MB/s with 0%
+  loss. It is now a latency question, not an availability one: the blink is
+  fixed whether or not the stall is. Reproduction needs a stall to happen —
+  none since the 0.47.0 restart.
+- [ ] **Do not treat a no-progress cancel as the bug.** That is discipline 2
+  working: the deadline fires instead of waiting forever.
 - [ ] Make an ingest survive a transient read-only window. A ten-second blip
   permanently failing a 6 GB job is the user-visible defect regardless of what
   causes the blip, and it is separable from the transport question.
-- [ ] Stop the forever-dial loop at the offline node, or make it back off.
+- [ ] **`publish_commit` gathers the durability floor serially**
+  (`src/metadata_manager.cpp:751-770`): `store_commit_on` per replica, stopping
+  at `required`, no fan-out and no hedge. The slowest of the first `required`
+  replicas sets the latency of every metadata commit, and a first choice that
+  stalls costs a full deadline before the third node is tried at all. Found
+  2026-09-21 while root-causing the above; not yet addressed.
+- [x] Stop the forever-dial loop at the offline node. Nothing to do: it was
+  ordinary bootstrap of a node that was down, and it stopped when gbni-1
+  rejoined.
 
 ## P0 — A replica that falls behind cannot rejoin: the materialisation cache is smaller than two snapshots (opened 2026-09-20, WORKED AROUND ON ALL THREE NODES, not fixed)
 
@@ -688,6 +849,24 @@ infrastructure defects, one product defect (`RpcServer::stop` executed
 queued requests during shutdown). Details, rates and what is still
 unproven are in the plan. The Pi-only cases remain.
 
+**Two es-1 cases measured 2026-09-21, both load-sensitive, neither yet
+diagnosed.** Named here because the alternative is calling them known flakes:
+
+- `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
+  — fails a full-suite run on
+  `metadata replica set forming: waiting for bootstrap checkpoint survey`,
+  passes 5/5 in isolation.
+- `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`
+  — 1/5 under `--repeat`, which interleaves across parallel slots; 0/10 when
+  run one at a time.
+
+Two full runs of one unchanged tree gave 477/479 and then 479/479, which is
+the whole problem in one line. **Also on this item: a before/after comparison
+on a node must check `macha-tests --list` counts first.** One was read as
+"baseline green, change red" when both runs were the same tree — rsync into a
+shared source tree is not a checkout, and the count difference was the only
+thing that showed it.
+
 Done means: the full suite passes 20 consecutive times on gbni-1 and es-1 at
 CI's real parallelism, no case is documented anywhere as expected to fail
 sometimes, and a red run therefore blocks a deploy. The two cases with
@@ -1005,14 +1184,21 @@ and the rest are unstarted.
 1. ~~**Speed factor.**~~ Shipped in 0.47.0 as `stream.production`. Core has the
    full brief, including the parked-producer trap, and has confirmed it back.
 
-2. - [ ] **The viewer key must be a route parameter.** A client-supplied
-   session key goes **in the route**, as a query parameter, consistent with
-   `idempotency_key` (`src/playback.cpp:2176`). **No non-standard HTTP
-   headers** — the operator was explicit. This is what unblocks the Web
-   Client's handover, which is impossible as currently designed because
-   sessions are keyed on the bearer token.
+2. - [~] **Superseded 2026-09-21 by the playback-session resource P0 at the
+   top of this file.** This item said a *client-supplied* session key should go
+   **in the route as a query parameter**. Both halves were wrong: no identifier
+   in this system is client-generated, and the id belongs in the path, not the
+   query string. The diagnosis it carried was right and survives — handover is
+   impossible because sessions are keyed on the bearer token
+   (`logical_session_for(request.session->id)`, `src/playback.cpp:2288`). The
+   operator's "no non-standard HTTP headers" rule also survives, and is why the
+   stream token stays a path segment. See
+   [the plan](2026-09-21-playback-sessions-as-a-resource-plan.md).
 
-3. - [ ] **Direct-session exemption plus per-account caps.** Direct sessions
+3. - [~] **Absorbed into the playback-session resource P0** (2026-09-21): the
+   cap ships with that work, because removing one-session-per-bearer without it
+   is the DoS. Stated here in the operator's own words, unchanged:
+   **Direct-session exemption plus per-account caps.** Direct sessions
    are exempt from supersession but **still counted against a per-account
    cap**. The constraint that governs the design: *"we need to make sure a
    rogue client cannot under any circumstances launch a media DoS against the
@@ -2418,10 +2604,11 @@ days to 2026-09-20.
 its absence as an incident.
 
 **gbni-2 (inverbeg) was removed from the cluster**, not merely unreachable.
-Verified in both nodes' own `known-nodes.bin`: each lists one known node — the
-other — plus a tombstone for `[inverbeg.macha.network]:7437`,
-`stale=68836f3e0a8b…`, epoch 1, at 18:47:42Z, propagated to both. The 7-second
-dial loop is gone. It was removed because its sshd began offering password
+Verified in both nodes' own `known-nodes.bin` **while the cluster was two
+nodes**: each listed one known node — the other — plus a tombstone for
+`[inverbeg.macha.network]:7437`, `stale=68836f3e0a8b…`, epoch 1, at 18:47:42Z,
+propagated to both. That roster description predates gbni-1 rejoining on
+2026-09-20; the tombstone is the part that still holds. It was removed because its sshd began offering password
 authentication only (`Authentications that can continue: password`) with the
 host key unchanged — the same machine, reconfigured — so it could not be
 deployed to and was four releases behind. **See the first P0 item: this is a
@@ -2433,11 +2620,11 @@ completes a handshake again.**
 `macha.yaml.bak-20260920-matcache`). It is a workaround for the P0 above, not
 a fix, and a fresh node will hit the 128 MiB default again.
 
-**Versions deployed.** es-1 and fi-1 run **0.46.2** (built on es-1 at `-j3`,
-shipped to fi-1 as `/tmp/macha-0.46.2.tgz`, md5 `91091ff928ab…`). Both answer
-`/api/v1/health` 200 with `"version":"0.46.2"` unauthenticated. **0.46.3 is
-tagged but not deployed** — it is documentation only, no binary change, so the
-cluster is not behind in any way that matters.
+**Versions deployed.** All three nodes run **0.47.0** (verified 2026-09-21:
+es-1 answers `/api/v1/health` 200 with `"version":"0.47.0"` unauthenticated,
+macha restarted 21:46:57 on 2026-09-20). The paragraph that stood here said
+0.46.2 and was already stale when the section above it was rewritten the same
+evening — check `/api/v1/health` rather than trusting this line.
 
 **Repository.** `main` and `develop` are both at `cd35f22`, tagged `0.46.3`
 (annotated), both pushed. `0.46.0`, `0.46.1` and `0.46.2` are lightweight
