@@ -130,6 +130,7 @@ configuration, keys, state, cache, spool, mounts and media data.
 | [Release notes](CHANGELOG.md) | [Roadmap](ROADMAP.md) |
 | [Validation](VALIDATION.md) | [Contributing](CONTRIBUTING.md) |
 
-Developed with substantial use of AI-assisted implementation.
+Developed with substantial use of AI-assisted implementation. If this troubles you
+greatly, there are [many alternatives](https://pinggy.io/blog/best_self_hosted_media_servers).
 
 GPL-3.0-or-later. See [`LICENSE`](LICENSE).
