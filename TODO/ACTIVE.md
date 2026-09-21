@@ -140,17 +140,26 @@ The governing laws are:
 3. Control traffic must remain promptly serviceable. Viewer priority is a large
    configurable share (95:5 by default), not indefinite starvation of all other work.
 
-## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, RELEASE READY AS 0.48.0, NOT DEPLOYED)
+## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, DEPLOYED 0.48.0 — joint test outstanding)
 
-**Server side is complete and documented, committed on `develop` as 0.48.0
-(`60d794e`); not tagged, and nothing is deployed.** The tag is deliberately
-held until the full suite has run on es-1, so that the tag names a tree
-verified on the hardware it ships to rather than on a laptop. The cutover is all three nodes at once, on the
-operator's word (2026-09-21), and it is gated on two things outside this
-repository: a published `@machafoundation/core` carrying `410` tolerance, and
-a current web bundle reaching `/etc/macha/web`. Readiness plan, with the
-ordered remainder: [what stands between these routes and the
-cluster](2026-09-21-playback-sessions-deploy-readiness-plan.md).
+**Shipped. 0.48.0 is tagged and running on all three nodes as of 2026-09-21.**
+Full suite green on es-1 at 484/484 before the cutover, built once there and
+shipped as a tarball, all three stopped and started together — not rolling,
+because TEL3 excludes a straggler from gossip rather than letting it misread.
+All three converged at metadata generation 33038, `replicas=3/3 required=2`,
+with exactly one expected `persisted telemetry ignored` per node and no other
+WARN or ERROR across a 15-minute watch. The web client's tolerant bundle went
+out two minutes ahead of the routes, so the intended ordering held.
+
+`max_sessions` was raised 8 to 64 on all three with
+`max_sessions_per_account: 32` written explicitly. That is what makes
+`account_session_limit` reachable at all: the two caps are enforced four lines
+apart in `reserve_session_slot`, node-wide first, so a per-account cap above
+the node-wide one can never fire.
+
+**What is left is the joint test**, Phase E of the [readiness
+plan](2026-09-21-playback-sessions-deploy-readiness-plan.md). Nothing in this
+repository blocks it.
 
 **This is the active work.** Agreed with the operator on 2026-09-21. Full
 specification: [playback sessions as a
@@ -268,11 +277,9 @@ three live nodes run 8.
   telemetry format is TEL3 with no compatibility, so a node left behind is
   excluded from gossip rather than misreading it — which is the intended
   behaviour, and the reason the cutover is not rolling.
-- [ ] Raise `max_sessions` node-wide on all three nodes, above
-  `max_sessions_per_account`, and write both numbers explicitly into each
-  config. All three run 8 today, which makes the account cap unreachable. The
-  keys reload live and a 0.47.0 binary ignores the unknown one, so this can go
-  in before the cutover.
+- [x] Raise `max_sessions` node-wide above `max_sessions_per_account` and
+  write both explicitly — done 2026-09-21, all three at 64/32, verified
+  against the pre-change backups.
 - [ ] Joint test with the clients afterwards, co-ordinated by core. One thing
   worth getting: a mode switch on a moved node, watched from a client, to make
   a real `410 generation_superseded` and see it classified. No amount of
