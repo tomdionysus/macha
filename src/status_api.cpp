@@ -379,6 +379,18 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_max_sessions_per_account)
             playback["max_sessions_per_account"] =
                 static_cast<uint64_t>(live->playback_max_sessions_per_account);
+        // The node-wide cap beside the per-account one. 0.48.0 shipped the
+        // second without the first, which left the two 429s asymmetric where
+        // it mattered: a client could say "another screen on this account is
+        // playing" and could not say "this node is full".
+        if (live->playback_max_sessions)
+            playback["max_sessions"] = static_cast<uint64_t>(live->playback_max_sessions);
+        // How long this node lets a session hold a transcode entitlement with
+        // no stream activity. A client pausing for longer must refresh it --
+        // a playlist fetch is enough -- or reacquire on resume and risk a 429.
+        if (live->playback_transcode_entitlement_idle_ms)
+            playback["transcode_entitlement_idle_ms"] =
+                static_cast<uint64_t>(live->playback_transcode_entitlement_idle_ms);
     }
     node["playback"] = std::move(playback);
     node["identity_association_reset"] =
