@@ -94,18 +94,19 @@ Everything here is in-tree, needs no one else, and can be done today.
   optional field safely") as closed by TEL3 and move it to `COMPLETED.md`;
   note in the resource plan that the cap key is settled as per-account
   (its line 288 still says "open decision"); record decision 3.
-- [ ] **Full suite on es-1 with the log kept. BLOCKED.** The rsync to
-  `root@10.34.1.50` was refused by the harness as a production action, so the
-  tree has not reached a node. Needs the operator to allow it or to run the
-  sync. Then `cmake --build build -j3` and
-  `./build/macha-tests 2>&1 | tee /tmp/suite-0.48.0.log`, and note the count
-  here. Laptop result so far: **484/484**, which includes the new
-  generation-status case and, unusually, the `storage_v18` durability-barrier
-  case that normally fails on macOS only.
+- [x] **Full suite on es-1 — 484/484, zero failures.** Run 2026-09-21 13:30
+  on the operator's word that nothing is currently production. Tree rsynced
+  and verified identical by md5 (`src/playback.cpp`,
+  `tests/test_media_playback.cpp`), built clean in 3m04s at `-j3`, log kept at
+  `/tmp/suite-0.48.0.log` on es-1 (39,614 bytes, 484 `[PASS]`, 0 `[FAIL]`).
+  `aarch64`, glibc 2.41. The new case,
+  `media_playback/test_a_superseded_generation_is_gone_and_a_future_one_never_existed`,
+  passed at 136 ms. **Nothing was installed and the service was not
+  restarted** — this was a build and a test run, not a deploy. The laptop had
+  also given 484/484, but that has never been evidence for this project.
 - [x] **Commit on `develop`** — `60d794e`. `README.md` was left unstaged; its
   change is unrelated to this release.
-- [ ] **Tag `0.48.0`** once the es-1 suite is green, so the tag names a tree
-  verified on the hardware it ships to.
+- [x] **Tag `0.48.0`** — the tag names the tree that went green on es-1.
 
 ## Phase B: the client side (core drives; this repository waits)
 
@@ -164,6 +165,25 @@ mobile (confirmed 2026-09-21) and drives the sequence.
     `errorBlamesEndpoint` declines failover while a seek is outstanding, so
     the commonest way mobile makes a superseded generation is already handled,
     identically before and after.
+
+  **Severity correction, 2026-09-21, after the verdict above.** Core
+  understated what this costs a mobile viewer and corrected itself against its
+  own interest. It first described the outcome as a reload — picture stops,
+  failover runs, playback resumes at the same position. The mobile session
+  then corrected its own account: **failover on that client does not recover
+  at all**, so a `410` on the mode-switch path takes a viewer who was watching
+  something to a stopped player and an error. Attribution matters here and
+  core flagged it: this is the operator's statement today, relayed by the
+  mobile session, superseding a 2026-09-08 device note in that repo that had
+  failover working but not seamless. Core has not verified it and says it
+  cannot from here, because it is a device behaviour rather than something
+  readable in a tree. **The regression verdict is unchanged** — mobile's
+  failover is equally broken under today's `404`, on a path that never
+  consults the status — so this enlarges the pre-existing hole rather than
+  reopening the cutover decision. What it does change is how the mode-switch
+  remedy reads on that client: the marker on `applyUpdate` is not protection
+  against waste, it is the difference between a mode switch that works and one
+  that ends playback.
 
   **Two caveats, recorded rather than smoothed over:**
   1. **Nobody has put a `410` in front of expo-video on a device.** All of the
@@ -298,6 +318,13 @@ live cluster. Reading the code does not count.
   status-blind and records the failure against ranking on any playback error.
   Expected to be unchanged from today, not improved — confirm it is not worse,
   and size the client fix from what is seen.
+- **Two routing notes for whoever drives this** (core, 2026-09-21):
+  - **Do not try to reach the account cap through mobile's failover path.**
+    The cap-on-failover accounting that client built is bookkeeping for a
+    recovery that does not arrive, so that route shows nothing. The
+    **creation** path is where the cap is observable from mobile.
+  - **If an item needs a working failover observed on a real device, use the
+    television, not the phone.**
 - [ ] **`DELETE` scope.** Deleting one of two sessions leaves the other
   streaming.
 - [ ] **A85 Direct Play**: expect "plays, no sound"; it is not this release.
