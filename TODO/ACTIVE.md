@@ -423,33 +423,6 @@ each node's listing at start — is the right shape and covers force-stop, crash
 OOM and background reaping; reinstall, cleared storage and non-our clients are
 what the node's timers are for.
 
-## P0 — One abandoned session holds a node's only transcode slot for 30 minutes (opened 2026-09-21)
-
-fi-1, day of the cutover: **57 session creates, 0 DELETEs**, 18 creates in the
-last 30 minutes alone. No client deletes its sessions — not one, all day,
-across four client sessions. With `session_idle_ms` at 30 minutes the node
-carries roughly 18 live sessions nobody wants.
-
-**The server is not leaking.** Expiry works and returns the slot. The defect is
-the interval: with `max_video_transcodes: 1`, one abandoned session that once
-transcoded denies transcoding to the whole node for up to half an hour. That is
-mobile's seven `resource_limit` refusals, TV's wall, and the web client's
-mode switch refusing itself.
-
-**The part that is ours.** A pipeline is reclaimed after 60 s *because no
-stream request arrived* — the server has already concluded nobody is watching.
-That same evidence may not release the transcode entitlement, which outlives it
-thirtyfold. The contract in `docs/streaming.md` is deliberate and the reasoning
-is sound (an entitlement evaporating on reclamation would break
-resume-after-pause against a busy node), but on a node admitting **one**
-transcode the cost of that guarantee is the entire node.
-
-- [ ] Decide: should reclamation release the entitlement when the node is at
-  its transcode limit, reacquiring on resume and accepting a refusal then? That
-  trades a certain 30-minute outage for a possible refusal at resume.
-- [ ] Separately, every client needs to `DELETE`. Client-side, and not a fix
-  for this.
-
 ## P0 — The block cache cannot be observed, and may never have served a read (opened 2026-09-21)
 
 **Not "the cache is broken" — "nothing in this system could tell us if it

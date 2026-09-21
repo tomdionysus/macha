@@ -310,6 +310,74 @@ law 1.
 
 Collated evidence from all four clients:
 [what the clients report](2026-09-21-what-the-clients-report-against-0.48.0.md).
+
+## One abandoned session held a node's only transcode slot for 30 minutes — fixed in 0.48.1, deployed 2026-09-21
+
+Opened and closed the same day. A transcode entitlement was held until the
+session was erased, so it outlived its own pipeline by `session_idle_ms`:
+thirty minutes against sixty seconds. With `max_video_transcodes` at 1, one
+client that crashed, was force-stopped or was reaped in the background closed
+that node to transcoding for everybody for half an hour.
+
+Measured on fi-1 the day 0.48.0 shipped: 57 session creates, zero deletes, and
+three separate client sessions refused a transcode by a node nobody was
+competing for.
+
+**The fix, on the operator's decision, taking core's threshold over the one
+originally proposed here.** The entitlement is released after
+`streaming.transcode_entitlement_idle` — five minutes by default — of no
+*stream* activity, and reacquired on resume where it may be refused. Releasing
+it at pipeline reclamation instead, which was the first implementation, was
+kinder to the node and crueller to the viewer: a sixty-one second pause could
+lose the slot wherever anything else wanted it, and at one transcode per node
+that is any second viewer at all.
+
+Keyed on stream activity rather than control traffic, on the operator's
+wording, which makes the client contract one sentence: ask for a stream object
+inside the window — a playlist fetch is enough — or reacquire on resume and
+risk a 429. Polling the session keeps the session alive and is deliberately not
+evidence that anyone still wants media.
+
+The release is per session: it clears only what that logical viewer holds and
+is skipped entirely while any sibling session shares it.
+`transcode_entitlement_idle_ms` rides telemetry to the per-node status block so
+a client can time its keep-alive against the node it is actually on.
+
+**What it does not fix, and why the client-side work still matters:** it bounds
+the damage from thirty minutes to five. The session still occupies
+`max_sessions` and the per-account cap until `session_idle`, and an orphan is
+still the precondition for the unreproduced stale-session 503. The cause of the
+orphans themselves turned out to be one bug in core — `stop()` returning
+silently when an in-process map entry was missing, discarding every client's
+cleanup — fixed at core `61e4d74` the same evening.
+
+## P0 — One abandoned session holds a node's only transcode slot for 30 minutes (opened 2026-09-21)
+
+fi-1, day of the cutover: **57 session creates, 0 DELETEs**, 18 creates in the
+last 30 minutes alone. No client deletes its sessions — not one, all day,
+across four client sessions. With `session_idle_ms` at 30 minutes the node
+carries roughly 18 live sessions nobody wants.
+
+**The server is not leaking.** Expiry works and returns the slot. The defect is
+the interval: with `max_video_transcodes: 1`, one abandoned session that once
+transcoded denies transcoding to the whole node for up to half an hour. That is
+mobile's seven `resource_limit` refusals, TV's wall, and the web client's
+mode switch refusing itself.
+
+**The part that is ours.** A pipeline is reclaimed after 60 s *because no
+stream request arrived* — the server has already concluded nobody is watching.
+That same evidence may not release the transcode entitlement, which outlives it
+thirtyfold. The contract in `docs/streaming.md` is deliberate and the reasoning
+is sound (an entitlement evaporating on reclamation would break
+resume-after-pause against a busy node), but on a node admitting **one**
+transcode the cost of that guarantee is the entire node.
+
+- [ ] Decide: should reclamation release the entitlement when the node is at
+  its transcode limit, reacquiring on resume and accepting a refusal then? That
+  trades a certain 30-minute outage for a possible refusal at resume.
+- [ ] Separately, every client needs to `DELETE`. Client-side, and not a fix
+  for this.
+
 ## The HTTP server without a thread per connection — 0.43.0, cluster UAT passed 2026-09-20
 
 Plan: [the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).
