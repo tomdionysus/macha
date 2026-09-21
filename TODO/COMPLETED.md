@@ -69,6 +69,247 @@ garbage and be believed. Nobody has looked for that case.
 - [ ] Until then, treat "add a telemetry field" as requiring both nodes to be
   upgraded together, and say so wherever that pattern is documented.
 
+
+## "AC-3 copied into fMP4 stalls the node" — NOT A SERVER DEFECT, closed 2026-09-21 the day it was opened
+
+**Three client sessions independently concluded the server could not copy
+(E-)AC-3 into fragmented MP4. They were wrong, and so was every mechanism I
+proposed for it.** Closed by a controlled reproduction on fi-1 with libav
+raised to VERBOSE, coordinated with the web client, against the real title on
+the real node.
+
+**The measurement that settled it.** Session `ed9b9eb7...`, trace `160e80a0`,
+a true copy plan (`mode=remux rank=1`, the negotiator did not decline it):
+
+```
+18:45:44 pipeline start mode=remux
+18:45:44 first fragment ready elapsed_ms=48 segments=1
+18:45:44 pipeline startup complete elapsed_ms=48
+```
+
+**48 milliseconds** against a 15,000 ms budget — faster than the AAC control's
+89 ms. Zero errors on the node. And then **no stream request ever arrived** for
+that session.
+
+**The actual cause, from the client's browser:**
+
+```
+MediaSource.isTypeSupported('audio/mp4; codecs="ac-3"')     -> false
+MediaSource.isTypeSupported('audio/mp4; codecs="ec-3"')     -> false
+MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"') -> true
+```
+
+hls.js parsed the manifest, MSE rejected the audio codec, and it never asked
+for media. The element sat at `readyState` 0 while the player's own status line
+correctly showed the plan the server had built. The "six non-fatal then two
+fatal errors" arrived ~39 s later, long after the pipeline was ready: hls.js
+failing on the manifest, not a fetch that failed. The client had asked the
+server to copy audio its browser cannot decode.
+
+**Four hypotheses died here, all mine, none of which reached the code:**
+
+1. **`delay_moov` / AC-3 cannot fill `dac3` on a copy.** Killed by experiment
+   on es-1 before any client run: ffmpeg with macha's exact movflags copies
+   AC-3 into fMP4 happily, and refuses with *"Cannot write moov atom before AC3
+   packets"* **only when `delay_moov` is removed**. The flag is the fix and it
+   works. Core independently killed it from the source with the better
+   argument: the mechanism contradicted the comments it cited, because if a
+   copy never produced a parsed packet then the 2026-09-07 fix could not have
+   worked, as it works by waiting for that packet.
+2. **AC-3 vs AAC in fMP4 generally.** A probe replicating macha's exact muxer
+   configuration — `delay_moov` **and** `frag_custom` **and** a custom
+   `AVIOContext` — produced a first fragment for both codecs, from the real
+   failing title through macha's own mount, in 0.73 s.
+3. **A supersession/PATCH defect with WAN contention.** Built on 8-of-8
+   timeouts being on `PATCH` and none on create. Real split, but a sampling
+   artefact: every create the clients made that day happened to transcode
+   audio and every PATCH happened to copy it. Killed when the phone saw the
+   same failure at *create* on a node that owns its extents.
+4. **The first cut consumed by the delayed moov.** A comment at
+   `media_engine.cpp:1435` says a flush writing the moov produces no moof, so
+   the first published fragment would need a second keyframe-aligned cut.
+   Measured: both codecs publish on cut 1.
+
+**Why it is worth this much space.** The symptom was reproduced by three
+independent clients on three codebases and the correlation with the audio codec
+was perfect. It was still not a server defect. Every mechanism that fitted the
+symptom was wrong, and the only thing that settled it was instrumenting the
+running node and reading what it actually did.
+
+The standing rule that came out of it, from the web client and worth borrowing:
+**do not treat a direct-play stall as a node fault without first checking what
+the element is actually pointed at.**
+## P0 — Copying (E-)AC-3 into fragmented MP4 never produces a first fragment (opened 2026-09-21)
+
+**Supersedes the supersession theory below, which was wrong.** A controlled
+experiment from the web client, relayed by core, split it cleanly: on one node,
+minutes apart, both created in `direct` and switched by `PATCH`:
+
+- **H.264 + AAC stereo → remux with audio COPIED: works.** Plays, `FMP4`,
+  `generation-update-ready`.
+- **H.264 + AC-3 stereo → remux with audio COPIED: never plays.**
+  `readyState` 0, position 0, six non-fatal hls errors over ~35 s, two fatal
+  at ~59 s.
+
+So remux is not broken and the `PATCH` path is not broken. **Copying (E-)AC-3
+into fMP4 is what does not complete.** The phone sees the same family at
+*create* — `503 playback_pipeline_start_failed`, "timed out waiting for first
+fragmented-MP4 segment", four attempts across **two different nodes**, every
+one AC-3 or E-AC-3 (2010 AC3 5.1, Avatar EAC3 5.1). Two nodes matters: it
+retires the WAN-contention hypothesis, since one of them owns its extents.
+
+**RETRACTED 2026-09-21, by experiment, before any code was changed. The
+`delay_moov` mechanism below is WRONG and is kept only so nobody re-derives
+it.** Two controlled experiments on es-1, against the same libavformat 61 the
+server links:
+
+1. **ffmpeg CLI, macha's exact movflags.** AAC copy into fMP4 with
+   `delay_moov`: works. **AC-3 copy into fMP4 with `delay_moov`: works**,
+   2.3 MB of output. AC-3 copy *without* `delay_moov`: fails with
+   `"Cannot write moov atom before AC3 packets. Set the delay_moov flag to fix
+   this."` — which confirms the comment is correct and the flag is doing its
+   job.
+2. **A probe replicating macha's muxer configuration exactly** — `delay_moov`
+   **and** `frag_custom` and a custom `AVIOContext`, which is the part the CLI
+   cannot reproduce. Both AAC and AC-3 wrote zero bytes at
+   `avformat_write_header` (identical, so the deferred moov is not
+   codec-specific) and both produced a first fragment on the first explicit
+   flush: AAC 3,797 bytes, AC-3 1,296 bytes.
+
+**So AC-3 muxes into fragmented MP4 correctly in macha's own configuration,
+and the mux path is not where this fails.** Core independently reached the
+same conclusion from the source, pointing out that the mechanism contradicted
+the very comments it cited: if an AC-3 copy never produced a parsed packet,
+the 2026-09-07 fix could not have worked, because it works by waiting for
+exactly that packet.
+
+**What the experiments do NOT rule out**, stated so the next attempt starts in
+the right place: both read a file from local disk rather than through macha's
+own source IO, and both used a substitute AC-3 title rather than the two that
+actually failed (2010, AC3 5.1; Avatar: Fire and Ash, EAC3 5.1), which are not
+on the node tested. A 5.1 layout, or the DHT-backed read path, remain
+untested.
+
+**The symptom is solid; only the explanation was not.** Three clients
+reproduced AAC-copy-works against AC-3-copy-stalls on one node within minutes,
+and the television measured `elapsedMs 15051.5` against that node's advertised
+15,000 ms budget — `wait_for_initial_fragment` timing out exactly.
+
+The superseded reasoning follows.
+
+**The mechanism is in a comment this repository already carries.**
+`src/media_containers.cpp:93-96` states it: *"(E-)AC-3 needs the muxer to parse
+a packet before it can write the dac3/dec3 sample-entry box, which is what
+`delay_moov` does. Measured on this libavformat: without it the header write
+fails 'Invalid argument' (the 503s of 2026-09-07)."* And
+`src/media_engine.cpp:1358-1366` sets `delay_moov` on **every** fMP4 output,
+not only for those codecs.
+
+So for an AC-3 **copy** there is no decoder and no parse step of our own, the
+muxer defers `moov` until it can fill `dac3`/`dec3` from a parsed packet, and
+if that never happens the init segment is never written — no init, no first
+fragment, and `wait_ready(startup_timeout)` returns false. That matches the
+throw site exactly: `src/playback.cpp:1578` is reached only when the wait
+failed **and** `state.error` is empty **and** the pipeline is still running.
+Not a mux rejection, which would have said "libav pipeline failed before first
+fragment"; not an exit, which would have said "ended before first fragment".
+Alive, no error, no fragment.
+
+**THERE IS A SECOND, UNRELATED CAUSE OF THE IDENTICAL MESSAGE, and it is a
+confound for the evidence above** (Android TV, 2026-09-21). That session
+force-stopped its app mid-playback, leaving an orphaned session on
+`10.35.1.50` for `tmdb:movie:583`. Relaunching and playing **the same title on
+the same node** then failed with the same error — `POST` this time,
+`elapsedMs 15026.8`, `503`, "timed out waiting for first fragmented-MP4
+segment" — on a plan of **video copy + audio transcode**. No AC-3, no remux, no
+audio copy anywhere in it. Deleting the orphan and replaying the same title on
+the same node succeeded immediately.
+
+n=1 each way and that session claims no mechanism. Neither do I, but one
+candidate is ruled out already: **it is not the probe coalescing path**, which
+throws its own distinct "timed out waiting for concurrent media inspection"
+(`src/playback.cpp:1225`) rather than this message. What an orphaned session
+holds that a *second session for the same media* then waits on is the open
+question — retained memory held by a pipeline that was not yet reclaimed is a
+candidate worth eliminating first, since it would stall without recording an
+error, which is what the throw site requires.
+
+**Consequences for the AC-3 investigation, which matter more than the second
+bug itself:**
+- The phone's four AC-3 failures are not clean evidence until it is known
+  whether they left orphans behind — that is exactly how the television
+  produced this one. Ask before treating four attempts as four data points.
+- "Timed out waiting for first fragmented-MP4 segment" is now known to have at
+  least two causes. Do not attribute an instance to `delay_moov` without
+  checking the node for a live session on the same media.
+- It is the same family as the entitlement work above: an orphan holding
+  resources for one media, rather than an orphan holding the node's only
+  transcode slot.
+
+- [ ] Establish what a second session for one media waits on when an earlier
+  session for that media is still live. Retained memory first.
+
+- [x] ~~Find out whether `moov` is ever written.~~ Done by experiment: it is,
+  for both codecs, in macha's exact configuration. Not the question.
+- [ ] Reproduce with the **actual failing media** — a 5.1 (E-)AC-3 title —
+  and through **macha's own source IO** rather than a local file. Both were
+  substituted in the experiments above and both are untested.
+- [ ] Then instrument the pipeline rather than the muxer: if libav writes a
+  fragment when driven directly, the question is what macha's cut logic or
+  first-fragment wait does differently on these sources.
+- [ ] If the muxer needs a parsed frame we are not giving it, attach a parser
+  or a bitstream filter on the AC-3 copy path.
+- [ ] **Second, separable defect: plan selection is not deterministic.** The
+  same Remux request produced `VIDEO COPY` + `AUDIO TRANSCODE · AC3 → AAC`
+  once and a true `REMUX · ENG · AC3` copy minutes later on the same node —
+  and **the one that played is the one that declined to copy**. If declining
+  is correct, the bug may be that it sometimes does not decline.
+  `max_audio_transcodes` is 4 on these nodes and the entitlement is per logical
+  viewer, so slot availability differs between two attempts seconds apart and
+  is a candidate for what selects between the plans.
+- [ ] Until then, `carriage_facts` claims `ac3`/`eac3` are fMP4-copyable
+  (`src/media_containers.cpp:115-116`) and `docs/streaming.md` repeats it. If
+  the copy cannot be made to work, that claim is what is wrong and MPEG-TS is
+  the documented route for those codecs.
+
+**Ruled out and worth not re-chasing:** the web client's two remux *seek*
+failures carrying the same message were `VIDEO COPY` + `AUDIO TRANSCODE` on
+HEVC + E-AC-3 — audio not copied — so they are a poor match and probably a
+separate fault.
+
+## P0 — The first-fragment timeout on PATCH: LARGELY SUPERSEDED, see the AC-3 item above (opened 2026-09-21)
+
+**Eight first-fragment timeouts on fi-1 on the day of the 0.48.0 cutover.
+All eight on `PATCH`. None on create**, on a node that served 18 successful
+creates in one 30-minute window. Reported independently by all four client
+sessions as a seek failure, which it is — a large seek is a `PATCH` — and none
+of them could see that creation never fails the same way.
+
+The replacement path marks the outgoing generation superseded but does not stop
+it before starting the replacement (`src/playback.cpp:2734-2744`), and the
+comment there says so deliberately: the old generation must keep serving until
+the new one can. So both pipelines are alive during the handover. On a node
+that owns its extents the second one reads from local disk and wins easily. On
+fi-1, which owns none, **both pull 4 MiB stripes across the WAN at 772-3431 ms
+each** against a 15 s startup budget.
+
+Viewer-visible: a control freezes for a quarter of a minute and then errors.
+Clients recover, sometimes unaided, so it is survivable — but the viewer is
+waiting behind a generation they have already abandoned, which is governing
+law 1.
+
+- [ ] **First: run a PATCH seek on es-1 or gbni-1**, which own their extents.
+  If the timeout does not reproduce there, it is WAN contention during the
+  handover window and not supersession being too expensive. **Change nothing
+  before this experiment** — the mechanism above is inferred from code and
+  timings, not instrumented.
+- [ ] Then decide whether the outgoing pipeline should still be drawing WAN
+  bandwidth once its replacement is committed.
+- [ ] Do **not** just raise `startup_timeout_ms` on fi-1. It makes the viewer
+  wait longer to be told the same thing.
+
+Collated evidence from all four clients:
+[what the clients report](2026-09-21-what-the-clients-report-against-0.48.0.md).
 ## The HTTP server without a thread per connection — 0.43.0, cluster UAT passed 2026-09-20
 
 Plan: [the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).
