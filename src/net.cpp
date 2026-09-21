@@ -2699,10 +2699,20 @@ void RpcClient::health_loop(std::stop_token stop) {
         TransportLane lane;
         std::optional<AsyncRpc> rpc;
         Clock::time_point deadline;
+        Clock::time_point attempt_started;
         Clock::time_point next_attempt;
         std::string last_error;
         bool done{};
     };
+
+    // Discipline 2 for the probe itself. A ping that never answers used to be
+    // held until the round deadline, which is dead_after -- so the one attempt
+    // consumed the whole liveness budget and the peer expired at the instant
+    // the probe was abandoned, with no retry able to land first. A third of
+    // the budget leaves room for the 50 ms retry path below to establish
+    // health twice more before the peer is declared dead.
+    const auto probe_attempt_budget =
+        std::max(dead_after_ / 3, std::chrono::milliseconds(100));
 
     uint64_t lane_wakeups_seen = lane_wakeups_.load(std::memory_order_acquire);
     auto last_probe_round = Clock::time_point{};
@@ -2753,10 +2763,10 @@ void RpcClient::health_loop(std::stop_token stop) {
         const auto started = Clock::now();
         for (const auto& [peer, endpoint] : active_peers)
             probes.push_back({peer, endpoint, TransportLane::control, std::nullopt,
-                              started + dead_after_, started, {}, false});
+                              started + dead_after_, started, started, {}, false});
         for (const auto& [peer, endpoint] : data_peers)
             probes.push_back({peer, endpoint, TransportLane::data, std::nullopt,
-                              started + dead_after_, started, {}, false});
+                              started + dead_after_, started, started, {}, false});
 
         size_t remaining = probes.size();
         while (remaining && !stop.stop_requested()) {
@@ -2801,8 +2811,22 @@ void RpcClient::health_loop(std::stop_token stop) {
 
                 if (probe.rpc) {
                     if (probe.rpc->wait_for(std::chrono::milliseconds(0)) !=
-                        std::future_status::ready)
+                        std::future_status::ready) {
+                        if (now - probe.attempt_started < probe_attempt_budget)
+                            continue;
+                        // Abandon this attempt, not the peer. The retry below
+                        // still has most of the liveness budget to work with,
+                        // and a ping that answers on the second attempt must
+                        // not cost the peer its membership.
+                        probe.rpc->cancel();
+                        probe.rpc.reset();
+                        probe.last_error =
+                            "ping made no progress for " +
+                            std::to_string(probe_attempt_budget.count()) + " ms";
+                        probe.next_attempt = now + std::chrono::milliseconds(50);
+                        progressed = true;
                         continue;
+                    }
                     progressed = true;
                     try {
                         auto reply = probe.rpc->get();
@@ -2850,6 +2874,7 @@ void RpcClient::health_loop(std::stop_token stop) {
                                                            MessageType::ping, {},
                                                            FrameType::control));
                     }
+                    probe.attempt_started = now;
                     progressed = true;
                 } catch (const std::exception& error) {
                     probe.last_error = error.what();
