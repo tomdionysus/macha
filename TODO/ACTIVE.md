@@ -2465,6 +2465,30 @@ work needed for any of these.
 
 ## What the client sessions now depend on (settled 2026-09-13)
 
+**Mobile walks and charges healthy nodes on any mid-stream player error, and
+has done all along** (core, 2026-09-21). This is not a contract and not a
+request; it is a standing client defect the server session needs to know
+about, because it shapes what node-health evidence from a mobile viewer is
+worth. macha-client-rn has no status-to-kind mapping at the player layer at
+all — playback errors arrive through expo-video's `statusChange` as a message
+string with no code — so on `status === 'error'` the provider calls
+`failoverSource` unconditionally, picks another node, and **records a failure
+against the node it left**. A routine superseded generation therefore costs a
+healthy node a mark in that client's ranking.
+
+`410`'s axes (`node_healthy: true`, `alternative_may_succeed: true`) exist to
+prevent exactly this and mobile cannot read them. **0.48.0 does not cause it
+and does not worsen it** — mobile is equally blind to the `404` it gets today,
+and core verified there is no status-dependent branch anywhere on that path —
+but the release makes it legible. Two consequences worth holding:
+
+- **Do not read a mobile client's endpoint-failure record as evidence about a
+  node.** It may be a seek that regenerated, not a fault.
+- The fix is client work, scheduled by core. The seek case is usually already
+  invisible (`repositionTo` repoints before refetching, and
+  `errorBlamesEndpoint` declines failover while a seek is outstanding), so the
+  exposure is mid-stream errors that are not seeks.
+
 Negotiated with the `@machafoundation/core` session and relayed by it to the
 web, Android TV and mobile clients. None of it exists anywhere else in this
 repository, and a server change that breaks one of these breaks four clients at
