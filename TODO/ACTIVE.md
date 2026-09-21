@@ -1250,7 +1250,8 @@ diagnosed.** Named here because the alternative is calling them known flakes:
 
 - `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly`
   — **1 failure in 20 on es-1, measured 2026-09-21.** Not previously recorded.
-  Surfaced as 1/485 in a full suite and is intermittent in isolation at 5%.
+  Did not fire once in the 1,455 executions below, so 5% is an upper bound and
+  the true rate may be lower.
 - `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`
   — fails a full-suite run on
   `metadata replica set forming: waiting for bootstrap checkpoint survey`,
@@ -1267,12 +1268,38 @@ diagnosed.** Named here because the alternative is calling them known flakes:
   and how it has been mistaken for load sensitivity every time it has been
   seen.
 
-  **Deprioritised by the operator, 2026-09-21: "torrents are flaky but lower
-  priority."** So the 35% is recorded, not urgent. What it is still worth is
-  this: when reading a full-suite result on a node, a single failure in this
-  case carries no information — expect it roughly one run in three and do not
-  spend time on it, and do not let it be the reason a green run is called red.
-  When this item *is* worked it remains the cheapest case to reproduce.
+  **Lower priority than the rest of this list, per the operator (2026-09-21) —
+  but not acceptable, and not a "known flake".** The operator's correction the
+  same day, after this file and several reports had started treating
+  intermittents as a standing category: *"No known intermittents. We're not
+  Microsoft."* The distinction is scheduling, not tolerance. This gets fixed;
+  it does not get fixed first.
+
+  It also remains the cheapest case in this section to reproduce, which is why
+  it should be taken first when the section is worked.
+
+**Where this section actually stands, measured rather than recalled
+(2026-09-21).** Three consecutive full suite runs on es-1 at `bd49895`:
+**1,455 test executions, 1 failure**, and it was the torrent case at 1/3.
+Nothing else in this section fired at all.
+
+That is a far better position than the running commentary in this file and in
+several reports suggested — "two known intermittents" was being repeated as a
+footnote when the measured position was one case failing one run in three and
+everything else quiet. **The lesson is about reporting, not about the suite:**
+a failure named and carried forward stops being counted, and a suite whose
+failures are pre-excused cannot tell anyone anything. Measure, name the rate,
+and fix it — do not build a category called "known".
+
+The remaining known-bad rates, all to be driven to zero:
+
+| case | rate | where |
+|---|---|---|
+| `rpc_cluster/.../ingest_torrent_jobs_visible...` | 7/20 in isolation, 1/3 full runs | es-1 |
+| `http_server/.../closes_mid_body...` | <= 1/20, did not fire in 1,455 | es-1 |
+| `storage_v18/.../durability_barrier_reports_objects...` | 10/20 | macOS only, green on es-1 |
+| `storage_v18/.../durability_barrier_rederives_placement...` | intermittent | macOS only, green on es-1 |
+| `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; did not fire in 1,455 on es-1 |
 
 Two full runs of one unchanged tree gave 477/479 and then 479/479, which is
 the whole problem in one line. **Also on this item: a before/after comparison
