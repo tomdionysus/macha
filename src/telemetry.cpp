@@ -7,6 +7,7 @@
 #include "log.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <thread>
 #include <ctime>
 #include <fstream>
@@ -20,7 +21,12 @@
 
 namespace macha {
 namespace {
-constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'T', 'E', 'L', '1'};
+// TEL3: the tagged, length-delimited format introduced in 0.48.0. The magic
+// changes with the format, so a node speaking the old positional one rejects
+// the set outright -- "bad telemetry set" -- rather than misreading it. There
+// is deliberately no compatibility with TEL1 or TEL2: every node moves at
+// once, and a half-understood record is worse than a refused one.
+constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'T', 'E', 'L', '3'};
 constexpr size_t max_persisted_records = 1024;
 
 uint64_t resident_bytes() {
@@ -69,112 +75,276 @@ uint32_t load1_milli() {
     return static_cast<uint32_t>(std::min<double>(load * 1000.0, UINT32_MAX));
 }
 
+// A telemetry record is a sequence of tagged, length-delimited fields inside
+// a length-delimited record. Nothing about it is positional.
+//
+// It was positional until 0.48.0: fields were appended in order, optional
+// trailing ones were detected by asking the reader whether any bytes were
+// left, and adding a field meant another level of nested "if there is more".
+// That works between peers of one version and fails across two, which is the
+// only time it matters. A newer sender's record carries bytes an older reader
+// does not know to consume, so in a SET -- up to 64 records on the gossip
+// path -- the older reader begins the next record part-way through the
+// previous one and every record after it is garbage. One added field cost a
+// mixed-version cluster every multi-node telemetry set it exchanged, for as
+// long as the versions differed.
+//
+// With tags and lengths: an unknown field is skipped by its own length, a
+// missing field keeps its default and means "this node did not say", and the
+// record length says where the next record starts regardless of what either
+// side understood. Fields may be added, and versions may differ, without a
+// flag day.
+enum TelemetryFieldId : uint16_t {
+    field_node_id = 1,
+    field_boot_id = 2,
+    field_sequence = 3,
+    field_observed_unix_ms = 4,
+    field_version = 5,
+    field_host = 6,
+    field_failure_domain = 7,
+    field_port = 8,
+    field_storage_capacity = 9,
+    field_storage_used = 10,
+    field_cache_capacity = 11,
+    field_cache_used = 12,
+    field_metadata_generation = 13,
+    field_uptime_ms = 14,
+    field_rss_bytes = 15,
+    field_process_cpu_milli_percent = 16,
+    field_load1_milli = 17,
+    field_storage_backends_online = 18,
+    field_peers_known = 19,
+    field_peers_active = 20,
+    field_rpc_connections_created = 21,
+    field_rpc_connections_reused = 22,
+    field_rpc_connections_canonical = 23,
+    field_phase = 24,
+    field_api_endpoint = 25,
+    field_cpu_cores = 26,
+    field_memory_total_bytes = 27,
+    field_playback_startup_timeout_ms = 28,
+    field_playback_segment_timeout_ms = 29,
+    field_playback_pipeline_idle_ms = 30,
+    field_playback_session_idle_ms = 31,
+    field_playback_max_sessions_per_account = 32,
+};
+
+void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
+    if (value.size() > std::numeric_limits<uint16_t>::max())
+        throw std::runtime_error("telemetry field too large");
+    writer.u16(id);
+    writer.u16(static_cast<uint16_t>(value.size()));
+    writer.raw(value);
+}
+
+// Absence already means "this node did not say", and a default-valued field
+// says nothing a decoder would not have assumed -- every record decodes into a
+// freshly defaulted struct, never merged into a previous one. So a zero or an
+// empty string is simply left out. On a node with streaming disabled, an edge
+// node holding no extents, or one with an empty cache, that is most of the
+// record; at up to 64 records a set, it is the difference between a gossip
+// message and a large one. Nothing is lost: a reader cannot distinguish an
+// omitted zero from a transmitted one, because they mean the same thing.
+template <typename T> void put_uint(Writer& writer, uint16_t id, T value) {
+    if (value == T{})
+        return;
+    Writer body;
+    if constexpr (sizeof(T) == 8)
+        body.u64(static_cast<uint64_t>(value));
+    else if constexpr (sizeof(T) == 4)
+        body.u32(static_cast<uint32_t>(value));
+    else if constexpr (sizeof(T) == 2)
+        body.u16(static_cast<uint16_t>(value));
+    else
+        body.u8(static_cast<uint8_t>(value));
+    put_field(writer, id, body.data());
+}
+
+void put_string(Writer& writer, uint16_t id, const std::string& value) {
+    if (value.empty())
+        return;
+    put_field(writer, id,
+              {reinterpret_cast<const uint8_t*>(value.data()), value.size()});
+}
+
 void encode(Writer& writer, const NodeTelemetry& value) {
-    writer.fixed(value.node_id.bytes);
-    writer.fixed(value.boot_id.bytes);
-    writer.u64(value.sequence);
-    writer.u64(value.observed_unix_ms);
-    writer.string(value.version);
-    writer.string(value.host);
-    writer.string(value.failure_domain);
-    writer.u16(value.port);
-    writer.u64(value.storage_capacity);
-    writer.u64(value.storage_used);
-    writer.u64(value.cache_capacity);
-    writer.u64(value.cache_used);
-    writer.u64(value.metadata_generation);
-    writer.u64(value.uptime_ms);
-    writer.u64(value.rss_bytes);
-    writer.u32(value.process_cpu_milli_percent);
-    writer.u32(value.load1_milli);
-    writer.u32(value.storage_backends_online);
-    writer.u32(value.peers_known);
-    writer.u32(value.peers_active);
-    writer.u64(value.rpc_connections_created);
-    writer.u64(value.rpc_connections_reused);
-    writer.u64(value.rpc_connections_canonical);
-    writer.u8(static_cast<uint8_t>(value.phase));
-    writer.string(value.api_endpoint);
-    writer.u32(value.cpu_cores);
-    writer.u64(value.memory_total_bytes);
-    writer.u32(value.playback_startup_timeout_ms);
-    writer.u32(value.playback_segment_timeout_ms);
+    Writer body;
+    put_field(body, field_node_id, value.node_id.bytes);
+    put_field(body, field_boot_id, value.boot_id.bytes);
+    put_uint(body, field_sequence, value.sequence);
+    put_uint(body, field_observed_unix_ms, value.observed_unix_ms);
+    put_string(body, field_version, value.version);
+    put_string(body, field_host, value.host);
+    put_string(body, field_failure_domain, value.failure_domain);
+    put_uint(body, field_port, value.port);
+    put_uint(body, field_storage_capacity, value.storage_capacity);
+    put_uint(body, field_storage_used, value.storage_used);
+    put_uint(body, field_cache_capacity, value.cache_capacity);
+    put_uint(body, field_cache_used, value.cache_used);
+    put_uint(body, field_metadata_generation, value.metadata_generation);
+    put_uint(body, field_uptime_ms, value.uptime_ms);
+    put_uint(body, field_rss_bytes, value.rss_bytes);
+    put_uint(body, field_process_cpu_milli_percent, value.process_cpu_milli_percent);
+    put_uint(body, field_load1_milli, value.load1_milli);
+    put_uint(body, field_storage_backends_online, value.storage_backends_online);
+    put_uint(body, field_peers_known, value.peers_known);
+    put_uint(body, field_peers_active, value.peers_active);
+    put_uint(body, field_rpc_connections_created, value.rpc_connections_created);
+    put_uint(body, field_rpc_connections_reused, value.rpc_connections_reused);
+    put_uint(body, field_rpc_connections_canonical, value.rpc_connections_canonical);
+    // Always stated even at its default: an omitted phase reads as `ready`,
+    // which is an assertion about the node rather than an absence of one.
+    put_field(body, field_phase, std::array<uint8_t, 1>{static_cast<uint8_t>(value.phase)});
+    put_string(body, field_api_endpoint, value.api_endpoint);
+    put_uint(body, field_cpu_cores, value.cpu_cores);
+    put_uint(body, field_memory_total_bytes, value.memory_total_bytes);
+    put_uint(body, field_playback_startup_timeout_ms, value.playback_startup_timeout_ms);
+    put_uint(body, field_playback_segment_timeout_ms, value.playback_segment_timeout_ms);
+    put_uint(body, field_playback_pipeline_idle_ms, value.playback_pipeline_idle_ms);
+    put_uint(body, field_playback_session_idle_ms, value.playback_session_idle_ms);
+    put_uint(body, field_playback_max_sessions_per_account,
+             value.playback_max_sessions_per_account);
+
+    // The record's own length, so a reader that understood none of the above
+    // still knows exactly where the next record begins.
+    const auto& encoded = body.data();
+    writer.u32(static_cast<uint32_t>(encoded.size()));
+    writer.raw(encoded);
+}
+
+uint64_t field_uint(const Bytes& value, size_t width, const char* what) {
+    if (value.size() != width)
+        throw DecodeError(std::string("telemetry field ") + what + " has the wrong width");
+    uint64_t out = 0;
+    for (auto byte : value)
+        out = (out << 8) | byte;
+    return out;
 }
 
 NodeTelemetry decode(Reader& reader) {
+    const auto length = reader.u32();
+    auto body = reader.raw(length);
+    Reader fields(body);
     NodeTelemetry value;
-    value.node_id.bytes = reader.fixed<16>();
-    value.boot_id.bytes = reader.fixed<16>();
-    value.sequence = reader.u64();
-    value.observed_unix_ms = reader.u64();
-    value.version = reader.string(256);
-    value.host = reader.string(4096);
-    value.failure_domain = reader.string(4096);
-    value.port = reader.u16();
-    value.storage_capacity = reader.u64();
-    value.storage_used = reader.u64();
-    value.cache_capacity = reader.u64();
-    value.cache_used = reader.u64();
-    value.metadata_generation = reader.u64();
-    value.uptime_ms = reader.u64();
-    value.rss_bytes = reader.u64();
-    value.process_cpu_milli_percent = reader.u32();
-    value.load1_milli = reader.u32();
-    value.storage_backends_online = reader.u32();
-    value.peers_known = reader.u32();
-    value.peers_active = reader.u32();
-    value.rpc_connections_created = reader.u64();
-    value.rpc_connections_reused = reader.u64();
-    value.rpc_connections_canonical = reader.u64();
-    // Optional trailing field: a record encoded before this field existed
-    // simply ends here, and is treated as "ready" (NodeTelemetry's default)
-    // rather than perpetually "recovering".
-    if (reader.remaining()) {
-        const auto phase = reader.u8();
-        if (phase > static_cast<uint8_t>(NodePhase::ready))
-            throw DecodeError("invalid telemetry node phase");
-        value.phase = static_cast<NodePhase>(phase);
-    }
-    // Optional trailing field: a record encoded before the API endpoint
-    // existed simply ends here, and the sender is treated as not reporting
-    // one (NodeTelemetry's default).
-    //
-    // A record from a node that predates the endpoint replacing the old
-    // host/port pair puts a bare hostname here. That is not an endpoint and
-    // must not be treated as one -- a client concatenating a scheme onto it
-    // is the guessing this field exists to remove -- so anything without a
-    // scheme is read as "not reported".
-    if (reader.remaining()) {
-        value.api_endpoint = reader.string(512);
-        if (value.api_endpoint.find("://") == std::string::npos)
-            value.api_endpoint.clear();
-    }
-    // Optional trailing field: a record encoded before cpu_cores existed ends
-    // here and reports no core count, which is the honest answer for a peer
-    // that cannot tell us. During a rolling upgrade every node is briefly in
-    // that position.
-    if (reader.remaining())
-        value.cpu_cores = reader.u32();
-    // Optional trailing field: a record encoded before physical memory existed
-    // ends here and reports none, which a consumer renders as unknown.
-    if (reader.remaining())
-        value.memory_total_bytes = reader.u64();
-    // Optional trailing fields: a record encoded before the playback budgets
-    // existed ends here and reports none, which a consumer reads as "this node
-    // cannot say" rather than as a budget of zero. Both are needed for the
-    // pair to mean anything, so a record carrying only the first is treated as
-    // carrying neither.
-    if (reader.remaining()) {
-        const auto startup = reader.u32();
-        if (reader.remaining()) {
-            value.playback_startup_timeout_ms = startup;
-            value.playback_segment_timeout_ms = reader.u32();
+    while (fields.remaining()) {
+        const auto id = fields.u16();
+        const auto size = fields.u16();
+        auto payload = fields.raw(size);
+        switch (id) {
+        case field_node_id:
+            if (payload.size() != value.node_id.bytes.size())
+                throw DecodeError("telemetry node_id has the wrong width");
+            std::copy(payload.begin(), payload.end(), value.node_id.bytes.begin());
+            break;
+        case field_boot_id:
+            if (payload.size() != value.boot_id.bytes.size())
+                throw DecodeError("telemetry boot_id has the wrong width");
+            std::copy(payload.begin(), payload.end(), value.boot_id.bytes.begin());
+            break;
+        case field_sequence: value.sequence = field_uint(payload, 8, "sequence"); break;
+        case field_observed_unix_ms:
+            value.observed_unix_ms = field_uint(payload, 8, "observed_unix_ms");
+            break;
+        case field_version:
+            value.version.assign(payload.begin(), payload.end());
+            break;
+        case field_host: value.host.assign(payload.begin(), payload.end()); break;
+        case field_failure_domain:
+            value.failure_domain.assign(payload.begin(), payload.end());
+            break;
+        case field_port:
+            value.port = static_cast<uint16_t>(field_uint(payload, 2, "port"));
+            break;
+        case field_storage_capacity:
+            value.storage_capacity = field_uint(payload, 8, "storage_capacity");
+            break;
+        case field_storage_used:
+            value.storage_used = field_uint(payload, 8, "storage_used");
+            break;
+        case field_cache_capacity:
+            value.cache_capacity = field_uint(payload, 8, "cache_capacity");
+            break;
+        case field_cache_used: value.cache_used = field_uint(payload, 8, "cache_used"); break;
+        case field_metadata_generation:
+            value.metadata_generation = field_uint(payload, 8, "metadata_generation");
+            break;
+        case field_uptime_ms: value.uptime_ms = field_uint(payload, 8, "uptime_ms"); break;
+        case field_rss_bytes: value.rss_bytes = field_uint(payload, 8, "rss_bytes"); break;
+        case field_process_cpu_milli_percent:
+            value.process_cpu_milli_percent =
+                static_cast<uint32_t>(field_uint(payload, 4, "process_cpu_milli_percent"));
+            break;
+        case field_load1_milli:
+            value.load1_milli = static_cast<uint32_t>(field_uint(payload, 4, "load1_milli"));
+            break;
+        case field_storage_backends_online:
+            value.storage_backends_online =
+                static_cast<uint32_t>(field_uint(payload, 4, "storage_backends_online"));
+            break;
+        case field_peers_known:
+            value.peers_known = static_cast<uint32_t>(field_uint(payload, 4, "peers_known"));
+            break;
+        case field_peers_active:
+            value.peers_active = static_cast<uint32_t>(field_uint(payload, 4, "peers_active"));
+            break;
+        case field_rpc_connections_created:
+            value.rpc_connections_created = field_uint(payload, 8, "rpc_connections_created");
+            break;
+        case field_rpc_connections_reused:
+            value.rpc_connections_reused = field_uint(payload, 8, "rpc_connections_reused");
+            break;
+        case field_rpc_connections_canonical:
+            value.rpc_connections_canonical =
+                field_uint(payload, 8, "rpc_connections_canonical");
+            break;
+        case field_phase:
+        {
+            const auto phase = static_cast<uint8_t>(field_uint(payload, 1, "phase"));
+            if (phase > static_cast<uint8_t>(NodePhase::ready))
+                throw DecodeError("invalid telemetry node phase");
+            value.phase = static_cast<NodePhase>(phase);
+        }
+            break;
+        case field_api_endpoint:
+            value.api_endpoint.assign(payload.begin(), payload.end());
+            break;
+        case field_cpu_cores:
+            value.cpu_cores = static_cast<uint32_t>(field_uint(payload, 4, "cpu_cores"));
+            break;
+        case field_memory_total_bytes:
+            value.memory_total_bytes = field_uint(payload, 8, "memory_total_bytes");
+            break;
+        case field_playback_startup_timeout_ms:
+            value.playback_startup_timeout_ms =
+                static_cast<uint32_t>(field_uint(payload, 4, "playback_startup_timeout_ms"));
+            break;
+        case field_playback_segment_timeout_ms:
+            value.playback_segment_timeout_ms =
+                static_cast<uint32_t>(field_uint(payload, 4, "playback_segment_timeout_ms"));
+            break;
+        case field_playback_pipeline_idle_ms:
+            value.playback_pipeline_idle_ms =
+                static_cast<uint32_t>(field_uint(payload, 4, "playback_pipeline_idle_ms"));
+            break;
+        case field_playback_session_idle_ms:
+            value.playback_session_idle_ms =
+                static_cast<uint32_t>(field_uint(payload, 4, "playback_session_idle_ms"));
+            break;
+        case field_playback_max_sessions_per_account:
+            value.playback_max_sessions_per_account = static_cast<uint32_t>(
+                field_uint(payload, 4, "playback_max_sessions_per_account"));
+            break;
+        default:
+            // A field this build does not know. Skipped by its own length,
+            // which is the entire point.
+            break;
         }
     }
     if (!value.sequence)
         throw DecodeError("telemetry sequence must be nonzero");
     return value;
 }
+
 } // namespace
 
 std::string_view node_phase_name(NodePhase phase) {
@@ -207,6 +377,7 @@ Bytes encode_telemetry_set(const std::vector<NodeTelemetry>& values) {
     Writer writer;
     writer.raw(magic);
     writer.u32(static_cast<uint32_t>(values.size()));
+    // Every record states its own length, so the set needs no second one.
     for (const auto& value : values)
         encode(writer, value);
     return writer.take();
@@ -222,8 +393,9 @@ std::vector<NodeTelemetry> decode_telemetry_set(std::span<const uint8_t> bytes) 
         throw DecodeError("too many telemetry records");
     std::vector<NodeTelemetry> values;
     values.reserve(count);
-    for (uint32_t i = 0; i < count; ++i)
+    for (uint32_t i = 0; i < count; ++i) {
         values.push_back(decode(reader));
+    }
     reader.finish();
     return values;
 }
@@ -305,6 +477,9 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.memory_total_bytes = physical_memory_bytes();
     telemetry.playback_startup_timeout_ms = playback.startup_timeout_ms;
     telemetry.playback_segment_timeout_ms = playback.segment_timeout_ms;
+    telemetry.playback_pipeline_idle_ms = playback.pipeline_idle_ms;
+    telemetry.playback_session_idle_ms = playback.session_idle_ms;
+    telemetry.playback_max_sessions_per_account = playback.max_sessions_per_account;
     observe(telemetry, true);
     return telemetry;
 }

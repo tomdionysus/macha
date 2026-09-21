@@ -3530,6 +3530,257 @@ MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catal
     CHECK(!webvtt_subtitle_codec_supported("dvd_subtitle"));
 }
 
+
+namespace {
+// Shared shape for the session-resource cases below: a node, one playable
+// file, and a playback manager whose limits the caller chooses.
+struct PlaybackFixture {
+    TempDir t;
+    std::filesystem::path keyfile{t.path() / "key"};
+    std::optional<Service> service;
+    std::optional<PlaybackManager> playback;
+    std::string media_id;
+
+    explicit PlaybackFixture(size_t per_account, size_t node_wide = 16) {
+        write_key(keyfile);
+        auto keys = load_cluster_keys(keyfile);
+        auto c = config_for(t.path() / "node", keyfile, free_port());
+        c.replication = 1;
+        c.metadata_min_write_replicas = 1;
+        c.catalogue.api.enabled = false;
+        service.emplace(c, keys);
+        service->start();
+        service->filesystem().mkdir("/media", 0755, getuid(), getgid());
+        service->filesystem().create_file("/media/a.mp4", 0644, getuid(), getgid());
+        auto writer = service->filesystem().open_write("/media/a.mp4", true);
+        auto bytes = pattern(64 * 1024);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        media_id = file_media_id(service->filesystem().getattr("/media/a.mp4"));
+
+        CatalogueApiConfig api;
+        StreamingConfig streaming;
+        streaming.enabled = true;
+        streaming.temp_path = t.path() / "playback";
+        streaming.startup_timeout = 2s;
+        streaming.max_sessions = node_wide;
+        streaming.max_sessions_per_account = per_account;
+        streaming.max_video_transcodes = 4;
+        streaming.max_audio_transcodes = 4;
+        playback.emplace(service->filesystem(), service->catalogue(), api, streaming,
+                         std::make_unique<FakeMediaEngine>());
+        playback->start();
+    }
+    ~PlaybackFixture() {
+        if (playback) playback->stop();
+        if (service) service->stop();
+    }
+
+    static SessionIdentity viewer(std::string_view user) {
+        return SessionIdentity{.id = std::string(user) + "-auth",
+                               .roles = {"media_viewer"},
+                               .user_id = std::string(user)};
+    }
+
+    HttpResponse create(const SessionIdentity& who, std::string_view key = {}) {
+        Json::Object preferences{{"mode", "remux"}};
+        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = who;
+        if (!key.empty()) request.query["idempotency_key"] = std::string(key);
+        request.body.assign(text.begin(), text.end());
+        return playback->handle(request);
+    }
+
+    HttpResponse control(std::string_view method, std::string_view id,
+                         const SessionIdentity& who, std::string body = {}) {
+        HttpRequest request;
+        request.method = std::string(method);
+        request.path = "/api/v1/playback/sessions/" + std::string(id);
+        request.session = who;
+        request.body.assign(body.begin(), body.end());
+        return playback->handle(request);
+    }
+
+    HttpResponse list(const SessionIdentity& who) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/playback/sessions";
+        request.session = who;
+        return playback->handle(request);
+    }
+
+    static Json body_of(const HttpResponse& response) {
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    }
+    static std::string id_of(const HttpResponse& response) {
+        return body_of(response).find("session_id")->asString();
+    }
+};
+} // namespace
+
+MACHA_TEST("media_playback", test_the_collection_lists_only_the_callers_own_sessions) {
+    // The listing is what makes handover possible -- a client that has lost
+    // its id finds its own session again -- so it is also the thing that must
+    // never show one account another's. It is node-local by decision: these
+    // are this node's sessions, and a client wanting the account's sessions
+    // cluster-wide asks each node, learning the provenance it needs to probe
+    // or release one as it goes.
+    PlaybackFixture fixture(8);
+    const auto alice = PlaybackFixture::viewer("alice");
+    const auto bob = PlaybackFixture::viewer("bob");
+
+    auto first = fixture.create(alice);
+    REQUIRE(first.status == 201);
+    auto second = fixture.create(alice);
+    REQUIRE(second.status == 201);
+    auto theirs = fixture.create(bob);
+    REQUIRE(theirs.status == 201);
+
+    auto listed = fixture.list(alice);
+    REQUIRE(listed.status == 200);
+    auto body = PlaybackFixture::body_of(listed);
+    auto items = body.find("items");
+    REQUIRE(items->isArray());
+    const auto& entries = items->asArray();
+    CHECK(entries.size() == 2);
+    std::set<std::string> ids;
+    for (const auto& entry : entries)
+        ids.insert(entry.find("session_id")->asString());
+    CHECK(ids.count(PlaybackFixture::id_of(first)) == 1);
+    CHECK(ids.count(PlaybackFixture::id_of(second)) == 1);
+    CHECK(ids.count(PlaybackFixture::id_of(theirs)) == 0);
+
+    // The cap is stated rather than left to be discovered by refusal.
+    auto account = body.find("account");
+    CHECK(account->find("sessions")->asUInt64() == 2);
+    CHECK(account->find("max_sessions")->asUInt64() == 8);
+
+    CHECK(PlaybackFixture::body_of(fixture.list(bob)).find("items")->asArray().size() == 1);
+}
+
+MACHA_TEST("media_playback", test_one_account_cannot_touch_anothers_session) {
+    // Before the routes moved, an id was only ever known to the client that
+    // made it, and the control routes checked nothing. Now several sessions
+    // exist per account and a listing hands ids out, so an unchecked id means
+    // any authenticated account could read, re-seek or DELETE another
+    // viewer's session mid-film -- and free its cap slots.
+    //
+    // 404 rather than 403 on purpose: whether an id exists on this node is not
+    // something one account gets to learn about another.
+    PlaybackFixture fixture(8);
+    const auto alice = PlaybackFixture::viewer("alice");
+    const auto bob = PlaybackFixture::viewer("bob");
+
+    auto mine = fixture.create(alice);
+    REQUIRE(mine.status == 201);
+    const auto id = PlaybackFixture::id_of(mine);
+
+    CHECK(fixture.control("GET", id, bob).status == 404);
+    CHECK(fixture.control("PATCH", id, bob, R"({"seek_ms":1000})").status == 404);
+    CHECK(fixture.control("DELETE", id, bob).status == 404);
+
+    // ... and the owner is unaffected by any of that.
+    CHECK(fixture.control("GET", id, alice).status == 200);
+    CHECK(fixture.control("DELETE", id, alice).status == 204);
+}
+
+MACHA_TEST("media_playback", test_ownership_survives_a_session_replacement) {
+    // A session is replaced wholesale on a subtitle change, a fast-path seek
+    // and a mode change, each copying fields one at a time. When `account`
+    // was not among the copied fields the replacement became unreachable to
+    // the account that made it -- and, worse, stopped counting against the
+    // per-account cap, so a mode switch was a way to launder sessions past the
+    // limit. Field-by-field copies lose new fields silently; this pins it.
+    PlaybackFixture fixture(8);
+    const auto alice = PlaybackFixture::viewer("alice");
+
+    auto created = fixture.create(alice);
+    REQUIRE(created.status == 201);
+    auto id = PlaybackFixture::id_of(created);
+
+    auto switched = fixture.control("PATCH", id, alice,
+                                    R"({"preferences":{"mode":"transcode"}})");
+    REQUIRE(switched.status == 200);
+    id = PlaybackFixture::body_of(switched).find("session_id")->asString();
+
+    // Still the caller's: reachable, listed, and counted exactly once.
+    CHECK(fixture.control("GET", id, alice).status == 200);
+    auto body = PlaybackFixture::body_of(fixture.list(alice));
+    CHECK(body.find("items")->asArray().size() == 1);
+    CHECK(body.find("account")->find("sessions")->asUInt64() == 1);
+    CHECK(fixture.control("GET", id, PlaybackFixture::viewer("bob")).status == 404);
+}
+
+MACHA_TEST("media_playback", test_the_account_cap_refuses_with_its_own_code_and_states_the_limit) {
+    // The cap must be distinguishable from a node-wide or transcode limit. A
+    // node limit is this node's property and a client is right to try another;
+    // an account cap is identical on every node, so a client that walks
+    // collects N identical refusals and charges N healthy nodes on the way
+    // through -- turning one account at its limit into a cluster that looks
+    // like it is failing.
+    PlaybackFixture fixture(2, 16);
+    const auto alice = PlaybackFixture::viewer("alice");
+    const auto bob = PlaybackFixture::viewer("bob");
+
+    REQUIRE(fixture.create(alice).status == 201);
+    REQUIRE(fixture.create(alice).status == 201);
+
+    auto refused = fixture.create(alice);
+    REQUIRE(refused.status == 429);
+    // Bound to a named Json: find() hands back a pointer into the document,
+    // so reading it off a temporary is a use-after-free that survives long
+    // enough to look like a server crash.
+    const auto refusal = PlaybackFixture::body_of(refused);
+    auto error = refusal.find("error");
+    CHECK(error->find("code")->asString() == "account_session_limit");
+    // Do not walk: every node would answer the same way, and this node is
+    // perfectly healthy.
+    CHECK(error->find("scope")->asString() == "request");
+    CHECK(error->find("node_healthy")->asBool() == true);
+    // Stated, so a client can plan rather than guess.
+    CHECK(error->find("sessions")->asUInt64() == 2);
+    CHECK(error->find("max_sessions")->asUInt64() == 2);
+
+    // Another account is entirely unaffected: the bound is per account.
+    CHECK(fixture.create(bob).status == 201);
+
+    // Releasing one frees one.
+    auto listed = PlaybackFixture::body_of(fixture.list(alice));
+    const auto id = listed.find("items")->asArray().front().find("session_id")->asString();
+    REQUIRE(fixture.control("DELETE", id, alice).status == 204);
+    CHECK(fixture.create(alice).status == 201);
+}
+
+MACHA_TEST("media_playback", test_an_idempotency_key_is_scoped_to_its_account) {
+    // The key is client-chosen and often predictable ("retry-1"), and the map
+    // was global: any authenticated account could occupy another's key and
+    // turn that account's legitimate retry into a 409. Not a takeover -- the
+    // creation fingerprint carries the auth session id, so a stolen key
+    // conflicts rather than replaying someone else's session -- but a denial
+    // of the retry path, which is the path a client is on when something has
+    // already gone wrong.
+    PlaybackFixture fixture(8);
+    const auto alice = PlaybackFixture::viewer("alice");
+    const auto bob = PlaybackFixture::viewer("bob");
+
+    auto squatted = fixture.create(bob, "retry-1");
+    REQUIRE(squatted.status == 201);
+
+    auto mine = fixture.create(alice, "retry-1");
+    CHECK(mine.status == 201);
+    CHECK(PlaybackFixture::id_of(mine) != PlaybackFixture::id_of(squatted));
+
+    // Within one account the key still means what it meant: the same request
+    // replays rather than creating a second session.
+    auto replayed = fixture.create(alice, "retry-1");
+    REQUIRE(replayed.status == 201);
+    CHECK(PlaybackFixture::id_of(replayed) == PlaybackFixture::id_of(mine));
+}
+
 MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_actually_has) {
     // A client has to know how far past the fragment it last asked for a
     // viewer may arrive and still find media produced, and before 0.45.0 it
