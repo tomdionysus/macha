@@ -2056,13 +2056,13 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     }
     CHECK(playback_status().find("video_transcodes")->asUInt64() == 1);
 
-    // A client retrying an obsolete generation receives a precise 404, but
-    // those invalid requests must not keep an abandoned encoder leased.
+    // A client retrying an obsolete generation is told it is gone for good,
+    // but those requests must not keep an abandoned encoder leased.
     for (int i = 0; i < 4; ++i) {
         HttpRequest stale;
         stale.method = "GET";
         stale.path = stale_stream;
-        CHECK(playback.handle(stale).status == 404);
+        CHECK(playback.handle(stale).status == 410);
         std::this_thread::sleep_for(20ms);
     }
 
@@ -2091,6 +2091,108 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     REQUIRE(playback.handle(remove).status == 204);
     second = playback.handle(create);
     REQUIRE(second.status == 201);
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_one_never_existed) {
+    // Two different facts share one shape -- the generation in the URL is not
+    // the one this session is producing -- and a client must act differently
+    // on each. Below the current generation the object existed here and was
+    // replaced, which is permanent and must not be retried; above it, nothing
+    // has produced that far, which is an ordinary not-found. Answering 404 to
+    // both made every regenerate look like a segment index that never existed,
+    // and a client that retries those reads a healthy node as a failing one.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/superseded.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/superseded.mp4", true);
+    auto bytes = pattern(65549);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr("/media/superseded.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.session_idle = 5min;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FakeMediaEngine>());
+    playback.start();
+
+    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.body.assign(text.begin(), text.end());
+    auto created = playback.handle(create);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
+    const auto session_id = created_json.find("session_id")->asString();
+    const auto first_url = created_json.find("stream")->find("url")->asString();
+    const auto first_generation = created_json.find("generation")->asUInt64();
+
+    // A seek ends the current generation and begins a new one. This is the
+    // routine event -- not an exotic one -- that the status has to describe.
+    Json::Object patch_root{{"seek_ms", 5'000}};
+    auto patch_text = Json(std::move(patch_root)).dump();
+    HttpRequest patch;
+    patch.method = "PATCH";
+    patch.path = "/api/v1/playback/sessions/" + session_id;
+    patch.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    patch.body.assign(patch_text.begin(), patch_text.end());
+    auto patched = playback.handle(patch);
+    REQUIRE(patched.status == 200);
+    auto patched_json = Json::parse(std::string(patched.body.begin(), patched.body.end()));
+    const auto second_generation = patched_json.find("generation")->asUInt64();
+    REQUIRE(second_generation > first_generation);
+
+    HttpRequest stale;
+    stale.method = "GET";
+    stale.path = first_url;
+    auto stale_response = playback.handle(stale);
+    REQUIRE(stale_response.status == 410);
+    auto stale_json = Json::parse(std::string(stale_response.body.begin(), stale_response.body.end()));
+    auto stale_error = stale_json.find("error");
+    REQUIRE(stale_error != nullptr);
+    CHECK(stale_error->find("code")->asString() == "generation_superseded");
+    // The axes are the point, not the status. `request` says do not walk the
+    // cluster: no other node has this session, so a walk would collect this
+    // same refusal from every healthy node it tried and charge each one for
+    // it. `node_healthy` is the correction. `alternative_may_succeed` is the
+    // instruction -- a different request, against this same node, works.
+    CHECK(stale_error->find("scope")->asString() == "request");
+    CHECK(stale_error->find("node_healthy")->asBool());
+    CHECK(stale_error->find("alternative_may_succeed")->asBool());
+
+    // Above the current generation nothing has produced that far, which is an
+    // ordinary not-found rather than something that is gone.
+    auto future_url = patched_json.find("stream")->find("url")->asString();
+    const auto marker = "/" + std::to_string(second_generation) + "/";
+    const auto at = future_url.find(marker);
+    REQUIRE(at != std::string::npos);
+    future_url.replace(at, marker.size(), "/" + std::to_string(second_generation + 99) + "/");
+    HttpRequest future;
+    future.method = "GET";
+    future.path = future_url;
+    auto future_response = playback.handle(future);
+    REQUIRE(future_response.status == 404);
+    auto future_json = Json::parse(std::string(future_response.body.begin(), future_response.body.end()));
+    CHECK(future_json.find("error")->find("code")->asString() == "not_found");
 
     playback.stop();
     service.stop();
