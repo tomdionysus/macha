@@ -287,6 +287,67 @@ three live nodes run 8.
 - [ ] Expect "plays, no sound" on the A85 Direct Play — it has no AC-3 or
   E-AC-3 decoder while claiming both, and it predates all of this.
 
+## P0 — The first-fragment timeout is a supersession defect, not a slow node (opened 2026-09-21)
+
+**Eight first-fragment timeouts on fi-1 on the day of the 0.48.0 cutover.
+All eight on `PATCH`. None on create**, on a node that served 18 successful
+creates in one 30-minute window. Reported independently by all four client
+sessions as a seek failure, which it is — a large seek is a `PATCH` — and none
+of them could see that creation never fails the same way.
+
+The replacement path marks the outgoing generation superseded but does not stop
+it before starting the replacement (`src/playback.cpp:2734-2744`), and the
+comment there says so deliberately: the old generation must keep serving until
+the new one can. So both pipelines are alive during the handover. On a node
+that owns its extents the second one reads from local disk and wins easily. On
+fi-1, which owns none, **both pull 4 MiB stripes across the WAN at 772-3431 ms
+each** against a 15 s startup budget.
+
+Viewer-visible: a control freezes for a quarter of a minute and then errors.
+Clients recover, sometimes unaided, so it is survivable — but the viewer is
+waiting behind a generation they have already abandoned, which is governing
+law 1.
+
+- [ ] **First: run a PATCH seek on es-1 or gbni-1**, which own their extents.
+  If the timeout does not reproduce there, it is WAN contention during the
+  handover window and not supersession being too expensive. **Change nothing
+  before this experiment** — the mechanism above is inferred from code and
+  timings, not instrumented.
+- [ ] Then decide whether the outgoing pipeline should still be drawing WAN
+  bandwidth once its replacement is committed.
+- [ ] Do **not** just raise `startup_timeout_ms` on fi-1. It makes the viewer
+  wait longer to be told the same thing.
+
+Collated evidence from all four clients:
+[what the clients report](2026-09-21-what-the-clients-report-against-0.48.0.md).
+
+## P0 — One abandoned session holds a node's only transcode slot for 30 minutes (opened 2026-09-21)
+
+fi-1, day of the cutover: **57 session creates, 0 DELETEs**, 18 creates in the
+last 30 minutes alone. No client deletes its sessions — not one, all day,
+across four client sessions. With `session_idle_ms` at 30 minutes the node
+carries roughly 18 live sessions nobody wants.
+
+**The server is not leaking.** Expiry works and returns the slot. The defect is
+the interval: with `max_video_transcodes: 1`, one abandoned session that once
+transcoded denies transcoding to the whole node for up to half an hour. That is
+mobile's seven `resource_limit` refusals, TV's wall, and the web client's
+mode switch refusing itself.
+
+**The part that is ours.** A pipeline is reclaimed after 60 s *because no
+stream request arrived* — the server has already concluded nobody is watching.
+That same evidence may not release the transcode entitlement, which outlives it
+thirtyfold. The contract in `docs/streaming.md` is deliberate and the reasoning
+is sound (an entitlement evaporating on reclamation would break
+resume-after-pause against a busy node), but on a node admitting **one**
+transcode the cost of that guarantee is the entire node.
+
+- [ ] Decide: should reclamation release the entitlement when the node is at
+  its transcode limit, reacquiring on resume and accepting a refusal then? That
+  trades a certain 30-minute outage for a possible refusal at resume.
+- [ ] Separately, every client needs to `DELETE`. Client-side, and not a fix
+  for this.
+
 ## P0 — The block cache cannot be observed, and may never have served a read (opened 2026-09-21)
 
 **Not "the cache is broken" — "nothing in this system could tell us if it
