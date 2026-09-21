@@ -587,6 +587,10 @@ void parse_streaming(const YAML::Node& root, Config& c) {
             milliseconds(streaming["session_unused_idle_ms"], "streaming.session_unused_idle_ms");
     if (streaming["pipeline_idle_ms"])
         c.streaming.pipeline_idle = milliseconds(streaming["pipeline_idle_ms"], "streaming.pipeline_idle_ms");
+    if (streaming["transcode_entitlement_idle_ms"])
+        c.streaming.transcode_entitlement_idle =
+            milliseconds(streaming["transcode_entitlement_idle_ms"],
+                         "streaming.transcode_entitlement_idle_ms");
     if (streaming["startup_timeout_ms"])
         c.streaming.startup_timeout = milliseconds(streaming["startup_timeout_ms"], "streaming.startup_timeout_ms");
     if (streaming["segment_duration_ms"])

@@ -2068,54 +2068,38 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
 
     REQUIRE(wait_until([&] {
         auto status = playback_status();
-        // The logical session survives reclamation -- sessions stays 1 -- but
-        // its transcode entitlement does not, so video_transcodes drops to 0
-        // with it. Those two numbers meaning different things is the point of
-        // reporting both: one counts who still holds a session, the other
-        // counts who still holds a slot, and after 2026-09-21 they diverge
-        // exactly here.
+        // Reclaiming the pipeline does not, by itself, surrender the
+        // entitlement: that goes on its own clock, transcode_entitlement_idle,
+        // which is left at its five-minute default here so this test stays
+        // about pipeline reclamation alone. The entitlement timer has its own
+        // test -- see the stream-fetch keep-alive case below, which is where
+        // the two numbers are shown diverging.
         return status.find("sessions")->asUInt64() == 1 &&
-               status.find("video_transcodes")->asUInt64() == 0 &&
+               status.find("video_transcodes")->asUInt64() == 1 &&
                status.find("running_video_transcode_pipelines")->asUInt64() == 0 &&
-               status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
                !status.find("heap_reclaim_pending")->asBool() &&
                status.find("heap_reclaim_requests")->asUInt64() >= 1 &&
+               status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
                status.find("heap_reclaim_runs")->asUInt64() >= 1;
-    }, 1s));
+    }, 2s));
 
-    // Physical reclamation NOW surrenders the logical entitlement, and this
-    // assertion is the inverse of what it was before 2026-09-21.
-    //
-    // The old reasoning was real and is worth keeping: an ordinary resume or
-    // seek can now be rejected if another viewer took the slot during the idle
-    // gap. What overruled it is what that guarantee cost. A pipeline is
-    // reclaimed because no stream request arrived for pipeline_idle -- the
-    // node has already decided nobody is watching -- and holding a scarce
-    // entitlement for a further session_idle on that evidence let one
-    // abandoned session deny transcoding to an entire node for thirty
-    // minutes. Measured on fi-1 the day 0.48.0 shipped: 57 session creates,
-    // zero DELETEs, and three separate client sessions refused a transcode by
-    // a node nobody was competing for.
-    //
-    // So the trade is a certain half-hour outage for a possible refusal at
-    // resume -- and a refusal at resume is visible, attributable and
-    // recoverable, which the outage was not.
+    // Physical reclamation alone does not surrender the logical entitlement:
+    // otherwise an ordinary resume or seek could be rejected the moment a
+    // pipeline went idle, which is sixty seconds. It is surrendered, but on
+    // the slower transcode_entitlement_idle clock, and that is tested
+    // separately rather than here.
     auto second = playback.handle(create);
-    REQUIRE(second.status == 201);
-
-    // And the slot really moved rather than being double-issued: the node
-    // admits one video transcode, so a third concurrent create is refused.
-    auto third = playback.handle(create);
-    REQUIRE(third.status == 429);
-    auto third_json = Json::parse(std::string(third.body.begin(), third.body.end()));
-    auto third_error = third_json.find("error");
-    REQUIRE(third_error != nullptr);
-    CHECK(third_error->find("code")->asString() == "resource_limit");
-    // Node-scoped on the create path: no session exists yet, so trying
-    // another node costs nothing and is the right move.
-    CHECK(third_error->find("scope")->asString() == "node");
-    CHECK(third_error->find("node_healthy")->asBool());
-    CHECK(third_error->find("alternative_may_succeed")->asBool());
+    REQUIRE(second.status == 429);
+    auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
+    auto second_error = second_json.find("error");
+    REQUIRE(second_error != nullptr);
+    CHECK(second_error->find("code")->asString() == "resource_limit");
+    // Node-scoped on the create path: no session exists yet, so trying another
+    // node costs nothing and is the right move. The update path says the
+    // opposite, because there the session is pinned here.
+    CHECK(second_error->find("scope")->asString() == "node");
+    CHECK(second_error->find("node_healthy")->asBool());
+    CHECK(second_error->find("alternative_may_succeed")->asBool());
 
     HttpRequest remove;
     remove.method = "DELETE";
@@ -2123,6 +2107,116 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
                   first_json.find("session_id")->asString();
     remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     REQUIRE(playback.handle(remove).status == 204);
+    second = playback.handle(create);
+    REQUIRE(second.status == 201);
+
+    playback.stop();
+    service.stop();
+}
+
+MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_session_poll_does_not) {
+    // The keep-alive contract, pinned because a client has to be told it and
+    // because the distinction is easy to erase by accident. A paused viewer
+    // keeps its transcode entitlement by asking for a stream object inside
+    // transcode_entitlement_idle -- a playlist fetch is enough. Polling the
+    // session does NOT count: it keeps the session alive, deliberately, but it
+    // is not evidence that anyone still wants the media, which is the question
+    // the entitlement answers.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/keepalive.mp4", 0644, getuid(), getgid());
+    auto writer = service.filesystem().open_write("/media/keepalive.mp4", true);
+    auto bytes = pattern(65549);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    const auto media_id = file_media_id(service.filesystem().getattr("/media/keepalive.mp4"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.max_video_transcodes = 1;
+    // Long enough that a fetch every 100ms keeps the pipeline alive -- a
+    // reclaimed pipeline removes its generation directory, so the playlist
+    // this test fetches has to still exist.
+    streaming.pipeline_idle = 250ms;
+    // Clamped into [pipeline_idle, session_idle], so both bounds must leave
+    // room for the value under test.
+    streaming.transcode_entitlement_idle = 600ms;
+    streaming.session_idle = 5min;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<FakeMediaEngine>());
+    playback.start();
+
+    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+    auto text = Json(std::move(root)).dump();
+    HttpRequest create;
+    create.method = "POST";
+    create.path = "/api/v1/playback/sessions";
+    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    create.body.assign(text.begin(), text.end());
+    auto created = playback.handle(create);
+    REQUIRE(created.status == 201);
+    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
+    const auto session_id = created_json.find("session_id")->asString();
+    const auto stream_url = created_json.find("stream")->find("url")->asString();
+
+    auto entitlements = [&] {
+        HttpRequest status;
+        status.method = "GET";
+        status.path = "/api/v1/playback/status";
+        auto response = playback.handle(status);
+        REQUIRE(response.status == 200);
+        auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
+        return json.find("video_transcodes")->asUInt64();
+    };
+    REQUIRE(entitlements() == 1);
+
+    // Polling the session keeps it alive but is not stream activity, so the
+    // entitlement still goes. Poll throughout, well inside the window, and the
+    // slot must still be released.
+    HttpRequest poll;
+    poll.method = "GET";
+    poll.path = "/api/v1/playback/sessions/" + session_id;
+    poll.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    REQUIRE(wait_until([&] {
+        CHECK(playback.handle(poll).status == 200);
+        return entitlements() == 0;
+    }, 3s));
+
+    // The session itself survived the release: the viewer keeps its place.
+    CHECK(playback.handle(poll).status == 200);
+
+    // Now the other half. A fresh session, kept warm by fetching the playlist,
+    // holds its entitlement across a span that would otherwise have released
+    // it twice over.
+    auto second = playback.handle(create);
+    REQUIRE(second.status == 201);
+    auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
+    const auto second_stream = second_json.find("stream")->find("url")->asString();
+    REQUIRE(entitlements() == 1);
+
+    HttpRequest fetch;
+    fetch.method = "GET";
+    fetch.path = second_stream;
+    const auto until = Clock::now() + 1500ms;
+    while (Clock::now() < until) {
+        CHECK(playback.handle(fetch).status == 200);
+        std::this_thread::sleep_for(100ms);
+    }
+    // 1500ms against a 600ms window: without the fetches this entitlement
+    // would have been released twice over.
+    CHECK(entitlements() == 1);
 
     playback.stop();
     service.stop();

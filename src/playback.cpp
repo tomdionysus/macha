@@ -1475,15 +1475,24 @@ struct PlaybackManager::Impl {
         return true;
     }
 
-    // A physical pipeline is reclaimed because no stream request arrived for
-    // pipeline_idle -- the node has already concluded nobody is watching.
-    // Until 2026-09-21 that evidence was not permitted to release the
-    // transcode entitlement, which then outlived it by session_idle: thirty
-    // minutes against sixty seconds. On a node admitting one transcode that
-    // meant a single abandoned session denied transcoding to everybody, which
-    // is exactly what three client sessions hit on fi-1 the day 0.48.0
-    // shipped -- 57 session creates, zero DELETEs, and seven refusals in half
-    // an hour to a viewer nobody was competing with.
+    bool holds_transcode_entitlement_locked(const Session& session) const {
+        return session.logical_session &&
+               (session.logical_session->video_transcode_entitled ||
+                session.logical_session->audio_transcode_entitled);
+    }
+
+    // Until 2026-09-21 a transcode entitlement was held until the session was
+    // erased, so it outlived its own pipeline by session_idle: thirty minutes
+    // against sixty seconds. On a node admitting one transcode that meant a
+    // single abandoned session denied transcoding to everybody, which is
+    // exactly what three client sessions hit on fi-1 the day 0.48.0 shipped --
+    // 57 session creates, zero DELETEs, and seven refusals in half an hour to
+    // a viewer nobody was competing with.
+    //
+    // It now goes on transcode_entitlement_idle of no stream activity, which
+    // is deliberately not the pipeline's clock: a pipeline is cheap to rebuild
+    // and goes at sixty seconds, while the slot is worth holding a while
+    // longer for a viewer who is merely paused.
     //
     // Released per session and never as a node-wide sweep: this clears what
     // this logical viewer holds and touches no other session and no other
@@ -1498,7 +1507,7 @@ struct PlaybackManager::Impl {
         if (!held) return;
         session.logical_session->video_transcode_entitled = false;
         session.logical_session->audio_transcode_entitled = false;
-        Log::info("playback transcode entitlement released on pipeline reclaim session=" +
+        Log::info("playback transcode entitlement released after stream inactivity session=" +
                   session.id);
     }
 
@@ -3093,12 +3102,21 @@ struct PlaybackManager::Impl {
             std::optional<Clock::time_point> next_expiry;
             std::chrono::milliseconds idle_timeout{};
             std::chrono::milliseconds unused_idle_timeout{};
+            std::chrono::milliseconds entitlement_idle{};
             bool reclaim_heap = false;
             {
                 std::unique_lock lock(mutex);
                 const auto now = Clock::now();
                 idle_timeout = config.pipeline_idle;
                 unused_idle_timeout = config.session_unused_idle;
+                // Clamped rather than merely read, the same way the unused
+                // clock is: a value at or below pipeline_idle would fire the
+                // instant the engine went, and one at or above session_idle
+                // would never fire at all because the session outlives it.
+                // reconfigure() takes a StreamingConfig from callers that
+                // never passed through config_base's validation.
+                entitlement_idle = std::clamp(config.transcode_entitlement_idle,
+                                              config.pipeline_idle, config.session_idle);
                 for (auto it = sessions.begin(); it != sessions.end();) {
                     // A session that has never served a stream object expires on
                     // the shorter clock. The transcode entitlement is held by the
@@ -3142,11 +3160,34 @@ struct PlaybackManager::Impl {
                                     idle_pipelines.emplace_back(
                                         it->second, std::move(it->second->engine_session));
                                     ++idle_pipelines_reclaimed;
-                                    if (sole_session_for_logical_locked(*it->second))
-                                        release_transcode_entitlements_locked(*it->second);
                                 } else if (!next_expiry || pipeline_expires < *next_expiry) {
                                     next_expiry = pipeline_expires;
                                 }
+                            }
+                        }
+                        // The transcode entitlement is released on its own
+                        // clock, not when the pipeline goes. Both a paused
+                        // viewer and an abandoned one stop requesting media,
+                        // so the pipeline cannot tell them apart at 60 s --
+                        // but by five minutes of no stream activity at all the
+                        // slot is worth more to whoever is waiting for it than
+                        // to a session that may never come back. A session
+                        // that does come back reacquires it and may be
+                        // refused; it keeps its position and its plan either
+                        // way.
+                        //
+                        // Checked every pass rather than once at reclamation,
+                        // because this fires later than that and a session
+                        // sitting idle must still be reconsidered. next_expiry
+                        // carries the wake-up so the loop does not spin.
+                        if (holds_transcode_entitlement_locked(*it->second)) {
+                            const auto entitlement_expires =
+                                it->second->stream_touched + entitlement_idle;
+                            if (now >= entitlement_expires) {
+                                if (sole_session_for_logical_locked(*it->second))
+                                    release_transcode_entitlements_locked(*it->second);
+                            } else if (!next_expiry || entitlement_expires < *next_expiry) {
+                                next_expiry = entitlement_expires;
                             }
                         }
                         ++it;

@@ -576,6 +576,30 @@ struct StreamingConfig {
     // Reclaim an abandoned physical encoder while retaining the logical
     // session long enough for client retry/reconciliation.
     std::chrono::milliseconds pipeline_idle{std::chrono::seconds(60)};
+    // How long a session may hold a transcode entitlement with no stream
+    // activity at all before it is released.
+    //
+    // The entitlement used to be sticky until the session was erased, so it
+    // outlived its own pipeline by session_idle -- thirty minutes against
+    // sixty seconds. On a node where max_video_transcodes is 1, one client
+    // that crashed, was force-stopped or was reaped in the background closed
+    // that node to transcoding for everybody for half an hour. Measured on
+    // fi-1 on 2026-09-21: 57 session creates, zero DELETEs, and three separate
+    // client sessions refused a transcode by a node nobody was competing for.
+    //
+    // Keyed on stream activity rather than on control traffic, deliberately:
+    // "has this session asked for media recently" is a simpler contract to
+    // state and for a client to reason about than "is anyone still polling".
+    // A viewer paused for longer than this loses the entitlement and
+    // reacquires it on resume, which may be refused -- a visible, attributable
+    // 429 on the update path, against a session that survives intact. That is
+    // the trade: a possible refusal after a long pause, instead of a certain
+    // half-hour outage after any unclean exit.
+    //
+    // Sits between pipeline_idle and session_idle and is meaningless outside
+    // that range: at or below pipeline_idle it would fire the moment the
+    // engine went, and at or above session_idle the session outlives it.
+    std::chrono::milliseconds transcode_entitlement_idle{std::chrono::minutes(5)};
     std::chrono::milliseconds startup_timeout{15000};
     std::chrono::milliseconds segment_duration{4000};
     size_t max_ahead_segments{8};

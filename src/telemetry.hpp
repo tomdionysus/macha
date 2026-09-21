@@ -111,6 +111,18 @@ struct NodeTelemetry {
     // about the node it happens to be talking to, which is why it rides here
     // rather than only on that node's own playback status.
     uint32_t playback_max_sessions_per_account{};
+    // Node-wide, every account together. 0.48.0 published the per-account cap
+    // and not this one, which left a client able to state "another screen on
+    // this account is playing" and unable to state "this node is full" -- the
+    // two refusals mean opposite things and only one of them was legible.
+    uint32_t playback_max_sessions{};
+    // How long a session may hold a transcode entitlement with no stream
+    // activity before the node releases it. A paused client that wants to keep
+    // its slot must ask for a stream object inside this window; a playlist
+    // fetch is enough and costs no media bytes. Published so a client can time
+    // its keep-alive against the node it is actually on rather than a
+    // hardcoded guess -- the same reason the two idle timers above are here.
+    uint32_t playback_transcode_entitlement_idle_ms{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -123,6 +135,8 @@ struct PlaybackBudgets {
     uint32_t pipeline_idle_ms{};
     uint32_t session_idle_ms{};
     uint32_t max_sessions_per_account{};
+    uint32_t max_sessions{};
+    uint32_t transcode_entitlement_idle_ms{};
 };
 
 struct TelemetryView {
