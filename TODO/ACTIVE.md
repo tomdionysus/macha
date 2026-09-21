@@ -1262,9 +1262,14 @@ diagnosed.** Named here because the alternative is calling them known flakes:
   It surfaced during the 0.48.2 verification as 1/485 in a full suite, which
   is exactly how a one-in-three failure presents when you only look once —
   and how it has been mistaken for load sensitivity every time it has been
-  seen. **This is the case to take first when this item is worked**, because
-  its rate makes it cheap to reproduce and because at 35% it is corrupting
-  every full-suite result on the node this project treats as authoritative.
+  seen.
+
+  **Deprioritised by the operator, 2026-09-21: "torrents are flaky but lower
+  priority."** So the 35% is recorded, not urgent. What it is still worth is
+  this: when reading a full-suite result on a node, a single failure in this
+  case carries no information — expect it roughly one run in three and do not
+  spend time on it, and do not let it be the reason a green run is called red.
+  When this item *is* worked it remains the cheapest case to reproduce.
 
 Two full runs of one unchanged tree gave 477/479 and then 479/479, which is
 the whole problem in one line. **Also on this item: a before/after comparison
