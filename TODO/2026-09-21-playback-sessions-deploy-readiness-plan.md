@@ -137,19 +137,45 @@ mobile (confirmed 2026-09-21) and drives the sequence.
   `stream.url` off the session), and `ExoPlayerAdapter.ts:68` feeds the media3
   `httpStatus` straight into core's `playbackFailureKindForStatus`, so `410`
   arrives classified on its next build with no client change.
-- [ ] **Mobile cannot classify a fragment status at all, and this release
-  does not cause that.** Core reports macha-client-rn has no
-  `playbackFailureKindForStatus` and no httpStatus plumbing at the player
-  layer; playback errors arrive through expo-video's `statusChange` as
-  `{status, error}` with a message string and no code. Its only status logic
-  is session creation (`policy.ts:125`). So a superseded generation reaches
-  mobile opaque — but it reaches it opaque **today**, as a `404`, for the same
-  reason. **This does not hold `410` back** (see the decision above): it is
-  client work to be scheduled, not a reason to ship a lesser server. Asked of
-  core 2026-09-21 and unanswered at the time of writing: whether `410` travels
-  any differently from `404` down that path. If it does, mobile gets worse at
-  cutover and that goes in front of the operator beforehand as an accepted
-  cost rather than a surprise a viewer finds.
+- [x] **Mobile: checked, NOT a regression. P1 against the client, not a
+  blocker.** Core tested the three ways this could have been one
+  (2026-09-21) and could not break it on any:
+  - **No different fatality or retry posture.** expo-video is media3
+    underneath. Core disassembled `DefaultLoadErrorHandlingPolicy` from the
+    Gradle-cached AARs (byte-identical across media3 1.8.0 and 1.9.0):
+    `isEligibleForFallback` returns true for `InvalidResponseCodeException`
+    with status in {403, 404, 410, 416, 500, 503} — **404 and 410 sit in the
+    same set with no branch between them** — and `getRetryDelayMsFor` gives
+    do-not-retry only for five non-HTTP causes, so both fall through to the
+    same `min(errorCount * 1000, 5000)` backoff.
+  - **Nothing classifies on the message text**, which is the only thing that
+    does differ (ExoPlayer puts the code in the exception message). Every read
+    of it is display or one prefix strip.
+  - **Nothing treats an unrecognised status differently from a 404.** Below
+    session creation, `404` is named in three non-playback places only.
+  - **The failover path is status-blind and already harmful today.** On
+    `status === 'error'` the provider calls `failoverSource` unconditionally,
+    which picks a replacement node and **records the failure so ranking learns
+    from it** — a healthy node charged for answering honestly, which is
+    precisely what the `410` axes exist to prevent. But it does that *today*
+    on the `404`, by the client's own comment at `PlaybackProvider.tsx:641`.
+    Same event, same blind failover, same charge. The status swap changes
+    nothing on that path. One guard exists and is also status-blind:
+    `errorBlamesEndpoint` declines failover while a seek is outstanding, so
+    the commonest way mobile makes a superseded generation is already handled,
+    identically before and after.
+
+  **Two caveats, recorded rather than smoothed over:**
+  1. **Nobody has put a `410` in front of expo-video on a device.** All of the
+     above is verified at the policy layer (disassembled bytecode) and by
+     reading client code. It is not an observation. See Phase E.
+  2. **The layer is not fully understood.** The mobile repo flags against
+     itself an unresolved contradiction: the A85 took a segment `500` as
+     fatal on first occurrence on 2026-09-13, which the disassembly says
+     should have been retried with backoff. Its reconciliation is explicitly
+     recorded as a guess. It cuts symmetrically — a `404` and a `410` reach it
+     as the same `InvalidResponseCodeException`, so it cannot single out
+     `410` — but it bounds the confidence above.
 
 ## Phase C: cluster preparation (can overlap Phase B)
 
@@ -168,8 +194,20 @@ mobile (confirmed 2026-09-21) and drives the sequence.
     file on one machine. It is also already behind core by five commits,
     including the 30 s to 10 s floor change, so its hash will move again.
   - Therefore a **fresh build from develop against current core** is what
-    should reach the nodes, not that artefact. Owner to be confirmed with
-    core; **not the server session's to build or deploy.**
+    should reach the nodes, not that artefact. Rebuilding also re-resolves the
+    link, so the hash moves again; the client's practice is to record the core
+    SHA and the `dist` hash rather than a version number, because a link
+    resolves a working tree and not a commit.
+
+  **Owner, confirmed by core 2026-09-21: the web client session builds it and
+  the operator authorises the deploy. Not the server session, and not core.**
+  The procedure is in macha-client's own notes: `npm run build`, then rsync
+  `dist/` into **`/etc/macha/web`** on each node — *not* `/var/lib/macha/web`
+  — files owned `1000:50`, `index` served `no-cache` so a deploy shows on the
+  next load without a restart. That is the pattern 0.17.2 followed on
+  2026-09-20. Core has passed all of this to the web client session directly,
+  including that its `develop`-only `410` branch is absent from the released
+  0.17.3.
 - [ ] **Config on all three nodes** per decision 2: `max_sessions` raised,
   `max_sessions_per_account` written explicitly rather than left to the
   default, so the two numbers sit together in the file. Back up each as
@@ -226,10 +264,19 @@ live cluster. Reading the code does not count.
   same node is unaffected, and core does *not* mark fi-1 failed. Restore the
   number afterwards. This is the only way to see the refusal that decision 2
   otherwise makes unreachable.
-- [ ] **`410` classified** (if decision 1 is yes): a mode switch on a node
-  the client has moved to, watched from the web client, yields a real
-  `generation_superseded` and the client resumes from the new `stream.url`
-  without charging the node.
+- [ ] **`410` classified on the web client**: a mode switch on a node the
+  client has moved to yields a real `generation_superseded`, and the client
+  resumes from the new `stream.url` without charging the node.
+- [ ] **`410` in front of expo-video on a real device.** Nobody has done this;
+  core's mobile verdict is reasoned from disassembled media3 bytecode and
+  client code, not measured. Provoke a superseded generation on mobile and
+  watch what the player does with it. This is also the cheapest chance to
+  learn something about the unexplained A85 `500`-fatal-on-first-occurrence
+  contradiction, since it exercises the same error path.
+- [ ] **Watch whether mobile charges a healthy node.** Its failover is
+  status-blind and records the failure against ranking on any playback error.
+  Expected to be unchanged from today, not improved — confirm it is not worse,
+  and size the client fix from what is seen.
 - [ ] **`DELETE` scope.** Deleting one of two sessions leaves the other
   streaming.
 - [ ] **A85 Direct Play**: expect "plays, no sound"; it is not this release.
