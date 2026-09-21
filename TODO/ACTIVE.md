@@ -342,9 +342,11 @@ neither reproduces nor clears this.
 *(That client first attributed its own stall to a `currentSrc` fallback
 pointing at the raw node URL, and this file recorded it. It then retracted
 that — it had grepped for the wrong path segment and the element **is** on its
-proxy. Its actual fault is its Service Worker never answering an open-ended
-`Range: bytes=0-`, which is exactly a media element's first request; a bounded
-range returns 206 in 244 ms. Theirs to fix. Recorded as a caution: a client's
+proxy. It then withdrew that second explanation too: the Service Worker answers an
+open-ended `Range: bytes=0-` in 46 ms, and the probe that said otherwise had
+awaited `arrayBuffer()` on a 1.76 GB body. There was no proxy bug either; the
+stalls were a force-stopped tab, a worker unregistered and re-registered three
+times, and 1.7 GB probes competing with the element for the same link. Recorded as a caution: a client's
 self-diagnosis is evidence about the client, not a finding, until it is
 measured.)*
 
@@ -362,6 +364,22 @@ measured.)*
 **Do not attribute an instance of "timed out waiting for first fragmented-MP4
 segment" to anything without first checking the node for a live session on the
 same media.**
+
+**The best hypothesis anyone has produced on this, from core, 2026-09-21: the
+AC-3 codec split may be confounded with retry count.** No `DELETE` reached any
+node all day, so every attempt was made against a cluster accumulating orphans.
+**The AC-3 titles were retried all day; the AAC ones were tried once.** If an
+orphan for the same media on the same node is what produces this error — which
+is the one thing the television actually demonstrated — then "AC-3 fails, AAC
+works" and "retried titles fail, once-tried titles work" are the same
+observation, and the codec is a passenger.
+
+It fits the one clean measurement too: my instrumented AC-3 remux succeeded in
+48 ms, on a node where that client had cleared its state and was not retrying.
+
+**This is now the leading explanation and it is testable, because the cluster
+is clean for the first time all day** — the 0.48.1 restarts cleared every
+in-memory session. Test it before anyone goes into libav.
 
 ## HANDED OFF AND FIXED — DELETEs were being swallowed inside core (2026-09-21)
 
@@ -422,6 +440,31 @@ reconciliation plan — persist each id, clear on clean close, reconcile against
 each node's listing at start — is the right shape and covers force-stop, crash,
 OOM and background reaping; reinstall, cleared storage and non-our clients are
 what the node's timers are for.
+
+## P2 — A restart leaks every live session's temp directory, forever (found 2026-09-21)
+
+**Measured across the cluster immediately after the 0.48.1 restarts**, which
+cleared every in-memory session and left their directories behind:
+
+| node | `/etc/macha/playback` | dirs | oldest |
+|---|---|---|---|
+| gbni-1 | **2.4 GB** | 16 | **2026-09-02** |
+| es-1 | 108 MB | 4 | 2026-09-09 |
+| fi-1 | 8 KB | 1 | today |
+
+A session's generated fragments live in `streaming.temp_path/<session id>` and
+are removed by `remove_all` on expiry or `DELETE`. A process restart does
+neither: the session map is in memory, so it goes, and nothing is left that
+knows the directory ever belonged to anything. Nineteen days of them on gbni-1.
+
+It only ever grows. Not urgent — those nodes have 836 GB free — but it is
+unbounded, it survives every upgrade, and it is invisible.
+
+- [ ] **Clear `streaming.temp_path` on startup.** Nothing in memory can own a
+  directory there at that moment, by construction, so anything present is
+  stale. That is the whole fix.
+- [ ] Consider whether the same reasoning applies anywhere else state is keyed
+  by a session id that does not survive the process.
 
 ## P1 — The block cache works, and still cannot be observed (opened 2026-09-21, falsified and downgraded the same day)
 
