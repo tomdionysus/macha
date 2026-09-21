@@ -2,8 +2,12 @@
 
 Date: 2026-09-21
 
-Status: **Phase A executed 2026-09-21.** The three decisions were taken on
-the recommendations below; Phase A is done and tagged. Phases B-E are gated on
+Status: **Phase A executed 2026-09-21**, except its last two steps. The three
+decisions were taken on the recommendations below and the work is committed on
+`develop` as `60d794e`. The es-1 suite run and the `0.48.0` tag are still
+owed: syncing to a node was refused as a production action, so the only
+evidence so far is 484/484 on the laptop, which this project has never
+accepted as sufficient. Phases B-E are gated on
 core, the web bundle and the operator's word. Companion to
 [the resource plan](2026-09-21-playback-sessions-as-a-resource-plan.md), which
 is the specification. This file is the ordered list of what has to happen
@@ -87,13 +91,18 @@ Everything here is in-tree, needs no one else, and can be done today.
   optional field safely") as closed by TEL3 and move it to `COMPLETED.md`;
   note in the resource plan that the cap key is settled as per-account
   (its line 288 still says "open decision"); record decision 3.
-- [ ] **Full suite on es-1 with the log kept.** The recorded 483/483 left no
-  artefact; `/tmp` on es-1 has nothing newer than Sep 18. Run
-  `./build/macha-tests 2>&1 | tee /tmp/suite-0.48.0.log` after the Phase A
-  source changes are rsynced and rebuilt, and note the count here.
-- [ ] **Commit on `develop` and tag `0.48.0`** once the suite is green, so
-  the tag is the tree that ships. Stage `README.md` separately or leave it;
-  its uncommitted change is unrelated to this release.
+- [ ] **Full suite on es-1 with the log kept. BLOCKED.** The rsync to
+  `root@10.34.1.50` was refused by the harness as a production action, so the
+  tree has not reached a node. Needs the operator to allow it or to run the
+  sync. Then `cmake --build build -j3` and
+  `./build/macha-tests 2>&1 | tee /tmp/suite-0.48.0.log`, and note the count
+  here. Laptop result so far: **484/484**, which includes the new
+  generation-status case and, unusually, the `storage_v18` durability-barrier
+  case that normally fails on macOS only.
+- [x] **Commit on `develop`** — `60d794e`. `README.md` was left unstaged; its
+  change is unrelated to this release.
+- [ ] **Tag `0.48.0`** once the es-1 suite is green, so the tag names a tree
+  verified on the hardware it ships to.
 
 ## Phase B: the client side (core drives; this repository waits)
 

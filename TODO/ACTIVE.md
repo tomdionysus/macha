@@ -142,8 +142,10 @@ The governing laws are:
 
 ## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, RELEASE READY AS 0.48.0, NOT DEPLOYED)
 
-**Server side is complete, documented and tagged `0.48.0` on `develop`;
-nothing is deployed.** The cutover is all three nodes at once, on the
+**Server side is complete and documented, committed on `develop` as 0.48.0
+(`60d794e`); not tagged, and nothing is deployed.** The tag is deliberately
+held until the full suite has run on es-1, so that the tag names a tree
+verified on the hardware it ships to rather than on a laptop. The cutover is all three nodes at once, on the
 operator's word (2026-09-21), and it is gated on two things outside this
 repository: a published `@machafoundation/core` carrying `410` tolerance, and
 a current web bundle reaching `/etc/macha/web`. Readiness plan, with the
