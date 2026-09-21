@@ -280,6 +280,52 @@ three live nodes run 8.
 - [ ] Expect "plays, no sound" on the A85 Direct Play — it has no AC-3 or
   E-AC-3 decoder while claiming both, and it predates all of this.
 
+## P0 — The block cache cannot be observed, and may never have served a read (opened 2026-09-21)
+
+**Not "the cache is broken" — "nothing in this system could tell us if it
+were."** The entire observable surface of `PersistentBlockCache` is a function
+of writes. `blocks()` is the only accessor, `cache_used` in telemetry is
+`blocks() * extent_size` (`src/cluster.cpp:1614-1619`), no test asserts a
+read-back from it, and the one log line that would show a hit only fires for
+foreground reads taking **≥250 ms** — so a working cache is silent by
+construction. A cache that has never returned a byte reports identically to
+one working perfectly, on every surface this project has.
+
+It is consulted, it is filled, it is not starved, and on fi-1 it is 2560/2560
+blocks full. None of that says it serves reads.
+
+**This is P0 because of where it lands.** fi-1 runs `hosts_extents: false`:
+the block cache is the entire reason a storage-less node can serve media. Every
+read either hits it or crosses the WAN at 772-3431 ms per 4 MiB stripe. A dead
+cache there is not a performance regression, it is the difference between an
+edge node and a proxy. One 40-minute window showed 154 foreground reads going
+`source=remote`, ~616 MB for one viewer — innocent if that was a first watch,
+and currently indistinguishable from a cache that never hits.
+
+Full write-up, evidence and remedy: [the block cache cannot be
+observed](2026-09-21-the-block-cache-cannot-be-observed.md).
+
+- [ ] **Falsify it cheaply first**, before any code: read one media file twice
+  through FUSE on fi-1 and compare wall-clock. Same speed twice means the
+  cache has never served, and the blast radius is every edge-node read since
+  it was introduced. One command, and it decides the urgency of the rest.
+- [ ] Counters on `PersistentBlockCache` — hits, misses, evictions, entries.
+  The materialisation cache already has exactly these and they are what made
+  the 2026-09-20 rejoin failure diagnosable. Mirror them.
+- [ ] Surface them beside `cache_used`, which alone looks like health.
+- [ ] A sustained zero-hit, high-eviction cache becomes a reportable
+  condition, per the P-1 below.
+- [ ] A test that pins a block-cache read-back. Nothing currently fails if
+  `get` always returns empty.
+- [ ] Only then revisit fi-1 latency, including whether hydration runs at all:
+  `enabled: true` with the `read_ahead` and `current_file` engines, and
+  **zero** log lines in 40 minutes.
+
+**Sizing is not the problem and a claim otherwise was retracted the same day.**
+Measured on fi-1: 1,427 media files, mean 1.19 GB, median 0.67 GB, p90
+2.16 GB, max 21.44 GB. A 10 GiB cache holds ~16 titles at the median. The P-1
+below is **satisfied** here; do not file this as an instance of it.
+
 ## P-1 — A cache must never be smaller than its own working set (opened 2026-09-20)
 
 **This sits at P-1 because it is not a defect in a feature. It is an invariant
