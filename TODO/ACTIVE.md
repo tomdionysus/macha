@@ -1253,8 +1253,18 @@ diagnosed.** Named here because the alternative is calling them known flakes:
   `metadata replica set forming: waiting for bootstrap checkpoint survey`,
   passes 5/5 in isolation.
 - `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`
-  — 1/5 under `--repeat`, which interleaves across parallel slots; 0/10 when
-  run one at a time.
+  — **re-measured on es-1, 2026-09-21: 7 failures in 20 under `--repeat`, a
+  35% rate.** The earlier reading of "1/5 under `--repeat`, 0/10 run one at a
+  time" understated it badly, and the characterisation elsewhere in this file
+  as load-sensitive-but-passes-in-isolation is wrong: 20 runs on an otherwise
+  quiet node, load average 1.77, fail more than a third of the time.
+
+  It surfaced during the 0.48.2 verification as 1/485 in a full suite, which
+  is exactly how a one-in-three failure presents when you only look once —
+  and how it has been mistaken for load sensitivity every time it has been
+  seen. **This is the case to take first when this item is worked**, because
+  its rate makes it cheap to reproduce and because at 35% it is corrupting
+  every full-suite result on the node this project treats as authoritative.
 
 Two full runs of one unchanged tree gave 477/479 and then 479/479, which is
 the whole problem in one line. **Also on this item: a before/after comparison
