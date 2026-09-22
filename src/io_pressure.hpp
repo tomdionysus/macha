@@ -36,24 +36,51 @@ namespace macha {
 class DiskServiceMonitor {
   public:
     struct Thresholds {
-        // Service time the backend defends. Above this, work nobody is waiting
-        // for is refused admission to this device.
-        std::chrono::milliseconds target{50};
-        // Hysteresis floor: pressure is released when the average falls back
-        // below this. Without a gap, a device sitting at the threshold
-        // oscillates and the loader stutters instead of yielding.
-        std::chrono::milliseconds release{20};
+        // What an operation on a healthy device is expected to cost:
+        // a fixed per-operation budget plus a budget per MiB transferred.
+        // Deliberately generous -- roughly 8 MB/s sustained -- because the
+        // question is not "is this device fast" but "is this device far worse
+        // than it should be".
+        //
+        // A fixed millisecond threshold was the first design and it was wrong
+        // in a way worth recording: it compared a 4 MiB extent write against
+        // the same 50 ms as a 4 KiB read, so every storage node doing ordinary
+        // work declared permanent pressure. On 2026-09-22 that pinned a node
+        // into "pressured" nine seconds after boot and held an operator's
+        // import to one background lease for an afternoon.
+        std::chrono::milliseconds overhead{25};
+        std::chrono::milliseconds per_mib{120};
+        // Pressure when the moving average of actual/expected exceeds this
+        // percentage, released when it falls back under the lower one. A
+        // device three times slower than a generous expectation is in trouble;
+        // one merely at the expectation is working.
+        uint32_t slowdown_percent{300};
+        uint32_t release_percent{150};
+        // Any single operation taking longer than this trips pressure at once,
+        // whatever the average says. The ratio catches sustained degradation;
+        // it cannot catch the event that started this work -- one 17.7 s extent
+        // write among fifty healthy ones, which moves a moving average hardly
+        // at all and starves a viewer completely. A multi-second operation is
+        // not a statistic to be averaged, it is a device in trouble now.
+        std::chrono::milliseconds outlier{2000};
     };
 
     struct Sample {
         uint64_t operations{};
         uint64_t bytes{};
         // Exponentially weighted mean completion latency, in microseconds.
+        // Reported for operators; it is NOT what pressure is decided on,
+        // because it cannot be compared against anything without knowing the
+        // size of the operations that produced it.
         uint64_t mean_us{};
         // Worst completion latency seen in the recent window, in microseconds.
         // Kept because a mean of 40 ms hides the 17 s write that actually broke
         // a viewer, and an operator reading a status page needs to see it.
         uint64_t worst_us{};
+        // The signal pressure is actually decided on: the moving average of
+        // actual/expected as a percentage. 100 means the device is performing
+        // exactly as expected for the work it was given.
+        uint64_t slowdown_percent{};
         bool pressured{};
     };
 
@@ -91,14 +118,29 @@ class DiskServiceMonitor {
                !worst_us_.compare_exchange_weak(worst, micros, std::memory_order_relaxed))
             ;
 
+        // What this operation should have cost on a device that is coping,
+        // given its size. Comparing against this rather than against a fixed
+        // millisecond figure is the whole of the fix: a 4 MiB write and a 4 KiB
+        // read are not the same event and must not be held to the same number.
+        constexpr uint64_t mib = 1024 * 1024;
+        const auto expected_us =
+            static_cast<uint64_t>(thresholds_.overhead.count()) * 1000 +
+            (bytes * static_cast<uint64_t>(thresholds_.per_mib.count()) * 1000) / mib;
+        const auto ratio = expected_us ? (micros * 100) / expected_us : 100;
+
+        auto slowdown = slowdown_percent_.load(std::memory_order_relaxed);
+        const auto next_slowdown =
+            slowdown ? (slowdown * (weight_denominator - 1) + ratio) / weight_denominator : ratio;
+        slowdown_percent_.store(next_slowdown, std::memory_order_relaxed);
+
         // Hysteresis, evaluated here so the admission path is a single relaxed
         // load rather than a comparison it has to get right at every call site.
-        const auto target_us = static_cast<uint64_t>(thresholds_.target.count()) * 1000;
-        const auto release_us = static_cast<uint64_t>(thresholds_.release.count()) * 1000;
-        if (next > target_us) {
+        const auto outlier_us = static_cast<uint64_t>(thresholds_.outlier.count()) * 1000;
+        if (next_slowdown > thresholds_.slowdown_percent ||
+            (outlier_us && micros > outlier_us)) {
             if (!pressured_.exchange(true, std::memory_order_relaxed))
                 pressure_onsets_.fetch_add(1, std::memory_order_relaxed);
-        } else if (next < release_us) {
+        } else if (next_slowdown < thresholds_.release_percent) {
             pressured_.store(false, std::memory_order_relaxed);
         }
     }
@@ -119,6 +161,7 @@ class DiskServiceMonitor {
                       bytes_.load(std::memory_order_relaxed),
                       mean_us_.load(std::memory_order_relaxed),
                       worst_us_.load(std::memory_order_relaxed),
+                      slowdown_percent_.load(std::memory_order_relaxed),
                       pressured_.load(std::memory_order_relaxed)};
     }
 
@@ -149,6 +192,7 @@ class DiskServiceMonitor {
     std::atomic<uint64_t> bytes_{};
     std::atomic<uint64_t> mean_us_{};
     std::atomic<uint64_t> worst_us_{};
+    std::atomic<uint64_t> slowdown_percent_{};
     std::atomic<uint64_t> pressure_onsets_{};
     std::atomic<bool> pressured_{};
 };

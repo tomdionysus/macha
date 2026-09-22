@@ -1090,7 +1090,13 @@ void CatalogueManager::commit(
 
     try {
         if (resolved_conflict) {
-            metadata_.mutate([&](MetadataSnapshot& metadata) {
+            // mutate_delta, not mutate: a tree-backed namespace has no entry
+            // map to diff, so a commit must declare its change set. This was
+            // the last caller still using the non-exact path, and on
+            // 2026-09-22 it took every catalogue route to 503 on all three
+            // nodes -- every client reporting "no API" while health and auth
+            // answered fine, because the catalogue is what a client renders.
+            metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
                 if (metadata.catalogue_root != expected_root)
                     throw CatalogueConflict("catalogue changed concurrently");
                 if (expected_namespace &&
@@ -1101,9 +1107,15 @@ void CatalogueManager::commit(
                     throw CatalogueConflict("catalogue conflict changed concurrently");
                 metadata.catalogue_root = root;
                 metadata.conflicts.erase(found);
+                delta.catalogue = CatalogueDelta::set;
+                delta.catalogue_root = root;
+                // The standing conflict set is part of the record, so the
+                // delta carries it rather than leaving a replay to infer the
+                // erase.
+                delta.replace_conflicts = metadata.conflicts;
                 for (const auto& id : old_artwork)
                     if (!new_artwork.contains(id))
-                        (void)append_garbage(metadata, id);
+                        record_garbage_upsert(delta, append_garbage(metadata, id));
             });
         } else {
             metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
