@@ -1024,4 +1024,92 @@ MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the
     CHECK(store.reads() * 4 < full_reads);
 }
 
+MACHA_TEST("namespace_tree", test_every_tree_node_is_reachable_for_the_collector) {
+    // Found on the live cluster on 2026-09-22, six hours after the cutover:
+    // the control-store live set was built from catalogue roots alone, so
+    // every node holding the namespace was, to garbage collection, an
+    // unreferenced object waiting out its grace. A 30-day grace set as a
+    // migration safety net was the only thing between the cluster and
+    // collecting the nodes that say where every file lives.
+    //
+    // So: the collector's set is exactly the set of nodes the build wrote --
+    // branches, leaves, and every extent spine node -- not one fewer.
+    const auto entries = library(12, 8);
+    MemoryNamespaceNodeStore store;
+    const auto root = build_namespace_tree(entries, store);
+
+    std::vector<ObjectId> reachable;
+    collect_namespace_tree_nodes(root, store, reachable);
+    std::sort(reachable.begin(), reachable.end());
+    reachable.erase(std::unique(reachable.begin(), reachable.end()), reachable.end());
+
+    auto written = store.written();
+    std::sort(written.begin(), written.end());
+    CHECK(reachable == written);
+    CHECK(reachable.size() == store.nodes());
+
+    const auto shape = namespace_tree_stats(root, store);
+    CHECK(reachable.size() == shape.leaves + shape.branches + shape.extent_nodes);
+}
+
+MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_prunes_the_rest) {
+    // What retention claims need per commit: everything the new root reaches
+    // that the old root did not, found by a parallel walk that never reads a
+    // subtree both sides share. Over-collecting is allowed -- a changed leaf
+    // brings all its spines -- under-collecting is the failure that loses a
+    // file, so the assertion is a superset check against what was actually
+    // written, plus a bound that proves the pruning works.
+    // Large enough that pruning is what decides the count: on a hundred-entry
+    // library one changed leaf and its spines is most of the tree.
+    auto entries = library(60, 20);
+    MemoryNamespaceNodeStore store;
+    const auto before = build_namespace_tree(entries, store);
+    const auto before_shape = namespace_tree_stats(before, store);
+
+    auto changed = entries.at("/TV/Show 4/Season 1/Episode 4.mkv");
+    changed.mtime_ns += 999;
+    store.forget_written();
+    const auto after = update_namespace_tree(before, store, {{"/TV/Show 4/Season 1/Episode 4.mkv", changed}});
+    auto written = store.written();
+    std::sort(written.begin(), written.end());
+    REQUIRE(!written.empty());
+
+    std::vector<ObjectId> claimed;
+    collect_namespace_tree_changes(before, after, store, claimed);
+    std::sort(claimed.begin(), claimed.end());
+    claimed.erase(std::unique(claimed.begin(), claimed.end()), claimed.end());
+
+    // Every node the commit wrote is claimed.
+    CHECK(std::includes(claimed.begin(), claimed.end(), written.begin(), written.end()));
+    // And the walk pruned: it claimed far fewer nodes than the tree holds.
+    const auto total = before_shape.leaves + before_shape.branches + before_shape.extent_nodes;
+    CHECK(claimed.size() * 4 < total);
+
+    // No `before` at all is the migration case, and then everything is new.
+    std::vector<ObjectId> everything;
+    collect_namespace_tree_changes(std::nullopt, after, store, everything);
+    std::sort(everything.begin(), everything.end());
+    everything.erase(std::unique(everything.begin(), everything.end()), everything.end());
+    std::vector<ObjectId> all;
+    collect_namespace_tree_nodes(after, store, all);
+    std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
+    CHECK(everything == all);
+
+    // An unreadable node fails the walk rather than returning a short list --
+    // a partial live set is what lets the collector delete the namespace.
+    MemoryNamespaceNodeStore damaged;
+    for (const auto& id : store.written())
+        if (auto bytes = store.get(id))
+            damaged.put_at(id, *bytes);
+    bool refused = false;
+    try {
+        std::vector<ObjectId> partial;
+        collect_namespace_tree_nodes(after, damaged, partial);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
 } // namespace
