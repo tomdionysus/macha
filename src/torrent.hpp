@@ -172,6 +172,24 @@ class TorrentService {
     // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
     // RPC survey per active peer. An unreachable/erroring peer is logged and
     // skipped, never fails the whole call.
+    // Starts a job on a named node rather than on whichever node happened to
+    // receive the request. Until this existed, placement was "wherever the
+    // POST landed", which is invisible from a client configured with one
+    // address and impossible to control from a UI behind a proxy -- and there
+    // is every reason to care which node downloads: they differ in disk, in
+    // memory, and in what else they are serving at the time.
+    //
+    // An empty node id means here. An unknown or unreachable node is reported
+    // rather than silently downloaded locally, because a job that quietly
+    // lands somewhere else is worse than one that fails to start.
+    struct Placement {
+        NodeId node_id;
+        std::string job_id;
+        bool placed{};
+        std::string error;
+    };
+    virtual Placement add_on(const NodeId& node, std::string_view magnet_or_uri) = 0;
+
     virtual std::vector<ClusterTorrentJob> jobs_cluster_wide() const = 0;
     // Local job(id) first (zero added latency for the common owned-here
     // case); only surveys peers when the job is locally absent.
