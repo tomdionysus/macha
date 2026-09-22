@@ -197,6 +197,22 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
                                const NamespaceChanges& changes,
                                const NamespaceTreeLimits& limits = {});
 
+// The change set a commit already carries, applied to the tree. This is the
+// half of Stage C that matters: a mutation knows exactly which paths it
+// touched, so the commit updates those and nothing else rather than
+// rediscovering the change by comparing two namespaces -- the mistake the
+// catalogue's commit makes, which re-shards and re-encodes everything to find
+// the one shard that moved.
+//
+// Erases, upserts and appends, in the order `apply_metadata_delta_in_place`
+// applies them so the two cannot disagree. An append reads the entry it
+// extends from the tree and refuses the same base mismatch the map path
+// refuses: a delta whose base extent count does not match what is there is a
+// delta against a namespace this is not.
+ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
+                                       const MetadataDelta& delta,
+                                       const NamespaceTreeLimits& limits = {});
+
 // Materialises the whole namespace back out. This is the inverse of the build
 // and exists to prove the round trip, not because anything on the hot path
 // should want it -- the point of the structure is that nothing has to.
