@@ -1,5 +1,72 @@
 # Current release
 
+## 0.50.0 — The namespace can be re-rooted onto the tree (development)
+
+**`macha-namespace-migrate` re-roots one stopped node's namespace onto the
+content-addressed Merkle tree, and a node that has been migrated serves and
+writes normally.** Measured against es-1's real head on a copy of its state:
+**5,201 entries and 468,850 extents, a 22.56 MiB record becoming 3.97 KiB**,
+and the whole metadata history collapsing from 23.7 MB to a single 4,180-byte
+frame. A stat of `/` through the migrated tree takes **0.069 ms** against the
+**56 ms** a namespace write costs today.
+
+Nothing is migrated by installing this. The tool is offline, deliberate, and
+run per node with the cluster stopped; until it is run, every node behaves
+exactly as it did.
+
+**Every namespace reader and writer now works in either form.** The FUSE
+frontend, catalogue scanner, media index, retention claims, the
+reachability/GC live set, and all nine filesystem mutations read and write
+through one pair of primitives. Each call site states whether it needs stat
+data or whole entries, which matters: `file_media_id` hashes the extent list,
+so a stat-only read there produces a different id that looks exactly as valid
+as the right one.
+
+**Mutations go through a working set rather than the entry map.** A batch has
+to see its own earlier edits -- `mkdir /a` then `create /a/b` -- which a map
+gives for free and a tree cannot. The overlay is the delta the mutation was
+already recording, with `erase_entries` as the tombstone a map cannot express.
+
+**A prefix scan descends.** A directory listing and the catalogue root scan
+read the subtree rather than the library, because the tree is keyed by path and
+a branch child that cannot contain the prefix is never fetched.
+
+**History replay can rebuild a tree-backed head without asking a peer.** Replay
+writes nodes locally and replicates nothing: the commit being materialised
+already reached the write floor when it was made, and requiring that again
+would make rebuilding a local head depend on peers being reachable.
+
+### Two failures found before shipping, both silent by nature
+
+**Reconciliation would have merged two trees into an empty namespace.** The
+three-way merge is path-wise over three entry maps, and a tree-backed snapshot
+has an empty one. Merging two empty maps does not fail -- it succeeds, reports
+no conflicts, and produces an empty namespace. A reconciliation that deletes
+the library and looks like agreement, on a cluster that reconciles around a
+hundred times a day. The merge now refuses a tree-backed branch; the manager
+materialises all three branches and re-roots the result. A merge therefore
+costs what it costs today and is the one operation this work has not made
+cheaper. The two manual split-brain repair planners had the same shape and
+refuse too.
+
+**`macha-metadata-dump` crashed on a migrated head**, found by rehearsing the
+migration against a copy of es-1's real state rather than by reasoning about
+it. It now reports a tree-backed record, and with `--objects <path>` it walks
+the real tree and times a stat against it -- so the forensics tool still works
+on the node an operator is most likely to be worried about.
+
+### What a cutover requires
+
+Every node stopped and converged on one head, the tool run on each, and the
+witnesses named with `--witness`: the acceptance format will not encode a write
+floor it cannot name replicas for, so the certificate carries the operator's
+assertion that these nodes are being re-rooted onto this record. `--expect-hash`
+is how the second node proves it computed the same record as the first, and
+because the record is a pure function of the converged head, it always will
+have. The previous checkpoint, journal, history, heads and acceptance proof are
+quarantined under `.pre-migration.<ns>` rather than deleted.
+
+
 ## 0.49.1 — The namespace read and written through one door (development)
 
 **Nothing in this release is reachable in production, and that is deliberate.**
