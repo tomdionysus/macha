@@ -27,6 +27,60 @@ SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
 for it died the same way. **A client's account of itself is evidence about the
 client, not a fact.**
 
+-1. **What the cutover cost on 2026-09-22, in order of how close it came.**
+   The cluster was re-rooted at 12:41Z. By 18:00Z four things had surfaced
+   that no test had, all recorded here so the next cutover of anything is
+   planned against them:
+   - **The tree was collectable.** The control-store live set walked
+     catalogue roots and nothing else; every tree node was an unreferenced
+     object to GC. Only a 30-day `garbage_grace_ms` set as a migration safety
+     net stood between the cluster and collecting the nodes that say where
+     every file lives. Fixed in 0.51.0 (`collect_namespace_tree_nodes` in the
+     release live set, `collect_namespace_tree_changes` for claims).
+     **The grace stays at 30 days until 0.51.0 has run on all three nodes for
+     a day**, then goes back to 24 h.
+   - **Ingest crawled at 1.8 MB/s on an idle node.** A commit re-chunks the
+     spine and replicated all ~12 nodes it touched synchronously to peers 60 ms
+     away, eleven of them byte-identical to what was stored. Fixed in 0.51.0:
+     a node already present is not re-replicated. Per-commit round trips ~12
+     to 1-3. **Not yet measured after the fix.**
+   - **A sixteen-minute stall with the wrong message on it.** Two heads at one
+     generation, no commits until reconciliation merged them, and every node
+     logging "delta replay ... does not reproduce the record hash" -- which
+     `diagnose_unreconstructable_locked` emits without ever replaying. The
+     chain replays byte-exactly (`macha-metadata-dump --objects`). The message
+     now says what it checked. **The stall itself is still open**: tree-backed
+     reconciliation materialises both branches and publishes a full record,
+     and the cost of that on a live branch is unmeasured. Item for Stage F:
+     a tree-native merge.
+   - **`torrent.pressure_download_rate` and the DATA pressure gate** (0.51.0)
+     are built and untested against a real saturated device. The torrent
+     download that prompted them is the reproduction; run it once 0.51.0 is on
+     gbni-1.
+
+   **Client asks from the placement API round (2026-09-22), both sessions.**
+   Verified against the code before writing down; two need nothing:
+   - Per-node free disk: already on `/api/v1/status` as
+     `nodes[].storage.free_bytes`. Core had not read it.
+   - Node id format: `unhex` takes even-length unseparated hex, either case.
+   - [ ] `node_id` on `/api/v1/torrents/jobs/{id}/{pause,resume,retry,cancel}`
+     responses (Core). The ingest route already does this; the torrent route
+     has the value in `TorrentActionResult::updated` and does not emit it.
+   - [ ] Structured `placement_failed`: `code`, target `node_id` as a field,
+     viewer-facing `detail` (Core). A host must never parse a message.
+   - [ ] Surface the peer's own refusal text on a forwarded add. fi-1 has
+     `torrent: enabled: false`, so a placement there is a correct 409 -- but
+     the message says "refused the request" where the peer said "torrents not
+     available on this node".
+   - [ ] Optional `name` per `nodes[]` entry on `/api/v1/status` (web client).
+     Needs a config knob and a `NodeTelemetry` field to travel; `host` is the
+     RPC bind address and is inconsistent on this cluster (two DNS names, one
+     machine name). **Operator's call** -- the operator chooses the names.
+   - Both sessions independently declined a server-side "best node" and a
+     name as the placement key. Core's reason stands: they already rank
+     endpoints and can say which axis decided; a second ranking on different
+     inputs would make placement unexplainable. Not doing it.
+
 0. **The namespace Merkle work**, the P-1 below. **Stage B is done**
    (2026-09-21): the substrate is built, measured against the live head, and
    the SM14 record shape now exists -- `namespace_root` on the snapshot,
