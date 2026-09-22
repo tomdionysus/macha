@@ -649,6 +649,38 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
                        limits.branch_max_fanout);
 }
 
+ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
+                                       const MetadataDelta& delta,
+                                       const NamespaceTreeLimits& limits) {
+    NamespaceChanges changes;
+    // Order matters and mirrors apply_metadata_delta_in_place exactly: erase,
+    // then upsert, then append. A path that is erased and then upserted in one
+    // delta ends up present, which is what the map path produces.
+    for (const auto& path : delta.erase_entries)
+        changes[normalize_path(path)] = std::nullopt;
+    for (const auto& [path, value] : delta.upsert_entries)
+        changes[normalize_path(path)] = value;
+    for (const auto& [path, append] : delta.append_entries) {
+        const auto normalized = normalize_path(path);
+        // The entry being appended to is whatever this delta has already made
+        // it, or what the tree holds. Reading it costs one path from the root.
+        std::optional<FsEntry> base;
+        if (const auto pending = changes.find(normalized); pending != changes.end())
+            base = pending->second;
+        else
+            base = namespace_tree_lookup(root, normalized, store, true);
+        if (!base || base->type != EntryType::file || base->extents.size() != append.base_extents)
+            throw DecodeError("metadata delta append base mismatch");
+        base->extents.insert(base->extents.end(), append.extents.begin(), append.extents.end());
+        base->size = append.size;
+        base->mtime_ns = append.mtime_ns;
+        base->ctime_ns = append.ctime_ns;
+        base->version = append.version;
+        changes[normalized] = std::move(base);
+    }
+    return update_namespace_tree(root, store, changes, limits);
+}
+
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               const NamespaceVisitor& visit) {
     if (!snapshot.namespace_root) {
