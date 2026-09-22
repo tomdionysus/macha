@@ -920,6 +920,11 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
         }
+        // The namespace tree is control objects too, every one of them
+        // reachable from the root and none of them from anything else.
+        if (context.proposed.namespace_root)
+            collect_namespace_tree_nodes(*context.proposed.namespace_root, namespace_nodes,
+                                         control);
     } else {
         if (context.delta) {
             for (const auto& [_, entry] : context.delta->upsert_entries)
@@ -949,6 +954,15 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
                         add_entry(entry);
                 });
         }
+
+        // The tree nodes this commit introduced need claims exactly as the
+        // catalogue shards it changed do. Without them the nodes that say
+        // where every file lives are unreferenced control objects to the
+        // collector, which is what they were from the cutover until this line.
+        if (context.proposed.namespace_root &&
+            before.namespace_root != context.proposed.namespace_root)
+            collect_namespace_tree_changes(before.namespace_root, *context.proposed.namespace_root,
+                                           namespace_nodes, control);
 
         const bool catalogue_changed =
             context.delta ? context.delta->catalogue != CatalogueDelta::unchanged
@@ -1532,6 +1546,22 @@ void Service::loop(std::stop_token stop) {
                             complete = false;
                             Log::debug("retention release horizon catalogue unavailable root=" +
                                        to_string(root) + " error=" + error.what());
+                        }
+                    }
+                    // The namespace tree itself. A live set that omits it is a
+                    // live set that lets the collector delete the namespace,
+                    // and a partial walk is worse than none -- so an unreadable
+                    // node marks the whole set incomplete and nothing is
+                    // released against it.
+                    if (floor->snapshot->namespace_root) {
+                        try {
+                            collect_namespace_tree_nodes(*floor->snapshot->namespace_root,
+                                                         release_nodes, *control_live);
+                        } catch (const std::exception& error) {
+                            complete = false;
+                            Log::warn("retention release horizon namespace tree unavailable root=" +
+                                      to_string(*floor->snapshot->namespace_root) +
+                                      " error=" + error.what());
                         }
                     }
                     std::sort(data_live->begin(), data_live->end());

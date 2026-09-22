@@ -1107,6 +1107,175 @@ MetadataSnapshot attach_namespace(MetadataSnapshot snapshot, const NamespaceNode
     return snapshot;
 }
 
+namespace {
+
+// A branch's children as (first key, id); a leaf's entries as
+// (path, external extent root or none). Both are read without decoding extents
+// or fetching anything beyond the one node, which is what keeps the collectors
+// proportional to the tree's shape rather than its content.
+struct NodeShape {
+    bool leaf{};
+    std::vector<std::pair<std::string, ObjectId>> children;      // branch
+    std::vector<std::pair<std::string, std::optional<ObjectId>>> entries; // leaf
+};
+
+NodeShape read_shape(const ObjectId& id, const NamespaceNodeStore& store) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    const auto magic = reader.fixed<4>();
+    NodeShape shape;
+    if (magic == leaf_magic) {
+        shape.leaf = true;
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i) {
+            // Mirrors encode_leaf_entry field by field, skipping stat data.
+            auto path = reader.string(8192);
+            (void)reader.u8();  // type
+            (void)reader.u32(); // mode
+            (void)reader.u32(); // uid
+            (void)reader.u32(); // gid
+            (void)reader.u64(); // size
+            (void)reader.i64(); // ctime
+            (void)reader.i64(); // mtime
+            (void)reader.u64(); // version
+            std::optional<ObjectId> extent_root;
+            switch (static_cast<ExtentForm>(reader.u8())) {
+            case ExtentForm::none:
+                break;
+            case ExtentForm::inlined: {
+                const auto extents = reader.u32();
+                for (uint32_t e = 0; e < extents; ++e)
+                    (void)decode_extent(reader);
+                break;
+            }
+            case ExtentForm::external:
+                (void)reader.u64();
+                extent_root = ObjectId{reader.fixed<32>()};
+                break;
+            default:
+                throw DecodeError("bad namespace tree extent form");
+            }
+            shape.entries.emplace_back(std::move(path), extent_root);
+        }
+        reader.finish();
+        return shape;
+    }
+    if (magic != branch_magic)
+        throw DecodeError("not a namespace tree node");
+    (void)reader.u8(); // level
+    const auto count = reader.u32();
+    for (uint32_t i = 0; i < count; ++i) {
+        auto key = reader.string(8192);
+        ObjectId child{reader.fixed<32>()};
+        (void)reader.u64();
+        shape.children.emplace_back(std::move(key), child);
+    }
+    reader.finish();
+    return shape;
+}
+
+void collect_extent_spine(const ObjectId& id, const NamespaceNodeStore& store,
+                          std::vector<ObjectId>& out) {
+    out.push_back(id);
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree extent node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    const auto magic = reader.fixed<4>();
+    if (magic == extent_leaf_magic)
+        return;
+    if (magic != extent_branch_magic)
+        throw DecodeError("not a namespace tree extent node");
+    (void)reader.u8();
+    const auto count = reader.u32();
+    std::vector<ObjectId> children;
+    for (uint32_t i = 0; i < count; ++i) {
+        children.push_back(ObjectId{reader.fixed<32>()});
+        (void)reader.u64();
+    }
+    for (const auto& child : children)
+        collect_extent_spine(child, store, out);
+}
+
+void collect_all(const ObjectId& id, const NamespaceNodeStore& store, std::vector<ObjectId>& out) {
+    out.push_back(id);
+    const auto shape = read_shape(id, store);
+    if (shape.leaf) {
+        for (const auto& [_, extent_root] : shape.entries)
+            if (extent_root)
+                collect_extent_spine(*extent_root, store, out);
+        return;
+    }
+    for (const auto& [_, child] : shape.children)
+        collect_all(child, store, out);
+}
+
+// The parallel walk. `before` may be absent, or a node of a different kind
+// when the tree changed shape; either way the subtree under `after` is simply
+// collected in full, which is the safe direction.
+void collect_changed(const ObjectId& after, const std::optional<ObjectId>& before,
+                     const NamespaceNodeStore& store, std::vector<ObjectId>& out) {
+    if (before && *before == after)
+        return;
+    out.push_back(after);
+    const auto shape = read_shape(after, store);
+    if (shape.leaf) {
+        // A changed leaf: its own extent spines, all of them. Comparing per
+        // path against the old leaf would tighten this; it would not make it
+        // safer.
+        for (const auto& [_, extent_root] : shape.entries)
+            if (extent_root)
+                collect_extent_spine(*extent_root, store, out);
+        return;
+    }
+    std::optional<NodeShape> old;
+    if (before) {
+        try {
+            auto shape_before = read_shape(*before, store);
+            if (!shape_before.leaf)
+                old = std::move(shape_before);
+        } catch (const std::exception&) {
+            // An unreadable old node means nothing can be pruned against it,
+            // not that the walk should fail: over-collect below.
+        }
+    }
+    for (size_t i = 0; i < shape.children.size(); ++i) {
+        const auto& [key, child] = shape.children[i];
+        std::optional<ObjectId> counterpart;
+        if (old) {
+            // Shared subtree: same id anywhere on the other side, skip it
+            // unread. Otherwise pair by key so the walk descends into the
+            // subtree most likely to share children with this one.
+            bool shared = false;
+            for (const auto& [_, old_child] : old->children)
+                if (old_child == child) {
+                    shared = true;
+                    break;
+                }
+            if (shared)
+                continue;
+            for (const auto& [old_key, old_child] : old->children)
+                if (old_key <= key)
+                    counterpart = old_child;
+        }
+        collect_changed(child, counterpart, store, out);
+    }
+}
+
+} // namespace
+
+void collect_namespace_tree_nodes(const ObjectId& root, const NamespaceNodeStore& store,
+                                  std::vector<ObjectId>& out) {
+    collect_all(root, store, out);
+}
+
+void collect_namespace_tree_changes(const std::optional<ObjectId>& before, const ObjectId& after,
+                                    const NamespaceNodeStore& store, std::vector<ObjectId>& out) {
+    collect_changed(after, before, store, out);
+}
+
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store) {
     NamespaceTreeStats stats;
     walk_stats(root, store, stats, 1);

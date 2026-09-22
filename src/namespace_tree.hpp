@@ -264,6 +264,29 @@ std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_v
 
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store);
 
+// Every control object the namespace is made of: branches, leaves, and the
+// extent spines the leaves address. This is what the reachability live set
+// has to carry, and until 2026-09-22 it carried none of it -- the control-store
+// live set was built from catalogue roots alone, so every tree node holding
+// the namespace was, to garbage collection, an unreferenced object waiting out
+// its grace. The 30-day grace set that afternoon as a migration safety net was
+// the only thing between the cluster and collecting the nodes that say where
+// every file lives. Throws if a node cannot be read: an incomplete live set is
+// not a live set, and the caller must refuse to delete against it.
+void collect_namespace_tree_nodes(const ObjectId& root, const NamespaceNodeStore& store,
+                                  std::vector<ObjectId>& out);
+
+// The nodes reachable from `after` that `before` does not share -- what a
+// commit has to acquire retention claims for. A parallel walk: a subtree whose
+// id appears on both sides is pruned without being read, so the cost is the
+// changed leaves and the path above them, not the namespace. A changed leaf
+// contributes itself and every extent spine it addresses; that over-collects
+// the spines of unchanged entries that happen to share the leaf, which is the
+// safe direction -- an object claimed twice costs a little work, an object
+// claimed never costs the file. No `before` means everything is new.
+void collect_namespace_tree_changes(const std::optional<ObjectId>& before, const ObjectId& after,
+                                    const NamespaceNodeStore& store, std::vector<ObjectId>& out);
+
 // A namespace being mutated, in whichever form it is in.
 //
 // A batch of filesystem operations has to see its own earlier edits: mkdir /a
