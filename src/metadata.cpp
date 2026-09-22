@@ -22,6 +22,7 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM8{'D', 'H', 'T', 'M', 'E', 'T', 'A', '8'}, SM9{'D', 'H', 'T', 'M', 'E', 'T', 'A', '9'},
     SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'}, SM11{'D', 'H', 'T', 'M', 'E', 'T', 'B', '1'},
     SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'}, SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
+    SM14{'D', 'H', 'T', 'M', 'E', 'T', 'B', '4'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
     MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'};
@@ -552,6 +553,13 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
     return pruned;
 }
 Bytes encode_snapshot(const MetadataSnapshot& s) {
+    // SM13 and earlier have nowhere to put a namespace root, and a snapshot
+    // that carries one has its entries in the tree rather than in the map.
+    // Encoding it here would publish an empty namespace under a valid-looking
+    // hash, which is the worst available failure: silent, durable, and
+    // indistinguishable from a library that was deleted. Refuse instead.
+    if (s.namespace_root)
+        throw std::runtime_error("namespace root cannot be encoded before SM14");
     Writer w;
     // SM11 introduced branch topology/conflicts. SM12 additionally persists
     // the metadata write floor as cluster policy. SM13 adds the durable
@@ -640,10 +648,205 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     }
     return w.take();
 }
+Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
+    // The re-rooting, and nothing else: every field SM13 carries is carried
+    // here in the same order, with the inline entry block replaced by the
+    // 32-byte root of the namespace tree. The legacy `metadata_voters` list
+    // survives the change deliberately -- retiring a field and moving the
+    // namespace out of the record are two decisions, and only one of them is
+    // this plan's.
+    //
+    // Every section SM8-SM13 wrote conditionally is unconditional here. Those
+    // conditions exist to reproduce the exact bytes of an older encoder for
+    // journal replay; SM14 has no older self to be byte-compatible with, and a
+    // format whose layout depends on which fields happen to be populated is
+    // the thing that made `encode_snapshot` hard to read.
+    if (!s.namespace_root)
+        throw std::runtime_error("SM14 snapshot has no namespace root");
+    // Both forms at once would let the two disagree, and a reader would have
+    // no rule for which one is the namespace. `detach_namespace` clears the
+    // map as it builds the tree.
+    if (!s.entries.empty())
+        throw std::runtime_error("SM14 snapshot still inlines its entries");
+    // SM14 is only ever authored above protocol 20, where the write floor is
+    // durably established; zero is a pre-0.19 snapshot that has not been
+    // transitioned and cannot be re-rooted yet.
+    if (!s.metadata_write_replicas_required)
+        throw std::runtime_error("SM14 snapshot has no metadata write floor");
+    if (s.merge_parents.size() > 64)
+        throw std::runtime_error("too many metadata merge parents");
+    if (s.conflicts.size() > 1000000)
+        throw std::runtime_error("too many metadata conflicts");
+    if (s.metadata_participants.size() > 65536)
+        throw std::runtime_error("too many metadata participants");
+
+    Writer w;
+    w.raw(SM14);
+    w.u32(s.metadata_voters.size());
+    for (const auto& v : s.metadata_voters)
+        w.fixed(v.bytes);
+    w.u32(s.data_replication);
+    w.u64(s.extent_size);
+    w.u32(s.mutation_sequences.size());
+    for (const auto& [node, sequence] : s.mutation_sequences) {
+        w.fixed(node.bytes);
+        w.u64(sequence);
+    }
+    w.fixed(s.namespace_root->bytes);
+    w.u8(s.catalogue_root.has_value());
+    if (s.catalogue_root)
+        w.fixed(s.catalogue_root->bytes);
+    w.u32(s.garbage.size());
+    for (const auto& garbage : s.garbage) {
+        w.fixed(garbage.id.bytes);
+        w.i64(garbage.retired_at_ns);
+        w.fixed(garbage.retirement_id.bytes);
+    }
+    w.u32(static_cast<uint32_t>(s.node_status.size()));
+    for (const auto& [node, status] : s.node_status) {
+        w.fixed(node.bytes);
+        encode_node_status(w, status);
+    }
+    w.u32(static_cast<uint32_t>(s.identity_resets.size()));
+    for (const auto& [key, reset] : s.identity_resets) {
+        w.string(key);
+        encode_identity_reset(w, reset);
+    }
+    w.u32(static_cast<uint32_t>(s.merge_parents.size()));
+    for (const auto& parent : s.merge_parents)
+        w.fixed(parent.bytes);
+    w.u32(static_cast<uint32_t>(s.conflicts.size()));
+    for (const auto& [id, conflict] : s.conflicts) {
+        w.string(id);
+        encode_conflict(w, conflict);
+    }
+    w.u32(s.metadata_write_replicas_required);
+    w.u32(static_cast<uint32_t>(s.metadata_participants.size()));
+    for (const auto& participant : s.metadata_participants)
+        w.fixed(participant.bytes);
+    w.fixed(s.metadata_branch_floor.bytes);
+    w.u8(s.retention_baseline_complete ? 1 : 0);
+    return w.take();
+}
+
+namespace {
+// The inverse, and the reason a decoded SM14 snapshot has no entries: this
+// function has no node store and must not acquire one. Materialising the
+// namespace is what the plan exists to stop happening on every decode, so the
+// caller that genuinely needs a map asks `attach_namespace` for it and the
+// rest read one path at a time through `namespace_tree_lookup`.
+MetadataSnapshot decode_snapshot_v14(Reader& r) {
+    MetadataSnapshot s;
+    const auto voters = r.u32();
+    if (voters > 1024)
+        throw DecodeError("too many metadata voters");
+    for (uint32_t i = 0; i < voters; ++i)
+        s.metadata_voters.push_back(NodeId{r.fixed<16>()});
+    s.data_replication = r.u32();
+    s.extent_size = r.u64();
+    const auto mutations = r.u32();
+    if (mutations > 65536)
+        throw DecodeError("too many metadata mutation origins");
+    for (uint32_t i = 0; i < mutations; ++i) {
+        NodeId node{r.fixed<16>()};
+        const auto sequence = r.u64();
+        if (!sequence || !s.mutation_sequences.emplace(node, sequence).second)
+            throw DecodeError("bad metadata mutation sequence");
+    }
+    ObjectId namespace_root;
+    namespace_root.bytes = r.fixed<32>();
+    if (namespace_root == ObjectId{})
+        throw DecodeError("missing namespace root");
+    s.namespace_root = namespace_root;
+    if (r.u8()) {
+        ObjectId catalogue_root;
+        catalogue_root.bytes = r.fixed<32>();
+        s.catalogue_root = catalogue_root;
+    }
+    const auto garbage_count = r.u32();
+    if (garbage_count > 10000000)
+        throw DecodeError("too many garbage records");
+    // A garbage record is 56 encoded bytes, so a count the remaining payload
+    // cannot possibly contain is a damaged or forged one. Reserving against
+    // the count alone is how a corrupt node talks a decoder into a 560 MB
+    // allocation it then fails to fill; bound it by what is actually there.
+    s.garbage.reserve(std::min<size_t>(garbage_count, r.remaining() / 56));
+    for (uint32_t i = 0; i < garbage_count; ++i) {
+        GarbageRef garbage;
+        garbage.id.bytes = r.fixed<32>();
+        garbage.retired_at_ns = r.i64();
+        if (garbage.retired_at_ns < 0)
+            throw DecodeError("bad garbage retirement time");
+        garbage.retirement_id.bytes = r.fixed<16>();
+        s.garbage.push_back(garbage);
+    }
+    const auto statuses = r.u32();
+    if (statuses > 65536)
+        throw DecodeError("too many persisted node status records");
+    for (uint32_t i = 0; i < statuses; ++i) {
+        NodeId node{r.fixed<16>()};
+        if (!s.node_status.emplace(node, decode_node_status(r)).second)
+            throw DecodeError("duplicate persisted node status");
+    }
+    const auto resets = r.u32();
+    if (resets > 65536)
+        throw DecodeError("too many identity reset tombstones");
+    for (uint32_t i = 0; i < resets; ++i) {
+        auto key = r.string(8192);
+        auto reset = decode_identity_reset(r);
+        if (key != identity_reset_key(reset.host, reset.port) ||
+            !s.identity_resets.emplace(std::move(key), std::move(reset)).second)
+            throw DecodeError("bad identity reset tombstone key");
+    }
+    const auto parents = r.u32();
+    if (parents > 64)
+        throw DecodeError("too many metadata merge parents");
+    s.merge_parents.reserve(parents);
+    for (uint32_t i = 0; i < parents; ++i) {
+        Hash256 parent;
+        parent.bytes = r.fixed<32>();
+        s.merge_parents.push_back(parent);
+    }
+    const auto conflicts = r.u32();
+    if (conflicts > 1000000)
+        throw DecodeError("too many metadata conflicts");
+    for (uint32_t i = 0; i < conflicts; ++i) {
+        auto id = r.string(256);
+        auto conflict = decode_conflict(r);
+        if (id.empty() || id != metadata_conflict_id(conflict) ||
+            !s.conflicts.emplace(std::move(id), std::move(conflict)).second)
+            throw DecodeError("bad metadata conflict id");
+    }
+    s.metadata_write_replicas_required = r.u32();
+    if (!s.metadata_write_replicas_required)
+        throw DecodeError("bad metadata write replica floor");
+    const auto participants = r.u32();
+    if (participants > 65536)
+        throw DecodeError("too many metadata participants");
+    for (uint32_t i = 0; i < participants; ++i) {
+        NodeId participant{r.fixed<16>()};
+        if (participant == NodeId{} || !s.metadata_participants.insert(participant).second)
+            throw DecodeError("bad metadata participant");
+    }
+    s.metadata_branch_floor.bytes = r.fixed<32>();
+    const auto baseline = r.u8();
+    if (baseline > 1)
+        throw DecodeError("bad retention baseline state");
+    s.retention_baseline_complete = baseline != 0;
+    r.finish();
+    // No "missing root" check: SM13 proves the namespace is a filesystem by
+    // finding "/" in the map, and there is no map here to look in. The
+    // equivalent proof is a tree read, which belongs to whoever has the store.
+    return s;
+}
+} // namespace
+
 MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     note_startup_progress();
     Reader r(d);
     auto m = r.raw(8);
+    if (std::equal(m.begin(), m.end(), SM14.begin()))
+        return decode_snapshot_v14(r);
     const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
     const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
     const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
