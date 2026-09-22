@@ -1,5 +1,63 @@
 # Current release
 
+## 0.49.1 — The namespace read and written through one door (development)
+
+**Nothing in this release is reachable in production, and that is deliberate.**
+0.49.0 added the SM14 record shape; this adds the machinery that a record with
+a namespace root needs before one may exist. No snapshot carries a root, so
+every path below falls through to the entry map exactly as it did.
+
+**A commit can update the tree instead of re-serialising the library.** The
+change set a mutation already carries is applied to the tree -- erase, upsert,
+append, in the order `apply_metadata_delta_in_place` uses so the two cannot
+disagree. Measured on a 2,520-entry library, one ordinary write rewrites **3
+nodes of 102**: the leaf holding the key and the two branches above it.
+
+The property this rests on is asserted rather than argued: the root an
+incremental update produces is byte-identical to the root a full rebuild
+produces. Sixty rounds of random change sets -- deletes that empty leaves,
+value changes in place, inserts landing on boundary keys, some with enough
+extents to force an external spine -- each compared against a build from
+scratch. Two nodes that reach one namespace by different routes must agree on
+its root, or the comparison that replaces `metadata_namespace_signature`
+reports divergence that does not exist.
+
+**History replay can rebuild a tree-backed head without asking a peer.** A
+record whose history cannot be replayed is the 2026-09-06 outage shape --
+durably written, hash-verified, unreadable the moment it leaves the
+materialisation cache -- so this was the prerequisite for any SM14 record
+existing at all. Replay writes nodes locally and replicates nothing: the
+commit being materialised already reached the write floor when it was made,
+and re-establishing that here would make rebuilding a local head depend on
+peers being reachable.
+
+**The readers that decide what garbage collection may delete read either
+form.** `Service`'s retention claims and release set, and
+`FileSystem::maintenance_objects_cached`. For these an empty namespace does
+not mean "no files", it means "nothing is live" -- the input destructive GC
+wants before it deletes. Every `MetadataSnapshotView` the manager hands out is
+now gated, so a namespace that lives in a tree cannot reach a reader that has
+not been converted; it raises rather than reading as empty.
+
+**Two costs on the FUSE hot path are now stated rather than incidental.**
+Existence checks go through a primitive that copies nothing, because path
+resolution asking `namespace_entry` would copy a film's 12,500-element extent
+list to answer a question about a key. And a stat-only read strips extents in
+the map form too, rather than returning a copy of them because this snapshot
+happens to be a map.
+
+**One regression was introduced and caught here, and it is worth reading.**
+Making `readdir` stat-only broke the manage API, which computes
+`file_media_id()` over what `readdir` returns -- and that hashes the extent
+list. A stat-only listing does not fail there: it hashes an empty list and
+produces a different id that looks exactly as valid as the right one, then
+matches no catalogue binding. That is this work's own failure shape from the
+other direction -- not "an empty namespace read as no files" but "an empty
+extent list read as a file with no content" -- and it is why trimming a read
+to stat data needs an audit of what callers do with the entry rather than what
+the FUSE path does with it.
+
+
 ## 0.49.0 — A record that points at the namespace (development)
 
 **The metadata record can now be a pointer to the namespace rather than the
