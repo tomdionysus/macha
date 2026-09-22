@@ -874,4 +874,53 @@ MACHA_TEST("namespace_tree", test_a_delta_applied_to_the_tree_lands_where_the_ma
     CHECK(refused);
 }
 
+MACHA_TEST("namespace_tree", test_history_replay_applies_a_delta_to_the_tree_not_the_map) {
+    // A record whose history cannot be replayed is the 2026-09-06 outage
+    // shape: durably written, hash-verified, and unreadable the moment it
+    // leaves the materialisation cache. So replay over a tree-backed namespace
+    // has to work before anything may author one.
+    auto entries = library(6, 4);
+    MemoryNamespaceNodeStore store;
+    MetadataSnapshot mapped = populated_snapshot(entries);
+    auto tree_backed = detach_namespace(mapped, store);
+
+    MetadataDelta delta;
+    auto touched = entries.at("/TV/Show 2/Season 3/Episode 2.mkv");
+    touched.mtime_ns += 7000;
+    delta.upsert_entries["/TV/Show 2/Season 3/Episode 2.mkv"] = touched;
+    delta.upsert_entries["/TV/Show 0/Season 1/late.mkv"] = make_file(31337, 5);
+    delta.erase_entries.push_back("/TV/Show 4/Season 2/Episode 1.mkv");
+
+    // Without an applier there is no node store, and the delta is refused
+    // rather than applied to an empty map while the root goes on addressing
+    // the namespace as it was.
+    bool refused = false;
+    try {
+        auto victim = tree_backed;
+        apply_metadata_delta_in_place(victim, delta);
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    apply_metadata_delta_in_place(tree_backed, delta,
+                                  [&](const ObjectId& root, const MetadataDelta& d) {
+                                      return apply_delta_to_namespace_tree(root, store, d);
+                                  });
+    apply_metadata_delta_in_place(mapped, delta);
+
+    // The replayed record is still tree-backed, carries no map, and addresses
+    // exactly the namespace the map form reached.
+    REQUIRE(tree_backed.namespace_root.has_value());
+    CHECK(tree_backed.entries.empty());
+    MemoryNamespaceNodeStore fresh;
+    CHECK(*tree_backed.namespace_root == build_namespace_tree(mapped.entries, fresh));
+    CHECK(read_namespace_tree(*tree_backed.namespace_root, store) == mapped.entries);
+
+    // And the non-entry fields moved exactly as they do in the map form, so
+    // replay is not quietly special-casing a tree-backed record.
+    CHECK(tree_backed.mutation_sequences == mapped.mutation_sequences);
+    CHECK(tree_backed.garbage == mapped.garbage);
+}
+
 } // namespace

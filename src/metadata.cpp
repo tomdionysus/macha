@@ -1442,43 +1442,55 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
     return delta;
 }
 
-void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& delta) {
+void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& delta,
+                                   const NamespaceDeltaApplier& namespace_applier) {
     note_startup_progress();
-    // A tree-backed namespace cannot be edited through the map: the entry
-    // edits below would land in an empty map that nothing reads, the root
-    // would keep addressing the namespace as it was, and the result would be a
-    // record that looks applied and is not. Replaying a delta against a tree
-    // needs a node store, which this function has no way to obtain -- it is
-    // apply_delta_to_namespace_tree, and the history replay path has to hand
-    // it one. Until it does, refuse.
-    if (out.namespace_root)
-        throw DecodeError("cannot apply a metadata delta to a tree-backed namespace through the "
-                          "entry map");
+    // A tree-backed namespace is not edited through the map: the entry edits
+    // below would land in an empty map that nothing reads while the root went
+    // on addressing the namespace as it was, which is a record that looks
+    // applied and is not. The applier does it properly, against the tree; with
+    // no applier this is refused rather than silently misapplied.
+    if (out.namespace_root) {
+        if (!namespace_applier)
+            throw DecodeError("cannot apply a metadata delta to a tree-backed namespace without a "
+                              "namespace node store");
+        out.namespace_root = namespace_applier(*out.namespace_root, delta);
+    }
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         auto it = out.mutation_sequences.find(node);
         if (it != out.mutation_sequences.end() && sequence < it->second)
             throw DecodeError("metadata delta sequence regressed");
         out.mutation_sequences[node] = sequence;
     }
+    // The entry edits belong to the map form only. A tree-backed snapshot has
+    // had them applied to the tree above, and running them here as well would
+    // leave it carrying both a root and a map -- the state every encoder
+    // refuses, and the one where the two can disagree about what the namespace
+    // is. The erase-root check still runs, because removing "/" is invalid in
+    // either form and the tree applier has no cheaper place to notice it.
     for (const auto& path : delta.erase_entries) {
         auto normalized = normalize_path(path);
         if (normalized == "/")
             throw DecodeError("metadata delta removed root");
-        out.entries.erase(normalized);
+        if (!out.namespace_root)
+            out.entries.erase(normalized);
     }
-    for (const auto& [path, value] : delta.upsert_entries)
-        out.entries[normalize_path(path)] = value;
-    for (const auto& [path, append] : delta.append_entries) {
-        auto found = out.entries.find(normalize_path(path));
-        if (found == out.entries.end() || found->second.type != EntryType::file ||
-            found->second.extents.size() != append.base_extents)
-            throw DecodeError("metadata delta append base mismatch");
-        auto& entry = found->second;
-        entry.extents.insert(entry.extents.end(), append.extents.begin(), append.extents.end());
-        entry.size = append.size;
-        entry.mtime_ns = append.mtime_ns;
-        entry.ctime_ns = append.ctime_ns;
-        entry.version = append.version;
+    if (!out.namespace_root) {
+        for (const auto& [path, value] : delta.upsert_entries)
+            out.entries[normalize_path(path)] = value;
+        for (const auto& [path, append] : delta.append_entries) {
+            auto found = out.entries.find(normalize_path(path));
+            if (found == out.entries.end() || found->second.type != EntryType::file ||
+                found->second.extents.size() != append.base_extents)
+                throw DecodeError("metadata delta append base mismatch");
+            auto& entry = found->second;
+            entry.extents.insert(entry.extents.end(), append.extents.begin(),
+                                 append.extents.end());
+            entry.size = append.size;
+            entry.mtime_ns = append.mtime_ns;
+            entry.ctime_ns = append.ctime_ns;
+            entry.version = append.version;
+        }
     }
     switch (delta.catalogue) {
     case CatalogueDelta::unchanged:
@@ -1533,14 +1545,20 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
         out.merge_parents = *delta.replace_merge_parents;
     if (delta.replace_conflicts)
         out.conflicts = *delta.replace_conflicts;
-    auto root = out.entries.find("/");
-    if (root == out.entries.end() || root->second.type != EntryType::directory)
-        throw DecodeError("metadata delta lost root");
+    // The same invariant the map form checks here is checked by the tree
+    // applier, which is the only party that can see inside a tree. Looking for
+    // "/" in an empty map would fail every tree-backed replay.
+    if (!out.namespace_root) {
+        auto root = out.entries.find("/");
+        if (root == out.entries.end() || root->second.type != EntryType::directory)
+            throw DecodeError("metadata delta lost root");
+    }
 }
 
-MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const MetadataDelta& delta) {
+MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const MetadataDelta& delta,
+                                      const NamespaceDeltaApplier& namespace_applier) {
     MetadataSnapshot out = before;
-    apply_metadata_delta_in_place(out, delta);
+    apply_metadata_delta_in_place(out, delta, namespace_applier);
     return out;
 }
 
@@ -2611,7 +2629,7 @@ void MetadataReplica::load_journal() {
                     throw std::runtime_error("delta CAS chain broken");
                 auto replayed = decode_snapshot(cur_.payload);
                 auto delta = decode_metadata_delta(body);
-                apply_metadata_delta_in_place(replayed, delta);
+                apply_metadata_delta_in_place(replayed, delta, namespace_applier_);
                 record.payload = encode_snapshot_for_delta(body, replayed);
                 if (!valid_metadata_record(record))
                     throw std::runtime_error("delta CAS hash invalid");
@@ -3529,7 +3547,7 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
                 !metadata_delta_succession_valid(working_record.generation, child.generation))
                 return {};
             const auto delta = decode_metadata_delta(child.payload);
-            apply_metadata_delta_in_place(working_snapshot, delta);
+            apply_metadata_delta_in_place(working_snapshot, delta, namespace_applier_);
             historical_deltas_applied_.fetch_add(1, std::memory_order_relaxed);
             MetadataRecord next;
             next.generation = child.generation;
@@ -3915,7 +3933,7 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
             snapshot = std::make_shared<const MetadataSnapshot>(std::move(decoded));
         } else {
             auto decoded = *parent->snapshot;
-            apply_metadata_delta_in_place(decoded, decode_metadata_delta(entry.payload));
+            apply_metadata_delta_in_place(decoded, decode_metadata_delta(entry.payload), namespace_applier_);
             record.payload = encode_snapshot_for_delta(entry.payload, decoded);
             snapshot = std::make_shared<const MetadataSnapshot>(std::move(decoded));
         }
@@ -4001,7 +4019,8 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
                 return false;
             }
             auto snapshot = *parent->snapshot;
-            apply_metadata_delta_in_place(snapshot, decode_metadata_delta(entry_value.payload));
+            apply_metadata_delta_in_place(snapshot, decode_metadata_delta(entry_value.payload),
+                                          namespace_applier_);
             MetadataRecord value;
             value.generation = entry_value.generation;
             value.previous = entry_value.previous;
@@ -4326,7 +4345,7 @@ MetadataReplica::materialized(const Hash256& hash) const {
                 !metadata_delta_succession_valid(working_record.generation, child.generation))
                 return {};
             const auto delta = decode_metadata_delta(child.payload);
-            apply_metadata_delta_in_place(working_snapshot, delta);
+            apply_metadata_delta_in_place(working_snapshot, delta, namespace_applier_);
             historical_deltas_applied_.fetch_add(1, std::memory_order_relaxed);
             MetadataRecord record;
             record.generation = child.generation;
@@ -4474,7 +4493,7 @@ bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
 
     auto after = decode_snapshot(base->payload);
     auto delta = decode_metadata_delta(encoded_delta);
-    apply_metadata_delta_in_place(after, delta);
+    apply_metadata_delta_in_place(after, delta, namespace_applier_);
 
     MetadataRecord next;
     next.generation = generation + 1;
@@ -4551,7 +4570,7 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
 
     auto after = decode_snapshot(cur_.payload);
     auto delta = decode_metadata_delta(encoded_delta);
-    apply_metadata_delta_in_place(after, delta);
+    apply_metadata_delta_in_place(after, delta, namespace_applier_);
     MetadataRecord next;
     next.generation = generation + 1;
     next.previous = hash;
