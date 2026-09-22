@@ -1830,6 +1830,22 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     if (right_head < left_head)
         return merge_metadata_snapshots(base, right, left, right_head, left_head);
 
+    // This is a path-wise three-way merge over three materialised namespaces.
+    // A tree-backed snapshot has an empty map, and an empty map here does not
+    // fail -- it merges to an empty namespace with no conflicts, which is a
+    // reconciliation that deletes the library and looks like agreement. Every
+    // caller therefore materialises its inputs first, and a snapshot that
+    // still carries a root has not been through that step.
+    //
+    // Merging tree-native -- comparing subtree roots and descending only where
+    // they differ -- is the obvious next thing and is not written. Until it
+    // is, a merge costs what a merge costs today, which is the one operation
+    // this work has not made cheaper.
+    for (const auto* branch : {&base, &left, &right})
+        if (branch->namespace_root)
+            throw std::logic_error("metadata merge requires materialised namespaces; a branch is "
+                                   "still a tree");
+
     MetadataMergeResult result;
     auto& out = result.snapshot;
     out.metadata_voters.clear();
@@ -2124,6 +2140,9 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
 std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
     const MetadataRecord& left_record, const MetadataSnapshot& left,
     const MetadataRecord& right_record, const MetadataSnapshot& right) {
+    if (left.namespace_root || right.namespace_root)
+        throw std::logic_error("metadata repair planning requires materialised namespaces; a "
+                               "branch is still a tree");
     auto dominates = [](const MetadataSnapshot& candidate, const MetadataSnapshot& other) {
         for (const auto& [origin, sequence] : other.mutation_sequences) {
             const auto found = candidate.mutation_sequences.find(origin);
@@ -2160,6 +2179,14 @@ std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
 std::optional<MetadataConflictPreservingRepairPlan> plan_conflict_preserving_metadata_repair(
     const MetadataRecord& left_record, const MetadataSnapshot& left,
     const MetadataRecord& right_record, const MetadataSnapshot& right) {
+    // Both planners compare entry maps, so a tree-backed branch would compare
+    // as empty and plan a repair against a namespace it never looked at. These
+    // are the operator's split-brain tools and they run once, under pressure,
+    // on a cluster that is already in trouble; refusing is the only acceptable
+    // behaviour until macha-metadata-repair materialises its inputs.
+    if (left.namespace_root || right.namespace_root)
+        throw std::logic_error("metadata repair planning requires materialised namespaces; a "
+                               "branch is still a tree");
     for (const auto& [path, _] : left.entries)
         if (!right.entries.contains(path))
             return {};
