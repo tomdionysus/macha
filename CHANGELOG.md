@@ -1,5 +1,63 @@
 # Current release
 
+## 0.49.0 — A record that points at the namespace (development)
+
+**The metadata record can now be a pointer to the namespace rather than the
+namespace itself.** SM14 carries the non-entry fields plus a 32-byte
+`namespace_root` addressing a content-addressed Merkle tree, in place of the
+inlined entry map. On the test fixture the payload is **590 bytes against
+434,731**, and it is still 590 for a library twenty times larger, differing in
+the 32 bytes it points with. Against es-1's real head the comparison is 590
+against 22,525,100.
+
+That number is the whole point of the work. Today the record *is* the
+serialised namespace and its identity *is* a SHA-256 over those bytes, so
+every commit re-serialises and re-hashes the entire library: 56 ms of CPU per
+namespace write on 1.618 TiB, and about 3.1 s at the 100 TB the system claims
+to be for. A commit's cost has to stop being a function of how much media the
+cluster holds, and this is the format in which it does.
+
+**Nothing authors one, on purpose.** `encode_snapshot` never emits SM14, no
+commit path constructs or reads it, and a node that does not know the magic
+refuses the payload as `bad snapshot`. This release ships the format and the
+tree it addresses as dead code, reachable only from tests. Making it
+authoritative is the next stage, and the migration that cuts a live cluster
+over to it is the one after that.
+
+**A snapshot carries entries or a root and never both.** Both encoders refuse
+the mixed state rather than resolving it: `encode_snapshot` will not drop a
+root it has no field for, and `encode_snapshot_v14` will not drop entries it
+would leave behind. The failure being designed out is publishing an empty
+namespace under a valid-looking hash — durable, silent, and indistinguishable
+from a library that was deleted.
+
+**The "missing root" check moved to the reader that holds a node store.**
+SM13's decoder proves the namespace is a filesystem by finding `/` in the map.
+SM14 has no map, and acquiring a store inside `decode_snapshot` to run a sanity
+check would reintroduce exactly the materialisation this removes, so
+`attach_namespace` makes the check instead.
+
+The acceptance is a byte-exact round trip. A snapshot with garbage, node
+status, identity resets, merge parents, the write floor, the participant
+roster, the branch floor and the retention baseline all populated — detached,
+encoded as SM14, decoded, reattached — re-encodes to the original SM13 payload
+byte for byte, which covers every field without enumerating them. Separately,
+and proved by counting store reads rather than asserted: a `getattr` answered
+from a decoded SM14 record reads at most `depth` nodes, fetches no extent
+node, and never materialises the namespace.
+
+Every section SM8–SM13 writes conditionally is unconditional in SM14. Those
+conditions exist to reproduce an older encoder's exact bytes for journal
+replay, and SM14 has no older self to be byte-compatible with. The legacy
+`metadata_voters` list survives the re-rooting deliberately: retiring a dead
+field and moving the namespace out of the record are two decisions, and only
+one of them belongs to this work.
+
+The SM14 garbage reserve is bounded by `Reader::remaining()` rather than by
+the count in the payload — the same defect the node decoder carried and which
+reading it, not fuzzing it, found.
+
+
 ## 0.48.2 — Things a node can say about itself (development)
 
 **Timestamps in the journal are UTC and say so.** Every line now reads
