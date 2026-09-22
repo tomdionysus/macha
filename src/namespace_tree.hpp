@@ -157,4 +157,26 @@ std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_v
 
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store);
 
+// The two halves of the SM14 record shape, and the only places a snapshot
+// changes which form its namespace is in.
+//
+// `detach_namespace` builds the tree over `entries`, writes its nodes to
+// `store`, and returns the snapshot with `namespace_root` set and `entries`
+// empty -- the form `encode_snapshot_v14` will accept. `attach_namespace` is
+// the inverse and materialises the whole namespace back into the map.
+//
+// Both take the snapshot by value so a caller that is done with its copy can
+// move it in: the map being transferred is the gigabyte this plan is about,
+// and a signature that quietly copied it would cost more than the work it is
+// doing.
+//
+// Nothing on the hot path should want `attach_namespace`. A point lookup is
+// `namespace_tree_lookup` and a listing is a prefix scan; materialising is for
+// proving the round trip loses nothing, and for the readers Stage C has not
+// converted yet.
+MetadataSnapshot detach_namespace(MetadataSnapshot snapshot, NamespaceNodeStore& store,
+                                  const NamespaceTreeLimits& limits = {});
+MetadataSnapshot attach_namespace(MetadataSnapshot snapshot, const NamespaceNodeStore& store,
+                                  const NamespaceTreeLimits& limits = {});
+
 } // namespace macha

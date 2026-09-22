@@ -577,6 +577,34 @@ void walk_stats(const ObjectId& id, const NamespaceNodeStore& store, NamespaceTr
 
 } // namespace
 
+MetadataSnapshot detach_namespace(MetadataSnapshot snapshot, NamespaceNodeStore& store,
+                                  const NamespaceTreeLimits& limits) {
+    if (snapshot.namespace_root)
+        throw std::runtime_error("namespace is already detached");
+    snapshot.namespace_root = build_namespace_tree(snapshot.entries, store, limits);
+    snapshot.entries.clear();
+    return snapshot;
+}
+
+MetadataSnapshot attach_namespace(MetadataSnapshot snapshot, const NamespaceNodeStore& store,
+                                  const NamespaceTreeLimits& limits) {
+    if (!snapshot.namespace_root)
+        throw std::runtime_error("snapshot carries no namespace root");
+    if (!snapshot.entries.empty())
+        throw std::runtime_error("snapshot already carries its entries");
+    snapshot.entries = read_namespace_tree(*snapshot.namespace_root, store, limits);
+    // The check SM13's decoder makes on every snapshot it reads, made here
+    // instead: a namespace without a root directory is not a filesystem. SM14
+    // cannot make it -- `decode_snapshot` has no node store and materialising
+    // one to run a sanity check is exactly the cost the tree removes -- so it
+    // belongs to whoever does hold the store and does read the tree.
+    const auto root = snapshot.entries.find("/");
+    if (root == snapshot.entries.end() || root->second.type != EntryType::directory)
+        throw DecodeError("missing root");
+    snapshot.namespace_root.reset();
+    return snapshot;
+}
+
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store) {
     NamespaceTreeStats stats;
     walk_stats(root, store, stats, 1);
