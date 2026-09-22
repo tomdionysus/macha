@@ -27,70 +27,153 @@ SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
 for it died the same way. **A client's account of itself is evidence about the
 client, not a fact.**
 
--3. **P0: audit the disk resource manager against the project's principles
-   before trusting it (operator, 2026-09-22). It has been wrong twice.**
+-4. **P0: both durability-barrier-after-peer-restart tests fail most of the
+   time, and neither is a flake or caused by 0.53.0 (measured 2026-09-23, NOT
+   FIXED).**
 
-   `src/io_pressure.hpp` and the pressure term in `DataResourceArbiter` were
-   built and deployed on 2026-09-22 and were wrong twice on the way:
+   Measured on the laptop, in isolation, `--repeat 8`, with the 0.53.0 changes
+   and again with them stashed at `5c5d008`:
 
-   1. The threshold was **invented, not derived** -- a flat 50 ms against every
-      operation, so an ordinary 4 MiB extent write read as pressure and a node
-      declared itself in trouble nine seconds after boot.
-   2. It **flattened law 2**, making the loader yield to a slow device with no
-      viewer anywhere, which is precisely what the law forbids.
+   | case | with 0.53.0 | at `5c5d008` |
+   |---|---|---|
+   | `..._reports_objects_a_restarted_peer_lost` | 5/8 fail | 5/8 fail |
+   | `..._rederives_placement_after_peer_restart` | 6/8 fail | 4/8 fail |
 
-   And arguably a third time: after both corrections it still did nothing about
-   the work actually taking the disk, because maintenance is not in the arbiter
-   at all (see the item below). A resource manager that cannot see the largest
-   consumer of the resource is not managing it.
+   **So they predate this work**, and the spread between 4/8 and 6/8 is noise
+   over eight runs, not a change. They pass together often enough that a single
+   full-suite run reports zero, one or both — which is how this went on being
+   called a flake. It is not one: it reproduces on demand.
 
-   **The audit is a gate, not a cleanup.** Until it is done, nothing further
-   should be built on this mechanism, and the operator may reasonably want it
-   off: `dht.io_pressure_slowdown_percent: 0` and
-   `torrent.pressure_download_rate: 0` disable it and restore the previous
-   admission behaviour exactly. Deployed state as of 2026-09-22 22:00Z: **on,
-   with defaults, on all three nodes.**
+   The "reports" case always fails at the same assertion,
+   `tests/test_storage_v18.cpp:1385`:
 
-   What the audit has to answer, each with a citation to the law or discipline
-   it rests on and a test that would fail if it regressed:
+   ```
+   REQUIRE failed: unsatisfiable.size() == 1
+   ```
 
-   - [ ] **Law 1.** Enumerate every path by which a viewer read can be delayed
-     by this mechanism. The intended answer is none. Verify for `foreground`
-     and `read_ahead` separately, and for a viewer arriving *while* pressure is
-     already engaged.
-   - [ ] **Law 2.** The loader yields only when a viewer is present. Check what
-     "present" means at the boundaries: a viewer that has just released its
-     lease, one waiting behind a no-progress deadline, one on a different
-     backend of the same pool.
-   - [ ] **Law 3.** Control touches no disk, so this should be incapable of
-     affecting it. Confirm rather than assume -- the arbiter refuses control
-     entry, but the monitor is fed from a pool the control store does not share.
-     State explicitly which device each store sits on for each node.
-   - [ ] **Law 4.** Can a stuck pressure state wedge the node? The EWMA has no
-     floor on recovery time and `min_background` is the only escape. Establish
-     that background work always drains and that pressure always releases on a
-     device that recovers, including after a long sustained overload.
-   - [ ] **Coverage.** List every writer and reader of a DATA backend and say,
-     for each, whether this mechanism can bound it: ingest/FUSE publication
-     (arbiter), repair/rebalance/GC/scrub (maintenance bandwidth, NOT the
-     arbiter), libtorrent (its own rate limit, clamped separately), playback
-     reads (never bounded). A gap here is how the maintenance finding below was
-     missed.
-   - [ ] **Every threshold derived or expressed as a ratio.** No number in the
-     config may be a guess about hardware. `io_pressure_outlier_ms` is
-     currently an absolute 2 s and needs justifying or replacing.
-   - [ ] **Discipline 1** (measured ground truth over bookkeeping): confirm the
-     signal is still measured at the completion point and that nothing has
-     started inferring it from byte budgets.
-   - [ ] **Observability.** An operator must be able to tell, from the status
-     API alone, that work was slowed and why. `device_pressured`,
-     `device_slowdown_percent`, `device_worst_us` and
-     `device_pressure_onsets` exist; check they are sufficient to distinguish
-     "throttled deliberately" from "node unwell", which was not possible during
-     the 2026-09-22 incident.
+   The line above it passes, so the barrier does correctly fail — it just does
+   not say **which** object the restarted peer lost. `unsatisfiable` comes back
+   empty. That contradicts the contract `DistributedStore::durability_barrier`
+   states where it is declared: "ids a peer no longer holds are appended to
+   `unsatisfiable` (if given) and the caller must re-put them." With an empty
+   vector the caller has nothing to re-put and the publication simply fails.
 
--2. **P0: maintenance outranks the ingest, and the mechanism to stop it is deaf
-   to the loader (found 2026-09-22 22:00Z, NOT FIXED).**
+   - [ ] Find out why the barrier fails without naming the object. Both cases
+     are about the same re-derivation path — it probes a peer with the object
+     ids after a placement token dies with that peer's incarnation — so treat
+     them as one defect until something proves otherwise.
+   - [ ] **Unverified, but check it:** this is the right shape to produce
+     `ingest failed: object replication quorum unavailable` after a node
+     restarts mid-put, which is recorded below as timing-dependent and is
+     exactly what a barrier that fails while naming nothing would cause. If it
+     is the same defect, fixing this closes both.
+   - [ ] Confirm on a node. Everything above is macOS/clang, and
+     `..._rederives_placement_after_peer_restart` was recorded in 2026-09-17 as
+     failing 12/12 on macOS and passing 3/3 on es-1. That it now fails only
+     4-6 times in 8 on the same machine means the earlier reading no longer
+     describes it either, so re-measure both on es-1 rather than inheriting a
+     platform split.
+
+-3. **The disk resource manager was audited on 2026-09-22 (0.53.0). It was
+   wrong in five more places than the two already recorded; all five are
+   fixed. The gate is lifted.**
+
+   The audit was called for after the mechanism had been wrong twice on the
+   day it shipped -- a threshold invented rather than derived, and law 2
+   flattened so the loader yielded to a slow device with no viewer present --
+   and it found that neither correction had reached the read path at all.
+
+   **What it found, worst first.**
+
+   1. **Every DATA read was measured with `bytes = 0`, so the founding bug was
+      still live.** `StoragePool::get()` started its timer with zero bytes
+      because a read's size is only known once it succeeds, and the
+      `DiskServiceTimer::note_bytes()` call that exists for exactly that
+      purpose was never written, anywhere in the tree. So every read was judged
+      against the fixed 25 ms per-operation overhead alone, with no per-size
+      allowance -- the same flat threshold the whole ratio model was built to
+      replace. Measured on es-1 during the audit: `sdb` serving 53.7 reads/s at
+      240 KB average and 30.9 ms average service, a healthy spinner, and the
+      node entered and left pressure **twelve times in the thirty-four minutes**
+      since it started 0.52.0, clamping an operator's torrent each time with
+      nobody watching anything.
+
+   2. **The torrent rate clamp never had law 2's second clause.**
+      `TorrentManager::follow_device_pressure()` clamped on `pressured()`
+      alone. An acquisition is durable work the user asked for, so it is
+      loader-class and yields to a slow device only when a viewer would
+      otherwise wait. The arbiter was corrected for this in 0.52.0; this path
+      was not, and it is what produced those twelve log lines.
+
+   3. **The signal could not see the largest consumer of the device.** Pool
+      maintenance reads its backends directly rather than through
+      `StoragePool::get()`, where the timer lived, so the 51.6 MB/s of
+      `macha-maint` reads that saturated `sdb` on 2026-09-22 never fed the
+      monitor at all. The mechanism was blind to maintenance in both
+      directions: it could not bound it and could not see it. (Object-level
+      repair in `DistributedStore::repair_step` does enter the arbiter, as
+      speculative. It was pool-level rebalance/scrub/GC that did neither.)
+
+   4. **"Viewer present" was narrower in the arbiter than everywhere else in
+      the system** -- byte credit held at this instant, which playback does not
+      hold between extents. Every gap in a stream readmitted the loader at full
+      concurrency, and the viewer's next read queued behind the extent write
+      the gap had just let in.
+
+   5. **The only counter that answers "throttled or unwell" did not exist.**
+      `pressure_refusals_` was a private member from the day the gate shipped,
+      incremented nowhere and reported nowhere.
+
+   **What it confirmed rather than assumed.**
+
+   - **Law 1.** Admission-wise, there is no path by which this mechanism delays
+     a viewer read. `available()` returns true for `foreground` and
+     `read_ahead` before pressure is consulted, on both `acquire()` and
+     `try_acquire()`, and a viewer arriving while pressure is engaged takes the
+     same path; the viewer reserve is subtracted from lower-class capacity so
+     background work can never occupy it. One physical path remains and is
+     deliberate: `min_background` (floor 1) means one background operation may
+     be on the spindle ahead of a viewer's read. That is law 2's trickle bought
+     at law 1's expense, and it is now stated rather than implied.
+   - **Law 3.** The control store is a separate `LocalStore` at
+     `metadata_store.path`, constructed outside `StoragePool`, with no timer
+     anywhere on its path, and `acquire()` throws on `FrameType::control`.
+     Measured on the hardware: control sits on `nvme0n1p2` (ROTA=0) on all
+     three nodes, DATA on `sdb1` (9.1 T, ROTA=1) on gbni-1 and es-1, and fi-1
+     holds no extents at all. **Law 3 holds by configuration, not by
+     construction** -- nothing stops an operator pointing `metadata_store.path`
+     at a DATA spindle, and the FUSE spool (`/mnt/diskB/spool`) and ingest
+     staging (`/mnt/diskB/ingest`) already sit on the DATA spindle, as plain
+     file I/O the monitor never sees and the arbiter never bounds.
+   - **Law 4.** Background work always drains: the refusal is
+     `lower_active_ >= min_background`, floored at 1, so with nothing active a
+     lease is always admitted, operations keep completing, and the signal can
+     never starve itself of input. The hysteresis band is a latch, though:
+     pressure engages above 300% and releases below 150%, so a device that
+     settles anywhere between stays pressured, and the average does not decay
+     without traffic. Neither wedges the node -- the trickle drains -- but
+     "pressure always releases on a device that recovers" is only true if it
+     recovers past 150%.
+
+   **Still open, recorded rather than papered over:**
+
+   - [ ] **One monitor covers a whole `StoragePool`, not one device.** A pool
+     may hold several backends on several devices and this cannot tell them
+     apart, so one slow backend makes the pool pressured for work bound
+     anywhere in it. Harmless today -- gbni-1 and es-1 configure exactly one
+     DATA backend each -- and it bites the moment a second is configured.
+     Per-device pressure also needs the arbiter to know an operation's
+     destination device, which it cannot: admission happens before placement
+     picks a backend. The false claim in the header comment is corrected.
+   - [ ] **Local disk maintenance is budgeted from a network measurement.**
+     `estimated_network_bps()` feeds `local_credit` as well as
+     `network_credit`, which is how a GC/repair pass helped itself to
+     51.6 MB/s of one spindle. See the third bullet of the item below; no
+     number is proposed here, because inventing one is what started all this.
+
+-2. **Maintenance outranked the ingest because the mechanism to stop it was
+   deaf to the loader (found 2026-09-22 22:00Z, FIXED in 0.53.0; the rate is
+   NOT yet re-measured on the cluster).**
 
    An operator's 36 GB import ran at ~2 MB/s on gbni-1 while, measured on the
    node:
@@ -122,18 +205,31 @@ client, not a fact.**
    That is law 2 in a third place: the loader must outrank background work, and
    here background work cannot even see it.
 
-   - [ ] A loader activity clock on `DistributedStore` beside the foreground
-     and interactive ones, fed from the loader write path, and included in the
-     maintenance busy predicate at `src/service.cpp:1178-1180`, `:1454-1455`
-     and `:1689-1690`. It must NOT be folded into the viewer clocks: viewer
-     reserves and the pressure gate key off those, and conflating them would
-     make an import look like a viewer and gate other loader work behind it.
-   - [ ] Then measure the import rate again. Everything claimed about
-     throughput today has been wrong at least once; the only numbers worth
-     trusting are the per-thread `/proc/<pid>/task/*/io` deltas and `iostat`.
+   - [x] A loader activity clock on `DistributedStore` beside the foreground
+     and interactive ones, fed from the loader read and write paths, and
+     included in the maintenance busy predicate and in all four slice-yield
+     predicates and the busy-pass wake-up. It is **not** folded into the viewer
+     clocks, and `test_a_loader_write_is_visible_to_maintenance_as_its_own_class`
+     asserts both halves: the loader clock moves, the two viewer clocks do not,
+     and `viewer_recently_active()` stays false -- because viewer reserves, the
+     pressure gate and the torrent clamp all key off the viewer clocks, and
+     conflating them would make an import look like a viewer and gate other
+     loader work behind it.
+   - [ ] **Then measure the import rate again.** Nothing here is verified on
+     the cluster yet; 0.53.0 is built and green on the laptop only. Everything
+     claimed about throughput on 2026-09-22 was wrong at least once, so the
+     only numbers worth trusting are the per-thread `/proc/<pid>/task/*/io`
+     deltas and `iostat`. Take a before reading with maintenance running
+     against an idle node, start an import, and confirm `macha-maint` drops to
+     nothing while it runs.
    - [ ] Consider whether `max_bandwidth: 0B` should mean "no cap" at all on a
      node whose DATA backend is one spindle. The observed-bandwidth fallback
-     let a GC/repair pass take 51 MB/s.
+     let a GC/repair pass take 51 MB/s -- and note what the audit found behind
+     that: `estimated_network_bps()` budgets `local_credit` as well as
+     `network_credit`, so **local disk maintenance is rationed by a network
+     measurement**. The loader clock stops maintenance during an import, which
+     is the case that hurt, but it does not make the budget mean anything on a
+     node with one spindle. No number is proposed here on purpose.
 
    **Also open from the same afternoon:** an ingest job dies permanently when
    its node restarts mid-put -- `state='failed' error='object replication

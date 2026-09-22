@@ -1174,14 +1174,25 @@ void Service::loop(std::stop_token stop) {
 
         auto playback_bytes = store_->take_foreground_bytes();
         auto interactive_bytes = store_->take_interactive_bytes();
+        auto loader_bytes = store_->take_loader_bytes();
         const bool playback_busy =
             playback_bytes > 0 || store_->foreground_idle_for() < policy.foreground_quiet;
         const bool interactive_busy =
             interactive_bytes > 0 || store_->interactive_idle_for() < policy.foreground_quiet;
+        // Law 2: the loader outranks background work, so background work has to
+        // be able to see it. Until 0.53.0 this decision was the two viewer
+        // classes alone, and an ingest feeds neither -- so a node importing
+        // 36 GB called itself idle and handed maintenance its idle share of a
+        // disk the import was waiting on (gbni-1, 2026-09-22: sdb at 91%
+        // utilisation, macha-maint reading 51.6 MB/s, the import writing
+        // 2.8 MB/s, and busy_bandwidth_fraction already set to 0.0).
+        const bool loader_busy =
+            loader_bytes > 0 || store_->loader_idle_for() < policy.foreground_quiet;
         // Priority law: playback/seek > mounted MachaDFS/useful prefetch >
-        // repair/rebalance/scrub. Both foreground classes suppress background
-        // work, while the transport queues themselves keep playback above mount I/O.
-        bool busy = playback_busy || interactive_busy;
+        // user-requested loader work > repair/rebalance/scrub. All three
+        // suppress background work, while the transport queues themselves keep
+        // playback above mount I/O.
+        bool busy = playback_busy || interactive_busy || loader_busy;
         double fraction = busy ? policy.busy_bandwidth_fraction : policy.idle_bandwidth_fraction;
 
         double bandwidth = store_->estimated_network_bps();
@@ -1452,7 +1463,8 @@ void Service::loop(std::stop_token stop) {
                             // will re-evaluate busy_bandwidth_fraction normally.
                             const auto quiet = node_.config().maintenance.foreground_quiet;
                             return store_->foreground_idle_for() < quiet ||
-                                   store_->interactive_idle_for() < quiet;
+                                   store_->interactive_idle_for() < quiet ||
+                                   store_->loader_idle_for() < quiet;
                         },
                         maintenance_inventory_generation_);
                     log_slow_stage("network-repair", repair_stage,
@@ -1687,7 +1699,8 @@ void Service::loop(std::stop_token stop) {
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
                             return store_->foreground_idle_for() < quiet ||
-                                   store_->interactive_idle_for() < quiet;
+                                   store_->interactive_idle_for() < quiet ||
+                                   store_->loader_idle_for() < quiet;
                         },
                         [this](const ObjectId& id) {
                             return node_.retention_store().retained(RetentionClass::data, id);
@@ -1739,7 +1752,8 @@ void Service::loop(std::stop_token stop) {
                     static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_->foreground_idle_for() < quiet ||
-                               store_->interactive_idle_for() < quiet;
+                               store_->interactive_idle_for() < quiet ||
+                               store_->loader_idle_for() < quiet;
                     });
                 log_slow_stage("local-rebalance", rebalance_stage,
                                "bytes=" + std::to_string(rebalance.bytes) +
@@ -1815,7 +1829,8 @@ void Service::loop(std::stop_token stop) {
                     node_.local_store().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_->foreground_idle_for() < quiet ||
-                               store_->interactive_idle_for() < quiet;
+                               store_->interactive_idle_for() < quiet ||
+                               store_->loader_idle_for() < quiet;
                     });
                 log_slow_stage("scrub", scrub_stage,
                                "bytes=" + std::to_string(scrub.bytes) +
@@ -1955,7 +1970,8 @@ void Service::loop(std::stop_token stop) {
             // objects never reclaimed (2026-09-15, 1-2 in 60 runs). Now the
             // pass re-evaluates as soon as the quiet period is met, and at
             // once when it already has.
-            auto idle = std::min(store_->foreground_idle_for(), store_->interactive_idle_for());
+            auto idle = std::min({store_->foreground_idle_for(), store_->interactive_idle_for(),
+                                  store_->loader_idle_for()});
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
                                                                 ? policy.foreground_quiet - idle
                                                                 : Clock::duration{}));

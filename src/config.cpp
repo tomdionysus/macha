@@ -174,8 +174,8 @@ void parse_dht(const YAML::Node& root, Config& c) {
         c.io_pressure_slowdown_percent = d["io_pressure_slowdown_percent"].as<uint32_t>();
     if (d["io_pressure_release_percent"])
         c.io_pressure_release_percent = d["io_pressure_release_percent"].as<uint32_t>();
-    if (d["io_pressure_outlier_ms"])
-        c.io_pressure_outlier_ms = d["io_pressure_outlier_ms"].as<uint32_t>();
+    if (d["io_pressure_outlier_percent"])
+        c.io_pressure_outlier_percent = d["io_pressure_outlier_percent"].as<uint32_t>();
     if (d["io_pressure_min_background"])
         c.io_pressure_min_background = d["io_pressure_min_background"].as<uint32_t>();
     if (d["read_ahead"])

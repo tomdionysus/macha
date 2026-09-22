@@ -1,5 +1,87 @@
 # Current release
 
+## 0.53.0 — The disk resource manager, audited (development)
+
+The operator called a gate on this mechanism after it had been wrong twice in
+one afternoon, and the audit found it wrong in five more places. Everything
+here comes out of that audit, worst first. Nothing in it is verified on the
+cluster yet.
+
+**Every DATA read was measured with a size of zero, so the flat threshold this
+model exists to replace was still live on the read path.**
+`StoragePool::get()` starts its timer before the read, because a read's size
+is only known once it has succeeded, and the `DiskServiceTimer::note_bytes()`
+call that exists for exactly that purpose was never written — anywhere in the
+tree. Every read was therefore judged against the fixed 25 ms per-operation
+overhead alone, with no per-MiB allowance at all: precisely the 0.51.0 bug
+that 0.52.0 was supposed to have removed, surviving inside the fix for it.
+
+Measured on es-1 while auditing: `sdb` serving 53.7 reads/s at 240 KB average
+and 30.9 ms average service — a healthy spinner — and the node had entered and
+left pressure **twelve times in the thirty-four minutes** since it started
+0.52.0, clamping an operator's torrent download each time, with nothing being
+watched anywhere on the cluster. `test_a_read_is_measured_with_the_bytes_it_returned`
+drives real objects through a real pool and fails without the call.
+
+**The torrent rate clamp never had law 2's second clause.**
+`TorrentManager::follow_device_pressure()` clamped the download rate whenever
+the device was pressured. An acquisition is durable work the user asked for —
+loader class — so it yields to a slow device only when a viewer would
+otherwise wait for it. The arbiter was corrected for this in 0.52.0 and this
+path was not, which is what produced those twelve log lines.
+
+**Maintenance is now part of the service time it spends.** Pool rebalance,
+scrub and GC read their backends directly rather than through
+`StoragePool::get()`, where the timer lived, so the 51.6 MB/s of `macha-maint`
+reads that took `sdb` to 91% utilisation on 2026-09-22 never reached the
+signal that decides the device is busy. The mechanism was blind to the largest
+consumer of the resource in both directions: it could not bound it and could
+not see it.
+
+**A loader is visible to maintenance as its own class.** The maintenance busy
+decision was `playback_busy || interactive_busy`, fed by clocks that only
+`foreground` and `read_ahead` writes touch. An ingest is loader-class and fed
+neither, so a node importing 36 GB reported itself idle and handed maintenance
+its idle share of the spindle the import was waiting on — with
+`busy_bandwidth_fraction: 0.0` already set and unable to help. There is now a
+loader activity clock beside the two viewer ones, fed from the loader read and
+write paths, and consulted by the busy predicate, all four slice-yield
+predicates and the busy-pass wake-up. It is deliberately **not** folded into
+the viewer clocks: viewer reserves, the pressure gate and the torrent clamp all
+key off those, and conflating them would make an import look like a viewer.
+
+**A viewer between two extents is still a viewer.** "Viewer present" in the
+arbiter meant byte credit held at that instant, and playback does not hold
+credit between extents — so every gap in a stream readmitted the loader at full
+concurrency, and the viewer's next read queued behind the extent write the gap
+had just let in. The arbiter now also consults the activity clock over
+`maintenance.foreground_quiet`, which is the window the rest of the system
+already uses for this question.
+
+**The last number that was a guess about hardware is gone.**
+`io_pressure_outlier_ms` (an absolute 2 s) becomes
+`io_pressure_outlier_percent` (1000). The absolute figure was unequal as well
+as invented: 2 s is 396% of expectation for a 4 MiB write and 8,000% of it for
+a 4 KiB read, so the same number meant "mildly slow" for one operation and
+"catastrophic" for another. The founding 17.7 s extent write scored 3,505%
+against its own expectation and still trips on its first sample, which is the
+whole reason a single-sample trip exists beside the moving average.
+
+**An operator can now see what the throttle cost.** `pressure_refusals` joins
+`device_pressure_onsets` on `/api/v1/status`. The counter had existed as a
+private member since the gate shipped, incremented nowhere and reported
+nowhere — which is why "is this node being throttled or is it unwell" could
+not be answered during the 2026-09-22 incident. `DataWorkContext::records_activity()`
+was dead in the same way and is removed.
+
+**What the audit confirmed rather than assumed**, and what it left open, is
+recorded in `TODO/ACTIVE.md`: law 1 has no admission path to a delayed viewer
+read; law 3 holds on the hardware (control on NVMe, DATA on the spinner, on all
+three nodes) but by configuration rather than by construction; law 4 does not
+wedge, though the 150–300% hysteresis band is a latch. Two things stay open —
+one monitor covers a whole `StoragePool` rather than one device, and local disk
+maintenance is still budgeted from a network bandwidth measurement.
+
 ## 0.52.0 — The catalogue comes back, and disk pressure means something (development)
 
 Everything here fixes something 0.51.0 broke or got wrong on the live cluster

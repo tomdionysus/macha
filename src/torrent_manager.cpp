@@ -892,15 +892,25 @@ void TorrentManager::drain_alerts() {
 void TorrentManager::follow_device_pressure() {
     if (!config_.pressure_download_rate || !impl_)
         return;
-    bool pressured = false;
+    bool clamp = false;
     try {
         // Reads the pool's measured service time. Wrapped because the DATA pool
         // is not available during early start-up or on an edge node that holds
         // no extents, and a torrent session must not fail to tick over that.
-        pressured = node_.local_store().service_monitor().pressured();
+        //
+        // Law 2, and the clause this missed until 0.53.0: an acquisition is
+        // durable work the user asked for, so it is loader-class and yields
+        // to a slow device only when a viewer would otherwise wait for it. The
+        // arbiter was corrected for this in 0.52.0; this path was not, and it
+        // went on clamping a download to 2 MB/s on a device that was merely
+        // busy with nobody watching -- es-1 did it twelve times in the
+        // thirty-four minutes after it started 0.52.0.
+        clamp = node_.local_store().service_monitor().pressured() &&
+                node_.viewer_recently_active(node_.config().maintenance.foreground_quiet);
     } catch (const std::exception&) {
         return;
     }
+    const bool pressured = clamp;
     if (pressured == download_rate_clamped_)
         return;
 
@@ -911,8 +921,8 @@ void TorrentManager::follow_device_pressure() {
     impl_->session.apply_settings(std::move(settings));
     download_rate_clamped_ = pressured;
     Log::info(std::string("torrent download rate ") +
-              (pressured ? "clamped: the DATA device is defending its service time"
-                         : "restored: the DATA device recovered") +
+              (pressured ? "clamped: a viewer is waiting on a DATA device that is slow"
+                         : "restored: no viewer is waiting, or the DATA device recovered") +
               " limit_bytes_per_s=" + std::to_string(rate));
 }
 

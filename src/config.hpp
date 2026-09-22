@@ -866,10 +866,14 @@ struct Config {
     uint32_t io_pressure_per_mib_ms{120};
     uint32_t io_pressure_slowdown_percent{300};
     uint32_t io_pressure_release_percent{150};
-    // A single operation this slow trips pressure at once, whatever the average
-    // says: the 17.7 s extent write that started this work barely moves a
-    // moving average and starves a viewer completely.
-    uint32_t io_pressure_outlier_ms{2000};
+    // A single operation this far past its own expected cost trips pressure at
+    // once, whatever the average says: the 17.7 s extent write that started
+    // this work scored 3,505% on its own and barely moved the moving average.
+    // Expressed as a ratio rather than the absolute 2 s it was until 0.53.0,
+    // which was the last number here that was a guess about hardware -- and an
+    // unequal one, since 2 s is 396% of expectation for a 4 MiB write and
+    // 8,000% of it for a 4 KiB read.
+    uint32_t io_pressure_outlier_percent{1000};
     uint32_t io_pressure_min_background{1};
     // How long a DATA credit wait may make no progress at all before it fails
     // instead of waiting for ever. "No progress" means not one lease was

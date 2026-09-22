@@ -173,8 +173,19 @@ class NodeRuntime {
     std::atomic_bool outbound_calls_stopped_{};
     std::atomic_uint64_t playback_activity_bytes_{};
     std::atomic_uint64_t interactive_activity_bytes_{};
+    // A loader clock beside the two viewer ones, deliberately NOT folded into
+    // them. Maintenance decides it is idle from the viewer clocks alone, and
+    // an ingest is loader-class and touched neither, so during an operator's
+    // 36 GB import on 2026-09-22 gbni-1 reported itself idle and maintenance
+    // took its idle share of a disk somebody was waiting on: sdb at 91%
+    // utilisation, macha-maint reading 51.6 MB/s, the import's writes getting
+    // 2.8 MB/s. Keeping it separate matters: viewer reserves and the DATA
+    // pressure gate key off the viewer clocks, and conflating them would make
+    // an import look like a viewer and gate other loader work behind it.
+    std::atomic_uint64_t loader_activity_bytes_{};
     std::atomic_int64_t last_playback_activity_ms_{};
     std::atomic_int64_t last_interactive_activity_ms_{};
+    std::atomic_int64_t last_loader_activity_ms_{};
     mutable std::mutex service_event_mutex_;
     std::function<void(ServiceEvent)> service_event_;
     mutable std::mutex job_bridge_mutex_;
@@ -323,6 +334,10 @@ class NodeRuntime {
     void note_activity(FrameType, uint64_t bytes = 0);
     uint64_t take_activity_bytes(FrameType);
     std::chrono::milliseconds activity_idle_for(FrameType) const;
+    // Is somebody watching right now, within `window`? The arbiter and the
+    // torrent rate clamp both need law 2's "unless it would make the viewer
+    // wait" clause, and neither can reach the filesystem to ask.
+    bool viewer_recently_active(std::chrono::milliseconds window) const;
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
     }

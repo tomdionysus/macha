@@ -433,6 +433,7 @@ class FileSystem {
     void note_foreground_activity(uint64_t bytes = 0) { s_.foreground_activity(bytes); }
     std::chrono::milliseconds foreground_idle_for() const { return s_.foreground_idle_for(); }
     std::chrono::milliseconds interactive_idle_for() const { return s_.interactive_idle_for(); }
+    std::chrono::milliseconds loader_idle_for() const { return s_.loader_idle_for(); }
     void reset_io_cancellation() { io_cancelled_.store(false, std::memory_order_relaxed); }
     void request_io_cancellation() {
         io_cancelled_.store(true, std::memory_order_relaxed);

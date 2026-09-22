@@ -17,9 +17,19 @@ namespace macha {
 // budget was satisfied: the bookkeeping was correct and the disk was gone.
 //
 // This is the primitive that was missing. It records completion latency of
-// local store operations on one durability domain and answers one question:
-// is this device currently slow enough that work nobody is waiting for should
-// stand aside?
+// local store operations and answers one question: is this device currently
+// slow enough that work nobody is waiting for should stand aside?
+//
+// One monitor covers a whole StoragePool, not one durability domain -- it said
+// otherwise here until 0.53.0 and the claim was simply false. A pool may hold
+// several backends on several devices, and this cannot tell them apart, so one
+// slow backend makes the pool pressured for work bound anywhere in it. That is
+// wrong in principle and harmless in this cluster today, where gbni-1 and es-1
+// each configure exactly one DATA backend and fi-1 holds no extents at all;
+// it starts to bite the moment a second backend is configured. Per-device
+// pressure would also need the arbiter to know an operation's destination
+// device, which it cannot: admission happens before placement picks a
+// backend. Recorded rather than papered over.
 //
 // Cost discipline: two steady_clock reads and a handful of relaxed atomic
 // updates per operation, no locks and no timer thread. If measuring service
@@ -56,13 +66,32 @@ class DiskServiceMonitor {
         // one merely at the expectation is working.
         uint32_t slowdown_percent{300};
         uint32_t release_percent{150};
-        // Any single operation taking longer than this trips pressure at once,
-        // whatever the average says. The ratio catches sustained degradation;
-        // it cannot catch the event that started this work -- one 17.7 s extent
-        // write among fifty healthy ones, which moves a moving average hardly
-        // at all and starves a viewer completely. A multi-second operation is
-        // not a statistic to be averaged, it is a device in trouble now.
-        std::chrono::milliseconds outlier{2000};
+        // A single operation this far past what it should have cost trips
+        // pressure at once, whatever the average says. The moving average
+        // catches sustained degradation; it cannot catch the event that
+        // started this work -- one 17.7 s extent write among fifty healthy
+        // ones, which moves a 1/16 average from 19% only to 237%, under the
+        // 300% line. That write scored 3,505% on its own against its own
+        // expectation, and one operation that far out is a device in trouble
+        // now, not a statistic to be averaged.
+        //
+        // This was an absolute 2 s until 0.53.0, which was the last guess
+        // about hardware left in the model and an unequal one: 2 s is 396% of
+        // expectation for a 4 MiB write and 8,000% of it for a 4 KiB read, so
+        // the same figure meant "mildly slow" for one operation and
+        // "catastrophic" for another. A ratio needs no such guess and scales
+        // with the operation, which is the whole argument the per-MiB
+        // expectation rests on.
+        //
+        // 1000% is chosen against the expectation being deliberately generous
+        // -- 25 ms + 120 ms/MiB is roughly 8 MB/s, several times slower than
+        // the spinners in this cluster actually are. Ten times a budget that
+        // loose is not jitter on any device; it is one that has stopped
+        // serving. It sits well above the 300% sustained line so ordinary
+        // variance cannot reach it, and well below the ~4,800% a single
+        // sample would need to carry the 1/16 average over that line by
+        // itself, which is the gap this trip exists to close.
+        uint32_t outlier_percent{1000};
     };
 
     struct Sample {
@@ -135,9 +164,8 @@ class DiskServiceMonitor {
 
         // Hysteresis, evaluated here so the admission path is a single relaxed
         // load rather than a comparison it has to get right at every call site.
-        const auto outlier_us = static_cast<uint64_t>(thresholds_.outlier.count()) * 1000;
         if (next_slowdown > thresholds_.slowdown_percent ||
-            (outlier_us && micros > outlier_us)) {
+            (thresholds_.outlier_percent && ratio > thresholds_.outlier_percent)) {
             if (!pressured_.exchange(true, std::memory_order_relaxed))
                 pressure_onsets_.fetch_add(1, std::memory_order_relaxed);
         } else if (next_slowdown < thresholds_.release_percent) {

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -66,9 +67,6 @@ class DataWorkContext {
     bool expired(Clock::time_point now = Clock::now()) const noexcept {
         return deadline_ != Clock::time_point{} && now >= deadline_;
     }
-    bool records_activity() const noexcept {
-        return frame_type_ == FrameType::foreground || frame_type_ == FrameType::read_ahead;
-    }
 };
 
 struct DataResourceStats {
@@ -99,6 +97,14 @@ struct DataResourceStats {
     // without knowing the size of the operations behind it.
     uint64_t device_slowdown_percent{};
     uint64_t device_pressure_onsets{};
+    // How much work this mechanism actually turned away. Onsets say the device
+    // went under; this says what it cost. Without both, an operator looking at
+    // a slow node cannot tell a loader being deliberately held back from a
+    // node that is simply unwell, which is exactly the question that could not
+    // be answered during the 2026-09-22 incident. The counter existed as a
+    // private member from the day the gate shipped and was never incremented
+    // and never reported.
+    uint64_t pressure_refusals{};
 };
 
 // Event-driven byte admission at blocking DATA resource boundaries. Lower
@@ -164,6 +170,18 @@ class DataResourceArbiter {
     // because of them.
     uint64_t min_background_under_pressure_{1};
     uint64_t pressure_refusals_{};
+    // Law 2 asks whether a viewer is *present*, not whether one happens to be
+    // holding byte credit at this instant. Playback is bursty: between two
+    // extents a viewer holds nothing, so deciding on credit alone readmitted
+    // the loader at full concurrency in every gap and a viewer's next read
+    // queued behind the extent write that gap had just let in. The rest of the
+    // system already answers this question with an activity clock and
+    // maintenance.foreground_quiet; this is how the arbiter reads the same
+    // answer without taking a dependency on the node. Two relaxed atomic loads
+    // and a clock read, called under the arbiter mutex and never re-entering
+    // it. Null where there is no node (tests), which leaves the credit test
+    // below as the whole answer, exactly as it was.
+    std::function<bool()> viewer_recently_active_;
     // Background effort ceiling: how many loader/speculative leases may be
     // active at once. Each lease is one extent's worth of hashing,
     // encryption and transfer, so this bounds the CPU that publication and
@@ -202,7 +220,12 @@ class DataResourceArbiter {
         return frame_type == FrameType::loader;
     }
     uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
-    bool available(FrameType frame_type, uint64_t bytes) const noexcept;
+    // `refused_for_pressure`, when given, says whether a false answer was this
+    // mechanism's doing rather than an ordinary byte or concurrency bound. The
+    // callers count it; counting here would re-count every condition-variable
+    // wakeup of a single waiter and produce a number that means nothing.
+    bool available(FrameType frame_type, uint64_t bytes,
+                   bool* refused_for_pressure = nullptr) const;
     void release(FrameType frame_type, uint64_t bytes);
 
   public:
@@ -215,6 +238,11 @@ class DataResourceArbiter {
         std::lock_guard lock(mutex_);
         service_monitor_ = monitor;
         min_background_under_pressure_ = std::max<uint64_t>(1, min_background_under_pressure);
+    }
+    // Set once during node construction, before any work is admitted.
+    void observe_viewers(std::function<bool()> recently_active) {
+        std::lock_guard lock(mutex_);
+        viewer_recently_active_ = std::move(recently_active);
     }
     std::optional<Lease> acquire(const DataWorkContext& context, uint64_t bytes);
     std::optional<Lease> try_acquire(const DataWorkContext& context, uint64_t bytes);
@@ -233,7 +261,10 @@ inline DataResourceArbiter::DataResourceArbiter(uint64_t capacity_bytes,
         throw std::invalid_argument("DATA resource capacity must exceed viewer reserve");
 }
 
-inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes) const noexcept {
+inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes,
+                                           bool* refused_for_pressure) const {
+    if (refused_for_pressure)
+        *refused_for_pressure = false;
     if (used_bytes_ > capacity_bytes_ - bytes)
         return false;
     if (viewer(frame_type))
@@ -248,12 +279,21 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes)
     //
     // Speculative work has no such protection: it sits below the loader, and
     // pressure alone is reason enough for it to stand aside.
-    const bool viewer_present = waiting_viewers_ > 0 || used_bytes_ > lower_used_bytes_;
-    const bool yields_to_pressure =
-        frame_type == FrameType::speculative || viewer_present;
-    if (service_monitor_ && service_monitor_->pressured() && yields_to_pressure &&
-        lower_active_ >= min_background_under_pressure_)
-        return false;
+    //
+    // Ordered so the viewer-presence question is only asked when the answer can
+    // change anything. The monitor's own cost discipline applies here too: this
+    // runs on the admission path of every extent in the system, and a device
+    // that is coping must not pay a clock read to be told so.
+    if (service_monitor_ && service_monitor_->pressured() &&
+        lower_active_ >= min_background_under_pressure_) {
+        const bool viewer_present = waiting_viewers_ > 0 || used_bytes_ > lower_used_bytes_ ||
+                                    (viewer_recently_active_ && viewer_recently_active_());
+        if (frame_type == FrameType::speculative || viewer_present) {
+            if (refused_for_pressure)
+                *refused_for_pressure = true;
+            return false;
+        }
+    }
     if (background_concurrency_ && lower_active_ >= background_concurrency_)
         return false;
     const auto lower_capacity = capacity_bytes_ - viewer_reserve_bytes_;
@@ -284,13 +324,19 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
     auto& waiters = viewer(frame_type)   ? waiting_viewers_
                     : loader(frame_type) ? waiting_loaders_
                                          : waiting_speculative_;
+    bool refused_for_pressure = false;
     auto wait_predicate = [&] {
         return stopping_ || context.cancelled() || context.expired() ||
-               available(frame_type, bytes);
+               available(frame_type, bytes, &refused_for_pressure);
     };
     while (!wait_predicate()) {
         if (!counted_wait) {
             counted_wait = true;
+            // Once per waiter, not once per wakeup: this counts units of work
+            // the gate turned away, which is what an operator needs beside the
+            // onset count to tell a deliberate throttle from an unwell node.
+            if (refused_for_pressure)
+                ++pressure_refusals_;
             ++waiters;
             if (viewer(frame_type))
                 ++viewer_waits_;
@@ -366,8 +412,12 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
     if (bytes > class_capacity || context.cancelled() || context.expired())
         return {};
     std::lock_guard lock(mutex_);
-    if (stopping_ || !available(frame_type, bytes))
+    bool refused_for_pressure = false;
+    if (stopping_ || !available(frame_type, bytes, &refused_for_pressure)) {
+        if (refused_for_pressure)
+            ++pressure_refusals_;
         return {};
+    }
     used_bytes_ += bytes;
     if (!viewer(frame_type)) {
         lower_used_bytes_ += bytes;
@@ -421,7 +471,8 @@ inline DataResourceStats DataResourceArbiter::stats() const {
             lower_active_,             peak_lower_active_,
             device.pressured,          device.mean_us,
             device.worst_us,           device.slowdown_percent,
-            service_monitor_ ? service_monitor_->pressure_onsets() : 0};
+            service_monitor_ ? service_monitor_->pressure_onsets() : 0,
+            pressure_refusals_};
 }
 
 } // namespace macha

@@ -369,10 +369,53 @@ MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
     // Remove unrelated startup accounting, then prove a user loader write does
     // not refresh the viewer/read-ahead activity clock used by playback gates.
     (void)node.take_activity_bytes(FrameType::read_ahead);
+    (void)node.take_activity_bytes(FrameType::foreground);
+    (void)node.take_activity_bytes(FrameType::loader);
     DistributedStore store(node);
     auto bytes = pattern(256 * 1024, 91);
     REQUIRE(store.put(bytes) == object_id(bytes));
     CHECK(node.take_activity_bytes(FrameType::read_ahead) == 0);
+    CHECK(node.take_activity_bytes(FrameType::foreground) == 0);
+}
+
+MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_own_class) {
+    // The other half of the same rule, and the one that was missing. A loader
+    // write must not look like a viewer -- viewer reserves and the DATA
+    // pressure gate key off the viewer clocks, and conflating them would make
+    // an import look like a viewer and gate other loader work behind it -- but
+    // it must be visible *somewhere*, because law 2 puts it above background
+    // maintenance and maintenance decides it is idle from these clocks.
+    //
+    // Until 0.53.0 there was no loader clock at all, so a node in the middle
+    // of an operator's 36 GB import reported itself idle and handed
+    // maintenance its idle share of the spindle the import was waiting on:
+    // gbni-1 on 2026-09-22 at 91% utilisation, macha-maint reading 51.6 MB/s,
+    // the import's writes getting 2.8 MB/s, with busy_bandwidth_fraction
+    // already set to 0.0 and unable to help.
+    TestNode fixture("loader-activity-clock");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    auto& node = fixture.start();
+
+    (void)node.take_activity_bytes(FrameType::loader);
+    (void)node.take_activity_bytes(FrameType::foreground);
+    (void)node.take_activity_bytes(FrameType::read_ahead);
+    DistributedStore store(node);
+    auto bytes = pattern(256 * 1024, 91);
+    REQUIRE(store.put(bytes) == object_id(bytes));
+
+    // Seen, as its own class, with the viewer clocks untouched.
+    CHECK(store.loader_idle_for() < 5s);
+    CHECK(store.take_loader_bytes() >= bytes.size());
+    CHECK(store.take_foreground_bytes() == 0);
+    CHECK(store.take_interactive_bytes() == 0);
+
+    // And it must not be mistaken for somebody watching: the DATA pressure
+    // gate and the torrent rate clamp both ask this question, and an import is
+    // not a viewer.
+    CHECK(!node.viewer_recently_active(30s));
 }
 
 MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retained_buffer) {

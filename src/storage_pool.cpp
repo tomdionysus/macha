@@ -369,7 +369,6 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
 }
 
 bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
-    DiskServiceTimer timer(&service_monitor_, data.size());
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -385,7 +384,16 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
             // the physical age when the content hash already exists, which keeps
             // reachability GC from racing a new write that reuses an old orphan.
             // Do not short-circuit this through has().
-            if (store->put(id, data))
+            // Discipline 1: one sample is one device operation. Ranking,
+            // backend locks and attempts against backends that refused the
+            // object are macha's time, not the disk's, and charging them to
+            // the device reads as pressure that is not there.
+            bool stored = false;
+            {
+                DiskServiceTimer timer(&service_monitor_, data.size());
+                stored = store->put(id, data);
+            }
+            if (stored)
                 return true;
         } catch (const std::exception& error) {
             Log::debug("storage write failed " + path.string() + ": " + error.what());
@@ -399,7 +407,6 @@ std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
     const ObjectId& id, std::span<const uint8_t> data) {
     // The provisional write path, which is how ingest and FUSE publication put
     // every extent -- the exact traffic that took a node to 91% iowait.
-    DiskServiceTimer timer(&service_monitor_, data.size());
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -416,7 +423,11 @@ std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
             domain = backend->durability_domain->id();
         }
         try {
-            const auto generation = store->put_deferred(id, data);
+            std::optional<uint64_t> generation;
+            {
+                DiskServiceTimer timer(&service_monitor_, data.size());
+                generation = store->put_deferred(id, data);
+            }
             if (!generation)
                 continue;
 
@@ -534,7 +545,6 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
 std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
     // A read is timed too, and counts toward the same pressure signal: a device
     // made slow by reads starves a viewer exactly as one made slow by writes.
-    DiskServiceTimer timer(const_cast<DiskServiceMonitor*>(&service_monitor_), 0);
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -549,7 +559,22 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
             if (!store->has(id))
                 continue;
             auto started = Clock::now();
-            auto data = store->get(id);
+            std::optional<Bytes> data;
+            {
+                DiskServiceTimer timer(const_cast<DiskServiceMonitor*>(&service_monitor_), 0);
+                data = store->get(id);
+                // The size of a read is only known once it has succeeded, and
+                // it is the whole of the expectation the sample is judged
+                // against. Without this call every read is held to the fixed
+                // per-operation overhead alone -- 25 ms, whatever its size --
+                // which is precisely the flat threshold this model was built
+                // to replace. It was missing from the day the model shipped:
+                // on 2026-09-22 a healthy spinner serving 240 KB reads in
+                // 31 ms scored over 1000%, and es-1 entered and left pressure
+                // twelve times in thirty-four minutes with no viewer anywhere,
+                // clamping an operator's torrent each time.
+                timer.note_bytes(data ? data->size() : 0);
+            }
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
             if (Log::enabled(LogLevel::all))
@@ -821,7 +846,15 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
             std::optional<Bytes> data;
             for (const auto& holder : holders) {
                 try {
+                    // Maintenance reads the backends directly rather than
+                    // through StoragePool::get(), so until 0.53.0 the largest
+                    // consumer of the device was invisible to the signal that
+                    // decides the device is busy: on 2026-09-22 macha-maint
+                    // read 51.6 MB/s off a spindle at 91% utilisation and
+                    // raised the service-time average not at all.
+                    DiskServiceTimer timer(&service_monitor_, 0);
                     data = holder.store->get(id);
+                    timer.note_bytes(data ? data->size() : 0);
                     if (data)
                         break;
                 } catch (...) {
@@ -836,7 +869,12 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
             }
             if (data && preferred_store) {
                 try {
-                    if (preferred_store->put(id, *data) && preferred_store->valid(id)) {
+                    bool stored = false;
+                    {
+                        DiskServiceTimer timer(&service_monitor_, data->size());
+                        stored = preferred_store->put(id, *data);
+                    }
+                    if (stored && preferred_store->valid(id)) {
                         result.bytes += data->size();
                         holders.push_back({preferred, preferred_store});
                         preferred_has = true;
@@ -879,7 +917,15 @@ StoragePool::scrub_step(uint64_t budget_bytes, size_t operation_budget,
         }
         ++result.objects;
         try {
-            auto data = item->store->get(item->id);
+            // A scrub reads every object on the device in full. It is the
+            // heaviest reader macha has, and it must be part of the service
+            // time it is spending.
+            std::optional<Bytes> data;
+            {
+                DiskServiceTimer timer(&service_monitor_, 0);
+                data = item->store->get(item->id);
+                timer.note_bytes(data ? data->size() : 0);
+            }
             if (data)
                 result.bytes += data->size();
         } catch (const std::exception& error) {
