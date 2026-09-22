@@ -1252,9 +1252,29 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         auto right_materialized = node_.metadata_replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
             throw MetadataNotReady("metadata merge head cannot be materialized");
+        // Reconciliation is the one path that still wants whole namespaces:
+        // the three-way merge is path-wise, so a tree-backed branch is
+        // materialised for it and the result is re-rooted afterwards. A merge
+        // therefore costs what it costs today -- it is the operation this work
+        // has not yet made cheaper -- but it is correct, which an empty map
+        // would not be: it would merge to an empty namespace and call that
+        // agreement.
+        auto namespace_nodes =
+            namespace_store_ ? std::optional<ControlNamespaceNodeStore>(
+                                   ControlNamespaceNodeStore::for_reading(node_, *namespace_store_))
+                             : std::nullopt;
+        const auto materialise = [&](const MetadataSnapshot& snapshot) {
+            if (!snapshot.namespace_root)
+                return snapshot;
+            if (!namespace_nodes)
+                throw MetadataNotReady("no namespace node store is configured");
+            return attach_namespace(snapshot, *namespace_nodes);
+        };
+        const auto tree_backed = left_materialized->snapshot->namespace_root.has_value() ||
+                                 right_materialized->snapshot->namespace_root.has_value();
         auto merged = merge_metadata_snapshots(
-            *base_materialized->snapshot, *left_materialized->snapshot,
-            *right_materialized->snapshot, left.hash, right.hash);
+            materialise(*base_materialized->snapshot), materialise(*left_materialized->snapshot),
+            materialise(*right_materialized->snapshot), left.hash, right.hash);
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
@@ -1273,10 +1293,22 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         merged.snapshot.metadata_voters.clear();
         merged.snapshot.merge_parents = {right.hash};
 
+        // Back into a tree if the branches were trees, which also means the
+        // merge result is written and replicated as tree nodes before the
+        // record naming its root is published.
+        if (tree_backed) {
+            if (!namespace_store_)
+                throw MetadataNotReady("no namespace node store is configured");
+            auto commit_nodes = ControlNamespaceNodeStore::for_commit(
+                node_, *namespace_store_, merged.snapshot.metadata_write_replicas_required);
+            merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
+        }
+
         MetadataRecord reconciliation;
         reconciliation.generation = std::max(left.generation, right.generation) + 1;
         reconciliation.previous = left.hash;
-        reconciliation.payload = encode_snapshot(merged.snapshot);
+        reconciliation.payload = tree_backed ? encode_snapshot_v14(merged.snapshot)
+                                             : encode_snapshot(merged.snapshot);
         reconciliation.hash = metadata_hash(reconciliation.generation,
                                             reconciliation.previous,
                                             reconciliation.payload);
@@ -1286,7 +1318,13 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             left_materialized->record.hash == reconciliation.previous
                 ? left_materialized->snapshot.get()
                 : right_materialized->snapshot.get();
-        if (auto delta = metadata_delta(*primary_snapshot, merged.snapshot)) {
+        // metadata_delta diffs two entry maps. The merged snapshot is a tree
+        // again by now, so there is nothing to diff against and the merge is
+        // published as a full record -- which is what it was before 0.28.2
+        // anyway. A tree-native merge would carry its own change set and make
+        // this a delta again.
+        if (auto delta = tree_backed ? std::nullopt
+                                     : metadata_delta(*primary_snapshot, merged.snapshot)) {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < reconciliation.payload.size())
                 reconciliation_delta = std::move(encoded);
