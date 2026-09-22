@@ -27,6 +27,68 @@ SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
 for it died the same way. **A client's account of itself is evidence about the
 client, not a fact.**
 
+-3. **P0: audit the disk resource manager against the project's principles
+   before trusting it (operator, 2026-09-22). It has been wrong twice.**
+
+   `src/io_pressure.hpp` and the pressure term in `DataResourceArbiter` were
+   built and deployed on 2026-09-22 and were wrong twice on the way:
+
+   1. The threshold was **invented, not derived** -- a flat 50 ms against every
+      operation, so an ordinary 4 MiB extent write read as pressure and a node
+      declared itself in trouble nine seconds after boot.
+   2. It **flattened law 2**, making the loader yield to a slow device with no
+      viewer anywhere, which is precisely what the law forbids.
+
+   And arguably a third time: after both corrections it still did nothing about
+   the work actually taking the disk, because maintenance is not in the arbiter
+   at all (see the item below). A resource manager that cannot see the largest
+   consumer of the resource is not managing it.
+
+   **The audit is a gate, not a cleanup.** Until it is done, nothing further
+   should be built on this mechanism, and the operator may reasonably want it
+   off: `dht.io_pressure_slowdown_percent: 0` and
+   `torrent.pressure_download_rate: 0` disable it and restore the previous
+   admission behaviour exactly. Deployed state as of 2026-09-22 22:00Z: **on,
+   with defaults, on all three nodes.**
+
+   What the audit has to answer, each with a citation to the law or discipline
+   it rests on and a test that would fail if it regressed:
+
+   - [ ] **Law 1.** Enumerate every path by which a viewer read can be delayed
+     by this mechanism. The intended answer is none. Verify for `foreground`
+     and `read_ahead` separately, and for a viewer arriving *while* pressure is
+     already engaged.
+   - [ ] **Law 2.** The loader yields only when a viewer is present. Check what
+     "present" means at the boundaries: a viewer that has just released its
+     lease, one waiting behind a no-progress deadline, one on a different
+     backend of the same pool.
+   - [ ] **Law 3.** Control touches no disk, so this should be incapable of
+     affecting it. Confirm rather than assume -- the arbiter refuses control
+     entry, but the monitor is fed from a pool the control store does not share.
+     State explicitly which device each store sits on for each node.
+   - [ ] **Law 4.** Can a stuck pressure state wedge the node? The EWMA has no
+     floor on recovery time and `min_background` is the only escape. Establish
+     that background work always drains and that pressure always releases on a
+     device that recovers, including after a long sustained overload.
+   - [ ] **Coverage.** List every writer and reader of a DATA backend and say,
+     for each, whether this mechanism can bound it: ingest/FUSE publication
+     (arbiter), repair/rebalance/GC/scrub (maintenance bandwidth, NOT the
+     arbiter), libtorrent (its own rate limit, clamped separately), playback
+     reads (never bounded). A gap here is how the maintenance finding below was
+     missed.
+   - [ ] **Every threshold derived or expressed as a ratio.** No number in the
+     config may be a guess about hardware. `io_pressure_outlier_ms` is
+     currently an absolute 2 s and needs justifying or replacing.
+   - [ ] **Discipline 1** (measured ground truth over bookkeeping): confirm the
+     signal is still measured at the completion point and that nothing has
+     started inferring it from byte budgets.
+   - [ ] **Observability.** An operator must be able to tell, from the status
+     API alone, that work was slowed and why. `device_pressured`,
+     `device_slowdown_percent`, `device_worst_us` and
+     `device_pressure_onsets` exist; check they are sufficient to distinguish
+     "throttled deliberately" from "node unwell", which was not possible during
+     the 2026-09-22 incident.
+
 -2. **P0: maintenance outranks the ingest, and the mechanism to stop it is deaf
    to the loader (found 2026-09-22 22:00Z, NOT FIXED).**
 
