@@ -592,6 +592,12 @@ std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const N
     return out;
 }
 
+bool namespace_differs(const MetadataSnapshot& a, const MetadataSnapshot& b) {
+    if (a.namespace_root || b.namespace_root)
+        return a.namespace_root != b.namespace_root;
+    return a.entries != b.entries;
+}
+
 std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
                                        const NamespaceNodeStore* store, std::string_view path,
                                        bool with_extents) {
