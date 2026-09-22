@@ -346,9 +346,10 @@ class FileSystem {
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*,
                       std::optional<int64_t> mtime_override = {});
-    static void require_parent(const MetadataSnapshot&, const std::string&);
+    static void require_parent(const NamespaceWorkingSet&, const std::string&);
     static std::optional<FsEntry> apply_namespace_mutation(
-        MetadataSnapshot&, MetadataDelta&, const FilesystemNamespaceMutation&);
+        NamespaceWorkingSet&, MetadataSnapshot&, MetadataDelta&,
+        const FilesystemNamespaceMutation&);
 
   public:
     FileSystem(NodeRuntime&, DistributedStore&, MetadataManager&, PlaybackTracker* = nullptr);
