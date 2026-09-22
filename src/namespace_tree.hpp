@@ -163,6 +163,13 @@ std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
                                        const NamespaceNodeStore* store, std::string_view path,
                                        bool with_extents = true);
 
+// Existence alone, which is what FUSE path resolution asks and what it should
+// cost: no entry is copied out of a map, and no extent node is fetched from a
+// tree. `namespace_entry` for a membership test would copy an FsEntry --
+// including a film's extent list -- to answer a question about a key.
+bool namespace_contains(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                        std::string_view path);
+
 // A change set against a namespace: an entry to upsert, or nothing to delete
 // the path.
 using NamespaceChanges = std::map<std::string, std::optional<FsEntry>>;

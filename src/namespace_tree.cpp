@@ -540,11 +540,27 @@ std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
         const auto found = snapshot.entries.find(std::string(path));
         if (found == snapshot.entries.end())
             return {};
-        return found->second;
+        if (with_extents)
+            return found->second;
+        // Stat-only means stat-only in both forms. A caller that asked not to
+        // pay for extents must not be handed a copy of a 12,500-extent list
+        // merely because this snapshot happens to be a map.
+        FsEntry stat = found->second;
+        stat.extents.clear();
+        return stat;
     }
     if (!store)
         throw DecodeError("namespace is a tree and no node store was supplied");
     return namespace_tree_lookup(*snapshot.namespace_root, path, *store, with_extents);
+}
+
+bool namespace_contains(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                        std::string_view path) {
+    if (!snapshot.namespace_root)
+        return snapshot.entries.find(std::string(path)) != snapshot.entries.end();
+    if (!store)
+        throw DecodeError("namespace is a tree and no node store was supplied");
+    return namespace_tree_lookup(*snapshot.namespace_root, path, *store, false).has_value();
 }
 
 ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
