@@ -181,6 +181,19 @@ std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
 bool namespace_contains(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                         std::string_view path);
 
+// Do these two snapshots hold different namespaces? For a tree that is a
+// comparison of two 32-byte roots, which is what the whole design is for: two
+// nodes that reconcile to the same namespace agree on its root, and a reader
+// asking "has the namespace changed" gets an answer without materialising
+// anything. For a map it is the map comparison it always was.
+//
+// This is the witness the FUSE frontend and the catalogue scanner wake up on.
+// Under SM14 the entry maps are both empty, so comparing them says "unchanged"
+// about every namespace change there will ever be -- the mount stops seeing
+// remote writes and the catalogue stops discovering them, silently and
+// permanently.
+bool namespace_differs(const MetadataSnapshot& a, const MetadataSnapshot& b);
+
 // A change set against a namespace: an entry to upsert, or nothing to delete
 // the path.
 using NamespaceChanges = std::map<std::string, std::optional<FsEntry>>;

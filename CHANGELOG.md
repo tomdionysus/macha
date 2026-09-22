@@ -1,5 +1,42 @@
 # Current release
 
+## 0.50.1 — What the cutover found in its first two minutes (development)
+
+**The live cluster was re-rooted onto the tree at 12:41Z on 2026-09-22**, all
+three nodes, generation 35503 becoming 35504: a 22.79 MiB record becoming
+3.97 KiB over 5,221 entries and 473,923 extents. All three computed the
+identical record independently — same head, same tree root, same record hash,
+on three machines in three countries with no coordination between them. Both
+defects below were found by watching the result rather than by reasoning about
+it, and both are fixed here.
+
+**A namespace change was not visible as a change.** gbni-1 came back on the
+migrated head, adopted the namespace once, and then never saw another: a
+directory created on es-1 was in gbni-1's metadata, at the same root, and
+absent from its mount. Both witnesses that answer "has the namespace changed"
+compared entry maps — `MetadataManager`'s cache witness and
+`metadata_namespace_signature` — and under SM14 both maps are empty, so every
+change reported as no change. A mount that stops seeing remote writes, and a
+catalogue that stops discovering them, silently and permanently. Both now
+compare the root, which is what the design was for: the namespace's identity is
+already a hash over exactly its content, and comparing two 32-byte roots is
+cheaper than the map comparison it replaces.
+
+**Every delta was failing to reconstruct.** Three `local metadata delta
+rejected; retrying full record` warnings in the first minute, one per commit.
+The replica keeps a delta body only if replaying it reproduces the record byte
+for byte, and that replay re-encodes the successor through the delta-versioned
+encoder, which reached for the SM13 encoder — which refuses a namespace root.
+The fallback to a full record is correct and did its job; it is also not the
+point of having deltas. Tree-backed successors now encode as SM14.
+
+Worth noting what these two have in common: neither was a crash, neither
+produced a wrong answer to anything that was asked, and neither would have
+appeared in a test suite that did not restart a second node and then look at
+its mount. The first one in particular was invisible from the node doing the
+writing, because that node's FUSE frontend already had the change locally.
+
+
 ## 0.50.0 — The namespace can be re-rooted onto the tree (development)
 
 **`macha-namespace-migrate` re-roots one stopped node's namespace onto the

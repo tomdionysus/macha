@@ -512,4 +512,98 @@ MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_
     CHECK(*diverged_root != *leader_root);
 }
 
+MACHA_TEST("namespace_migration", test_a_namespace_change_is_visible_as_a_change) {
+    // Found on the live cluster during the cutover, which is the only reason
+    // there is a test for it. gbni-1 came back on the migrated head, adopted
+    // the namespace once, and then never saw another change: a directory
+    // created on es-1 was in its metadata, at the same root, and invisible on
+    // its mount.
+    //
+    // Both witnesses that answer "has the namespace changed" compared entry
+    // maps, and under SM14 both maps are empty. So every change reported as no
+    // change -- the mount stops seeing remote writes and the catalogue stops
+    // discovering them, silently, for good.
+    MemoryNamespaceNodeStore store;
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    entries["/Films"] = make_directory(1);
+    const auto before = populated_snapshot(entries);
+
+    auto changed_entries = entries;
+    changed_entries["/Films/new.mkv"] = make_file(5, 2);
+    const auto after = populated_snapshot(changed_entries);
+
+    // The map form, which always worked.
+    CHECK(namespace_differs(before, after));
+    CHECK(!namespace_differs(before, before));
+    CHECK(metadata_namespace_signature(before) != metadata_namespace_signature(after));
+
+    // The tree form, which did not.
+    const auto before_tree = detach_namespace(before, store);
+    const auto after_tree = detach_namespace(after, store);
+    CHECK(namespace_differs(before_tree, after_tree));
+    CHECK(!namespace_differs(before_tree, before_tree));
+    CHECK(metadata_namespace_signature(before_tree) != metadata_namespace_signature(after_tree));
+
+    // Two snapshots of the same namespace agree, however they were reached --
+    // which is the property that lets the signature be a root comparison at
+    // all.
+    MemoryNamespaceNodeStore elsewhere;
+    const auto same_elsewhere = detach_namespace(populated_snapshot(entries), elsewhere);
+    CHECK(!namespace_differs(before_tree, same_elsewhere));
+    CHECK(metadata_namespace_signature(before_tree) ==
+          metadata_namespace_signature(same_elsewhere));
+
+    // And a tree-backed namespace never signs as the map-backed one, so a
+    // cutover is a change rather than a silent no-op.
+    CHECK(metadata_namespace_signature(before) != metadata_namespace_signature(before_tree));
+}
+
+MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_record) {
+    // The other thing the cutover found in its first minute. A commit publishes
+    // a delta body and the replica only keeps it if replaying it reproduces the
+    // record byte for byte. That replay re-encodes the successor through
+    // encode_snapshot_for_delta, which called the SM13 encoder -- and that
+    // refuses a namespace root. So every delta was rejected and every commit
+    // fell back to a full record: correct, logged, and pointless.
+    MemoryNamespaceNodeStore store;
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    entries["/Films"] = make_directory(1);
+    entries["/Films/a.mkv"] = make_file(3, 2);
+    auto parent = detach_namespace(populated_snapshot(entries), store);
+
+    MetadataDelta delta;
+    delta.upsert_entries["/Films/b.mkv"] = make_file(4, 3);
+
+    auto successor = parent;
+    apply_metadata_delta_in_place(successor, delta,
+                                 [&](const ObjectId& root, const MetadataDelta& d) {
+                                     return apply_delta_to_namespace_tree(root, store, d);
+                                 });
+    REQUIRE(successor.namespace_root.has_value());
+    CHECK(*successor.namespace_root != *parent.namespace_root);
+
+    // What the replica does to decide whether to keep the delta body: re-encode
+    // the replayed successor and compare it against the record. The re-encode
+    // goes through the delta-versioned encoder, which is internal, so this
+    // asserts the property that made it fail -- a tree-backed snapshot has an
+    // SM14 encoding and no SM13 one, so any path that reaches for
+    // encode_snapshot on it throws rather than returning bytes.
+    CHECK(!encode_snapshot_v14(successor).empty());
+    bool sm13_refused = false;
+    try {
+        (void)encode_snapshot(successor);
+    } catch (const std::exception&) {
+        sm13_refused = true;
+    }
+    CHECK(sm13_refused);
+
+    // And the payload a replay produces is the payload a commit would: the
+    // record is a function of the namespace, so the delta body reconstructs.
+    auto committed = parent;
+    committed.namespace_root = apply_delta_to_namespace_tree(*parent.namespace_root, store, delta);
+    CHECK(encode_snapshot_v14(committed) == encode_snapshot_v14(successor));
+}
+
 } // namespace

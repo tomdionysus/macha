@@ -3,6 +3,7 @@
 #include "diagnostics.hpp"
 #include "placement.hpp"
 #include "namespace_control_store.hpp"
+#include "namespace_tree.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -226,7 +227,12 @@ MetadataRecord MetadataManager::cache_record(
     cache_until_ = Clock::now() + node_.config().metadata_cache;
     cache_remote_epoch_ = node_.remote_metadata_epoch();
     if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
-        const bool namespace_changed = !decoded_cache_ || decoded_cache_->entries != decoded->entries;
+        // The witness FUSE and the catalogue wake up on. It compares roots for
+        // a tree-backed namespace: comparing the entry maps would compare two
+        // empty maps and report "unchanged" for every change there will ever
+        // be, which is a mount that stops seeing remote writes for good.
+        const bool namespace_changed =
+            !decoded_cache_ || namespace_differs(*decoded_cache_, *decoded);
         decoded_cache_ = std::move(decoded);
         decoded_generation_ = record.generation;
         decoded_hash_ = record.hash;

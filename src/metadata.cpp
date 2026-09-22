@@ -371,7 +371,15 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 6:
     case 7:
     case 8:
-        return encode_snapshot(snapshot);
+        // A tree-backed successor encodes as SM14. Without this every delta
+        // body fails to reconstruct its record -- encode_snapshot refuses a
+        // namespace root -- and every commit falls back to a full record. That
+        // fallback is correct and was observed doing its job on the live
+        // cluster within a minute of the cutover: three consecutive
+        // "local metadata delta rejected; retrying full record" warnings, one
+        // per commit. Correct, and not the point of having deltas.
+        return snapshot.namespace_root ? encode_snapshot_v14(snapshot)
+                                       : encode_snapshot(snapshot);
     default:
         throw DecodeError("bad metadata delta");
     }
@@ -4945,6 +4953,17 @@ Hash256 metadata_namespace_signature(const MetadataSnapshot& snapshot) {
     // canonical representation into SHA-256 so a namespace containing millions
     // of extents never requires a second namespace-sized byte buffer.
     Sha256Hasher hash;
+    // A tree already has an identity, and it is a better one: the root is a
+    // hash over exactly this content, computed once when the namespace was
+    // written rather than again on every comparison. Hashing the empty entry
+    // map instead would return the same signature for every tree-backed
+    // namespace in existence, which reads as "the namespace never changes".
+    if (snapshot.namespace_root) {
+        hash.update(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>("macha/namespace-signature/tree/v1"), 33));
+        hash.update(snapshot.namespace_root->bytes);
+        return Hash256{hash.finish().bytes};
+    }
     hash_u64(hash, snapshot.entries.size());
     for (const auto& [path, entry] : snapshot.entries) {
         hash_string(hash, path);
