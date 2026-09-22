@@ -3845,8 +3845,17 @@ std::string MetadataReplica::diagnose_unreconstructable_locked(const Hash256& ta
             return "delta frame " + describe(*it) + " unreadable: " + error.what();
         }
     }
-    return "delta replay from anchor " + describe(cursor) + " over " +
-           std::to_string(chain.size()) + " frame(s) does not reproduce the record hash";
+    // Everything this function can check has passed. It has NOT replayed the
+    // chain, and the previous wording here said it had: "does not reproduce
+    // the record hash" was a default conclusion that on 2026-09-22 sent an
+    // operator hunting a tree corruption while the real event was a branch
+    // waiting on reconciliation. Say what was checked and no more; the replay
+    // that would settle it is macha-metadata-dump --objects.
+    return "delta chain from anchor " + describe(cursor) + " over " +
+           std::to_string(chain.size()) +
+           " frame(s) is structurally sound and every frame is readable; the failure is in "
+           "materialisation itself and was not diagnosed here (replay it with "
+           "macha-metadata-dump --objects to find the frame)";
 }
 
 bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) {
