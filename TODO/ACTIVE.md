@@ -27,6 +27,59 @@ SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
 for it died the same way. **A client's account of itself is evidence about the
 client, not a fact.**
 
+-2. **P0: maintenance outranks the ingest, and the mechanism to stop it is deaf
+   to the loader (found 2026-09-22 22:00Z, NOT FIXED).**
+
+   An operator's 36 GB import ran at ~2 MB/s on gbni-1 while, measured on the
+   node:
+
+   | | |
+   |---|---|
+   | `sdb` utilisation | **91.2%**, aqu-sz 3.23 |
+   | reads | **37 MB/s**, 151/s |
+   | writes | **2.8 MB/s**, 14/s |
+   | `macha-maint` thread read rate | **51.6 MB/s** |
+   | torrent download | complete, directory static at 63,255 MB |
+
+   So the disk was saturated by maintenance reads while the ingest's writes got
+   2.8 MB/s. The torrent was not downloading; two rounds of fixes aimed at the
+   DATA pressure gate and at namespace-node replication changed nothing,
+   because neither touches maintenance.
+
+   **Why the existing knobs did not help.** gbni-1 has
+   `maintenance.busy_bandwidth_fraction: 0.0` -- maintenance is meant to get
+   *nothing* while the node is busy -- and `max_bandwidth: 0B`, which is "no
+   configured cap". The busy decision is `playback_busy || interactive_busy`
+   (`src/service.cpp:1174-1184`), fed by `foreground_idle_for()` and
+   `interactive_idle_for()`. Those clocks are written only for
+   `FrameType::foreground` and `FrameType::read_ahead`
+   (`src/filesystem.cpp:248-252`, `:996-998`). **An ingest is loader-class and
+   feeds neither**, so during an import the node reports itself idle and
+   maintenance takes its idle share of a disk somebody is waiting on.
+
+   That is law 2 in a third place: the loader must outrank background work, and
+   here background work cannot even see it.
+
+   - [ ] A loader activity clock on `DistributedStore` beside the foreground
+     and interactive ones, fed from the loader write path, and included in the
+     maintenance busy predicate at `src/service.cpp:1178-1180`, `:1454-1455`
+     and `:1689-1690`. It must NOT be folded into the viewer clocks: viewer
+     reserves and the pressure gate key off those, and conflating them would
+     make an import look like a viewer and gate other loader work behind it.
+   - [ ] Then measure the import rate again. Everything claimed about
+     throughput today has been wrong at least once; the only numbers worth
+     trusting are the per-thread `/proc/<pid>/task/*/io` deltas and `iostat`.
+   - [ ] Consider whether `max_bandwidth: 0B` should mean "no cap" at all on a
+     node whose DATA backend is one spindle. The observed-bandwidth fallback
+     let a GC/repair pass take 51 MB/s.
+
+   **Also open from the same afternoon:** an ingest job dies permanently when
+   its node restarts mid-put -- `state='failed' error='object replication
+   quorum unavailable'` -- rather than pausing and resuming. It survived three
+   restarts today and failed on the fourth, so it is timing-dependent. Same
+   class as the read-only-window item under the metadata-stall P0. The job is
+   retried from the UI; completed files are skipped.
+
 -1. **What the cutover cost on 2026-09-22, in order of how close it came.**
    The cluster was re-rooted at 12:41Z. By 18:00Z four things had surfaced
    that no test had, all recorded here so the next cutover of anything is
@@ -53,10 +106,27 @@ client, not a fact.**
      reconciliation materialises both branches and publishes a full record,
      and the cost of that on a live branch is unmeasured. Item for Stage F:
      a tree-native merge.
-   - **`torrent.pressure_download_rate` and the DATA pressure gate** (0.51.0)
-     are built and untested against a real saturated device. The torrent
-     download that prompted them is the reproduction; run it once 0.51.0 is on
-     gbni-1.
+   - **The DATA pressure gate was wrong twice before it was right** (0.51.0,
+     corrected in 0.52.0). First it compared every operation against a flat
+     50 ms, so a 4 MiB extent write -- 100-200 ms on a healthy spinner -- read
+     as pressure: gbni-1 declared itself pressured nine seconds after boot and
+     held the import to one background lease for an afternoon. Now pressure is
+     the moving average of actual against expected *for the operation's size*
+     (25 ms + 120 ms/MiB, pressured above 300%, released below 150%), plus an
+     absolute 2 s outlier trip. The outlier exists because the tests showed the
+     ratio alone would have let the founding 17.7 s write through: against
+     fifty healthy samples it moves the average to 237%, under the 300% line.
+     0.51.0 also flattened law 2 by making the loader yield to pressure with no
+     viewer present; it now yields only when a viewer is waiting or holding
+     credit. **Still untested against a genuinely pathological device.**
+   - **Every catalogue route returned 503 on every node and all clients
+     reported "no API"** (0.51.0, fixed in 0.52.0). `catalogue.cpp` committed a
+     resolved conflict through the non-exact `mutate()` path, which the
+     tree-backed guard refuses. It was the last caller on that path and the
+     line had been spotted hours earlier without being fixed. Health and auth
+     answered throughout, so the app loaded empty -- worth remembering as a
+     failure shape: *the server looks fine from every probe except the one the
+     client actually needs.*
 
    **Client asks from the placement API round (2026-09-22), both sessions.**
    Verified against the code before writing down; two need nothing:
