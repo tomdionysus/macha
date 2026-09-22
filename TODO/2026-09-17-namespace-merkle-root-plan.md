@@ -772,21 +772,54 @@ some with enough extents to force an external spine -- each compared against a
 fresh build. Two nodes that reach one namespace by different routes must agree
 on the root or the signature comparison reports divergence that does not exist.
 
+**History replay is done (2026-09-22), and it was the blocking item.**
+`apply_metadata_delta_in_place` takes a `NamespaceDeltaApplier`;
+`MetadataReplica` carries one and passes it at all seven of its replay sites;
+`MetadataManager` installs it once it has a store. Replay writes nodes locally
+and replicates nothing -- a history entry being materialised is a commit that
+already reached the floor when it was made, and re-establishing that here
+would make rebuilding a local head depend on peers being reachable. Two
+invariants moved to where they can still be checked: "metadata delta removed
+root" fires in both forms, and "metadata delta lost root" is checked by the
+tree applier with a stat-only lookup.
+
+**The filesystem reads through the primitives (2026-09-22).** `getattr`,
+`readdir`, path resolution and the namespace index build. Two costs are now
+explicit rather than incidental: `namespace_contains` answers existence
+without copying an entry, because FUSE path resolution would otherwise copy a
+film's extent list per lookup; and a stat-only read strips extents in the map
+form too, rather than handing back a copy because the snapshot happens to be a
+map.
+
+**A regression worth recording, because it is this plan's own failure shape
+arriving from the other direction.** Making `readdir` stat-only broke the
+manage API: it computes `file_media_id()` over what `readdir` returns, and
+that hashes the extent list. A stat-only listing does not fail there -- it
+hashes an empty list, produces a different id that looks exactly as valid as
+the right one, and matches no catalogue binding. Not "an empty namespace read
+as no files" but "an empty extent list read as a file with no content", and
+equally silent. The invariants suite caught it 3/3. **Trimming any read to
+stat data requires auditing what callers do with the entry, not just what the
+FUSE path does with it** -- Stage D, not a casual change.
+
 What Stage C still owes:
 
 - [ ] **The mutation callbacks still write `snapshot.entries`.** A tree-backed
   mutation refuses a callback that touched the map, because applying the delta
   alone would silently drop whatever the callback did. That refusal is the
   mechanism for converting them one at a time; none is converted yet.
-- [ ] **History replay cannot apply a delta to a tree.**
-  `apply_metadata_delta_in_place` has no node store and now refuses a
-  tree-backed snapshot outright rather than editing a map nothing reads. The
-  replay path has to hand it a store, or call
-  `apply_delta_to_namespace_tree` itself. **This is a prerequisite for any
-  SM14 record existing at all**: a record whose history cannot be replayed is
-  the 2026-09-06 outage shape.
-- [ ] The 15 point-lookup sites and 8 full scans (FUSE, catalogue, media
-  index), which are mechanical once the primitives are in.
+- [ ] **The FUSE frontend, the catalogue scanner and the media index still
+  read `entries` directly** -- about 20 sites. They are mechanical now the
+  primitives exist, but two of them are not: `catalogue_snapshot_files` is a
+  prefix scan by `lower_bound`, and the media index is a full scan computing
+  `file_media_id` per file, so both want the tree's key order rather than a
+  filtered walk of it. All are protected meanwhile: a detached snapshot cannot
+  reach them, because `require_materialised_namespace` refuses to hand one
+  out.
+- [ ] **A prefix scan over the tree.** `readdir` and the catalogue root scan
+  are prefix queries, and the tree is key-ordered, so descending to the prefix
+  and walking from there is available and is not written yet. Without it a
+  converted prefix scan walks the namespace and filters.
 - [ ] **Who writes the first root.** Nothing constructs a detached snapshot, so
   the authorship decision -- a per-node opt-in, a cluster policy transition
   like the write floor, or nothing until the migration itself -- is still open
