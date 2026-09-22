@@ -58,15 +58,42 @@ client, not a fact.**
    `unsatisfiable` (if given) and the caller must re-put them." With an empty
    vector the caller has nothing to re-put and the publication simply fails.
 
-   - [ ] Find out why the barrier fails without naming the object. Both cases
-     are about the same re-derivation path — it probes a peer with the object
-     ids after a placement token dies with that peer's incarnation — so treat
-     them as one defect until something proves otherwise.
-   - [ ] **Unverified, but check it:** this is the right shape to produce
-     `ingest failed: object replication quorum unavailable` after a node
-     restarts mid-put, which is recorded below as timing-dependent and is
-     exactly what a barrier that fails while naming nothing would cause. If it
-     is the same defect, fixing this closes both.
+   **Why, measured 2026-09-23 with `MACHA_TEST_LOG_LEVEL=debug`.** Every
+   failing run logs the same thing, and it is not the re-derivation path at
+   all:
+
+   ```
+   object durability quorum unavailable id=f360... required=2 durable=1 transient=yes
+     replica=628c404edda8 epoch=0b1681ce gen=2 outcome="remote-not-sent"
+     replica=bef45e617144 epoch=fc979619 gen=2 outcome="local-durable"
+   ```
+
+   `remote-not-sent` with the peer present in membership can only come from one
+   place: the launch loop in `DistributedStore::durability_barrier` wraps
+   `n_.call_async(...)` in `try { ... } catch (...) {}` and **swallows the
+   exception entirely**. (The other route to that string requires the peer to
+   be absent from membership, which produces `peer-unknown` instead.) So right
+   after `b.restart()` the RPC cannot be sent, nobody records why, and the
+   requirement is scored `transient=yes` — which returns false early and
+   deliberately leaves `unsatisfiable` empty.
+
+   That makes this **two findings**:
+
+   - [ ] **The `catch (...) {}` is a real defect on its own**, whatever the
+     test does. The `outcome` map exists precisely so a failure says which
+     peer and whether it was the epoch, the barrier or the transport that said
+     no — its own comment records a bare "required=1 durable=0" spinning
+     gbni-1 for half an hour on 2026-09-06. Swallowing the launch exception
+     reintroduces that blindness one layer down: "could not send" and "did not
+     try" become the same string. Record the reason and let it be scored.
+   - [ ] **The tests are racing the transport, not testing the contract.**
+     They wait for membership to show both nodes active after the restart,
+     which is liveness, not an open data connection. The first barrier
+     routinely cannot send at all, so the definitive answer the assertion wants
+     (`epoch changed; object absent on peer after probe`) is never reached.
+     Either wait for a reachable peer before asserting, or assert across a
+     retry — the contract is "ask again", and a single call is not entitled to
+     the final answer.
    - [ ] Confirm on a node. Everything above is macOS/clang, and
      `..._rederives_placement_after_peer_restart` was recorded in 2026-09-17 as
      failing 12/12 on macOS and passing 3/3 on es-1. That it now fails only
@@ -231,8 +258,12 @@ client, not a fact.**
      is the case that hurt, but it does not make the budget mean anything on a
      node with one spindle. No number is proposed here on purpose.
 
-   **Also open from the same afternoon:** an ingest job dies permanently when
-   its node restarts mid-put -- `state='failed' error='object replication
+   **Also open from the same afternoon** (and **not** the durability-barrier
+   defect in item -4, checked on 2026-09-23: this message comes from
+   `filesystem.cpp:1215`, the *write* quorum in `put_impl` failing to reach
+   `min_write_replicas`, not from the barrier, whose failure says "object
+   durability quorum unavailable before publication" instead): an ingest job
+   dies permanently when its node restarts mid-put -- `state='failed' error='object replication
    quorum unavailable'` -- rather than pausing and resuming. It survived three
    restarts today and failed on the fourth, so it is timing-dependent. Same
    class as the read-only-window item under the metadata-stall P0. The job is
