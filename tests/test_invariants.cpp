@@ -1737,7 +1737,8 @@ MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_g
     REQUIRE(scanned.snapshot->entries.contains("/Movies/A/live.mkv"));
     CHECK(!scanned.snapshot->entries.contains("/Movies/B/live.mkv"));
 
-    const auto discovered = catalogue_snapshot_files("/Movies", *scanned.snapshot);
+    auto scan_nodes = fs.namespace_nodes();
+    const auto discovered = catalogue_snapshot_files("/Movies", *scanned.snapshot, &scan_nodes);
     REQUIRE(discovered.size() == 1);
     CHECK(discovered.front().first == "/Movies/A/live.mkv");
     CHECK(file_media_id(discovered.front().second) == file_media_id(file));

@@ -967,4 +967,63 @@ MACHA_TEST("namespace_tree", test_a_stat_only_read_costs_no_extents_in_either_fo
     CHECK(store.reads() > contains_reads);
 }
 
+MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the_library) {
+    // A directory listing and the catalogue's root scan are prefix queries.
+    // The tree is keyed by path precisely so they can descend to the prefix
+    // instead of reading everything and discarding most of it -- that is the
+    // reason the design rejected hashing keys the way the catalogue shards do.
+    const auto entries = library(30, 8);
+    const auto attached = populated_snapshot(entries);
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(attached, store);
+
+    const std::string prefix = "/TV/Show 7/";
+    std::map<std::string, FsEntry> expected;
+    for (const auto& [path, entry] : entries)
+        if (path.starts_with(prefix))
+            expected[path] = entry;
+    REQUIRE(expected.size() > 4);
+    REQUIRE(expected.size() * 4 < entries.size());
+
+    // Same answer from both forms, and the same answer as filtering a full walk.
+    std::map<std::string, FsEntry> from_map, from_tree;
+    for_each_namespace_entry_with_prefix(attached, nullptr, prefix,
+                                         [&](const std::string& p, const FsEntry& e) {
+                                             from_map[p] = e;
+                                         });
+    store.forget_reads();
+    for_each_namespace_entry_with_prefix(detached, &store, prefix,
+                                         [&](const std::string& p, const FsEntry& e) {
+                                             from_tree[p] = e;
+                                         });
+    const auto prefix_reads = store.reads();
+    CHECK(from_map == expected);
+    CHECK(from_tree == expected);
+
+    // And it cost a fraction of the library. The comparison is against the
+    // full walk on the same tree, so it measures descending rather than
+    // hardware.
+    store.forget_reads();
+    size_t walked = 0;
+    for_each_namespace_entry(detached, &store,
+                             [&](const std::string&, const FsEntry&) { ++walked; });
+    const auto full_reads = store.reads();
+    CHECK(walked == entries.size());
+    CHECK(prefix_reads * 4 < full_reads);
+
+    // An empty prefix is every entry, and a prefix nothing matches costs
+    // almost nothing rather than a full walk.
+    size_t all = 0;
+    for_each_namespace_entry_with_prefix(detached, &store, "",
+                                         [&](const std::string&, const FsEntry&) { ++all; });
+    CHECK(all == entries.size());
+
+    store.forget_reads();
+    size_t none = 0;
+    for_each_namespace_entry_with_prefix(detached, &store, "/zzz-nothing/",
+                                         [&](const std::string&, const FsEntry&) { ++none; });
+    CHECK(none == 0);
+    CHECK(store.reads() * 4 < full_reads);
+}
+
 } // namespace

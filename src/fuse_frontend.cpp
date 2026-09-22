@@ -2399,44 +2399,57 @@ struct FuseFrontend::State {
             throw FsError(ENOTDIR, "parent not directory");
     }
 
-    static bool snapshot_has_path(const MetadataSnapshot& snapshot, std::string_view path) {
-        return snapshot.entries.find(normalize_path(std::string(path))) != snapshot.entries.end();
+    // Both read the namespace in whichever form the snapshot carries it, so
+    // they need somewhere to fetch tree nodes from. They stay static -- these
+    // are pure questions about a snapshot -- and the store is handed in.
+    static bool snapshot_has_path(const MetadataSnapshot& snapshot,
+                                  const NamespaceNodeStore& nodes, std::string_view path) {
+        return namespace_contains(snapshot, &nodes, normalize_path(std::string(path)));
     }
 
-    static const FsEntry* snapshot_entry(const MetadataSnapshot& snapshot, std::string_view path) {
-        auto found = snapshot.entries.find(normalize_path(std::string(path)));
-        return found == snapshot.entries.end() ? nullptr : &found->second;
+    // `with_extents` false is for the callers that compare stat fields only.
+    // It matters on a tree -- it is the difference between reading a path and
+    // reading a path plus a film's extent spine -- and it matters on a map
+    // too, where it avoids copying that spine out of it.
+    static std::optional<FsEntry> snapshot_entry(const MetadataSnapshot& snapshot,
+                                                 const NamespaceNodeStore& nodes,
+                                                 std::string_view path, bool with_extents = true) {
+        return namespace_entry(snapshot, &nodes, normalize_path(std::string(path)), with_extents);
     }
 
-    static bool namespace_effect_confirmed(const NamespaceOp& op,
-                                           const MetadataSnapshot& snapshot) {
+    // Every question here is about stat fields -- type, mode, uid, gid, mtime --
+    // so every read is stat-only and no extent list is fetched or copied to
+    // answer "did my mkdir land".
+    static bool namespace_effect_confirmed(const NamespaceOp& op, const MetadataSnapshot& snapshot,
+                                           const NamespaceNodeStore& nodes) {
         switch (op.kind) {
         case NamespaceOp::Kind::mkdir: {
-            auto entry = snapshot_entry(snapshot, op.from);
+            auto entry = snapshot_entry(snapshot, nodes, op.from, false);
             return entry && entry->type == EntryType::directory &&
                    entry->mode == (op.mode & 07777) && entry->uid == op.uid && entry->gid == op.gid;
         }
         case NamespaceOp::Kind::create: {
-            auto entry = snapshot_entry(snapshot, op.from);
+            auto entry = snapshot_entry(snapshot, nodes, op.from, false);
             return entry && entry->type == EntryType::file && entry->mode == (op.mode & 07777) &&
                    entry->uid == op.uid && entry->gid == op.gid;
         }
         case NamespaceOp::Kind::rmdir:
         case NamespaceOp::Kind::unlink:
-            return !snapshot_has_path(snapshot, op.from);
+            return !snapshot_has_path(snapshot, nodes, op.from);
         case NamespaceOp::Kind::rename:
-            return !snapshot_has_path(snapshot, op.from) && snapshot_has_path(snapshot, op.to);
+            return !snapshot_has_path(snapshot, nodes, op.from) &&
+                   snapshot_has_path(snapshot, nodes, op.to);
         case NamespaceOp::Kind::chmod: {
-            auto entry = snapshot_entry(snapshot, op.from);
+            auto entry = snapshot_entry(snapshot, nodes, op.from, false);
             return entry && entry->mode == (op.mode & 07777);
         }
         case NamespaceOp::Kind::chown: {
-            auto entry = snapshot_entry(snapshot, op.from);
+            auto entry = snapshot_entry(snapshot, nodes, op.from, false);
             return entry && (!op.set_uid || entry->uid == op.uid) &&
                    (!op.set_gid || entry->gid == op.gid);
         }
         case NamespaceOp::Kind::utimens: {
-            auto entry = snapshot_entry(snapshot, op.from);
+            auto entry = snapshot_entry(snapshot, nodes, op.from, false);
             return entry && entry->mtime_ns == op.mtime_ns;
         }
         }
@@ -2449,10 +2462,11 @@ struct FuseFrontend::State {
     // an unlink/rename or hide a mkdir/create. Effect visibility stays as the
     // fast path for a view that lags the commit (e.g. after a reconciliation
     // survey failed and the mutation returned without refreshing the cache).
-    static bool namespace_op_confirmed(const NamespaceOp& op, const MetadataSnapshotView& view) {
+    static bool namespace_op_confirmed(const NamespaceOp& op, const MetadataSnapshotView& view,
+                                       const NamespaceNodeStore& nodes) {
         if (op.published_generation && view.generation >= op.published_generation)
             return true;
-        return namespace_effect_confirmed(op, *view.snapshot);
+        return namespace_effect_confirmed(op, *view.snapshot, nodes);
     }
 
     static std::string_view namespace_op_kind_name(NamespaceOp::Kind kind) {
@@ -2947,7 +2961,7 @@ struct FuseFrontend::State {
                     std::lock_guard inode_lock(found->second->mutex);
                     found->second->published_path = op.from;
                     if (snapshot) {
-                        if (auto entry = snapshot_entry(*snapshot, op.from))
+                        if (auto entry = snapshot_entry(*snapshot, fs.namespace_nodes(), op.from))
                             found->second->base = *entry;
                     }
                 }
@@ -3044,7 +3058,8 @@ struct FuseFrontend::State {
                     if (identity_batch && fuse_namespace_clock(*before.snapshot) >= identity.sequence)
                         published_prefix = batch.size();
                     while (published_prefix < batch.size() &&
-                           namespace_effect_confirmed(batch[published_prefix], *before.snapshot))
+                           namespace_effect_confirmed(batch[published_prefix], *before.snapshot,
+                                                      fs.namespace_nodes()))
                         ++published_prefix;
                     uint64_t published_generation = before.generation;
 
@@ -3210,7 +3225,7 @@ struct FuseFrontend::State {
                 if (auto available = fs.available_snapshot_view()) {
                     confirmed =
                         std::all_of(prefix.begin(), prefix.end(), [&](const NamespaceOp& op) {
-                            return namespace_op_confirmed(op, *available);
+                            return namespace_op_confirmed(op, *available, fs.namespace_nodes());
                         });
                 }
                 if (confirmed) {
@@ -3396,7 +3411,7 @@ struct FuseFrontend::State {
         if (!path)
             return true; // retired by the next attempt, never terminal.
         if (auto available = fs.available_snapshot_view())
-            return snapshot_has_path(*available->snapshot, *path);
+            return snapshot_has_path(*available->snapshot, fs.namespace_nodes(), *path);
         return true;
     }
 
@@ -4242,7 +4257,7 @@ struct FuseFrontend::State {
             if (recovery.namespace_done.contains(sequence) ||
                 !recovery.namespace_published.contains(sequence))
                 continue;
-            if (!namespace_effect_confirmed(op, snapshot))
+            if (!namespace_effect_confirmed(op, snapshot, fs.namespace_nodes()))
                 Log::info("FUSE recovery retiring published namespace op whose effect is no "
                           "longer visible seq=" + std::to_string(op.sequence) +
                           " kind=" + std::string(namespace_op_kind_name(op.kind)) +
@@ -4265,7 +4280,7 @@ struct FuseFrontend::State {
             auto paths = recovery_paths(inode, descriptor->second, recovery);
             if (!paths.published)
                 continue;
-            auto entry = snapshot_entry(snapshot, *paths.published);
+            auto entry = snapshot_entry(snapshot, fs.namespace_nodes(), *paths.published);
             if (!entry || !same_file_content(*entry, published.second))
                 continue;
             const auto retired = pending_data_count(recovery, inode, published.first);
@@ -4658,14 +4673,19 @@ struct FuseFrontend::State {
         next_inode = std::max<uint64_t>(2, recovery.max_inode + 1);
         next_namespace_sequence = std::max<uint64_t>(1, recovery.max_namespace_sequence + 1);
 
+        auto recovery_nodes = fs.namespace_nodes();
         std::lock_guard lock(namespace_mutex);
-        for (const auto& [path, entry] : snapshot.entries) {
+        // A full pass, with extents: an inode's base entry is what reads and
+        // writes are served against, so this is one of the few walks that
+        // genuinely wants the whole entry.
+        for_each_namespace_entry(snapshot, &recovery_nodes,
+                                 [&](const std::string& path, const FsEntry& entry) {
             const auto key = canonical_path(path);
             if (snapshot_path_shadowed(key, recovery))
-                continue;
+                return;
             auto mapped = descriptor_by_published_path.find(key);
             if (mapped != descriptor_by_published_path.end())
-                continue;
+                return;
             auto inode = std::make_shared<Inode>();
             inode->id = path == "/" ? 1 : next_inode++;
             inode->base = entry;
@@ -4675,7 +4695,7 @@ struct FuseFrontend::State {
             paths[key] = inode;
             inodes[inode->id] = std::move(inode);
             note_inode_inserted_locked();
-        }
+        });
 
         for (auto id : needed) {
             const auto& descriptor = recovery.inodes.at(id);
@@ -4688,9 +4708,9 @@ struct FuseFrontend::State {
             inode->published_path = rpaths.published;
             inode->next_data_sequence = descriptor.next_data_sequence;
 
-            const FsEntry* committed = nullptr;
+            std::optional<FsEntry> committed;
             if (rpaths.published)
-                committed = snapshot_entry(snapshot, *rpaths.published);
+                committed = snapshot_entry(snapshot, fs.namespace_nodes(), *rpaths.published);
             inode->base = committed ? *committed : descriptor.base;
             inode->visible = inode->base;
             if (!committed && descriptor.visible.type == inode->base.type)
@@ -4884,7 +4904,7 @@ struct FuseFrontend::State {
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
             for (const auto& op : namespace_unconfirmed) {
-                if (!namespace_op_confirmed(op, view))
+                if (!namespace_op_confirmed(op, view, fs.namespace_nodes()))
                     break;
                 confirmed.push_back(op);
             }
@@ -4929,14 +4949,14 @@ struct FuseFrontend::State {
             if (!retired)
                 return false;
             if (path) {
-                auto entry = snapshot_entry(snapshot, *path);
+                auto entry = snapshot_entry(snapshot, fs.namespace_nodes(), *path);
                 if (!entry || !same_file_content(*entry, expected))
                     return false;
             }
 
             journal_idle = journal_data_done(inode->id, target, retired);
             if (path) {
-                auto entry = snapshot_entry(snapshot, *path);
+                auto entry = snapshot_entry(snapshot, fs.namespace_nodes(), *path);
                 if (entry)
                     inode->base = *entry;
             } else {
@@ -5055,6 +5075,10 @@ struct FuseFrontend::State {
 
         std::vector<uint64_t> detached;
         size_t adopted_new = 0;
+        // Counted during the walk rather than read off the map: a tree-backed
+        // snapshot has no map to take a size from, and a log line that says
+        // "entries=0" about a full library is worse than no log line.
+        size_t walked = 0;
         {
             std::lock_guard lock(namespace_mutex);
             {
@@ -5069,7 +5093,10 @@ struct FuseFrontend::State {
             }
         }
             std::set<std::string, std::less<>> seen;
-            for (const auto& [path, entry] : snapshot.entries) {
+            auto adopt_nodes = fs.namespace_nodes();
+            for_each_namespace_entry(snapshot, &adopt_nodes,
+                                     [&](const std::string& path, const FsEntry& entry) {
+            ++walked;
             const auto key = canonical_path(path);
             seen.insert(key);
             auto found = paths.find(key);
@@ -5084,7 +5111,7 @@ struct FuseFrontend::State {
                 inodes[inode->id] = std::move(inode);
                 note_inode_inserted_locked();
                 ++adopted_new;
-                continue;
+                return;
             }
             auto inode = found->second;
             std::lock_guard inode_lock(inode->mutex);
@@ -5113,7 +5140,7 @@ struct FuseFrontend::State {
                 found->second = replacement;
                 inodes[replacement->id] = std::move(replacement);
                 note_inode_inserted_locked();
-                continue;
+                return;
             }
             inode->published_path = path;
             if (inode->data_ops.empty() && !inode->durability_pending &&
@@ -5122,7 +5149,7 @@ struct FuseFrontend::State {
                 inode->visible = entry;
                 inode->admitted_size = entry.size;
             }
-            }
+            });
 
             for (auto it = paths.begin(); it != paths.end();) {
             if (it->first == canonical_path("/") || seen.contains(it->first)) {
@@ -5149,7 +5176,7 @@ struct FuseFrontend::State {
         if (Log::enabled(LogLevel::debug))
             Log::debug("FUSE namespace adopted revision=" + std::to_string(view.namespace_revision) +
                        " generation=" + std::to_string(view.generation) +
-                       " entries=" + std::to_string(snapshot.entries.size()) +
+                       " entries=" + std::to_string(walked) +
                        " new=" + std::to_string(adopted_new) +
                        " detached=" + std::to_string(detached.size()));
     }

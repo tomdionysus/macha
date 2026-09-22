@@ -5,6 +5,7 @@
 #include "catalogue_hints.hpp"
 #include "config.hpp"
 #include "filesystem.hpp"
+#include "namespace_tree.hpp"
 #include "json.hpp"
 
 #include <chrono>
@@ -297,7 +298,7 @@ class MusicScanProvider final : public CatalogueScanProvider {
 // this result with live readdir()/getattr() state.
 std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
     std::string_view root, const MetadataSnapshot& namespace_snapshot,
-    std::stop_token stop = {});
+    const NamespaceNodeStore* namespace_nodes, std::stop_token stop = {});
 
 class CatalogueScanner {
     NodeRuntime& node_;
