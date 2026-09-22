@@ -3,6 +3,7 @@
 #include "data_work.hpp"
 #include "distributed_store.hpp"
 #include "metadata_manager.hpp"
+#include "namespace_control_store.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -418,6 +419,14 @@ class FileSystem {
     MaintenanceObjects maintenance_objects();
     DistributedStore& store() {
         return s_;
+    }
+    // A read-only view of wherever namespace tree nodes live, for the readers
+    // that hold a FileSystem rather than a store: the catalogue scanner and
+    // the media index. Cheap to make -- two references and a mode -- so it is
+    // made at the call site rather than cached, which also keeps it impossible
+    // to accidentally write through.
+    ControlNamespaceNodeStore namespace_nodes() {
+        return ControlNamespaceNodeStore::for_reading(n_, s_);
     }
     void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
     void note_foreground_activity(uint64_t bytes = 0) { s_.foreground_activity(bytes); }
