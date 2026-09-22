@@ -167,18 +167,49 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (request.method == "POST" && request.path == "/api/v1/torrents/jobs") {
             const auto body = parse_body(request);
-            std::string id;
+
+            // Optional placement. Absent means "here", which is what this route
+            // always did; a node id means that node downloads it. Which node
+            // runs a download is not a detail -- they differ in disk, in memory
+            // and in what else they are serving -- and until now it was decided
+            // by which address the client happened to be configured with.
+            NodeId target{};
+            if (const auto* node = body.find("node_id"); node && !node->isNull()) {
+                if (!node->isString())
+                    return http_error(400, "bad_request", "node_id must be a string");
+                const auto bytes = unhex(node->asString());
+                if (!bytes || bytes->size() != NodeId{}.bytes.size())
+                    return http_error(400, "bad_request", "node_id is not a node identifier");
+                std::copy(bytes->begin(), bytes->end(), target.bytes.begin());
+            }
+
+            std::string uri;
             if (const auto* magnet = body.find("magnet"); magnet && magnet->isString()) {
-                id = torrents->add(magnet->asString());
+                uri = magnet->asString();
             } else if (const auto* ref = body.find("acquisition_ref"); ref && ref->isString()) {
-                auto uri = search_.resolve(ref->asString());
-                if (!uri) return http_error(404, "not_found", "torrent search result expired or not found");
-                id = torrents->add_search_result(std::move(*uri));
+                auto resolved = search_.resolve(ref->asString());
+                if (!resolved)
+                    return http_error(404, "not_found",
+                                      "torrent search result expired or not found");
+                uri = std::move(*resolved);
             } else {
                 return http_error(400, "bad_request", "magnet or acquisition_ref is required");
             }
+
+            const auto placement = torrents->add_on(target, uri);
+            if (!placement.placed) {
+                // An unreachable or unknown target is refused rather than
+                // quietly downloaded here. A job that lands somewhere the
+                // operator did not ask for is worse than one that fails.
+                return http_error(409, "placement_failed",
+                                  placement.error.empty() ? "the job could not be placed"
+                                                          : placement.error);
+            }
             Json::Object out;
-            out["id"] = id;
+            out["id"] = placement.job_id;
+            // Always reported, including for a local add, so a client never has
+            // to infer where its own job went.
+            out["node_id"] = to_string(placement.node_id);
             return http_json(202, Json(std::move(out)).dump());
         }
 
