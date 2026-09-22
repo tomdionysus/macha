@@ -20,6 +20,8 @@
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "metadata.hpp"
+#include "local_store.hpp"
+#include "namespace_control_store.hpp"
 #include "namespace_tree.hpp"
 
 #include <algorithm>
@@ -72,22 +74,45 @@ void print(const Frame& frame, const std::string& note = {}) {
 }
 } // namespace
 
+// Reads the root directory out of the tree and says what it cost. This is the
+// claim an operator most wants to check on a migrated node: that a stat is a
+// path from the root rather than the namespace.
+void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto entry = namespace_tree_lookup(root, "/", nodes, false);
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    std::cout << "  stat of \"/\": " << (entry ? "found" : "MISSING") << " in " << elapsed
+              << "ms\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] "
-                     "[--all] [--stats] [--tree]\n";
+                     "[--all] [--stats] [--tree] [--objects <path>]\n";
         return 2;
     }
     bool all = false;
     bool stats = false;
     bool tree = false;
+    std::filesystem::path objects;
     std::string heads_path;
     for (int i = 3; i < argc; ++i) {
         if (std::string(argv[i]) == "--all")
             all = true;
         else if (std::string(argv[i]) == "--stats")
             stats = true;
-        else if (std::string(argv[i]) == "--tree") {
+        else if (std::string(argv[i]) == "--objects") {
+            // The control object store, so a tree-backed namespace can be
+            // walked rather than merely named. Without it this tool can only
+            // report that the record points somewhere.
+            if (++i >= argc) {
+                std::cerr << "--objects needs a path\n";
+                return 2;
+            }
+            objects = argv[i];
+        } else if (std::string(argv[i]) == "--tree") {
             // Implies --stats: the tree is built from the materialised head,
             // which is what --stats already produces.
             tree = true;
@@ -261,10 +286,16 @@ int main(int argc, char** argv) {
             return decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
         };
         MetadataSnapshot snapshot;
+        size_t record_bytes = 0;
         try {
-            snapshot = decode_snapshot(load(cursor).payload);
-            for (auto it = chain.rbegin(); it != chain.rend(); ++it)
-                apply_metadata_delta_in_place(snapshot, decode_metadata_delta(load(*it).payload));
+            const auto anchor = load(cursor);
+            record_bytes = anchor.payload.size();
+            snapshot = decode_snapshot(anchor.payload);
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                const auto body = load(*it);
+                record_bytes = body.payload.size();
+                apply_metadata_delta_in_place(snapshot, decode_metadata_delta(body.payload));
+            }
         } catch (const std::exception& error) {
             std::cout << "  stats unavailable: " << error.what() << '\n';
             continue;
@@ -278,6 +309,47 @@ int main(int argc, char** argv) {
             extents += value.extents.size();
             for (const auto& extent : value.extents)
                 holes += extent.hole ? 1 : 0;
+        }
+        // A tree-backed head carries a root instead of entries, so the
+        // whole-namespace arithmetic below is about a map that is not there and
+        // encode_snapshot refuses it outright. Say what the record is and stop,
+        // rather than crashing on the operator's forensics tool the first time
+        // it is pointed at a migrated node. `--tree` is the mode that reads a
+        // tree-backed namespace.
+        if (snapshot.namespace_root) {
+            std::cout << "  snapshot: tree-backed namespace_root="
+                      << to_string(*snapshot.namespace_root)
+                      << " last_body_bytes=" << record_bytes
+                      << " tombstones=" << snapshot.garbage.size()
+                      << " conflicts=" << snapshot.conflicts.size()
+                      << " node_status=" << snapshot.node_status.size()
+                      << " identity_resets=" << snapshot.identity_resets.size()
+                      << " mutation_sequences=" << snapshot.mutation_sequences.size() << '\n'
+                      << '\n';
+            if (objects.empty()) {
+                std::cout << "  the namespace is in the control store, not in this record; pass "
+                             "--objects <path> to walk it\n";
+                continue;
+            }
+            try {
+                LocalStore store(objects,
+                                 LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0, 0, 0},
+                                 key);
+                LocalNamespaceNodeStore nodes(store);
+                const auto shape = namespace_tree_stats(*snapshot.namespace_root, nodes);
+                std::cout << "  tree: nodes=" << shape.leaves + shape.branches
+                          << " leaves=" << shape.leaves << " branches=" << shape.branches
+                          << " extent_nodes=" << shape.extent_nodes << " depth=" << shape.depth
+                          << " bytes=" << shape.bytes
+                          << " largest_node=" << shape.largest_node_bytes
+                          << " entries=" << shape.entries << " extents=" << shape.extents << '\n';
+                // A stat against the tree, which is what a getattr now costs:
+                // one path from the root, no extent node fetched.
+                nodes_read_probe(nodes, *snapshot.namespace_root);
+            } catch (const std::exception& error) {
+                std::cout << "  tree unavailable: " << error.what() << '\n';
+            }
+            continue;
         }
         const auto full = encode_snapshot(snapshot).size();
         auto without = [&](const std::function<void(MetadataSnapshot&)>& strip) {
