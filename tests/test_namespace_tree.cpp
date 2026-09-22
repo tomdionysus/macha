@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
+#include "metadata_manager.hpp"
 #include "namespace_tree.hpp"
 
 #include <set>
@@ -593,6 +594,36 @@ MACHA_TEST("namespace_tree", test_a_damaged_record_is_refused_rather_than_truste
     // structural fields are checked, and they are.
     CHECK(refused > 0);
     CHECK(refused + accepted == payload.size());
+}
+
+MACHA_TEST("namespace_tree", test_a_detached_namespace_never_reaches_a_reader_that_wants_entries) {
+    // The Stage C guard, stated where it can be tested. Around forty call
+    // sites read `snapshot->entries` directly and none of them treats an empty
+    // map as a failure; for the three that compute reachability it reads as
+    // "nothing is live", which is what destructive GC acts on. So the manager
+    // refuses to hand out a view over a detached namespace at all, and this is
+    // the predicate it refuses with.
+    MemoryNamespaceNodeStore store;
+    const auto snapshot = populated_snapshot(library(2, 2));
+
+    // An ordinary materialised snapshot passes, including an empty one: a
+    // cluster with no files is not the same thing as a namespace that is
+    // somewhere else.
+    require_materialised_namespace(snapshot);
+    require_materialised_namespace(MetadataSnapshot{});
+
+    const auto detached = detach_namespace(snapshot, store);
+    bool refused = false;
+    try {
+        require_materialised_namespace(detached);
+    } catch (const MetadataNotReady&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    // And it passes again once the namespace is actually there, so the guard
+    // tracks where the entries are rather than which format produced them.
+    require_materialised_namespace(attach_namespace(detached, store));
 }
 
 } // namespace

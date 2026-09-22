@@ -31,6 +31,21 @@ struct MetadataSnapshotView {
 };
 
 
+// Stage C invariant. Roughly forty call sites read `snapshot->entries`
+// directly, and under SM14 that map is empty by design because the namespace
+// lives in the tree at `namespace_root`. An empty map is not an error to any
+// of them -- it reads as "the namespace is empty", which for the three
+// reachability readers (Service's retention claims and release set, and
+// FileSystem::maintenance_objects_cached) means "nothing is live", and that is
+// exactly the input destructive GC wants before it deletes.
+//
+// So every MetadataSnapshotView the manager hands out passes through this, and
+// a detached namespace does not reach a reader that has not been converted.
+// Throws MetadataNotReady. Nothing authors SM14 yet, so it cannot fire in
+// production; it is here so the first commit that does produce one fails at
+// the boundary rather than silently in the collector.
+void require_materialised_namespace(const MetadataSnapshot&);
+
 enum class MetadataAvailability : uint8_t {
     unavailable = 0,
     read_only = 1,

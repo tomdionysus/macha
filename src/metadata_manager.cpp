@@ -271,6 +271,22 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
     return cache_;
 }
 
+void require_materialised_namespace(const MetadataSnapshot& snapshot) {
+    if (snapshot.namespace_root)
+        throw MetadataNotReady("metadata snapshot carries a detached namespace root; its readers "
+                               "have not been converted to the tree");
+}
+
+namespace {
+// The view is where the rest of the system gets a namespace, so it is where
+// the invariant above is enforced. See require_materialised_namespace.
+MetadataSnapshotView materialised(MetadataSnapshotView view) {
+    if (view.snapshot)
+        require_materialised_namespace(*view.snapshot);
+    return view;
+}
+} // namespace
+
 std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     std::lock_guard lock(cache_mutex_);
     // The decoded snapshot is reusable indefinitely for a specific immutable
@@ -285,7 +301,8 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     if (node_.metadata_replica().committed_generation() > decoded_generation_ ||
         node_.remote_metadata_generation() > decoded_generation_)
         return {};
-    return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
+    return materialised(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
+                                             decoded_hash_, decoded_cache_});
 }
 
 bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash256& target,
@@ -1566,7 +1583,9 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
         if (decoded_cache_ &&
             (decoded_generation_ > record.generation ||
              (decoded_generation_ == record.generation && decoded_hash_ >= record.hash))) {
-            return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
+            return materialised(MetadataSnapshotView{decoded_generation_,
+                                                     decoded_namespace_revision_, decoded_hash_,
+                                                     decoded_cache_});
         }
     }
 
@@ -1575,7 +1594,7 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
     // Decode that exact generation rather than turning cache churn into FUSE
     // EIO.  This path is exceptional; normal operations reuse decoded_cache_.
     auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
-    return MetadataSnapshotView{record.generation, 0, record.hash, std::move(decoded)};
+    return materialised(MetadataSnapshotView{record.generation, 0, record.hash, std::move(decoded)});
 }
 
 std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() const {
@@ -1585,7 +1604,8 @@ std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() c
     std::lock_guard lock(cache_mutex_);
     if (!decoded_cache_)
         return {};
-    return MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_, decoded_hash_, decoded_cache_};
+    return materialised(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
+                                             decoded_hash_, decoded_cache_});
 }
 
 MetadataSnapshot MetadataManager::snapshot() {
@@ -1612,8 +1632,11 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
         auto materialized = node_.metadata_replica().materialized(heads.front().hash);
         if (!materialized)
             return {};
-        return MetadataSnapshotView{heads.front().generation, 0, heads.front().hash,
-                                    materialized->snapshot};
+        // The catch below turns a refusal here into "no view", which stops
+        // retention release rather than running it against an empty live set.
+        // Fail-closed is the correct direction for the one reader that deletes.
+        return materialised(MetadataSnapshotView{heads.front().generation, 0, heads.front().hash,
+                                                 materialized->snapshot});
     } catch (...) {
         return {};
     }
