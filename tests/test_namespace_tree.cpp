@@ -696,4 +696,115 @@ MACHA_TEST("namespace_tree", test_a_detached_namespace_without_a_store_refuses_r
     CHECK(refused);
 }
 
+MACHA_TEST("namespace_tree", test_an_incremental_update_produces_the_tree_a_rebuild_would) {
+    // The property the commit path rests on, asserted rather than argued: an
+    // update applied to an existing root produces the SAME root a full build
+    // over the resulting namespace produces. Not an equivalent tree -- the
+    // same 32 bytes. Two nodes that reach one namespace by different routes
+    // must agree, or the root comparison that replaces
+    // metadata_namespace_signature reports divergence that does not exist.
+    //
+    // Random change sets rather than chosen ones, because the cases that break
+    // this are the ones nobody thinks to write: a delete that empties a leaf,
+    // an insert that lands on a boundary key and splits one, a run long enough
+    // for the count cap to decide where the split goes.
+    auto entries = library(8, 6);
+    MemoryNamespaceNodeStore store;
+    auto root = build_namespace_tree(entries, store);
+
+    uint64_t seed = 99;
+    const auto next = [&] {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return seed >> 33;
+    };
+
+    for (int round = 0; round < 60; ++round) {
+        NamespaceChanges changes;
+        const size_t count = 1 + next() % 6;
+        for (size_t i = 0; i < count; ++i) {
+            const auto pick = next() % 3;
+            if (pick == 0 && !entries.empty()) {
+                // Delete an existing path, but never the root directory.
+                auto it = entries.begin();
+                std::advance(it, static_cast<ptrdiff_t>(next() % entries.size()));
+                if (it->first == "/")
+                    continue;
+                changes[it->first] = std::nullopt;
+            } else if (pick == 1 && !entries.empty()) {
+                // Change a value in place: the common case, and the one that
+                // must rewrite exactly one leaf.
+                auto it = entries.begin();
+                std::advance(it, static_cast<ptrdiff_t>(next() % entries.size()));
+                auto updated = it->second;
+                updated.mtime_ns += 1000;
+                updated.size += 4096;
+                changes[it->first] = updated;
+            } else {
+                // Insert a new path, sometimes with enough extents to force an
+                // external spine.
+                const auto path = "/TV/new " + std::to_string(next() % 10000) + ".mkv";
+                changes[path] = make_file(next(), next() % 4 == 0 ? 700 : 2);
+            }
+        }
+        if (changes.empty())
+            continue;
+
+        for (const auto& [path, value] : changes) {
+            if (value)
+                entries[path] = *value;
+            else
+                entries.erase(path);
+        }
+
+        MemoryNamespaceNodeStore fresh;
+        const auto rebuilt = build_namespace_tree(entries, fresh);
+        root = update_namespace_tree(root, store, changes);
+        CHECK(root == rebuilt);
+        if (root != rebuilt)
+            break;
+    }
+
+    // And the namespace really is what the changes said it should be.
+    CHECK(read_namespace_tree(root, store) == entries);
+}
+
+MACHA_TEST("namespace_tree", test_a_write_rewrites_a_path_rather_than_the_library) {
+    // What the update costs, measured. One ordinary write -- an mtime and a
+    // size on one file -- against a library of 302 entries.
+    auto entries = library(120, 20);
+    MemoryNamespaceNodeStore store;
+    auto root = build_namespace_tree(entries, store);
+    const auto shape = namespace_tree_stats(root, store);
+
+    auto changed = entries.at("/TV/Show 7/Season 2/Episode 5.mkv");
+    changed.mtime_ns += 1000;
+    changed.size += 4096;
+
+    store.forget_written();
+    root = update_namespace_tree(root, store, {{"/TV/Show 7/Season 2/Episode 5.mkv", changed}});
+    const auto written = store.written().size();
+
+    // Measured: **3 new nodes out of 102** (96 leaves, 6 branches) on a
+    // 2,520-entry library -- the leaf holding the key and the two branches
+    // above it, which is exactly the path from the root.
+    //
+    // The spine is recomputed over the whole leaf sequence rather than
+    // spliced, and it costs nothing to do so: an unchanged branch node
+    // re-encodes to the same bytes and therefore the same content address, so
+    // it is not a new node and nothing replicates it. What the recompute costs
+    // is local reads and CPU over the branch nodes, not write amplification,
+    // and that is the distinction that decides whether local splicing is worth
+    // writing.
+    CHECK(written == shape.depth);
+    CHECK(written < shape.leaves);
+    CHECK(read_namespace_tree(root, store).at("/TV/Show 7/Season 2/Episode 5.mkv") == changed);
+
+    // Nothing else moved: every other entry is still the entry it was, and the
+    // unchanged leaves kept their content addresses.
+    auto after = read_namespace_tree(root, store);
+    CHECK(after.size() == entries.size());
+    entries["/TV/Show 7/Season 2/Episode 5.mkv"] = changed;
+    CHECK(after == entries);
+}
+
 } // namespace

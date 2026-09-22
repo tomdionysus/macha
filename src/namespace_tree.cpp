@@ -354,10 +354,27 @@ void MemoryNamespaceNodeStore::put_at(const ObjectId& id, Bytes node) {
     nodes_[id] = std::move(node);
 }
 
-ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,
-                              const NamespaceTreeLimits& limits) {
+namespace {
+// Does this key end its leaf? The whole structure rests on this being a
+// function of the key alone: a value change never moves a boundary, and the
+// same key set partitions the same way however it was reached.
+bool ends_a_leaf(std::string_view path, const NamespaceTreeLimits& limits) {
+    return is_boundary(boundary_hash("macha/namespace-tree/entry/v1", 0, key_span(path)),
+                       limits.entry_target_fanout);
+}
+
+// Chunks a run of entries into leaves, exactly as a full build does. `open`
+// says the final run did not end on a boundary key and was flushed only
+// because the sequence ran out -- which for an incremental update means the
+// window has not re-synchronised with the global partition yet and must
+// absorb the next leaf.
+using EntryRef = std::pair<const std::string*, const FsEntry*>;
+
+std::vector<Child> chunk_leaves(const std::vector<EntryRef>& entries, NamespaceNodeStore& store,
+                                const NamespaceTreeLimits& limits, bool* open = nullptr) {
     std::vector<Child> leaves;
-    std::vector<std::pair<const std::string*, const FsEntry*>> run;
+    std::vector<EntryRef> run;
+    bool ended_on_boundary = true;
 
     const auto flush = [&] {
         if (run.empty())
@@ -368,34 +385,104 @@ ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, Nam
         for (const auto& [path, entry] : run)
             encode_leaf_entry(writer, *path, *entry, store, limits);
         const auto encoded = writer.take();
-        leaves.push_back(Child{*run.front().first, store.put(encoded),
-                               static_cast<uint64_t>(run.size())});
+        leaves.push_back(
+            Child{*run.front().first, store.put(encoded), static_cast<uint64_t>(run.size())});
         run.clear();
     };
 
-    for (const auto& [path, entry] : entries) {
-        run.emplace_back(&path, &entry);
-        if (is_boundary(boundary_hash("macha/namespace-tree/entry/v1", 0, key_span(path)),
-                        limits.entry_target_fanout) ||
-            run.size() >= limits.entry_max_fanout)
+    for (const auto& item : entries) {
+        run.push_back(item);
+        if (ends_a_leaf(*item.first, limits) || run.size() >= limits.entry_max_fanout) {
+            ended_on_boundary = true;
             flush();
+        } else {
+            ended_on_boundary = false;
+        }
     }
     flush();
+    if (open)
+        *open = !ended_on_boundary;
+    return leaves;
+}
+
+ObjectId empty_leaf(NamespaceNodeStore& store) {
+    Writer writer;
+    writer.raw(leaf_magic);
+    writer.u32(0);
+    const auto encoded = writer.take();
+    return store.put(encoded);
+}
+} // namespace
+
+ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,
+                              const NamespaceTreeLimits& limits) {
+    std::vector<EntryRef> ordered;
+    ordered.reserve(entries.size());
+    for (const auto& [path, entry] : entries)
+        ordered.emplace_back(&path, &entry);
+    auto leaves = chunk_leaves(ordered, store, limits);
 
     // An empty namespace is still a tree: one empty leaf, so a root always
     // exists and `read_namespace_tree` of a fresh cluster is not a special case.
-    if (leaves.empty()) {
-        Writer writer;
-        writer.raw(leaf_magic);
-        writer.u32(0);
-        const auto encoded = writer.take();
-        return store.put(encoded);
-    }
+    if (leaves.empty())
+        return empty_leaf(store);
     return build_spine(std::move(leaves), store, true, limits.branch_target_fanout,
                        limits.branch_max_fanout);
 }
 
 namespace {
+
+// The leaf sequence of a tree, in order, without decoding a single entry. A
+// branch node carries each child's first key, id and item count, so this costs
+// the branch nodes alone -- 10 of them on es-1's namespace against 169 leaves
+// and 5,101 entries.
+void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
+                    std::vector<Child>& out) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    const auto magic = reader.fixed<4>();
+    if (magic == leaf_magic) {
+        const auto count = reader.u32();
+        // The first key is all the caller needs; the rest of the leaf is not
+        // decoded, and its extents certainly are not fetched.
+        std::string first;
+        if (count)
+            first = reader.string(8192);
+        out.push_back(Child{std::move(first), id, count});
+        return;
+    }
+    if (magic != branch_magic)
+        throw DecodeError("not a namespace tree node");
+    (void)reader.u8(); // level
+    const auto count = reader.u32();
+    std::vector<ObjectId> children;
+    children.reserve(std::min<size_t>(count, reader.remaining() / 44));
+    for (uint32_t i = 0; i < count; ++i) {
+        (void)reader.string(8192);
+        children.push_back(ObjectId{reader.fixed<32>()});
+        (void)reader.u64();
+    }
+    reader.finish();
+    for (const auto& child : children)
+        collect_leaves(child, store, out);
+}
+
+// Every entry of one leaf, extents and all.
+void read_leaf(const ObjectId& id, const NamespaceNodeStore& store,
+               std::vector<std::pair<std::string, FsEntry>>& out) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    if (reader.fixed<4>() != leaf_magic)
+        throw DecodeError("not a namespace tree leaf");
+    const auto count = reader.u32();
+    for (uint32_t i = 0; i < count; ++i)
+        out.push_back(decode_leaf_entry(reader, store, true));
+    reader.finish();
+}
 
 void walk_subtree(const ObjectId& id, const NamespaceNodeStore& store,
                   const NamespaceVisitor& visit) {
@@ -458,6 +545,108 @@ std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
     if (!store)
         throw DecodeError("namespace is a tree and no node store was supplied");
     return namespace_tree_lookup(*snapshot.namespace_root, path, *store, with_extents);
+}
+
+ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
+                               const NamespaceChanges& changes, const NamespaceTreeLimits& limits) {
+    if (changes.empty())
+        return root;
+
+    // The leaf sequence, which costs the branch nodes and no entries.
+    std::vector<Child> leaves;
+    collect_leaves(root, store, leaves);
+    // The empty tree is a single empty leaf; treat it as no leaves at all so
+    // the first write does not have to special-case it.
+    if (leaves.size() == 1 && leaves.front().items == 0)
+        leaves.clear();
+
+    // Which leaf owns a key: the last one whose first key is at or before it.
+    // A key below every leaf's first key belongs to the first leaf, because
+    // that is where a full build would have put it.
+    const auto owner_of = [&](const std::string& key) -> size_t {
+        size_t index = 0;
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            if (leaves[i].first_key <= key)
+                index = i;
+            else
+                break;
+        }
+        return index;
+    };
+
+    size_t first = leaves.size(), last = 0;
+    for (const auto& [key, _] : changes) {
+        if (leaves.empty())
+            break;
+        const auto owner = owner_of(key);
+        first = std::min(first, owner);
+        last = std::max(last, owner);
+    }
+    if (leaves.empty()) {
+        first = 0;
+        last = 0;
+    }
+
+    // Read the window, apply the changes to it, and re-chunk. The window may
+    // have to grow rightwards: a run that did not end on a boundary key has
+    // not re-synchronised with the partition a full build would produce, and
+    // absorbing the next leaf is what restores it. In practice this absorbs
+    // nothing or one leaf; it is bounded by the next boundary key, which is
+    // one in `entry_target_fanout` of them.
+    std::vector<std::pair<std::string, FsEntry>> window;
+    std::vector<Child> replacement;
+    size_t end = last;
+    for (;;) {
+        window.clear();
+        for (size_t i = first; i <= end && i < leaves.size(); ++i)
+            read_leaf(leaves[i].id, store, window);
+
+        // Apply. A change to a key inside the window is an upsert or a delete;
+        // a key outside any existing leaf's range lands here too, because
+        // owner_of put it in the leaf a build would have placed it in.
+        std::map<std::string, FsEntry> merged;
+        for (auto& [path, entry] : window)
+            merged.insert_or_assign(std::move(path), std::move(entry));
+        const std::string low = leaves.empty() ? std::string() : leaves[first].first_key;
+        const bool last_window = end + 1 >= leaves.size();
+        const std::string high = last_window ? std::string() : leaves[end + 1].first_key;
+        for (const auto& [key, value] : changes) {
+            if (!leaves.empty() && key < low && first != 0)
+                continue;
+            if (!last_window && key >= high)
+                continue;
+            if (value)
+                merged.insert_or_assign(key, *value);
+            else
+                merged.erase(key);
+        }
+
+        std::vector<EntryRef> ordered;
+        ordered.reserve(merged.size());
+        for (const auto& [path, entry] : merged)
+            ordered.emplace_back(&path, &entry);
+        bool open = false;
+        replacement = chunk_leaves(ordered, store, limits, &open);
+        // An open tail with nothing left to absorb is the end of the sequence,
+        // where a full build flushes the remainder too.
+        if (!open || end + 1 >= leaves.size())
+            break;
+        ++end;
+    }
+
+    std::vector<Child> updated;
+    updated.reserve(leaves.size() + replacement.size());
+    for (size_t i = 0; i < first && i < leaves.size(); ++i)
+        updated.push_back(leaves[i]);
+    for (auto& leaf : replacement)
+        updated.push_back(std::move(leaf));
+    for (size_t i = end + 1; i < leaves.size(); ++i)
+        updated.push_back(leaves[i]);
+
+    if (updated.empty())
+        return empty_leaf(store);
+    return build_spine(std::move(updated), store, true, limits.branch_target_fanout,
+                       limits.branch_max_fanout);
 }
 
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
