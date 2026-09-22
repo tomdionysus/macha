@@ -251,6 +251,61 @@ std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_v
 
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store);
 
+// A namespace being mutated, in whichever form it is in.
+//
+// A batch of filesystem operations has to see its own earlier edits: mkdir /a
+// then create /a/b requires the parent check to find /a, which was created a
+// moment ago and is in no snapshot yet. The map form gets that for free by
+// mutating `entries` and reading it back. A tree cannot be edited in place
+// entry by entry -- every edit would rewrite a path to the root -- so the
+// batch's own changes have to be overlaid on it.
+//
+// The overlay is the delta, which the mutation was recording anyway. A path in
+// `upsert_entries` reads as that entry; a path in `erase_entries` reads as
+// absent, which is the part a map cannot express and a tombstone must; anything
+// else reads from the namespace underneath. The delta is therefore not a
+// by-product of the mutation any more, it is the mutation, and the snapshot's
+// map is left alone.
+//
+// On a map-backed snapshot this writes through to `entries` as well, because
+// SM13's payload is encoded from that map and a commit would otherwise publish
+// a namespace without the edit in it. That is the one behavioural difference
+// between the two forms and it is confined to this class.
+class NamespaceWorkingSet {
+  public:
+    NamespaceWorkingSet(MetadataSnapshot& snapshot, MetadataDelta& delta,
+                        const NamespaceNodeStore* nodes)
+        : snapshot_(snapshot), delta_(delta), nodes_(nodes),
+          tree_backed_(snapshot.namespace_root.has_value()) {}
+
+    bool tree_backed() const noexcept {
+        return tree_backed_;
+    }
+
+    std::optional<FsEntry> get(const std::string& path, bool with_extents = true) const;
+    bool contains(const std::string& path) const;
+    void put(const std::string& path, const FsEntry& entry);
+    void erase(const std::string& path);
+
+    // The first path strictly after `directory` that lies under it, if any.
+    // This is the emptiness test: namespace entries are ordered by path, so a
+    // directory's children are exactly the entries immediately after it.
+    std::optional<std::string> first_path_under(const std::string& directory) const;
+
+    // Every path under `directory`, with its entry, in path order -- what a
+    // rename has to move. Extents included: a rename re-keys the entry it
+    // found, and dropping its extents would silently empty the file.
+    std::vector<std::pair<std::string, FsEntry>> subtree(const std::string& directory) const;
+
+  private:
+    bool erased(const std::string& path) const;
+
+    MetadataSnapshot& snapshot_;
+    MetadataDelta& delta_;
+    const NamespaceNodeStore* nodes_;
+    bool tree_backed_;
+};
+
 // The two halves of the SM14 record shape, and the only places a snapshot
 // changes which form its namespace is in.
 //
