@@ -801,9 +801,39 @@ void TorrentManager::drain_alerts() {
     }
 }
 
+void TorrentManager::follow_device_pressure() {
+    if (!config_.pressure_download_rate || !impl_)
+        return;
+    bool pressured = false;
+    try {
+        // Reads the pool's measured service time. Wrapped because the DATA pool
+        // is not available during early start-up or on an edge node that holds
+        // no extents, and a torrent session must not fail to tick over that.
+        pressured = node_.local_store().service_monitor().pressured();
+    } catch (const std::exception&) {
+        return;
+    }
+    if (pressured == download_rate_clamped_)
+        return;
+
+    libtorrent::settings_pack settings;
+    const auto rate = pressured ? config_.pressure_download_rate : config_.max_download_rate;
+    settings.set_int(libtorrent::settings_pack::download_rate_limit,
+                     static_cast<int>(std::min<uint64_t>(rate, INT_MAX)));
+    impl_->session.apply_settings(std::move(settings));
+    download_rate_clamped_ = pressured;
+    Log::info(std::string("torrent download rate ") +
+              (pressured ? "clamped: the DATA device is defending its service time"
+                         : "restored: the DATA device recovered") +
+              " limit_bytes_per_s=" + std::to_string(rate));
+}
+
 void TorrentManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         drain_alerts();
+        // Before sampling jobs, so a device that went under during the last
+        // half-second is answered on this tick rather than the next.
+        follow_device_pressure();
         update_jobs();
         std::unique_lock lock(mutex_);
         if (has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire)) {
