@@ -678,7 +678,15 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
         base->version = append.version;
         changes[normalized] = std::move(base);
     }
-    return update_namespace_tree(root, store, changes, limits);
+    const auto updated = update_namespace_tree(root, store, changes, limits);
+    // The invariant the map form checks after applying a delta, checked where
+    // it can be: a namespace without a root directory is not a filesystem.
+    // This is a stat-only lookup -- one path from the root, no extent node --
+    // so it costs the depth of the tree and not the namespace.
+    const auto root_entry = namespace_tree_lookup(updated, "/", store, false);
+    if (!root_entry || root_entry->type != EntryType::directory)
+        throw DecodeError("metadata delta lost root");
+    return updated;
 }
 
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,

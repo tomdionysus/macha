@@ -405,8 +405,20 @@ MetadataHistoryEntry decode_metadata_history_entry(std::span<const uint8_t>);
 Bytes encode_metadata_delta(const MetadataDelta&);
 MetadataDelta decode_metadata_delta(std::span<const uint8_t>);
 std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot&, const MetadataSnapshot&);
-void apply_metadata_delta_in_place(MetadataSnapshot&, const MetadataDelta&);
-MetadataSnapshot apply_metadata_delta(const MetadataSnapshot&, const MetadataDelta&);
+// How a tree-backed namespace applies a delta: given the current root and the
+// delta, return the new root. Supplied by whoever holds a node store, because
+// this layer deliberately has none -- MetadataReplica is a state directory and
+// a codec, not a cluster client.
+//
+// Unset means a tree-backed delta cannot be applied, and it is refused rather
+// than applied to the entry map, where the edits would land in an empty map
+// nothing reads while the root went on addressing the namespace as it was.
+using NamespaceDeltaApplier = std::function<ObjectId(const ObjectId& root, const MetadataDelta&)>;
+
+void apply_metadata_delta_in_place(MetadataSnapshot&, const MetadataDelta&,
+                                   const NamespaceDeltaApplier& = {});
+MetadataSnapshot apply_metadata_delta(const MetadataSnapshot&, const MetadataDelta&,
+                                      const NamespaceDeltaApplier& = {});
 MetadataRecord decode_metadata_record(std::span<const uint8_t>);
 Hash256 metadata_hash(uint64_t, const Hash256&, std::span<const uint8_t>);
 MetadataRecord genesis_metadata();
@@ -550,6 +562,7 @@ class MetadataReplica {
     size_t history_records_{};
     uint64_t history_bytes_{};
     bool recovery_required_{};
+    NamespaceDeltaApplier namespace_applier_;
     bool accept_pristine_genesis_authority_{true};
     mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_;
     mutable uint64_t materialized_history_clock_{};
@@ -615,6 +628,14 @@ class MetadataReplica {
     uint64_t committed_generation() const;
     bool recovery_required() const;
     void mark_recovered();
+
+    // How this replica replays a delta over a tree-backed namespace. Set by
+    // MetadataManager once it has a store; until then a tree-backed history
+    // entry is refused rather than misapplied. Set once during construction of
+    // the node, before any replay can run.
+    void set_namespace_delta_applier(NamespaceDeltaApplier applier) {
+        namespace_applier_ = std::move(applier);
+    }
     uint64_t reserve_mutation_sequence(uint64_t observed_floor);
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);

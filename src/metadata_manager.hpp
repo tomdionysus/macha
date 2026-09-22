@@ -220,9 +220,7 @@ class MetadataManager {
     //
     // Unset until Service has a store, and irrelevant while no snapshot
     // carries a root -- which is every snapshot today.
-    void set_namespace_store(DistributedStore* store) noexcept {
-        namespace_store_ = store;
-    }
+    void set_namespace_store(DistributedStore* store);
     void set_publication_retention(std::function<void(const MetadataPublicationContext&)> guard) {
         publication_retention_ = std::move(guard);
     }

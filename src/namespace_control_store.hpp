@@ -31,13 +31,23 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
     // can address nodes no peer holds, and the readers that want this class --
     // reachability walks, the catalogue scan -- never write.
     static ControlNamespaceNodeStore for_reading(NodeRuntime& node, DistributedStore& store) {
-        return ControlNamespaceNodeStore(node, store, 0);
+        return ControlNamespaceNodeStore(node, store, 0, Mode::read);
     }
     static ControlNamespaceNodeStore for_commit(NodeRuntime& node, DistributedStore& store,
                                                 size_t required) {
         if (!required)
             throw std::invalid_argument("namespace commit requires a metadata write floor");
-        return ControlNamespaceNodeStore(node, store, required);
+        return ControlNamespaceNodeStore(node, store, required, Mode::commit);
+    }
+    // Replay writes locally and replicates nothing. A history entry being
+    // materialised is a commit that already happened: its nodes reached the
+    // floor when it was made, and re-establishing that here would turn a local
+    // materialisation into a network dependency -- a node coming back with
+    // peers still down could not rebuild its own head. Reconstructed nodes are
+    // content-addressed, so a locally written one is either identical to the
+    // node the committer wrote or it is not that node at all.
+    static ControlNamespaceNodeStore for_replay(NodeRuntime& node, DistributedStore& store) {
+        return ControlNamespaceNodeStore(node, store, 0, Mode::replay);
     }
 
     // Writes the node and returns its content address. A node that fails to
@@ -61,11 +71,14 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
     }
 
   private:
-    ControlNamespaceNodeStore(NodeRuntime& node, DistributedStore& store, size_t required);
+    enum class Mode : uint8_t { read, commit, replay };
+    ControlNamespaceNodeStore(NodeRuntime& node, DistributedStore& store, size_t required,
+                              Mode mode);
 
     NodeRuntime& node_;
     DistributedStore& store_;
     size_t required_;
+    Mode mode_;
     std::vector<ObjectId> written_;
 };
 

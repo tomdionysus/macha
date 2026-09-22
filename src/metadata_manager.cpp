@@ -272,6 +272,24 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
     return cache_;
 }
 
+void MetadataManager::set_namespace_store(DistributedStore* store) {
+    namespace_store_ = store;
+    if (!store) {
+        node_.metadata_replica().set_namespace_delta_applier({});
+        return;
+    }
+    // Replay writes nodes locally and replicates nothing: a history entry
+    // being materialised is a commit that already reached the floor when it
+    // was made, and re-establishing that here would make rebuilding a local
+    // head depend on peers being up. That is the shape of outage this codebase
+    // has already had once.
+    node_.metadata_replica().set_namespace_delta_applier(
+        [this](const ObjectId& root, const MetadataDelta& delta) {
+            auto nodes = ControlNamespaceNodeStore::for_replay(node_, *namespace_store_);
+            return apply_delta_to_namespace_tree(root, nodes, delta);
+        });
+}
+
 void require_materialised_namespace(const MetadataSnapshot& snapshot) {
     if (snapshot.namespace_root)
         throw MetadataNotReady("metadata snapshot carries a detached namespace root; its readers "
