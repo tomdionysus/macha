@@ -1549,7 +1549,11 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
     built->generation = view.generation;
     built->hash = view.hash;
     built->snapshot = std::move(view.snapshot);
-    for (const auto& [path, entry] : built->snapshot->entries) {
+    auto index_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    // The index is canonical names and a parent-to-children map: stat data
+    // about paths, with no entry body in it at all.
+    for_each_namespace_entry(*built->snapshot, &index_nodes,
+                             [&](const std::string& path, const FsEntry&) {
         const auto canonical = macos_fuse_composed_name(path);
         auto [canonical_it, inserted] = built->canonical_paths.emplace(canonical, path);
         if (!inserted && canonical_it->second != path) {
@@ -1559,9 +1563,9 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
                            canonical + " first=" + canonical_it->second + " second=" + path);
         }
         if (path == "/")
-            continue;
+            return;
         built->children[parent_path(path)].push_back({base_name(path), path});
-    }
+    });
 
     std::lock_guard lock(namespace_index_mutex_);
     if (!namespace_index_ || namespace_index_->generation < built->generation ||
@@ -1573,7 +1577,10 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
 std::optional<std::string> FileSystem::resolve_existing_path(const std::string& p) {
     const auto q = normalize_path(p);
     auto index = namespace_index();
-    if (index->snapshot->entries.contains(q))
+    auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    // Existence, so nothing is copied and no extent node is fetched. This is
+    // the hottest path in the filesystem: every FUSE lookup passes through it.
+    if (namespace_contains(*index->snapshot, &nodes, q))
         return q;
 
     const auto canonical = macos_fuse_composed_name(q);
@@ -1615,10 +1622,16 @@ FsEntry FileSystem::getattr(const std::string& p) {
     auto resolved = resolve_existing_path(p);
     if (!resolved)
         fail(ENOENT, "not found");
-    auto i = index->snapshot->entries.find(*resolved);
-    if (i == index->snapshot->entries.end())
+    auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    // With extents, which preserves exactly what this returned from the map.
+    // Trimming it to a stat-only read is Stage D's business and wants an audit
+    // of what callers do with the entry they get back: a caller that reads
+    // `extents` off a stat-only entry sees an empty list rather than an error,
+    // and that is the class of silence this work exists to remove.
+    auto found = namespace_entry(*index->snapshot, &nodes, *resolved);
+    if (!found)
         fail(ENOENT, "not found");
-    return i->second;
+    return *found;
 }
 std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::string& p) {
     auto resolved = resolve_existing_path(p);
@@ -1626,20 +1639,32 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
         fail(ENOENT, "not found");
     auto q = *resolved;
     auto index = namespace_index();
-    auto entry = index->snapshot->entries.find(q);
-    if (entry == index->snapshot->entries.end())
+    auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    // The directory itself is only inspected for its type, so stat-only.
+    auto entry = namespace_entry(*index->snapshot, &nodes, q, false);
+    if (!entry)
         fail(ENOENT, "not found");
-    if (entry->second.type != EntryType::directory)
+    if (entry->type != EntryType::directory)
         fail(ENOTDIR, "not directory");
     auto children = index->children.find(q);
     if (children == index->children.end())
         return {};
     std::vector<std::pair<std::string, FsEntry>> result;
     result.reserve(children->second.size());
+    // The children come back WITH their extents, and that is not an oversight.
+    // A listing looks like stat data and is not: the manage API computes
+    // file_media_id() over what readdir returns, and file_media_id hashes the
+    // extent list. Handing it a stat-only entry does not fail -- it hashes an
+    // empty list and returns a different id that looks exactly as valid as the
+    // right one, which then fails to match any catalogue binding.
+    //
+    // Found by making exactly that mistake here: the invariants suite caught
+    // it deterministically, three runs out of three. Trimming a listing to
+    // stat data belongs to Stage D, after an audit of what every caller does
+    // with the entries rather than with the names.
     for (const auto& [name, child_path] : children->second) {
-        auto child = index->snapshot->entries.find(child_path);
-        if (child != index->snapshot->entries.end())
-            result.emplace_back(name, child->second);
+        if (auto child = namespace_entry(*index->snapshot, &nodes, child_path))
+            result.emplace_back(name, *child);
     }
     return result;
 }

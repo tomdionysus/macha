@@ -923,4 +923,48 @@ MACHA_TEST("namespace_tree", test_history_replay_applies_a_delta_to_the_tree_not
     CHECK(tree_backed.garbage == mapped.garbage);
 }
 
+MACHA_TEST("namespace_tree", test_a_stat_only_read_costs_no_extents_in_either_form) {
+    // FUSE path resolution is the hottest read in the filesystem and it asks
+    // only whether a key exists. Before the primitives it was a map lookup
+    // that copied nothing; it must not become one that copies a film's extent
+    // list, and on a tree it must not fetch one either.
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    entries["/film.mkv"] = make_file(1, 12500);
+
+    const auto attached = populated_snapshot(entries);
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(attached, store);
+
+    CHECK(namespace_contains(attached, nullptr, "/film.mkv"));
+    CHECK(!namespace_contains(attached, nullptr, "/missing.mkv"));
+
+    store.forget_reads();
+    CHECK(namespace_contains(detached, &store, "/film.mkv"));
+    const auto contains_reads = store.reads();
+    CHECK(!namespace_contains(detached, &store, "/missing.mkv"));
+
+    // A stat-only entry read carries no extents, from the map as well as from
+    // the tree: a caller that asked not to pay for them is not handed a copy
+    // of 12,500 of them because this snapshot happens to be a map.
+    const auto stat_from_map = namespace_entry(attached, nullptr, "/film.mkv", false);
+    REQUIRE(stat_from_map.has_value());
+    CHECK(stat_from_map->extents.empty());
+    CHECK(stat_from_map->size == entries.at("/film.mkv").size);
+
+    store.forget_reads();
+    const auto stat_from_tree = namespace_entry(detached, &store, "/film.mkv", false);
+    REQUIRE(stat_from_tree.has_value());
+    CHECK(stat_from_tree->extents.empty());
+    CHECK(store.reads() == contains_reads);
+
+    // And asking for extents costs more than not asking, which is how we know
+    // the cheap path was avoiding work rather than there being none to do.
+    store.forget_reads();
+    const auto full = namespace_entry(detached, &store, "/film.mkv", true);
+    REQUIRE(full.has_value());
+    CHECK(full->extents.size() == 12500);
+    CHECK(store.reads() > contains_reads);
+}
+
 } // namespace
