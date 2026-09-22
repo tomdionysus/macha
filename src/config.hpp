@@ -855,8 +855,21 @@ struct Config {
     // on 2026-09-19, and no available setting would have prevented it. Zero
     // target disables the mechanism and restores exactly the previous
     // behaviour.
-    uint32_t io_pressure_target_ms{50};
-    uint32_t io_pressure_release_ms{20};
+    // What an operation on a coping device is expected to cost: a fixed
+    // per-operation budget plus a budget per MiB. Pressure is the moving
+    // average of actual/expected, so a 4 MiB write and a 4 KiB read are judged
+    // against what each should cost rather than against one number.
+    //
+    // A single io_pressure_target_ms was the first design and it declared
+    // permanent pressure on every node doing ordinary 4 MiB extent writes.
+    uint32_t io_pressure_overhead_ms{25};
+    uint32_t io_pressure_per_mib_ms{120};
+    uint32_t io_pressure_slowdown_percent{300};
+    uint32_t io_pressure_release_percent{150};
+    // A single operation this slow trips pressure at once, whatever the average
+    // says: the 17.7 s extent write that started this work barely moves a
+    // moving average and starves a viewer completely.
+    uint32_t io_pressure_outlier_ms{2000};
     uint32_t io_pressure_min_background{1};
     // How long a DATA credit wait may make no progress at all before it fails
     // instead of waiting for ever. "No progress" means not one lease was

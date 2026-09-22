@@ -1,5 +1,53 @@
 # Current release
 
+## 0.52.0 — The catalogue comes back, and disk pressure means something (development)
+
+Everything here fixes something 0.51.0 broke or got wrong on the live cluster
+within the hour. Recorded in the order it hurt.
+
+**Every catalogue route was returning 503 on every node, and all clients
+reported "no API".** `catalogue.cpp` committed a resolved catalogue conflict
+through the non-exact `mutate()` path, and the tree-backed guard refuses that:
+a tree has no entry map to diff, so a commit must declare its change set. It
+was the last caller still on that path. Health and authentication answered
+normally throughout, which is why the app loaded and had nothing in it. It now
+commits through `mutate_delta`, carrying its catalogue root, its garbage
+upserts and the standing conflict set explicitly.
+
+**Disk pressure was measured against a number that had been invented rather
+than derived.** `io_pressure_target_ms: 50` compared the total time of every
+operation against one threshold, so a 4 MiB extent write — 100–200 ms on a
+healthy spinning disk — read as pressure. A node declared itself in trouble
+nine seconds after boot and stayed there, which held an operator's 36 GB import
+to one background lease and about 2 MB/s for an afternoon while nothing was
+being watched.
+
+Pressure is now the moving average of **actual against expected for that
+operation's size**: `io_pressure_overhead_ms` (25) plus
+`io_pressure_per_mib_ms` (120), with pressure above
+`io_pressure_slowdown_percent` (300) and release below
+`io_pressure_release_percent` (150). A 4 MiB write at 200 ms reads as 40% of
+expectation. Setting `io_pressure_slowdown_percent: 0` disables the mechanism.
+
+**A single catastrophic operation trips pressure on its own**
+(`io_pressure_outlier_ms`, 2 s). The tests caught this before it shipped: the
+17.7 s extent write that prompted this whole line of work moves the ratio from
+19% to 237% against fifty healthy samples — *under* the 300% line. The ratio
+catches sustained degradation and would have let the founding case through.
+
+**Law 2 is enforced instead of flattened.** "Thou Shalt Not Make The
+Ingester/Loader Wait, Unless It Would Make The Viewer Wait." 0.51.0 made the
+loader yield whenever the device was slow, with no viewer anywhere. Now the
+loader yields only when a viewer is present — waiting for credit or holding it
+— and gets its concurrency back the moment the viewer leaves. Speculative work
+still yields on pressure alone: it sits below the loader and nobody is waiting
+for it. A viewer is never gated by pressure at all.
+
+`device_slowdown_percent` joins the per-node data-resource block on
+`GET /api/v1/status`, beside the service time and worst case, because a mean
+latency cannot be judged without knowing the size of the operations behind it.
+
+
 ## 0.51.0 — The namespace tree is protected from the collector, and a slow disk stops being invisible (development)
 
 **The namespace tree was collectable.** Found on the live cluster six hours
