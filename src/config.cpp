@@ -166,6 +166,12 @@ void parse_dht(const YAML::Node& root, Config& c) {
                                                           "dht.data_credit_no_progress_deadline_ms");
     if (d["data_viewer_reserve_bytes"])
         c.data_viewer_reserve_bytes = yaml_size(d["data_viewer_reserve_bytes"]);
+    if (d["io_pressure_target_ms"])
+        c.io_pressure_target_ms = d["io_pressure_target_ms"].as<uint32_t>();
+    if (d["io_pressure_release_ms"])
+        c.io_pressure_release_ms = d["io_pressure_release_ms"].as<uint32_t>();
+    if (d["io_pressure_min_background"])
+        c.io_pressure_min_background = d["io_pressure_min_background"].as<uint32_t>();
     if (d["read_ahead"])
         c.read_ahead_extents = d["read_ahead"].as<size_t>();
     if (d["metadata_cache_ms"])

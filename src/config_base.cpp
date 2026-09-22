@@ -78,6 +78,15 @@ void validate(Config& config) {
         config.data_viewer_reserve_bytes >= config.data_inflight_bytes)
         throw std::runtime_error(
             "dht.data_inflight_bytes must exceed nonzero data_viewer_reserve_bytes");
+    // Release below target, or the device never leaves pressure once it enters.
+    // Zero target disables the mechanism, and then the release value is moot.
+    if (config.io_pressure_target_ms &&
+        config.io_pressure_release_ms >= config.io_pressure_target_ms)
+        throw std::runtime_error(
+            "dht.io_pressure_release_ms must be below dht.io_pressure_target_ms");
+    if (config.io_pressure_target_ms && !config.io_pressure_min_background)
+        throw std::runtime_error("dht.io_pressure_min_background must be at least 1: the loader is "
+                                 "bounded under pressure, never stopped");
     if (config.extent_size >
         config.data_inflight_bytes - config.data_viewer_reserve_bytes)
         throw std::runtime_error(

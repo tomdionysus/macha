@@ -522,6 +522,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_storage_metadata.cpp
         tests/test_namespace_tree.cpp
         tests/test_namespace_migration.cpp
+        tests/test_io_pressure.cpp
         tests/test_storage_v18.cpp
         tests/test_rpc_cluster.cpp
         tests/test_filesystem_fuse.cpp
