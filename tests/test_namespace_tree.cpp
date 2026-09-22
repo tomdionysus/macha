@@ -807,4 +807,71 @@ MACHA_TEST("namespace_tree", test_a_write_rewrites_a_path_rather_than_the_librar
     CHECK(after == entries);
 }
 
+MACHA_TEST("namespace_tree", test_a_delta_applied_to_the_tree_lands_where_the_map_lands) {
+    // The commit path's half of the property: the delta a mutation already
+    // carries, applied to the tree, produces the root a build over the map
+    // with the same delta applied produces. The two applications cannot
+    // disagree about order, about an append's base, or about a path erased and
+    // re-created in one delta, because this test would catch it.
+    auto entries = library(10, 6);
+    MemoryNamespaceNodeStore store;
+    auto root = build_namespace_tree(entries, store);
+    MetadataSnapshot mapped;
+    mapped.entries = entries;
+
+    // A file with an external extent spine, found rather than assumed: the
+    // fixture gives every sixteenth entry 600 extents and which path that is
+    // depends on the library's shape.
+    std::string appended;
+    for (const auto& [path, entry] : entries)
+        if (entry.extents.size() == 600) {
+            appended = path;
+            break;
+        }
+    REQUIRE(!appended.empty());
+
+    MetadataDelta delta;
+    // An upsert, an erase, a create, and an append onto a file that already
+    // has an external extent spine.
+    auto touched = entries.at("/TV/Show 1/Season 2/Episode 5.mkv");
+    touched.mtime_ns += 5000;
+    delta.upsert_entries["/TV/Show 1/Season 2/Episode 5.mkv"] = touched;
+    delta.upsert_entries["/TV/Show 9/Season 4/new.mkv"] = make_file(4242, 3);
+    delta.erase_entries.push_back("/TV/Show 2/Season 3/Episode 7.mkv");
+    MetadataDelta::EntryAppend append;
+    append.base_extents = 600;
+    append.extents = {make_file(77, 2).extents[0], make_file(78, 2).extents[1]};
+    append.size = entries.at(appended).size + 8ULL * 1024 * 1024;
+    append.mtime_ns = 12345;
+    append.ctime_ns = 12345;
+    append.version = 9;
+    delta.append_entries[appended] = append;
+
+    const auto updated = apply_delta_to_namespace_tree(root, store, delta);
+
+    apply_metadata_delta_in_place(mapped, delta);
+    MemoryNamespaceNodeStore fresh;
+    const auto rebuilt = build_namespace_tree(mapped.entries, fresh);
+
+    CHECK(updated == rebuilt);
+    CHECK(read_namespace_tree(updated, store) == mapped.entries);
+    CHECK(read_namespace_tree(updated, store).at(appended).extents.size() == 602);
+
+    // A delta whose append base does not match what is there is refused, not
+    // applied to whatever happens to be at the path -- the same refusal the
+    // map path makes, because a delta against a different namespace is not a
+    // delta this tree can take.
+    MetadataDelta wrong;
+    MetadataDelta::EntryAppend mismatched = append;
+    mismatched.base_extents = 599;
+    wrong.append_entries[appended] = mismatched;
+    bool refused = false;
+    try {
+        (void)apply_delta_to_namespace_tree(updated, store, wrong);
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
 } // namespace

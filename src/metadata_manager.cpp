@@ -2,6 +2,7 @@
 #include "metadata_manager.hpp"
 #include "diagnostics.hpp"
 #include "placement.hpp"
+#include "namespace_control_store.hpp"
 
 #include "codec.hpp"
 #include "log.hpp"
@@ -1771,7 +1772,35 @@ MetadataRecord MetadataManager::mutate_impl(
                 supplied_delta.replace_conflicts = snapshot.conflicts;
         }
 
-        auto payload = encode_snapshot(snapshot);
+        // A tree-backed namespace commits by updating the tree with the change
+        // set this mutation already carries, rather than by re-serialising the
+        // library. Unreachable today: nothing produces a snapshot with a root.
+        if (snapshot.namespace_root) {
+            // Without an exact delta there is no change set, and rediscovering
+            // one means materialising both namespaces and diffing them --
+            // precisely the cost this replaces. A caller that cannot describe
+            // its own edit cannot mutate a tree-backed namespace.
+            if (!exact_delta)
+                throw MetadataNotReady("a tree-backed namespace requires an exact delta");
+            // A callback that wrote into the map has made a change the delta
+            // does not describe, and applying the delta alone would silently
+            // drop it. Refuse rather than guess which of the two is the
+            // mutation. This is the contract each mutation callback is
+            // converted to, one at a time, and the loud failure is how the
+            // conversion is driven.
+            if (!snapshot.entries.empty())
+                throw std::runtime_error(
+                    "metadata mutation wrote the namespace map on a tree-backed snapshot");
+            if (!namespace_store_)
+                throw MetadataNotReady("no namespace node store is configured");
+            auto nodes =
+                ControlNamespaceNodeStore::for_commit(node_, *namespace_store_, need);
+            snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
+                                                                    nodes, supplied_delta);
+        }
+
+        auto payload =
+            snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
         if (payload == current.payload)
             return cache_record(current,
                                 std::make_shared<MetadataSnapshot>(std::move(snapshot)));

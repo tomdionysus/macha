@@ -46,6 +46,8 @@ struct MetadataSnapshotView {
 // the boundary rather than silently in the collector.
 void require_materialised_namespace(const MetadataSnapshot&);
 
+class DistributedStore;
+
 enum class MetadataAvailability : uint8_t {
     unavailable = 0,
     read_only = 1,
@@ -90,6 +92,7 @@ struct MetadataHistoryTransferDiagnostics {
 
 class MetadataManager {
     NodeRuntime& node_;
+    DistributedStore* namespace_store_{};
     std::mutex mutation_mutex_;
     // Guards only the multi-head merge-and-publish branch of read_group().
     // Kept separate from mutation_mutex_ because mutate_impl() already holds
@@ -207,6 +210,19 @@ class MetadataManager {
 
   public:
     explicit MetadataManager(NodeRuntime&);
+
+    // Where namespace tree nodes live, for a snapshot whose namespace is a
+    // tree. Supplied rather than constructed here because the manager has a
+    // NodeRuntime and not a DistributedStore, and because the node store a
+    // commit uses is bound to the write floor that commit is being made under:
+    // a namespace root may name a node only once that node has durably reached
+    // the same floor as the record naming it.
+    //
+    // Unset until Service has a store, and irrelevant while no snapshot
+    // carries a root -- which is every snapshot today.
+    void set_namespace_store(DistributedStore* store) noexcept {
+        namespace_store_ = store;
+    }
     void set_publication_retention(std::function<void(const MetadataPublicationContext&)> guard) {
         publication_retention_ = std::move(guard);
     }

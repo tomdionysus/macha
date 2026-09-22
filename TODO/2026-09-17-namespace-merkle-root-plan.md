@@ -8,7 +8,10 @@ tree substrate is written, tested and measured against the live es-1 namespace
 reduction -- and the SM14 record shape now exists to point at it. Nothing
 authors an SM14 record yet; `encode_snapshot` never emits one and no commit
 path reads one, so it ships as dead code and becomes reachable in Stage C. See
-"Stage B: the SM14 record shape" below.** Stages C-F not started. The finding below is verified against current `develop` (0.43.0);
+"Stage B: the SM14 record shape" below. Stage C is under way (2026-09-22):
+the commit path can update a tree and the readers that decide what GC deletes
+can read one, but nothing authors a root yet -- see "Stage C progress".**
+Stages D-F not started. The finding below is verified against current `develop` (0.43.0);
 the design is proposed and the migration is not yet designed in enough detail to
 execute. The estimates in "The arithmetic" have been replaced by measurements --
 see "Stage A results" below, which supersedes them. Every line reference here was
@@ -715,6 +718,79 @@ specifically to reproduce historical byte-exact encodings for journal replay, an
 right one. Staged metadata format migration is established practice here, with a
 worked pattern for keeping old encodings byte-exact. Write the tree as SM14
 alongside the existing path, readable both ways, not yet authoritative.
+
+## Stage C progress (2026-09-22)
+
+**The commit path can update a tree, and the readers that decide what GC
+deletes can read one. Nothing produces a snapshot with a root yet, so all of
+it is still unreachable in production.**
+
+What exists:
+
+- **`require_materialised_namespace`** gates all four places
+  `MetadataManager` hands out a `MetadataSnapshotView`. Around forty call sites
+  read `snapshot->entries` directly and none treats an empty map as a failure;
+  for the reachability readers an empty map reads as "nothing is live", which
+  is the input destructive GC wants. A detached namespace does not reach a
+  reader that has not been converted.
+- **`for_each_namespace_entry` / `namespace_entry`** read the namespace in
+  whichever form the snapshot carries it, so a converted reader works on both
+  sides of the cutover. Handed a detached snapshot and no store they throw
+  rather than visiting nothing and reporting success.
+- **The five readers with teeth are converted**: `Service`'s retention claims
+  (baseline walk, append lookup, no-delta diff) and its retention-release live
+  set, and `FileSystem::maintenance_objects_cached`.
+- **`ControlNamespaceNodeStore`** puts tree nodes in the existing
+  content-addressed control store, the path the catalogue's shards already
+  take. It opens `for_reading` or `for_commit(required)`; zero means read-only
+  and `put` refuses, because a tree written under no durability floor is a root
+  addressing nodes no peer holds.
+- **`update_namespace_tree`** applies a change set without rebuilding, and
+  **`apply_delta_to_namespace_tree`** feeds it the delta a commit already
+  carries -- the change set carried in rather than rediscovered, which is the
+  mistake the catalogue's `commit` makes.
+- **`mutate_impl` commits a tree-backed snapshot** by applying its delta to
+  the tree and encoding SM14.
+
+**Measured: one ordinary write rewrites 3 nodes of 102** on a 2,520-entry
+library -- the leaf holding the key and the two branches above it, which is
+the path from the root and nothing else.
+
+**The spine recompute is not the cost it looked like.** The update recomputes
+the spine over the whole leaf sequence rather than splicing it, and that writes
+nothing extra: an unchanged branch re-encodes to the same bytes and so to the
+same content address, so it is not a new node and nothing replicates it. The
+cost is local reads and CPU over the branch nodes -- 10 on es-1's namespace
+against 5,101 entries. Local splicing is an optimisation for an order of
+magnitude more namespace, not for now.
+
+**The property that makes any of it usable is asserted, not argued**: the root
+an incremental update produces is byte-identical to the root a full build over
+the resulting namespace produces. Sixty rounds of random change sets -- deletes
+that empty leaves, value changes in place, inserts landing on boundary keys,
+some with enough extents to force an external spine -- each compared against a
+fresh build. Two nodes that reach one namespace by different routes must agree
+on the root or the signature comparison reports divergence that does not exist.
+
+What Stage C still owes:
+
+- [ ] **The mutation callbacks still write `snapshot.entries`.** A tree-backed
+  mutation refuses a callback that touched the map, because applying the delta
+  alone would silently drop whatever the callback did. That refusal is the
+  mechanism for converting them one at a time; none is converted yet.
+- [ ] **History replay cannot apply a delta to a tree.**
+  `apply_metadata_delta_in_place` has no node store and now refuses a
+  tree-backed snapshot outright rather than editing a map nothing reads. The
+  replay path has to hand it a store, or call
+  `apply_delta_to_namespace_tree` itself. **This is a prerequisite for any
+  SM14 record existing at all**: a record whose history cannot be replayed is
+  the 2026-09-06 outage shape.
+- [ ] The 15 point-lookup sites and 8 full scans (FUSE, catalogue, media
+  index), which are mechanical once the primitives are in.
+- [ ] **Who writes the first root.** Nothing constructs a detached snapshot, so
+  the authorship decision -- a per-node opt-in, a cluster policy transition
+  like the write floor, or nothing until the migration itself -- is still open
+  and belongs with Stage E rather than here.
 
 **Stage C — the commit path.** `mutate_impl` stops decoding the whole snapshot,
 mutates the tree, updates the root. `apply_metadata_delta_in_place` becomes a

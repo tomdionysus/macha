@@ -676,6 +676,7 @@ void Service::initialise_services(std::stop_token stop) {
         });
 
         store_ = std::move(store);
+        metadata->set_namespace_store(store_.get());
         // Repair is the only component that learns an object is unobtainable,
         // and it learns it in the ordinary course of a maintenance pass. Wire
         // its counters to Status now that the store exists.

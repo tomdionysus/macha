@@ -1444,6 +1444,16 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
 
 void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& delta) {
     note_startup_progress();
+    // A tree-backed namespace cannot be edited through the map: the entry
+    // edits below would land in an empty map that nothing reads, the root
+    // would keep addressing the namespace as it was, and the result would be a
+    // record that looks applied and is not. Replaying a delta against a tree
+    // needs a node store, which this function has no way to obtain -- it is
+    // apply_delta_to_namespace_tree, and the history replay path has to hand
+    // it one. Until it does, refuse.
+    if (out.namespace_root)
+        throw DecodeError("cannot apply a metadata delta to a tree-backed namespace through the "
+                          "entry map");
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         auto it = out.mutation_sequences.find(node);
         if (it != out.mutation_sequences.end() && sequence < it->second)
