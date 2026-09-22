@@ -277,6 +277,7 @@ set(MACHA_CORE_SOURCES
     src/persistent_cache.cpp
     src/metadata.cpp
     src/namespace_tree.cpp
+    src/namespace_control_store.cpp
     src/net.cpp
     src/cluster.cpp
     src/distributed_store.cpp
