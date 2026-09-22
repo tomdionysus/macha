@@ -8,13 +8,20 @@
 namespace macha {
 
 ControlNamespaceNodeStore::ControlNamespaceNodeStore(NodeRuntime& node, DistributedStore& store,
-                                                     size_t required)
-    : node_(node), store_(store), required_(required) {}
+                                                     size_t required, Mode mode)
+    : node_(node), store_(store), required_(required), mode_(mode) {}
 
 ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
-    if (!required_)
+    if (mode_ == Mode::read)
         throw std::logic_error("namespace node store opened for reading cannot write a node");
     const auto id = object_id(node);
+    if (mode_ == Mode::replay) {
+        if (!node_.control_store().put(id, node))
+            throw std::runtime_error("namespace node could not be written locally during replay: " +
+                                     to_string(id));
+        written_.push_back(id);
+        return id;
+    }
     // Storing the same bytes twice is not an error and must return the same
     // id, which content addressing gives for free -- and which is what makes
     // an unchanged subtree cost nothing on a commit that rewrites its
