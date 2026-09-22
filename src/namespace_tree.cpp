@@ -1026,6 +1026,53 @@ std::vector<std::pair<std::string, FsEntry>> NamespaceWorkingSet::subtree(
     return {merged.begin(), merged.end()};
 }
 
+NamespaceMigration plan_namespace_migration(const MetadataRecord& head,
+                                            NamespaceNodeStore& nodes) {
+    if (!valid_metadata_record(head))
+        throw std::runtime_error("the head to migrate is not a valid metadata record");
+    auto snapshot = decode_snapshot(head.payload);
+    if (snapshot.namespace_root)
+        throw std::runtime_error("this namespace is already a tree");
+    if (!snapshot.metadata_write_replicas_required)
+        throw std::runtime_error("this namespace predates the protocol-20 write floor and cannot "
+                                 "be re-rooted; transition it first");
+
+    NamespaceMigration migration;
+    migration.entries = snapshot.entries.size();
+    migration.previous_payload_bytes = head.payload.size();
+
+    const auto source = snapshot.entries;
+    auto migrated = detach_namespace(std::move(snapshot), nodes);
+    migration.root = *migrated.namespace_root;
+    migration.stats = namespace_tree_stats(migration.root, nodes);
+
+    // Read the tree back out of the store it was just written to and compare
+    // it against the namespace it came from -- paths, stat fields and extents.
+    // This is the whole safety of the operation: everything after it assumes
+    // the tree is the namespace.
+    const auto read_back = read_namespace_tree(migration.root, nodes);
+    if (read_back.size() != source.size())
+        throw std::runtime_error("namespace migration verification failed: tree holds " +
+                                 std::to_string(read_back.size()) + " entries, namespace had " +
+                                 std::to_string(source.size()));
+    for (const auto& [path, entry] : source) {
+        const auto found = read_back.find(path);
+        if (found == read_back.end())
+            throw std::runtime_error("namespace migration verification failed: tree is missing " +
+                                     path);
+        if (!(found->second == entry))
+            throw std::runtime_error("namespace migration verification failed: tree changed " +
+                                     path);
+    }
+
+    migration.record.generation = head.generation + 1;
+    migration.record.previous = head.hash;
+    migration.record.payload = encode_snapshot_v14(migrated);
+    migration.record.hash = metadata_hash(migration.record.generation, migration.record.previous,
+                                          migration.record.payload);
+    return migration;
+}
+
 MetadataSnapshot detach_namespace(MetadataSnapshot snapshot, NamespaceNodeStore& store,
                                   const NamespaceTreeLimits& limits) {
     if (snapshot.namespace_root)

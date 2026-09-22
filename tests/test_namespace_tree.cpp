@@ -598,34 +598,32 @@ MACHA_TEST("namespace_tree", test_a_damaged_record_is_refused_rather_than_truste
     CHECK(refused + accepted == payload.size());
 }
 
-MACHA_TEST("namespace_tree", test_a_detached_namespace_never_reaches_a_reader_that_wants_entries) {
-    // The Stage C guard, stated where it can be tested. Around forty call
-    // sites read `snapshot->entries` directly and none of them treats an empty
-    // map as a failure; for the three that compute reachability it reads as
-    // "nothing is live", which is what destructive GC acts on. So the manager
-    // refuses to hand out a view over a detached namespace at all, and this is
-    // the predicate it refuses with.
+MACHA_TEST("namespace_tree", test_a_snapshot_handed_to_a_reader_names_its_namespace_once) {
+    // The invariant the view boundary keeps. A snapshot with both a root and a
+    // map would let the two disagree and let every reader choose which one to
+    // believe; the encoders refuse to write that state and the manager refuses
+    // to hand it out.
     MemoryNamespaceNodeStore store;
     const auto snapshot = populated_snapshot(library(2, 2));
 
-    // An ordinary materialised snapshot passes, including an empty one: a
-    // cluster with no files is not the same thing as a namespace that is
-    // somewhere else.
-    require_materialised_namespace(snapshot);
-    require_materialised_namespace(MetadataSnapshot{});
-
+    // Either form alone is fine, including the empty namespace: a cluster with
+    // no files is not the same thing as a namespace that is somewhere else.
+    require_coherent_namespace(snapshot);
+    require_coherent_namespace(MetadataSnapshot{});
     const auto detached = detach_namespace(snapshot, store);
+    require_coherent_namespace(detached);
+    require_coherent_namespace(attach_namespace(detached, store));
+
+    // Both at once is refused.
+    auto incoherent = detached;
+    incoherent.entries = snapshot.entries;
     bool refused = false;
     try {
-        require_materialised_namespace(detached);
+        require_coherent_namespace(incoherent);
     } catch (const MetadataNotReady&) {
         refused = true;
     }
     CHECK(refused);
-
-    // And it passes again once the namespace is actually there, so the guard
-    // tracks where the entries are rather than which format produced them.
-    require_materialised_namespace(attach_namespace(detached, store));
 }
 
 MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_form) {

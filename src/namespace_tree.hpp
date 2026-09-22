@@ -306,6 +306,31 @@ class NamespaceWorkingSet {
     bool tree_backed_;
 };
 
+// What a migration would do to one node, built and verified but not installed.
+struct NamespaceMigration {
+    MetadataRecord record; // the SM14 head to install
+    ObjectId root{};
+    NamespaceTreeStats stats;
+    size_t entries{};
+    uint64_t previous_payload_bytes{};
+};
+
+// Builds the tree for `head`'s namespace into `nodes`, verifies it entry by
+// entry against that namespace, and returns the record that would replace the
+// head. Installs nothing and touches no node state.
+//
+// The result is a pure function of the head: the tree's shape is determined by
+// the entry set alone, so every node holding the same head computes the same
+// nodes, the same root and the same record hash without exchanging anything.
+// That is what makes a cluster-wide re-root possible without a coordinator,
+// and what makes `--expect-hash` a real check rather than a formality.
+//
+// Verification is not optional and is done here rather than by the caller: a
+// re-root that drops an entry drops the only record of where that file's
+// extents live, and the extents themselves are untouched and unaware. Throws
+// if the tree does not read back as the namespace it was built from.
+NamespaceMigration plan_namespace_migration(const MetadataRecord& head, NamespaceNodeStore& nodes);
+
 // The two halves of the SM14 record shape, and the only places a snapshot
 // changes which form its namespace is in.
 //

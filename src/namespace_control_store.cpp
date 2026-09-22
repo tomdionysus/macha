@@ -41,4 +41,17 @@ std::optional<Bytes> ControlNamespaceNodeStore::get(const ObjectId& id) const {
     return node_.control_store().get(id);
 }
 
+ObjectId LocalNamespaceNodeStore::put(std::span<const uint8_t> node) {
+    const auto id = object_id(node);
+    if (!store_.put(id, node))
+        throw std::runtime_error("namespace node could not be written: " + to_string(id));
+    written_.push_back(id);
+    bytes_written_ += node.size();
+    return id;
+}
+
+std::optional<Bytes> LocalNamespaceNodeStore::get(const ObjectId& id) const {
+    return store_.get(id);
+}
+
 } // namespace macha

@@ -4591,6 +4591,103 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
     return true;
 }
 
+bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
+                                            const std::vector<NodeId>& witnesses,
+                                            const std::string& reason) {
+    if (!valid_metadata_record(record))
+        return false;
+    std::lock_guard durable(durable_mutation_m_);
+    std::lock_guard lock(m_);
+
+    const auto stamp = ".pre-migration." + std::to_string(wall_time_ns());
+    std::vector<std::filesystem::path> quarantined;
+    for (const auto& path :
+         {checkpoint_p_, journal_p_, history_p_, heads_p_, checkpoint_proof_p_, p_, committed_p_}) {
+        if (auto moved = quarantine_metadata_file(path, stamp))
+            quarantined.push_back(*moved);
+    }
+
+    cur_ = record;
+    committed_ = record;
+    reset_checkpoint(record);
+    load_history();
+    ensure_history_root(record);
+    load_heads();
+    load_checkpoint_proof();
+
+    // The new record has to be an accepted head, or the node comes back with a
+    // committed record nobody has accepted and refuses to serve: "no accepted
+    // metadata heads available".
+    //
+    // The certificate carries the write floor the record names, witnessed by
+    // the durable participant roster. Both halves are forced, and the second
+    // one is the most uncomfortable line in this change, so it is worth being
+    // exact about what it claims.
+    //
+    // The floor is forced because a protocol-20 record may not be accepted
+    // under legacy authority: a required=0 certificate over a record naming a
+    // floor is refused by acceptance_matches_record_policy_locked, and rightly
+    // -- that would be a branch quietly discarding the floor it inherited.
+    //
+    // The witnesses are forced because encode_metadata_acceptance refuses a
+    // certificate claiming a floor it cannot name enough replicas for. So this
+    // cannot say "valid under this floor, acknowledged by nobody", which is
+    // the literal truth at the moment it is written.
+    //
+    // What it says instead is the operator's assertion, named node by node:
+    // these are the nodes being re-rooted onto this record. That assertion is
+    // the whole premise of the migration -- the record is a pure function of
+    // the converged head, every node computes it independently, and
+    // `--expect-hash` is how a second node proves it computed the same one. If
+    // the operator migrates one node and not the rest, this certificate is
+    // wrong, which is why the witnesses are typed rather than inferred.
+    //
+    // Fewer witnesses than the floor is refused outright: that record could
+    // never be accepted by the cluster it describes.
+    accepted_heads_.clear();
+    const auto migrated_snapshot = decode_snapshot(record.payload);
+    MetadataAcceptance accepted;
+    accepted.generation = record.generation;
+    accepted.hash = record.hash;
+    accepted.required = migrated_snapshot.metadata_write_replicas_required;
+    accepted.replicas = witnesses;
+    std::sort(accepted.replicas.begin(), accepted.replicas.end());
+    accepted.replicas.erase(std::unique(accepted.replicas.begin(), accepted.replicas.end()),
+                            accepted.replicas.end());
+    if (std::any_of(accepted.replicas.begin(), accepted.replicas.end(),
+                    [](const NodeId& id) { return id == NodeId{}; })) {
+        Log::error("metadata migration refused: a witness is the empty node id");
+        return false;
+    }
+    if (accepted.replicas.size() < accepted.required) {
+        Log::error("metadata migration refused: " + std::to_string(accepted.replicas.size()) +
+                   " witnesses named against a write floor of " +
+                   std::to_string(accepted.required) +
+                   "; this record could never be accepted by the cluster it describes");
+        return false;
+    }
+    accepted_heads_.emplace(accepted.hash, accepted);
+    persist_heads_locked();
+
+    refresh_materialized_head_locked();
+    // Not recovery: the operator has re-rooted this node deliberately and the
+    // record is authoritative from here.
+    recovery_required_ = false;
+    pending_recovered_ = false;
+
+    std::string preserved;
+    for (const auto& path : quarantined) {
+        if (!preserved.empty())
+            preserved += ",";
+        preserved += path.string();
+    }
+    Log::warn("metadata namespace migrated to a new root generation=" +
+              std::to_string(record.generation) + " hash=" + to_string(record.hash) +
+              " state=" + checkpoint_p_.parent_path().string() + " preserved=" + preserved +
+              " reason=" + reason);
+    return true;
+}
+
 bool MetadataReplica::seed(const MetadataRecord& record) {
     if (!valid_metadata_record(record))
         return false;
