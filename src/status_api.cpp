@@ -1061,6 +1061,10 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     data_resource_diagnostics["device_worst_us"] = data_resource.device_worst_us;
     data_resource_diagnostics["device_slowdown_percent"] = data_resource.device_slowdown_percent;
     data_resource_diagnostics["device_pressure_onsets"] = data_resource.device_pressure_onsets;
+    // Onsets say the device went under; this says what that cost. Both are
+    // needed to answer "is this node being throttled or is it unwell", which
+    // is the question the status page could not answer on 2026-09-22.
+    data_resource_diagnostics["pressure_refusals"] = data_resource.pressure_refusals;
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
 
