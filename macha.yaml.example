@@ -543,6 +543,16 @@ torrent:
   max_active: 4
   max_download_rate: 0B  # 0 = unlimited
   max_upload_rate: 0B    # 0 = unlimited
+
+  # The rate a download is held to while the DATA device is defending its
+  # service time (see dht.io_pressure_target_ms). libtorrent writes straight to
+  # its save path and never enters the DATA arbiter, so bounding macha's own
+  # extent writes does nothing about a download saturating the same spindle --
+  # measured on 2026-09-22 at 17 MB/s onto a 9.1 TB disk at 90% utilisation,
+  # load 13 on four cores, with no import running.
+  #
+  # 0 never clamps.
+  pressure_download_rate: 2M
   dht: true
   pex: true
   lsd: true

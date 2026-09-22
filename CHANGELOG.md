@@ -1,5 +1,63 @@
 # Current release
 
+## 0.51.0 — A slow disk stops being invisible (development)
+
+**Nothing measured disk service time.** Every bound on DATA work was declared
+up front — bytes in flight, concurrent operations, a maintenance bandwidth
+fraction — and none was derived from the device. That is how one ordinary
+ingest took a node to 91% iowait with single 4 MiB extent writes at **17.7 s**
+and twelve aborted client requests, while every byte budget was satisfied. The
+bookkeeping was right and the disk was gone.
+
+**`DiskServiceMonitor`** records completion latency of DATA store operations as
+an EWMA with hysteresis, fed from `StoragePool`'s `put`, `put_deferred` and
+`get`. Two clock reads and a few relaxed atomics per operation, no locks and no
+timer thread. It sits on the pool rather than in `LocalStore` because the
+contended thing is the physical DATA backends: the control store is a different
+device and must not be gated by their pressure, which is exactly what the
+2026-09-20 measurements turned on — 3.3 ms on NVMe against 7.8 s on sdb1, same
+lane, same workers, same moment.
+
+**DATA admission consults it.** While a device is pressured, loader and
+speculative admission for it is held to `io_pressure_min_background` leases.
+**A viewer is never gated by pressure**: if the disk is slow, the person waiting
+on it gets all of it. Law 2 is kept — bounded, never stopped — so a loader that
+is itself the reason the disk is busy drains at a trickle instead of
+deadlocking on its own publication.
+
+**And a torrent download yields the spindle too.** This is the half that would
+have made the rest prove nothing: libtorrent writes straight to its save path
+and never enters `StoragePool` or the arbiter, so gating macha's own writes does
+nothing about a download saturating the same disk. Measured on gbni-1 on
+2026-09-22: **17 MB/s onto a 9.1 TB disk at 90% utilisation, load 13 on four
+cores, with no import running at all.** The session's download rate is now
+clamped to `torrent.pressure_download_rate` while the device is defending
+itself and restored when it recovers.
+
+Why the signal is indirect and why that is right: the monitor sees only
+operations that pass through the pool, so an external writer raises it once
+macha's own reads and writes start taking longer as a result. A disk nobody is
+reading can be as busy as it likes and starve nothing. Pressure is only
+meaningful when there is work to protect, and when there is, that work is
+itself the probe.
+
+**Visible, or it may as well not exist**: `device_pressured`,
+`device_service_us`, `device_worst_us` and `device_pressure_onsets` join the
+per-node data-resource block on `GET /api/v1/status`. The worst case is there
+because a healthy-looking mean hides the single 17-second write that breaks a
+viewer.
+
+New knobs, both with an off switch that restores the previous behaviour exactly:
+`dht.io_pressure_target_ms` (50), `dht.io_pressure_release_ms` (20),
+`dht.io_pressure_min_background` (1) and `torrent.pressure_download_rate` (2M).
+
+**Not yet validated against a real saturated device.** The plan's acceptance
+wants a DATA-backed route holding under 250 ms p99 through a real ingest, and
+the four previous reproduction attempts failed because the synthetic load was
+the wrong shape. A live torrent download is the right shape, and that test is
+next rather than claimed.
+
+
 ## 0.50.1 — What the cutover found in its first two minutes (development)
 
 **The live cluster was re-rooted onto the tree at 12:41Z on 2026-09-22**, all
