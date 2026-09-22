@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "io_pressure.hpp"
 #include "local_store.hpp"
 
 #include <atomic>
@@ -45,6 +46,7 @@ class StoragePool {
     };
 
   private:
+    DiskServiceMonitor service_monitor_{};
     struct CursorItem {
         std::shared_ptr<Backend> backend;
         std::shared_ptr<LocalStore> store;
@@ -95,6 +97,23 @@ class StoragePool {
 
     // Strict write. Provisional callers use put_deferred() so the durability
     // token cannot be discarded accidentally.
+    // What this pool's devices are actually doing. Fed by every put and get
+    // below, whatever class of work issued it, and consulted by DATA admission
+    // so that work nobody is waiting for yields a slow device to work somebody
+    // is. Lives here rather than in LocalStore because the contended thing is
+    // the pool's physical backends -- the control store is a different device
+    // and must not be gated by their pressure, which is exactly the
+    // distinction the 2026-09-20 measurements turned on.
+    DiskServiceMonitor& service_monitor() noexcept {
+        return service_monitor_;
+    }
+    const DiskServiceMonitor& service_monitor() const noexcept {
+        return service_monitor_;
+    }
+    void configure_service_monitor(DiskServiceMonitor::Thresholds thresholds) {
+        service_monitor_.configure(thresholds);
+    }
+
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<DurabilityToken> put_deferred(const ObjectId&, std::span<const uint8_t>);
     void durability_barrier(const DurabilityToken&,
