@@ -469,4 +469,47 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
     CHECK(read_namespace_tree(*merged_tree.namespace_root, store) == expected.snapshot.entries);
 }
 
+MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_only_if_it_agrees) {
+    // Three nodes stopped back to back do not land on the same generation:
+    // this cluster commits tens of times a minute from catalogue discovery
+    // alone, so the laggards' own computed records differ in `previous`, in
+    // `generation` and in whatever the last commit carried. What has to match
+    // is the namespace.
+    //
+    // So a node can adopt the record another node computed, but only after
+    // proving that its own namespace produces the root that record names.
+    MemoryNamespaceNodeStore leader_store, follower_store, diverged_store;
+
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    entries["/Films"] = make_directory(1);
+    entries["/Films/a.mkv"] = make_file(10, 3);
+
+    // The leader's head, and a follower a few catalogue commits behind: same
+    // namespace, different generation and catalogue root.
+    auto leader = populated_snapshot(entries);
+    leader.catalogue_root = fake_object(77);
+    auto follower = populated_snapshot(entries);
+    follower.catalogue_root = fake_object(78);
+
+    const auto leader_root = detach_namespace(leader, leader_store).namespace_root;
+    const auto follower_root = detach_namespace(follower, follower_store).namespace_root;
+    REQUIRE(leader_root.has_value());
+    REQUIRE(follower_root.has_value());
+
+    // The namespaces agree even though the records do not. That is the whole
+    // basis on which adoption is safe.
+    CHECK(*leader_root == *follower_root);
+
+    // A node whose namespace really has diverged computes a different root, so
+    // adoption must be refused there -- that node is missing a namespace
+    // commit, not merely a catalogue one.
+    auto diverged_entries = entries;
+    diverged_entries["/Films/b.mkv"] = make_file(11, 2);
+    auto diverged = populated_snapshot(diverged_entries);
+    const auto diverged_root = detach_namespace(diverged, diverged_store).namespace_root;
+    REQUIRE(diverged_root.has_value());
+    CHECK(*diverged_root != *leader_root);
+}
+
 } // namespace
