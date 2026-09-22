@@ -38,6 +38,7 @@
 
 #include <filesystem>
 #include <set>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -52,6 +53,8 @@ struct Options {
     std::filesystem::path objects;
     std::optional<Hash256> expect;
     std::vector<NodeId> witnesses;
+    std::filesystem::path export_record;
+    std::filesystem::path adopt_record;
     bool dry_run{false};
 };
 
@@ -65,6 +68,11 @@ struct Options {
               << "  --witness <node-id>  a node being re-rooted onto this record; repeat\n"
               << "                       once per node. Defaults to the nodes this one\n"
               << "                       has seen. At least as many as the write floor.\n"
+              << "  --export-record <p>  write the computed record to a file\n"
+              << "  --adopt <p>           install THAT record instead of this node's own,\n"
+              << "                       after proving this node's namespace produces the\n"
+              << "                       same tree root. For a node that stopped a few\n"
+              << "                       commits behind the one you migrated first.\n"
               << "  --dry-run            build and verify, install nothing\n\n"
               << "Stop every node and let them converge first. Run this on each\n"
               << "node; they all compute the same record independently.\n";
@@ -98,6 +106,14 @@ Options parse(int argc, char** argv) {
             if (++i >= argc)
                 usage("--expect-hash needs a hash");
             options.expect = parse_hash(argv[i]);
+        } else if (arg == "--export-record") {
+            if (++i >= argc)
+                usage("--export-record needs a path");
+            options.export_record = argv[i];
+        } else if (arg == "--adopt") {
+            if (++i >= argc)
+                usage("--adopt needs a path");
+            options.adopt_record = argv[i];
         } else if (arg == "--witness") {
             if (++i >= argc)
                 usage("--witness needs a node id");
@@ -225,13 +241,61 @@ int main(int argc, char** argv) {
                 to_string(*options.expect) +
                 "; the nodes had not converged, so migrating would split the cluster");
 
+        if (!options.export_record.empty()) {
+            const auto encoded = encode_metadata_record(record);
+            std::ofstream out(options.export_record, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(encoded.data()),
+                      static_cast<std::streamsize>(encoded.size()));
+            if (!out)
+                throw std::runtime_error("cannot write " + options.export_record.string());
+            std::cout << "exported record to " << options.export_record.string() << '\n';
+        }
+
+        // Adopting another node's record. This cluster commits constantly --
+        // catalogue discovery alone moves the head tens of times a minute --
+        // so three nodes stopped back to back do not land on the same
+        // generation, and their own computed records differ in `previous`, in
+        // `generation` and in whatever catalogue root the last commit carried.
+        //
+        // What must match is the namespace, and that is what is checked: this
+        // node builds its own tree from its own head and adopts the supplied
+        // record only if the root it computed is the root that record names. A
+        // node whose namespace really has diverged is refused, and the operator
+        // starts it alongside the leader to catch up rather than re-rooting it
+        // onto a namespace it does not have.
+        auto installing = record;
+        if (!options.adopt_record.empty()) {
+            std::ifstream in(options.adopt_record, std::ios::binary);
+            if (!in)
+                throw std::runtime_error("cannot read " + options.adopt_record.string());
+            const std::string raw{std::istreambuf_iterator<char>(in),
+                                  std::istreambuf_iterator<char>{}};
+            const Bytes encoded(raw.begin(), raw.end());
+            const auto adopted = decode_metadata_record(std::span<const uint8_t>(encoded));
+            if (!valid_metadata_record(adopted))
+                throw std::runtime_error("the record to adopt does not verify");
+            const auto adopted_snapshot = decode_snapshot(adopted.payload);
+            if (!adopted_snapshot.namespace_root)
+                throw std::runtime_error("the record to adopt is not tree-backed");
+            if (*adopted_snapshot.namespace_root != migration.root)
+                throw std::runtime_error(
+                    "this node's namespace produces root " + to_string(migration.root) +
+                    " but the record to adopt names " + to_string(*adopted_snapshot.namespace_root) +
+                    "; this node's namespace differs, so start it alongside the migrated node, let "
+                    "it catch up, stop it and try again");
+            installing = adopted;
+            std::cout << "adopting record generation=" << installing.generation
+                      << " hash=" << to_string(installing.hash)
+                      << " -- same namespace root, computed independently here\n";
+        }
+
         if (options.dry_run) {
             std::cout << "dry run: nothing installed. The tree nodes were written and are "
                          "harmless -- they are content-addressed objects nothing points at.\n";
             return 0;
         }
 
-        if (!replica.install_migrated_head(record, witnesses,
+        if (!replica.install_migrated_head(installing, witnesses,
                                            "namespace migrated to SM14 by "
                                            "macha-namespace-migrate"))
             throw std::runtime_error("the replica refused the migrated head");
