@@ -499,7 +499,7 @@ each node's listing at start — is the right shape and covers force-stop, crash
 OOM and background reaping; reinstall, cleared storage and non-our clients are
 what the node's timers are for.
 
-## P2 — A restart leaks every live session's temp directory, forever (found 2026-09-21)
+## P2 — An unclean exit leaks staging files, forever (found 2026-09-21, second instance 2026-09-22)
 
 **Measured across the cluster immediately after the 0.48.1 restarts**, which
 cleared every in-memory session and left their directories behind:
@@ -521,8 +521,48 @@ unbounded, it survives every upgrade, and it is invisible.
 - [ ] **Clear `streaming.temp_path` on startup.** Nothing in memory can own a
   directory there at that moment, by construction, so anything present is
   stale. That is the whole fix.
-- [ ] Consider whether the same reasoning applies anywhere else state is keyed
-  by a session id that does not survive the process.
+
+### The same leak, in the write path (measured 2026-09-22)
+
+The second checkbox above asked whether this reasoning applies anywhere else.
+It does, and the instance is much larger:
+
+| node | `state/tmp` `write.*` | files | oldest | largest |
+|---|---|---|---|---|
+| gbni-1 | **26 GB** | 23 | 2026-09-07 | **13 GB**, and an 8 GB |
+| es-1 | 72 KB | 2 | 2026-09-08 | 36 KB |
+| fi-1 | none | 0 | — | — |
+
+`WriteHandle` stages a write in `state_path/tmp/write.<node-id>.XXXXXX`, from
+`begin_sparse_overlay` (`src/filesystem.cpp:645-656`) or `materialize_step`
+(`:690-698`). `WriteHandle::cleanup` (`:1449-1458`) removes it, and the
+destructor calls `cleanup` (`:364-374`). So an orderly close always removes
+the file, and **an unclean exit never does**: the path lives only in the
+handle, which lives only in memory. Nothing sweeps `state/tmp` at startup.
+
+**This is not a GC problem.** These are not objects: reachability GC,
+retention claims and `garbage_grace_ms` never look at them, and no amount of
+convergence will ever reclaim one. It is the playback leak with a different
+owner -- keyed by an open write handle rather than by a session id.
+
+**Why gbni-1 has all of it, since the obvious guess is wrong.** It is not the
+smallest disk: gbni-1's root is 938G with 55G used (7%), the same size as
+es-1's. It is the node that exits uncleanly most, and it has two independent
+reasons to -- recurring power failures with no remote power control
+([[project-gbni1-undervolt]]), and **3 GB of RAM against es-1's 7 and fi-1's
+15**, which makes it the one an OOM kill lands on. The file sizes say what was
+in flight: 13 GB and 8 GB staging files are large-media ingest, killed
+mid-write. fi-1 has none because it owns no extents and materialises no
+writes.
+
+- [ ] **Sweep `state_path/tmp` for `write.*` at startup**, before any
+  WriteHandle can exist, by the same argument as the playback fix: nothing in
+  memory can own one at that moment. **Do not clear `state/tmp` wholesale** --
+  `tmp/ingest` and `tmp/playback` live under it and ingest staging is meant to
+  be resumable across a restart. Match `write.<node-id>.*` only.
+- [ ] While there, decide whether 26 GB of orphans should have been visible to
+  anything. Nothing reports it: it is not an object, so no store accounting
+  sees it, and `df` on a 938G disk at 7% never raised a voice.
 
 ## P1 — The block cache works, and still cannot be observed (opened 2026-09-21, falsified and downgraded the same day)
 
