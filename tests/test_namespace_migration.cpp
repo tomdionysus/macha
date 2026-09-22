@@ -61,6 +61,54 @@ void make_solo(Config& config) {
     config.min_write_replicas = 1;
 }
 
+// A snapshot with the policy fields a real one carries, so encode/merge paths
+// behave as they do in production.
+MetadataSnapshot populated_snapshot(std::map<std::string, FsEntry> entries) {
+    MetadataSnapshot snapshot;
+    snapshot.entries = std::move(entries);
+    snapshot.data_replication = 2;
+    snapshot.extent_size = 4 * 1024 * 1024;
+    snapshot.metadata_write_replicas_required = 2;
+    snapshot.retention_baseline_complete = true;
+    return snapshot;
+}
+
+FsEntry make_directory(uint64_t seed) {
+    FsEntry entry;
+    entry.type = EntryType::directory;
+    entry.mode = 0755;
+    entry.ctime_ns = static_cast<int64_t>(seed);
+    entry.mtime_ns = static_cast<int64_t>(seed);
+    return entry;
+}
+
+ObjectId fake_object(uint64_t seed) {
+    ObjectId id{};
+    for (size_t i = 0; i < id.bytes.size(); ++i) {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        id.bytes[i] = static_cast<uint8_t>(seed >> 33);
+    }
+    return id;
+}
+
+FsEntry make_file(uint64_t seed, size_t extents) {
+    FsEntry entry;
+    entry.type = EntryType::file;
+    entry.mode = 0644;
+    entry.size = static_cast<uint64_t>(extents) * 4 * 1024 * 1024;
+    entry.ctime_ns = static_cast<int64_t>(seed) * 1000;
+    entry.mtime_ns = static_cast<int64_t>(seed) * 2000;
+    entry.version = 1;
+    for (size_t i = 0; i < extents; ++i) {
+        ExtentRef extent;
+        extent.offset = static_cast<uint64_t>(i) * 4 * 1024 * 1024;
+        extent.length = 4 * 1024 * 1024;
+        extent.id = fake_object(seed * 1000 + i);
+        entry.extents.push_back(extent);
+    }
+    return entry;
+}
+
 std::vector<uint8_t> pattern(size_t bytes, uint8_t seed) {
     std::vector<uint8_t> out(bytes);
     for (size_t i = 0; i < bytes; ++i)
@@ -359,6 +407,66 @@ MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_delet
             CHECK(preserved.contains(name));
     CHECK(std::filesystem::exists(state / "checkpoint.meta"));
     CHECK(std::filesystem::exists(state / "heads.meta"));
+}
+
+MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keeps_the_namespace) {
+    // The failure this test exists for: the three-way merge is path-wise over
+    // three entry maps, and a tree-backed snapshot has an empty one. Merging
+    // two empty maps succeeds, reports no conflicts, and produces an empty
+    // namespace -- a reconciliation that deletes the library and looks like
+    // agreement. This cluster reconciles routinely, so that would have been
+    // found in production within a day.
+    //
+    // What the manager does instead is tested here without a cluster:
+    // materialise both branches, merge them as before, and re-root the result.
+    MemoryNamespaceNodeStore store;
+
+    std::map<std::string, FsEntry> base_entries;
+    base_entries["/"] = make_directory(0);
+    base_entries["/Films"] = make_directory(1);
+    base_entries["/Films/shared.mkv"] = make_file(10, 3);
+    auto base = populated_snapshot(base_entries);
+
+    // Two branches: each adds a file the other has not seen.
+    auto left = base;
+    left.entries["/Films/left.mkv"] = make_file(20, 4);
+    auto right = base;
+    right.entries["/Films/right.mkv"] = make_file(30, 5);
+
+    Hash256 left_head{}, right_head{};
+    left_head.bytes[0] = 1;
+    right_head.bytes[0] = 2;
+
+    const auto expected = merge_metadata_snapshots(base, left, right, left_head, right_head);
+    CHECK(expected.snapshot.entries.size() == 5);
+    CHECK(expected.conflicts_created == 0);
+
+    // Now the same three branches as trees. A merge over them directly is
+    // refused rather than quietly producing nothing.
+    const auto base_tree = detach_namespace(base, store);
+    const auto left_tree = detach_namespace(left, store);
+    const auto right_tree = detach_namespace(right, store);
+    bool refused = false;
+    try {
+        (void)merge_metadata_snapshots(base_tree, left_tree, right_tree, left_head, right_head);
+    } catch (const std::logic_error&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    // Materialised, merged, re-rooted: the same namespace, and a root
+    // identical to building the merged namespace from scratch.
+    auto merged = merge_metadata_snapshots(attach_namespace(base_tree, store),
+                                           attach_namespace(left_tree, store),
+                                           attach_namespace(right_tree, store), left_head,
+                                           right_head);
+    CHECK(merged.snapshot.entries == expected.snapshot.entries);
+    const auto merged_tree = detach_namespace(merged.snapshot, store);
+    REQUIRE(merged_tree.namespace_root.has_value());
+
+    MemoryNamespaceNodeStore fresh;
+    CHECK(*merged_tree.namespace_root == build_namespace_tree(expected.snapshot.entries, fresh));
+    CHECK(read_namespace_tree(*merged_tree.namespace_root, store) == expected.snapshot.entries);
 }
 
 } // namespace
