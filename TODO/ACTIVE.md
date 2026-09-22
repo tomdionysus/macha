@@ -9,8 +9,8 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.** Read, in order:
 
-**What is being built right now is the namespace Merkle work, Stage B**
-(operator, 2026-09-21 evening). The playback-session programme that occupied
+**What is being built right now is the namespace Merkle work; Stage B is
+complete and Stage C is next** (operator, 2026-09-21 evening). The playback-session programme that occupied
 most of 2026-09-21 is **shipped and deployed** — 0.48.0 moved the routes,
 0.48.1 fixed what testing it found, and 0.48.2 added what a node could not
 previously say about itself. All three nodes run 0.48.2.
@@ -27,9 +27,17 @@ SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
 for it died the same way. **A client's account of itself is evidence about the
 client, not a fact.**
 
-0. **The namespace Merkle work**, the P-1 below, Stage B. The substrate is
-   built, measured against the live head, and owes only the SM14 record shape
-   and `decode_snapshot` dispatch. See
+0. **The namespace Merkle work**, the P-1 below. **Stage B is done**
+   (2026-09-21): the substrate is built, measured against the live head, and
+   the SM14 record shape now exists -- `namespace_root` on the snapshot,
+   `encode_snapshot_v14`, `decode_snapshot` dispatch, and
+   `detach_namespace`/`attach_namespace` to move between the two forms. On the
+   test fixture the record goes from 434,731 bytes to 590, and stays at 590
+   for a library twenty times larger. **Nothing authors one yet**: the commit
+   path, journal and delta encoders are untouched, so this ships as dead code
+   and a peer that does not know the magic refuses it. **Stage C is next** --
+   `mutate_impl` mutating the tree and carrying its change set into the commit
+   rather than rediscovering it. See
    [the plan](2026-09-17-namespace-merkle-root-plan.md), which now carries the
    arithmetic for whether it is worth doing at all: **56 ms of CPU per
    namespace write today, ~3.1 s at the 100 TB target.** Not urgent today,

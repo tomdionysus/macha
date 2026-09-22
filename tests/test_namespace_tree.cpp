@@ -362,4 +362,237 @@ MACHA_TEST("namespace_tree", test_a_stat_only_lookup_fetches_no_extent_nodes) {
     CHECK(store.reads() <= shape.depth);
 }
 
+// A snapshot with every field SM14 has to carry populated, so a round trip
+// proves the format preserves the record and not merely the namespace. The
+// entries are the caller's; everything else here is cluster state that must
+// survive the re-rooting untouched.
+MetadataSnapshot populated_snapshot(std::map<std::string, FsEntry> entries) {
+    MetadataSnapshot snapshot;
+    snapshot.entries = std::move(entries);
+    snapshot.data_replication = 3;
+    snapshot.extent_size = 4 * 1024 * 1024;
+    snapshot.metadata_write_replicas_required = 2;
+    snapshot.retention_baseline_complete = true;
+    snapshot.catalogue_root = fake_object(7);
+    snapshot.metadata_branch_floor.bytes = fake_object(8).bytes;
+
+    NodeId first{}, second{};
+    first.bytes[0] = 1;
+    second.bytes[0] = 2;
+    snapshot.metadata_voters.push_back(first);
+    snapshot.mutation_sequences[first] = 4242;
+    snapshot.mutation_sequences[second] = 11;
+    snapshot.metadata_participants.insert(first);
+    snapshot.metadata_participants.insert(second);
+
+    GarbageRef garbage;
+    garbage.id = fake_object(9);
+    garbage.retired_at_ns = 1758400000000000000;
+    garbage.retirement_id = second;
+    snapshot.garbage.push_back(garbage);
+
+    PersistedNodeStatus status;
+    status.observed_unix_ms = 1758400000000;
+    status.version = "0.48.2";
+    status.host = "es-1.macha.network";
+    status.failure_domain = "es";
+    status.port = 9443;
+    status.storage_capacity = 8ULL * 1024 * 1024 * 1024 * 1024;
+    status.storage_used = 1618ULL * 1024 * 1024 * 1024;
+    status.metadata_generation = 31663;
+    status.storage_backends_online = 2;
+    snapshot.node_status[first] = status;
+
+    IdentityAssociationReset reset;
+    reset.host = "gbni-2.macha.network";
+    reset.port = 9443;
+    reset.stale_node_id = second;
+    reset.epoch = 5;
+    reset.reset_unix_ms = 1758300000000;
+    reset.reset_by = first;
+    reset.reason = "endpoint reassigned";
+    snapshot.identity_resets[identity_reset_key(reset.host, reset.port)] = reset;
+
+    Hash256 parent{};
+    parent.bytes = fake_object(10).bytes;
+    snapshot.merge_parents.push_back(parent);
+    return snapshot;
+}
+
+MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead_of_carrying_it) {
+    // The Stage B deliverable: the record shape. Everything before this built
+    // a tree nothing could reach; this is the encoding that reaches it.
+    const auto entries = library(20, 10);
+    const auto snapshot = populated_snapshot(entries);
+    const auto sm13 = encode_snapshot(snapshot);
+
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(snapshot, store);
+    REQUIRE(detached.namespace_root.has_value());
+    CHECK(detached.entries.empty());
+    const auto sm14 = encode_snapshot_v14(detached);
+
+    // The number this stage exists for. The SM13 payload is the library; the
+    // SM14 payload is the cluster's own state plus a 32-byte pointer at it.
+    // Measured on this fixture: 434,731 bytes against 590, for 302 entries.
+    // The ratio is asserted rather than either size, because the ratio is the
+    // claim and it has no ceiling -- es-1's real head is 22,525,100 SM13 bytes
+    // against the same ~590.
+    CHECK(sm14.size() < 1024);
+    CHECK(sm13.size() > 100 * sm14.size());
+
+    // Read it back with no store in sight -- which is the point: decoding a
+    // record no longer materialises a namespace.
+    const auto decoded = decode_snapshot(sm14);
+    REQUIRE(decoded.namespace_root.has_value());
+    CHECK(*decoded.namespace_root == *detached.namespace_root);
+    CHECK(decoded.entries.empty());
+
+    // Nothing else moved. Re-encoding the reattached snapshot as SM13 has to
+    // reproduce the original payload byte for byte, which covers every field
+    // individually without listing them: garbage, node status, identity
+    // resets, merge parents, the write floor, the participant roster, the
+    // branch floor and the retention baseline.
+    const auto reattached = attach_namespace(decoded, store);
+    CHECK(reattached.entries == entries);
+    CHECK(!reattached.namespace_root.has_value());
+    CHECK(encode_snapshot(reattached) == sm13);
+}
+
+MACHA_TEST("namespace_tree", test_the_record_stops_growing_with_the_library) {
+    // Stated as a property rather than a measurement, because it is the whole
+    // claim: a commit's cost has to stop being a function of how much media
+    // the cluster holds. Two libraries an order of magnitude apart, one
+    // payload size.
+    MemoryNamespaceNodeStore small_store, large_store;
+    const auto small = encode_snapshot_v14(
+        detach_namespace(populated_snapshot(library(2, 4)), small_store));
+    const auto large = encode_snapshot_v14(
+        detach_namespace(populated_snapshot(library(40, 20)), large_store));
+
+    CHECK(small.size() == large.size());
+    // And the two are the same record apart from where they point, so the
+    // difference between them is exactly one content address.
+    size_t differing = 0;
+    for (size_t i = 0; i < small.size(); ++i)
+        if (small[i] != large[i])
+            ++differing;
+    CHECK(differing <= 32);
+}
+
+MACHA_TEST("namespace_tree", test_a_snapshot_never_carries_its_namespace_in_two_places) {
+    // A record with both forms populated would let them disagree, and no
+    // reader would have a rule for which one is the namespace. Every path into
+    // that state is closed, and the closure is what stops a half-migrated
+    // snapshot publishing an empty library under a valid-looking hash.
+    MemoryNamespaceNodeStore store;
+    const auto snapshot = populated_snapshot(library(2, 2));
+    const auto detached = detach_namespace(snapshot, store);
+
+    // SM13 has nowhere to put a root, so it refuses rather than dropping it.
+    bool refused = false;
+    try {
+        (void)encode_snapshot(detached);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    // SM14 has nowhere to put entries, and refuses for the same reason.
+    refused = false;
+    try {
+        (void)encode_snapshot_v14(snapshot);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    // Neither direction can be run twice.
+    refused = false;
+    try {
+        (void)detach_namespace(detached, store);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    refused = false;
+    try {
+        (void)attach_namespace(snapshot, store);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+
+    // A namespace with no root directory is not a filesystem. SM13's decoder
+    // checks that on every read; SM14's cannot, because it has no store, so
+    // the check moved to the reader that does.
+    std::map<std::string, FsEntry> rootless;
+    rootless["/a.mkv"] = make_file(1, 2);
+    MemoryNamespaceNodeStore rootless_store;
+    const auto bad = detach_namespace(populated_snapshot(rootless), rootless_store);
+    refused = false;
+    try {
+        (void)attach_namespace(decode_snapshot(encode_snapshot_v14(bad)), rootless_store);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
+MACHA_TEST("namespace_tree", test_a_stat_against_a_decoded_record_never_materialises_the_namespace) {
+    // The two halves joined: a record off the wire, and a getattr answered
+    // from it without the library ever existing as a map. This is what Stage C
+    // converts the FUSE path to, and it is already true here.
+    std::map<std::string, FsEntry> entries;
+    entries["/"] = make_directory(0);
+    for (int i = 0; i < 200; ++i)
+        entries["/film" + std::to_string(i) + ".mkv"] = make_file(100 + i, 400);
+
+    MemoryNamespaceNodeStore store;
+    const auto payload = encode_snapshot_v14(detach_namespace(populated_snapshot(entries), store));
+    const auto decoded = decode_snapshot(payload);
+    REQUIRE(decoded.namespace_root.has_value());
+    const auto shape = namespace_tree_stats(*decoded.namespace_root, store);
+
+    store.forget_reads();
+    const auto stat = namespace_tree_lookup(*decoded.namespace_root, "/film137.mkv", store, false);
+    REQUIRE(stat);
+    CHECK(stat->size == entries.at("/film137.mkv").size);
+    CHECK(store.reads() <= shape.depth);
+    CHECK(decoded.entries.empty());
+}
+
+MACHA_TEST("namespace_tree", test_a_damaged_record_is_refused_rather_than_trusted) {
+    // The record is the one part of this that arrives from the network, so its
+    // decoder gets the same treatment the node decoder got: flip a bit at
+    // every position and require refusal or coping, never a crash, a hang or
+    // an allocation sized from the damaged bytes.
+    MemoryNamespaceNodeStore store;
+    const auto payload = encode_snapshot_v14(detach_namespace(populated_snapshot(library(2, 2)), store));
+
+    size_t refused = 0, accepted = 0;
+    for (size_t at = 0; at < payload.size(); ++at) {
+        auto damaged = payload;
+        damaged[at] ^= 0x40;
+        try {
+            const auto decoded = decode_snapshot(damaged);
+            ++accepted;
+            // Anything that decodes is still a record that points somewhere
+            // rather than one that carries a namespace; a flipped byte must
+            // never produce entries out of nothing.
+            CHECK(decoded.entries.empty());
+            CHECK(decoded.namespace_root.has_value());
+        } catch (const std::exception&) {
+            ++refused;
+        }
+    }
+    // A flip in the root address or a node id decodes cleanly and addresses
+    // something that is not there -- that is the content-addressing doing its
+    // job one layer down, not a decoder failure. What matters is that the
+    // structural fields are checked, and they are.
+    CHECK(refused > 0);
+    CHECK(refused + accepted == payload.size());
+}
+
 } // namespace

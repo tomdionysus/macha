@@ -107,6 +107,14 @@ struct MetadataSnapshot {
     // or branch reconciliation.
     std::map<NodeId, uint64_t> mutation_sequences;
     std::optional<ObjectId> catalogue_root;
+    // SM14 only: the root of the content-addressed namespace tree, carried
+    // *instead of* `entries` rather than alongside them. A snapshot holds one
+    // or the other and never both -- `encode_snapshot` refuses a root it has
+    // no field for and `encode_snapshot_v14` refuses entries it would silently
+    // drop -- so there is no encoding in which the two can disagree about what
+    // the namespace is. See namespace_tree.hpp and
+    // TODO/2026-09-17-namespace-merkle-root-plan.md.
+    std::optional<ObjectId> namespace_root;
     std::map<std::string, FsEntry> entries;
     std::vector<GarbageRef> garbage;
     // Low-frequency, cluster-persisted last-known node observations. This is
@@ -373,6 +381,18 @@ bool same_content(const FsEntry&, const FsEntry&);
 size_t prune_superseded_conflicts(MetadataSnapshot&);
 Bytes encode_snapshot(const MetadataSnapshot&);
 MetadataSnapshot decode_snapshot(std::span<const uint8_t>);
+// SM14: the record as a pointer to the namespace rather than the namespace.
+// The payload is the non-entry fields plus `namespace_root`, so its size is a
+// property of the cluster rather than of the library -- a few hundred bytes
+// where SM13 is the whole serialised namespace, which on es-1 today is
+// 22,525,100 of them.
+//
+// Not authoritative. `encode_snapshot` never emits SM14, nothing in the commit
+// path constructs one, and a peer that does not know the magic refuses it as
+// `bad snapshot` -- so this deploys as dead code and becomes reachable in
+// Stage C. Requires `namespace_root` set and `entries` empty; `detach_namespace`
+// (namespace_tree.hpp) is how an ordinary snapshot gets there.
+Bytes encode_snapshot_v14(const MetadataSnapshot&);
 Bytes encode_metadata_record(const MetadataRecord&);
 Bytes encode_metadata_acceptance(const MetadataAcceptance&);
 MetadataAcceptance decode_metadata_acceptance(std::span<const uint8_t>);

@@ -2,12 +2,13 @@
 
 Date: 2026-09-17
 
-Status: **Stage A complete (2026-09-17). Stage B substrate complete and now
-measured against the live es-1 namespace (2026-09-21): one ordinary write costs
-10,745 bytes against 22,525,100 today, a 2,096x reduction. Stage B
-started the same day -- the tree substrate is written and tested, and is not
-yet SM14 or reachable from a record; see "Stage B progress" below.** Stages
-C-F not started. The finding below is verified against current `develop` (0.43.0);
+Status: **Stage A complete (2026-09-17). Stage B complete (2026-09-21): the
+tree substrate is written, tested and measured against the live es-1 namespace
+-- one ordinary write costs 10,745 bytes against 22,525,100 today, a 2,096x
+reduction -- and the SM14 record shape now exists to point at it. Nothing
+authors an SM14 record yet; `encode_snapshot` never emits one and no commit
+path reads one, so it ships as dead code and becomes reachable in Stage C. See
+"Stage B: the SM14 record shape" below.** Stages C-F not started. The finding below is verified against current `develop` (0.43.0);
 the design is proposed and the migration is not yet designed in enough detail to
 execute. The estimates in "The arithmetic" have been replaced by measurements --
 see "Stage A results" below, which supersedes them. Every line reference here was
@@ -611,9 +612,9 @@ figures came off a real 1.618 TiB namespace rather than a generated one; what
 it actually bought was a latent abort on a 1-in-65,536 condition that would
 have reached SM14 otherwise.
 
-What Stage B still owes before it can be called done: **the SM14 record shape
-and `decode_snapshot` dispatch alongside SM13.** That is the whole of the
-remainder. The other three are done:
+What Stage B still owed at that point -- **the SM14 record shape and
+`decode_snapshot` dispatch alongside SM13** -- is done, and has its own section
+below. The other three were already done:
 
 - ~~a fuzz case~~ — `test_a_corrupt_node_is_refused_rather_than_trusted`, which
   flips a bit at every seventh byte of every node and requires the reader to
@@ -634,6 +635,77 @@ remainder. The other three are done:
   nothing for the entries it discards.
 - ~~the `macha-metadata-dump` mode~~ — `--tree`, and the figures above are off
   the live head.
+
+## Stage B: the SM14 record shape (2026-09-21)
+
+**The record can now be a pointer to the namespace rather than the namespace.**
+`MetadataSnapshot` gains `namespace_root`; `encode_snapshot_v14` writes SM14
+(`DHTMETB4`); `decode_snapshot` dispatches on the magic and returns a snapshot
+with the root set and `entries` empty; `detach_namespace`/`attach_namespace`
+(`src/namespace_tree.hpp`) move a snapshot between the two forms.
+
+**Measured on the test fixture -- 302 entries, 20 shows of 10 episodes with
+every sixteenth a 600-extent feature:**
+
+| | |
+|---|---|
+| SM13 payload | 434,731 bytes |
+| SM14 payload | **590 bytes** |
+| the same record over a library 20x larger | **590 bytes, differing in 32 of them** |
+
+The second row is the one that matters and it is asserted as a property rather
+than a measurement: two libraries an order of magnitude apart encode to the
+same number of bytes, differing only in the content address they point at. The
+record has stopped being a function of how much media the cluster holds.
+
+Four decisions were settled in building it:
+
+- **A snapshot carries entries or a root, never both.** `encode_snapshot`
+  refuses a snapshot with a root rather than dropping it, and
+  `encode_snapshot_v14` refuses one that still inlines its entries. The failure
+  being designed out is the worst one available: publishing an empty namespace
+  under a valid-looking hash, which is durable, silent, and indistinguishable
+  from a library that was deleted.
+- **Every section SM14 writes is unconditional.** SM8-SM13 write theirs behind
+  `policy_state`/`branch_state`/`governance_state` conditions, which exist to
+  reproduce an older encoder's exact bytes for journal replay. SM14 has no
+  older self to be byte-compatible with, and a layout that depends on which
+  fields happen to be populated is what makes `encode_snapshot` hard to read.
+- **The "missing root" check moved to the reader that holds a store.** SM13's
+  decoder proves the namespace is a filesystem by finding `/` in the map. SM14
+  has no map and `decode_snapshot` has no node store -- acquiring one to run a
+  sanity check is the cost this plan removes -- so `attach_namespace` makes the
+  check instead.
+- **The legacy `metadata_voters` list survives the re-rooting.** Retiring a
+  dead field and moving the namespace out of the record are two decisions, and
+  only one of them is this plan's. SM14 is SM13 minus the entry block plus a
+  32-byte root, and nothing else, which is what makes the round trip
+  byte-exact in both directions.
+
+**The round trip is the acceptance.** A populated snapshot -- garbage,
+node status, identity resets, merge parents, write floor, participant roster,
+branch floor, retention baseline -- detached, encoded as SM14, decoded, and
+reattached, re-encodes to the original SM13 payload byte for byte. That covers
+every field without enumerating them, and it fails if the re-rooting loses one.
+
+Also proved by counting rather than asserted: a `getattr` answered from a
+decoded SM14 record reads at most `depth` nodes, fetches no extent node, and
+never materialises the namespace. That is what Stage C converts the FUSE path
+to, and it already holds.
+
+The record decoder gets the same bit-flip treatment the node decoder got, since
+it is the half that arrives from the network. A flip in a content address
+decodes cleanly and addresses something that is not there -- content-addressing
+doing its job one layer down, not a decoder failure -- and the structural
+fields are checked. The SM14 garbage reserve is bounded by
+`Reader::remaining()` rather than by the count in the payload, which is the
+defect the node decoder had.
+
+**What this does not do.** Nothing constructs an SM14 record: `mutate_impl`,
+the journal, the checkpoint and the delta encoders are untouched, and a peer
+that does not know the magic refuses the payload as `bad snapshot`. The cluster
+can run this build and never produce one. Making it authoritative is Stage C,
+and the migration that cuts over is Stage E.
 
 **Stage B — the Merkle namespace, behind a new snapshot version.** Define the
 tree, node encoding and root. `decode_snapshot` already carries SM5 through SM13
