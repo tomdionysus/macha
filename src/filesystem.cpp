@@ -250,6 +250,8 @@ size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point 
             s_.foreground_activity(done);
         else if (frame_type == FrameType::read_ahead)
             s_.interactive_activity(done);
+        else if (frame_type == FrameType::loader)
+            s_.loader_activity(done);
     }
     if (seq && done && playback_ && playback_session_ && last_extent != static_cast<size_t>(-1))
         playback_->progress(playback_session_, last_extent);
@@ -996,6 +998,12 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         fs_.store().foreground_activity(d.size());
     else if (work_context_.frame_type() == FrameType::read_ahead)
         fs_.store().interactive_activity(d.size());
+    else if (work_context_.frame_type() == FrameType::loader)
+        // The clock maintenance was missing. An ingest writes here, through a
+        // default DataWorkContext, which is loader-class; until 0.53.0 nothing
+        // recorded that and a node in the middle of a 36 GB import reported
+        // itself idle to its own maintenance scheduler.
+        fs_.store().loader_activity(d.size());
     const auto total =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {

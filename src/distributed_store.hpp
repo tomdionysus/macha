@@ -234,6 +234,7 @@ class DistributedStore {
     void erase_all(const ObjectId&);
     void foreground_activity(uint64_t bytes) { note_foreground(bytes); }
     void interactive_activity(uint64_t bytes) { n_.note_activity(FrameType::read_ahead, bytes); }
+    void loader_activity(uint64_t bytes) { n_.note_activity(FrameType::loader, bytes); }
 
     // Converges remote placement and proactively pulls live objects for which
     // this node has become an owner. Bounded repair_step() calls retain push/pull
@@ -251,9 +252,16 @@ class DistributedStore {
 
     uint64_t take_foreground_bytes() { return n_.take_activity_bytes(FrameType::foreground); }
     uint64_t take_interactive_bytes() { return n_.take_activity_bytes(FrameType::read_ahead); }
+    uint64_t take_loader_bytes() { return n_.take_activity_bytes(FrameType::loader); }
     std::chrono::milliseconds foreground_idle_for() const;
     std::chrono::milliseconds interactive_idle_for() const {
         return n_.activity_idle_for(FrameType::read_ahead);
+    }
+    // Durable work the user asked for -- FUSE publication, ingest, acquisition
+    // -- which must finish but need not finish first. Law 2 puts it above
+    // background maintenance, so maintenance has to be able to see it.
+    std::chrono::milliseconds loader_idle_for() const {
+        return n_.activity_idle_for(FrameType::loader);
     }
     double estimated_network_bps() const {
         return network_bps_.load();

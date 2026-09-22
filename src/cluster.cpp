@@ -473,15 +473,26 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
                 std::chrono::milliseconds(cfg_.io_pressure_overhead_ms),
                 std::chrono::milliseconds(cfg_.io_pressure_per_mib_ms),
                 cfg_.io_pressure_slowdown_percent, cfg_.io_pressure_release_percent,
-                std::chrono::milliseconds(cfg_.io_pressure_outlier_ms)});
+                cfg_.io_pressure_outlier_percent});
             data_resources_.observe_device(&local_->service_monitor(),
                                           cfg_.io_pressure_min_background);
+            // Law 2's second clause, read the way the rest of the system reads
+            // it. "A viewer is present" was byte credit held at this instant,
+            // which playback does not hold between extents, so every gap in a
+            // stream readmitted the loader at full concurrency onto a disk the
+            // next viewer read was about to want. maintenance.foreground_quiet
+            // is the window everything else already uses for this question.
+            // Set only alongside the monitor, so a disabled gate leaves
+            // admission byte-for-byte what it was.
+            const auto viewer_window = cfg_.maintenance.foreground_quiet;
+            data_resources_.observe_viewers(
+                [this, viewer_window] { return viewer_recently_active(viewer_window); });
             Log::info("data io pressure gate enabled expected_ms=" +
                       std::to_string(cfg_.io_pressure_overhead_ms) + "+" +
                       std::to_string(cfg_.io_pressure_per_mib_ms) + "/MiB slowdown_percent=" +
                       std::to_string(cfg_.io_pressure_slowdown_percent) + " release_percent=" +
-                      std::to_string(cfg_.io_pressure_release_percent) + " outlier_ms=" +
-                      std::to_string(cfg_.io_pressure_outlier_ms) + " min_background=" +
+                      std::to_string(cfg_.io_pressure_release_percent) + " outlier_percent=" +
+                      std::to_string(cfg_.io_pressure_outlier_percent) + " min_background=" +
                       std::to_string(cfg_.io_pressure_min_background));
         }
         members_.storage(used, capacity);
@@ -830,6 +841,12 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
 
 void NodeRuntime::request_stop() {
     data_resources_.stop();
+    // The viewer-presence callback reads this node's activity clocks, which
+    // are declared after the arbiter and so are destroyed before it. Drop it
+    // on the way down rather than leaving a window in which a late admission
+    // attempt could read them. Law 4 is about what a node can be left holding,
+    // and a dangling read during shutdown is exactly that shape.
+    data_resources_.observe_viewers({});
     retained_memory_.stop();
     if (storage_recovery_.joinable())
         storage_recovery_.request_stop();
@@ -969,7 +986,15 @@ void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
     } else if (type == FrameType::read_ahead) {
         interactive_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         last_interactive_activity_ms_.store(now, std::memory_order_relaxed);
+    } else if (type == FrameType::loader) {
+        loader_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        last_loader_activity_ms_.store(now, std::memory_order_relaxed);
     }
+}
+
+bool NodeRuntime::viewer_recently_active(std::chrono::milliseconds window) const {
+    return activity_idle_for(FrameType::foreground) < window ||
+           activity_idle_for(FrameType::read_ahead) < window;
 }
 
 void NodeRuntime::set_service_event_callback(std::function<void(ServiceEvent)> callback) {
@@ -1008,6 +1033,8 @@ uint64_t NodeRuntime::take_activity_bytes(FrameType type) {
         return playback_activity_bytes_.exchange(0, std::memory_order_relaxed);
     if (type == FrameType::read_ahead)
         return interactive_activity_bytes_.exchange(0, std::memory_order_relaxed);
+    if (type == FrameType::loader)
+        return loader_activity_bytes_.exchange(0, std::memory_order_relaxed);
     return 0;
 }
 
@@ -1017,6 +1044,8 @@ std::chrono::milliseconds NodeRuntime::activity_idle_for(FrameType type) const {
         last = last_playback_activity_ms_.load(std::memory_order_relaxed);
     else if (type == FrameType::read_ahead)
         last = last_interactive_activity_ms_.load(std::memory_order_relaxed);
+    else if (type == FrameType::loader)
+        last = last_loader_activity_ms_.load(std::memory_order_relaxed);
     if (!last)
         return std::chrono::hours(24);
     return std::chrono::milliseconds(std::max<int64_t>(0, activity_now_ms() - last));
