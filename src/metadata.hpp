@@ -641,6 +641,32 @@ class MetadataReplica {
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,
                                  const MetadataRecord&);
+    // Installs `record` as this replica's sole accepted, committed head and
+    // discards everything behind it. The existing checkpoint, journal,
+    // history, heads and acceptance proof are quarantined under a timestamped
+    // suffix rather than deleted, exactly as recover_from_seed quarantines
+    // them, so the pre-migration state is still on the disk afterwards.
+    //
+    // **This grants authority, which recover_from_seed deliberately refuses
+    // to do.** That refusal is right for its case: a cache seed is evidence
+    // about what the namespace was, not evidence that the cluster accepted it.
+    // A migration is the other case -- an operator has taken every node down
+    // and is re-rooting all of them onto a record that is a pure function of
+    // the namespace they had all converged on, so every node computes the same
+    // record independently and the authority comes from the operator's
+    // coordination rather than from a peer's acknowledgement.
+    //
+    // It is therefore only correct offline, with the whole cluster stopped,
+    // run on every node, against a converged head. Used any other way it
+    // manufactures a head nobody agreed to. There is no in-process caller and
+    // there should not be one: `macha-namespace-migrate` is the only user.
+    // `witnesses` names the nodes the operator is re-rooting onto this record.
+    // It becomes the acceptance certificate's replica list, and there must be
+    // at least as many as the record's write floor -- the acceptance format
+    // refuses a certificate claiming a floor it cannot name replicas for, and
+    // nothing here can invent an acknowledgement that has not happened.
+    bool install_migrated_head(const MetadataRecord&, const std::vector<NodeId>& witnesses,
+                               const std::string& reason);
     bool seed(const MetadataRecord&);
     bool remember_committed(const MetadataRecord&);
     bool remember_current_committed(uint64_t, const Hash256&);
