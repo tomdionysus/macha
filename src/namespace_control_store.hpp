@@ -82,4 +82,28 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
     std::vector<ObjectId> written_;
 };
 
+// The same tree over one node's control store alone, with no cluster around
+// it. This is what an offline tool has: a state directory, a key, and the
+// objects already on the disk. It writes nothing to peers and asks nothing of
+// them, which is the point -- a migration runs with the cluster stopped.
+class LocalNamespaceNodeStore final : public NamespaceNodeStore {
+  public:
+    explicit LocalNamespaceNodeStore(LocalStore& store) : store_(store) {}
+
+    ObjectId put(std::span<const uint8_t> node) override;
+    std::optional<Bytes> get(const ObjectId& id) const override;
+
+    const std::vector<ObjectId>& written() const noexcept {
+        return written_;
+    }
+    uint64_t bytes_written() const noexcept {
+        return bytes_written_;
+    }
+
+  private:
+    LocalStore& store_;
+    std::vector<ObjectId> written_;
+    uint64_t bytes_written_{};
+};
+
 } // namespace macha
