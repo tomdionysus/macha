@@ -369,6 +369,7 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
 }
 
 bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
+    DiskServiceTimer timer(&service_monitor_, data.size());
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -396,6 +397,9 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
 
 std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
     const ObjectId& id, std::span<const uint8_t> data) {
+    // The provisional write path, which is how ingest and FUSE publication put
+    // every extent -- the exact traffic that took a node to 91% iowait.
+    DiskServiceTimer timer(&service_monitor_, data.size());
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
@@ -528,6 +532,9 @@ void StoragePool::observe_get(size_t bytes, uint64_t elapsed) const {
 }
 
 std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
+    // A read is timed too, and counts toward the same pressure signal: a device
+    // made slow by reads starves a viewer exactly as one made slow by writes.
+    DiskServiceTimer timer(const_cast<DiskServiceMonitor*>(&service_monitor_), 0);
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;

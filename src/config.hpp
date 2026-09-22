@@ -836,6 +836,18 @@ struct Config {
     // non-reserved portion; viewer reads retain immediate bounded headroom.
     uint64_t data_inflight_bytes{128ULL * 1024 * 1024};
     uint64_t data_viewer_reserve_bytes{32ULL * 1024 * 1024};
+    // Measured device service time the DATA backends defend. Above this,
+    // loader and speculative admission for those backends is held at
+    // io_pressure_min_background leases; a viewer is never gated by it.
+    //
+    // These bound service *time*, which data_viewer_reserve_bytes does not: a
+    // viewer holding byte credit still queued behind a 17-second extent write
+    // on 2026-09-19, and no available setting would have prevented it. Zero
+    // target disables the mechanism and restores exactly the previous
+    // behaviour.
+    uint32_t io_pressure_target_ms{50};
+    uint32_t io_pressure_release_ms{20};
+    uint32_t io_pressure_min_background{1};
     // How long a DATA credit wait may make no progress at all before it fails
     // instead of waiting for ever. "No progress" means not one lease was
     // released anywhere in the arbiter for this long -- under any real load

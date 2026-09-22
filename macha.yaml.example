@@ -279,6 +279,24 @@ dht:
   # and executors and does not enter this budget.
   data_inflight_bytes: 128M
   data_viewer_reserve_bytes: 32M
+
+  # Measured device service time the DATA backends defend. Above the target,
+  # loader and speculative admission for those backends is held to
+  # io_pressure_min_background leases until the measured mean falls back below
+  # the release floor. A viewer is never gated by this: if the disk is slow,
+  # the person waiting on it gets all of it.
+  #
+  # This bounds service *time*, which the byte reserves above do not. On
+  # 2026-09-19 one ordinary ingest took a node to 91% iowait with single 4 MiB
+  # extent writes at 17.7 s and twelve client requests aborted at ~8 s, while
+  # every byte budget was satisfied -- a viewer holding byte credit still
+  # queued behind the write. No setting available at the time would have
+  # prevented it.
+  #
+  # target 0 disables the mechanism entirely.
+  io_pressure_target_ms: 50
+  io_pressure_release_ms: 20
+  io_pressure_min_background: 1
   # How long a DATA credit wait may make no progress before it fails instead
   # of waiting for ever. "No progress" means not one lease was released
   # anywhere for this long: under any real load releases happen constantly and

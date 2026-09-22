@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "io_pressure.hpp"
 #include "log.hpp"
 #include "net.hpp"
 
@@ -86,12 +87,27 @@ struct DataResourceStats {
     uint64_t background_limit{};
     uint64_t background_active{};
     uint64_t peak_background_active{};
+    // Device pressure, so an operator can see the reason a loader slowed down
+    // rather than inferring it. Without this the mechanism is invisible and
+    // indistinguishable from the node being mysteriously slow.
+    bool device_pressured{};
+    uint64_t device_service_us{};
+    uint64_t device_worst_us{};
+    uint64_t device_pressure_onsets{};
 };
 
 // Event-driven byte admission at blocking DATA resource boundaries. Lower
 // classes may borrow all non-reserved capacity, but can never consume the
 // viewer headroom. A waiting viewer also closes lower-class admission until it
 // has acquired its bounded credit. CONTROL does not enter this object.
+//
+// Bytes are not the only contended resource, and on 2026-09-19 they were not
+// the one that broke: every byte budget here was satisfied while a viewer's
+// read sat behind a 17-second extent write on the same spindle. So admission
+// also consults measured device service time, and refuses loader and
+// speculative work while the disk it would use is slow. A viewer is never
+// refused for pressure -- if the device is slow, the person waiting on it gets
+// all of it.
 class DataResourceArbiter {
   public:
     using Clock = DataWorkContext::Clock;
@@ -134,6 +150,15 @@ class DataResourceArbiter {
   private:
     uint64_t capacity_bytes_{};
     uint64_t viewer_reserve_bytes_{};
+    // Measured device service time, or null where there is no device to
+    // measure (tests, and any arbiter not fronting a store).
+    const DiskServiceMonitor* service_monitor_{};
+    // Law 2: the loader is bounded, never stopped. Under pressure this many
+    // background leases are still admitted, so publication and repair make
+    // progress at a trickle instead of deadlocking behind a disk that is busy
+    // because of them.
+    uint64_t min_background_under_pressure_{1};
+    uint64_t pressure_refusals_{};
     // Background effort ceiling: how many loader/speculative leases may be
     // active at once. Each lease is one extent's worth of hashing,
     // encryption and transfer, so this bounds the CPU that publication and
@@ -179,6 +204,13 @@ class DataResourceArbiter {
     DataResourceArbiter(uint64_t capacity_bytes, uint64_t viewer_reserve_bytes,
                         uint64_t background_concurrency = 0,
                         std::chrono::milliseconds no_progress_deadline = {});
+    // Set once during node construction, before any work is admitted.
+    void observe_device(const DiskServiceMonitor* monitor,
+                        uint64_t min_background_under_pressure) {
+        std::lock_guard lock(mutex_);
+        service_monitor_ = monitor;
+        min_background_under_pressure_ = std::max<uint64_t>(1, min_background_under_pressure);
+    }
     std::optional<Lease> acquire(const DataWorkContext& context, uint64_t bytes);
     std::optional<Lease> try_acquire(const DataWorkContext& context, uint64_t bytes);
     void stop();
@@ -202,6 +234,12 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes)
     if (viewer(frame_type))
         return true;
     if (waiting_viewers_)
+        return false;
+    // The device is slow. Hold background work at a trickle until it recovers:
+    // bounded, not stopped, so a loader that is itself the cause can still
+    // drain rather than deadlock.
+    if (service_monitor_ && service_monitor_->pressured() &&
+        lower_active_ >= min_background_under_pressure_)
         return false;
     if (background_concurrency_ && lower_active_ >= background_concurrency_)
         return false;
@@ -360,10 +398,16 @@ inline void DataResourceArbiter::stop() {
 
 inline DataResourceStats DataResourceArbiter::stats() const {
     std::lock_guard lock(mutex_);
-    return {capacity_bytes_, viewer_reserve_bytes_, used_bytes_, peak_used_bytes_,
-            viewer_admissions_, loader_admissions_, speculative_admissions_,
-            viewer_waits_, loader_waits_, speculative_waits_, cancelled_waits_,
-            background_concurrency_, lower_active_, peak_lower_active_};
+    const auto device = service_monitor_ ? service_monitor_->sample() : DiskServiceMonitor::Sample{};
+    return {capacity_bytes_,           viewer_reserve_bytes_,
+            used_bytes_,               peak_used_bytes_,
+            viewer_admissions_,        loader_admissions_,
+            speculative_admissions_,   viewer_waits_,
+            loader_waits_,             speculative_waits_,
+            cancelled_waits_,          background_concurrency_,
+            lower_active_,             peak_lower_active_,
+            device.pressured,          device.mean_us,
+            device.worst_us,           service_monitor_ ? service_monitor_->pressure_onsets() : 0};
 }
 
 } // namespace macha

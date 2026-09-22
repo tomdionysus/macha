@@ -465,6 +465,20 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
         const auto used = local->used();
         const auto capacity = local->limit();
         local_ = std::move(local);
+        // DATA admission now has a device to consult. Zero target means the
+        // mechanism is off and admission behaves exactly as it did before it
+        // existed.
+        if (cfg_.io_pressure_target_ms) {
+            local_->configure_service_monitor(DiskServiceMonitor::Thresholds{
+                std::chrono::milliseconds(cfg_.io_pressure_target_ms),
+                std::chrono::milliseconds(cfg_.io_pressure_release_ms)});
+            data_resources_.observe_device(&local_->service_monitor(),
+                                          cfg_.io_pressure_min_background);
+            Log::info("data io pressure gate enabled target_ms=" +
+                      std::to_string(cfg_.io_pressure_target_ms) + " release_ms=" +
+                      std::to_string(cfg_.io_pressure_release_ms) + " min_background=" +
+                      std::to_string(cfg_.io_pressure_min_background));
+        }
         members_.storage(used, capacity);
         server_.set_local(members_.self());
         telemetry_storage_used_.store(used, std::memory_order_relaxed);
