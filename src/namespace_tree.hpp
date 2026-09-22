@@ -146,6 +146,17 @@ using NamespaceVisitor = std::function<void(const std::string& path, const FsEnt
 void walk_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
                          const NamespaceVisitor& visit);
 
+// Every entry whose path starts with `prefix`, in path order. On a tree this
+// descends: a branch child covers the key range from its own first key to the
+// next child's, so a child whose range cannot intersect the prefix is never
+// fetched. That is what makes a directory listing cost the subtree rather than
+// the library, and it is why the tree is keyed by path rather than by a hash
+// of it.
+void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
+                                          const NamespaceNodeStore* store,
+                                          std::string_view prefix,
+                                          const NamespaceVisitor& visit);
+
 // The namespace of a snapshot, whichever form it is in: the inline map when
 // there is one, the tree when the snapshot carries a root. This is what a
 // reader converted for Stage C calls, so that it works before and after the

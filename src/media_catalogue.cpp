@@ -2586,19 +2586,21 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
         }
     }
 
-    for (const auto& [path, entry] : snapshot->entries) {
+    auto rescan_nodes = fs_.namespace_nodes();
+    for_each_namespace_entry(*snapshot, &rescan_nodes,
+                             [&](const std::string& path, const FsEntry& entry) {
         if (entry.type != EntryType::file)
-            continue;
+            return;
         const auto media_id = file_media_id(entry);
         if (!wanted.contains(media_id))
-            continue;
+            return;
         std::string root;
         auto* provider = provider_for_path(path, root);
         if (!provider || !provider->accepts_path(path))
-            continue;
+            return;
         submissions.push_back({path, "manual", media_id,
                                CatalogueHintPriority::manual_rescan});
-    }
+    });
 
     const auto queued = hints_.submit_many(std::move(submissions)).size();
     Log::debug("catalogue metadata clear targeted rematch media_ids=" +
@@ -2625,13 +2627,15 @@ size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& 
         existing_by_path.emplace(hint.path, hint);
     std::vector<CatalogueHintSubmission> submissions;
     size_t pending = 0;
-    for (const auto& [path, entry] : available->snapshot->entries) {
-        if (entry.type != EntryType::file || !entry.size) continue;
+    auto pending_nodes = fs_.namespace_nodes();
+    for_each_namespace_entry(*available->snapshot, &pending_nodes,
+                             [&](const std::string& path, const FsEntry& entry) {
+        if (entry.type != EntryType::file || !entry.size) return;
         const auto media_id = file_media_id(entry);
-        if (!wanted.contains(media_id)) continue;
+        if (!wanted.contains(media_id)) return;
         std::string root;
         auto* provider = provider_for_path(path, root);
-        if (!provider || !provider->accepts_path(path)) continue;
+        if (!provider || !provider->accepts_path(path)) return;
 
         // An explicit immutable-profile request is a single background job,
         // not permission to reopen the same terminal catalogue hint forever.
@@ -2649,12 +2653,12 @@ size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& 
                     hint.state == CatalogueHintState::processing ||
                     hint.state == CatalogueHintState::deferred)
                     ++pending;
-                continue;
+                return;
             }
         }
         submissions.push_back({path, "media-profile", media_id,
                                CatalogueHintPriority::periodic_scan});
-    }
+    });
     const auto queued = hints_.submit_many(std::move(submissions)).size();
     pending += queued;
     Log::debug("catalogue media profile requested media_ids=" +
@@ -2691,12 +2695,14 @@ void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
 }
 
 std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
-    std::string_view root, const MetadataSnapshot& namespace_snapshot, std::stop_token stop) {
+    std::string_view root, const MetadataSnapshot& namespace_snapshot,
+    const NamespaceNodeStore* namespace_nodes, std::stop_token stop) {
     const auto normalized = normalize_path(std::string(root));
-    const auto root_entry = namespace_snapshot.entries.find(normalized);
-    if (root_entry == namespace_snapshot.entries.end())
+    // The root is checked for its type only, so a stat-only read.
+    const auto root_entry = namespace_entry(namespace_snapshot, namespace_nodes, normalized, false);
+    if (!root_entry)
         throw FsError(ENOENT, "missing");
-    if (root_entry->second.type != EntryType::directory)
+    if (root_entry->type != EntryType::directory)
         throw FsError(ENOTDIR, "catalogue root is not a directory");
 
     // A destructive discovery pass must describe one immutable namespace
@@ -2705,13 +2711,17 @@ std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
     // from manufacturing an absence that never existed in any generation.
     std::vector<std::pair<std::string, FsEntry>> out;
     const auto prefix = normalized == "/" ? std::string("/") : normalized + "/";
-    auto it = namespace_snapshot.entries.lower_bound(prefix);
-    for (; it != namespace_snapshot.entries.end(); ++it) {
-        if (stop.stop_requested()) break;
-        if (!it->first.starts_with(prefix)) break;
-        if (it->second.type == EntryType::file)
-            out.emplace_back(it->first, it->second);
-    }
+    // A prefix query, which on a tree descends to the subtree rather than
+    // reading the library and discarding most of it. The entries come back
+    // whole: the scanner computes file_media_id over them, which hashes the
+    // extent list.
+    for_each_namespace_entry_with_prefix(namespace_snapshot, namespace_nodes, prefix,
+                                        [&](const std::string& path, const FsEntry& entry) {
+        if (stop.stop_requested())
+            return;
+        if (entry.type == EntryType::file)
+            out.emplace_back(path, entry);
+    });
     return out;
 }
 
@@ -2758,12 +2768,13 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     // FileSystem::getattr() here: that path may acquire authoritative metadata
     // and previously rebuilt/read metadata separately for every hint.
     const auto path = normalize_path(hint.path);
-    auto entry_it = namespace_snapshot.entries.find(path);
-    if (entry_it == namespace_snapshot.entries.end()) {
+    auto scan_nodes = fs_.namespace_nodes();
+    auto found_entry = namespace_entry(namespace_snapshot, &scan_nodes, path);
+    if (!found_entry) {
         hints_.fail(hint.id, "namespace path no longer exists");
         return {};
     }
-    const auto& entry = entry_it->second;
+    const auto& entry = *found_entry;
     if (entry.type != EntryType::file) {
         hints_.mark_no_match(hint.id, std::string(provider->name()), {},
                              "namespace path is not a media file");
@@ -3033,13 +3044,14 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                         "media-information-catalogue");
                 } else if (profile_engine_ && profile_engine_->status().available &&
                     match->media_id.starts_with("macha:")) {
-                    auto entry = namespace_view->snapshot->entries.find(normalize_path(hint->path));
-                    if (entry != namespace_view->snapshot->entries.end() &&
-                        entry->second.type == EntryType::file && entry->second.size) {
+                    auto profile_nodes = fs_.namespace_nodes();
+                    auto entry = namespace_entry(*namespace_view->snapshot, &profile_nodes,
+                                                 normalize_path(hint->path));
+                    if (entry && entry->type == EntryType::file && entry->size) {
                         try {
                             const auto media_id = match->media_id;
                             const auto path = normalize_path(hint->path);
-                            const auto source_entry = entry->second;
+                            const auto source_entry = *entry;
                             const auto deadline = Clock::now() +
                                 node_.config().streaming.probe_timeout;
                             auto resolved = catalogue_.resolve_media_profile(
@@ -3178,7 +3190,9 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     for (auto& provider : providers_) {
         for (const auto& root : provider->roots()) {
             try {
-                auto root_files = catalogue_snapshot_files(root, namespace_snapshot, stop);
+                auto scan_nodes = fs_.namespace_nodes();
+                auto root_files =
+                    catalogue_snapshot_files(root, namespace_snapshot, &scan_nodes, stop);
                 if (stop.stop_requested()) return 0;
                 ++roots_scanned;
                 for (auto& [path, entry] : root_files)
