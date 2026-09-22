@@ -93,6 +93,11 @@ struct DataResourceStats {
     bool device_pressured{};
     uint64_t device_service_us{};
     uint64_t device_worst_us{};
+    // The signal pressure is decided on: actual/expected as a percentage,
+    // where 100 is a device performing exactly as expected for the work it
+    // was given. Reported because a mean latency alone cannot be judged
+    // without knowing the size of the operations behind it.
+    uint64_t device_slowdown_percent{};
     uint64_t device_pressure_onsets{};
 };
 
@@ -235,10 +240,18 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes)
         return true;
     if (waiting_viewers_)
         return false;
-    // The device is slow. Hold background work at a trickle until it recovers:
-    // bounded, not stopped, so a loader that is itself the cause can still
-    // drain rather than deadlock.
-    if (service_monitor_ && service_monitor_->pressured() &&
+    // Law 2: the loader yields only when it would otherwise make a viewer
+    // wait. A slow device with nobody reading from it is a device doing its
+    // job, and holding an operator's import back for it is exactly the
+    // violation the law names -- it cost a 36 GB import an afternoon at 2 MB/s
+    // on 2026-09-22 while nothing was being watched.
+    //
+    // Speculative work has no such protection: it sits below the loader, and
+    // pressure alone is reason enough for it to stand aside.
+    const bool viewer_present = waiting_viewers_ > 0 || used_bytes_ > lower_used_bytes_;
+    const bool yields_to_pressure =
+        frame_type == FrameType::speculative || viewer_present;
+    if (service_monitor_ && service_monitor_->pressured() && yields_to_pressure &&
         lower_active_ >= min_background_under_pressure_)
         return false;
     if (background_concurrency_ && lower_active_ >= background_concurrency_)
@@ -407,7 +420,8 @@ inline DataResourceStats DataResourceArbiter::stats() const {
             cancelled_waits_,          background_concurrency_,
             lower_active_,             peak_lower_active_,
             device.pressured,          device.mean_us,
-            device.worst_us,           service_monitor_ ? service_monitor_->pressure_onsets() : 0};
+            device.worst_us,           device.slowdown_percent,
+            service_monitor_ ? service_monitor_->pressure_onsets() : 0};
 }
 
 } // namespace macha

@@ -294,8 +294,26 @@ dht:
   # prevented it.
   #
   # target 0 disables the mechanism entirely.
-  io_pressure_target_ms: 50
-  io_pressure_release_ms: 20
+  # What an operation on a coping device should cost: a fixed per-operation
+  # budget plus a budget per MiB. Pressure is the moving average of
+  # actual/expected, so a 4 MiB extent write and a 4 KiB read are each judged
+  # against what they should cost rather than against one number -- a single
+  # millisecond threshold declared permanent pressure on every node doing
+  # ordinary writes.
+  #
+  # Under pressure, speculative work stands aside always, and the loader stands
+  # aside only when a viewer is present: law 2 says the loader waits only when
+  # it would otherwise make a viewer wait.
+  #
+  # io_pressure_slowdown_percent: 0 disables the mechanism entirely.
+  io_pressure_overhead_ms: 25
+  io_pressure_per_mib_ms: 120
+  io_pressure_slowdown_percent: 300
+  io_pressure_release_percent: 150
+  # One operation this slow trips pressure immediately, whatever the average
+  # says: a 17.7 s extent write barely moves a moving average and starves a
+  # viewer completely.
+  io_pressure_outlier_ms: 2000
   io_pressure_min_background: 1
   # How long a DATA credit wait may make no progress before it fails instead
   # of waiting for ever. "No progress" means not one lease was released

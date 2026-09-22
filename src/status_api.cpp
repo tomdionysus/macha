@@ -1059,6 +1059,7 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     data_resource_diagnostics["device_pressured"] = data_resource.device_pressured;
     data_resource_diagnostics["device_service_us"] = data_resource.device_service_us;
     data_resource_diagnostics["device_worst_us"] = data_resource.device_worst_us;
+    data_resource_diagnostics["device_slowdown_percent"] = data_resource.device_slowdown_percent;
     data_resource_diagnostics["device_pressure_onsets"] = data_resource.device_pressure_onsets;
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);

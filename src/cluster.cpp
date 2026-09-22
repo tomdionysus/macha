@@ -468,15 +468,20 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
         // DATA admission now has a device to consult. Zero target means the
         // mechanism is off and admission behaves exactly as it did before it
         // existed.
-        if (cfg_.io_pressure_target_ms) {
+        if (cfg_.io_pressure_slowdown_percent) {
             local_->configure_service_monitor(DiskServiceMonitor::Thresholds{
-                std::chrono::milliseconds(cfg_.io_pressure_target_ms),
-                std::chrono::milliseconds(cfg_.io_pressure_release_ms)});
+                std::chrono::milliseconds(cfg_.io_pressure_overhead_ms),
+                std::chrono::milliseconds(cfg_.io_pressure_per_mib_ms),
+                cfg_.io_pressure_slowdown_percent, cfg_.io_pressure_release_percent,
+                std::chrono::milliseconds(cfg_.io_pressure_outlier_ms)});
             data_resources_.observe_device(&local_->service_monitor(),
                                           cfg_.io_pressure_min_background);
-            Log::info("data io pressure gate enabled target_ms=" +
-                      std::to_string(cfg_.io_pressure_target_ms) + " release_ms=" +
-                      std::to_string(cfg_.io_pressure_release_ms) + " min_background=" +
+            Log::info("data io pressure gate enabled expected_ms=" +
+                      std::to_string(cfg_.io_pressure_overhead_ms) + "+" +
+                      std::to_string(cfg_.io_pressure_per_mib_ms) + "/MiB slowdown_percent=" +
+                      std::to_string(cfg_.io_pressure_slowdown_percent) + " release_percent=" +
+                      std::to_string(cfg_.io_pressure_release_percent) + " outlier_ms=" +
+                      std::to_string(cfg_.io_pressure_outlier_ms) + " min_background=" +
                       std::to_string(cfg_.io_pressure_min_background));
         }
         members_.storage(used, capacity);
