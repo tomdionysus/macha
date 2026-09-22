@@ -1322,7 +1322,17 @@ The remaining known-bad rates, all to be driven to zero:
 | `http_server/.../closes_mid_body...` | <= 1/20, did not fire in 1,455 | es-1 |
 | `storage_v18/.../durability_barrier_reports_objects...` | 10/20 | macOS only, green on es-1 |
 | `storage_v18/.../durability_barrier_rederives_placement...` | intermittent | macOS only, green on es-1 |
-| `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; did not fire in 1,455 on es-1 |
+| `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; **fired once on es-1**, 2026-09-22 |
+
+**The `storage_data_credit` case is no longer macOS-only (2026-09-22).** It
+failed once in the 0.49.0 full suite on es-1 -- 1/492, at 125 ms, with
+`uncaught exception: peer in retry backoff` after the two nodes had logged
+their inbound and outbound data-lane connections. It then passed 10/10 in
+isolation on the same node. So the symptom is a readiness race between a peer
+becoming connected and becoming usable, it is not platform-specific, and the
+row above that said it had never fired on es-1 is now wrong. It did not fire
+in the same release's macOS run, where a *different* three cases failed in
+each of two consecutive full runs.
 
 Two full runs of one unchanged tree gave 477/479 and then 479/479, which is
 the whole problem in one line. **Also on this item: a before/after comparison
