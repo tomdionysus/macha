@@ -1,6 +1,50 @@
 # Current release
 
-## 0.51.0 — A slow disk stops being invisible (development)
+## 0.51.0 — The namespace tree is protected from the collector, and a slow disk stops being invisible (development)
+
+**The namespace tree was collectable.** Found on the live cluster six hours
+after the cutover: the control-store live set was built from catalogue roots
+alone, and nothing walked `namespace_root`. Every tree node holding the
+namespace — the nodes that say where every file lives — was, to reachability
+GC, an unreferenced control object waiting out its grace, on all three nodes.
+It had not bitten only because `garbage_grace_ms` had been raised to 30 days
+that afternoon as a migration safety net. That accident was the whole margin.
+
+The retention-release live set now carries every branch, leaf and extent-spine
+node reachable from the root, beside the catalogue roots. An unreadable node
+marks the whole set incomplete and nothing is released against it, because a
+partial live set is exactly what lets the collector delete the namespace. Per
+commit, the nodes a new root introduces acquire retention claims as changed
+catalogue shards do, found by a parallel walk that never reads a subtree both
+roots share and over-collects only in the safe direction.
+
+**A commit replicates the nodes it wrote, not the nodes it touched.** An ingest
+was crawling at 1.8 MB/s on a node at 0.5 load and 2% iowait — 2.6 hours for a
+36 GB import with nothing saturated. A commit re-chunks the spine, so it put
+about a dozen nodes of which all but the changed leaf and its path were
+byte-identical to what was already stored, and each was replicated
+synchronously to peers 60 ms away to be told they had it. A node already in
+the local store is immutable and was replicated when first written; `put` now
+checks presence first, and per-commit round trips fall from about twelve to
+the changed leaf and its path.
+
+**The replica's "not reconstructible" diagnosis was a default conclusion, not
+a measurement.** `diagnose_unreconstructable_locked` checks the chain links and
+that each frame is readable, and if both pass it reports "delta replay over N
+frames does not reproduce the record hash" without ever replaying. That sent
+an operator chasing a tree corruption that does not exist while the real event
+was a branch waiting sixteen minutes on reconciliation. The message now says
+what was checked. `macha-metadata-dump --objects` gains a real replay that
+reconstructs every frame and names the first that diverges; on the live
+cluster it reproduced all 25 byte-exactly.
+
+**A torrent can be started on a named node.** `POST /api/v1/torrents/jobs`
+takes an optional `node_id`; absent means the receiving node, as before. The
+response always carries `node_id`, including for a local add. An unknown or
+unreachable target is a 409 with the reason, never a quiet local download.
+
+### A slow disk stops being invisible
+
 
 **Nothing measured disk service time.** Every bound on DATA work was declared
 up front — bytes in flight, concurrent operations, a maintenance bandwidth
