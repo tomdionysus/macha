@@ -484,6 +484,65 @@ void read_leaf(const ObjectId& id, const NamespaceNodeStore& store,
     reader.finish();
 }
 
+// The half-open upper bound of the keys that start with `prefix`: the prefix
+// with its last byte incremented, carrying where a byte is 0xFF. An empty
+// result means "no upper bound", which is what an all-0xFF prefix implies.
+std::string prefix_upper_bound(std::string_view prefix) {
+    std::string upper(prefix);
+    while (!upper.empty()) {
+        auto& last = reinterpret_cast<unsigned char&>(upper.back());
+        if (last != 0xFF) {
+            ++last;
+            return upper;
+        }
+        upper.pop_back();
+    }
+    return {};
+}
+
+void walk_subtree_prefix(const ObjectId& id, const NamespaceNodeStore& store,
+                         std::string_view prefix, std::string_view upper,
+                         const NamespaceVisitor& visit) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    const auto magic = reader.fixed<4>();
+    if (magic == leaf_magic) {
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i) {
+            auto item = decode_leaf_entry(reader, store, true);
+            if (item.first.starts_with(prefix))
+                visit(item.first, item.second);
+        }
+        reader.finish();
+        return;
+    }
+    if (magic != branch_magic)
+        throw DecodeError("not a namespace tree node");
+    (void)reader.u8(); // level
+    const auto count = reader.u32();
+    std::vector<std::pair<std::string, ObjectId>> children;
+    children.reserve(std::min<size_t>(count, reader.remaining() / 44));
+    for (uint32_t i = 0; i < count; ++i) {
+        auto key = reader.string(8192);
+        children.emplace_back(std::move(key), ObjectId{reader.fixed<32>()});
+        (void)reader.u64();
+    }
+    reader.finish();
+    for (size_t i = 0; i < children.size(); ++i) {
+        // This child holds the keys from its own first key up to the next
+        // child's. Skip it when that range cannot contain the prefix: entirely
+        // before it, or entirely at or after its upper bound.
+        const bool last = i + 1 == children.size();
+        if (!last && children[i + 1].first <= prefix)
+            continue;
+        if (!upper.empty() && children[i].first >= upper)
+            break;
+        walk_subtree_prefix(children[i].second, store, prefix, upper, visit);
+    }
+}
+
 void walk_subtree(const ObjectId& id, const NamespaceNodeStore& store,
                   const NamespaceVisitor& visit) {
     auto encoded = store.get(id);
@@ -703,6 +762,24 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
     if (!root_entry || root_entry->type != EntryType::directory)
         throw DecodeError("metadata delta lost root");
     return updated;
+}
+
+void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
+                                          const NamespaceNodeStore* store,
+                                          std::string_view prefix,
+                                          const NamespaceVisitor& visit) {
+    if (!snapshot.namespace_root) {
+        for (auto it = snapshot.entries.lower_bound(std::string(prefix));
+             it != snapshot.entries.end(); ++it) {
+            if (!it->first.starts_with(prefix))
+                break;
+            visit(it->first, it->second);
+        }
+        return;
+    }
+    if (!store)
+        throw DecodeError("namespace is a tree and no node store was supplied");
+    walk_subtree_prefix(*snapshot.namespace_root, *store, prefix, prefix_upper_bound(prefix), visit);
 }
 
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media_information.hpp"
+#include "namespace_tree.hpp"
 
 #include "diagnostics.hpp"
 #include "log.hpp"
@@ -119,11 +120,17 @@ std::optional<std::pair<std::string, FsEntry>>
 MediaInformationService::source_for(std::string_view media_id) const {
     auto view = fs_.available_snapshot_view();
     if (!view) return {};
-    for (const auto& [path, entry] : view->snapshot->entries) {
+    // file_media_id hashes the extent list, so this walk needs whole entries.
+    auto nodes = fs_.namespace_nodes();
+    std::optional<std::pair<std::string, FsEntry>> found;
+    for_each_namespace_entry(*view->snapshot, &nodes,
+                             [&](const std::string& path, const FsEntry& entry) {
+        if (found)
+            return;
         if (entry.type == EntryType::file && entry.size && file_media_id(entry) == media_id)
-            return std::pair{path, entry};
-    }
-    return {};
+            found = std::pair{path, entry};
+    });
+    return found;
 }
 
 bool MediaInformationService::media_is_live(std::string_view media_id) const {
@@ -149,10 +156,12 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
     for (const auto& hint : existing) by_path.emplace(hint.path, hint);
     std::vector<CatalogueHintSubmission> submissions;
     size_t outstanding = 0;
-    for (const auto& [path, entry] : view->snapshot->entries) {
-        if (entry.type != EntryType::file || !entry.size) continue;
+    auto nodes = fs_.namespace_nodes();
+    for_each_namespace_entry(*view->snapshot, &nodes,
+                             [&](const std::string& path, const FsEntry& entry) {
+        if (entry.type != EntryType::file || !entry.size) return;
         const auto media_id = file_media_id(entry);
-        if (!wanted.contains(media_id)) continue;
+        if (!wanted.contains(media_id)) return;
         if (auto found = by_path.find(path); found != by_path.end()) {
             const auto& hint = found->second;
             const bool same = std::any_of(hint.origins.begin(), hint.origins.end(),
@@ -166,11 +175,11 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
                     if (priority > hint.priority)
                         submissions.push_back({path, source, media_id, priority});
                 }
-                continue;
+                return;
             }
         }
         submissions.push_back({path, source, media_id, priority});
-    }
+    });
     outstanding += hints_.submit_many(std::move(submissions)).size();
     cv_.notify_all();
     return outstanding;
@@ -181,11 +190,11 @@ bool MediaInformationService::request_path(std::string path, int priority,
     path = normalize_path(path);
     auto view = fs_.available_snapshot_view();
     if (!view) return false;
-    auto found = view->snapshot->entries.find(path);
-    if (found == view->snapshot->entries.end() || found->second.type != EntryType::file ||
-        !found->second.size)
+    auto nodes = fs_.namespace_nodes();
+    auto found = namespace_entry(*view->snapshot, &nodes, path);
+    if (!found || found->type != EntryType::file || !found->size)
         return false;
-    const auto media_id = file_media_id(found->second);
+    const auto media_id = file_media_id(*found);
     if (catalogue_.media_profile(media_id)) return true;
     (void)hints_.submit(path, std::move(source), media_id, priority);
     cv_.notify_all();
@@ -361,9 +370,11 @@ void MediaInformationService::prune() {
     auto view = fs_.available_snapshot_view();
     if (!view) return;
     std::set<std::string> live;
-    for (const auto& [_, entry] : view->snapshot->entries)
+    auto nodes = fs_.namespace_nodes();
+    for_each_namespace_entry(*view->snapshot, &nodes, [&](const std::string&, const FsEntry& entry) {
         if (entry.type == EntryType::file && entry.size)
             live.insert(file_media_id(entry));
+    });
     const auto removed = catalogue_.prune_media_profiles(live);
     if (removed)
         Log::debug("media information pruned profiles=" + std::to_string(removed));

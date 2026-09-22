@@ -2072,11 +2072,10 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         if (media_index_valid_ && media_index_snapshot_) {
             auto found = media_index_.find(std::string(id));
             if (found != media_index_.end()) {
-                auto entry = media_index_snapshot_->entries.find(found->second);
-                if (entry != media_index_snapshot_->entries.end() &&
-                    entry->second.type == EntryType::file &&
-                    file_media_id(entry->second) == id)
-                    return std::pair{found->second, entry->second};
+                auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+                auto entry = namespace_entry(*media_index_snapshot_, &nodes, found->second);
+                if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
+                    return std::pair{found->second, *entry};
             }
         }
     }
@@ -2090,22 +2089,26 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         if (media_index_valid_ && media_index_snapshot_) {
             auto found = media_index_.find(std::string(id));
             if (found != media_index_.end()) {
-                auto entry = media_index_snapshot_->entries.find(found->second);
-                if (entry != media_index_snapshot_->entries.end() &&
-                    entry->second.type == EntryType::file &&
-                    file_media_id(entry->second) == id)
-                    return std::pair{found->second, entry->second};
+                auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+                auto entry = namespace_entry(*media_index_snapshot_, &nodes, found->second);
+                if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
+                    return std::pair{found->second, *entry};
             }
             if (media_index_namespace_revision_ == view.namespace_revision)
                 return {};
         }
 
         std::map<std::string, std::string> next;
-        for (const auto& [path, entry] : view.snapshot->entries) {
+        // A full pass with extents: file_media_id hashes the extent list, which
+        // is why the plan lists persisting it as Stage D work -- this walk is
+        // the media index rebuild it exists to make cheaper.
+        auto index_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        for_each_namespace_entry(*view.snapshot, &index_nodes,
+                                 [&](const std::string& path, const FsEntry& entry) {
             if (entry.type != EntryType::file)
-                continue;
+                return;
             next.emplace(file_media_id(entry), path);
-        }
+        });
         media_index_ = std::move(next);
         media_index_namespace_revision_ = view.namespace_revision;
         media_index_snapshot_ = view.snapshot;
@@ -2118,10 +2121,11 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         auto found = media_index_.find(std::string(id));
         if (found == media_index_.end())
             return {};
-        auto entry = media_index_snapshot_->entries.find(found->second);
-        if (entry == media_index_snapshot_->entries.end() || entry->second.type != EntryType::file)
+        auto lookup_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        auto entry = namespace_entry(*media_index_snapshot_, &lookup_nodes, found->second);
+        if (!entry || entry->type != EntryType::file)
             return {};
-        return std::pair{found->second, entry->second};
+        return std::pair{found->second, *entry};
     };
 
     // Playback resolution is a data-plane operation. MetadataManager already
@@ -2440,8 +2444,10 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     // is not a small mistake, it is every extent in the library looking
     // unreachable at once.
     auto namespace_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    size_t walked_entries = 0;
     for_each_namespace_entry(snapshot, &namespace_nodes,
                              [&](const std::string&, const FsEntry& entry) {
+                                 ++walked_entries;
                                  add_entry_extents(entry);
                              });
 
@@ -2482,7 +2488,10 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     built->garbage = std::move(garbage);
     built->metadata_generation = view.generation;
     built->observed_mutations = snapshot.mutation_sequences;
-    built->entries = snapshot.entries.size();
+    // Counted during the walk: a tree-backed snapshot has no map to size, and
+    // an inventory reporting zero entries over a full library would read as a
+    // library that had vanished.
+    built->entries = walked_entries;
     built->extents = extents;
 
     std::lock_guard lock(maintenance_index_mutex_);
