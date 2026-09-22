@@ -18,6 +18,7 @@
 // node status) and how many encoded bytes each part accounts for -- the
 // measurement behind discipline 4 of the self-healing plan.
 #include "codec.hpp"
+#include "config.hpp"
 #include "crypto.hpp"
 #include "metadata.hpp"
 #include "local_store.hpp"
@@ -87,6 +88,31 @@ void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
               << "ms\n";
 }
 
+// Reads tree nodes from the node's own control store and keeps everything it
+// writes in memory. A diagnostic run against a live node must not add objects to
+// that node's store: replay reconstructs nodes that are almost all already
+// there, and the handful it recomputes are nobody's business but this process's.
+class ReplayNodeStore final : public NamespaceNodeStore {
+  public:
+    explicit ReplayNodeStore(const LocalStore& disk) : disk_(disk) {}
+
+    ObjectId put(std::span<const uint8_t> node) override {
+        const auto id = object_id(node);
+        memory_.emplace(id, Bytes(node.begin(), node.end()));
+        return id;
+    }
+
+    std::optional<Bytes> get(const ObjectId& id) const override {
+        if (const auto found = memory_.find(id); found != memory_.end())
+            return found->second;
+        return disk_.get(id);
+    }
+
+  private:
+    const LocalStore& disk_;
+    std::map<ObjectId, Bytes> memory_;
+};
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] "
@@ -97,13 +123,20 @@ int main(int argc, char** argv) {
     bool stats = false;
     bool tree = false;
     std::filesystem::path objects;
+    // Replay writing reconstructed nodes into the store, the way a replica
+    // does, rather than into memory. Point it at a COPY of a node's store: the
+    // question it answers is whether the write path accepts nodes that are
+    // already there.
+    bool replay_write = false;
     std::string heads_path;
     for (int i = 3; i < argc; ++i) {
         if (std::string(argv[i]) == "--all")
             all = true;
         else if (std::string(argv[i]) == "--stats")
             stats = true;
-        else if (std::string(argv[i]) == "--objects") {
+        else if (std::string(argv[i]) == "--replay-write") {
+            replay_write = true;
+        } else if (std::string(argv[i]) == "--objects") {
             // The control object store, so a tree-backed namespace can be
             // walked rather than merely named. Without it this tool can only
             // report that the record points somewhere.
@@ -219,6 +252,19 @@ int main(int argc, char** argv) {
     reader.finish();
     auto heads = decode_metadata_acceptance_set(aes_gcm_open(key, nonce, tag, ciphertext, MA));
     std::cout << "accepted heads: " << heads.size() << '\n';
+    auto load = [&](const Frame& frame) {
+        std::ifstream in(history_path, std::ios::binary);
+        in.seekg(static_cast<std::streamoff>(frame.offset + 4));
+        Bytes bytes(frame.length);
+        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        Reader envelope(bytes);
+        auto nonce = envelope.fixed<12>();
+        auto tag = envelope.fixed<16>();
+        auto ciphertext = envelope.bytes();
+        envelope.finish();
+        return decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
+    };
+
     for (const auto& head : heads) {
         std::cout << "head gen=" << head.generation << " hash=" << hex(head.hash.bytes)
                   << " required=" << head.required << " replicas=" << head.replicas.size() << '\n';
@@ -265,6 +311,87 @@ int main(int argc, char** argv) {
             }
             working = *it;
         }
+        // Structural reconstructibility says the links line up. It does not say
+        // the replay reproduces the record, and on 2026-09-22 the cluster
+        // wedged on exactly that gap: every node reported "delta replay from
+        // anchor over 25 frames does not reproduce the record hash", so nothing
+        // could advance and every node was waiting for a peer that was
+        // equally stuck. This replays the chain for real and names the first
+        // frame whose reconstruction diverges.
+        if (ok && !objects.empty() && !chain.empty()) {
+            try {
+                LocalStore store(objects,
+                                 LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
+                                                   StoragePackingConfig{}.threshold,
+                                                   StoragePackingConfig{}.target_size},
+                                 key);
+                ReplayNodeStore overlay(store);
+                LocalNamespaceNodeStore writing(store);
+                NamespaceDeltaApplier applier = [&](const ObjectId& root,
+                                                   const MetadataDelta& delta) {
+                    if (replay_write)
+                        return apply_delta_to_namespace_tree(root, writing, delta);
+                    return apply_delta_to_namespace_tree(root, overlay, delta);
+                };
+                auto snapshot = decode_snapshot(load(cursor).payload);
+                size_t frame_index = 0;
+                for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                    ++frame_index;
+                    const auto body = load(*it);
+                    if (it->body == MetadataHistoryEntry::Body::full) {
+                        snapshot = decode_snapshot(body.payload);
+                        continue;
+                    }
+                    const auto delta = decode_metadata_delta(body.payload);
+                    const auto root_before = snapshot.namespace_root;
+                    apply_metadata_delta_in_place(snapshot, delta, applier);
+                    // Mirrors the encoder the replica picks for a delta body's
+                    // successor: SM14 for a tree-backed snapshot, otherwise the
+                    // canonical one.
+                    const auto payload = snapshot.namespace_root ? encode_snapshot_v14(snapshot)
+                                                                 : encode_snapshot(snapshot);
+                    const auto reconstructed =
+                        metadata_hash(it->generation, it->previous, payload);
+                    if (reconstructed != it->hash) {
+                        std::cout << "  REPLAY DIVERGES at frame " << frame_index << " of "
+                                  << chain.size() << " gen=" << it->generation
+                                  << "\n    recorded=" << to_string(it->hash)
+                                  << "\n    replayed=" << to_string(reconstructed) << '\n'
+                                  << "    delta: upserts=" << delta.upsert_entries.size()
+                                  << " erases=" << delta.erase_entries.size()
+                                  << " appends=" << delta.append_entries.size()
+                                  << " garbage_upserts=" << delta.upsert_garbage.size()
+                                  << " canonical_garbage=" << (delta.canonical_garbage ? 1 : 0)
+                                  << " replace_conflicts="
+                                  << (delta.replace_conflicts ? 1 : 0)
+                                  << " replace_merge_parents="
+                                  << (delta.replace_merge_parents ? 1 : 0)
+                                  << " catalogue=" << static_cast<int>(delta.catalogue) << '\n'
+                                  << "    namespace root "
+                                  << (root_before ? to_string(*root_before).substr(0, 16)
+                                                  : std::string("(map)"))
+                                  << " -> "
+                                  << (snapshot.namespace_root
+                                          ? to_string(*snapshot.namespace_root).substr(0, 16)
+                                          : std::string("(map)"))
+                                  << "\n    payload_bytes=" << payload.size() << '\n';
+                        for (const auto& [path, _] : delta.upsert_entries)
+                            std::cout << "      upsert " << path << '\n';
+                        for (const auto& path : delta.erase_entries)
+                            std::cout << "      erase " << path << '\n';
+                        for (const auto& [path, append] : delta.append_entries)
+                            std::cout << "      append " << path << " base_extents="
+                                      << append.base_extents << " added="
+                                      << append.extents.size() << '\n';
+                        break;
+                    }
+                }
+                if (frame_index == chain.size())
+                    std::cout << "  replay reproduces every frame\n";
+            } catch (const std::exception& error) {
+                std::cout << "  replay failed: " << error.what() << '\n';
+            }
+        }
         std::cout << "  chain length=" << chain.size() << " reconstructible=" << (ok ? "yes" : "NO")
                   << '\n';
         if (!ok || !stats)
@@ -273,18 +400,6 @@ int main(int argc, char** argv) {
         // Materialize exactly as the replica would, then attribute the
         // encoded bytes to each part of the snapshot by re-encoding with
         // that part removed.
-        auto load = [&](const Frame& frame) {
-            std::ifstream in(history_path, std::ios::binary);
-            in.seekg(static_cast<std::streamoff>(frame.offset + 4));
-            Bytes bytes(frame.length);
-            in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-            Reader envelope(bytes);
-            auto nonce = envelope.fixed<12>();
-            auto tag = envelope.fixed<16>();
-            auto ciphertext = envelope.bytes();
-            envelope.finish();
-            return decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
-        };
         MetadataSnapshot snapshot;
         size_t record_bytes = 0;
         try {
@@ -333,9 +448,11 @@ int main(int argc, char** argv) {
             }
             try {
                 LocalStore store(objects,
-                                 LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0, 0, 0},
+                                 LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
+                                                   StoragePackingConfig{}.threshold,
+                                                   StoragePackingConfig{}.target_size},
                                  key);
-                LocalNamespaceNodeStore nodes(store);
+                ReplayNodeStore nodes(store);
                 const auto shape = namespace_tree_stats(*snapshot.namespace_root, nodes);
                 std::cout << "  tree: nodes=" << shape.leaves + shape.branches
                           << " leaves=" << shape.leaves << " branches=" << shape.branches
