@@ -533,6 +533,8 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     if (torrent["listen_port"]) c.torrent.listen_port = torrent["listen_port"].as<uint16_t>();
     if (torrent["max_download_rate"]) c.torrent.max_download_rate = yaml_size(torrent["max_download_rate"]);
     if (torrent["max_upload_rate"]) c.torrent.max_upload_rate = yaml_size(torrent["max_upload_rate"]);
+    if (torrent["pressure_download_rate"])
+        c.torrent.pressure_download_rate = yaml_size(torrent["pressure_download_rate"]);
     if (torrent["dht"]) c.torrent.dht = torrent["dht"].as<bool>();
     if (torrent["pex"]) c.torrent.pex = torrent["pex"].as<bool>();
     if (torrent["lsd"]) c.torrent.lsd = torrent["lsd"].as<bool>();

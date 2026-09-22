@@ -24,6 +24,15 @@ namespace macha {
 // Cost discipline: two steady_clock reads and a handful of relaxed atomic
 // updates per operation, no locks and no timer thread. If measuring service
 // time measurably costs service time, this has failed on its own terms.
+//
+// It observes only operations that pass through the pool, which has a
+// consequence worth stating: a device saturated by something outside macha --
+// libtorrent writing to its save path, another process entirely -- raises this
+// signal only once macha's own reads and writes start taking longer as a
+// result. That is the right shape rather than a gap. A disk nobody is reading
+// can be as busy as it likes and starve nothing; pressure is only meaningful
+// when there is work to protect, and when there is, that work is itself the
+// probe.
 class DiskServiceMonitor {
   public:
     struct Thresholds {
