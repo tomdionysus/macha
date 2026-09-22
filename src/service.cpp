@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service.hpp"
+#include "namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse_frontend.hpp"
 #include "fuse_subsystem.hpp"
@@ -894,6 +895,11 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
     auto before = decode_snapshot(context.parent.payload);
     decode_ms = since_ms(decode_started);
     const auto collect_started = Clock::now();
+    // Both namespaces below may be trees rather than maps, so every read of
+    // them goes through the namespace primitives. These are retention claims:
+    // an entry missed here is an object that never acquires liveness evidence
+    // and can be collected while it is still referenced.
+    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(node_, *store_);
     const bool establish_baseline =
         !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
     if (establish_baseline) {
@@ -902,8 +908,10 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
         // migration view must acquire physical liveness evidence. This is a
         // one-time potentially-large publication; normal partition-time GC does
         // not require global convergence after the baseline exists.
-        for (const auto& [_, entry] : context.proposed.entries)
-            add_entry(entry);
+        for_each_namespace_entry(context.proposed, &namespace_nodes,
+                                 [&](const std::string&, const FsEntry& entry) {
+                                     add_entry(entry);
+                                 });
         const auto conflict_extents = metadata_conflict_extent_roots(context.proposed);
         data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());
         for (const auto& root : metadata_catalogue_root_set(context.proposed)) {
@@ -921,16 +929,24 @@ void Service::retain_metadata_publication(const MetadataPublicationContext& cont
             // (a touch that carries no extents included), or a concurrent
             // delete could release the inherited claim.
             for (const auto& [path, _] : context.delta->append_entries) {
-                const auto found = context.proposed.entries.find(path);
-                if (found != context.proposed.entries.end())
-                    add_entry(found->second);
+                if (auto found = namespace_entry(context.proposed, &namespace_nodes, path))
+                    add_entry(*found);
             }
         } else {
-            for (const auto& [path, entry] : context.proposed.entries) {
-                const auto found = before.entries.find(path);
-                if (found == before.entries.end() || found->second != entry)
-                    add_entry(entry);
-            }
+            // The no-delta path: rediscover what changed by comparing the
+            // two namespaces entry by entry. Under trees that is a walk of
+            // one plus a lookup per path in the other, which is worse than
+            // the two map walks it replaces -- and it is exactly the cost
+            // Stage C removes by carrying the change set into the commit
+            // instead. This branch is the fallback; every ordinary mutation
+            // arrives with a delta and takes the cheap path above.
+            for_each_namespace_entry(
+                context.proposed, &namespace_nodes,
+                [&](const std::string& path, const FsEntry& entry) {
+                    const auto found = namespace_entry(before, &namespace_nodes, path);
+                    if (!found || *found != entry)
+                        add_entry(entry);
+                });
         }
 
         const bool catalogue_changed =
@@ -1486,13 +1502,20 @@ void Service::loop(std::stop_token stop) {
                     auto data_live = std::make_shared<std::vector<ObjectId>>();
                     auto control_live = std::make_shared<std::vector<ObjectId>>();
                     bool complete = true;
-                    for (const auto& [_, entry] : floor->snapshot->entries) {
-                        if (entry.type != EntryType::file)
-                            continue;
-                        for (const auto& extent_ref : entry.extents)
-                            if (!extent_ref.hole)
-                                data_live->push_back(extent_ref.id);
-                    }
+                    // The live set destructive GC acts on. Read the
+                    // namespace in whichever form it is in: an empty one here
+                    // means "collect everything".
+                    auto release_nodes =
+                        ControlNamespaceNodeStore::for_reading(node_, *store_);
+                    for_each_namespace_entry(
+                        *floor->snapshot, &release_nodes,
+                        [&](const std::string&, const FsEntry& entry) {
+                            if (entry.type != EntryType::file)
+                                return;
+                            for (const auto& extent_ref : entry.extents)
+                                if (!extent_ref.hole)
+                                    data_live->push_back(extent_ref.id);
+                        });
                     const auto conflict_extents = metadata_conflict_extent_roots(*floor->snapshot);
                     data_live->insert(data_live->end(), conflict_extents.begin(),
                                       conflict_extents.end());

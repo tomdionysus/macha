@@ -4,7 +4,9 @@
 #include "metadata_manager.hpp"
 #include "namespace_tree.hpp"
 
+#include <algorithm>
 #include <set>
+#include <vector>
 #include <string>
 
 using namespace macha;
@@ -624,6 +626,74 @@ MACHA_TEST("namespace_tree", test_a_detached_namespace_never_reaches_a_reader_th
     // And it passes again once the namespace is actually there, so the guard
     // tracks where the entries are rather than which format produced them.
     require_materialised_namespace(attach_namespace(detached, store));
+}
+
+MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_form) {
+    // What the converted reachability sites depend on: the primitives give the
+    // same answer whichever form the namespace is in, so a reader that uses
+    // them works before and after the cutover and cannot be quietly wrong on
+    // one side of it.
+    const auto entries = library(6, 5);
+    const auto attached = populated_snapshot(entries);
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(attached, store);
+
+    std::map<std::string, FsEntry> from_map, from_tree;
+    for_each_namespace_entry(attached, nullptr, [&](const std::string& path, const FsEntry& e) {
+        from_map[path] = e;
+    });
+    for_each_namespace_entry(detached, &store, [&](const std::string& path, const FsEntry& e) {
+        from_tree[path] = e;
+    });
+    CHECK(from_map == entries);
+    CHECK(from_tree == entries);
+
+    // Visited in path order in both forms, which is what a prefix scan needs.
+    std::vector<std::string> order;
+    for_each_namespace_entry(detached, &store,
+                             [&](const std::string& path, const FsEntry&) { order.push_back(path); });
+    CHECK(std::is_sorted(order.begin(), order.end()));
+
+    // And the point lookup agrees with both, including for a path that is not
+    // there.
+    for (const auto& [path, entry] : entries) {
+        const auto by_map = namespace_entry(attached, nullptr, path);
+        const auto by_tree = namespace_entry(detached, &store, path);
+        REQUIRE(by_map.has_value());
+        REQUIRE(by_tree.has_value());
+        CHECK(*by_map == entry);
+        CHECK(*by_tree == entry);
+    }
+    CHECK(!namespace_entry(attached, nullptr, "/nothing/here.mkv").has_value());
+    CHECK(!namespace_entry(detached, &store, "/nothing/here.mkv").has_value());
+}
+
+MACHA_TEST("namespace_tree", test_a_detached_namespace_without_a_store_refuses_rather_than_reporting_empty) {
+    // The failure mode the primitives exist to remove. Before them, a
+    // reachability walk over a detached snapshot visited nothing and reported
+    // success, which reads as "no object in this library is live" -- the exact
+    // input destructive GC wants. It must be an error, and a named one.
+    MemoryNamespaceNodeStore store;
+    const auto detached = detach_namespace(populated_snapshot(library(2, 2)), store);
+
+    size_t visited = 0;
+    bool refused = false;
+    try {
+        for_each_namespace_entry(detached, nullptr,
+                                 [&](const std::string&, const FsEntry&) { ++visited; });
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
+    CHECK(visited == 0);
+
+    refused = false;
+    try {
+        (void)namespace_entry(detached, nullptr, "/");
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
 }
 
 } // namespace

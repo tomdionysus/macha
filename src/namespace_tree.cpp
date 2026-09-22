@@ -397,8 +397,8 @@ ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, Nam
 
 namespace {
 
-void read_subtree(const ObjectId& id, const NamespaceNodeStore& store,
-                  std::map<std::string, FsEntry>& out) {
+void walk_subtree(const ObjectId& id, const NamespaceNodeStore& store,
+                  const NamespaceVisitor& visit) {
     auto encoded = store.get(id);
     if (!encoded)
         throw DecodeError("namespace tree node unavailable: " + to_string(id));
@@ -408,8 +408,7 @@ void read_subtree(const ObjectId& id, const NamespaceNodeStore& store,
         const auto count = reader.u32();
         for (uint32_t i = 0; i < count; ++i) {
             auto item = decode_leaf_entry(reader, store, true);
-            if (!out.emplace(std::move(item.first), std::move(item.second)).second)
-                throw DecodeError("namespace tree contains a duplicate path");
+            visit(item.first, item.second);
         }
         reader.finish();
         return;
@@ -427,16 +426,53 @@ void read_subtree(const ObjectId& id, const NamespaceNodeStore& store,
     }
     reader.finish();
     for (const auto& child : children)
-        read_subtree(child, store, out);
+        walk_subtree(child, store, visit);
 }
 
 } // namespace
 
+void walk_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
+                         const NamespaceVisitor& visit) {
+    walk_subtree(root, store, visit);
+}
+
 std::map<std::string, FsEntry> read_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
                                                    const NamespaceTreeLimits&) {
     std::map<std::string, FsEntry> out;
-    read_subtree(root, store, out);
+    walk_subtree(root, store, [&](const std::string& path, const FsEntry& entry) {
+        if (!out.emplace(path, entry).second)
+            throw DecodeError("namespace tree contains a duplicate path");
+    });
     return out;
+}
+
+std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
+                                       const NamespaceNodeStore* store, std::string_view path,
+                                       bool with_extents) {
+    if (!snapshot.namespace_root) {
+        const auto found = snapshot.entries.find(std::string(path));
+        if (found == snapshot.entries.end())
+            return {};
+        return found->second;
+    }
+    if (!store)
+        throw DecodeError("namespace is a tree and no node store was supplied");
+    return namespace_tree_lookup(*snapshot.namespace_root, path, *store, with_extents);
+}
+
+void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                              const NamespaceVisitor& visit) {
+    if (!snapshot.namespace_root) {
+        for (const auto& [path, entry] : snapshot.entries)
+            visit(path, entry);
+        return;
+    }
+    // A detached namespace with no store is the silent-empty case this exists
+    // to prevent: iterating `entries` here would visit nothing and report
+    // success. Refuse instead, and name what is missing.
+    if (!store)
+        throw DecodeError("namespace is a tree and no node store was supplied");
+    walk_namespace_tree(*snapshot.namespace_root, *store, visit);
 }
 
 std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_view path,
