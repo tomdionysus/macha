@@ -464,6 +464,16 @@ struct TorrentConfig {
     size_t max_active{4};
     uint64_t max_download_rate{}; // bytes/s, 0 = unlimited
     uint64_t max_upload_rate{};   // bytes/s, 0 = unlimited
+    // The rate a download is held to while the DATA device is defending its
+    // service time (see dht.io_pressure_target_ms). libtorrent writes straight
+    // to its save path and never enters the DATA arbiter, so gating macha's own
+    // extent writes does nothing about it: a download saturating the spindle
+    // starves a viewer exactly as an ingest does, and on 2026-09-22 that was
+    // measured at 17 MB/s onto a 9.1 TB disk sitting at 90% utilisation with
+    // load 13 on four cores.
+    //
+    // 0 means never clamp, which is the previous behaviour.
+    uint64_t pressure_download_rate{2ULL * 1024 * 1024};
     bool dht{true};
     bool pex{true};
     bool lsd{true};

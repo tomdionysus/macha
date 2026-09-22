@@ -1050,6 +1050,16 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     data_resource_diagnostics["background_limit"] = data_resource.background_limit;
     data_resource_diagnostics["background_active"] = data_resource.background_active;
     data_resource_diagnostics["peak_background_active"] = data_resource.peak_background_active;
+    // Measured device service time and whether it is currently being defended.
+    // Without these the throttle is invisible: an operator sees a loader that
+    // has slowed down and has no way to tell whether the disk is being
+    // protected or the node is simply unwell. `device_worst_us` is kept because
+    // a healthy-looking mean hides the single 17-second write that actually
+    // breaks a viewer.
+    data_resource_diagnostics["device_pressured"] = data_resource.device_pressured;
+    data_resource_diagnostics["device_service_us"] = data_resource.device_service_us;
+    data_resource_diagnostics["device_worst_us"] = data_resource.device_worst_us;
+    data_resource_diagnostics["device_pressure_onsets"] = data_resource.device_pressure_onsets;
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
 
