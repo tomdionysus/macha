@@ -1951,7 +1951,10 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
     if (choice != "left" && choice != "right" && choice != "base")
         throw std::invalid_argument("conflict resolution choice must be left, right or base");
     bool resolved = false;
-    mutate([&](MetadataSnapshot& snapshot) {
+    // mutate_delta rather than mutate: this edits the namespace, and a
+    // tree-backed commit needs the change set declared rather than
+    // rediscovered by diffing two namespaces.
+    mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         auto found = snapshot.conflicts.find(id);
         if (found == snapshot.conflicts.end())
             return;
@@ -1960,16 +1963,29 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
             const auto& chosen = choice == "left"    ? conflict.left_entry
                                  : choice == "right" ? conflict.right_entry
                                                      : conflict.base_entry;
+            // Resolving a conflict is a namespace edit like any other, so it
+            // goes through the working set: on a tree-backed snapshot writing
+            // the map here would be a decision nothing ever applied.
+            auto nodes = namespace_store_
+                             ? std::optional<ControlNamespaceNodeStore>(
+                                   ControlNamespaceNodeStore::for_reading(node_, *namespace_store_))
+                             : std::nullopt;
+            NamespaceWorkingSet working(snapshot, delta, nodes ? &*nodes : nullptr);
             if (chosen)
-                snapshot.entries[conflict.key] = *chosen;
+                working.put(conflict.key, *chosen);
             else
-                snapshot.entries.erase(conflict.key);
+                working.erase(conflict.key);
         } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
             snapshot.catalogue_root = choice == "left"    ? conflict.left_catalogue_root
                                       : choice == "right" ? conflict.right_catalogue_root
                                                           : conflict.base_catalogue_root;
+            delta.catalogue = snapshot.catalogue_root ? CatalogueDelta::set : CatalogueDelta::clear;
+            delta.catalogue_root = snapshot.catalogue_root;
         }
         snapshot.conflicts.erase(found);
+        // The standing conflict set is part of the record, so an exact delta
+        // has to carry it rather than leave the replay to infer it.
+        delta.replace_conflicts = snapshot.conflicts;
         resolved = true;
     });
     if (resolved)

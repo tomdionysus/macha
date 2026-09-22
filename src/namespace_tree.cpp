@@ -935,6 +935,97 @@ void walk_stats(const ObjectId& id, const NamespaceNodeStore& store, NamespaceTr
 
 } // namespace
 
+bool NamespaceWorkingSet::erased(const std::string& path) const {
+    return std::find(delta_.erase_entries.begin(), delta_.erase_entries.end(), path) !=
+           delta_.erase_entries.end();
+}
+
+std::optional<FsEntry> NamespaceWorkingSet::get(const std::string& path, bool with_extents) const {
+    if (const auto pending = delta_.upsert_entries.find(path);
+        pending != delta_.upsert_entries.end()) {
+        if (with_extents)
+            return pending->second;
+        FsEntry stat = pending->second;
+        stat.extents.clear();
+        return stat;
+    }
+    if (erased(path))
+        return {};
+    return namespace_entry(snapshot_, nodes_, path, with_extents);
+}
+
+bool NamespaceWorkingSet::contains(const std::string& path) const {
+    if (delta_.upsert_entries.contains(path))
+        return true;
+    if (erased(path))
+        return false;
+    return namespace_contains(snapshot_, nodes_, path);
+}
+
+void NamespaceWorkingSet::put(const std::string& path, const FsEntry& entry) {
+    delta_.upsert_entries[path] = entry;
+    // A path created after being erased in the same batch is present, so its
+    // tombstone has to go or the overlay would contradict the delta it is made
+    // of.
+    delta_.erase_entries.erase(
+        std::remove(delta_.erase_entries.begin(), delta_.erase_entries.end(), path),
+        delta_.erase_entries.end());
+    if (!tree_backed_)
+        snapshot_.entries[path] = entry;
+}
+
+void NamespaceWorkingSet::erase(const std::string& path) {
+    delta_.upsert_entries.erase(path);
+    if (!erased(path))
+        delta_.erase_entries.push_back(path);
+    if (!tree_backed_)
+        snapshot_.entries.erase(path);
+}
+
+namespace {
+bool path_under(const std::string& path, const std::string& root) {
+    return path == root ||
+           (path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
+            path[root.size()] == '/');
+}
+} // namespace
+
+std::optional<std::string> NamespaceWorkingSet::first_path_under(
+    const std::string& directory) const {
+    // The overlay first: a child created in this batch counts, and a child the
+    // batch erased does not, whatever the namespace underneath still says.
+    for (const auto& [path, _] : delta_.upsert_entries)
+        if (path != directory && path_under(path, directory))
+            return path;
+    std::optional<std::string> found;
+    const auto prefix = directory == "/" ? std::string("/") : directory + "/";
+    for_each_namespace_entry_with_prefix(snapshot_, nodes_, prefix,
+                                         [&](const std::string& path, const FsEntry&) {
+                                             if (found || path == directory || erased(path))
+                                                 return;
+                                             found = path;
+                                         });
+    return found;
+}
+
+std::vector<std::pair<std::string, FsEntry>> NamespaceWorkingSet::subtree(
+    const std::string& directory) const {
+    std::map<std::string, FsEntry> merged;
+    const auto prefix = directory == "/" ? std::string("/") : directory + "/";
+    for_each_namespace_entry_with_prefix(snapshot_, nodes_, prefix,
+                                         [&](const std::string& path, const FsEntry& entry) {
+                                             if (!erased(path))
+                                                 merged.emplace(path, entry);
+                                         });
+    // `directory` itself is not under its own prefix, and a rename moves it too.
+    if (auto self = get(directory); self)
+        merged.insert_or_assign(directory, *self);
+    for (const auto& [path, entry] : delta_.upsert_entries)
+        if (path_under(path, directory))
+            merged.insert_or_assign(path, entry);
+    return {merged.begin(), merged.end()};
+}
+
 MetadataSnapshot detach_namespace(MetadataSnapshot snapshot, NamespaceNodeStore& store,
                                   const NamespaceTreeLimits& limits) {
     if (snapshot.namespace_root)

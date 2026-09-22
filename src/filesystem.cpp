@@ -1610,11 +1610,13 @@ std::string FileSystem::resolve_new_path(const std::string& p) {
     return actual_parent == "/" ? "/" + leaf : actual_parent + "/" + leaf;
 }
 
-void FileSystem::require_parent(const MetadataSnapshot& s, const std::string& p) {
-    auto i = s.entries.find(parent_path(p));
-    if (i == s.entries.end())
+void FileSystem::require_parent(const NamespaceWorkingSet& working, const std::string& p) {
+    // Type only, so stat-only: a parent check must not fetch a directory's
+    // extent list, and directories have none anyway.
+    auto parent = working.get(parent_path(p), false);
+    if (!parent)
         fail(ENOENT, "parent missing");
-    if (i->second.type != EntryType::directory)
+    if (parent->type != EntryType::directory)
         fail(ENOTDIR, "parent not directory");
 }
 FsEntry FileSystem::getattr(const std::string& p) {
@@ -1676,12 +1678,13 @@ void FileSystem::mkdir(const std::string& p, uint32_t mode, uint32_t uid, uint32
 }
 
 std::optional<FsEntry> FileSystem::apply_namespace_mutation(
-    MetadataSnapshot& s, MetadataDelta& delta, const FilesystemNamespaceMutation& op) {
+    NamespaceWorkingSet& working, MetadataSnapshot& s, MetadataDelta& delta,
+    const FilesystemNamespaceMutation& op) {
     const auto& q = op.from;
     switch (op.kind) {
     case FilesystemNamespaceMutation::Kind::mkdir: {
-        require_parent(s, q);
-        if (s.entries.contains(q))
+        require_parent(working, q);
+        if (working.contains(q))
             fail(EEXIST, "exists");
         FsEntry e;
         e.type = EntryType::directory;
@@ -1689,13 +1692,12 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         e.uid = op.uid;
         e.gid = op.gid;
         e.ctime_ns = e.mtime_ns = wall_time_ns();
-        s.entries[q] = e;
-        delta.upsert_entries[q] = e;
+        working.put(q, e);
         return e;
     }
     case FilesystemNamespaceMutation::Kind::create: {
-        require_parent(s, q);
-        if (s.entries.contains(q))
+        require_parent(working, q);
+        if (working.contains(q))
             fail(EEXIST, "exists");
         FsEntry e;
         e.type = EntryType::file;
@@ -1703,42 +1705,43 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         e.uid = op.uid;
         e.gid = op.gid;
         e.ctime_ns = e.mtime_ns = wall_time_ns();
-        s.entries[q] = e;
-        delta.upsert_entries[q] = e;
+        working.put(q, e);
         return e;
     }
     case FilesystemNamespaceMutation::Kind::rmdir: {
         if (q == "/")
             fail(EBUSY, "root");
-        auto i = s.entries.find(q);
-        if (i == s.entries.end())
+        // Stat-only: only the type decides whether this is an rmdir at all.
+        auto entry = working.get(q, false);
+        if (!entry)
             fail(ENOENT, "missing");
-        if (i->second.type != EntryType::directory)
+        if (entry->type != EntryType::directory)
             fail(ENOTDIR, "not directory");
-        // Namespace entries are ordered by path. Any child/subtree entry is
-        // immediately after its directory, so emptiness is one indexed lookup
-        // rather than a full namespace scan per recovered rmdir.
-        const auto child = s.entries.upper_bound(q);
-        if (child != s.entries.end() && under(child->first, q))
+        // Namespace entries are ordered by path, so a directory's children are
+        // the entries immediately after it -- one bounded lookup on a map, and
+        // a descent to the prefix on a tree, rather than a namespace scan per
+        // recovered rmdir.
+        if (working.first_path_under(q))
             fail(ENOTEMPTY, "not empty");
-        s.entries.erase(i);
-        delta.erase_entries.push_back(q);
+        working.erase(q);
         return {};
     }
     case FilesystemNamespaceMutation::Kind::unlink: {
-        auto i = s.entries.find(q);
-        if (i == s.entries.end())
+        // With extents: every extent this file held becomes a retirement
+        // tombstone, and a stat-only read here would retire nothing and leak
+        // every object the file owned.
+        auto entry = working.get(q);
+        if (!entry)
             fail(ENOENT, "missing");
-        if (i->second.type != EntryType::file)
+        if (entry->type != EntryType::file)
             fail(EISDIR, "directory");
         std::vector<ObjectId> retiring;
-        retiring.reserve(i->second.extents.size());
-        for (const auto& extent : i->second.extents)
+        retiring.reserve(entry->extents.size());
+        for (const auto& extent : entry->extents)
             if (!extent.hole)
                 retiring.push_back(extent.id);
         queue_garbage_batch(s, std::move(retiring), delta);
-        s.entries.erase(i);
-        delta.erase_entries.push_back(q);
+        working.erase(q);
         return {};
     }
     case FilesystemNamespaceMutation::Kind::rename: {
@@ -1750,50 +1753,41 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
             return {};
         if (under(y, x))
             fail(EINVAL, "recursive rename");
-        auto src = s.entries.find(x);
-        if (src == s.entries.end())
+        // Stat-only for the two type checks; the entries that actually move
+        // are read whole below, extents and all.
+        auto src = working.get(x, false);
+        if (!src)
             fail(ENOENT, "source missing");
-        require_parent(s, y);
-        auto dst = s.entries.find(y);
-        if (dst != s.entries.end()) {
+        require_parent(working, y);
+        if (auto dst = working.get(y); dst) {
             if (op.noreplace)
                 fail(EEXIST, "target exists");
-            if (src->second.type == EntryType::directory &&
-                dst->second.type != EntryType::directory)
+            if (src->type == EntryType::directory && dst->type != EntryType::directory)
                 fail(ENOTDIR, "cannot replace file with directory");
-            if (src->second.type != EntryType::directory &&
-                dst->second.type == EntryType::directory)
+            if (src->type != EntryType::directory && dst->type == EntryType::directory)
                 fail(EISDIR, "cannot replace directory with file");
-            if (dst->second.type == EntryType::directory) {
-                for (auto& [z, _] : s.entries) {
-                    if (z != y && under(z, y))
-                        fail(ENOTEMPTY, "target not empty");
-                }
+            if (dst->type == EntryType::directory) {
+                if (working.first_path_under(y))
+                    fail(ENOTEMPTY, "target not empty");
             } else {
                 std::vector<ObjectId> retiring;
-                retiring.reserve(dst->second.extents.size());
-                for (const auto& extent : dst->second.extents)
+                retiring.reserve(dst->extents.size());
+                for (const auto& extent : dst->extents)
                     if (!extent.hole)
                         retiring.push_back(extent.id);
                 queue_garbage_batch(s, std::move(retiring), delta);
             }
-            s.entries.erase(dst);
-            delta.erase_entries.push_back(y);
+            working.erase(y);
         }
-        std::vector<std::pair<std::string, FsEntry>> mv;
-        for (auto i = s.entries.begin(); i != s.entries.end();) {
-            if (under(i->first, x)) {
-                const auto target = y + i->first.substr(x.size());
-                delta.erase_entries.push_back(i->first);
-                delta.upsert_entries[target] = i->second;
-                mv.push_back({target, i->second});
-                i = s.entries.erase(i);
-            } else {
-                ++i;
-            }
+        // A rename moves a subtree, so it is the one operation whose cost is
+        // the subtree rather than the path. The entries come back whole
+        // because they are being re-keyed, not inspected: dropping their
+        // extents here would empty every file the rename touched.
+        for (auto& [path, entry] : working.subtree(x)) {
+            const auto target = y + path.substr(x.size());
+            working.erase(path);
+            working.put(target, entry);
         }
-        for (auto& v : mv)
-            s.entries.emplace(std::move(v));
         std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
         delta.erase_entries.erase(
             std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
@@ -1801,37 +1795,36 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
         return {};
     }
     case FilesystemNamespaceMutation::Kind::chmod: {
-        auto j = s.entries.find(q);
-        if (j == s.entries.end())
+        auto entry = working.get(q);
+        if (!entry)
             fail(ENOENT, "missing");
-        auto& i = j->second;
-        i.mode = op.mode & 07777;
-        ++i.version;
-        i.ctime_ns = wall_time_ns();
-        delta.upsert_entries[q] = i;
+        entry->mode = op.mode & 07777;
+        ++entry->version;
+        entry->ctime_ns = wall_time_ns();
+        working.put(q, *entry);
         return {};
     }
     case FilesystemNamespaceMutation::Kind::chown: {
-        auto i = s.entries.find(q);
-        if (i == s.entries.end())
+        auto entry = working.get(q);
+        if (!entry)
             fail(ENOENT, "missing");
         if (op.set_uid)
-            i->second.uid = op.uid;
+            entry->uid = op.uid;
         if (op.set_gid)
-            i->second.gid = op.gid;
-        ++i->second.version;
-        i->second.ctime_ns = wall_time_ns();
-        delta.upsert_entries[q] = i->second;
+            entry->gid = op.gid;
+        ++entry->version;
+        entry->ctime_ns = wall_time_ns();
+        working.put(q, *entry);
         return {};
     }
     case FilesystemNamespaceMutation::Kind::utimens: {
-        auto i = s.entries.find(q);
-        if (i == s.entries.end())
+        auto entry = working.get(q);
+        if (!entry)
             fail(ENOENT, "missing");
-        i->second.mtime_ns = op.mtime_ns;
-        i->second.ctime_ns = wall_time_ns();
-        ++i->second.version;
-        delta.upsert_entries[q] = i->second;
+        entry->mtime_ns = op.mtime_ns;
+        entry->ctime_ns = wall_time_ns();
+        ++entry->version;
+        working.put(q, *entry);
         return {};
     }
     }
@@ -1850,13 +1843,16 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
     FilesystemNamespaceBatchResult result;
     result.entries.resize(operations.size());
     result.record = m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        NamespaceWorkingSet working(snapshot, delta, &nodes);
         result.applied = 0;
         result.failure_code.reset();
         result.failure_message.clear();
         std::fill(result.entries.begin(), result.entries.end(), std::nullopt);
         for (size_t i = 0; i < operations.size(); ++i) {
             try {
-                result.entries[i] = apply_namespace_mutation(snapshot, delta, operations[i]);
+                result.entries[i] =
+                    apply_namespace_mutation(working, snapshot, delta, operations[i]);
                 ++result.applied;
             } catch (const FsError& error) {
                 // With no valid prefix there is nothing to publish. Preserve
@@ -2278,17 +2274,22 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
     auto q = normalize_path(p);
     FsEntry committed;
     m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
-        auto i = s.entries.find(q);
-        if (i == s.entries.end())
+        auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        NamespaceWorkingSet working(s, delta, &nodes);
+        // With extents: this compares them against the basis the handle opened
+        // with, and retires the ones the new manifest does not keep.
+        auto entry = working.get(q);
+        if (!entry)
             fail(ENOENT, "removed while open");
+        auto& current = *entry;
 
         // chmod/chown/utimens may legitimately run against an open write handle
         // (macOS cp does exactly this).  Those operations advance the inode
         // version but do not change file content, so they must not invalidate
         // the data writer.  Reject only if the content observed when the handle
         // opened has actually changed.
-        if (i->second.version != expected.version &&
-            (i->second.size != expected.size || i->second.extents != expected.extents)) {
+        if (current.version != expected.version &&
+            (current.size != expected.size || current.extents != expected.extents)) {
             // Permanently unrecoverable for this handle: `expected` was
             // captured when it opened and the entry has moved past it, so
             // retrying with the same basis fails identically forever. A
@@ -2303,7 +2304,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         // that value.  This is required for cp -p / macOS copyfile semantics,
         // which can set timestamps before the final flush/close.  Otherwise a
         // successful data write updates mtime normally.
-        const bool explicit_mtime = i->second.mtime_ns != expected.mtime_ns;
+        const bool explicit_mtime = current.mtime_ns != expected.mtime_ns;
 
         std::set<ObjectId> retained;
         for (const auto& extent : xs) {
@@ -2311,25 +2312,32 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
                 retained.insert(extent.id);
         }
         std::vector<ObjectId> retiring;
-        retiring.reserve(i->second.extents.size());
-        for (const auto& extent : i->second.extents) {
+        retiring.reserve(current.extents.size());
+        for (const auto& extent : current.extents) {
             if (!extent.hole && !retained.contains(extent.id))
                 retiring.push_back(extent.id);
         }
         queue_garbage_batch(s, std::move(retiring), delta);
 
-        const FsEntry previous = i->second;
-        i->second.size = z;
-        i->second.extents = xs;
+        const FsEntry previous = current;
+        current.size = z;
+        current.extents = xs;
         const auto now = wall_time_ns();
         if (mtime_override)
-            i->second.mtime_ns = *mtime_override;
+            current.mtime_ns = *mtime_override;
         else if (!explicit_mtime)
-            i->second.mtime_ns = now;
-        i->second.ctime_ns = now;
-        ++i->second.version;
-        committed = i->second;
+            current.mtime_ns = now;
+        current.ctime_ns = now;
+        ++current.version;
+        committed = current;
+        // record_entry_change decides between an upsert and an append, and the
+        // working set must not overwrite that choice -- an append is what keeps
+        // a growing file's delta proportional to what was added rather than to
+        // the whole extent list. So the delta is written by record_entry_change
+        // and the working set is told only what the map form still needs.
         record_entry_change(delta, q, &previous, committed);
+        if (!working.tree_backed())
+            s.entries[q] = committed;
     });
     if (out)
         *out = std::move(committed);
