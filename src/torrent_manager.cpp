@@ -256,6 +256,34 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
             action = act->asString();
     } catch (const std::exception&) {
     }
+    // A targeted add arrives as an action with no job id: the sender chose this
+    // node, so this is where the job is created.
+    if (action == "add") {
+        std::string uri;
+        try {
+            const std::string text(reinterpret_cast<const char*>(request_payload.data()),
+                                   request_payload.size());
+            auto request = Json::parse(text);
+            if (const auto* u = request.find("uri"); u && u->isString()) uri = u->asString();
+        } catch (const std::exception&) {
+        }
+        Json::Object added;
+        if (uri.empty()) {
+            added["exists"] = false;
+            added["error"] = std::string("a magnet or torrent uri is required");
+        } else {
+            try {
+                added["job_id"] = add(uri);
+                added["exists"] = true;
+            } catch (const std::exception& error) {
+                added["exists"] = false;
+                added["error"] = std::string(error.what());
+            }
+        }
+        const auto text = Json(std::move(added)).dump();
+        return Bytes(text.begin(), text.end());
+    }
+
     Json::Object out;
     const bool exists = job(job_id).has_value();
     out["exists"] = exists;
@@ -274,6 +302,66 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
         out["job"] = Json(nullptr);
     const auto text = Json(std::move(out)).dump();
     return Bytes(text.begin(), text.end());
+}
+
+TorrentService::Placement TorrentManager::add_on(const NodeId& node,
+                                                std::string_view magnet_or_uri) {
+    Placement placement;
+    placement.node_id = node;
+    if (node == NodeId{} || node == node_.node_id()) {
+        placement.node_id = node_.node_id();
+        try {
+            placement.job_id = add(std::string(magnet_or_uri));
+            placement.placed = true;
+        } catch (const std::exception& error) {
+            placement.error = error.what();
+        }
+        return placement;
+    }
+
+    // A named node that is not in the active set is an error, not a reason to
+    // download it here: silently placing the job somewhere the operator did not
+    // ask for is exactly what this call exists to stop.
+    const auto peers = node_.membership().active();
+    const auto peer = std::find_if(peers.begin(), peers.end(),
+                                   [&](const NodeInfo& info) { return info.id == node; });
+    if (peer == peers.end()) {
+        placement.error = "node " + to_string(node) + " is not an active member of this cluster";
+        return placement;
+    }
+
+    Json::Object request;
+    request["action"] = std::string("add");
+    request["uri"] = std::string(magnet_or_uri);
+    const auto request_text = Json(std::move(request)).dump();
+    const Bytes request_bytes(request_text.begin(), request_text.end());
+    try {
+        auto reply = node_.call(*peer, MessageType::torrent_job_action, request_bytes,
+                                FrameType::control);
+        if (reply.message.type != MessageType::torrent_job_action_reply) {
+            placement.error = "node " + to_string(node) + " refused the request";
+            return placement;
+        }
+        const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
+                               reply.message.payload.size());
+        auto parsed = Json::parse(text);
+        if (const auto* placed = parsed.find("exists"); placed && placed->isBool() &&
+                                                        placed->asBool()) {
+            if (const auto* id = parsed.find("job_id"); id && id->isString()) {
+                placement.job_id = id->asString();
+                placement.placed = true;
+                return placement;
+            }
+        }
+        if (const auto* error = parsed.find("error"); error && error->isString())
+            placement.error = error->asString();
+        else
+            placement.error = "node " + to_string(node) + " did not start the job";
+    } catch (const std::exception& error) {
+        placement.error = std::string("node ") + to_string(node) + " is unreachable: " +
+                          error.what();
+    }
+    return placement;
 }
 
 std::vector<ClusterTorrentJob> TorrentManager::jobs_cluster_wide() const {
