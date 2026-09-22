@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "filesystem.hpp"
+#include "namespace_control_store.hpp"
 #include "crypto.hpp"
 #include "codec.hpp"
 #include "hydration.hpp"
@@ -2408,8 +2409,16 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
                 live.push_back(extent.id);
         }
     };
-    for (const auto& [_, entry] : snapshot.entries)
-        add_entry_extents(entry);
+    // The reachability walk, and the one that decides what GC may delete. It
+    // goes through for_each_namespace_entry so that a snapshot whose namespace
+    // is a tree is walked rather than read as empty -- an empty live set here
+    // is not a small mistake, it is every extent in the library looking
+    // unreachable at once.
+    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    for_each_namespace_entry(snapshot, &namespace_nodes,
+                             [&](const std::string&, const FsEntry& entry) {
+                                 add_entry_extents(entry);
+                             });
 
     // Unresolved conflict alternatives are reachability roots just as surely as
     // the effective namespace. Count their physical extents for diagnostics and

@@ -4,6 +4,7 @@
 #include "metadata.hpp"
 #include "types.hpp"
 
+#include <functional>
 #include <map>
 #include <optional>
 #include <span>
@@ -136,6 +137,31 @@ struct NamespaceTreeStats {
 // set alone; see property 1 above.
 ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, NamespaceNodeStore& store,
                               const NamespaceTreeLimits& limits = {});
+
+// One entry at a time, in path order, without a map of the namespace existing
+// anywhere. Every full-scan reader wants this rather than `read_namespace_tree`:
+// the catalogue scan, the media index rebuild and the reachability walks all
+// pass over the namespace once and keep something much smaller than it.
+using NamespaceVisitor = std::function<void(const std::string& path, const FsEntry& entry)>;
+void walk_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
+                         const NamespaceVisitor& visit);
+
+// The namespace of a snapshot, whichever form it is in: the inline map when
+// there is one, the tree when the snapshot carries a root. This is what a
+// reader converted for Stage C calls, so that it works before and after the
+// cutover and so that a detached namespace can never be read as an empty one.
+// Throws if the snapshot is detached and no store is supplied, rather than
+// visiting nothing and reporting success.
+void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                              const NamespaceVisitor& visit);
+
+// One path from a snapshot, whichever form its namespace is in. The map when
+// there is one; a path from the root to a leaf when there is a tree, which
+// fetches at most `depth` nodes and, with `with_extents` false, no extent node
+// at all. Throws if the snapshot is detached and no store is supplied.
+std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
+                                       const NamespaceNodeStore* store, std::string_view path,
+                                       bool with_extents = true);
 
 // Materialises the whole namespace back out. This is the inverse of the build
 // and exists to prove the round trip, not because anything on the hot path
