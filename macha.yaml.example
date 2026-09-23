@@ -567,15 +567,13 @@ torrent:
   # also subscribes libtorrent's internal log categories.
   log_level: INFO
 
-  # The rate a download is held to while the DATA device is defending its
-  # service time (see dht.io_pressure_target_ms). libtorrent writes straight to
-  # its save path and never enters the DATA arbiter, so bounding macha's own
-  # extent writes does nothing about a download saturating the same spindle --
-  # measured on 2026-09-22 at 17 MB/s onto a 9.1 TB disk at 90% utilisation,
-  # load 13 on four cores, with no import running.
-  #
-  # 0 never clamps.
-  pressure_download_rate: 2M
+  # Threads doing the torrent's file I/O. Every read, write and hash they
+  # perform is admitted by the DATA arbiter as loader work and timed into the
+  # disk service monitor, so a download yields to a viewer on a slow device and
+  # the network waits for the disk. libtorrent's own backend ran ten, outside
+  # both, and on 2026-09-23 they wrote 65 MB/s onto a DATA spindle while
+  # macha's own writes waited behind them.
+  disk_threads: 2
   dht: true
   pex: true
   lsd: true
