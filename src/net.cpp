@@ -44,8 +44,8 @@ constexpr size_t data_worker_count = 8;
 // otherwise already be inside synchronous storage handlers.
 constexpr size_t foreground_data_worker_reserve = 2;
 static_assert(foreground_data_worker_reserve < data_worker_count);
-constexpr size_t max_pending_requests = 512;
-constexpr size_t max_peer_outbound = 256;
+constexpr size_t max_pending_requests = max_pending_rpc_requests;
+constexpr size_t max_peer_outbound = max_peer_outbound_messages;
 // A connection owns at most this many queued payload bytes. The writer may
 // additionally own one dequeued message, itself bounded to the same size.
 constexpr size_t max_peer_outbound_bytes = 128ULL * 1024 * 1024;
@@ -681,6 +681,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "session_sync";
     case MessageType::have_objects:
         return "have_objects";
+    case MessageType::have_control_objects:
+        return "have_control_objects";
     case MessageType::dial_request:
         return "dial_request";
     case MessageType::dial_back_probe:
@@ -725,6 +727,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "session_sync_reply";
     case MessageType::have_objects_reply:
         return "have_objects_reply";
+    case MessageType::have_control_objects_reply:
+        return "have_control_objects_reply";
     case MessageType::user_sync:
         return "user_sync";
     case MessageType::user_sync_reply:
@@ -2235,27 +2239,39 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
             return stalled_call_for_tests_locked();
     }
 
+    std::string route_error;
     if (expected)
-        if (auto existing = call_existing(*expected, lane, type, payload, frame_type))
+        if (auto existing =
+                call_existing(*expected, lane, type, payload, frame_type, &route_error))
             return std::move(*existing);
 
     NodeId actual{};
     auto outbound = connection(endpoint, expected, &actual, lane);
+    // Why the canonical route could not carry this call. Swallowing it was a
+    // real outage: a caller exhausting the connection's shared pending-reply
+    // budget threw "peer pending reply limit reached" here, the reason was
+    // discarded, and every layer above reported "no canonical RPC route to
+    // peer" -- a dead link. On 2026-09-22 that turned a self-inflicted
+    // concurrency limit into hours of ingest failures blamed on the WAN, and
+    // the true message had never once been logged on any node in the cluster.
     if (outbound && outbound->usable()) {
         try {
             return outbound->call(type, payload, frame_type);
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            route_error = error.what();
         }
     }
-    if (auto existing = call_existing(actual, lane, type, payload, frame_type))
+    if (auto existing = call_existing(actual, lane, type, payload, frame_type, &route_error))
         return std::move(*existing);
-    throw std::runtime_error("no canonical RPC route to peer");
+    throw std::runtime_error(route_error.empty()
+                                 ? "no canonical RPC route to peer"
+                                 : "no canonical RPC route to peer: " + route_error);
 }
 
 std::optional<AsyncRpc> RpcClient::call_existing(const NodeId& peer, TransportLane lane,
                                                  MessageType type,
                                                  std::span<const uint8_t> payload,
-                                                 FrameType frame_type) {
+                                                 FrameType frame_type, std::string* why) {
     std::shared_ptr<PeerConnection> outbound;
     std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
     {
@@ -2274,14 +2290,18 @@ std::optional<AsyncRpc> RpcClient::call_existing(const NodeId& peer, TransportLa
         ++connections_reused_;
         try {
             return outbound->call(type, payload, frame_type);
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            if (why)
+                *why = error.what();
         }
     }
     if (inbound) {
         ++connections_reused_;
         try {
             return inbound(type, payload, frame_type);
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            if (why)
+                *why = error.what();
         }
     }
     return std::nullopt;
