@@ -464,16 +464,15 @@ struct TorrentConfig {
     size_t max_active{4};
     uint64_t max_download_rate{}; // bytes/s, 0 = unlimited
     uint64_t max_upload_rate{};   // bytes/s, 0 = unlimited
-    // The rate a download is held to while the DATA device is defending its
-    // service time (see dht.io_pressure_target_ms). libtorrent writes straight
-    // to its save path and never enters the DATA arbiter, so gating macha's own
-    // extent writes does nothing about it: a download saturating the spindle
-    // starves a viewer exactly as an ingest does, and on 2026-09-22 that was
-    // measured at 17 MB/s onto a 9.1 TB disk sitting at 90% utilisation with
-    // load 13 on four cores.
+    // Threads doing the torrent's file I/O. Every read, write and hash they
+    // perform is admitted by the DATA arbiter at loader class and timed into
+    // the disk service monitor (src/torrent_disk_io.hpp). libtorrent's own
+    // backend ran ten, outside both, and on 2026-09-23 they wrote 65 MB/s onto
+    // es-1's DATA spindle while macha's own writes waited behind them.
     //
-    // 0 means never clamp, which is the previous behaviour.
-    uint64_t pressure_download_rate{2ULL * 1024 * 1024};
+    // This replaces pressure_download_rate, a rate clamp gated on a two-second
+    // viewer window that flipped 300 times an hour and limited nothing.
+    size_t disk_threads{2};
     // Threshold for the libtorrent alert stream bridged into the journal,
     // independent of the process log_level in the same way ffmpeg_log_level
     // is. INFO (the default) keeps the explicit lines -- listen, DHT

@@ -1,5 +1,59 @@
 # Current release
 
+## 0.54.0 — The torrent's disk I/O is macha's disk I/O (development)
+
+**libtorrent now does its file I/O through a disk backend of macha's own, and
+every read, write and hash it performs is admitted by the DATA arbiter at
+loader class and timed into the disk service monitor.** Until now libtorrent
+used its default backend: ten threads of plain file I/O that neither admission
+nor the monitor ever saw. On 2026-09-23 that pool wrote 65 MB/s of torrent
+payload onto es-1's DATA spindle (91% busy, ~190 ms per write). The monitor
+measured macha's own extent writes taking 30-100x their expected time,
+declared the device pressured, and the arbiter throttled publication to one
+slot -- which gbni-1 and es-1 then each held across a put to the other.
+Seven ingests died with `CONTROL retention floor unavailable before metadata
+publication`. The diagnosis is in
+`TODO/2026-09-23-torrent-writes-starve-publication-incident.md`.
+
+The backend (`src/torrent_disk_io.cpp`) implements libtorrent's
+`disk_interface` on the public API only, for 2.0 (the nodes) and 2.1:
+
+- **Admitted as a loader.** An acquisition is durable work someone asked for,
+  so it yields to a slow device only when a viewer would otherwise wait
+  (law 2), like the ingest that follows it.
+- **Measured on the right device.** The torrent's I/O is fed to the DATA
+  device's monitor only when staging shares that device, which it does on
+  every node today. The monitor's verdict now describes the load that is
+  actually on the disk.
+- **Backpressure, not a clamp.** When admission holds writes back, the
+  queued-write limit (`max_queued_disk_bytes`) tells libtorrent to stop
+  reading from peers until the disk drains: the network rate follows what the
+  disk admits.
+- **Bounded.** `torrent.disk_threads` (default 2) workers, and at most 64 open
+  descriptors per torrent, where a discography is thousands of files.
+- **Ordered.** One torrent's jobs run strictly in the order libtorrent issued
+  them, because libtorrent may ask for a piece's hash before the writes of its
+  blocks have completed.
+
+Payload is still written in the torrent's own file layout under the save path,
+so the ingest that runs after a download is unchanged. Assembling extents in
+staging and publishing each one as it is verified is the next stage of
+`TODO/2026-09-23-torrent-disk-backend-plan.md`.
+
+**Removed: `torrent.pressure_download_rate`**, the rate clamp that flipped on
+and off with a two-second viewer window. es-1 logged 287 clamps and 287
+restores in one hour on 2026-09-23, and the torrent wrote 65 MB/s throughout.
+A node that still sets the key is unaffected; the parser ignores it.
+
+**Added: `torrent.disk_threads`** (default 2, at least 1).
+
+Tests: a new `macha-tests-torrent` binary drives the backend through
+`disk_interface` as a session does, including a loopback swarm that
+downloads a hybrid v1/v2 multi-file torrent three times over and checks the
+payload is byte-identical, every admission was loader class, every credit
+came back, and delete left no payload and no open descriptor. 200/200 on
+es-1. It links libtorrent, which `macha_core` and `macha-tests` never do.
+
 ## 0.53.2 — The torrent alert stream has its own log level (development)
 
 **`torrent.log_level`.** With the process at `DEBUG`, libtorrent's DHT and

@@ -23,6 +23,15 @@ that assembles extents in staging and publishes each one as soon as it is
 verified, under the DATA arbiter at loader class. Four stages, the first of
 which alone removes the mechanism.
 
+**Approved next, after stage 1 is deployed and observed (operator,
+2026-09-24): a `kind` filter on `GET /api/v1/catalogue/search`**, asked for
+by the Core client session. A repeated `kind` parameter (`movie`, `show`,
+`season`, `episode`, `artist`, `album`, `track`, in any combination),
+filtered **before** `limit` is applied; absent means every kind, as today;
+an unknown value is a 400, never ignored. Today the route takes only `q` and
+`limit` (`src/catalogue_api.cpp`, around line 417), so Core over-fetches 200
+and keeps 50, and still gets short pages. Tell Core the version it ships in.
+
 **Cluster state:** all three live nodes (gbni-1, es-1, fi-1) run **0.53.2**,
 converged at one accepted head, `required=2 replicas=2`. gbni-2 is defunct
 for months (operator). Every node's config carries `torrent.log_level: INFO`.

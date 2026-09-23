@@ -22,6 +22,8 @@
 #include <sstream>
 #include <system_error>
 
+#include <sys/stat.h>
+
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/error_code.hpp>
@@ -120,8 +122,10 @@ lt::alert_category_t alert_mask_for(LogLevel level) {
     return mask;
 }
 
-lt::session_params make_session_params(const TorrentConfig& config, std::string_view advertise) {
+lt::session_params make_session_params(const TorrentConfig& config, std::string_view advertise,
+                                       TorrentDiskHooks disk_hooks) {
     lt::session_params params;
+    params.disk_io_constructor = macha_disk_io_constructor(std::move(disk_hooks));
     auto& settings = params.settings;
     settings.set_str(lt::settings_pack::listen_interfaces,
                      torrent_listen_interfaces(config, advertise));
@@ -170,8 +174,8 @@ struct TorrentManager::Impl {
     std::map<std::string, libtorrent::torrent_handle, std::less<>> handles;
     CurlHttpClient http;
 
-    Impl(const TorrentConfig& config, std::string_view advertise)
-        : session(make_session_params(config, advertise)) {}
+    Impl(const TorrentConfig& config, std::string_view advertise, TorrentDiskHooks disk_hooks)
+        : session(make_session_params(config, advertise, std::move(disk_hooks))) {}
 };
 
 TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, TorrentConfig config,
@@ -183,7 +187,7 @@ TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, Torrent
         [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
     if (!config_.enabled) return;
     std::filesystem::create_directories(state_file_.parent_path());
-    impl_ = std::make_unique<Impl>(config_, node_.config().advertise_host);
+    impl_ = std::make_unique<Impl>(config_, node_.config().advertise_host, disk_hooks());
     // Alerts arrive on libtorrent's own thread; this only wakes the worker,
     // which does the draining. Without it a settled manager blocks on the
     // condition and never reads the queue.
@@ -916,49 +920,42 @@ void TorrentManager::drain_alerts() {
     }
 }
 
-void TorrentManager::follow_device_pressure() {
-    if (!config_.pressure_download_rate || !impl_)
-        return;
-    bool clamp = false;
-    try {
-        // Reads the pool's measured service time. Wrapped because the DATA pool
-        // is not available during early start-up or on an edge node that holds
-        // no extents, and a torrent session must not fail to tick over that.
-        //
-        // Law 2, and the clause this missed until 0.53.0: an acquisition is
-        // durable work the user asked for, so it is loader-class and yields
-        // to a slow device only when a viewer would otherwise wait for it. The
-        // arbiter was corrected for this in 0.52.0; this path was not, and it
-        // went on clamping a download to 2 MB/s on a device that was merely
-        // busy with nobody watching -- es-1 did it twelve times in the
-        // thirty-four minutes after it started 0.52.0.
-        clamp = node_.local_store().service_monitor().pressured() &&
-                node_.viewer_recently_active(node_.config().maintenance.foreground_quiet);
-    } catch (const std::exception&) {
-        return;
+TorrentDiskHooks TorrentManager::disk_hooks() const {
+    TorrentDiskHooks hooks;
+    hooks.threads = config_.disk_threads;
+    NodeRuntime* node = &node_;
+    hooks.admit = loader_admission(node_.data_resources());
+    // The DATA device's monitor hears the torrent's I/O only when staging
+    // lives on a DATA backend's device. On every node today it does
+    // (/mnt/diskB/ingest beside /mnt/diskB), and that is why the monitor's
+    // verdict on 2026-09-23 described the torrent's load and blamed macha's.
+    struct stat staging_stat {};
+    bool shared = false;
+    if (::stat(ingest_.staging().path().c_str(), &staging_stat) == 0) {
+        for (const auto& backend : node_.config().storage_backends) {
+            struct stat backend_stat {};
+            if (::stat(backend.path.c_str(), &backend_stat) == 0 &&
+                backend_stat.st_dev == staging_stat.st_dev)
+                shared = true;
+        }
     }
-    const bool pressured = clamp;
-    if (pressured == download_rate_clamped_)
-        return;
-
-    libtorrent::settings_pack settings;
-    const auto rate = pressured ? config_.pressure_download_rate : config_.max_download_rate;
-    settings.set_int(libtorrent::settings_pack::download_rate_limit,
-                     static_cast<int>(std::min<uint64_t>(rate, INT_MAX)));
-    impl_->session.apply_settings(std::move(settings));
-    download_rate_clamped_ = pressured;
-    Log::info(std::string("torrent download rate ") +
-              (pressured ? "clamped: a viewer is waiting on a DATA device that is slow"
-                         : "restored: no viewer is waiting, or the DATA device recovered") +
-              " limit_bytes_per_s=" + std::to_string(rate));
+    if (shared) {
+        hooks.observe = [node](std::chrono::nanoseconds elapsed, uint64_t bytes) {
+            try {
+                node->local_store().service_monitor().note(elapsed, bytes);
+            } catch (const std::exception&) {
+                // No DATA pool yet (early start-up) or none at all (edge node).
+            }
+        };
+    }
+    Log::info("torrent disk backend threads=" + std::to_string(hooks.threads) +
+              " admission=loader monitor=" + (shared ? "data-device" : "none (staging on another device)"));
+    return hooks;
 }
 
 void TorrentManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         drain_alerts();
-        // Before sampling jobs, so a device that went under during the last
-        // half-second is answered on this tick rather than the next.
-        follow_device_pressure();
         update_jobs();
         std::unique_lock lock(mutex_);
         if (has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire)) {

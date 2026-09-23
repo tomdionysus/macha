@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.53.2 LANGUAGES CXX)
+project(macha VERSION 0.54.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -364,7 +364,8 @@ file(RELATIVE_PATH MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR
      "${MACHA_PLUGIN_INSTALL_DIR_FULL}"
      "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
 if(MACHA_LIBTORRENT_TARGET)
-    add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_plugin.cpp)
+    add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_plugin.cpp
+        src/torrent_disk_io.cpp)
     target_link_libraries(macha-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
     set_target_properties(macha-torrent PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${MACHA_PLUGIN_BUILD_DIR}"
@@ -644,6 +645,26 @@ if(MACHA_BUILD_TESTS)
         set_tests_properties(macha-tests-runtime PROPERTIES TIMEOUT 300)
     else()
         message(STATUS "yaml-cpp and/or FFmpeg development files not found; runtime-adapter tests will not be built")
+    endif()
+    # The torrent disk backend, driven through libtorrent's disk_interface as a
+    # session drives it. Its own binary because it links libtorrent, which
+    # macha_core and macha-tests deliberately never do.
+    if(TARGET macha-torrent)
+        add_executable(macha-tests-torrent
+            tests/main.cpp
+            tests/test_framework.cpp
+            tests/test_torrent_disk_io.cpp
+            src/torrent_disk_io.cpp)
+        target_link_libraries(macha-tests-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
+        target_compile_definitions(macha-tests-torrent PRIVATE
+            MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(macha-tests-torrent PRIVATE -Wall -Wextra -Wpedantic)
+            if(MACHA_WARNINGS_AS_ERRORS)
+                target_compile_options(macha-tests-torrent PRIVATE -Werror)
+            endif()
+        endif()
+        add_test(NAME macha-tests-torrent COMMAND macha-tests-torrent)
     endif()
 endif()
 

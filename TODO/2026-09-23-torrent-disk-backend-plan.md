@@ -1,6 +1,23 @@
 # The torrent writes into the store: a macha disk backend for libtorrent
 
-Status: planned 2026-09-23, not started. This is the fix for
+Status: **stage 1 built and tested 2026-09-24, not yet committed or
+deployed** (0.54.0 in the tree): es-1 full suite 525/525 + runtime 10/10 +
+`macha-tests-torrent` 10/10, the torrent binary 200/200 over 20 repeats
+there, including a loopback swarm through the backend. Stages 2-4 not
+started.
+
+**The laptop cannot host a real libtorrent session** (the swarm test fails
+there, every time): `/usr/local/include/boost` is a manual Boost 1.91 install
+that shadows Homebrew's 1.92, and CMake finds it
+(`Boost_DIR=/usr/local/lib/cmake/Boost-1.91.0`), while Homebrew's libtorrent
+2.1.1 was built against 1.92. Asio is header-only, so the test binary and the
+dylib disagree about object layout and the heap is corrupted inside
+`session_impl::setup_listener`. Proven with AddressSanitizer and a standalone
+probe. The nodes are unaffected (Debian's Boost 1.83 and libtorrent 2.0.11
+come from the same distribution). Fixing the laptop is the operator's call;
+until then run torrent tests on es-1.
+
+Previously: planned 2026-09-23. This is the fix for
 [torrent writes starve publication](2026-09-23-torrent-writes-starve-publication-incident.md);
 nothing else is worked on until it ships.
 
