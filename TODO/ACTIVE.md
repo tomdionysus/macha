@@ -9,6 +9,20 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here if you are new to this work.**
 
+**STOP. Work on nothing else until this is fixed (operator, 2026-09-23
+evening):** [torrent writes starve publication](2026-09-23-torrent-writes-starve-publication-incident.md).
+libtorrent's ten-thread disk pool writes torrent payload onto the DATA
+spindle outside every admission control; the disk monitor sees only the
+consequence, declares pressure, and throttles publication to one slot, which
+both nodes then hold across a put to each other. Seven ingests died on
+2026-09-23 with `CONTROL retention floor unavailable`. The file has the
+proof, the mechanism, and the design questions that are the operator's to
+answer before any code is changed. **Decided 2026-09-23 evening:** the fix
+is [a macha disk backend for libtorrent](2026-09-23-torrent-disk-backend-plan.md)
+that assembles extents in staging and publishes each one as soon as it is
+verified, under the DATA arbiter at loader class. Four stages, the first of
+which alone removes the mechanism.
+
 **Cluster state:** all three live nodes (gbni-1, es-1, fi-1) run **0.53.2**,
 converged at one accepted head, `required=2 replicas=2`. gbni-2 is defunct
 for months (operator). Every node's config carries `torrent.log_level: INFO`.
@@ -59,20 +73,63 @@ measurement. **A client's account of itself is evidence about the client, not
 a fact.**
 
 -5. **`rpc_cluster/test_service_metadata_repair_coalesces_real_generation_burst`
-   failed once in the full suite on es-1 (2026-09-23, 0.53.2 build), NOT
-   FIXED.** `tests/test_rpc_cluster.cpp:2616`:
+   was a product race, not load noise -- FIXED in the tree 2026-09-23, not yet
+   released.** `tests/test_rpc_cluster.cpp:2616`:
    `CHECK failed: s2.node().metadata_announcements() == announcements_before + burst + 1`.
-   Passed 10/10 in isolation on the same node straight afterwards. The suite
-   was running beside three live imports on that node and the assertion is an
-   exact count of announcements after a burst, so the likely shape is the
-   coalescing window opening or closing on load rather than a regression --
-   0.53.2 touches only the torrent alert bridge. Recorded rather than filed as
-   a flake; re-run under `--repeat` on a quiet node before trusting either
-   reading.
+
+   It passes 20/20 serial and 40/40 parallel on a quiet es-1, and fails
+   **12/120** on the laptop at `--jobs 12` -- contention exposes it, it does not
+   cause it. Instrumented: the failing run announces generation 16 **twice**
+   (34 against 33). `NodeRuntime::accept_metadata_commit` decided whether the
+   accepted-head set changed by copying it before and after
+   `MetadataReplica::accept_commit`, outside the replica lock. A repeated,
+   no-op gen-16 certificate whose two copies straddled the install of gen 17
+   saw the heads differ and announced a change it did not make. Only
+   duplicates, never a missed change; each duplicate is a spurious
+   `metadata_notice` broadcast and epoch bump, i.e. peer cache invalidation for
+   nothing -- against the "repeated evidence is intentionally a no-op" contract
+   at `src/metadata_manager.cpp` `accept_commit_on`.
+
+   Fix: `accept_commit` reports the `changed` it already computes under the
+   lock (optional `bool* heads_changed`), and `NodeRuntime` announces on that.
+   After: **0/120** at `--jobs 12`. The existing case is the regression test.
+   - [ ] Confirm on es-1 with the next build (`--repeat 20`, parallel).
+
+-4a. **`media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`
+   fails 9/20 on the laptop at `--jobs 12` at HEAD `eea4795` (2026-09-23), NOT
+   DIAGNOSED.** `tests/test_media_playback.cpp:2054`:
+   `CHECK failed: playback.handle(current).status == 200`. Found in a full
+   laptop suite run; unrelated to the -5 fix (fails with it stashed). Not
+   previously recorded anywhere. Measure on es-1 before diagnosing.
+
+   **Two more, from the laptop full suite of 2026-09-23 with the -5/-4 fixes
+   in the tree, neither caused by them, NOT DIAGNOSED:**
+   - `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`,
+     `tests/test_rpc_cluster.cpp:4753`: `CHECK failed: state->asString() == "queued"`.
+     1/20 at HEAD `eea4795` in isolation at `--jobs 12`, 0/20 with the fixes.
+   - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`,
+     `tests/test_storage_v18.cpp:605`: `CHECK failed: !reopened.has(truncated_id)`.
+     20/20 in isolation both with and without the fixes; failed only inside
+     the full suite. A presence check that says a truncated object is present
+     is worth a look on its own, whatever the timing.
+
+   **`rpc_cluster/test_storage_data_credit_reserves_viewer_headroom_and_control`
+   -- FIXED in the tree 2026-09-23 (test only).** Not the barrier's backoff
+   after all, though it throws the same message. The node records the test's
+   bare `RpcClient` as a peer from the handshake and pings it back over the
+   same connection; the client has no inbound handler, `dispatch_inbound`
+   throws, and the reader loop closes the connection and fails every pending
+   call on it -- hence three different "uncaught" messages and the early
+   `blocked_loader` completion. Proven with a temporary log at the throw
+   (`type=ping` in every failing run). 10-15/20 before, **40/40** after giving
+   the client an `RpcServer` that answers, the pattern the telemetry test at
+   the top of the file already uses. The product is untouched on purpose
+   (operator, 2026-09-23: don't change the product just to test it);
+   `NodeRuntime` installs its handler in its constructor, before any dial.
 
 -4. **P0: both durability-barrier-after-peer-restart tests fail most of the
-   time, and neither is a flake or caused by 0.53.0 (measured 2026-09-23, NOT
-   FIXED).**
+   time, and neither is a flake or caused by 0.53.0 (measured 2026-09-23;
+   FIXED in the tree 2026-09-23, not yet released -- see the ticked boxes).**
 
    Measured on the laptop, in isolation, `--repeat 8`, with the 0.53.0 changes
    and again with them stashed at `5c5d008`:
@@ -122,14 +179,34 @@ a fact.**
 
    That makes this **two findings**:
 
-   - [ ] **The `catch (...) {}` is a real defect on its own**, whatever the
+   - [x] **Fixed 2026-09-23:** the launch failure is recorded as
+     `remote-launch-failed: <reason>` and still scored transient. With it, the
+     failing runs say what the swallowed exception was, 5/5:
+     **`remote-launch-failed: peer in retry backoff`**. a's dial to b failed
+     while b was down, `RpcClient::observe_result` put the endpoint in backoff
+     (250 ms doubling to 4 s), and `RpcClient::connection` refuses a new dial
+     until it expires -- even though membership already shows b active.
+     Original finding: **The `catch (...) {}` is a real defect on its own**, whatever the
      test does. The `outcome` map exists precisely so a failure says which
      peer and whether it was the epoch, the barrier or the transport that said
      no — its own comment records a bare "required=1 durable=0" spinning
      gbni-1 for half an hour on 2026-09-06. Swallowing the launch exception
      reintroduces that blindness one layer down: "could not send" and "did not
      try" become the same string. Record the reason and let it be scored.
-   - [ ] **The tests are racing the transport, not testing the contract.**
+   - [x] **Fixed 2026-09-23:** both cases now ask again until the answer is
+     definitive (durable, or an id named unsatisfiable), within 30 s -- the
+     pattern `..._treats_an_unreachable_peer_as_transient` already used.
+     Laptop `--jobs 12 --repeat 20` over every durability-barrier case:
+     **100/100**, each restart case now ~2.6 s against ~0.6 s (the backoff).
+   - [ ] **Open, a product question, not changed:** an inbound session from a
+     peer (proof it is up) does not clear the backoff on that peer's endpoint
+     for other lanes, so after a peer restart a node refuses to dial it for up
+     to 4 s. Everything that hits it is transient and retried, so it costs
+     latency, not correctness. `rpc_cluster/test_storage_data_credit_reserves_viewer_headroom_and_control`
+     dies on the same exception (`peer in retry backoff`, 6-8/20 on the
+     laptop at `--jobs 12`) and is probably the same test shape; check before
+     assuming.
+     Original finding: **The tests are racing the transport, not testing the contract.**
      They wait for membership to show both nodes active after the restart,
      which is liveness, not an open data connection. The first barrier
      routinely cannot send at all, so the definitive answer the assertion wants
@@ -146,7 +223,11 @@ a fact.**
    before attributing an intermittent failure to a change**, and never attribute
    one on a single run.
 
-   - [ ] Confirm on a node. Everything above is macOS/clang, and
+   - [x] **Confirmed on es-1, 2026-09-23 (0.53.2 build, quiet node): both
+     cases pass 20/20 serial and 20/20 at 4 parallel slots.** The platform
+     split recorded on 2026-09-17 holds after all; the laptop's ~50% is not
+     reproduced on the node. The `catch (...) {}` defect stands regardless.
+     Original note: Everything above is macOS/clang, and
      `..._rederives_placement_after_peer_restart` was recorded in 2026-09-17 as
      failing 12/12 on macOS and passing 3/3 on es-1. That it now fails only
      4-6 times in 8 on the same machine means the earlier reading no longer
