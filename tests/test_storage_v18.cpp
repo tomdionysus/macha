@@ -1287,9 +1287,15 @@ MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer
 
     // The dead token is re-derived, not re-sent: the barrier succeeds and the
     // batch now names b's new epoch, with the object still present exactly
-    // once on b.
+    // once on b. Membership is liveness, not a route: a's dial to b failed
+    // while b was down, so the first barriers may be refused with "peer in
+    // retry backoff" -- transient, and the contract is to ask again.
     std::vector<ObjectId> unsatisfiable;
-    CHECK(a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
+    REQUIRE(wait_until([&] {
+        unsatisfiable.clear();
+        return a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable) ||
+               !unsatisfiable.empty();
+    }, 30s));
     CHECK(unsatisfiable.empty());
     bool restamped = false;
     for (const auto& requirement : batch.requirements)
@@ -1380,8 +1386,17 @@ MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_pe
     REQUIRE(b.node().local_store().remove(id));
     REQUIRE(!b.node().local_store().has(id));
 
+    // Ask until the answer is definitive. Until a's backoff from the failed
+    // dial expires the barrier cannot reach b, which is transient and names
+    // nothing; the loss can only be reported once b has been asked.
     std::vector<ObjectId> unsatisfiable;
-    CHECK(!a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
+    bool durable = false;
+    REQUIRE(wait_until([&] {
+        unsatisfiable.clear();
+        durable = a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
+        return durable || !unsatisfiable.empty();
+    }, 30s));
+    CHECK(!durable);
     REQUIRE(unsatisfiable.size() == 1);
     CHECK(unsatisfiable.front() == id);
 }
