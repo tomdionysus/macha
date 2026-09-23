@@ -9,6 +9,16 @@ endif()
 
 project(macha VERSION 0.53.2 LANGUAGES CXX)
 
+# README.md states the version under its header as *vX.Y.Z*. Refuse to
+# configure when it disagrees with the project version, so a release cannot
+# ship with a stale README.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/README.md" MACHA_README_VERSION
+     REGEX "^\\*v[0-9]+\\.[0-9]+\\.[0-9]+\\*$" LIMIT_COUNT 1)
+if(NOT MACHA_README_VERSION STREQUAL "*v${PROJECT_VERSION}*")
+    message(FATAL_ERROR "README.md version line '${MACHA_README_VERSION}' does not match "
+                        "project version ${PROJECT_VERSION}; update it to *v${PROJECT_VERSION}*")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
