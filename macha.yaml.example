@@ -561,6 +561,11 @@ torrent:
   max_active: 4
   max_download_rate: 0B  # 0 = unlimited
   max_upload_rate: 0B    # 0 = unlimited
+  # Threshold for libtorrent's alert stream, independent of the top-level
+  # log_level. INFO keeps listen/DHT/port-mapping lines and warnings; DEBUG
+  # bridges every alert (thousands of lines a minute on a busy node); ALL
+  # also subscribes libtorrent's internal log categories.
+  log_level: INFO
 
   # The rate a download is held to while the DATA device is defending its
   # service time (see dht.io_pressure_target_ms). libtorrent writes straight to

@@ -474,6 +474,16 @@ struct TorrentConfig {
     //
     // 0 means never clamp, which is the previous behaviour.
     uint64_t pressure_download_rate{2ULL * 1024 * 1024};
+    // Threshold for the libtorrent alert stream bridged into the journal,
+    // independent of the process log_level in the same way ffmpeg_log_level
+    // is. INFO (the default) keeps the explicit lines -- listen, DHT
+    // bootstrap, port mapping, and every WARN -- and drops the per-alert
+    // chatter; DEBUG bridges every alert the session already subscribes to;
+    // ALL additionally subscribes the tracker, peer and libtorrent internal
+    // log categories. Split out on 2026-09-23 after DHT alerts at DEBUG were
+    // 99.9% of gbni-1's journal and had evicted its entire diagnostic
+    // record in nine hours.
+    LogLevel log_level{LogLevel::info};
     bool dht{true};
     bool pex{true};
     bool lsd{true};

@@ -1,5 +1,19 @@
 # Current release
 
+## 0.53.2 — The torrent alert stream has its own log level (development)
+
+**`torrent.log_level`.** With the process at `DEBUG`, libtorrent's DHT and
+tracker alerts were 99,088 of the 99,187 lines in gbni-1's journal -- 99.9% --
+and had evicted every line of the previous night's diagnostic record within
+nine hours. The alert bridge now has its own threshold, independent of
+`log_level` in the same way `ffmpeg_log_level` is: `INFO` (the default) keeps
+the explicit listen, DHT-bootstrap, port-mapping and warning lines and drops
+the per-alert chatter; `DEBUG` bridges every alert the session subscribes to;
+`ALL` additionally subscribes libtorrent's internal tracker, peer, session,
+torrent and DHT log categories. Like the ffmpeg bridge it emits past the
+process filter, so a node at `INFO` can still turn it on. Applies live on
+reconfigure.
+
 ## 0.53.1 — A commit publishes what changed, not what exists (development)
 
 **Every metadata commit re-uploaded its entire control graph to every peer, on

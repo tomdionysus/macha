@@ -105,6 +105,21 @@ TorrentJob parse_torrent_job(const Json& value) {
 
 namespace lt = libtorrent;
 
+// Which alert categories the session subscribes to for a given
+// torrent.log_level. error/status/port_mapping/dht are always on: the drain
+// loop reads listen, bootstrap and port-mapping outcomes from them, and a
+// session that reported nothing sat dead for hours once. ALL adds the
+// categories libtorrent itself calls logs, which are opt-in for a reason.
+lt::alert_category_t alert_mask_for(LogLevel level) {
+    auto mask = lt::alert_category::error | lt::alert_category::status |
+                lt::alert_category::port_mapping | lt::alert_category::dht;
+    if (level == LogLevel::all)
+        mask |= lt::alert_category::tracker | lt::alert_category::peer |
+                lt::alert_category::session_log | lt::alert_category::torrent_log |
+                lt::alert_category::dht_log;
+    return mask;
+}
+
 lt::session_params make_session_params(const TorrentConfig& config, std::string_view advertise) {
     lt::session_params params;
     auto& settings = params.settings;
@@ -114,9 +129,7 @@ lt::session_params make_session_params(const TorrentConfig& config, std::string_
     // nothing usable, failed to bootstrap DHT or was refused by every tracker
     // reported exactly nothing: two torrents sat dead for hours with an empty
     // error field and one "plugin loaded" line in the journal.
-    settings.set_int(lt::settings_pack::alert_mask,
-                     lt::alert_category::error | lt::alert_category::status |
-                         lt::alert_category::port_mapping | lt::alert_category::dht);
+    settings.set_int(lt::settings_pack::alert_mask, alert_mask_for(config.log_level));
     settings.set_int(lt::settings_pack::active_downloads, static_cast<int>(config.max_active));
     settings.set_int(lt::settings_pack::active_limit, static_cast<int>(config.max_active + 4));
     settings.set_int(lt::settings_pack::active_seeds, 0);
@@ -534,6 +547,15 @@ void TorrentManager::reconfigure(TorrentConfig config) {
     config_.max_active = config.max_active;
     config_.max_download_rate = config.max_download_rate;
     config_.max_upload_rate = config.max_upload_rate;
+    if (config.log_level != config_.log_level) {
+        config_.log_level = config.log_level;
+        alert_log_level_.store(config.log_level, std::memory_order_relaxed);
+        if (impl_) {
+            lt::settings_pack settings;
+            settings.set_int(lt::settings_pack::alert_mask, alert_mask_for(config.log_level));
+            impl_->session.apply_settings(std::move(settings));
+        }
+    }
     cv_.notify_all();
 }
 
@@ -866,10 +888,15 @@ void TorrentManager::drain_alerts() {
             }
             continue;
         }
-        // Everything else at debug: tracker churn and peer errors are normal
-        // and must not become the noise that hides the two lines above.
-        if (Log::enabled(LogLevel::debug))
-            Log::debug(std::string("torrent alert ") + alert->what() + ": " + alert->message());
+        // Everything else is libtorrent's own chatter -- tracker churn, DHT
+        // traffic, peer errors -- and goes through torrent.log_level, not the
+        // process level: like the ffmpeg bridge it applies its own threshold
+        // and then emits past the process filter, so a node can run at INFO
+        // and still turn this on, and a node at DEBUG no longer has its
+        // journal eaten by it (gbni-1, 2026-09-23: 99,088 of 99,187 lines).
+        if (alert_log_level_.load(std::memory_order_relaxed) <= LogLevel::debug)
+            Log::emit(LogLevel::debug,
+                      std::string("torrent alert ") + alert->what() + ": " + alert->message());
     }
 
     // A session holding only loopback sockets can reach no peer at all. That

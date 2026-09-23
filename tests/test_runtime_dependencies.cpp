@@ -389,6 +389,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  enabled: " << torrent_enabled << "\n"
             << "  upnp: false\n"
             << "  natpmp: false\n"
+            << "  log_level: DEBUG\n"
             << "  search:\n"
             << "    providers:\n"
             << "session:\n"
@@ -430,6 +431,10 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.storage_backends[0].reserve_free == 2ULL * 1024 * 1024 * 1024);
     CHECK(yc.storage_packing.threshold == 512ULL * 1024);
     CHECK(yc.storage_packing.target_size == 32ULL * 1024 * 1024);
+    // torrent.log_level is its own threshold, parsed like the process one and
+    // defaulting to INFO so the alert stream is quiet unless asked for.
+    CHECK(yc.torrent.log_level == LogLevel::debug);
+    CHECK(Config{}.torrent.log_level == LogLevel::info);
     CHECK(yc.metadata_store.path == state / "control");
     CHECK(yc.metadata_store.limit == 2ULL * 1024 * 1024 * 1024);
     CHECK(yc.metadata_store.packing.threshold == 256ULL * 1024);
