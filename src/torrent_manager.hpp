@@ -33,6 +33,8 @@ class TorrentManager final : public TorrentService {
     std::map<std::string, TorrentJob, std::less<>> jobs_;
     std::unique_ptr<Impl> impl_;
     std::atomic_bool alerts_pending_{false};
+    // torrent.log_level, readable from the alert drain without the mutex.
+    std::atomic<LogLevel> alert_log_level_{LogLevel::info};
     // Listen endpoints libtorrent reported succeeding, excluding loopback. A
     // session with none of these can reach no peer and must say so.
     size_t routable_listen_endpoints_{};
