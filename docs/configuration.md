@@ -599,3 +599,5 @@ A node configured with a `root` that does not exist, or one with no index docume
 ## Logging
 
 `log_level` accepts `ALL`, `DEBUG`, `INFO`, `WARN`, or `ERROR`. `ffmpeg_log_level` is an independent libav threshold and can be more verbose than the Macha application threshold.
+
+`torrent.log_level` is the same kind of independent threshold for the libtorrent alert stream. `INFO` (the default) keeps the explicit lines -- listen results, DHT bootstrap, port mapping, every warning -- and drops the per-alert chatter. `DEBUG` bridges every alert the session subscribes to (tracker announces, DHT traffic, peer errors), which on a busy node is well over a thousand journal lines a minute and will evict the rest of the journal within hours. `ALL` additionally subscribes libtorrent's internal tracker, peer, session, torrent and DHT log categories. It applies live on reconfigure.
