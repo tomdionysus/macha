@@ -8,6 +8,7 @@
 
 #include "ingest.hpp"
 #include "torrent.hpp"
+#include "torrent_disk_io.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -38,10 +39,6 @@ class TorrentManager final : public TorrentService {
     // Listen endpoints libtorrent reported succeeding, excluding loopback. A
     // session with none of these can reach no peer and must say so.
     size_t routable_listen_endpoints_{};
-    // Whether the download rate is currently clamped because the DATA device is
-    // under pressure, so the clamp is applied and lifted once per transition
-    // rather than on every loop tick.
-    bool download_rate_clamped_{};
     bool warned_loopback_only_{};
     // Said once per session: a router with no UPnP must not become a
     // recurring complaint, but "this node has no inbound port" has to be
@@ -54,11 +51,10 @@ class TorrentManager final : public TorrentService {
     void save_state_locked() const;
     void restore_jobs();
     void loop(std::stop_token);
-    // Applies or lifts the download-rate clamp according to measured DATA
-    // device service time. libtorrent writes to its save path directly and
-    // never enters the DATA arbiter, so this is the only place its share of a
-    // contended spindle can be bounded.
-    void follow_device_pressure();
+    // The hooks through which the torrent's disk backend is admitted and
+    // measured: loader-class DATA credit, and the DATA device's service
+    // monitor when staging shares its device.
+    TorrentDiskHooks disk_hooks() const;
     // Drains libtorrent's alert queue into the journal. Also the only place
     // that can observe whether the session actually bound a usable interface.
     void drain_alerts();

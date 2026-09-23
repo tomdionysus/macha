@@ -539,8 +539,10 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     if (torrent["listen_port"]) c.torrent.listen_port = torrent["listen_port"].as<uint16_t>();
     if (torrent["max_download_rate"]) c.torrent.max_download_rate = yaml_size(torrent["max_download_rate"]);
     if (torrent["max_upload_rate"]) c.torrent.max_upload_rate = yaml_size(torrent["max_upload_rate"]);
-    if (torrent["pressure_download_rate"])
-        c.torrent.pressure_download_rate = yaml_size(torrent["pressure_download_rate"]);
+    if (torrent["disk_threads"]) {
+        c.torrent.disk_threads = torrent["disk_threads"].as<size_t>();
+        if (c.torrent.disk_threads == 0) throw std::runtime_error("torrent.disk_threads must be at least 1");
+    }
     if (torrent["log_level"])
         c.torrent.log_level = parse_log_level(torrent["log_level"].as<std::string>());
     if (torrent["dht"]) c.torrent.dht = torrent["dht"].as<bool>();
