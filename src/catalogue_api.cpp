@@ -559,14 +559,25 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (!decoded || decoded->size() != 32) return error(400, "bad_id", "bad artwork object id");
             ObjectId id;
             std::copy(decoded->begin(), decoded->end(), id.bytes.begin());
-            auto artwork = catalogue_.artwork(id);
-            if (!artwork) return error(404, "not_found", "artwork not found");
             // The id is a content hash: identical bytes forever, so this is
-            // genuinely immutable, not just cacheable for a while.
+            // genuinely immutable, not just cacheable for a while, and the id
+            // itself is the entity tag. A browser revalidating a poster it
+            // already holds is answered before the artwork is fetched at all,
+            // so it never pays a cold read for bytes it has.
+            const auto tag = "\"" + to_string(id) + "\"";
             const auto max_age =
                 std::chrono::duration_cast<std::chrono::seconds>(artwork_capability_ttl_).count();
             std::map<std::string, std::string, std::less<>> headers{
-                {"Cache-Control", "public, max-age=" + std::to_string(max_age) + ", immutable"}};
+                {"Cache-Control", "public, max-age=" + std::to_string(max_age) + ", immutable"},
+                {"ETag", tag},
+                // Without it the browser zeroes every timing for a
+                // cross-origin poster, and a client cannot measure this.
+                {"Timing-Allow-Origin", "*"}};
+            if (auto it = request.headers.find("if-none-match");
+                it != request.headers.end() && it->second == tag)
+                return {304, "", std::move(headers), {}};
+            auto artwork = catalogue_.artwork(id);
+            if (!artwork) return error(404, "not_found", "artwork not found");
             return {200, std::move(artwork->mime_type), std::move(headers),
                    std::move(artwork->bytes)};
         }

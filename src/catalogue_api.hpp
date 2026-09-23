@@ -27,7 +27,7 @@ class CatalogueApi {
         std::function<void(const std::vector<std::string>&)> request_media_rescan = {},
         std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
         std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile = {},
-        std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24))
+        std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30))
         : catalogue_(catalogue), hints_(hints),
           request_media_rescan_(std::move(request_media_rescan)),
           request_media_profiles_(std::move(request_media_profiles)),
