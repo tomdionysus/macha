@@ -2,6 +2,8 @@
 
 # Macha
 
+*v0.53.2*
+
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
 Macha is a C++20 distributed filesystem (MachaDFS) and media server for large,
