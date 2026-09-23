@@ -32,6 +32,22 @@ an unknown value is a 400, never ignored. Today the route takes only `q` and
 `limit` (`src/catalogue_api.cpp`, around line 417), so Core over-fetches 200
 and keeps 50, and still gets short pages. Tell Core the version it ships in.
 
+**Approved next, after the search filter (operator, 2026-09-24): people on
+catalogue items -- directors, cast, and the equivalent for TV.** Today
+`CatalogueItem` (`src/catalogue.hpp`) holds title, synopsis, year, numbering,
+aliases, external ids and artwork, and nothing about people; the scanner calls
+TMDB `/movie/{id}` and `/tv/...` without `append_to_response=credits`
+(`src/media_catalogue.cpp` around 1544), so credits are never fetched.
+- Fetch credits on the requests the scanner already makes (one round trip).
+- Store them on the item: a versioned change to the stored catalogue record.
+- Expose them through the catalogue API (and tell the client sessions).
+- **Backfill is required, not optional** (operator): existing items were
+  matched before this existed and will not be rescanned on their own. A
+  background pass over every item that carries a `tmdb` external id and has
+  no credits, fetching by id (no re-matching), rate-limited and resumable,
+  admitted as background work under the laws, and visible (progress and
+  remaining count) so it can be seen to finish.
+
 **Cluster state:** all three live nodes (gbni-1, es-1, fi-1) run **0.53.2**,
 converged at one accepted head, `required=2 replicas=2`. gbni-2 is defunct
 for months (operator). Every node's config carries `torrent.log_level: INFO`.

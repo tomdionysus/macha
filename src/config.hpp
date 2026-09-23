@@ -364,7 +364,10 @@ struct CatalogueApiConfig {
     // content-addressed/immutable and lower-stakes than a playback session,
     // so this deliberately outlives a typical browsing session; the intended
     // recovery for an expired URL is simply re-fetching the catalogue item.
-    std::chrono::milliseconds artwork_capability_ttl{std::chrono::hours(24)};
+    // Thirty days. The URL is byte-identical within a bucket of this length and
+    // the response's max-age equals it, so at 24 h every poster URL changed at
+    // UTC midnight and every browser re-downloaded every poster the next day.
+    std::chrono::milliseconds artwork_capability_ttl{std::chrono::hours(24 * 30)};
 };
 
 struct CatalogueTmdbConfig {

@@ -3350,6 +3350,40 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_stable_so_it_can
     const auto fetched = api.handle(signed_request);
     REQUIRE(fetched.status == 200);
     CHECK(fetched.body == cover_bytes);
+
+    // Artwork is content-addressed, so its id is its entity tag, and the
+    // cache lifetime equals the capability's: a poster is downloaded once per
+    // browser per TTL, and a revalidation of one already held is a 304 with
+    // no body, answered before the artwork is read at all.
+    const auto tag = fetched.headers.find("ETag");
+    REQUIRE(tag != fetched.headers.end());
+    const auto id_text = signed_request.path.substr(signed_request.path.rfind('/') + 1);
+    CHECK(tag->second == "\"" + id_text + "\"");
+    CHECK(fetched.headers.at("Cache-Control") ==
+          "public, max-age=" + std::to_string(ttl_ms / 1000) + ", immutable");
+    // Without it the browser zeroes every cross-origin timing, and a client
+    // cannot measure how long a poster took.
+    CHECK(fetched.headers.at("Timing-Allow-Origin") == "*");
+
+    auto revalidation = signed_request;
+    revalidation.headers["if-none-match"] = tag->second;
+    const auto not_modified = api.handle(revalidation);
+    CHECK(not_modified.status == 304);
+    CHECK(not_modified.body.empty());
+    CHECK(not_modified.headers.at("ETag") == tag->second);
+
+    // A different tag is not a match: the bytes come back.
+    auto stale = signed_request;
+    stale.headers["if-none-match"] = "\"not-this-one\"";
+    const auto refetched = api.handle(stale);
+    CHECK(refetched.status == 200);
+    CHECK(refetched.body == cover_bytes);
+}
+
+MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_lasts_thirty_days_by_default) {
+    // At 24 h every artwork URL changed at UTC midnight and every browser
+    // downloaded every poster again the next day (2026-09-24, web client).
+    CHECK(Config{}.catalogue.api.artwork_capability_ttl == std::chrono::hours(24 * 30));
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tampered_or_expired) {

@@ -1,5 +1,30 @@
 # Current release
 
+## 0.54.1 — Artwork is downloaded once, not once a day (development)
+
+**Every artwork URL changed at UTC midnight, and every browser downloaded every
+poster again the next day.** The signed artwork URL's expiry is rounded to a
+bucket of `catalogue.api.artwork_capability_ttl_ms`, which is what keeps it
+byte-identical and therefore cacheable, and the response's `max-age` equals
+that TTL. At the 24-hour default both rolled over daily. The default is now
+**30 days**. No node set the key, so every node takes the new default.
+
+**Artwork responses now carry an `ETag`**, the artwork's id (it is a content
+hash), and a request whose `If-None-Match` matches is answered `304` with no
+body **before the artwork is read at all**. So a browser revalidating a poster
+it holds never pays a cold read for bytes it already has. Before this,
+artwork had no validator, so an expired cache entry was a full re-download.
+
+**`Timing-Allow-Origin: *`** on artwork, so a cross-origin client can measure
+how long a poster took instead of reading zeros.
+
+Reported by the web client session (2026-09-24): a first read of a 77 KB
+poster from gbni-1 took 1.1 s at about 1 Mbit/s, and posters seemed to go
+slow at random -- each one expiring on its own 24-hour clock. This release
+removes the daily expiry and the re-downloads. **It does not change how long
+a cold read takes.** That read waits behind loader I/O on a busy DATA disk
+(the loader-I/O item in `TODO/ACTIVE.md`), which is still open.
+
 ## 0.54.0 — The torrent's disk I/O is macha's disk I/O (development)
 
 **libtorrent now does its file I/O through a disk backend of macha's own, and

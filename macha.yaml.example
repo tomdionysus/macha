@@ -510,8 +510,11 @@ catalogue:
     # <img src> without a bearer header. Artwork is content-addressed/immutable
     # and lower-stakes than a playback session, so this deliberately outlives
     # a typical browsing session; an expired URL is recovered by re-fetching
-    # the catalogue item, which the client already does on navigation.
-    artwork_capability_ttl_ms: 86400000
+    # the catalogue item, which the client already does on navigation. It is
+    # also the response's max-age and the interval at which every artwork URL
+    # changes, so it is measured in days: at 24 h every poster was downloaded
+    # again every day.
+    artwork_capability_ttl_ms: 2592000000
 
 # Persistent host-side ingest. Jobs may point at a regular file or recursively
 # import a directory (for example, a temporarily mounted USB disk). The source
