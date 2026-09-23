@@ -1,31 +1,62 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-21 late evening, after 0.48.0, 0.48.1 and 0.48.2 all
-shipped and deployed the same day.
+Last updated: 2026-09-23 afternoon, after 0.53.0, 0.53.1 and 0.53.2 shipped
+and deployed across 2026-09-22/23.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here if you are new to this work.** Read, in order:
+**Start here if you are new to this work.**
 
-**What is being built right now is the namespace Merkle work; Stage B is
-complete and Stage C is next** (operator, 2026-09-21 evening). The playback-session programme that occupied
-most of 2026-09-21 is **shipped and deployed** — 0.48.0 moved the routes,
-0.48.1 fixed what testing it found, and 0.48.2 added what a node could not
-previously say about itself. All three nodes run 0.48.2.
+**Cluster state:** all three live nodes (gbni-1, es-1, fi-1) run **0.53.2**,
+converged at one accepted head, `required=2 replicas=2`. gbni-2 is defunct
+for months (operator). Every node's config carries `torrent.log_level: INFO`.
+
+**What shipped in the last two days, all verified on the cluster rather than
+by version string** (details in `COMPLETED.md`):
+- **0.53.0** -- the disk resource manager audited and corrected (every DATA
+  read had been measured as zero bytes; the torrent clamp ignored law 2;
+  maintenance could neither be seen nor bounded), plus a loader activity
+  clock so maintenance yields to an import. Measured afterwards: an import at
+  **13 MB/s** aggregate with `macha-maint` at 0, against ~2 MB/s the day
+  before; es-1's pressure flapping (12 onsets in 34 min) gone.
+- **0.53.1** -- a metadata commit re-uploaded its entire control graph to
+  every peer on every commit (5,469 objects in three minutes against a control
+  store that grew by none). It now asks each peer what it is missing. Every
+  commit since logs `referenced=N missing=0`. This is what was killing ingest
+  jobs with "CONTROL retention floor unavailable".
+- **0.53.2** -- `torrent.log_level`, because DHT alerts at DEBUG were 99.9% of
+  gbni-1's journal and had evicted its whole diagnostic record in nine hours.
+
+**The one live defect that is diagnosed and not fixed is item -3 below**: a
+reconciliation merge installs the common-ancestor value on a conflict, which
+rolls a committed ingest checkpoint back, and the ingest dies on the resulting
+"concurrent file content change". Read it before touching the merge, the
+reconciler, or the ingest's error handling.
+
+**Standing rules learned the hard way this week, so a fresh session does not
+relearn them:**
+- journald's timestamp prefix is node-local; correlate on the `Z` timestamp
+  inside the message. A `--since` in local time on es-1 (CEST) silently cut
+  off a whole deploy window once.
+- `macha-tests-runtime` (the yaml/config tests) is a Linux-only target; the
+  laptop's 525 never include it. Run it on a node.
+- When a release adds a wire message, roll the *peers* first and the node
+  that needs the fix last: the sender's fix does nothing until the other end
+  can answer.
+- Check the tarball's size and md5 on the build node before shipping it. A
+  0-byte tarball has md5 `d41d8cd9...`.
+- A node under "high load" may be Plex, not macha: `ps --sort=-pcpu` first.
+- Absence of failures on an idle node proves nothing. The retention-floor
+  bug was declared fixed once on a node that had made zero commits.
 
 **Read this before trusting anything below about a client.** Four client
-sessions spent the afternoon testing 0.48.0 against the live cluster and
+sessions spent 2026-09-21 testing 0.48.0 against the live cluster and
 reported sixteen findings. Six were real and are recorded; the rest were
 retracted, several of them client self-diagnoses that did not survive
-measurement. The headline — that the server could not copy (E-)AC-3 into
-fragmented MP4, which three clients independently concluded — **was wrong**,
-and is archived in `COMPLETED.md` with the instrumented reproduction that
-killed it: 48 ms to first fragment, and a browser that would not open a
-SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
-for it died the same way. **A client's account of itself is evidence about the
-client, not a fact.**
+measurement. **A client's account of itself is evidence about the client, not
+a fact.**
 
 -5. **`rpc_cluster/test_service_metadata_repair_coalesces_real_generation_burst`
    failed once in the full suite on es-1 (2026-09-23, 0.53.2 build), NOT
@@ -106,6 +137,15 @@ client, not a fact.**
      Either wait for a reachable peer before asserting, or assert across a
      retry — the contract is "ask again", and a single call is not entitled to
      the final answer.
+
+   **Why this was nearly missed, which is the part worth keeping.** Small samples
+   lied in both directions. The case passed 6/6 at HEAD and failed 1/3 with an
+   unrelated change in the tree, which reads as "the change broke it". Twenty runs
+   said the opposite: 10/20 at HEAD, 1/10 with the change. At a true rate near
+   50%, three runs are worth nothing and six are worth little. **Use `--repeat 20`
+   before attributing an intermittent failure to a change**, and never attribute
+   one on a single run.
+
    - [ ] Confirm on a node. Everything above is macOS/clang, and
      `..._rederives_placement_after_peer_restart` was recorded in 2026-09-17 as
      failing 12/12 on macOS and passing 3/3 on es-1. That it now fails only
@@ -113,162 +153,79 @@ client, not a fact.**
      describes it either, so re-measure both on es-1 rather than inheriting a
      platform split.
 
--3. **The disk resource manager was audited on 2026-09-22 (0.53.0). It was
-   wrong in five more places than the two already recorded; all five are
-   fixed. The gate is lifted.**
+-3. **P0: a reconciliation merge rolls committed ingest checkpoints back, and
+   the ingest dies on it -- `ingest failed: concurrent file content change`
+   (diagnosed 2026-09-23, NOT FIXED).**
 
-   The audit was called for after the mechanism had been wrong twice on the
-   day it shipped -- a threshold invented rather than derived, and law 2
-   flattened so the loader yielded to a slow device with no viewer present --
-   and it found that neither correction had reached the read path at all.
+   On es-1, three torrent-sourced ingest jobs died at 12:51:12Z, 12:51:47Z and
+   12:52:07Z. What the namespace holds now versus what es-1 had committed and
+   had confirmed `stored=yes` on a replica:
 
-   **What it found, worst first.**
+   | `.part` | on the mount (both nodes) | last committed by es-1 |
+   |---|---|---|
+   | Gremlins | 335,544,320 | 469,762,048 (12:50:57Z) |
+   | Voyager S04E04 | 402,653,184 | 469,762,048 (12:52:00Z) |
+   | Matrix Revolutions | 536,870,912 | 603,979,776 (12:51:38Z) |
 
-   1. **Every DATA read was measured with `bytes = 0`, so the founding bug was
-      still live.** `StoragePool::get()` started its timer with zero bytes
-      because a read's size is only known once it succeeds, and the
-      `DiskServiceTimer::note_bytes()` call that exists for exactly that
-      purpose was never written, anywhere in the tree. So every read was judged
-      against the fixed 25 ms per-operation overhead alone, with no per-size
-      allowance -- the same flat threshold the whole ratio model was built to
-      replace. Measured on es-1 during the audit: `sdb` serving 53.7 reads/s at
-      240 KB average and 30.9 ms average service, a healthy spinner, and the
-      node entered and left pressure **twelve times in the thirty-four minutes**
-      since it started 0.52.0, clamping an operator's torrent each time with
-      nobody watching anything.
+   One to two 64 MB checkpoints gone from each. Each failure lands within two
+   seconds of a `metadata histories reconciled ... conflicts=1 superseded=1`
+   line; the last one in the same second.
 
-   2. **The torrent rate clamp never had law 2's second clause.**
-      `TorrentManager::follow_device_pressure()` clamped on `pressured()`
-      alone. An acquisition is durable work the user asked for, so it is
-      loader-class and yields to a slow device only when a viewer would
-      otherwise wait. The arbiter was corrected for this in 0.52.0; this path
-      was not, and it is what produced those twelve log lines.
+   **Mechanism.** `src/metadata.cpp:2040-2046`: on a genuine three-way
+   conflict the merge installs the **common-ancestor value** at the path and
+   records a conflict ("Keep the common-ancestor value visible until explicit
+   resolution"). The ingest's open `WriteHandle` still carries its last
+   committed basis; the entry now has an older size and older extents under a
+   newer version; `commit_file`'s basis check (`src/filesystem.cpp:2294`)
+   fails EAGAIN; `IngestManager::process_job` marks the job `failed`
+   (`src/ingest.cpp:1221`). No bytes are lost -- extents are on disk and
+   `copy_file` resumes from the namespace size -- but the job is dead and a
+   retry re-copies 64-128 MB.
 
-   3. **The signal could not see the largest consumer of the device.** Pool
-      maintenance reads its backends directly rather than through
-      `StoragePool::get()`, where the timer lived, so the 51.6 MB/s of
-      `macha-maint` reads that saturated `sdb` on 2026-09-22 never fed the
-      monitor at all. The mechanism was blind to maintenance in both
-      directions: it could not bound it and could not see it. (Object-level
-      repair in `DistributedStore::repair_step` does enter the arbiter, as
-      speculative. It was pool-level rebalance/scrub/GC that did neither.)
+   **Why a path only es-1 ever writes conflicts at all.** gbni-1's history for
+   gens 36465-36499 is a sibling-merge storm: ~20 merges in 25 records, with
+   two or three records at the *same* generation (36470 x3, 36477 x3, 36480 x3,
+   36484 x3). All three nodes reconcile, each sorts the accepted heads by hash
+   from its own view and folds `heads[0]`/`heads[1]`
+   (`src/metadata_manager.cpp:1248-1251`), so with three or more heads they
+   merge *different pairs* and manufacture sibling merges of each other's
+   merges. In that braid `history_common_ancestor` (which does follow
+   `merge_parents`) lands well below both heads, so es-1's checkpoint N (left)
+   and the other head's copy of es-1's earlier checkpoint N-1 (right, absorbed
+   via a different fold) *both* differ from a base at N-2 -> conflict -> N-2
+   installed. That is the one-to-two-checkpoint regression measured.
 
-   4. **"Viewer present" was narrower in the arbiter than everywhere else in
-      the system** -- byte credit held at this instant, which playback does not
-      hold between extents. Every gap in a stream readmitted the loader at full
-      concurrency, and the viewer's next read queued behind the extent write
-      the gap had just let in.
+   **It is a tree-cutover regression.** Reconciliations on es-1: 4 on
+   2026-09-21, **131** on 2026-09-22, 20 by noon on 2026-09-23. Tree-backed
+   merges are full records (17-34 KB, 300-400 ms) and six concurrent imports
+   each committing every ~7 s collide constantly. The cutover note in -1
+   already lists "a tree-native merge" for Stage F.
 
-   5. **The only counter that answers "throttled or unwell" did not exist.**
-      `pressure_refusals_` was a private member from the day the gate shipped,
-      incremented nowhere and reported nowhere.
+   **Not proven:** which path each `conflicts=1` was on. No log line names the
+   conflict key, and es-1's history had compacted past the window before the
+   record could be materialised. Sizes, timing and the DAG leave no other
+   consistent explanation, but that last step is inference.
 
-   **What it confirmed rather than assumed.**
-
-   - **Law 1.** Admission-wise, there is no path by which this mechanism delays
-     a viewer read. `available()` returns true for `foreground` and
-     `read_ahead` before pressure is consulted, on both `acquire()` and
-     `try_acquire()`, and a viewer arriving while pressure is engaged takes the
-     same path; the viewer reserve is subtracted from lower-class capacity so
-     background work can never occupy it. One physical path remains and is
-     deliberate: `min_background` (floor 1) means one background operation may
-     be on the spindle ahead of a viewer's read. That is law 2's trickle bought
-     at law 1's expense, and it is now stated rather than implied.
-   - **Law 3.** The control store is a separate `LocalStore` at
-     `metadata_store.path`, constructed outside `StoragePool`, with no timer
-     anywhere on its path, and `acquire()` throws on `FrameType::control`.
-     Measured on the hardware: control sits on `nvme0n1p2` (ROTA=0) on all
-     three nodes, DATA on `sdb1` (9.1 T, ROTA=1) on gbni-1 and es-1, and fi-1
-     holds no extents at all. **Law 3 holds by configuration, not by
-     construction** -- nothing stops an operator pointing `metadata_store.path`
-     at a DATA spindle, and the FUSE spool (`/mnt/diskB/spool`) and ingest
-     staging (`/mnt/diskB/ingest`) already sit on the DATA spindle, as plain
-     file I/O the monitor never sees and the arbiter never bounds.
-   - **Law 4.** Background work always drains: the refusal is
-     `lower_active_ >= min_background`, floored at 1, so with nothing active a
-     lease is always admitted, operations keep completing, and the signal can
-     never starve itself of input. The hysteresis band is a latch, though:
-     pressure engages above 300% and releases below 150%, so a device that
-     settles anywhere between stays pressured, and the average does not decay
-     without traffic. Neither wedges the node -- the trickle drains -- but
-     "pressure always releases on a device that recovers" is only true if it
-     recovers past 150%.
-
-   **Still open, recorded rather than papered over:**
-
-   - [ ] **One monitor covers a whole `StoragePool`, not one device.** A pool
-     may hold several backends on several devices and this cannot tell them
-     apart, so one slow backend makes the pool pressured for work bound
-     anywhere in it. Harmless today -- gbni-1 and es-1 configure exactly one
-     DATA backend each -- and it bites the moment a second is configured.
-     Per-device pressure also needs the arbiter to know an operation's
-     destination device, which it cannot: admission happens before placement
-     picks a backend. The false claim in the header comment is corrected.
-   - [ ] **Local disk maintenance is budgeted from a network measurement.**
-     `estimated_network_bps()` feeds `local_credit` as well as
-     `network_credit`, which is how a GC/repair pass helped itself to
-     51.6 MB/s of one spindle. See the third bullet of the item below; no
-     number is proposed here, because inventing one is what started all this.
-
--2. **Maintenance outranked the ingest because the mechanism to stop it was
-   deaf to the loader (found 2026-09-22 22:00Z, FIXED in 0.53.0; the rate is
-   NOT yet re-measured on the cluster).**
-
-   An operator's 36 GB import ran at ~2 MB/s on gbni-1 while, measured on the
-   node:
-
-   | | |
-   |---|---|
-   | `sdb` utilisation | **91.2%**, aqu-sz 3.23 |
-   | reads | **37 MB/s**, 151/s |
-   | writes | **2.8 MB/s**, 14/s |
-   | `macha-maint` thread read rate | **51.6 MB/s** |
-   | torrent download | complete, directory static at 63,255 MB |
-
-   So the disk was saturated by maintenance reads while the ingest's writes got
-   2.8 MB/s. The torrent was not downloading; two rounds of fixes aimed at the
-   DATA pressure gate and at namespace-node replication changed nothing,
-   because neither touches maintenance.
-
-   **Why the existing knobs did not help.** gbni-1 has
-   `maintenance.busy_bandwidth_fraction: 0.0` -- maintenance is meant to get
-   *nothing* while the node is busy -- and `max_bandwidth: 0B`, which is "no
-   configured cap". The busy decision is `playback_busy || interactive_busy`
-   (`src/service.cpp:1174-1184`), fed by `foreground_idle_for()` and
-   `interactive_idle_for()`. Those clocks are written only for
-   `FrameType::foreground` and `FrameType::read_ahead`
-   (`src/filesystem.cpp:248-252`, `:996-998`). **An ingest is loader-class and
-   feeds neither**, so during an import the node reports itself idle and
-   maintenance takes its idle share of a disk somebody is waiting on.
-
-   That is law 2 in a third place: the loader must outrank background work, and
-   here background work cannot even see it.
-
-   - [x] A loader activity clock on `DistributedStore` beside the foreground
-     and interactive ones, fed from the loader read and write paths, and
-     included in the maintenance busy predicate and in all four slice-yield
-     predicates and the busy-pass wake-up. It is **not** folded into the viewer
-     clocks, and `test_a_loader_write_is_visible_to_maintenance_as_its_own_class`
-     asserts both halves: the loader clock moves, the two viewer clocks do not,
-     and `viewer_recently_active()` stays false -- because viewer reserves, the
-     pressure gate and the torrent clamp all key off the viewer clocks, and
-     conflating them would make an import look like a viewer and gate other
-     loader work behind it.
-   - [ ] **Then measure the import rate again.** Nothing here is verified on
-     the cluster yet; 0.53.0 is built and green on the laptop only. Everything
-     claimed about throughput on 2026-09-22 was wrong at least once, so the
-     only numbers worth trusting are the per-thread `/proc/<pid>/task/*/io`
-     deltas and `iostat`. Take a before reading with maintenance running
-     against an idle node, start an import, and confirm `macha-maint` drops to
-     nothing while it runs.
-   - [ ] Consider whether `max_bandwidth: 0B` should mean "no cap" at all on a
-     node whose DATA backend is one spindle. The observed-bandwidth fallback
-     let a GC/repair pass take 51 MB/s -- and note what the audit found behind
-     that: `estimated_network_bps()` budgets `local_credit` as well as
-     `network_credit`, so **local disk maintenance is rationed by a network
-     measurement**. The loader clock stops maintenance during an import, which
-     is the case that hurt, but it does not make the budget mean anything on a
-     node with one spindle. No number is proposed here on purpose.
+   **Plugging the hole, three parts, none done:**
+   - [ ] **The merge rule.** When one side's entry is causally the other's
+     ancestor -- per-path `version` is monotonic and right's value equals an
+     earlier state of left's -- take the newer instead of declaring a
+     conflict. Today ancestry seen through a stale LCA is indistinguishable
+     from divergence.
+   - [ ] **The ingest.** On EAGAIN from a checkpoint commit, re-base on the
+     current entry and continue from its size rather than failing the job.
+     Same class as the restart-mid-put failure below.
+   - [ ] **The reconciler.** One merger at a time, or a deterministic pair
+     choice that every node makes identically, so three heads cannot fan out
+     into sibling merges. This is also where the operator's point lands:
+     **publications are supposed to batch and to throttle, and did before the
+     tree.** Six jobs x 64 MB checkpoints is the collision source. The only
+     throttle found so far is `fuse.publication_quiet_ms`, which gates on
+     *foreground viewer* activity alone and so cannot see an import; no
+     coalescing layer exists in `MetadataManager`. The operator knows what
+     used to batch; ask before guessing.
+   - [ ] Log the conflict key when a merge records one, so the next instance
+     is provable from the journal alone.
 
    **Also open from the same afternoon** (and **not** the durability-barrier
    defect in item -4, checked on 2026-09-23: this message comes from
@@ -280,6 +237,37 @@ client, not a fact.**
    restarts today and failed on the fourth, so it is timing-dependent. Same
    class as the read-only-window item under the metadata-stall P0. The job is
    retried from the UI; completed files are skipped.
+
+-2. **What the disk resource audit left open, and the batching question
+   (2026-09-23).** The audit itself is closed (`COMPLETED.md`, 0.53.0); these
+   are the parts it recorded rather than fixed:
+   - [ ] **One `DiskServiceMonitor` covers a whole `StoragePool`, not one
+     device.** A pool may hold several backends on several devices and the
+     monitor cannot tell them apart, so one slow backend pressures work bound
+     anywhere in the pool. Harmless today -- gbni-1 and es-1 configure exactly
+     one DATA backend each -- and it bites the moment a second is configured.
+     Per-device pressure also needs the arbiter to know an operation's
+     destination device, which it cannot: admission happens before placement.
+   - [ ] **Local disk maintenance is budgeted from a network measurement.**
+     `estimated_network_bps()` feeds `local_credit` as well as
+     `network_credit` (`src/service.cpp` maintenance loop), which is how a
+     GC/repair pass once took 51.6 MB/s of one spindle. The loader clock stops
+     maintenance during an import, which was the case that hurt, but the
+     budget still means nothing on a node with one spindle. No number is
+     proposed on purpose.
+   - [ ] **The 150-300% hysteresis band is a latch.** A device that settles
+     anywhere between stays pressured, and the EWMA does not decay without
+     traffic. The trickle drains so it does not wedge, but "pressure always
+     releases on a device that recovers" is only true past 150%.
+   - Law 3 holds **by configuration, not by construction**: control on
+     `nvme0n1p2` and DATA on `sdb1` on every node, but nothing stops
+     `metadata_store.path` being pointed at a DATA spindle, and the FUSE spool
+     and ingest staging already sit on the DATA spindle as plain file I/O the
+     monitor never sees.
+   - [ ] The ingest's own ceiling is now the spindle, not CPU: it reads its
+     staging copy from and writes its extents to the same disk
+     (`/mnt/diskB/ingest` and `/mnt/diskB`), measured at 34-49% util during a
+     13 MB/s import.
 
 -1. **What the cutover cost on 2026-09-22, in order of how close it came.**
    The cluster was re-rooted at 12:41Z. By 18:00Z four things had surfaced
@@ -297,7 +285,11 @@ client, not a fact.**
      spine and replicated all ~12 nodes it touched synchronously to peers 60 ms
      away, eleven of them byte-identical to what was stored. Fixed in 0.51.0:
      a node already present is not re-replicated. Per-commit round trips ~12
-     to 1-3. **Not yet measured after the fix.**
+     to 1-3. **Measured 2026-09-23 on gbni-1 after 0.53.0/0.53.1: 13 MB/s
+     aggregate across three concurrent imports** (810 MB in 60 s), `sdb` at
+     34-49%, `macha-maint` at 0. The same defect -- re-sending what the peer
+     already holds -- turned out to be alive on the *retention* path too and
+     was the cause of the retention-floor ingest failures; fixed in 0.53.1.
    - **A sixteen-minute stall with the wrong message on it.** Two heads at one
      generation, no commits until reconciliation merged them, and every node
      logging "delta replay ... does not reproduce the record hash" -- which
@@ -319,7 +311,11 @@ client, not a fact.**
      fifty healthy samples it moves the average to 237%, under the 300% line.
      0.51.0 also flattened law 2 by making the loader yield to pressure with no
      viewer present; it now yields only when a viewer is waiting or holding
-     credit. **Still untested against a genuinely pathological device.**
+     credit. **Superseded by the 0.53.0 audit** (`COMPLETED.md`): the read
+     path was still measuring every read as zero bytes, the outlier is now a
+     ratio (`io_pressure_outlier_percent`, 1000), and the torrent clamp gained
+     law 2's second clause. Still untested against a genuinely pathological
+     device.
    - **Every catalogue route returned 503 on every node and all clients
      reported "no API"** (0.51.0, fixed in 0.52.0). `catalogue.cpp` committed a
      resolved conflict through the non-exact `mutate()` path, which the
@@ -634,35 +630,6 @@ three live nodes run 8.
   reading produces that observation.
 - [ ] Expect "plays, no sound" on the A85 Direct Play — it has no AC-3 or
   E-AC-3 decoder while claiming both, and it predates all of this.
-
-## P0 — `test_durability_barrier_reports_objects_a_restarted_peer_lost` fails half the time on macOS (measured 2026-09-21)
-
-Not a footnote and not a known flake to be lived with. **Measured, not
-recalled:** `./build/macha-tests --filter
-'test_durability_barrier_reports_objects_a_restarted_peer_lost' --repeat 20`
-on the macOS laptop at `f1d1548` fails **10 times in 20**. It fails at
-`tests/test_storage_v18.cpp:1385`, `REQUIRE(unsatisfiable.size() == 1)`.
-
-The same tree is **484/484 on es-1**, so this is the platform split again
-rather than a defect the cluster is running. Its sibling
-`test_durability_barrier_rederives_placement_after_peer_restart` behaves the
-same way — it failed a full local run and passed on es-1 in the same hour.
-
-**Why this was nearly missed, which is the part worth keeping.** Small samples
-lied in both directions. The case passed 6/6 at HEAD and failed 1/3 with an
-unrelated change in the tree, which reads as "the change broke it". Twenty runs
-said the opposite: 10/20 at HEAD, 1/10 with the change. At a true rate near
-50%, three runs are worth nothing and six are worth little. **Use `--repeat 20`
-before attributing an intermittent failure to a change**, and never attribute
-one on a single run.
-
-- [ ] Root-cause it. A 50% failure rate on any platform is a defect, either in
-  the test's synchronisation or in the barrier's reporting under a timing the
-  Pi never hits. The suite is green on the nodes, so it is not urgent for the
-  cluster — but it is corrosive, because a test that fails half the time on the
-  machine where code is written trains everyone to ignore a red suite.
-- [ ] Decide whether the two durability-barrier cases share one cause. They
-  have the same shape, the same platform split and adjacent assertions.
 
 ## P0 — A stale session for the same media may produce a 503 on the next create (opened 2026-09-21, n=1, DISCONFIRMED ONCE, still unexplained)
 
@@ -1376,6 +1343,10 @@ target. This is P-1's shadow falling on a second subsystem.
   to the aggregation-truthfulness item under P1.
 
 ## P0 — The node starves its own control plane with loader I/O (opened 2026-09-19, IN PROGRESS)
+
+**Status 2026-09-23:** the DATA pressure mechanism this programme produced was
+audited and corrected in 0.53.0 (`COMPLETED.md`); what the audit left open is
+item -2 at the top of this file. The founding measurement below stands.
 
 **Doing this now, ahead of everything below including P-1.** Finding:
 [loader I/O starves control](2026-09-19-loader-io-starves-control-incident.md).
