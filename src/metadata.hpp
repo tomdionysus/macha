@@ -695,7 +695,12 @@ class MetadataReplica {
     bool import_history(const MetadataHistoryEntry&);
     bool history_contains(const Hash256&) const;
     bool store_commit(const MetadataRecord&, std::span<const uint8_t> delta = {});
-    bool accept_commit(const MetadataAcceptance&);
+    // `heads_changed`, if given, reports whether this call changed the
+    // accepted-head set. It is decided under the replica lock, so a caller
+    // announcing head changes must use it rather than comparing copies of the
+    // head set taken around the call: a concurrent acceptance can land between
+    // those copies and be announced twice.
+    bool accept_commit(const MetadataAcceptance&, bool* heads_changed = nullptr);
     std::vector<MetadataAcceptance> accepted_head_certificates() const;
     std::vector<MetadataRecord> accepted_heads() const;
     std::optional<MetadataAcceptance> acceptance(const Hash256&) const;

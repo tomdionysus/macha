@@ -541,6 +541,12 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
     };
     std::vector<PendingBarrier> pending;
 
+    // Why each replica did or did not count, for the failure line below. A
+    // bare "required=1 durable=0" spun gbni-1 for half an hour on 2026-09-06
+    // with nothing saying which peer, or whether it was the epoch, the
+    // barrier, or the transport that said no.
+    std::map<ReplicaKey, std::string> outcome;
+
     // Launch remote waits before blocking on the local domain. This aligns the
     // batch windows across replicas, so a publication does not unnecessarily
     // serialize one physical durability cut per node.
@@ -550,6 +556,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
         auto found = peers.find(replica.id);
         if (found == peers.end())
             continue;
+        const ReplicaKey key{replica.id, replica.epoch, replica.domain, replica.backend_instance};
         try {
             Writer payload;
             payload.fixed(replica.epoch.bytes);
@@ -561,15 +568,15 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
             item.rpc.emplace(n_.call_async(found->second, MessageType::object_durability_barrier,
                                            payload.data(), frame_type));
             pending.push_back(std::move(item));
+        } catch (const std::exception& error) {
+            // Still transient -- a request that was never sent is "ask again" --
+            // but say why, so "could not send" and "did not try" stay distinct.
+            outcome[key] = std::string("remote-launch-failed: ") + error.what();
         } catch (...) {
+            outcome[key] = "remote-launch-failed: unknown";
         }
     }
 
-    // Why each replica did or did not count, for the failure line below. A
-    // bare "required=1 durable=0" spun gbni-1 for half an hour on 2026-09-06
-    // with nothing saying which peer, or whether it was the epoch, the
-    // barrier, or the transport that said no.
-    std::map<ReplicaKey, std::string> outcome;
     std::map<ReplicaKey, uint64_t> durable;
     for (const auto& replica : wanted) {
         if (replica.id != n_.node_id())

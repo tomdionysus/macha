@@ -1983,6 +1983,18 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     client_info.failure_domain = "client-site";
     RpcClient client(fixture.keys(), [client_info] { return client_info; },
                      [](const NodeInfo&) {}, [](uint64_t) {}, 500ms, 100ms, 2s);
+    // The node records this client as a peer from the handshake and pings it
+    // back over the same connection. A client with no inbound handler throws
+    // on that ping, which closes the connection and fails every call pending
+    // on it -- 10-15/20 on a busy laptop. Serve inbound like a node does.
+    RpcServer client_server(
+        "127.0.0.1", client_info.port, fixture.keys(), client_info,
+        [](const NodeInfo&, FrameType, const RpcMessage&) {
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {});
+    client_server.attach_client(client);
+    client_server.start();
     Endpoint endpoint{"127.0.0.1", config.port};
     Writer request;
     request.fixed(id.bytes);

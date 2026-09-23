@@ -1088,14 +1088,17 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
             cfg_.metadata_min_write_replicas)
             return false;
     }
-    const auto heads_before = metadata_replica().accepted_head_certificates();
     const auto before = metadata_replica().committed();
-    if (!metadata_replica().accept_commit(acceptance))
+    bool heads_changed = false;
+    if (!metadata_replica().accept_commit(acceptance, &heads_changed))
         return false;
-    const auto heads_after = metadata_replica().accepted_head_certificates();
     const auto after = metadata_replica().committed();
     members_.metadata_generation(std::max(after.generation, acceptance.generation));
-    if (heads_after == heads_before)
+    // Whether the head set changed is decided under the replica lock. Comparing
+    // copies taken around the call instead counts a concurrent acceptance that
+    // lands between them, so a repeated, no-op certificate racing a real commit
+    // announced that commit a second time.
+    if (!heads_changed)
         return true;
     if (after.hash != before.hash)
         block_cache().remember_metadata(after);

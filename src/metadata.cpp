@@ -4117,7 +4117,9 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     return true;
 }
 
-bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
+bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads_changed) {
+    if (heads_changed)
+        *heads_changed = false;
     MetadataAcceptance value = input;
     std::sort(value.replicas.begin(), value.replicas.end());
     value.replicas.erase(std::unique(value.replicas.begin(), value.replicas.end()),
@@ -4176,6 +4178,8 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
     }
     if (incoming_is_ancestor) {
         if (accepted_heads_.erase(value.hash)) {
+            if (heads_changed)
+                *heads_changed = true;
             persist_heads_locked();
             if (refresh_materialized_head_in_memory_locked()) {
                 reset_checkpoint_journal_locked();
@@ -4220,6 +4224,8 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input) {
     }
 
     changed = prune_accepted_heads_locked() || changed;
+    if (heads_changed)
+        *heads_changed = changed;
     if (changed) {
         persist_heads_locked();
         if (refresh_materialized_head_in_memory_locked()) {
