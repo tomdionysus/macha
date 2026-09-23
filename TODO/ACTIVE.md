@@ -27,6 +27,18 @@ SourceBuffer for the codec it had asked us to copy. Four of my own mechanisms
 for it died the same way. **A client's account of itself is evidence about the
 client, not a fact.**
 
+-5. **`rpc_cluster/test_service_metadata_repair_coalesces_real_generation_burst`
+   failed once in the full suite on es-1 (2026-09-23, 0.53.2 build), NOT
+   FIXED.** `tests/test_rpc_cluster.cpp:2616`:
+   `CHECK failed: s2.node().metadata_announcements() == announcements_before + burst + 1`.
+   Passed 10/10 in isolation on the same node straight afterwards. The suite
+   was running beside three live imports on that node and the assertion is an
+   exact count of announcements after a burst, so the likely shape is the
+   coalescing window opening or closing on load rather than a regression --
+   0.53.2 touches only the torrent alert bridge. Recorded rather than filed as
+   a flake; re-run under `--repeat` on a quiet node before trusting either
+   reading.
+
 -4. **P0: both durability-barrier-after-peer-restart tests fail most of the
    time, and neither is a flake or caused by 0.53.0 (measured 2026-09-23, NOT
    FIXED).**
