@@ -1,5 +1,50 @@
 # Current release
 
+## 0.53.1 — A commit publishes what changed, not what exists (development)
+
+**Every metadata commit re-uploaded its entire control graph to every peer, on
+every commit, whether or not the peer already held it.** `retain_control`
+collected the commit's referenced control objects and `put_graph_on` sent all
+of them, with no presence check anywhere on the path. That was tolerable while
+a graph was 65 catalogue shards. Once the namespace became tree-backed a commit
+referenced its whole spine, and the cost stopped scaling with what changed and
+started scaling with how large the library had grown.
+
+Measured on gbni-1 on 2026-09-22: **three minutes of importing produced 25
+commits, pushed 5,469 control objects to peers, and grew the control store by
+zero objects.** Over two hours it pushed 8,924 against a store holding 4,162.
+All of it was already on both ends.
+
+It is the same defect 0.51.0 fixed on the replication path — "a node already
+present is not re-replicated" — which was never applied here.
+
+A commit now asks each peer which of the referenced objects it is missing and
+sends only those, over a new CONTROL-plane `have_control_objects` message.
+`have_objects` could not answer this: it reads `local_store()`, so it can say
+nothing about control objects. The new handler reads `control_store()` and
+takes no DATA admission at all, because law 3 does not let a control index
+lookup wait on the DATA arbiter. A peer too old to know the message answers
+with an error and is sent the whole graph, exactly as before.
+
+The bytes are also read lazily now. The old form materialised every referenced
+object out of the control store up front, so a commit decrypted its whole spine
+to discover the peer wanted none of it.
+
+**The symptom this was found through:** `ingest failed: CONTROL retention floor
+unavailable before metadata publication`, on gbni-1 and then es-1, killing
+ingest jobs outright. 840 concurrent puts overran the connection's outbound
+queue, every candidate peer was skipped, and the node ended with `retained=1`
+against `required=2`. The publication is now bounded to a quarter of the
+smaller of the connection's two budgets as well, so a large graph cannot
+exhaust a resource it shares with heartbeats, metadata commits and status
+traffic.
+
+**And three `catch` blocks on the RPC path were discarding the reason a call
+failed**, so a self-inflicted concurrency limit reported itself as
+`no canonical RPC route to peer` — a dead network link. `peer outbound queue
+full` had never once been logged on any node in the cluster. The reason now
+travels with the error.
+
 ## 0.53.0 — The disk resource manager, audited (development)
 
 The operator called a gate on this mechanism after it had been wrong twice in

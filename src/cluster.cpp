@@ -1261,6 +1261,31 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 writer.u8(local_store().has(id));
             return {MessageType::have_objects_reply, writer.take()};
         }
+        case MessageType::have_control_objects: {
+            // The CONTROL counterpart, and deliberately not a variant of the
+            // case above: it answers from control_store(), and it takes no
+            // DATA admission at all. Law 3 -- control traffic must remain
+            // promptly serviceable whatever the DATA devices are doing, and
+            // an index lookup on the control device has no business waiting
+            // on the DATA arbiter.
+            Reader reader(request.payload);
+            const auto count = reader.u32();
+            if (!count || count > 200000)
+                return error_reply("invalid control presence batch count");
+            std::vector<ObjectId> ids;
+            ids.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                ObjectId id;
+                id.bytes = reader.fixed<32>();
+                ids.push_back(id);
+            }
+            reader.finish();
+            Writer writer;
+            writer.u32(count);
+            for (const auto& id : ids)
+                writer.u8(control_store().has(id));
+            return {MessageType::have_control_objects_reply, writer.take()};
+        }
         case MessageType::get_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};

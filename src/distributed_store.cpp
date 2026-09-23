@@ -1031,61 +1031,154 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         return n_.peer_latency(peer);
     });
 
-    std::vector<std::pair<ObjectId, Bytes>> graph;
-    graph.reserve(ids.size());
-    for (const auto& id : ids) {
+    // A retention claim asserts this node holds every object, and the peer
+    // copies are derived from ours, so local presence is a precondition
+    // whatever any peer turns out to need.
+    for (const auto& id : ids)
         if (!ensure_control_local(id))
             return false;
-        auto bytes = n_.control_store().get(id);
-        if (!bytes)
-            return false;
-        graph.emplace_back(id, std::move(*bytes));
-    }
 
-    // Store the whole graph on one candidate with the puts in flight
-    // together: they are small (catalogue shards) and independent, and one
-    // round trip after another cost 65 x 65 ms = 4.2 s per mutation on the
-    // live cluster (`control_ms=4247 control_objects=65`).
+    // Ask the peer what it is missing before sending it anything.
+    //
+    // Until 0.53.1 this uploaded the whole referenced control graph to every
+    // candidate on every commit, with no presence check anywhere on the path.
+    // That was tolerable while a graph was 65 catalogue shards. Once the
+    // namespace became tree-backed a commit referenced its whole spine, and
+    // the cost stopped scaling with what changed and started scaling with how
+    // large the library had grown: measured on gbni-1 on 2026-09-22, three
+    // minutes of importing produced 25 commits, pushed 5,469 control objects
+    // to peers, and grew the control store by *zero* objects. Every byte of it
+    // was an object both ends already had. It is the same defect 0.51.0 fixed
+    // on the replication path -- "a node already present is not
+    // re-replicated" -- which was never applied here.
+    //
+    // A peer too old to answer, or one that fails the probe, falls back to
+    // being sent everything, which is exactly what it got before.
+    auto missing_on = [&](const NodeInfo& target) {
+        std::vector<ObjectId> missing;
+        constexpr size_t probe_batch = 4096;
+        for (size_t offset = 0; offset < ids.size(); offset += probe_batch) {
+            const auto end = std::min(ids.size(), offset + probe_batch);
+            Writer writer;
+            writer.u32(static_cast<uint32_t>(end - offset));
+            for (size_t i = offset; i < end; ++i)
+                writer.fixed(ids[i].bytes);
+            try {
+                auto reply = bounded_control_call(target, MessageType::have_control_objects,
+                                                  writer.data());
+                if (reply.message.type != MessageType::have_control_objects_reply)
+                    throw std::runtime_error(reply_error_text(reply));
+                Reader reader(reply.message.payload);
+                const auto count = reader.u32();
+                if (count != end - offset)
+                    throw std::runtime_error("control presence reply count mismatch");
+                for (size_t i = offset; i < end; ++i)
+                    if (!reader.u8())
+                        missing.push_back(ids[i]);
+                reader.finish();
+            } catch (const std::exception& error) {
+                Log::debug("CONTROL presence probe peer=" + target.host +
+                           " error=" + error.what() + "; sending the whole graph");
+                return ids;
+            }
+        }
+        return missing;
+    };
+
+    // Store the graph on one candidate with the puts pipelined rather than one
+    // round trip after another, which cost 65 x 65 ms = 4.2 s per mutation on
+    // the live cluster (`control_ms=4247 control_objects=65`).
+    //
+    // Pipelined, but bounded. Until 0.53.1 this fired the entire graph at once,
+    // which was correct while a graph was 65 catalogue shards and became a
+    // cluster-wide failure when the namespace went tree-backed and a commit
+    // started touching 838 control objects: the puts overran the connection's
+    // outbound queue, the catch below cancelled the whole batch, and every
+    // peer was skipped in turn. gbni-1 then had retained=1 against required=2
+    // and killed the operator's ingest job -- on every commit over the line,
+    // for hours, while reporting a dead network link (2026-09-22).
+    //
+    // Bound it by what the connection will actually hold, not by a number of
+    // our own choosing. A put occupies a writer queue slot until it is sent
+    // and a pending-reply slot until it is answered, so the binding limit is
+    // the smaller of the two. A quarter of it, because this graph is one
+    // caller among heartbeats, metadata commits and status traffic on the same
+    // lane, and taking more than a share of a shared budget is precisely how
+    // this broke. That still pipelines ~64 deep -- about thirteen round trips
+    // for a graph of 838 against the fifty it would take serially -- and it no
+    // longer has any relationship to how large the namespace has grown.
+    const size_t connection_budget =
+        std::min(max_pending_rpc_requests, max_peer_outbound_messages);
+    const size_t put_window = std::max<size_t>(1, connection_budget / 4);
     auto put_graph_on = [&](const NodeInfo& target) {
         if (target.id == n_.node_id()) {
-            for (const auto& [id, bytes] : graph)
-                if (!n_.control_store().put(id, bytes))
+            // Local puts are reaffirmations as well as writes: LocalStore::put
+            // refreshes an existing object's physical age, which is what keeps
+            // reachability GC from racing a commit that reuses an old orphan.
+            // So the local candidate is not presence-filtered.
+            for (const auto& id : ids) {
+                auto bytes = n_.control_store().get(id);
+                if (!bytes || !n_.control_store().put(id, *bytes))
                     return false;
+            }
             return true;
         }
+        const auto missing = missing_on(target);
+        if (missing.size() != ids.size() && Log::enabled(LogLevel::debug))
+            Log::debug("CONTROL graph peer=" + target.host +
+                       " referenced=" + std::to_string(ids.size()) +
+                       " missing=" + std::to_string(missing.size()));
+        if (missing.empty())
+            return true;
         std::vector<std::pair<AsyncRpc, size_t>> in_flight;
-        in_flight.reserve(graph.size());
+        in_flight.reserve(std::min(put_window, missing.size()));
         const auto put_started = Clock::now();
-        try {
-            for (const auto& [id, bytes] : graph) {
-                Writer writer;
-                writer.fixed(id.bytes);
-                writer.bytes(bytes);
-                in_flight.emplace_back(n_.call_async(target, MessageType::put_control_object,
-                                                     writer.data(), FrameType::control),
-                                       bytes.size());
-            }
-        } catch (const std::exception& error) {
-            Log::debug("CONTROL retention object store peer=" + target.host +
-                       " error=" + error.what());
-            for (auto& [rpc, _] : in_flight)
-                rpc.cancel();
-            return false;
-        }
         bool ok = true;
         size_t bytes_sent = 0;
-        for (auto& [rpc, size] : in_flight) {
-            try {
-                if (rpc.get().message.type == MessageType::ok)
-                    bytes_sent += size;
-                else
+        auto drain = [&] {
+            for (auto& [rpc, size] : in_flight) {
+                try {
+                    if (rpc.get().message.type == MessageType::ok)
+                        bytes_sent += size;
+                    else
+                        ok = false;
+                } catch (const std::exception& error) {
+                    Log::debug("CONTROL retention object store peer=" + target.host +
+                               " error=" + error.what());
                     ok = false;
+                }
+            }
+            in_flight.clear();
+        };
+        for (const auto& id : missing) {
+            if (in_flight.size() >= put_window)
+                drain();
+            // Read the bytes only for what is actually being sent. The old
+            // form materialised every referenced object up front, so a commit
+            // decrypted its whole spine out of the control store to discover
+            // the peer wanted none of it.
+            auto bytes = n_.control_store().get(id);
+            if (!bytes) {
+                for (auto& [rpc, _] : in_flight)
+                    rpc.cancel();
+                return false;
+            }
+            Writer writer;
+            writer.fixed(id.bytes);
+            writer.bytes(*bytes);
+            try {
+                in_flight.emplace_back(n_.call_async(target, MessageType::put_control_object,
+                                                     writer.data(), FrameType::control),
+                                       bytes->size());
             } catch (const std::exception& error) {
                 Log::debug("CONTROL retention object store peer=" + target.host +
                            " error=" + error.what());
-                ok = false;
+                for (auto& [rpc, _] : in_flight)
+                    rpc.cancel();
+                return false;
             }
         }
+        drain();
         if (bytes_sent)
             note_network(bytes_sent, Clock::now() - put_started);
         return ok;

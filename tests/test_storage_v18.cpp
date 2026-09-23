@@ -1386,6 +1386,92 @@ MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_pe
     CHECK(unsatisfiable.front() == id);
 }
 
+MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget_still_publishes) {
+    // A metadata publication claims retention on its whole control graph
+    // before it may commit, and it pipelines those puts rather than paying a
+    // round trip each. Until 0.53.1 it pipelined *all* of them at once, which
+    // was fine while a graph was 65 catalogue shards and became an outage when
+    // the namespace went tree-backed and a commit started touching 838
+    // objects: one connection holds at most max_pending_rpc_requests replies
+    // outstanding across every caller on the lane, so the 513th put was
+    // refused, the batch was cancelled, and every peer was skipped in turn.
+    //
+    // gbni-1 then had retained=1 against required=2 and killed the operator's
+    // ingest job -- deterministically, on every commit over the line, for
+    // hours (2026-09-22). The measured signature was unmistakable once looked
+    // at: every commit of 65 objects or fewer succeeded, every commit of 828
+    // or more failed, and the failures came back *faster* than the successes
+    // because nothing was ever sent.
+    //
+    // So the size of a namespace must not decide whether it can be published.
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config = storage_node_config(cluster, "graph-a", a_port, 64ULL * 1024 * 1024, 2, 2);
+    auto b_config = storage_node_config(cluster, "graph-b", b_port, 64ULL * 1024 * 1024, 2, 2,
+                                        {{"127.0.0.1", a_port}});
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 10s));
+
+    // Comfortably past the budget, and past it by more than one window, so a
+    // fix that merely raised the limit by a constant would not pass either.
+    const size_t count = max_pending_rpc_requests * 2;
+    std::vector<ObjectId> ids;
+    ids.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto bytes = pattern(128, static_cast<uint8_t>(i % 251));
+        bytes[0] = static_cast<uint8_t>(i & 0xff);
+        bytes[1] = static_cast<uint8_t>((i >> 8) & 0xff);
+        const auto id = object_id(bytes);
+        REQUIRE(a.node().control_store().put(id, bytes));
+        ids.push_back(id);
+    }
+
+    const RetentionDot dot{a.node().node_id(), 1};
+    REQUIRE(a.store().retain_control(ids, dot, 2));
+
+    // The floor was met by a real second replica, not by the writer counting
+    // itself twice: the peer holds every object in the graph.
+    size_t on_peer = 0;
+    for (const auto& id : ids)
+        if (b.node().control_store().has(id))
+            ++on_peer;
+    CHECK(on_peer == ids.size());
+
+    // And the second commit over the same graph sends nothing at all. This is
+    // the part that matters: a metadata commit references its whole spine, so
+    // without a presence check the cost of publishing scales with how large
+    // the library has grown rather than with what changed. Measured on gbni-1
+    // before this existed: three minutes of importing, 25 commits, 5,469
+    // control objects pushed to peers, and the control store grew by zero.
+    const auto puts_before =
+        b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
+    REQUIRE(puts_before > 0);
+    const RetentionDot again{a.node().node_id(), 2};
+    REQUIRE(a.store().retain_control(ids, again, 2));
+    const auto puts_after =
+        b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
+    CHECK(puts_after == puts_before);
+
+    // Removing part of the graph from the peer brings back exactly that part,
+    // so the probe is selecting rather than simply never sending.
+    for (size_t i = 0; i < 10; ++i)
+        REQUIRE(b.node().control_store().remove(ids[i]));
+    const RetentionDot third{a.node().node_id(), 3};
+    REQUIRE(a.store().retain_control(ids, third, 2));
+    const auto puts_final =
+        b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
+    CHECK(puts_final == puts_after + 10);
+    for (size_t i = 0; i < 10; ++i)
+        CHECK(b.node().control_store().has(ids[i]));
+}
+
 MACHA_TEST("storage_v18", test_catalogue_metadata_ignores_full_data_quota_and_artwork_uses_data_fallback) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto small_port = free_port();

@@ -63,6 +63,16 @@ enum class MessageType : uint16_t {
     commit_history_floor = 38,
     session_sync = 39,
     have_objects = 40,
+    // 0.53.1: the CONTROL-plane counterpart of have_objects, which answers
+    // from local_store() and so can say nothing about control objects. A
+    // metadata publication needs it to avoid re-uploading a control graph the
+    // peer already holds: before this existed it pushed every referenced
+    // object on every commit, which on a tree-backed namespace meant 840
+    // objects a commit and 5,469 objects in three minutes against a control
+    // store that grew by none of them. Reply: have_control_objects_reply. A
+    // peer that does not know this message answers with an error, and the
+    // caller falls back to sending the whole graph as it always did.
+    have_control_objects = 45,
     // 0.27.0: the immutable record for a history hash as a self-contained
     // full-body entry, materialized by the serving peer (get_metadata_history_entry
     // returns the peer's *stored* frame, which may be exactly the delta the
@@ -97,7 +107,8 @@ enum class MessageType : uint16_t {
     session_sync_reply = 117,
     have_objects_reply = 118,
     user_sync_reply = 119,
-    dial_back_probe_reply = 120
+    dial_back_probe_reply = 120,
+    have_control_objects_reply = 121
 };
 
 // Transport priority is a property of the frame type itself. There is no
@@ -114,6 +125,21 @@ enum class TransportLane : uint8_t {
 };
 
 const char* transport_lane_name(TransportLane) noexcept;
+
+// What one peer connection will hold for all callers on its lane: messages
+// queued for the writer, and replies still outstanding. A caller that
+// pipelines a batch has to size its window against these rather than against
+// a number of its own invention.
+//
+// On 2026-09-22 a tree-backed metadata commit fired all 838 of its
+// control-object writes at once, overran the outbound queue, and the whole
+// publication failed -- reported as a dead network link, because three
+// separate `catch` blocks on that path discarded the reason. The queue is the
+// binding limit of the two and it is timing-dependent, since the writer drains
+// it concurrently: on the live cluster every commit of 65 objects got through,
+// every commit of 828+ failed, and 353 did both on different days.
+inline constexpr size_t max_pending_rpc_requests = 512;
+inline constexpr size_t max_peer_outbound_messages = 256;
 
 enum class FrameType : uint8_t {
     control = 1,
@@ -408,8 +434,12 @@ class RpcClient {
                               FrameType);
     // Send on a route that already exists (outbound first, then inbound);
     // never dials. Empty when the peer has no usable route on `lane`.
+    // `why`, when given, receives the reason a usable route still refused the
+    // call. Discarding it made a caller exhausting the connection's shared
+    // pending-reply budget indistinguishable from a peer with no route at all.
     std::optional<AsyncRpc> call_existing(const NodeId&, TransportLane, MessageType,
-                                          std::span<const uint8_t>, FrameType);
+                                          std::span<const uint8_t>, FrameType,
+                                          std::string* why = nullptr);
     bool local_inbound_capable() const;
     bool peer_inbound_capable_locked(const NodeId&) const;
     bool route_usable_locked(const NodeId&, TransportLane) const;
