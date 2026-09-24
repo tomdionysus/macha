@@ -805,6 +805,7 @@ bool TorrentManager::cancel(std::string_view id) {
         impl_->handles.erase(h);
     }
     ingest_.staging().release(it->first);
+    publication_waits_.erase(it->first);
     if (delete_payload) {
         std::error_code ec;
         std::filesystem::remove_all(it->second.save_path, ec);
@@ -987,6 +988,37 @@ std::optional<std::string> TorrentManager::save_path_of(const lt::torrent_handle
         return job->second.save_path.string();
     }
     return std::nullopt;
+}
+
+bool TorrentManager::publication_settled_locked(const std::string& id, const TorrentJob& job) {
+    // Nothing when the backend is not publishing or does not hold the torrent:
+    // then there is nothing to wait for.
+    const auto progress = verifications_->publication(job.save_path.string());
+    if (!progress || progress->complete()) {
+        if (publication_waits_.erase(id) && progress)
+            Log::info("torrent extents published; importing id=" + id +
+                      " extents=" + std::to_string(progress->extents));
+        return true;
+    }
+    const auto now = Clock::now();
+    const auto [wait, first] = publication_waits_.try_emplace(id, PublicationWait{progress->published, now});
+    if (first) {
+        Log::info("torrent downloaded; import waits for extent publication id=" + id +
+                  " published=" + std::to_string(progress->published) +
+                  " extents=" + std::to_string(progress->extents));
+        return false;
+    }
+    if (progress->published != wait->second.published) {
+        wait->second = {progress->published, now};
+        return false;
+    }
+    if (now - wait->second.advanced < publication_stall_limit) return false;
+    Log::warn("torrent extent publication made no progress for " +
+              std::to_string(std::chrono::duration_cast<std::chrono::minutes>(publication_stall_limit).count()) +
+              " min id=" + id + " published=" + std::to_string(progress->published) +
+              " extents=" + std::to_string(progress->extents) + "; importing now, the rest is copied");
+    publication_waits_.erase(wait);
+    return true;
 }
 
 TorrentDiskHooks TorrentManager::disk_hooks() const {
@@ -1191,6 +1223,15 @@ void TorrentManager::update_jobs() {
 
         if (job.state == TorrentJobState::downloaded) {
             hit->second.pause();
+            // Pretty Woman, 2026-09-24: submitted at download finish with
+            // publication still 30-odd extents behind, the ingest found an
+            // incomplete journal and copied the whole film. The torrent is
+            // kept, paused, until its extents are all published.
+            if (!publication_settled_locked(id, job)) {
+                job.updated_unix_ms = unix_ms();
+                changed = true;
+                continue;
+            }
             try {
                 const auto ingest_id = ingest_.submit_path(job.save_path, "torrent", job.id,
                                                            job.name, std::nullopt, true, true);

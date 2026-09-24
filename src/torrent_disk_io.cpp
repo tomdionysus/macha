@@ -141,7 +141,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         if (publishing()) {
             publisher_ = std::thread([this] { publisher(); });
             hooks_.verifications->attach(
-                [this](const std::string& save_path, int piece) { piece_verified(save_path, piece); });
+                [this](const std::string& save_path, int piece) { piece_verified(save_path, piece); },
+                [this](const std::string& save_path) { return publication(save_path); });
         }
     }
 
@@ -506,6 +507,20 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             for (const auto index : ready) publish_queue_.push_back({storage, index, Clock::now()});
         }
         publish_cv_.notify_one();
+    }
+
+    // How far a torrent's publication has got; nothing for a torrent this
+    // backend does not hold.
+    std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
+        std::shared_ptr<Storage> storage;
+        {
+            std::lock_guard lock(by_path_mutex_);
+            const auto found = by_path_.find(save_path);
+            if (found != by_path_.end()) storage = found->second.lock();
+        }
+        if (!storage) return std::nullopt;
+        std::lock_guard lock(storage->publish_mutex);
+        return TorrentPublicationProgress{storage->published_count, storage->extents.size()};
     }
 
     void publisher() {

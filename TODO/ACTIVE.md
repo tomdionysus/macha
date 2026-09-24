@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-24 evening, after 0.54.0 through 0.56.0.
+Last updated: 2026-09-24 ~15:20Z, after 0.57.0 (committed, not deployed).
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -10,53 +10,58 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 [the 2026-09-24 handover](HANDOVER-2026-09-24.md) first.** It says what is in
 flight, what is owed to whom, and the traps that cost time that day.
 
-## Cluster state (2026-09-24 ~14:10Z)
+## Cluster state (2026-09-24 ~15:20Z)
 
-- **node-c** runs 0.55.1. **node-e and node-f** run 0.55.1 but became
-  **unreachable from home at about 14:03Z** (SSH, the RPC port, and node-e's
-  public https all time out, from the laptop and from node-c; home internet is
-  up). Not diagnosed: a site outage or the links between sites.
-- **0.56.0 is committed and pushed (`60ce47a`), NOT deployed** -- node-e is the
-  build node and was unreachable. Core, the web client, the Android TV client
-  and the mobile client have been sent the full 0.56.0 change notice, marked
-  "not yet deployed"; **each is owed a second message when it is live**.
+- **node-e (node-e) is offline for the foreseeable future** (operator). Do
+  not wait for it and do not plan deploys around it.
+- **node-f** runs 0.55.1 and is healthy, but its **eth0 has no carrier since
+  11:37:19Z**, so it is on wifi at **198.51.100.10** (and .20), not 198.51.100.50.
+  The operator says it should not be on wifi: cable or switch port, on site.
+  node-f is now the only node that can build.
+- **node-f hosts DATA since 15:25:44Z**: `hosts_extents: true`, one backend
+  at `/var/lib/macha/data`, `limit: 10G` (config backed up as
+  `macha.yaml.bak-pre-data-10g`). Live from a restart at 15:25:44Z (not from
+  this session); restarted again gated at 16:05Z. 5.4 GB used by 16:06Z;
+  writable, replicas 2/2. It logs `extents hosted here are reachable from
+  inbound-capable peers only`: node-f is behind CGNAT, so no peer can dial it
+  to fetch what it holds.
+- **node-c** runs 0.55.1. With node-e gone, node-c and node-f are the only
+  metadata replicas against `metadata_min_write_replicas: 2`: **restarting
+  either makes metadata read-only until it is back.**
+- **0.56.0 (`60ce47a`) and 0.57.0 are committed, NOT deployed.** Core, the
+  web client, the Android TV client and the mobile client have the 0.56.0
+  notice marked "not yet deployed"; each is owed a message when it is live,
+  and the 0.57.0 notice (below) with it.
 - node-d is defunct for months (operator). Every node's config carries
   `torrent.log_level: INFO`.
 
 ## The queue
 
-1. **Deploy 0.56.0** (every response has a snake_case `status`; `error_code`
-   beside every text error; catalogue hint `result` is a code) when node-e and
-   node-f are reachable: build and suite on node-e, gated rolling restart
-   (`tools/gated-install.sh`, below), then tell the four Macha client
-   sessions it is live, per node. Verify on the wire that a success body
-   starts `{"status":"ok"`.
-2. **Torrent disk backend, finish stage 2** ([plan](2026-09-23-torrent-disk-backend-plan.md),
-   [incident](2026-09-23-torrent-writes-starve-publication-incident.md)).
-   Stage 1 (0.54.0) and stage 2 (0.55.0/0.55.1) are deployed and working:
-   the torrent's I/O is admitted at loader class, extents publish as pieces
-   verify, and the ingest adopts a complete manifest instead of copying.
-   **But no production torrent has been adopted yet:**
-   - [ ] **The ingest starts before publication finishes.** Pretty Stranger
-     (node-c, 13:14-13:33Z): publication ran fine to at least 495 of 527
-     extents, but the ingest was queued at download finish (13:26:35Z),
-     found an incomplete manifest, and copied -- silently. Fix: the torrent
-     manager submits the ingest only when the backend reports the torrent
-     fully published (it already logs `torrent extents all published`), and
-     the ingest logs why it copies when a journal exists but is incomplete.
-   - [ ] Trackwatching (09:14Z, 0.55.0): publication stalled at 162/436 --
-     fixed in 0.55.1 by taking verified pieces from the torrent's own
-     bitfield; Pretty Stranger confirmed the fix (no stall, no dropped alerts).
+1. **Deploy 0.56.0 and 0.57.0 together** to node-f and node-c: build and
+   suite on **node-f** (node-e is gone; never node-c), tarball to node-c, gated
+   restarts. Each restart is a metadata read-only window (two replicas, W=2),
+   so do them back to back once both are gated clear. Then tell the four
+   Macha client sessions both versions are live, per node, with 0.57.0's API
+   notes (a torrent job stays `downloaded` while its extents publish; an
+   ingest and its torrent job can be `blocked` with `metadata_unavailable`
+   and recover by themselves instead of `failed`). Verify on the wire that a
+   success body starts `{"status":"ok"`. The swarm test must pass on node-f:
+   it has never run against the 0.57.0 backend.
+2. **Torrent disk backend: prove stage 2 in production**
+   ([plan](2026-09-23-torrent-disk-backend-plan.md)). 0.57.0 finishes the
+   code: a downloaded torrent is imported only once every extent is published
+   (10 min no-progress fallback), the ingest logs why it copies, and the three
+   promised side fixes are in (`ensure_control_local` takes no DATA credit
+   and logs failure; `MetadataNotReady` blocks and retries an ingest; DATA
+   pressure onset and release are logged). Each fix has a test that fails
+   without it.
+   - [ ] **An adopted torrent in production**: after the deploy, a torrent
+     should log `torrent downloaded; import waits ...`, `torrent extents
+     published; importing`, then `ingest adopted published extents` for
+     every file and no `ingest copying`. Only node-c runs torrents.
    - [ ] **Operator's call, open:** option A (payload files are the assembly
      area -- what is built) or option B (a staging format of macha's own).
      Everything A-specific is behind `read_extent`.
-   - [ ] **Owed since stage 1 and not done** (the plan said they ship with
-     it): `ensure_control_local` takes a 4 MiB *speculative* DATA credit to
-     validate an 18 KB local control object and returns false with no log;
-     the ingest dies on a transient `MetadataNotReady` instead of pausing and
-     retrying (same class as -3's ingest part); DATA pressure onset/release
-     is not logged. Now `metadata_unavailable` in 0.56.0's codes -- but the
-     job still dies.
    - [ ] Stages 3-4 of the plan (random order, commit batching,
      watch-while-downloading, cleanup proof).
 3. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
