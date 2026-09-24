@@ -23,6 +23,35 @@ that assembles extents in staging and publishes each one as soon as it is
 verified, under the DATA arbiter at loader class. Four stages, the first of
 which alone removes the mechanism.
 
+**Stage 2 in production, first torrent (Trainspotting, gbni-1, 2026-09-24
+09:14Z): publication stalled at 162 of 436 extents, NOT FIXED.** Download and
+publication started together (39 -> 121 extents in 40 s), then publication
+stopped with no error while the download finished. A gdb stack showed the
+publisher idle in its empty-queue wait: the remaining extents were never
+queued because their pieces' verifications never reached the backend. The
+ingest correctly fell back to copying. Likely cause, not yet proven:
+verification depends on one `piece_finished_alert` per piece, libtorrent's
+alert queue is bounded and drops on overflow, and nothing logs
+`alerts_dropped_alert`. Proposed fix: take verified pieces from the torrent's
+own have-bitfield (`status().pieces`) on `torrent_finished_alert` and on a
+periodic tick while downloading, as resume already does; log dropped alerts.
+(Also noted: I attached gdb to gbni-1 while one playback session was live --
+the check ran but did not gate the attach.)
+
+**Catalogue misclassification (operator TODO, 2026-09-24):** "My Name Is Earl"
+was imported as a Movie during a torrent download. The web client saw the
+same job: `/mnt/diskB/ingest/torrents/014ea49d.../My Name Is Earl/Season 1/122
+- Stole a Badge.avi` planned to `/Movies/122 Stole a Badge/122 - Stole a
+Badge.avi`. The episode name carries no `SxxEyy`; the series and season are in
+the folders, which the planner apparently does not use. Not diagnosed.
+
+**From the web client's torrent page (2026-09-24), not yet checked:**
+- [ ] `info_hash` is null on finished and imported torrent jobs (e.g.
+  014ea49d..., 5eccf2d2...): dropped after metadata, or never stored?
+- [ ] While a torrent imports, the torrent job's own `bytes_completed`,
+  `progress` and `download_rate` carry the import job's figures. Intended
+  (then document it) or not (then keep the download's own).
+
 **Artwork, business P0 from the web client (2026-09-24).** 0.54.1 shipped
 and was verified by the web client on all three nodes over http and https:
 30-day capability and max-age (URLs now roll monthly, not at UTC midnight),
