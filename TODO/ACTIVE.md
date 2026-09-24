@@ -1,167 +1,139 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-23 afternoon, after 0.53.0, 0.53.1 and 0.53.2 shipped
-and deployed across 2026-09-22/23.
+Last updated: 2026-09-24 evening, after 0.54.0 through 0.56.0.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here if you are new to this work.**
+**Start here if you are new to this work: read
+[the 2026-09-24 handover](HANDOVER-2026-09-24.md) first.** It says what is in
+flight, what is owed to whom, and the traps that cost time that day.
 
-**STOP. Work on nothing else until this is fixed (operator, 2026-09-23
-evening):** [torrent writes starve publication](2026-09-23-torrent-writes-starve-publication-incident.md).
-libtorrent's ten-thread disk pool writes torrent payload onto the DATA
-spindle outside every admission control; the disk monitor sees only the
-consequence, declares pressure, and throttles publication to one slot, which
-both nodes then hold across a put to each other. Seven ingests died on
-2026-09-23 with `CONTROL retention floor unavailable`. The file has the
-proof, the mechanism, and the design questions that are the operator's to
-answer before any code is changed. **Decided 2026-09-23 evening:** the fix
-is [a macha disk backend for libtorrent](2026-09-23-torrent-disk-backend-plan.md)
-that assembles extents in staging and publishes each one as soon as it is
-verified, under the DATA arbiter at loader class. Four stages, the first of
-which alone removes the mechanism.
+## Cluster state (2026-09-24 ~14:10Z)
 
-**Stage 2 in production, first torrent (Trainspotting, gbni-1, 2026-09-24
-09:14Z): publication stalled at 162 of 436 extents -- fixed in 0.55.1 by
-taking verified pieces from the torrent's bitfield; confirm on the next torrent.** Download and
-publication started together (39 -> 121 extents in 40 s), then publication
-stopped with no error while the download finished. A gdb stack showed the
-publisher idle in its empty-queue wait: the remaining extents were never
-queued because their pieces' verifications never reached the backend. The
-ingest correctly fell back to copying. Likely cause, not yet proven:
-verification depends on one `piece_finished_alert` per piece, libtorrent's
-alert queue is bounded and drops on overflow, and nothing logs
-`alerts_dropped_alert`. Proposed fix: take verified pieces from the torrent's
-own have-bitfield (`status().pieces`) on `torrent_finished_alert` and on a
-periodic tick while downloading, as resume already does; log dropped alerts.
-(Also noted: I attached gdb to gbni-1 while one playback session was live --
-the check ran but did not gate the attach.)
+- **gbni-1** runs 0.55.1. **es-1 and fi-1** run 0.55.1 but became
+  **unreachable from home at about 14:03Z** (SSH, the RPC port, and es-1's
+  public https all time out, from the laptop and from gbni-1; home internet is
+  up). Not diagnosed: a site outage or the links between sites.
+- **0.56.0 is committed and pushed (`60ce47a`), NOT deployed** -- es-1 is the
+  build node and was unreachable. Core, the web client, the Android TV client
+  and the mobile client have been sent the full 0.56.0 change notice, marked
+  "not yet deployed"; **each is owed a second message when it is live**.
+- gbni-2 is defunct for months (operator). Every node's config carries
+  `torrent.log_level: INFO`.
 
-**Catalogue misclassification (operator TODO, 2026-09-24):** "My Name Is Earl"
-was imported as a Movie during a torrent download. The web client saw the
-same job: `/mnt/diskB/ingest/torrents/014ea49d.../My Name Is Earl/Season 1/122
-- Stole a Badge.avi` planned to `/Movies/122 Stole a Badge/122 - Stole a
-Badge.avi`. The episode name carries no `SxxEyy`; the series and season are in
-the folders, which the planner apparently does not use. Not diagnosed.
+## The queue
 
-**From the web client's torrent page (2026-09-24), not yet checked:**
-- [ ] `info_hash` is null on finished and imported torrent jobs (e.g.
-  014ea49d..., 5eccf2d2...): dropped after metadata, or never stored?
-- [ ] While a torrent imports, the torrent job's own `bytes_completed`,
-  `progress` and `download_rate` carry the import job's figures. Intended
-  (then document it) or not (then keep the download's own).
+1. **Deploy 0.56.0** (every response has a snake_case `status`; `error_code`
+   beside every text error; catalogue hint `result` is a code) when es-1 and
+   fi-1 are reachable: build and suite on es-1, gated rolling restart
+   (`tools/gated-install.sh`, below), then tell the four Macha client
+   sessions it is live, per node. Verify on the wire that a success body
+   starts `{"status":"ok"`.
+2. **Torrent disk backend, finish stage 2** ([plan](2026-09-23-torrent-disk-backend-plan.md),
+   [incident](2026-09-23-torrent-writes-starve-publication-incident.md)).
+   Stage 1 (0.54.0) and stage 2 (0.55.0/0.55.1) are deployed and working:
+   the torrent's I/O is admitted at loader class, extents publish as pieces
+   verify, and the ingest adopts a complete manifest instead of copying.
+   **But no production torrent has been adopted yet:**
+   - [ ] **The ingest starts before publication finishes.** Pretty Woman
+     (gbni-1, 13:14-13:33Z): publication ran fine to at least 495 of 527
+     extents, but the ingest was queued at download finish (13:26:35Z),
+     found an incomplete manifest, and copied -- silently. Fix: the torrent
+     manager submits the ingest only when the backend reports the torrent
+     fully published (it already logs `torrent extents all published`), and
+     the ingest logs why it copies when a journal exists but is incomplete.
+   - [ ] Trainspotting (09:14Z, 0.55.0): publication stalled at 162/436 --
+     fixed in 0.55.1 by taking verified pieces from the torrent's own
+     bitfield; Pretty Woman confirmed the fix (no stall, no dropped alerts).
+   - [ ] **Operator's call, open:** option A (payload files are the assembly
+     area -- what is built) or option B (a staging format of macha's own).
+     Everything A-specific is behind `read_extent`.
+   - [ ] Stages 3-4 of the plan (random order, commit batching,
+     watch-while-downloading, cleanup proof).
+3. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
+   switchable in config under the API section (`enabled: true|false`).
+   **There is no route table today**: each API class (catalogue, playback,
+   session, status, manage, users, acquisition, web) dispatches through its
+   own chain of path tests. The agreed design (2026-09-07, 2026-09-13) is to
+   generate the document from the route table so it cannot drift, so the
+   first step is a declarative route table that dispatch actually runs from.
+   Document the status and error codes from 0.56.0 with it.
+4. **Search `kind` filter** (approved; Core asked). Repeated `kind`
+   parameter (`movie`, `show`, `season`, `episode`, `artist`, `album`,
+   `track`), filtered before `limit`; absent means all; unknown is a 400.
+   `src/catalogue_api.cpp` around line 417. Tell Core the version.
+5. **People on catalogue items -- directors, cast** (approved), with a
+   **required backfill**: TMDB `append_to_response=credits` on the requests
+   the scanner already makes (`src/media_catalogue.cpp` ~1544); store on
+   `CatalogueItem` (versioned record change); expose in the API; a
+   background, rate-limited, resumable, visible pass over every item with a
+   `tmdb` id and no credits, fetched by id. Announce to every client.
+6. **Catalogue misclassification (operator TODO):** "My Name Is Earl" was
+   imported as a Movie: `.../My Name Is Earl/Season 1/122 - Stole a
+   Badge.avi` planned to `/Movies/122 Stole a Badge/`. The episode filename
+   has no `SxxEyy`; the series and season are only in folder names, which the
+   planner apparently ignores. Not diagnosed.
+7. **Torrent job `info_hash` is null** on finished and imported jobs (web
+   client, e.g. 014ea49d..., 5eccf2d2...): dropped after metadata, or never
+   stored? Not checked.
+8. **Artwork (business P0, shipped half):** 0.54.1 verified on all nodes.
+   Still open: a **cold read is slow** (1.1 s for 77 KB from gbni-1 at ~1
+   Mbit/s); `CatalogueManager::artwork` fetches the whole object before the
+   first byte, likely queued behind loader I/O on a busy DATA disk (item 12
+   of the old list, the loader-I/O P0) -- inference until timed under load.
+   And **sized variants** (`?w=300`) -- a feature, operator's priority.
+9. **Deploy viewer check has a blind spot.** From logs, the only sound gate
+   is "no playback line in the last 30 minutes" (`session_idle_ms` is
+   1800000; a used session is erased silently; a pipeline reclaim is not a
+   session end). A client polling a paused session is invisible to it. The
+   status API sees sessions but needs `view_status`, which the anonymous
+   session lacks. **Operator's call:** a credential for deploy checks.
+10. **Test failures, undiagnosed** (no known flakes -- each is P0 work):
+    - `media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`,
+      9/20 on the laptop at `--jobs 12` at `eea4795`.
+    - `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`,
+      1/20 at `eea4795`.
+    - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`
+      (`:605`, a truncated object reported present), full suite only.
+    - `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly`,
+      once in a full laptop suite 2026-09-24, 60/60 alone.
+11. **Transport backoff after a peer restart** (open product question from
+    the 2026-09-23 barrier work): an inbound session from a peer does not
+    clear the dial backoff for its other lanes, so a node refuses to dial a
+    restarted peer for up to 4 s. Everything that hits it is transient and
+    retried; costs latency, not correctness.
+12. **The developer laptop cannot host a libtorrent session**:
+    `/usr/local/include/boost` is a manual Boost 1.91 shadowing Homebrew's
+    1.92, which Homebrew's libtorrent 2.1.1 was built with; CMake finds 1.91.
+    The swarm test fails there every time; run torrent tests on es-1.
+    Fixing the laptop is the operator's call.
 
-**Codes are primary (operator rule, 2026-09-24).** Every response carries a
-snake_case status code, success included. Normal flow: the code and no message.
-Errors and warnings: the code plus an English message, never the message alone.
-- [ ] **Rollout (operator, 2026-09-24): announce every change to Core and
-  every client session** (web client, Android TV, and any other), naming the
-  version, the routes and fields, old and new shape; they must check
-  everything that parses them. Send with the deploy, not after.
-- [ ] **Audit every route for a status code on success.** Not yet done: many
-  success bodies are probably bare data with no status field.
-- [ ] Catalogue hint `result` is prose in normal flow ("already stored",
-  "profile prepared", "no metadata provider match", "namespace path is not a
-  media file", "no supported media candidate", "path is outside configured
-  catalogue roots", "immutable media is no longer live";
-  `src/media_catalogue.cpp`, `src/media_information.cpp`): make these codes.
-Text-only error fields found by the same day's audit, each needing a closed
-code enum emitted (and persisted, for jobs) beside its message:
-- [ ] Ingest job `error` (`src/ingest.cpp:336`): e.g. retention floor
-  unavailable, source changed, no supported media, destination conflict.
-- [ ] Torrent job `error` (`src/torrent_common.cpp:226`): libtorrent
-  `errc.message()`, staging full, ingest disappeared/failed, submit failed.
-- [ ] Torrent placement failures (`src/torrent_manager.cpp:352-382`) -- the
-  structured `placement_failed` Core already asked for, recorded below.
-- [ ] Cluster torrent add result (`src/torrent_manager.cpp:296-303`).
-- [ ] Catalogue hint `error` (`src/catalogue_api.cpp:382`, `src/ingest.cpp:298`);
-  check whether `result` is an enum.
-- [ ] Status diagnostics: `upnp.error`, `external_ip.error`, `check.error`,
-  `startup.error` (`src/status_api.cpp:115-128, 866`), node reachability
-  `error` (`:1482`).
-Already right: the HTTP error envelope (`src/http.cpp:384-420`), playback
-errors, blocked/parked FUSE operations (`error_code` beside the message).
+Then the older ordered items, unchanged: -3 (the P0 merge rollback), -2, -1,
+0 to 7 below.
 
-**Artwork, business P0 from the web client (2026-09-24).** 0.54.1 shipped
-and was verified by the web client on all three nodes over http and https:
-30-day capability and max-age (URLs now roll monthly, not at UTC midnight),
-ETag = artwork id with 304 answered before any read, Timing-Allow-Origin.
-**Still open, behind the torrent work by the operator's order:**
-- [ ] A cold artwork read is slow (1.1 s for 77 KB from gbni-1, arriving at
-  ~1 Mbit/s: "loading like a blind"). `CatalogueManager::artwork` fetches the
-  whole object before the first byte; the likely cause is the read queuing
-  behind loader I/O on a DATA disk at 89-99% (the loader-I/O item below).
-  Inference until a cold read is timed under load.
-- [ ] Sized variants (`?w=300`): posters are 500x750 for ~300 px cards.
+## Standing rules (learned the hard way; do not relearn)
 
-**Approved next, after stage 1 is deployed and observed (operator,
-2026-09-24): a `kind` filter on `GET /api/v1/catalogue/search`**, asked for
-by the Core client session. A repeated `kind` parameter (`movie`, `show`,
-`season`, `episode`, `artist`, `album`, `track`, in any combination),
-filtered **before** `limit` is applied; absent means every kind, as today;
-an unknown value is a 400, never ignored. Today the route takes only `q` and
-`limit` (`src/catalogue_api.cpp`, around line 417), so Core over-fetches 200
-and keeps 50, and still gets short pages. Tell Core the version it ships in.
-
-**Approved next, after the search filter (operator, 2026-09-24): people on
-catalogue items -- directors, cast, and the equivalent for TV.** Today
-`CatalogueItem` (`src/catalogue.hpp`) holds title, synopsis, year, numbering,
-aliases, external ids and artwork, and nothing about people; the scanner calls
-TMDB `/movie/{id}` and `/tv/...` without `append_to_response=credits`
-(`src/media_catalogue.cpp` around 1544), so credits are never fetched.
-- Fetch credits on the requests the scanner already makes (one round trip).
-- Store them on the item: a versioned change to the stored catalogue record.
-- Expose them through the catalogue API (and tell the client sessions).
-- **Backfill is required, not optional** (operator): existing items were
-  matched before this existed and will not be rescanned on their own. A
-  background pass over every item that carries a `tmdb` external id and has
-  no credits, fetching by id (no re-matching), rate-limited and resumable,
-  admitted as background work under the laws, and visible (progress and
-  remaining count) so it can be seen to finish.
-
-**Cluster state:** all three live nodes (gbni-1, es-1, fi-1) run **0.53.2**,
-converged at one accepted head, `required=2 replicas=2`. gbni-2 is defunct
-for months (operator). Every node's config carries `torrent.log_level: INFO`.
-
-**What shipped in the last two days, all verified on the cluster rather than
-by version string** (details in `COMPLETED.md`):
-- **0.53.0** -- the disk resource manager audited and corrected (every DATA
-  read had been measured as zero bytes; the torrent clamp ignored law 2;
-  maintenance could neither be seen nor bounded), plus a loader activity
-  clock so maintenance yields to an import. Measured afterwards: an import at
-  **13 MB/s** aggregate with `macha-maint` at 0, against ~2 MB/s the day
-  before; es-1's pressure flapping (12 onsets in 34 min) gone.
-- **0.53.1** -- a metadata commit re-uploaded its entire control graph to
-  every peer on every commit (5,469 objects in three minutes against a control
-  store that grew by none). It now asks each peer what it is missing. Every
-  commit since logs `referenced=N missing=0`. This is what was killing ingest
-  jobs with "CONTROL retention floor unavailable".
-- **0.53.2** -- `torrent.log_level`, because DHT alerts at DEBUG were 99.9% of
-  gbni-1's journal and had evicted its whole diagnostic record in nine hours.
-
-**The one live defect that is diagnosed and not fixed is item -3 below**: a
-reconciliation merge installs the common-ancestor value on a conflict, which
-rolls a committed ingest checkpoint back, and the ingest dies on the resulting
-"concurrent file content change". Read it before touching the merge, the
-reconciler, or the ingest's error handling.
-
-**Standing rules learned the hard way this week, so a fresh session does not
-relearn them:**
 - journald's timestamp prefix is node-local; correlate on the `Z` timestamp
-  inside the message. A `--since` in local time on es-1 (CEST) silently cut
-  off a whole deploy window once.
-- `macha-tests-runtime` (the yaml/config tests) is a Linux-only target; the
-  laptop's 525 never include it. Run it on a node.
-- When a release adds a wire message, roll the *peers* first and the node
-  that needs the fix last: the sender's fix does nothing until the other end
-  can answer.
-- Check the tarball's size and md5 on the build node before shipping it. A
+  inside the message, and `--since` is local time on each node.
+- `macha-tests-runtime` is Linux-only; `macha-tests-torrent` needs a working
+  libtorrent session, so es-1, not the laptop.
+- When a release adds a wire message, roll the peers first and the node that
+  needs the fix last.
+- Check the tarball's size and md5 on the build node before shipping; a
   0-byte tarball has md5 `d41d8cd9...`.
-- A node under "high load" may be Plex, not macha: `ps --sort=-pcpu` first.
-- Absence of failures on an idle node proves nothing. The retention-floor
-  bug was declared fixed once on a node that had made zero commits.
+- A node under "high load" may be Plex: `ps --sort=-pcpu` first.
+- Absence of failures on an idle node proves nothing.
+- **When a shared struct changes (config, jobs), rebuild every target**:
+  building only the plugin left core on the old `TorrentConfig` layout and
+  the plugin tried to start 2,097,152 threads.
+- **After a deliberate mutation, delete the object file when restoring**: a
+  same-second restore skipped the rebuild and an hour went on a phantom bug.
+- **Gate a gdb attach on the viewer check**, not just run the check.
+- **Every response has a snake_case status code; errors add a message beside
+  it; clients own sorting and presentation; every API change is announced to
+  Core and every client** (operator, 2026-09-24).
 
 **Read this before trusting anything below about a client.** Four client
 sessions spent 2026-09-21 testing 0.48.0 against the live cluster and
@@ -169,168 +141,6 @@ reported sixteen findings. Six were real and are recorded; the rest were
 retracted, several of them client self-diagnoses that did not survive
 measurement. **A client's account of itself is evidence about the client, not
 a fact.**
-
--5. **`rpc_cluster/test_service_metadata_repair_coalesces_real_generation_burst`
-   was a product race, not load noise -- FIXED in the tree 2026-09-23, not yet
-   released.** `tests/test_rpc_cluster.cpp:2616`:
-   `CHECK failed: s2.node().metadata_announcements() == announcements_before + burst + 1`.
-
-   It passes 20/20 serial and 40/40 parallel on a quiet es-1, and fails
-   **12/120** on the laptop at `--jobs 12` -- contention exposes it, it does not
-   cause it. Instrumented: the failing run announces generation 16 **twice**
-   (34 against 33). `NodeRuntime::accept_metadata_commit` decided whether the
-   accepted-head set changed by copying it before and after
-   `MetadataReplica::accept_commit`, outside the replica lock. A repeated,
-   no-op gen-16 certificate whose two copies straddled the install of gen 17
-   saw the heads differ and announced a change it did not make. Only
-   duplicates, never a missed change; each duplicate is a spurious
-   `metadata_notice` broadcast and epoch bump, i.e. peer cache invalidation for
-   nothing -- against the "repeated evidence is intentionally a no-op" contract
-   at `src/metadata_manager.cpp` `accept_commit_on`.
-
-   Fix: `accept_commit` reports the `changed` it already computes under the
-   lock (optional `bool* heads_changed`), and `NodeRuntime` announces on that.
-   After: **0/120** at `--jobs 12`. The existing case is the regression test.
-   - [ ] Confirm on es-1 with the next build (`--repeat 20`, parallel).
-
--4a. **`media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`
-   fails 9/20 on the laptop at `--jobs 12` at HEAD `eea4795` (2026-09-23), NOT
-   DIAGNOSED.** `tests/test_media_playback.cpp:2054`:
-   `CHECK failed: playback.handle(current).status == 200`. Found in a full
-   laptop suite run; unrelated to the -5 fix (fails with it stashed). Not
-   previously recorded anywhere. Measure on es-1 before diagnosing.
-
-   **Two more, from the laptop full suite of 2026-09-23 with the -5/-4 fixes
-   in the tree, neither caused by them, NOT DIAGNOSED:**
-   - `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`,
-     `tests/test_rpc_cluster.cpp:4753`: `CHECK failed: state->asString() == "queued"`.
-     1/20 at HEAD `eea4795` in isolation at `--jobs 12`, 0/20 with the fixes.
-   - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`,
-     `tests/test_storage_v18.cpp:605`: `CHECK failed: !reopened.has(truncated_id)`.
-     20/20 in isolation both with and without the fixes; failed only inside
-     the full suite. A presence check that says a truncated object is present
-     is worth a look on its own, whatever the timing.
-
-   **`rpc_cluster/test_storage_data_credit_reserves_viewer_headroom_and_control`
-   -- FIXED in the tree 2026-09-23 (test only).** Not the barrier's backoff
-   after all, though it throws the same message. The node records the test's
-   bare `RpcClient` as a peer from the handshake and pings it back over the
-   same connection; the client has no inbound handler, `dispatch_inbound`
-   throws, and the reader loop closes the connection and fails every pending
-   call on it -- hence three different "uncaught" messages and the early
-   `blocked_loader` completion. Proven with a temporary log at the throw
-   (`type=ping` in every failing run). 10-15/20 before, **40/40** after giving
-   the client an `RpcServer` that answers, the pattern the telemetry test at
-   the top of the file already uses. The product is untouched on purpose
-   (operator, 2026-09-23: don't change the product just to test it);
-   `NodeRuntime` installs its handler in its constructor, before any dial.
-
--4. **P0: both durability-barrier-after-peer-restart tests fail most of the
-   time, and neither is a flake or caused by 0.53.0 (measured 2026-09-23;
-   FIXED in the tree 2026-09-23, not yet released -- see the ticked boxes).**
-
-   Measured on the laptop, in isolation, `--repeat 8`, with the 0.53.0 changes
-   and again with them stashed at `5c5d008`:
-
-   | case | with 0.53.0 | at `5c5d008` |
-   |---|---|---|
-   | `..._reports_objects_a_restarted_peer_lost` | 5/8 fail | 5/8 fail |
-   | `..._rederives_placement_after_peer_restart` | 6/8 fail | 4/8 fail |
-
-   **So they predate this work**, and the spread between 4/8 and 6/8 is noise
-   over eight runs, not a change. They pass together often enough that a single
-   full-suite run reports zero, one or both — which is how this went on being
-   called a flake. It is not one: it reproduces on demand.
-
-   The "reports" case always fails at the same assertion,
-   `tests/test_storage_v18.cpp:1385`:
-
-   ```
-   REQUIRE failed: unsatisfiable.size() == 1
-   ```
-
-   The line above it passes, so the barrier does correctly fail — it just does
-   not say **which** object the restarted peer lost. `unsatisfiable` comes back
-   empty. That contradicts the contract `DistributedStore::durability_barrier`
-   states where it is declared: "ids a peer no longer holds are appended to
-   `unsatisfiable` (if given) and the caller must re-put them." With an empty
-   vector the caller has nothing to re-put and the publication simply fails.
-
-   **Why, measured 2026-09-23 with `MACHA_TEST_LOG_LEVEL=debug`.** Every
-   failing run logs the same thing, and it is not the re-derivation path at
-   all:
-
-   ```
-   object durability quorum unavailable id=f360... required=2 durable=1 transient=yes
-     replica=628c404edda8 epoch=0b1681ce gen=2 outcome="remote-not-sent"
-     replica=bef45e617144 epoch=fc979619 gen=2 outcome="local-durable"
-   ```
-
-   `remote-not-sent` with the peer present in membership can only come from one
-   place: the launch loop in `DistributedStore::durability_barrier` wraps
-   `n_.call_async(...)` in `try { ... } catch (...) {}` and **swallows the
-   exception entirely**. (The other route to that string requires the peer to
-   be absent from membership, which produces `peer-unknown` instead.) So right
-   after `b.restart()` the RPC cannot be sent, nobody records why, and the
-   requirement is scored `transient=yes` — which returns false early and
-   deliberately leaves `unsatisfiable` empty.
-
-   That makes this **two findings**:
-
-   - [x] **Fixed 2026-09-23:** the launch failure is recorded as
-     `remote-launch-failed: <reason>` and still scored transient. With it, the
-     failing runs say what the swallowed exception was, 5/5:
-     **`remote-launch-failed: peer in retry backoff`**. a's dial to b failed
-     while b was down, `RpcClient::observe_result` put the endpoint in backoff
-     (250 ms doubling to 4 s), and `RpcClient::connection` refuses a new dial
-     until it expires -- even though membership already shows b active.
-     Original finding: **The `catch (...) {}` is a real defect on its own**, whatever the
-     test does. The `outcome` map exists precisely so a failure says which
-     peer and whether it was the epoch, the barrier or the transport that said
-     no — its own comment records a bare "required=1 durable=0" spinning
-     gbni-1 for half an hour on 2026-09-06. Swallowing the launch exception
-     reintroduces that blindness one layer down: "could not send" and "did not
-     try" become the same string. Record the reason and let it be scored.
-   - [x] **Fixed 2026-09-23:** both cases now ask again until the answer is
-     definitive (durable, or an id named unsatisfiable), within 30 s -- the
-     pattern `..._treats_an_unreachable_peer_as_transient` already used.
-     Laptop `--jobs 12 --repeat 20` over every durability-barrier case:
-     **100/100**, each restart case now ~2.6 s against ~0.6 s (the backoff).
-   - [ ] **Open, a product question, not changed:** an inbound session from a
-     peer (proof it is up) does not clear the backoff on that peer's endpoint
-     for other lanes, so after a peer restart a node refuses to dial it for up
-     to 4 s. Everything that hits it is transient and retried, so it costs
-     latency, not correctness. `rpc_cluster/test_storage_data_credit_reserves_viewer_headroom_and_control`
-     dies on the same exception (`peer in retry backoff`, 6-8/20 on the
-     laptop at `--jobs 12`) and is probably the same test shape; check before
-     assuming.
-     Original finding: **The tests are racing the transport, not testing the contract.**
-     They wait for membership to show both nodes active after the restart,
-     which is liveness, not an open data connection. The first barrier
-     routinely cannot send at all, so the definitive answer the assertion wants
-     (`epoch changed; object absent on peer after probe`) is never reached.
-     Either wait for a reachable peer before asserting, or assert across a
-     retry — the contract is "ask again", and a single call is not entitled to
-     the final answer.
-
-   **Why this was nearly missed, which is the part worth keeping.** Small samples
-   lied in both directions. The case passed 6/6 at HEAD and failed 1/3 with an
-   unrelated change in the tree, which reads as "the change broke it". Twenty runs
-   said the opposite: 10/20 at HEAD, 1/10 with the change. At a true rate near
-   50%, three runs are worth nothing and six are worth little. **Use `--repeat 20`
-   before attributing an intermittent failure to a change**, and never attribute
-   one on a single run.
-
-   - [x] **Confirmed on es-1, 2026-09-23 (0.53.2 build, quiet node): both
-     cases pass 20/20 serial and 20/20 at 4 parallel slots.** The platform
-     split recorded on 2026-09-17 holds after all; the laptop's ~50% is not
-     reproduced on the node. The `catch (...) {}` defect stands regardless.
-     Original note: Everything above is macOS/clang, and
-     `..._rederives_placement_after_peer_restart` was recorded in 2026-09-17 as
-     failing 12/12 on macOS and passing 3/3 on es-1. That it now fails only
-     4-6 times in 8 on the same machine means the earlier reading no longer
-     describes it either, so re-measure both on es-1 rather than inheriting a
-     platform split.
 
 -3. **P0: a reconciliation merge rolls committed ingest checkpoints back, and
    the ingest dies on it -- `ingest failed: concurrent file content change`
