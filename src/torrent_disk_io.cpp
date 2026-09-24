@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torrent_disk_io.hpp"
 
+#include "log.hpp"
+#include "torrent_extent_journal.hpp"
+
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/disk_buffer_holder.hpp>
 #include <libtorrent/disk_interface.hpp>
@@ -30,6 +33,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -82,9 +86,31 @@ struct OpenFile {
     bool writable{};
 };
 
+// One file-relative extent of the payload, planned when the torrent is added.
+// Everything but the two flags is immutable once planned; the flags are
+// guarded by Storage::publish_mutex.
+struct PlannedExtent {
+    lt::file_index_t file{};
+    std::string relative_path;
+    uint64_t file_size{};
+    uint64_t offset{};
+    uint64_t length{};
+    int first_piece{};
+    int last_piece{};
+    bool published{};
+    bool queued{};
+};
+
 struct Storage {
     const lt::file_storage& files;
     std::string save_path;
+    // Stage 2 (empty when publication is off).
+    std::vector<PlannedExtent> extents;
+    std::vector<std::vector<size_t>> piece_extents;
+    std::mutex publish_mutex;
+    std::vector<bool> verified; // guarded by publish_mutex
+    // Touched only by the publisher thread.
+    std::unique_ptr<TorrentExtentJournal> journal;
     // Touched only by the job currently running for this storage, and jobs
     // for one storage never run concurrently (see MachaDiskIo::worker).
     std::map<lt::file_index_t, OpenFile> open;
@@ -111,6 +137,11 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         workers_.reserve(threads);
         for (size_t i = 0; i < threads; ++i)
             workers_.emplace_back([this] { worker(); });
+        if (publishing()) {
+            publisher_ = std::thread([this] { publisher(); });
+            hooks_.verifications->attach(
+                [this](const std::string& save_path, int piece) { piece_verified(save_path, piece); });
+        }
     }
 
     ~MachaDiskIo() override { shut_down(); }
@@ -133,6 +164,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     lt::storage_holder new_torrent(const lt::storage_params& params,
                                    const std::shared_ptr<void>&) override {
         auto storage = std::make_shared<Storage>(params.files, std::string(params.path));
+        if (publishing()) plan(*storage);
         int index;
         if (!free_slots_.empty()) {
             index = free_slots_.back();
@@ -142,12 +174,20 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             index = static_cast<int>(storages_.size());
             storages_.push_back(std::move(storage));
         }
+        if (publishing()) {
+            std::lock_guard lock(by_path_mutex_);
+            by_path_[storages_[static_cast<size_t>(index)]->save_path] = storages_[static_cast<size_t>(index)];
+        }
         return lt::storage_holder(lt::storage_index_t(static_cast<std::uint32_t>(index)), *this);
     }
 
     void remove_torrent(lt::storage_index_t index) override {
         // Queued jobs hold their own reference; the storage closes its files
         // when the last of them has run.
+        if (publishing() && storages_[slot(index)]) {
+            std::lock_guard lock(by_path_mutex_);
+            by_path_.erase(storages_[slot(index)]->save_path);
+        }
         storages_[slot(index)].reset();
         free_slots_.push_back(static_cast<int>(slot(index)));
     }
@@ -378,6 +418,186 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     std::atomic<uint64_t> queued_write_bytes_{0};
     std::atomic<uint64_t> queue_limit_{0};
 
+    // Stage 2: publication runs on its own thread, off the I/O strand, so a
+    // slow network put never holds up a torrent's disk writes.
+    std::mutex by_path_mutex_;
+    std::unordered_map<std::string, std::weak_ptr<Storage>> by_path_;
+    struct PublishJob {
+        std::shared_ptr<Storage> storage;
+        size_t extent{};
+        Clock::time_point not_before{};
+    };
+    std::mutex publish_queue_mutex_;
+    std::condition_variable publish_cv_;
+    std::deque<PublishJob> publish_queue_;
+    bool publisher_stopping_{};
+    std::thread publisher_;
+
+    bool publishing() const {
+        return hooks_.extent_size && hooks_.publish && hooks_.verifications;
+    }
+
+    // Plans the payload's file-relative extents and the pieces covering each,
+    // and marks those the journal already records as published.
+    void plan(Storage& storage) {
+        const auto& files = storage.files;
+        const auto extent_size = hooks_.extent_size;
+        storage.piece_extents.resize(static_cast<size_t>(files.num_pieces()));
+        storage.verified.assign(static_cast<size_t>(files.num_pieces()), false);
+        const auto recorded = TorrentExtentJournal::load(storage.save_path);
+        for (const auto file : files.file_range()) {
+            if (files.pad_file_at(file)) continue;
+            const auto size = static_cast<uint64_t>(files.file_size(file));
+            if (!size) continue;
+            const auto relative = std::filesystem::path(files.file_path(file)).generic_string();
+            const auto known = recorded.find(relative);
+            for (uint64_t offset = 0; offset < size; offset += extent_size) {
+                PlannedExtent extent;
+                extent.file = file;
+                extent.relative_path = relative;
+                extent.file_size = size;
+                extent.offset = offset;
+                extent.length = std::min(extent_size, size - offset);
+                extent.first_piece = static_cast<int>(files.map_file(file, static_cast<int64_t>(offset), 1).piece);
+                extent.last_piece = static_cast<int>(
+                    files.map_file(file, static_cast<int64_t>(offset + extent.length - 1), 1).piece);
+                if (known != recorded.end() && known->second.size == size) {
+                    const auto it = known->second.extents.find(offset);
+                    extent.published = it != known->second.extents.end() && it->second.length == extent.length;
+                }
+                const auto index = storage.extents.size();
+                storage.extents.push_back(std::move(extent));
+                for (int piece = storage.extents[index].first_piece; piece <= storage.extents[index].last_piece; ++piece)
+                    storage.piece_extents[static_cast<size_t>(piece)].push_back(index);
+            }
+        }
+    }
+
+    // A piece libtorrent has verified. Every extent whose covering pieces
+    // have now all verified is queued for publication, once.
+    void piece_verified(const std::string& save_path, int piece) {
+        std::shared_ptr<Storage> storage;
+        {
+            std::lock_guard lock(by_path_mutex_);
+            const auto found = by_path_.find(save_path);
+            if (found != by_path_.end()) storage = found->second.lock();
+        }
+        if (!storage || piece < 0 || static_cast<size_t>(piece) >= storage->verified.size()) return;
+        std::vector<size_t> ready;
+        {
+            std::lock_guard lock(storage->publish_mutex);
+            storage->verified[static_cast<size_t>(piece)] = true;
+            for (const auto index : storage->piece_extents[static_cast<size_t>(piece)]) {
+                auto& extent = storage->extents[index];
+                if (extent.published || extent.queued) continue;
+                bool complete = true;
+                for (int p = extent.first_piece; p <= extent.last_piece && complete; ++p)
+                    complete = storage->verified[static_cast<size_t>(p)];
+                if (!complete) continue;
+                extent.queued = true;
+                ready.push_back(index);
+            }
+        }
+        if (ready.empty()) return;
+        {
+            std::lock_guard lock(publish_queue_mutex_);
+            for (const auto index : ready) publish_queue_.push_back({storage, index, Clock::now()});
+        }
+        publish_cv_.notify_one();
+    }
+
+    void publisher() {
+        std::unique_lock lock(publish_queue_mutex_);
+        while (true) {
+            publish_cv_.wait(lock, [this] { return publisher_stopping_ || !publish_queue_.empty(); });
+            if (publisher_stopping_) return;
+            const auto now = Clock::now();
+            auto due = std::find_if(publish_queue_.begin(), publish_queue_.end(),
+                                    [&](const PublishJob& job) { return job.not_before <= now; });
+            if (due == publish_queue_.end()) {
+                auto next = publish_queue_.front().not_before;
+                for (const auto& job : publish_queue_) next = std::min(next, job.not_before);
+                publish_cv_.wait_until(lock, next);
+                continue;
+            }
+            auto job = std::move(*due);
+            publish_queue_.erase(due);
+            lock.unlock();
+            const bool published = publish(job);
+            lock.lock();
+            if (!published && !publisher_stopping_) {
+                job.not_before = Clock::now() + hooks_.publish_retry;
+                publish_queue_.push_back(std::move(job));
+            }
+        }
+    }
+
+    bool publish(PublishJob& job) {
+        auto& storage = *job.storage;
+        const auto& extent = storage.extents[job.extent];
+        std::vector<uint8_t> bytes(static_cast<size_t>(extent.length));
+        {
+            auto admitted = admit(extent.length);
+            if (!admitted && aborting_.load()) return false;
+            lt::storage_error error;
+            if (!read_extent(storage, extent, bytes, error)) {
+                Log::warn("torrent extent read-back failed path=" + extent.relative_path +
+                          " offset=" + std::to_string(extent.offset) + ": " + error.ec.message() +
+                          "; retrying");
+                return false;
+            }
+        } // the read's credit is released before the put, which admits itself
+        const auto id = hooks_.publish(bytes);
+        if (!id) {
+            Log::warn("torrent extent publication failed path=" + extent.relative_path + " offset=" +
+                      std::to_string(extent.offset) + "; retrying");
+            return false;
+        }
+        try {
+            if (!storage.journal) storage.journal = std::make_unique<TorrentExtentJournal>(storage.save_path);
+            storage.journal->append(extent.relative_path, extent.file_size,
+                                    {extent.offset, extent.length, *id});
+        } catch (const std::exception& e) {
+            Log::warn("torrent extent journal append failed path=" + extent.relative_path + ": " + e.what());
+            return false;
+        }
+        std::lock_guard lock(storage.publish_mutex);
+        storage.extents[job.extent].published = true;
+        storage.extents[job.extent].queued = false;
+        return true;
+    }
+
+    // The one place an extent is read back for publication: stage 2 reads it
+    // from the payload file, which is the assembly area. A staging format of
+    // macha's own would replace this function and nothing else.
+    bool read_extent(Storage& storage, const PlannedExtent& extent, std::vector<uint8_t>& out,
+                     lt::storage_error& error) {
+        const auto path = storage.files.file_path(extent.file, storage.save_path);
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            error = lt::storage_error(errno_code(errno), extent.file, lt::operation_t::file_open);
+            return false;
+        }
+        const auto started = Clock::now();
+        size_t done = 0;
+        while (done < out.size()) {
+            const auto got = ::pread(fd, out.data() + done, out.size() - done,
+                                     static_cast<off_t>(extent.offset + done));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) {
+                error = lt::storage_error(got < 0 ? errno_code(errno)
+                                                  : lt::errors::make_error_code(lt::errors::file_too_short),
+                                          extent.file, lt::operation_t::file_read);
+                ::close(fd);
+                return false;
+            }
+            done += static_cast<size_t>(got);
+        }
+        ::close(fd);
+        observe(started, done);
+        return true;
+    }
+
     static size_t slot(lt::storage_index_t index) {
         return static_cast<size_t>(static_cast<std::uint32_t>(index));
     }
@@ -438,6 +658,16 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     // Nothing is marked downloaded unless it hashed, so nothing is lost.
     void shut_down() {
         aborting_.store(true);
+        if (publishing()) {
+            hooks_.verifications->detach();
+            {
+                std::lock_guard lock(publish_queue_mutex_);
+                publisher_stopping_ = true;
+                publish_queue_.clear();
+            }
+            publish_cv_.notify_all();
+            if (publisher_.joinable()) publisher_.join();
+        }
         {
             std::lock_guard lock(mutex_);
             if (stopping_) return;
@@ -608,6 +838,12 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             if (ec && !error.ec)
                 error = lt::storage_error(errno_code(ec), file, lt::operation_t::file_remove);
             parents.push_back(path.parent_path());
+        }
+        // The extent journal describes this payload; without it the record
+        // is stale.
+        {
+            std::error_code ec;
+            std::filesystem::remove(TorrentExtentJournal::path_for(storage.save_path), ec);
         }
         // Prune directories the payload created, deepest first, stopping at
         // the save path; a directory still holding anything stays.

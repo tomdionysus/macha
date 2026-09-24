@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "filesystem.hpp"
 #include "json.hpp"
+#include "torrent_extent_journal.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -163,6 +164,13 @@ class IngestManager {
     bool plan_job(IngestJob&, std::stop_token);
     bool import_job(IngestJob&, std::stop_token);
     bool copy_file(IngestJob&, IngestFileProgress&, std::stop_token);
+    // A torrent-sourced file whose every extent the torrent's disk backend has
+    // already published: its manifest, from the job's TorrentExtentJournal.
+    std::optional<std::vector<ExtentRef>> published_extents(const IngestJob&,
+                                                            const IngestFileProgress&);
+    std::mutex extent_journals_mutex_;
+    // By job id; see process_job.
+    std::map<std::string, std::map<std::string, TorrentExtentJournal::File>> extent_journals_;
     void refresh_progress(IngestJob&, uint64_t sample_bytes = 0,
                           std::chrono::steady_clock::duration sample_time = {});
     void refresh_catalogue_jobs();
@@ -211,6 +219,9 @@ class IngestManager {
     bool delete_external_source_on_clear() const;
     bool delete_owned_source_on_cancel() const;
     StagingArea& staging() noexcept { return staging_; }
+    // The torrent disk backend publishes extents through the same store the
+    // ingest commits into.
+    FileSystem& filesystem() noexcept { return fs_; }
     const StagingArea& staging() const noexcept { return staging_; }
     size_t max_concurrent_jobs() const noexcept { return config_.max_concurrent_jobs; }
     size_t active_jobs() const;

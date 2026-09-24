@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.54.1 LANGUAGES CXX)
+project(macha VERSION 0.55.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -315,6 +315,7 @@ set(MACHA_CORE_SOURCES
     src/acquisition_api.cpp
     src/media_catalogue.cpp
     src/ingest.cpp
+    src/torrent_extent_journal.cpp
     src/torrent_common.cpp
     src/macos_unicode.cpp
     src/hydration.cpp
