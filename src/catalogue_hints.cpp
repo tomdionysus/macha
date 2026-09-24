@@ -49,6 +49,7 @@ Json hint_json(const CatalogueHint& hint) {
     out["provider"] = hint.provider;
     out["media_id"] = hint.media_id;
     out["result"] = hint.result;
+    out["error_code"] = hint.error_code;
     out["error"] = hint.error;
     Json::Array ids;
     for (const auto& id : hint.catalogue_item_ids) ids.emplace_back(id);
@@ -115,7 +116,10 @@ CatalogueHint parse_hint(const Json& value) {
     hint.provider = json_string(value, "provider");
     hint.media_id = json_string(value, "media_id");
     hint.result = json_string(value, "result");
+    hint.error_code = json_string(value, "error_code");
     hint.error = json_string(value, "error");
+    // Recorded before error codes existed: an error is never shown without one.
+    if (!hint.error.empty() && hint.error_code.empty()) hint.error_code = "catalogue_error";
     if (const auto* ids = value.find("catalogue_item_ids"))
         for (const auto& id : ids->asArray()) hint.catalogue_item_ids.push_back(id.asString());
     if (const auto* origins = value.find("origins")) {
@@ -343,6 +347,7 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
             hint.catalogue_item_ids.clear();
             hint.result.clear();
             hint.error.clear();
+            hint.error_code.clear();
         } else if (hint.state == CatalogueHintState::deferred &&
                    submission.priority > previous_priority) {
             // A stronger producer (for example ingest over a periodic scan)
@@ -460,8 +465,9 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
     hint.provider = std::move(provider);
     hint.media_id = std::move(media_id);
     hint.catalogue_item_ids = std::move(catalogue_item_ids);
-    hint.result = std::move(result);
+    hint.result = result.empty() ? std::string("matched") : std::move(result);
     hint.error.clear();
+    hint.error_code.clear();
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     discard_ephemeral_origins(hint);
@@ -485,6 +491,7 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     hint.catalogue_item_ids.clear();
     hint.result = std::move(result);
     hint.error.clear();
+    hint.error_code.clear();
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     if (hint.origins.empty()) hints_.erase(it);
@@ -503,6 +510,7 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
     hint.failures = 0;
     hint.candidate_cursor = next_cursor;
     hint.error.clear();
+    hint.error_code.clear();
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
     mark_state_dirty_locked();
@@ -510,12 +518,14 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
     changed_locked();
 }
 
-void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t retry_after_unix_ms) {
+void CatalogueHintQueue::defer(std::string_view id, std::string code, std::string error,
+                               uint64_t retry_after_unix_ms) {
     std::lock_guard lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
     hint.state = CatalogueHintState::deferred;
+    hint.error_code = std::move(code);
     hint.error = std::move(error);
     hint.ready_after_unix_ms = retry_after_unix_ms;
     hint.updated_unix_ms = now_ms();
@@ -526,7 +536,7 @@ void CatalogueHintQueue::defer(std::string_view id, std::string error, uint64_t 
 
 size_t CatalogueHintQueue::defer_matching(
     const std::function<bool(const CatalogueHint&)>& predicate,
-    std::string error, uint64_t retry_after_unix_ms) {
+    std::string code, std::string error, uint64_t retry_after_unix_ms) {
     const auto now = now_ms();
     std::lock_guard lock(mutex_);
     size_t deferred = 0;
@@ -538,6 +548,7 @@ size_t CatalogueHintQueue::defer_matching(
         if (!predicate(hint))
             continue;
         hint.state = CatalogueHintState::deferred;
+        hint.error_code = code;
         hint.error = error;
         hint.ready_after_unix_ms = std::max(hint.ready_after_unix_ms, retry_after_unix_ms);
         hint.updated_unix_ms = now;
@@ -553,7 +564,7 @@ size_t CatalogueHintQueue::defer_matching(
     return deferred;
 }
 
-bool CatalogueHintQueue::record_failure(std::string_view id, std::string error,
+bool CatalogueHintQueue::record_failure(std::string_view id, std::string code, std::string error,
                                         uint64_t retry_after_unix_ms,
                                         unsigned max_failures) {
     std::lock_guard lock(mutex_);
@@ -562,6 +573,7 @@ bool CatalogueHintQueue::record_failure(std::string_view id, std::string error,
     if (it == hints_.end()) return false;
     auto& hint = it->second;
     ++hint.failures;
+    hint.error_code = std::move(code);
     hint.error = std::move(error);
     hint.updated_unix_ms = now_ms();
     const bool gave_up = max_failures != 0 && hint.failures >= max_failures;
@@ -582,7 +594,7 @@ bool CatalogueHintQueue::record_failure(std::string_view id, std::string error,
     return gave_up;
 }
 
-void CatalogueHintQueue::fail(std::string_view id, std::string error) {
+void CatalogueHintQueue::fail(std::string_view id, std::string code, std::string error) {
     std::lock_guard lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
@@ -590,6 +602,7 @@ void CatalogueHintQueue::fail(std::string_view id, std::string error) {
     hint.state = CatalogueHintState::failed;
     hint.failures = std::max(1u, hint.failures);
     hint.candidate_cursor = 0;
+    hint.error_code = std::move(code);
     hint.error = std::move(error);
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();

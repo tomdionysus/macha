@@ -112,6 +112,7 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     upnp["external_port"] = static_cast<uint64_t>(status.upnp.external_port);
     upnp["lease_seconds"] = static_cast<uint64_t>(status.upnp.lease_seconds);
     upnp["igd_status"] = static_cast<int64_t>(status.upnp.igd_status);
+    upnp["error_code"] = status.upnp.error_code.empty() ? Json(nullptr) : Json(status.upnp.error_code);
     upnp["error"] = status.upnp.error.empty() ? Json(nullptr) : Json(status.upnp.error);
 
     Json::Object external_ip;
@@ -119,6 +120,8 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     external_ip["attempted"] = status.external_ip.attempted;
     external_ip["address"] =
         status.external_ip.address.empty() ? Json(nullptr) : Json(status.external_ip.address);
+    external_ip["error_code"] =
+        status.external_ip.error_code.empty() ? Json(nullptr) : Json(status.external_ip.error_code);
     external_ip["error"] =
         status.external_ip.error.empty() ? Json(nullptr) : Json(status.external_ip.error);
 
@@ -863,6 +866,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     startup["started_at_unix_ms"] = readiness.started_unix_ms;
     startup["ready_at_unix_ms"] =
         readiness.ready_unix_ms ? Json(readiness.ready_unix_ms) : Json(nullptr);
+    startup["error_code"] = readiness.error.empty() ? Json(nullptr) : Json("recovery_failed");
     startup["error"] = readiness.error.empty() ? Json(nullptr) : Json(readiness.error);
 
     Json::Object root;
@@ -1478,8 +1482,10 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
             }
         }
         Json::Object item{{"node_id", to_string(member.id)}, {"reachable", reachable}};
-        if (!error.empty())
+        if (!error.empty()) {
+            item["error_code"] = std::string("rpc_failed");
             item["error"] = error;
+        }
         results.emplace_back(std::move(item));
     }
     if (!found_requested)
