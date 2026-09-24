@@ -66,6 +66,11 @@ class TorrentManager final : public TorrentService {
     // Drains libtorrent's alert queue into the journal. Also the only place
     // that can observe whether the session actually bound a usable interface.
     void drain_alerts();
+    // Reports every piece a torrent holds to the disk backend, from the
+    // torrent's own bitfield. Repeats are harmless.
+    void report_held_pieces(const libtorrent::torrent_handle&);
+    static constexpr auto held_pieces_report_interval = std::chrono::seconds(10);
+    Clock::time_point last_held_pieces_report_{};
     // The save path of the job a session handle belongs to, if any.
     std::optional<std::string> save_path_of(const libtorrent::torrent_handle&) const;
     void update_jobs();
