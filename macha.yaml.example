@@ -302,7 +302,7 @@ dht:
   # ordinary writes.
   #
   # Under pressure, speculative work stands aside always, and the loader stands
-  # aside only when a viewer is present: law 2 says the loader waits only when
+  # aside only when a viewer is present: law 3 says the loader waits only when
   # it would otherwise make a viewer wait.
   #
   # io_pressure_slowdown_percent: 0 disables the mechanism entirely.

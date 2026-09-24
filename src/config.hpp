@@ -330,7 +330,7 @@ struct CatalogueApiConfig {
     // lane -- catalogue, playback, web assets, and every body read that can
     // block on a disk or a replica. `control_workers` is the control lane
     // -- health, status, session, users -- so control traffic never queues
-    // behind playback (governing law 3, as a data structure).
+    // behind playback (governing law 1, as a data structure).
     size_t workers{16};
     size_t control_workers{2};
     // Open connections, not queued ones: an idle kept-alive connection is an

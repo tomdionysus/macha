@@ -136,7 +136,7 @@ A held request occupies one of those workers for the whole of its wait. With
 `max_sessions: 8` and an 8-segment window, the unbounded worst case is 64 held
 requests against 16 workers, and a single deeply prefetching player can take
 all 16 by itself. At that point the node stops answering Status and control
-traffic, which is a direct governing-law-3 violation. This is very likely part
+traffic, which is a direct governing-law-1 violation. This is very likely part
 of what the 98 s black screen actually was: not only the player waiting on the
 encoder, but the pool exhausted while it did.
 
@@ -283,7 +283,7 @@ default.
   refused; one outside it, or over either limit, is refused immediately with
   `503 segment_not_ready` and never occupies a worker.
 - With every session holding its maximum, `GET /api/v1/status` still answers
-  promptly. This is the governing-law-3 gate and the reason the budget exists;
+  promptly. This is the governing-law-1 gate and the reason the budget exists;
   it must be an actual test, not an assumption.
 - No client-visible regression in time to first frame on a title whose source
   audio is not DTS or TrueHD.

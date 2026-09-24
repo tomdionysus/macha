@@ -209,7 +209,7 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
     // reclaimable 0, ~1 refusal per second, spool draining at 0 B/s).
     //
     // It sits BELOW the control/viewer waiter gate above, and must stay there.
-    // Governing law 1 is that the viewer never waits, and a queued viewer
+    // Governing law 2 is that the viewer never waits, and a queued viewer
     // outranks reassembly unconditionally; a viewer cannot be the party
     // publication is deadlocked against anyway, because the viewer reserve is
     // headroom that loader and speculative work can never consume.

@@ -89,7 +89,7 @@ qualifier on the `LocalStore::valid()` item is retracted by this incident.
   alone is asked for.
 - A flood of `have_object` (or any other retention-check) messages must
   never be able to delay an unrelated control-plane message, regardless of
-  batch size. This is governing law 3, unconditionally — not "should
+  batch size. This is governing law 1, unconditionally — not "should
   usually hold," but must hold under an adversarial-sized batch.
 - Retention-before-acceptance semantics (the actual safety property
   `retain_data`/`retain_control` exist to provide) must not regress: a

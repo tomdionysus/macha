@@ -2,10 +2,12 @@
 
 ## Read first
 
-The [governing laws and self-healing disciplines](ARCHITECTURE.md#governing-laws)
-come before everything else in this file. They are cited by number in the
-source and in review, so a comment reading "governing law 3" or "discipline 1"
-refers to that section.
+The [governing laws and self-healing disciplines](docs/principles-and-laws.md)
+come before everything else in this file, with
+[how they apply in the node](ARCHITECTURE.md#governing-laws). They are shared
+by every Macha project with the same numbering and cited by number in the
+source and in review, so a comment reading "governing law 1" or "discipline 1"
+refers to them.
 
 A change that touches scheduling, admission, priority, retry or recovery is not
 complete until it says which law it serves and which discipline it follows. In

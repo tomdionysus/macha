@@ -12,7 +12,7 @@ already dead, with measurements.
 
 All three nodes are up, `healthy`, metadata writable, generation ~25752, and
 serving playback (a `mode=direct` session was created on node-e in 47 ms while
-it was wedged, so governing law 1 is intact).
+it was wedged, so governing law 2 is intact).
 
 - node-c `192.0.2.50`, node-d `192.0.2.51`, node-e `198.18.34.50`, all `root@`.
 - All three run the working tree as built this evening: committed `7d00d2e`
@@ -44,7 +44,7 @@ control/viewer waiter gate and *above* the loader gate and durable-lower
 budget. An earlier attempt (`ec33a78`, reset away this morning) put it above
 every gate; that starves publication completely on a node receiving from two
 peers, which is why it was dropped. Putting it above the *viewer* gate also
-breaks governing law 1 outright. `test_retained_memory_reassembly_reserve_is_bounded_not_absolute`
+breaks governing law 2 outright. `test_retained_memory_reassembly_reserve_is_bounded_not_absolute`
 pins all of this, including that a queued viewer outranks reassembly.
 
 **2. Publication waited with no deadline at all.**
