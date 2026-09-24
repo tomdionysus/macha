@@ -53,11 +53,18 @@ the folders, which the planner apparently does not use. Not diagnosed.
   `progress` and `download_rate` carry the import job's figures. Intended
   (then document it) or not (then keep the download's own).
 
-**Codes are primary (operator rule, 2026-09-24).** Every error, warning or
-failure status sent to a client carries a stable machine code first; an
-English message accompanies it but is never the only signal. Audited the same
-day; text-only today, each needing a closed code enum emitted (and persisted,
-for jobs) beside its message:
+**Codes are primary (operator rule, 2026-09-24).** Every response carries a
+snake_case status code, success included. Normal flow: the code and no message.
+Errors and warnings: the code plus an English message, never the message alone.
+- [ ] **Audit every route for a status code on success.** Not yet done: many
+  success bodies are probably bare data with no status field.
+- [ ] Catalogue hint `result` is prose in normal flow ("already stored",
+  "profile prepared", "no metadata provider match", "namespace path is not a
+  media file", "no supported media candidate", "path is outside configured
+  catalogue roots", "immutable media is no longer live";
+  `src/media_catalogue.cpp`, `src/media_information.cpp`): make these codes.
+Text-only error fields found by the same day's audit, each needing a closed
+code enum emitted (and persisted, for jobs) beside its message:
 - [ ] Ingest job `error` (`src/ingest.cpp:336`): e.g. retention floor
   unavailable, source changed, no supported media, destination conflict.
 - [ ] Torrent job `error` (`src/torrent_common.cpp:226`): libtorrent
