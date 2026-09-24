@@ -41,7 +41,7 @@ The per-stream instructions name what happens to each stream:
 }
 ```
 
-`code` is `choice_required` (several candidates, none named, or a language several share) or `choice_not_available` (the index or language names nothing this media has; `choices` lists what it does have). `choice` is `video_stream`, `audio_stream`, `subtitle_stream` or `container`; `choices` holds stream indexes, or the two container names. Both are `400`. A language the media lacks is never answered with a different track: until 0.57.1 it silently fell back to the default one. `direct` is the exception that proves the rule: the file is served untouched and the player picks its own tracks, so an unnamed stream is not refused there, and `output` then describes no selected stream.
+`code` is `choice_required` (several candidates, none named, or a language several share) or `choice_not_available` (the index or language names nothing this media has; `choices` lists what it does have). `choice` is `video_stream`, `audio_stream`, `subtitle_stream` or `container`; `choices` holds stream indexes, or the two container names. Both are `400`. A language the media lacks is never answered with a different track: until 0.58.0 it silently fell back to the default one. `direct` is the exception that proves the rule: the file is served untouched and the player picks its own tracks, so an unnamed stream is not refused there, and `output` then describes no selected stream.
 
 **The mode has to describe what is being done.** `direct` and `remux` copy every stream; `transcode` re-encodes at least one and may copy the other. `transcode` is the permissive mode, and it is how a mixture is asked for.
 
@@ -89,7 +89,7 @@ GET /api/v1/playback/media?media_id=<macha: or path: identity>
 GET /api/v1/playback/media?item_id=<catalogue item>
 ```
 
-It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true) and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. Whether a stream can be copied into a container is a fact about that stream, so every video and audio stream carries its own `copy_into` object with `fmp4` and `mpegts` booleans. Until 0.57.1 `operations` carried `copy_into_fmp4` and `copy_into_mpegts` for the first video and audio stream only, which answered for whichever track happened to be first. No session is created and no pipeline starts. Each file gets the whole probe allowance; one slow file no longer pushes the rest into `unavailable`.
+It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true) and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. Whether a stream can be copied into a container is a fact about that stream, so every video and audio stream carries its own `copy_into` object with `fmp4` and `mpegts` booleans. Until 0.58.0 `operations` carried `copy_into_fmp4` and `copy_into_mpegts` for the first video and audio stream only, which answered for whichever track happened to be first. No session is created and no pipeline starts. Each file gets the whole probe allowance; one slow file no longer pushes the rest into `unavailable`.
 
 **This is how a title is played.** A catalogue item is a title; its `media_ids` are its files, and each file has its own facts. The client reads them with `?item_id=`, chooses the file, the mode, the streams and the container, and creates the session with that file's `media_id`.
 
@@ -297,7 +297,7 @@ Content-Type: application/json
 Authorization: Bearer <session token>
 ```
 
-`media_id` is required, and playback is by `media_id` only: a title is not playable as such, its files are, and choosing one is the client's decision. A request naming `item_id` is refused with `400 item_id_not_accepted`, and one naming no `media_id` with `400 media_id_required`; the same holds for `PATCH`, where a `media_id` switches the file being served. Until 0.57.1 an `item_id` alone made the server rank the item's files (direct over remux over transcode, then list order) and play the winner. `path:/logical/file` is also accepted as a media identity, and a file no title references is playable by its `media_id` like any other.
+`media_id` is required, and playback is by `media_id` only: a title is not playable as such, its files are, and choosing one is the client's decision. A request naming `item_id` is refused with `400 item_id_not_accepted`, and one naming no `media_id` with `400 media_id_required`; the same holds for `PATCH`, where a `media_id` switches the file being served. Until 0.58.0 an `item_id` alone made the server rank the item's files (direct over remux over transcode, then list order) and play the winner. `path:/logical/file` is also accepted as a media identity, and a file no title references is playable by its `media_id` like any other.
 
 **A playback session is a resource, not a property of the bearer.** A `POST`
 to the collection creates a member, every time. Two `POST`s on one bearer

@@ -128,6 +128,24 @@ flight, what is owed to whom, and the traps that cost time that day.
     1.92, which Homebrew's libtorrent 2.1.1 was built with; CMake finds 1.91.
     The swarm test fails there every time; run torrent tests on es-1.
     Fixing the laptop is the operator's call.
+13. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
+    "later"). A movie may belong to more than one set (a franchise, a
+    collection, a director's box set). Nothing exists today: `CatalogueItem`
+    has a single `parent_id`, which is a hierarchy (show > season > episode,
+    artist > album > track), not membership. Not designed; needs a proposal
+    before building. Things to settle: where membership lives (on the set, on
+    the member, or a separate relation); whether sets can come from providers
+    (TMDB has collections) as well as by hand; and the API a client needs to
+    list sets and their members. The server gives membership as data;
+    ordering and presentation stay the client's. Announce to Core and every
+    client when it ships.
+14. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
+    [docs/macha-ebooks-proposal.md](../docs/macha-ebooks-proposal.md),
+    dated 2026-09-24, status Proposal: ebooks as another class of immutable
+    media, several formats grouped under one library entry, book metadata and
+    covers, read in the browser or phone UI or download the original. To be
+    read against the server as it stands and answered with what it would
+    need; nothing decided, nothing to build yet.
 
 Then the older ordered items: -3 (the P0 merge rollback), -2, -1, 0 to 7
 below. Reconciled against 0.57.0 on 2026-09-24: what was found already done

@@ -1,6 +1,6 @@
 # Current release
 
-## 0.57.1 — The server plays what it is told and chooses nothing (development)
+## 0.58.0 — The server plays what it is told and chooses nothing (development)
 
 Operator, 2026-09-24: **"The server supplies facts, operations, then does what
 it's told."** Playback is by `media_id`: a catalogue item is a title, its
@@ -8,7 +8,10 @@ it's told."** Playback is by `media_id`: a catalogue item is a title, its
 the container is the client's decision, made from
 `GET /api/v1/playback/media?item_id=`.
 
-**API changes. Every client must check what it sends and parses.**
+**Breaking API change, hence a minor version.** A request that 0.57.0 accepted
+is refused here: clients cannot ask for a title, only for a file. It was
+first built and deployed as "0.57.1" on 2026-09-24 and renumbered before it
+was tagged. **Every client must check what it sends and parses.**
 
 - **`POST /api/v1/playback/sessions` requires `media_id` and refuses
   `item_id`**: `400 media_id_required`, `400 item_id_not_accepted`. `PATCH`
