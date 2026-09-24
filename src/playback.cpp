@@ -458,7 +458,7 @@ std::vector<const MediaStreamInfo*> streams_of(const MediaProbeResult& probe, Me
 // fact and that stream is used. Several with no instruction, or an
 // instruction matching none or several, is refused with the candidates: the
 // server does not choose, and it never answers a language it does not have
-// with a different one (until 0.57.1 it fell back to the default stream).
+// with a different one (until 0.58.0 it fell back to the default stream).
 // `none_is_an_answer` is true where no instruction means "none of them":
 // subtitles, and every stream of media served untouched, whose tracks the
 // player chooses for itself.
@@ -1791,7 +1791,7 @@ struct PlaybackManager::Impl {
     // Playback is by media_id and nothing else (operator, 2026-09-24): the
     // client reads a title's files and their facts from
     // GET /api/v1/playback/media?item_id=, chooses the file, the mode and the
-    // codecs, and names them here. Until 0.57.1 an item_id alone made the
+    // codecs, and names them here. Until 0.58.0 an item_id alone made the
     // server rank the item's files direct > remux > transcode and play the
     // first winner -- a choice that was never the server's.
     std::shared_ptr<Session> resolve_session(const std::string& media_id, PlaybackPreferences preferences,
