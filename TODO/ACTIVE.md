@@ -53,6 +53,26 @@ the folders, which the planner apparently does not use. Not diagnosed.
   `progress` and `download_rate` carry the import job's figures. Intended
   (then document it) or not (then keep the download's own).
 
+**Codes are primary (operator rule, 2026-09-24).** Every error, warning or
+failure status sent to a client carries a stable machine code first; an
+English message accompanies it but is never the only signal. Audited the same
+day; text-only today, each needing a closed code enum emitted (and persisted,
+for jobs) beside its message:
+- [ ] Ingest job `error` (`src/ingest.cpp:336`): e.g. retention floor
+  unavailable, source changed, no supported media, destination conflict.
+- [ ] Torrent job `error` (`src/torrent_common.cpp:226`): libtorrent
+  `errc.message()`, staging full, ingest disappeared/failed, submit failed.
+- [ ] Torrent placement failures (`src/torrent_manager.cpp:352-382`) -- the
+  structured `placement_failed` Core already asked for, recorded below.
+- [ ] Cluster torrent add result (`src/torrent_manager.cpp:296-303`).
+- [ ] Catalogue hint `error` (`src/catalogue_api.cpp:382`, `src/ingest.cpp:298`);
+  check whether `result` is an enum.
+- [ ] Status diagnostics: `upnp.error`, `external_ip.error`, `check.error`,
+  `startup.error` (`src/status_api.cpp:115-128, 866`), node reachability
+  `error` (`:1482`).
+Already right: the HTTP error envelope (`src/http.cpp:384-420`), playback
+errors, blocked/parked FUSE operations (`error_code` beside the message).
+
 **Artwork, business P0 from the web client (2026-09-24).** 0.54.1 shipped
 and was verified by the web client on all three nodes over http and https:
 30-day capability and max-age (URLs now roll monthly, not at UTC midnight),
