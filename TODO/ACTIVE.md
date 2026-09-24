@@ -50,6 +50,13 @@ flight, what is owed to whom, and the traps that cost time that day.
    - [ ] **Operator's call, open:** option A (payload files are the assembly
      area -- what is built) or option B (a staging format of macha's own).
      Everything A-specific is behind `read_extent`.
+   - [ ] **Owed since stage 1 and not done** (the plan said they ship with
+     it): `ensure_control_local` takes a 4 MiB *speculative* DATA credit to
+     validate an 18 KB local control object and returns false with no log;
+     the ingest dies on a transient `MetadataNotReady` instead of pausing and
+     retrying (same class as -3's ingest part); DATA pressure onset/release
+     is not logged. Now `metadata_unavailable` in 0.56.0's codes -- but the
+     job still dies.
    - [ ] Stages 3-4 of the plan (random order, commit batching,
      watch-while-downloading, cleanup proof).
 3. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
