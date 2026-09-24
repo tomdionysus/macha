@@ -113,8 +113,11 @@ namespace lt = libtorrent;
 // session that reported nothing sat dead for hours once. ALL adds the
 // categories libtorrent itself calls logs, which are opt-in for a reason.
 lt::alert_category_t alert_mask_for(LogLevel level) {
+    // piece_progress carries piece_finished_alert, which is how the disk
+    // backend learns an extent's pieces have verified and it can publish it.
     auto mask = lt::alert_category::error | lt::alert_category::status |
-                lt::alert_category::port_mapping | lt::alert_category::dht;
+                lt::alert_category::port_mapping | lt::alert_category::dht |
+                lt::alert_category::piece_progress;
     if (level == LogLevel::all)
         mask |= lt::alert_category::tracker | lt::alert_category::peer |
                 lt::alert_category::session_log | lt::alert_category::torrent_log |
@@ -165,6 +168,9 @@ void harden_add_params(lt::add_torrent_params& atp, const TorrentConfig& config)
     if (!config.dht) atp.flags |= lt::torrent_flags::disable_dht;
     if (!config.lsd) atp.flags |= lt::torrent_flags::disable_lsd;
     if (!config.pex) atp.flags |= lt::torrent_flags::disable_pex;
+    // In order, so extents complete in order and are published while their
+    // bytes are still in page cache, and so a file is watchable soonest.
+    atp.flags |= lt::torrent_flags::sequential_download;
 }
 
 } // namespace
@@ -866,6 +872,21 @@ void TorrentManager::drain_alerts() {
             Log::info("torrent DHT bootstrapped");
             continue;
         }
+        if (const auto* finished = lt::alert_cast<lt::piece_finished_alert>(alert)) {
+            if (const auto path = save_path_of(finished->handle))
+                verifications_->piece_verified(*path, static_cast<int>(finished->piece_index));
+            continue;
+        }
+        // A check (a resume, or a recheck) reports no per-piece alerts, so
+        // every piece the torrent already has is reported here instead.
+        if (const auto* checked = lt::alert_cast<lt::torrent_checked_alert>(alert)) {
+            if (const auto path = save_path_of(checked->handle)) {
+                const auto have = checked->handle.status(lt::torrent_handle::query_pieces).pieces;
+                for (int piece = 0; piece < have.size(); ++piece)
+                    if (have.get_bit(lt::piece_index_t(piece))) verifications_->piece_verified(*path, piece);
+            }
+            continue;
+        }
         // Having no inbound port is an operational fact, not churn: the node
         // can still reach peers it dials, but nothing can dial it, so peer
         // counts stay low and it can never seed. At debug that is invisible in
@@ -920,11 +941,37 @@ void TorrentManager::drain_alerts() {
     }
 }
 
+std::optional<std::string> TorrentManager::save_path_of(const lt::torrent_handle& handle) const {
+    if (!impl_) return std::nullopt;
+    for (const auto& [id, candidate] : impl_->handles) {
+        if (candidate != handle) continue;
+        std::lock_guard lock(mutex_);
+        const auto job = jobs_.find(id);
+        if (job == jobs_.end()) return std::nullopt;
+        return job->second.save_path.string();
+    }
+    return std::nullopt;
+}
+
 TorrentDiskHooks TorrentManager::disk_hooks() const {
     TorrentDiskHooks hooks;
     hooks.threads = config_.disk_threads;
     NodeRuntime* node = &node_;
     hooks.admit = loader_admission(node_.data_resources());
+    // Stage 2: every verified extent is published into the store the ingest
+    // commits into, at loader class, durably, and recorded in the job's extent
+    // journal; the ingest then commits the file by naming its extents.
+    hooks.extent_size = node_.config().extent_size;
+    hooks.verifications = verifications_;
+    FileSystem* fs = &ingest_.filesystem();
+    hooks.publish = [fs](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        try {
+            return fs->store().put(bytes, FrameType::loader);
+        } catch (const std::exception& e) {
+            Log::debug(std::string("torrent extent put failed: ") + e.what());
+            return std::nullopt;
+        }
+    };
     // The DATA device's monitor hears the torrent's I/O only when staging
     // lives on a DATA backend's device. On every node today it does
     // (/mnt/diskB/ingest beside /mnt/diskB), and that is why the monitor's

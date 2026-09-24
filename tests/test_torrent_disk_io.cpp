@@ -7,9 +7,11 @@
 #include "test_framework.hpp"
 #include "test_support.hpp"
 
+#include "crypto.hpp"
 #include "data_work.hpp"
 #include "io_pressure.hpp"
 #include "torrent_disk_io.hpp"
+#include "torrent_extent_journal.hpp"
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/address.hpp>
@@ -35,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -54,10 +57,17 @@ using test_support::TempDir;
 
 constexpr int block = lt::default_block_size;
 
+// Non-repeating: a periodic pattern gives equal extents equal object ids, which
+// content addressing then (correctly) deduplicates.
 std::vector<char> pattern_bytes(size_t size, int seed) {
     std::vector<char> out(size);
-    for (size_t i = 0; i < size; ++i)
-        out[i] = static_cast<char>((i * 131 + static_cast<size_t>(seed) * 7919) & 0xff);
+    uint64_t state = 0x9e3779b97f4a7c15ULL ^ static_cast<uint64_t>(seed);
+    for (size_t i = 0; i < size; ++i) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out[i] = static_cast<char>(state & 0xff);
+    }
     return out;
 }
 
@@ -259,7 +269,8 @@ lt::session_params loopback_session_params() {
     settings.set_bool(lt::settings_pack::enable_upnp, false);
     settings.set_bool(lt::settings_pack::enable_natpmp, false);
     settings.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
-    settings.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
+    settings.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status |
+                                                        lt::alert_category::piece_progress);
     return lt::session_params(std::move(settings));
 }
 
@@ -287,9 +298,26 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
 
     DataResourceArbiter arbiter(64 * 1024 * 1024, 16 * 1024 * 1024, 2, 500ms);
     std::atomic<uint64_t> observed_bytes{0};
+    std::mutex published_mutex;
+    std::map<ObjectId, Bytes> published;
+    std::atomic<size_t> publishes{0};
     TorrentDiskHooks hooks;
     hooks.admit = loader_admission(arbiter);
     hooks.observe = [&](std::chrono::nanoseconds, uint64_t bytes) { observed_bytes += bytes; };
+    // Stage 2: every extent is published as its pieces verify.
+    constexpr uint64_t extent_size = 64 * 1024;
+    hooks.extent_size = extent_size;
+    hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        const auto id = object_id(bytes);
+        std::lock_guard lock(published_mutex);
+        published[id] = Bytes(bytes.begin(), bytes.end());
+        ++publishes;
+        return id;
+    };
+    const auto verifications = hooks.verifications;
+    size_t expected_extents = 0;
+    for (const auto size : sizes) expected_extents += static_cast<size_t>((size + extent_size - 1) / extent_size);
 
     lt::session seeder(loopback_session_params());
     auto leecher_params = loopback_session_params();
@@ -311,7 +339,36 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
         leech.save_path = leech_dir.string();
         auto downloading = leecher.add_torrent(leech);
         downloading.connect_peer(seed_endpoint);
-        REQUIRE(wait_for([&] { return downloading.status().is_seeding; }, 30s));
+        // What TorrentManager::drain_alerts does in production.
+        auto pump = [&] {
+            std::vector<lt::alert*> alerts;
+            leecher.pop_alerts(&alerts);
+            for (const auto* alert : alerts)
+                if (const auto* piece = lt::alert_cast<lt::piece_finished_alert>(alert))
+                    verifications->piece_verified(leech.save_path, static_cast<int>(piece->piece_index));
+        };
+        publishes = 0;
+        REQUIRE(wait_for([&] { pump(); return downloading.status().is_seeding; }, 30s));
+        REQUIRE(wait_for([&] { pump(); return publishes.load() == expected_extents; }, 30s));
+
+        // The journal's manifests rebuild every file from published extents.
+        const auto journal = TorrentExtentJournal::load(leech_dir);
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            const auto name = "payload/f" + std::to_string(i);
+            const auto found = journal.find(name);
+            REQUIRE(found != journal.end());
+            const auto manifest = TorrentExtentJournal::manifest(found->second, static_cast<uint64_t>(sizes[i]));
+            REQUIRE(manifest.has_value());
+            Bytes rebuilt;
+            for (const auto& extent : *manifest) {
+                std::lock_guard lock(published_mutex);
+                const auto& bytes = published.at(extent.id);
+                rebuilt.insert(rebuilt.end(), bytes.begin(), bytes.end());
+            }
+            const auto original = read_file(dir.path() / "seed" / "payload" / ("f" + std::to_string(i)));
+            REQUIRE(rebuilt.size() == original.size());
+            CHECK(std::memcmp(rebuilt.data(), original.data(), original.size()) == 0);
+        }
 
         for (size_t i = 0; i < sizes.size(); ++i) {
             const auto name = "f" + std::to_string(i);
@@ -325,10 +382,116 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
 
         leecher.remove_torrent(downloading, lt::session_handle::delete_files);
         CHECK(wait_for([&] { return !std::filesystem::exists(leech_dir / "payload"); }, 10s));
+        // And the journal that described it, so a later add starts clean.
+        CHECK(wait_for([&] { return !std::filesystem::exists(TorrentExtentJournal::path_for(leech_dir)); }, 10s));
         CHECK(wait_for([&] { return open_files_under(leech_dir) == 0; }, 10s));
         CHECK(wait_for([&] { return arbiter.stats().used_bytes == 0; }, 10s));
     }
     seeder.remove_torrent(seeding);
+}
+
+MACHA_TEST("torrent_disk_io", test_extents_publish_once_their_pieces_verify_and_journal_the_manifest) {
+    // Stage 2. Extents are file-relative and deliberately not aligned to
+    // pieces here (48 KiB extents over 32 KiB pieces, files that end mid-piece),
+    // so an extent is published only when every piece covering it has
+    // verified, each exactly once, and the journal's manifests rebuild every
+    // file byte for byte. The first attempt fails, to prove it is retried.
+    TempDir dir;
+    std::mutex published_mutex;
+    std::map<ObjectId, Bytes> published;
+    std::atomic<int> attempts{0};
+    TorrentDiskHooks hooks;
+    hooks.extent_size = 3 * block;
+    hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+    hooks.publish_retry = 50ms;
+    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        if (attempts.fetch_add(1) == 0) return std::nullopt;
+        const auto id = object_id(bytes);
+        std::lock_guard lock(published_mutex);
+        published[id] = Bytes(bytes.begin(), bytes.end());
+        return id;
+    };
+    const auto verifications = hooks.verifications;
+    const std::vector<int64_t> sizes{100000, 30000, 5000};
+    Harness h(layout(sizes, 2 * block), dir.path(), hooks);
+    const auto data = pattern_bytes(135000, 9);
+    REQUIRE(h.write_all(data));
+
+    auto published_count = [&] {
+        std::lock_guard lock(published_mutex);
+        return published.size();
+    };
+    // Piece 0 alone completes no extent: f0's first extent is [0, 48 KiB),
+    // which piece 1 also covers.
+    verifications->piece_verified(h.save_path, 0);
+    std::this_thread::sleep_for(200ms);
+    CHECK(published_count() == 0);
+
+    for (int piece = 1; piece < h.files.num_pieces(); ++piece)
+        verifications->piece_verified(h.save_path, piece);
+    // f0: 48K + 48K + 4.1K; f1: 30000; f2: 5000.
+    constexpr size_t expected_extents = 5;
+    REQUIRE(wait_for([&] { return published_count() == expected_extents; }, 5s));
+    // Reporting a piece again publishes nothing twice.
+    verifications->piece_verified(h.save_path, 0);
+    std::this_thread::sleep_for(200ms);
+    CHECK(published_count() == expected_extents);
+    CHECK(attempts.load() == static_cast<int>(expected_extents) + 1);
+
+    const auto journal = TorrentExtentJournal::load(dir.path());
+    int64_t file_start = 0;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        const auto name = "payload/f" + std::to_string(i);
+        const auto found = journal.find(name);
+        REQUIRE(found != journal.end());
+        const auto manifest = TorrentExtentJournal::manifest(found->second, static_cast<uint64_t>(sizes[i]));
+        REQUIRE(manifest.has_value());
+        Bytes rebuilt;
+        for (const auto& extent : *manifest) {
+            std::lock_guard lock(published_mutex);
+            const auto& bytes = published.at(extent.id);
+            rebuilt.insert(rebuilt.end(), bytes.begin(), bytes.end());
+        }
+        REQUIRE(rebuilt.size() == static_cast<size_t>(sizes[i]));
+        CHECK(std::memcmp(rebuilt.data(), data.data() + file_start, rebuilt.size()) == 0);
+        file_start += sizes[i];
+    }
+}
+
+MACHA_TEST("torrent_disk_io", test_a_restarted_backend_does_not_republish_journalled_extents) {
+    // Resume: extents the journal already records are not published again
+    // when the same payload is added to a new backend and its pieces verify.
+    TempDir dir;
+    std::atomic<int> publishes{0};
+    auto make_hooks = [&] {
+        TorrentDiskHooks hooks;
+        hooks.extent_size = 3 * block;
+        hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+        hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+            ++publishes;
+            return object_id(bytes);
+        };
+        return hooks;
+    };
+    const auto data = pattern_bytes(100000, 10);
+    {
+        auto hooks = make_hooks();
+        const auto verifications = hooks.verifications;
+        Harness h(layout({100000}, 2 * block), dir.path(), hooks);
+        REQUIRE(h.write_all(data));
+        for (int piece = 0; piece < h.files.num_pieces(); ++piece)
+            verifications->piece_verified(h.save_path, piece);
+        REQUIRE(wait_for([&] { return publishes.load() == 3; }, 5s));
+    }
+    {
+        auto hooks = make_hooks();
+        const auto verifications = hooks.verifications;
+        Harness h(layout({100000}, 2 * block), dir.path(), hooks);
+        for (int piece = 0; piece < h.files.num_pieces(); ++piece)
+            verifications->piece_verified(h.save_path, piece);
+        std::this_thread::sleep_for(300ms);
+        CHECK(publishes.load() == 3);
+    }
 }
 
 MACHA_TEST("torrent_disk_io", test_pieces_spanning_files_round_trip_through_the_payload_layout) {
