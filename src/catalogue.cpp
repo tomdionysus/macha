@@ -662,6 +662,7 @@ void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapsho
     }
     ready_ = true;
     error_.clear();
+    error_code_.clear();
 }
 
 bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& view) {
@@ -750,10 +751,13 @@ void CatalogueManager::repair_once() {
                 cached_metadata_generation_ = generation;
                 cache_until_ = Clock::now() + node_.config().metadata_cache;
                 last_sync_unix_ms_ = unix_ms();
-                if (control_converged)
+                if (control_converged) {
                     error_.clear();
-                else
+                    error_code_.clear();
+                } else {
+                    error_code_ = "converging";
                     error_ = "catalogue control replicas are converging";
+                }
                 return;
             }
         }
@@ -764,6 +768,7 @@ void CatalogueManager::repair_once() {
         // A failed convergence attempt must not invalidate a catalogue snapshot
         // that was previously loaded successfully. Warm API reads can continue
         // from that immutable root while the next request/background pass retries.
+        error_code_ = "unavailable";
         error_ = e.what();
         throw;
     }
@@ -810,6 +815,7 @@ CatalogueStatus CatalogueManager::status() const {
         status.items = cached_ ? cached_->items.size() : 0;
         status.ready = ready_;
         status.last_sync_unix_ms = last_sync_unix_ms_;
+        status.error_code = error_code_;
         status.error = error_;
         cached = cached_;
     }

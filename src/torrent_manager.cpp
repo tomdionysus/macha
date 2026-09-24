@@ -76,6 +76,7 @@ Json torrent_job_json(const TorrentJob& job) {
     o["ingest_job_id"] = job.ingest_job_id ? Json(*job.ingest_job_id) : Json(nullptr);
     o["created_unix_ms"] = job.created_unix_ms;
     o["updated_unix_ms"] = job.updated_unix_ms;
+    o["error_code"] = job.error_code;
     o["error"] = job.error;
     return o;
 }
@@ -102,6 +103,9 @@ TorrentJob parse_torrent_job(const Json& value) {
     if (const auto* v = value.find("created_unix_ms")) job.created_unix_ms = v->asUInt64();
     if (const auto* v = value.find("updated_unix_ms")) job.updated_unix_ms = v->asUInt64();
     if (const auto* v = value.find("error")) job.error = v->asString();
+    if (const auto* v = value.find("error_code")) job.error_code = v->asString();
+    // Recorded before error codes existed: an error is never shown without one.
+    if (!job.error.empty() && job.error_code.empty()) job.error_code = "torrent_failed";
     return job;
 }
 
@@ -293,6 +297,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
         Json::Object added;
         if (uri.empty()) {
             added["exists"] = false;
+            added["error_code"] = std::string("missing_uri");
             added["error"] = std::string("a magnet or torrent uri is required");
         } else {
             try {
@@ -300,6 +305,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
                 added["exists"] = true;
             } catch (const std::exception& error) {
                 added["exists"] = false;
+                added["error_code"] = std::string("add_failed");
                 added["error"] = std::string(error.what());
             }
         }
@@ -337,6 +343,7 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
             placement.job_id = add(std::string(magnet_or_uri));
             placement.placed = true;
         } catch (const std::exception& error) {
+            placement.reason = "add_failed";
             placement.error = error.what();
         }
         return placement;
@@ -349,6 +356,7 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
     const auto peer = std::find_if(peers.begin(), peers.end(),
                                    [&](const NodeInfo& info) { return info.id == node; });
     if (peer == peers.end()) {
+        placement.reason = "node_not_member";
         placement.error = "node " + to_string(node) + " is not an active member of this cluster";
         return placement;
     }
@@ -362,6 +370,7 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
         auto reply = node_.call(*peer, MessageType::torrent_job_action, request_bytes,
                                 FrameType::control);
         if (reply.message.type != MessageType::torrent_job_action_reply) {
+            placement.reason = "node_refused";
             placement.error = "node " + to_string(node) + " refused the request";
             return placement;
         }
@@ -376,11 +385,15 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
                 return placement;
             }
         }
+        // The peer's own code, so a refusal there reads the same as one here.
+        const auto* code = parsed.find("error_code");
+        placement.reason = code && code->isString() ? code->asString() : "node_did_not_start";
         if (const auto* error = parsed.find("error"); error && error->isString())
             placement.error = error->asString();
         else
             placement.error = "node " + to_string(node) + " did not start the job";
     } catch (const std::exception& error) {
+        placement.reason = "node_unreachable";
         placement.error = std::string("node ") + to_string(node) + " is unreachable: " +
                           error.what();
     }
@@ -594,6 +607,7 @@ void TorrentManager::restore_jobs() {
             std::lock_guard lock(mutex_);
             auto& mutable_job = jobs_[job.id];
             mutable_job.state = TorrentJobState::failed;
+            mutable_job.error_code = "restore_failed";
             mutable_job.error = e.what();
             mutable_job.updated_unix_ms = unix_ms();
             save_state_locked();
@@ -725,6 +739,7 @@ bool TorrentManager::resume(std::string_view id) {
     else if (auto h = impl_->handles.find(it->first); h != impl_->handles.end()) h->second.resume();
     it->second.state = it->second.ingest_job_id ? TorrentJobState::importing : TorrentJobState::queued;
     it->second.error.clear();
+    it->second.error_code.clear();
     it->second.updated_unix_ms = unix_ms();
     save_state_locked();
     cv_.notify_all();
@@ -747,6 +762,7 @@ bool TorrentManager::retry(std::string_view id) {
     job.upload_rate = 0;
     job.eta_seconds.reset();
     job.error.clear();
+    job.error_code.clear();
     job.updated_unix_ms = unix_ms();
     try {
         // Persist the wrapper first. If the daemon exits before ingest.resume(),
@@ -1067,6 +1083,7 @@ void TorrentManager::update_jobs() {
             auto ingest_job = ingest_.job(*job.ingest_job_id);
             if (!ingest_job) {
                 job.state = TorrentJobState::failed;
+                job.error_code = "ingest_missing";
                 job.error = "associated ingest job disappeared";
             } else {
                 job.catalogue_total = ingest_job->catalogue_total;
@@ -1077,10 +1094,14 @@ void TorrentManager::update_jobs() {
                 if (ingest_job->state == IngestJobState::completed) {
                     job.state = TorrentJobState::completed;
                     job.error.clear();
+                    job.error_code.clear();
                     ingest_.staging().release(id);
                 } else if (ingest_job->state == IngestJobState::failed ||
                            ingest_job->state == IngestJobState::cancelled) {
                     job.state = TorrentJobState::failed;
+                    job.error_code = ingest_job->state == IngestJobState::cancelled ? "ingest_cancelled"
+                                     : !ingest_job->error_code.empty()          ? ingest_job->error_code
+                                                                                : "ingest_failed";
                     job.error = "ingest " + ingest_job_state_name(ingest_job->state) +
                                 (ingest_job->error.empty() ? std::string{} : ": " + ingest_job->error);
                 } else {
@@ -1096,6 +1117,7 @@ void TorrentManager::update_jobs() {
                     job.bytes_completed = ingest_job->bytes_completed;
                     job.download_rate = ingest_job->rate_bytes_per_second;
                     job.eta_seconds = ingest_job->eta_seconds;
+                    job.error_code = ingest_job->error_code;
                     job.error = ingest_job->error;
                 }
             }
@@ -1122,6 +1144,7 @@ void TorrentManager::update_jobs() {
 
         if (status.errc) {
             job.state = TorrentJobState::failed;
+            job.error_code = "torrent_error";
             job.error = status.errc.message();
             ingest_.staging().release(id);
             changed = true;
@@ -1133,15 +1156,17 @@ void TorrentManager::update_jobs() {
             if (!ingest_.staging().reserve(id, remaining)) {
                 hit->second.pause();
                 job.state = TorrentJobState::blocked;
+                job.error_code = "staging_full";
                 job.error = "staging size limit reached";
                 job.download_rate = 0;
                 job.eta_seconds.reset();
                 job.updated_unix_ms = unix_ms();
                 changed = true;
                 continue;
-            } else if (job.state == TorrentJobState::blocked && job.error == "staging size limit reached") {
+            } else if (job.state == TorrentJobState::blocked && job.error_code == "staging_full") {
                 hit->second.resume();
                 job.error.clear();
+                job.error_code.clear();
             }
         }
 
@@ -1175,6 +1200,7 @@ void TorrentManager::update_jobs() {
                 impl_->handles.erase(hit);
             } catch (const std::exception& e) {
                 job.state = TorrentJobState::failed;
+                job.error_code = "ingest_submit_failed";
                 job.error = "cannot submit completed torrent to ingest: " + std::string(e.what());
             }
         }

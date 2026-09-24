@@ -89,6 +89,7 @@ struct CatalogueStatus {
     size_t artwork_objects{};
     size_t local_artwork_objects{};
     uint64_t last_sync_unix_ms{};
+    std::string error_code; // converging, unavailable
     std::string error;
 };
 
@@ -173,6 +174,7 @@ class CatalogueManager {
     bool control_gc_root_epoch_initialized_{};
     std::map<ObjectId, uint64_t> control_gc_unreferenced_epoch_;
     bool ready_{};
+    std::string error_code_; // converging, unavailable
     std::string error_;
     struct MediaProfileFlight {
         std::mutex mutex;

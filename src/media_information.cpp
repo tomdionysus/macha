@@ -316,30 +316,30 @@ void MediaInformationService::process_hint(const CatalogueHint& hint,
         return value.source.starts_with("media-information");
     });
     if (origin == hint.origins.end()) {
-        hints_.fail(hint.id, "media-information hint has no immutable identity");
+        hints_.fail(hint.id, "no_immutable_identity", "media-information hint has no immutable identity");
         return;
     }
     const auto media_id = origin->source_ref;
     try {
         if (catalogue_.media_profile(media_id)) {
-            hints_.mark_catalogued(hint.id, "media-information", media_id, {}, "already stored");
+            hints_.mark_catalogued(hint.id, "media-information", media_id, {}, "already_stored");
             return;
         }
         auto source = source_for(media_id);
         if (!source) {
             hints_.mark_no_match(hint.id, "media-information", media_id,
-                                 "immutable media is no longer live");
+                                 "media_not_live");
             request_prune();
             return;
         }
         auto deadline = Clock::now() + std::chrono::seconds(30);
         (void)resolve(media_id, source->first, source->second, false, deadline);
-        hints_.mark_catalogued(hint.id, "media-information", media_id, {}, "profile prepared");
+        hints_.mark_catalogued(hint.id, "media-information", media_id, {}, "profile_prepared");
     } catch (const InformationPreempted&) {
-        hints_.defer(hint.id, "yielded to playback", 0);
+        hints_.defer(hint.id, "yielded_to_playback", "yielded to playback", 0);
     } catch (const std::exception& e) {
         if (!stop.stop_requested())
-            hints_.record_failure(hint.id, e.what(), 0, 3);
+            hints_.record_failure(hint.id, "media_information_error", e.what(), 0, 3);
     }
 }
 

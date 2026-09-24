@@ -57,6 +57,10 @@ struct TorrentJob {
     std::optional<std::string> ingest_job_id;
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
+    // Why the job is blocked or failed: `error_code` is the snake_case code
+    // clients act on, `error` the English message beside it. A failure that
+    // is the ingest's carries the ingest's own code.
+    std::string error_code;
     std::string error;
 };
 
@@ -186,6 +190,10 @@ class TorrentService {
         NodeId node_id;
         std::string job_id;
         bool placed{};
+        // Why it was not placed: a snake_case code (node_not_member,
+        // node_refused, node_unreachable, node_did_not_start, missing_uri,
+        // add_failed, or the peer's own), and the English message beside it.
+        std::string reason;
         std::string error;
     };
     virtual Placement add_on(const NodeId& node, std::string_view magnet_or_uri) = 0;

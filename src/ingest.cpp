@@ -164,6 +164,7 @@ Json job_json(const IngestJob& job) {
     o["current_destination"] = job.current_destination;
     o["created_unix_ms"] = job.created_unix_ms;
     o["updated_unix_ms"] = job.updated_unix_ms;
+    o["error_code"] = job.error_code;
     o["error"] = job.error;
     Json::Array files;
     files.reserve(job.files.size());
@@ -225,7 +226,10 @@ IngestJob parse_job(const Json& value) {
     job.current_destination = json_string(value, "current_destination");
     job.created_unix_ms = json_u64(value, "created_unix_ms");
     job.updated_unix_ms = json_u64(value, "updated_unix_ms");
+    job.error_code = json_string(value, "error_code");
     job.error = json_string(value, "error");
+    // Recorded before error codes existed: an error is never shown without one.
+    if (!job.error.empty() && job.error_code.empty()) job.error_code = "import_failed";
     if (const auto* files = value.find("files")) {
         for (const auto& file : files->asArray()) job.files.push_back(parse_file(file));
     }
@@ -295,6 +299,7 @@ Json catalogue_summary_json(const IngestJob& job, const CatalogueHintSummary* de
             item["priority"] = static_cast<int64_t>(hint.priority);
             item["attempts"] = static_cast<uint64_t>(hint.attempts);
             item["result"] = hint.result.empty() ? Json(nullptr) : Json(hint.result);
+            item["error_code"] = hint.error_code.empty() ? Json(nullptr) : Json(hint.error_code);
             item["error"] = hint.error.empty() ? Json(nullptr) : Json(hint.error);
             Json::Array ids;
             for (const auto& id : hint.catalogue_item_ids) ids.emplace_back(id);
@@ -333,6 +338,7 @@ Json ingest_job_json(const IngestJob& job, bool include_files,
     out["catalogue"] = catalogue_summary_json(job, catalogue_detail);
     out["created_unix_ms"] = job.created_unix_ms;
     out["updated_unix_ms"] = job.updated_unix_ms;
+    out["error_code"] = job.error_code.empty() ? Json(nullptr) : Json(job.error_code);
     out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
 
     if (include_files) {
@@ -833,6 +839,7 @@ bool IngestManager::resume(std::string_view id) {
     const auto previous = it->second;
     it->second.state = IngestJobState::queued;
     it->second.error.clear();
+    it->second.error_code.clear();
     it->second.updated_unix_ms = now_ms();
     try {
         save_state_locked();
@@ -1039,6 +1046,7 @@ void IngestManager::refresh_catalogue_jobs() {
             job.rate_bytes_per_second = 0;
             job.eta_seconds = 0;
             job.error.clear();
+            job.error_code.clear();
             Log::info("ingest completed id=" + id + " files=" +
                       std::to_string(job.files_completed) + " catalogue_matched=" +
                       std::to_string(job.catalogue_catalogued) + " catalogue_no_match=" +
@@ -1204,6 +1212,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.rate_bytes_per_second = 0;
         job.eta_seconds = 0;
         job.error.clear();
+        job.error_code.clear();
         job.updated_unix_ms = now_ms();
         {
             std::lock_guard lock(mutex_);
@@ -1230,6 +1239,14 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         }
         job.state = IngestJobState::failed;
         job.error = e.what();
+        if (const auto* failure = dynamic_cast<const IngestError*>(&e))
+            job.error_code = failure->code();
+        else if (dynamic_cast<const MetadataNotReady*>(&e))
+            job.error_code = "metadata_unavailable";
+        else if (dynamic_cast<const FsError*>(&e))
+            job.error_code = "filesystem_error";
+        else
+            job.error_code = "import_failed";
         job.rate_bytes_per_second = 0;
         job.eta_seconds.reset();
         job.updated_unix_ms = now_ms();
@@ -1245,11 +1262,12 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
 bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     std::error_code ec;
     if (!std::filesystem::exists(job.source_path, ec) || ec) {
-        set_blocked(job, "source path is unavailable");
+        set_blocked(job, "source_unavailable", "source path is unavailable");
         return false;
     }
     job.state = IngestJobState::scanning;
     job.error.clear();
+    job.error_code.clear();
     job.updated_unix_ms = now_ms();
     {
         std::lock_guard lock(mutex_);
@@ -1264,7 +1282,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     std::vector<std::filesystem::path> host_files;
     bool scan_incomplete = false;
     if (std::filesystem::is_symlink(std::filesystem::symlink_status(job.source_path, ec)) && !ec) {
-        throw std::runtime_error("ingest source cannot be a symbolic link");
+        throw IngestError("source_is_symlink", "ingest source cannot be a symbolic link");
     }
     ec.clear();
     if (std::filesystem::is_regular_file(job.source_path, ec) && !ec) {
@@ -1293,7 +1311,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
             if (ec) scan_incomplete = true;
         }
     } else {
-        set_blocked(job, "source path is not a regular file or directory");
+        set_blocked(job, "source_not_regular", "source path is not a regular file or directory");
         return false;
     }
 
@@ -1301,7 +1319,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         job.files.clear();
         job.bytes_total = job.bytes_completed = 0;
         job.files_total = job.files_completed = 0;
-        set_blocked(job, "source scan was interrupted; source may be unavailable");
+        set_blocked(job, "source_scan_interrupted", "source scan was interrupted; source may be unavailable");
         return false;
     }
     for (const auto& source : host_files) {
@@ -1309,7 +1327,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
             job.files.clear();
             job.bytes_total = job.bytes_completed = 0;
             job.files_total = job.files_completed = 0;
-            set_blocked(job, "source changed or disappeared during scan");
+            set_blocked(job, "source_changed_during_scan", "source changed or disappeared during scan");
             return false;
         }
     }
@@ -1394,7 +1412,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     }
 
     job.files_total = job.files.size();
-    if (job.files.empty()) throw std::runtime_error("no supported media found in source");
+    if (job.files.empty()) throw IngestError("no_supported_media", "no supported media found in source");
     job.state = IngestJobState::queued;
     job.updated_unix_ms = now_ms();
     {
@@ -1454,7 +1472,7 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
         try {
             auto existing = fs_.getattr(current);
             if (existing.type != EntryType::directory)
-                throw std::runtime_error("ingest destination parent is not a directory: " + current);
+                throw IngestError("destination_parent_not_directory", "ingest destination parent is not a directory: " + current);
         } catch (const FsError& e) {
             if (e.code() != ENOENT) throw;
             const auto& policy = node_.config().filesystem;
@@ -1474,7 +1492,7 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
                 if (created.code() != EEXIST) throw;
                 const auto existing = fs_.getattr(current);
                 if (existing.type != EntryType::directory)
-                    throw std::runtime_error("ingest destination parent is not a directory: " +
+                    throw IngestError("destination_parent_not_directory", "ingest destination parent is not a directory: " +
                                              current);
             }
         }
@@ -1486,19 +1504,19 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     const std::filesystem::path source(file.source_path);
     std::error_code ec;
     if (!std::filesystem::exists(source, ec) || ec) {
-        set_blocked(job, "source disappeared while importing: " + source.string());
+        set_blocked(job, "source_disappeared", "source disappeared while importing: " + source.string());
         return false;
     }
     const auto actual_size = std::filesystem::file_size(source, ec);
     if (ec || actual_size != file.size || host_mtime(source) != file.source_mtime_ns) {
-        set_blocked(job, "source changed while importing: " + source.string());
+        set_blocked(job, "source_changed", "source changed while importing: " + source.string());
         return false;
     }
 
     ensure_namespace_parents(file.destination_path);
     try {
         auto partial = fs_.getattr(file.temporary_path);
-        if (partial.type != EntryType::file) throw std::runtime_error("ingest partial is not a file");
+        if (partial.type != EntryType::file) throw IngestError("partial_not_file", "ingest partial is not a file");
         file.copied = std::min<uint64_t>(partial.size, file.size);
     } catch (const FsError& e) {
         if (e.code() != ENOENT) throw;
@@ -1518,7 +1536,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
                 refresh_progress(job);
                 return true;
             }
-            throw std::runtime_error("ingest destination appeared with an unexpected type or size");
+            throw IngestError("destination_conflict", "ingest destination appeared with an unexpected type or size");
         } catch (const FsError& final_error) {
             if (final_error.code() != ENOENT) throw;
         }
@@ -1564,12 +1582,12 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
 
     std::ifstream input(source, std::ios::binary);
     if (!input) {
-        set_blocked(job, "source is not readable: " + source.string());
+        set_blocked(job, "source_unreadable", "source is not readable: " + source.string());
         return false;
     }
     input.seekg(static_cast<std::streamoff>(file.copied));
     if (!input) {
-        set_blocked(job, "cannot seek source for resume: " + source.string());
+        set_blocked(job, "source_seek_failed", "cannot seek source for resume: " + source.string());
         return false;
     }
 
@@ -1614,11 +1632,11 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         if (!got) {
             output->commit();
             file.copied = output->size();
-            set_blocked(job, "short read from source: " + source.string());
+            set_blocked(job, "source_short_read", "short read from source: " + source.string());
             return false;
         }
         const auto written = output->write(file.copied, std::span<const uint8_t>(buffer.data(), got));
-        if (written != got) throw std::runtime_error("short namespace write during ingest");
+        if (written != got) throw IngestError("namespace_short_write", "short namespace write during ingest");
         file.copied += written;
 
         if (file.copied - checkpoint_start >= config_.checkpoint_bytes || file.copied == file.size) {
@@ -1659,7 +1677,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
 
     output->commit();
     file.copied = output->size();
-    if (file.copied != file.size) throw std::runtime_error("ingest committed size mismatch");
+    if (file.copied != file.size) throw IngestError("size_mismatch", "ingest committed size mismatch");
     fs_.rename(file.temporary_path, file.destination_path, true);
     file.completed = true;
     if (file.catalogue_candidate) {
@@ -1718,6 +1736,7 @@ void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,
 bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
     job.state = IngestJobState::importing;
     job.error.clear();
+    job.error_code.clear();
     {
         std::lock_guard lock(mutex_);
         auto it = jobs_.find(job.id);
@@ -1756,9 +1775,10 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
     return true;
 }
 
-void IngestManager::set_blocked(IngestJob& job, std::string error) {
+void IngestManager::set_blocked(IngestJob& job, std::string code, std::string message) {
     job.state = IngestJobState::blocked;
-    job.error = std::move(error);
+    job.error_code = std::move(code);
+    job.error = std::move(message);
     job.rate_bytes_per_second = 0;
     job.eta_seconds.reset();
     job.updated_unix_ms = now_ms();

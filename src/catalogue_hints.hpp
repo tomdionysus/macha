@@ -65,7 +65,11 @@ struct CatalogueHint {
     std::string provider;
     std::string media_id;
     std::vector<std::string> catalogue_item_ids;
+    // The outcome as a snake_case code (matched, no_provider_match, ...): no
+    // message in normal flow. A deferral or failure carries `error_code`, the
+    // code clients act on, and `error`, the English message beside it.
     std::string result;
+    std::string error_code;
     std::string error;
     std::vector<CatalogueHintOrigin> origins;
 };
@@ -122,12 +126,12 @@ class CatalogueHintQueue {
     void mark_no_match(std::string_view id, std::string provider, std::string media_id,
                        std::string result = {});
     void advance_candidate(std::string_view id, size_t next_cursor);
-    void defer(std::string_view id, std::string error, uint64_t retry_after_unix_ms);
+    void defer(std::string_view id, std::string code, std::string error, uint64_t retry_after_unix_ms);
     size_t defer_matching(const std::function<bool(const CatalogueHint&)>& predicate,
-                          std::string error, uint64_t retry_after_unix_ms);
-    bool record_failure(std::string_view id, std::string error,
+                          std::string code, std::string error, uint64_t retry_after_unix_ms);
+    bool record_failure(std::string_view id, std::string code, std::string error,
                         uint64_t retry_after_unix_ms, unsigned max_failures);
-    void fail(std::string_view id, std::string error);
+    void fail(std::string_view id, std::string code, std::string error);
     void requeue_processing();
 
     std::vector<CatalogueHint> list() const;

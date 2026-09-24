@@ -223,6 +223,7 @@ Json torrent_job_api_json(const TorrentJob& job) {
     out["ingest_job_id"] = job.ingest_job_id ? Json(*job.ingest_job_id) : Json(nullptr);
     out["created_unix_ms"] = job.created_unix_ms;
     out["updated_unix_ms"] = job.updated_unix_ms;
+    out["error_code"] = job.error_code.empty() ? Json(nullptr) : Json(job.error_code);
     out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
     return Json(std::move(out));
 }

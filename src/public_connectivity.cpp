@@ -320,9 +320,11 @@ void PublicConnectivity::refresh_locked() {
     status_.upnp.external_address.clear();
     status_.upnp.igd_status = 0;
     status_.upnp.error.clear();
+    status_.upnp.error_code.clear();
     status_.external_ip.attempted = false;
     status_.external_ip.address.clear();
     status_.external_ip.error.clear();
+    status_.external_ip.error_code.clear();
     status_.self_probe = "not_run";
     status_.self_probe_error.clear();
 
@@ -343,9 +345,11 @@ void PublicConnectivity::refresh_locked() {
                 miniupnpc_compat::private_wan(MINIUPNPC_API_VERSION, session->igd_status);
 #endif
             usable_igd = miniupnpc_compat::usable(MINIUPNPC_API_VERSION, session->igd_status);
-            if (!usable_igd)
+            if (!usable_igd) {
+                status_.upnp.error_code = "igd_not_connected";
                 status_.upnp.error =
                     "UPnP IGD is not connected status=" + std::to_string(session->igd_status);
+            }
             if (usable_igd) {
                 const auto ext = std::to_string(external_port);
                 const auto in = std::to_string(configured_.port);
@@ -356,6 +360,7 @@ void PublicConnectivity::refresh_locked() {
                 bool active = existing.exists && existing.internal_port == configured_.port &&
                               existing.internal_client == status_.upnp.lan_address;
                 if (existing.exists && !active) {
+                    status_.upnp.error_code = "port_mapped_elsewhere";
                     status_.upnp.error = "UPnP external port " + ext + " is already mapped to " +
                                          existing.internal_client + ":" +
                                          std::to_string(existing.internal_port);
@@ -374,10 +379,12 @@ void PublicConnectivity::refresh_locked() {
                             status_.upnp.mapping_created = true;
                             status_.upnp.mapping_owned = true;
                         } else {
+                            status_.upnp.error_code = "mapping_verification_failed";
                             status_.upnp.error =
                                 "UPnP AddPortMapping succeeded but mapping verification failed";
                         }
                     } else {
+                        status_.upnp.error_code = "add_mapping_failed";
                         status_.upnp.error =
                             "UPnP AddPortMapping failed code=" + std::to_string(result) + " (" +
                             strupnperror(result) + ")";
@@ -391,9 +398,11 @@ void PublicConnectivity::refresh_locked() {
                 }
             }
         } else {
+            status_.upnp.error_code = "discovery_failed";
             status_.upnp.error = std::move(discovery_error);
         }
 #else
+        status_.upnp.error_code = "support_not_built";
         status_.upnp.error = "UPnP support was not built (miniupnpc not found)";
 #endif
     }
@@ -412,6 +421,7 @@ void PublicConnectivity::refresh_locked() {
             status_.advertised_source =
                 status_.upnp.mapping_active ? "upnp+external_ip" : "external_ip";
         } catch (const std::exception& error) {
+            status_.external_ip.error_code = "lookup_failed";
             status_.external_ip.error = error.what();
         }
     }

@@ -203,7 +203,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 // operator did not ask for is worse than one that fails.
                 return http_error(409, "placement_failed",
                                   placement.error.empty() ? "the job could not be placed"
-                                                          : placement.error);
+                                                          : placement.error,
+                                  placement.reason.empty() ? "add_failed" : placement.reason);
             }
             Json::Object out;
             out["id"] = placement.job_id;

@@ -75,8 +75,23 @@ struct IngestJob {
     std::optional<uint64_t> eta_seconds;
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
+    // Why the job is blocked or failed: `error_code` is the snake_case code
+    // clients act on (see IngestError), `error` the English message beside it.
+    std::string error_code;
     std::string error;
     std::vector<IngestFileProgress> files;
+};
+
+// A job failure with its code. Thrown from the import path; process_job
+// records the code beside the message.
+class IngestError : public std::runtime_error {
+  public:
+    IngestError(std::string code, const std::string& message)
+        : std::runtime_error(message), code_(std::move(code)) {}
+    const std::string& code() const noexcept { return code_; }
+
+  private:
+    std::string code_;
 };
 
 // HTTP/RPC-facing JSON shape for an ingest job -- shared by the local HTTP
@@ -180,7 +195,7 @@ class IngestManager {
     bool allowed_external_source(const std::filesystem::path&) const;
     void ensure_namespace_parents(std::string_view path);
     bool should_pause_or_cancel(const IngestJob&) const;
-    void set_blocked(IngestJob&, std::string);
+    void set_blocked(IngestJob&, std::string code, std::string message);
     void cleanup_partials(const IngestJob&);
 
     // NodeRuntime::set_ingest_bridge() handler bodies. Local-only -- never

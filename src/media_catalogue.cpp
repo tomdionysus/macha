@@ -2760,7 +2760,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     std::string root;
     auto* provider = provider_for_path(hint.path, root);
     if (!provider) {
-        hints_.mark_no_match(hint.id, {}, {}, "path is outside configured catalogue roots");
+        hints_.mark_no_match(hint.id, {}, {}, "outside_catalogue_roots");
         return {};
     }
 
@@ -2771,13 +2771,13 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     auto scan_nodes = fs_.namespace_nodes();
     auto found_entry = namespace_entry(namespace_snapshot, &scan_nodes, path);
     if (!found_entry) {
-        hints_.fail(hint.id, "namespace path no longer exists");
+        hints_.fail(hint.id, "path_missing", "namespace path no longer exists");
         return {};
     }
     const auto& entry = *found_entry;
     if (entry.type != EntryType::file) {
         hints_.mark_no_match(hint.id, std::string(provider->name()), {},
-                             "namespace path is not a media file");
+                             "not_media_file");
         return {};
     }
     if (entry.size == 0) {
@@ -2786,7 +2786,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         // immutable media identity yet, so do not negative-cache it as a
         // provider miss. A later namespace generation/source_ref will reopen
         // the hint as soon as committed content becomes visible.
-        hints_.defer(hint.id, "namespace media file has no committed content yet",
+        hints_.defer(hint.id, "content_not_committed", "namespace media file has no committed content yet",
                      unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         return {};
     }
@@ -2817,7 +2817,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     if (stop.stop_requested()) return {};
     if (probed.candidates.empty()) {
         hints_.mark_no_match(hint.id, std::string(provider->name()), media_id,
-                             "no supported media candidate");
+                             "no_media_candidate");
         return {};
     }
 
@@ -2864,9 +2864,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     constexpr size_t max_candidate_attempts = 5;
     const auto candidate_limit = std::min(max_candidate_attempts, probed.candidates.size());
     if (hint.candidate_cursor >= candidate_limit) {
-        std::string result = "no metadata provider match";
-        if (candidate_limit > 1)
-            result += " after " + std::to_string(candidate_limit) + " candidates";
+        std::string result = "no_provider_match";
         hints_.mark_no_match(hint.id, std::string(provider->name()), media_id, std::move(result));
         Log::debug("catalogue hint: no provider match path=" + hint.path +
                    " provider=" + std::string(provider->name()));
@@ -2890,7 +2888,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
             selected_candidate = &candidate;
         }
     } catch (const ProviderBudgetExhausted&) {
-        hints_.defer(hint.id, "provider request budget exhausted",
+        hints_.defer(hint.id, "provider_budget_exhausted", "provider request budget exhausted",
                      unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         return {};
     } catch (const ProviderTemporarilyUnavailable& e) {
@@ -2906,7 +2904,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                 std::string queued_root;
                 return provider_for_path(queued.path, queued_root) == provider;
             },
-            e.what(), retry_at);
+            "provider_unavailable", e.what(), retry_at);
         Log::warn("catalogue hint provider temporarily unavailable provider=" +
                   std::string(provider->name()) + " path=" + hint.path +
                   " deferred_hints=" + std::to_string(deferred) +
@@ -2915,7 +2913,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     } catch (const std::exception& e) {
         Log::warn("catalogue hint lookup failed provider=" + std::string(provider->name()) +
                   " path=" + hint.path + " candidate=" + candidate.generator + ": " + e.what());
-        hints_.record_failure(hint.id, e.what(),
+        hints_.record_failure(hint.id, "provider_error", e.what(),
                               unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()),
                               5);
         return {};
@@ -2927,9 +2925,7 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
             hints_.advance_candidate(hint.id, next_cursor);
             return {};
         }
-        std::string result = "no metadata provider match";
-        if (candidate_limit > 1)
-            result += " after " + std::to_string(candidate_limit) + " candidates";
+        std::string result = "no_provider_match";
         hints_.mark_no_match(hint.id, std::string(provider->name()), media_id, std::move(result));
         Log::debug("catalogue hint: no provider match path=" + hint.path +
                    " provider=" + std::string(provider->name()));
@@ -3083,12 +3079,12 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
                 prepared.push_back(std::move(*match));
             }
         } catch (const CatalogueConflict& e) {
-            hints_.defer(hint->id, e.what(), unix_ms() + 500);
+            hints_.defer(hint->id, "catalogue_conflict", e.what(), unix_ms() + 500);
         } catch (const CatalogueUnavailable& e) {
-            hints_.defer(hint->id, e.what(),
+            hints_.defer(hint->id, "catalogue_unavailable", e.what(),
                          unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         } catch (const std::exception& e) {
-            hints_.record_failure(hint->id, e.what(),
+            hints_.record_failure(hint->id, "catalogue_error", e.what(),
                                   unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()),
                                   5);
             Log::warn("catalogue hint failed path=" + hint->path + ": " + e.what());
@@ -3104,7 +3100,7 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
         const auto retry = unix_ms() +
             static_cast<uint64_t>(config.provider_batch_delay.count());
         for (const auto& match : prepared)
-            hints_.defer(match.hint_id, "catalogue artwork durability floor unavailable", retry);
+            hints_.defer(match.hint_id, "artwork_durability_unavailable", "catalogue artwork durability floor unavailable", retry);
         Log::debug("catalogue hint batch deferred: artwork durability floor unavailable");
         return out;
     }
@@ -3124,19 +3120,19 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
             catalogue_.reconcile_scanner(discovered, active_media_ids, false, {}, media_profiles);
     } catch (const CatalogueConflict& e) {
         for (const auto& match : prepared)
-            hints_.defer(match.hint_id, e.what(), unix_ms() + 500);
+            hints_.defer(match.hint_id, "catalogue_conflict", e.what(), unix_ms() + 500);
         return out;
     } catch (const CatalogueUnavailable& e) {
         const auto retry = unix_ms() +
             static_cast<uint64_t>(config.provider_batch_delay.count());
         for (const auto& match : prepared)
-            hints_.defer(match.hint_id, e.what(), retry);
+            hints_.defer(match.hint_id, "catalogue_unavailable", e.what(), retry);
         Log::debug("catalogue hint batch deferred: " + std::string(e.what()));
         return out;
     } catch (const std::exception& e) {
         for (const auto& match : prepared)
             hints_.record_failure(
-                match.hint_id, e.what(),
+                match.hint_id, "catalogue_error", e.what(),
                 unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()), 5);
         Log::warn("catalogue hint batch reconcile failed: " + std::string(e.what()));
         return out;

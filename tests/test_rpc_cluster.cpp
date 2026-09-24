@@ -4622,6 +4622,16 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
             return job && job->state == IngestJobState::failed;
         },
         5s));
+    // The failure carries a code first (operator rule, 2026-09-24), and the
+    // API shape emits it beside the message.
+    {
+        const auto failed = s1.ingest().job(ingest_id);
+        REQUIRE(failed.has_value());
+        CHECK(failed->error_code == "no_supported_media");
+        CHECK(!failed->error.empty());
+        const auto json = ingest_job_json(*failed, false);
+        CHECK(json.find("error_code")->asString() == "no_supported_media");
+    }
 
     // The engine is supplied by the libmacha-torrent plugin the Service
     // dlopens from this build's plugin directory, so a non-null handle here

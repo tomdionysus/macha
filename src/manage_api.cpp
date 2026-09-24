@@ -695,7 +695,7 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                     item->media_ids.push_back(current->second);
                 auto saved = catalogue_.upsert(*item, item->revision);
                 hints_.mark_catalogued(hint->id, "manual", current->second, {saved.id},
-                                       "manually matched to existing catalogue item");
+                                       "manual_existing_item");
                 Json::Object out;
                 out["item"] = catalogue_item_json(saved);
                 return http_json(200, Json(std::move(out)).dump());
@@ -710,7 +710,7 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 auto manual = build_manual_items(catalogue_, parse_body(request), current->second);
                 auto saved = catalogue_.upsert_many(std::move(manual.items));
                 hints_.mark_catalogued(hint->id, "manual", current->second, {manual.leaf_id},
-                                       "manual catalogue metadata");
+                                       "manual_metadata");
                 Json::Array items;
                 for (const auto& item : saved) items.push_back(catalogue_item_json(item));
                 Json::Object out;

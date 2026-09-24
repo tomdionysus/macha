@@ -88,6 +88,74 @@ int connect_and_stall(uint16_t port, std::string_view path) {
     return fd;
 }
 
+namespace {
+std::string body_of(const HttpResponse& response) {
+    return std::string(response.body.begin(), response.body.end());
+}
+HttpResponse json_response(int status, std::string body) { return http_json(status, std::move(body)); }
+} // namespace
+
+MACHA_FAST_TEST("http_server", test_every_json_object_response_carries_a_snake_case_status) {
+    // Operator rule, 2026-09-24: every response carries a status code, success
+    // included; normal flow has no message.
+    auto ok = json_response(200, R"({"items":[1,2]})");
+    http_stamp_status(ok);
+    CHECK(body_of(ok) == R"({"status":"ok","items":[1,2]})");
+    CHECK(Json::parse(body_of(ok)).find("status")->asString() == "ok");
+
+    auto empty = json_response(200, "{}");
+    http_stamp_status(empty);
+    CHECK(body_of(empty) == R"({"status":"ok"})");
+
+    // A handler's own code is the code.
+    auto pending = json_response(202, R"({"status":"pending","media_id":"x"})");
+    http_stamp_status(pending);
+    CHECK(body_of(pending) == R"({"status":"pending","media_id":"x"})");
+
+    // "status" nested, or inside a string, is not the top-level key.
+    auto nested = json_response(200, R"({"node":{"status":"up"},"note":"\"status\": no","list":[{"status":1}]})");
+    http_stamp_status(nested);
+    CHECK(Json::parse(body_of(nested)).find("status")->asString() == "ok");
+    CHECK(Json::parse(body_of(nested)).find("node")->find("status")->asString() == "up");
+
+    // An error built by http_error states its own code as the status.
+    const auto error = http_error(404, "not_found", "Not Found");
+    const auto parsed = Json::parse(body_of(error));
+    CHECK(parsed.find("status")->asString() == "not_found");
+    CHECK(parsed.find("error")->find("code")->asString() == "not_found");
+    CHECK(parsed.find("error")->find("message")->asString() == "Not Found");
+    auto error_copy = error;
+    http_stamp_status(error_copy);
+    CHECK(body_of(error_copy) == body_of(error));
+
+    // A hand-built error body without a status is marked an error, not "ok".
+    auto hand_error = json_response(500, R"({"error":{"code":"x"}})");
+    http_stamp_status(hand_error);
+    CHECK(Json::parse(body_of(hand_error)).find("status")->asString() == "error");
+
+    // Left alone: arrays, non-JSON, 304, streams, deferrals.
+    auto array = json_response(200, "[1,2]");
+    http_stamp_status(array);
+    CHECK(body_of(array) == "[1,2]");
+    HttpResponse text{200, "text/plain", {}, Bytes{'h', 'i'}, {}};
+    http_stamp_status(text);
+    CHECK(body_of(text) == "hi");
+    auto not_modified = json_response(304, "{}");
+    http_stamp_status(not_modified);
+    CHECK(body_of(not_modified) == "{}");
+}
+
+MACHA_FAST_TEST("http_server", test_top_level_key_scan_ignores_strings_and_nesting) {
+    CHECK(http_json_object_has_key(R"({"a":1,"status":"x"})", "status"));
+    CHECK(http_json_object_has_key(R"(  { "status" : 1 })", "status"));
+    CHECK(!http_json_object_has_key(R"({"a":{"status":1}})", "status"));
+    CHECK(!http_json_object_has_key(R"({"a":"status"})", "status"));
+    CHECK(!http_json_object_has_key(R"({"a":"\"status\"","b":[{"status":2}]})", "status"));
+    CHECK(!http_json_object_has_key(R"({"a\"status":1})", "status"));
+    CHECK(!http_json_object_has_key(R"([{"status":1}])", "status"));
+    CHECK(!http_json_object_has_key("", "status"));
+}
+
 MACHA_TEST("http_server", test_a_blocking_body_read_on_one_connection_does_not_delay_another) {
     auto config = loopback_config();
     std::atomic_bool entered{};
@@ -427,7 +495,8 @@ MACHA_TEST("http_server", test_head_and_pipelined_requests_on_one_connection) {
                       "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
     auto first = raw_http_read_response(fd);
     CHECK(first.status == 200);
-    CHECK(first.body == "{\"ok\":true}");
+    // Every JSON object response is stamped with its status code.
+    CHECK(first.body == "{\"status\":\"ok\",\"ok\":true}");
     auto second = raw_http_read_response(fd);
     CHECK(second.status == 200);
     CHECK(second.body.size() == 1000);
@@ -450,6 +519,8 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
         catalogue += "{\"id\":\"macha:" + std::to_string(i) + "\",\"title\":\"A Title\"}";
     }
     catalogue += "]}";
+    // What goes on the wire: the handler's body stamped with its status code.
+    const std::string served = "{\"status\":\"ok\"," + catalogue.substr(1);
 
     HttpServer server(config, [&](const HttpRequest& request) {
         if (request.path == "/api/v1/catalogue")
@@ -474,7 +545,7 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
     CHECK(compressed.find("Content-Encoding: gzip") != std::string::npos);
     CHECK(compressed.find("Vary: Accept-Encoding") != std::string::npos);
     const auto compressed_body = body_of(compressed);
-    CHECK(gunzip(compressed_body) == catalogue);
+    CHECK(gunzip(compressed_body) == served);
     CHECK(compressed_body.size() < catalogue.size() / 3);
     // Content-Length describes what was actually sent, or the client hangs
     // waiting for bytes that are never coming.
@@ -484,7 +555,7 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
     // The same route for a client that never mentioned encodings.
     const auto identity = raw_http_get(port, "/api/v1/catalogue");
     CHECK(identity.find("Content-Encoding") == std::string::npos);
-    CHECK(body_of(identity) == catalogue);
+    CHECK(body_of(identity) == served);
 
     // Already compressed, and served straight from resident memory. A
     // transform here would undo the path it is sent on.
@@ -497,11 +568,11 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
     const auto tiny = raw_http_get(port, "/tiny", gzip);
     CHECK(tiny.find("Content-Encoding") == std::string::npos);
     CHECK(tiny.find("Vary: Accept-Encoding") != std::string::npos);
-    CHECK(body_of(tiny) == "{\"ok\":true}");
+    CHECK(body_of(tiny) == "{\"status\":\"ok\",\"ok\":true}");
 
     const auto diagnostics = server.diagnostics();
     CHECK(diagnostics.responses_compressed == 1);
-    CHECK(diagnostics.compression_bytes_saved == catalogue.size() - compressed_body.size());
+    CHECK(diagnostics.compression_bytes_saved == served.size() - compressed_body.size());
     // The reactor did none of it.
     CHECK(diagnostics.reactor_stalls == 0);
     server.stop();

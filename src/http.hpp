@@ -99,6 +99,16 @@ struct HttpResponse {
 };
 
 HttpResponse http_json(int status, std::string value);
+// Every JSON object response carries a snake_case `status` code at its top
+// level, success included (operator rule, 2026-09-24): the code is primary, and
+// normal flow has no message. A handler that states its own `status` keeps it;
+// otherwise a success is stamped "ok" and an error "error" (http_error sets the
+// specific code itself). Streams, deferrals, 204/304 and non-object bodies are
+// left alone. Applied once, on the lane worker, before compression.
+void http_stamp_status(HttpResponse&);
+// Whether a JSON object's top level has `key`, by a single linear scan that
+// builds nothing: catalogue bodies run to megabytes on a Raspberry Pi.
+bool http_json_object_has_key(std::string_view json, std::string_view key);
 HttpResponse http_error(int status, std::string_view code, std::string_view message);
 // Same, plus a machine-readable reason the client can act on. Used where the
 // server states why it could not answer and leaves the decision to the client.
