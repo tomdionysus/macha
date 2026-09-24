@@ -23,6 +23,18 @@ that assembles extents in staging and publishes each one as soon as it is
 verified, under the DATA arbiter at loader class. Four stages, the first of
 which alone removes the mechanism.
 
+**Artwork, business P0 from the web client (2026-09-24).** 0.54.1 shipped
+and was verified by the web client on all three nodes over http and https:
+30-day capability and max-age (URLs now roll monthly, not at UTC midnight),
+ETag = artwork id with 304 answered before any read, Timing-Allow-Origin.
+**Still open, behind the torrent work by the operator's order:**
+- [ ] A cold artwork read is slow (1.1 s for 77 KB from gbni-1, arriving at
+  ~1 Mbit/s: "loading like a blind"). `CatalogueManager::artwork` fetches the
+  whole object before the first byte; the likely cause is the read queuing
+  behind loader I/O on a DATA disk at 89-99% (the loader-I/O item below).
+  Inference until a cold read is timed under load.
+- [ ] Sized variants (`?w=300`): posters are 500x750 for ~300 px cards.
+
 **Approved next, after stage 1 is deployed and observed (operator,
 2026-09-24): a `kind` filter on `GET /api/v1/catalogue/search`**, asked for
 by the Core client session. A repeated `kind` parameter (`movie`, `show`,
