@@ -8,7 +8,7 @@
     <array>
         <string>/usr/local/bin/macha</string>
         <string>--config</string>
-        <string>/usr/local/etc/macha.yaml</string>
+        <string>/usr/local/etc/macha/macha.yaml</string>
     </array>
     <key>KeepAlive</key><true/>
     <key>RunAtLoad</key><true/>

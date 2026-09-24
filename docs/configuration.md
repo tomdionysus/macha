@@ -129,18 +129,50 @@ dht:
   metadata_materialization_cache_bytes: 128M
   retention_check_batch_size: 2000
   retention_check_concurrency: 8
+  data_credit_no_progress_deadline_ms: 120000
 ```
 
 - `replicas`: desired converged authoritative DATA copies.
 - `min_write_replicas`: durable DATA copies required before foreground publication; must be `<= replicas`.
 - `metadata_min_write_replicas`: minimum distinct active nodes that must durably accept a namespace/control mutation before publication. Every node is metadata-capable; this is a write durability floor, not a voter count or convergence target. The legacy `metadata_replicas` key is accepted as an alias, translated to the majority of the voter count it named; the two keys are mutually exclusive.
 - `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted.
-- `extent_size`: maximum ordinary file extent size. It is unrelated to small-object pack allocation.
+- `extent_size`: maximum ordinary file extent size, `1M`..`64M`, default `16M` (the examples here use `4M`). It is fixed once a namespace exists; live reload refuses a change. It is unrelated to small-object pack allocation.
 - `data_inflight_bytes`: node-wide byte budget for blocking DATA object reads, writes, and transfers.
 - `data_viewer_reserve_bytes`: non-borrowable headroom inside that budget for foreground playback and read-ahead. Loader and speculative work remain work-conserving within the rest of the budget, but cannot consume this reserve. It must be smaller than `data_inflight_bytes`, and the difference must fit at least one `extent_size` object.
 - `metadata_materialization_cache_bytes`: bounded process-memory budget for decoded metadata snapshots and their immutable records. Historical payloads remain in `history.log` and are read on demand. The default is `128M`.
 - `retention_check_batch_size`: extent IDs per `have_objects` presence-check RPC issued while planning a DATA retention claim (e.g. accepting a metadata publication). Must fit within `network.max_frame_size` (32 bytes/id plus a small header).
 - `retention_check_concurrency`: maximum `have_objects` batches in flight at once, across all peers combined, from a single retention claim. Bounds fan-out against any one peer for an arbitrarily large publication.
+- `data_credit_no_progress_deadline_ms`: how long a DATA credit wait may see no lease released anywhere in the arbiter before it fails instead of waiting for ever. Under real load releases happen constantly, so this fires only when the arbiter is wedged. `0` restores the unbounded wait.
+- `read_ahead`: extents of read-ahead, at most 64 (default 3).
+- `metadata_cache_ms`: at most 5000 (default 250).
+
+### Disk I/O pressure
+
+```yaml
+dht:
+  io_pressure_overhead_ms: 25
+  io_pressure_per_mib_ms: 120
+  io_pressure_slowdown_percent: 300
+  io_pressure_release_percent: 150
+  io_pressure_outlier_percent: 1000
+  io_pressure_min_background: 1
+```
+
+The DATA backends defend measured device service *time*, which the byte
+budgets above do not bound. Each operation is judged against what it should
+cost on a coping device, `io_pressure_overhead_ms` plus `io_pressure_per_mib_ms`
+per MiB, and pressure is the moving average of actual/expected as a
+percentage. Above `io_pressure_slowdown_percent` the device is pressured until
+the average falls below `io_pressure_release_percent`; a single operation more
+than `io_pressure_outlier_percent` of its own expectation trips pressure at
+once (`0` disables that trip). While pressured, speculative work stands aside,
+and loader work is held to `io_pressure_min_background` leases only when a
+viewer is present, meaning a viewer read within
+`maintenance.foreground_quiet_ms` (law 3). A viewer is never gated.
+
+`io_pressure_slowdown_percent: 0` disables the mechanism. Otherwise the release
+percentage must be below the slowdown percentage, the two expectation budgets
+cannot both be zero, and `io_pressure_min_background` must be at least 1.
 
 Replica policy should be identical across the cluster and changed as a coordinated cluster operation. `metadata_min_write_replicas: 2` means any two active nodes, not two preselected nodes.
 
@@ -160,6 +192,19 @@ network:
   max_frame_size: 256K
   control_no_progress_deadline_ms: 30000
   data_no_progress_deadline_ms: 0
+  control_stall_notice_ms: 5000
+  data_stall_notice_ms: 120000
+  upnp:
+    enabled: false
+    external_port: 0
+    discovery_timeout_ms: 2000
+    lease_seconds: 0
+  external_ip:
+    enabled: false
+    timeout_ms: 3000
+  connectivity_check:
+    enabled: false
+    timeout_ms: 3000
 ```
 
 `advertise` must be reachable by peers, unless the node accepts no inbound
@@ -197,6 +242,20 @@ request and then wedged costs one deadline per attempt rather than an
 indefinite wait. `data_no_progress_deadline_ms` does the same for object
 transfers and is off (`0`) by default because those already have their own
 stall/spill handling. `failure_domain` should be identical for nodes that share the same physical/site failure boundary.
+
+`control_stall_notice_ms` and `data_stall_notice_ms` are observability only:
+a request outstanding that long logs a `DEBUG` line and is never cancelled.
+`0` disables the line. `max_frame_size` must be `4K`..`4M`, and
+`connect_timeout_ms` at least 100.
+
+`upnp` asks the gateway for a mapping of `network.port` (or `external_port`
+when non-zero; `lease_seconds: 0` requests a permanent mapping) and advertises
+the external address it gets. `external_ip` is the fallback when UPnP cannot
+supply one: it asks `https://checkip.amazonaws.com` and assumes any port
+forwarding is already in place. `connectivity_check` probes the effective
+advertised endpoint from this node after startup; a failure can mean the port
+is closed or that the gateway lacks NAT hairpin. All three timeouts must be
+100..30000 ms.
 
 Bootstrap entries are discovery seeds:
 
@@ -349,12 +408,16 @@ fuse:
   namespace_retry_window_ms: 1800000
   namespace_retry_initial_backoff_ms: 50
   namespace_retry_max_backoff_ms: 5000
+  publication_retry_max_failing_ms: 3600000
+  namespace_retry_max_failing_ms: 3600000
 ```
 
 A data publication that fails with a transient error is re-queued after an
 exponential backoff (`initial_backoff` doubling up to `max_backoff`); the
 backoff is per inode, so other files keep publishing at full speed. When one
-inode has failed `max_failures` times inside `window_ms` it is **parked**: its
+inode has failed more than `max_failures` times inside `window_ms`, or has not
+succeeded once for `max_failing_ms` (a backstop for failures too sparse for the
+window to catch; `0` disables it), it is **parked**: its
 bytes stay in the spool and journal, it leaves the loader queue, the daemon
 logs one `WARN` line, `diagnostics.filesystem.parked_publications` counts it,
 and `GET /api/v1/manage/filesystem/parked-publications` lists it with the
@@ -389,7 +452,19 @@ streaming:
   segment_memory_bytes: 67108864
   max_session_holds: 2
   max_concurrent_holds: 64
+  segment_timeout_ms: 6000
+  transcode_entitlement_idle_ms: 300000
+  startup_timeout_ms: 15000
+  probe_bytes: 8M
+  probe_analyze_duration_ms: 5000
+  probe_timeout_ms: 20000
+  # temp_path: /var/lib/macha/tmp/playback
 ```
+
+`streaming.enabled` requires `catalogue.api.enabled`. `max_sessions` is
+1..1024 and must stay above `max_sessions_per_account` (`0` disables the
+per-account bound), or the node-wide limit refuses first and the account cap
+is never reached. Neither transcode limit may exceed `max_sessions`.
 
 `max_ahead_segments` (8) is how far beyond the highest fragment index a client
 has actually requested the producer is allowed to run before it parks on a
@@ -418,6 +493,20 @@ authorised production ahead of the frontier when it had 16.
 consumed fragments spill below `temp_path` rather than stalling production.
 `max_session_holds` (2, one in flight plus one prefetch) and
 `max_concurrent_holds` (64) bound held requests per session and node-wide.
+`segment_timeout_ms` (6000, range 1000..20000) is how long a held request may
+wait; it must stay under the tightest client time-to-first-byte deadline,
+because a held request sends no bytes.
+
+`transcode_entitlement_idle_ms` (5 minutes) releases a session's transcode
+entitlement after that long with no stream activity at all; a viewer paused
+longer reacquires it on resume, which may be refused with a `429`. It is
+meaningful only between `pipeline_idle_ms` and `session_idle_ms`.
+
+`probe_bytes` (`256K`..`64M`), `probe_analyze_duration_ms` (250..30000) and
+`probe_timeout_ms` (2000..120000) bound source inspection. `temp_path`
+defaults to `<state_path>/tmp/playback`. Changing `enabled`, `temp_path`,
+`segment_memory_bytes`, `video_decoder_threads` or the probe bounds requires a
+restart; the other limits apply on live reload.
 
 `pipeline_idle_ms` releases an abandoned physical remux/transcode encoder after
 valid current-generation stream requests stop (60 seconds by default). The
@@ -553,13 +642,36 @@ catalogue:
     compression_min_bytes: 1K
     compression_level: 6
     compression_max_asset_bytes: 4M
+    max_request_bytes: 8M
+    artwork_capability_ttl_ms: 2592000000
+    # advertised_endpoint: https://media-node-2.example.net:443
+    # token_file: /etc/macha-api.token
 ```
+
+`advertised_endpoint` is the URL clients are told to use for this node
+(`nodes[].api_endpoint` in Status), stated because the outer address behind a
+TLS-terminating proxy or port forward cannot be derived from `listen`/`port`.
+It must be `http://` or `https://` plus a host and optional port: a path,
+query, fragment or userinfo is rejected at startup, and an IPv6 literal must be
+bracketed. Empty means `http://` this node's resolved `network.advertise` and
+`port`.
+
+`artwork_capability_ttl_ms` (30 days) is the lifetime of the signed artwork
+URLs in catalogue responses, which let a client load artwork with a plain
+`<img src>`. It is also the response's `max-age` and the interval at which
+every artwork URL changes, so a short value makes every client re-download
+every poster. An expired URL is recovered by re-fetching the catalogue item.
+
+Validated ranges: `workers` 1..256, `control_workers` 1..64,
+`max_connections` and `max_queued_requests` 1..65536, `staging_chunks` 1..64,
+`stream_chunk_bytes` `16K`..`4M`, `client_io_timeout_ms` 1000..300000,
+`max_request_bytes` at least `1K`.
 
 The server is one reactor thread that owns every socket, plus two pools of threads that only compute (see `docs/streaming.md`, "Public HTTP behaviour"). `workers` is the data lane: catalogue, playback, web assets, and every body read that can block on a disk or a replica. `control_workers` is the control lane: health, status, session and account routes, so they are answered while the data lane is saturated. `max_connections` bounds open connections; an idle kept-alive connection is a descriptor and a small struct, not a thread. `max_queued_requests` bounds how many requests may wait for a lane worker before the reactor answers `503 overloaded` with `Retry-After: 1`. `staging_chunks` is how many `stream_chunk_bytes` chunks a streaming response may hold ahead of a slow client, so streaming memory is at most connections × `staging_chunks` × `stream_chunk_bytes`. A handler slower than `slow_request_threshold_ms` is logged with its route; a reactor pass longer than `reactor_stall_threshold_ms` is counted in diagnostics as a stall, which should never happen.
 
-`compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes`, and only for a client whose `Accept-Encoding` asks for it. Media is never compressed — it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
+`compression` gzips text responses on the way out: JSON from the API, and the web client's HTML, CSS and JavaScript. It applies only to complete in-memory bodies above `compression_min_bytes` (at least 64), and only for a client whose `Accept-Encoding` asks for it. Media is never compressed — it is already compressed, it is streamed rather than buffered, and the reactor sends it from resident memory without a copy. Neither are images, fonts or wasm, for the same reason. `compression_level` is the zlib level, 1 to 9; 1 gives most of the ratio for a fraction of the CPU, which is what a Pi-class node wants. Every compressible response carries `Vary: Accept-Encoding` whether or not it was compressed, so a shared cache keys the two representations apart.
 
-For the web client, a precompressed file sitting next to the asset (`app.js.gz` beside `app.js`) is preferred and costs no CPU per request. When the client build did not produce one, an asset up to `compression_max_asset_bytes` is compressed on demand instead; larger ones are streamed unchanged. The compressed and uncompressed forms of an asset never share an entity tag, so revalidation cannot return the wrong one.
+For the web client, a precompressed file sitting next to the asset (`app.js.gz` beside `app.js`) is preferred and costs no CPU per request. When the client build did not produce one, an asset up to `compression_max_asset_bytes` (at most `64M`) is compressed on demand instead; larger ones are streamed unchanged. The compressed and uncompressed forms of an asset never share an entity tag, so revalidation cannot return the wrong one.
 
 Set `compression: false` on a node that sits behind a proxy which already compresses. That is a supported deployment, not a degraded one, and the counters `responses_compressed` and `compression_bytes_saved` in the diagnostics route say what the setting is actually doing.
 
@@ -568,6 +680,17 @@ Set `compression: false` on a node that sits behind a proxy which already compre
 ## Streaming, ingest and acquisition
 
 Streaming, ingest and BitTorrent configuration remain independent of the storage authority model. The complete set of fields is shown in [`../macha.yaml.example`](../macha.yaml.example).
+
+`ingest.enabled` requires `catalogue.scanner.enabled`, and `torrent.enabled`
+requires `ingest.enabled`. `ingest.max_concurrent_jobs` is 1..64 (default 10)
+and `torrent.max_active` 1..64 (default 4).
+
+`torrent.disk_threads` (default 2, at least 1) is the number of threads doing
+the torrent's file I/O. Every read, write and hash they perform is admitted by
+the DATA arbiter as loader work and timed into the disk-pressure monitor above,
+so a download yields to a viewer on a slow device. It replaced
+`torrent.pressure_download_rate`, which is no longer read. It takes effect at
+restart; `max_active`, the rate limits and `log_level` apply on live reload.
 
 ## Web client
 
@@ -595,6 +718,18 @@ Client assets are served without a bearer token, since a browser has none until 
 The client is served while local services are still recovering, because it is static files and depends on none of them. That is deliberate: the client loads and shows what `/api/v1/status` reports, rather than failing to load at all during a recovery.
 
 A node configured with a `root` that does not exist, or one with no index document, answers `503 web_client_unavailable` rather than `404` — a misconfigured node says so instead of pretending the route was never there, and starts serving as soon as the files appear, without a restart.
+
+## Renamed and obsolete keys
+
+`verbose`, top-level `mount_path` (now `fuse.mount_path`),
+`network.control_timeout_ms` and `network.data_timeout_ms` are refused at
+startup. Accepted as aliases: `dht.metadata_replicas` (see DHT policy),
+`catalogue.api.max_queued_connections`, and `allow_other`, `entry_timeout_ms`,
+`attr_timeout_ms` and `negative_timeout_ms` under `filesystem` (the 0.12.x
+spellings of the `fuse` keys). `dht.io_pressure_outlier_ms` (replaced by
+`io_pressure_outlier_percent` in 0.53.0) and `torrent.pressure_download_rate`
+(removed in 0.54.0) are no longer read; a file that still sets them starts, and the value is
+ignored.
 
 ## Logging
 

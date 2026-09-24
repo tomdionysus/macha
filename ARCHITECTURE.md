@@ -3,9 +3,8 @@
 ## Governing laws
 
 Four laws govern every Macha project, and five self-healing disciplines go
-with them. Their text is shared by the server, the client core and the clients,
-with the same numbering everywhere, in
-[Principles and laws](docs/principles-and-laws.md). Read that first. The source
+with them. Every project numbers them the same way; the server's statement of
+them is [Principles and laws](docs/principles-and-laws.md). Read that first. The source
 and reviews cite them by number: "law 2", "discipline 5".
 
 1. **Thou Shalt Not Make Control Wait.**
@@ -121,7 +120,7 @@ Files are represented by namespace metadata and ordered extent references. Holes
 
 ## DATA placement
 
-Each node advertises the configured capacity of its currently eligible authoritative DATA backends. Placement uses stable capacity-aware hashing; live free space is not a placement weight, avoiding continual reshuffling as disks fill.
+Each node advertises the configured capacity of its currently eligible authoritative DATA backends. A node with `storage.hosts_extents` false (an edge node) is never a placement candidate; it publishes its writes to the owners. Placement uses stable capacity-aware hashing; live free space is not a placement weight, avoiding continual reshuffling as disks fill.
 
 For an object, placement produces preferred owners followed by deterministic fallback candidates. A preferred owner that is offline, stalled or unable to admit the object does not cap the cluster: the writer tries the next candidate.
 
@@ -133,7 +132,9 @@ Each node may have several local DATA backends. The same stable capacity-aware p
 
 Namespace metadata is an encrypted immutable DAG replicated by every node. A mutation is first stored as the exact same immutable commit on `dht.metadata_min_write_replicas` distinct active replicas; only then is an acceptance certificate for that commit persisted. There is no privileged voter subset and no live distributed CAS/PREPARE/COMMIT phase. A receiving replica may store a commit regardless of its current head. Accepted heads are a set rather than a singleton, so disconnected cohorts may create independently valid branches. Replicas exchange accepted-head certificates and compact ancestry, reconcile divergent maximal heads by common-ancestor semantic merge, and materialise incompatible namespace/catalogue alternatives as durable conflicts rather than overwriting a branch.
 
-Content-addressed control objects are stored separately from DATA. The principal current user is the media catalogue. DATA quota exhaustion must not prevent a metadata replica from storing control objects required to represent committed metadata.
+A commit's record either inlines the serialised namespace or, on a node re-rooted with `macha-namespace-migrate` (0.50.0), carries the root of a content-addressed Merkle tree over the namespace, keyed by path. An ordinary commit then rewrites the leaf holding the changed path and the branches above it, and the tree's nodes must reach the metadata write floor before a commit may name its root. A reconciliation merge materialises its three branches and re-roots the result.
+
+Content-addressed control objects are stored separately from DATA. Their principal users are the namespace tree and the media catalogue. DATA quota exhaustion must not prevent a metadata replica from storing control objects required to represent committed metadata.
 
 Control object storage has its own safety ceiling. Metadata/control capacity is an operational resource and must be monitored, but it is not borrowed by bulk media DATA.
 
@@ -204,13 +205,13 @@ External metadata providers are enrichment inputs, not recovery dependencies.
 
 ## Maintenance
 
-Maintenance is low priority and bounded. It performs replica repair, local backend rebalance, reachability GC, catalogue control convergence/GC and scheduled integrity scrub. Foreground playback and mounted MachaDFS traffic suppress speculative work.
+Maintenance is low priority and bounded. It performs replica repair, local backend rebalance, reachability GC, catalogue control convergence/GC and scheduled integrity scrub. Foreground playback, mounted MachaDFS traffic and loader work (ingest and acquisition) suppress speculative work.
 
 Logical GC authority is reachability from accepted metadata; physical deletion is additionally fenced by durable local retention claims. DATA and CONTROL have separate physical sweeps. Newly orphaned/unreferenced objects remain protected by the configured grace period, and a physical copy cannot be reclaimed while any local causal claim remains. This lets GC make progress during partitions without deleting data protected by a concurrent accepted branch.
 
 ## Network model
 
-Peers use separate CONTROL and DATA transport lanes. Health/membership and metadata/control RPCs are isolated from bulk DATA scheduling. The cluster protocol version is 21; a peer offering any other version fails the handshake rather than negotiating down, so a cluster is homogeneous in protocol and a protocol change is a rolling upgrade.
+Peers use separate CONTROL and DATA transport lanes. Object payloads travel on DATA; health/membership and metadata/control RPCs travel on CONTROL, isolated from bulk DATA scheduling. A node that accepts no inbound connections (`network.inbound_capable`) keeps both lanes dialled to every capable peer itself and is never dialled; a peer that needs a lane asks for it over the CONTROL session that node opened. The cluster protocol version is 21; a peer offering any other version fails the handshake rather than negotiating down, so a cluster is homogeneous in protocol and a protocol change is a rolling upgrade.
 
 ## Correctness gates
 

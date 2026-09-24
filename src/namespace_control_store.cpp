@@ -2,6 +2,7 @@
 #include "namespace_control_store.hpp"
 
 #include "crypto.hpp"
+#include "metadata_manager.hpp"
 
 #include <stdexcept>
 
@@ -37,9 +38,13 @@ ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
     // saturated. The bytes were never the problem; the round trips were.
     if (node_.control_store().has(id))
         return id;
+    // MetadataNotReady, not a bare runtime_error: a peer dropping out mid
+    // commit is the same transient cluster condition as a floor missing
+    // before it, and callers (an ingest, 0.57.0) block and retry on that type
+    // rather than failing the job.
     if (store_.replicate_control(id, node) < required_)
-        throw std::runtime_error("namespace node could not reach the metadata durability floor: " +
-                                 to_string(id));
+        throw MetadataNotReady("namespace node could not reach the metadata durability floor: " +
+                               to_string(id));
     written_.push_back(id);
     return id;
 }

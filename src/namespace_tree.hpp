@@ -15,10 +15,10 @@ namespace macha {
 
 // A content-addressed Merkle tree over the namespace, keyed by path.
 //
-// This is the substrate for SM14 (see TODO/2026-09-17-namespace-merkle-root-plan.md).
-// It is not yet authoritative for anything: nothing here is reachable from a
-// MetadataRecord, and `encode_snapshot` is untouched. What it establishes is the
-// structure the record will eventually point at instead of inlining.
+// This is SM14 (see TODO/2026-09-17-namespace-merkle-root-plan.md). A
+// tree-backed MetadataRecord carries only the root of this tree instead of
+// inlining the namespace; its nodes are CONTROL objects, stored to the write
+// floor before any record names the root.
 //
 // Two properties are load-bearing and both are tested:
 //

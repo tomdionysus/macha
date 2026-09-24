@@ -1,9 +1,10 @@
 # Macha principles and laws
 
 These principles and laws are shared by every Macha project: the server, the
-shared client core (`@machafoundation/core`) and the clients built on it. The
-same text, with the same numbering, lives in each repository, and every
-repository cites the laws and disciplines by these numbers. They define the
+shared client core (`@machafoundation/core`) and the clients built on it. Each
+repository states them in its own words for its own side, but the laws keep
+the same numbers and order everywhere, and every repository cites them by
+these numbers. This is the server's statement. They define the
 conceptual boundary of the product and the priority contract every component
 must preserve. They are constraints on design and implementation, not
 performance aspirations.
