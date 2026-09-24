@@ -22,11 +22,11 @@ The key is never sent over the network. Every node must nevertheless have the sa
 - AES-256-GCM authoritative extents, cache objects and metadata at rest.
 - Random 96-bit GCM nonces from OpenSSL `RAND_bytes`.
 
-The handshake authenticates peer identity, the negotiated frame ceiling and the ephemeral X25519 exchange. Each peer pair uses one canonical bidirectional connection. Variable-length frames are independently AES-256-GCM protected, and frame type is the sole transport-priority authority. The exchange has forward secrecy against later disclosure of the shared cluster key, assuming the endpoint and ephemeral session secrets were not compromised while the session was live.
+The handshake authenticates peer identity, the negotiated frame ceiling and the ephemeral X25519 exchange. Each peer pair uses one canonical bidirectional connection per transport lane: CONTROL, and DATA for object payloads. Variable-length frames are independently AES-256-GCM protected, and frame type decides a frame's transport priority. The exchange has forward secrecy against later disclosure of the shared cluster key, assuming the endpoint and ephemeral session secrets were not compromised while the session was live.
 
 ## Network exposure
 
-The protocol is authenticated; still restrict it with the host/network firewall. Peers must be directly reachable at their advertised address. The server has no NAT traversal or anonymity layer.
+The protocol is authenticated; still restrict it with the host/network firewall. A node is dialled at its advertised address unless it declares, or is found by a dial-back probe, to accept no inbound connections (`network.inbound_capable`); such a node dials its peers itself and is never dialled. Two nodes that both accept no inbound connections cannot reach each other. Optional UPnP IGD port mapping (`network.upnp`) is the only NAT assistance; there is no relay or anonymity layer.
 
 For Internet deployment use routable addressing, explicit forwarding, or a private routed overlay such as WireGuard.
 
@@ -36,7 +36,7 @@ The catalogue/playback HTTP API is separate from the authenticated cluster proto
 
 The shared cluster key authenticates *nodes*. It says nothing about *people*, and the HTTP API has its own identity model.
 
-Every HTTP route requires a session bearer token from `POST /api/v1/session`, which is the only route reachable without one. A session is minted either from a username and password, or -- when `session.allow_anonymous` is on -- with no credentials at all, in which case it is bound to the `anonymous` account. Each session carries the roles of the account behind it, and every route is gated on those roles in one place before dispatch.
+Every API route requires a session bearer token from `POST /api/v1/session`. The exceptions are that route itself, `GET /api/v1/health` (service name, readiness and running version only), the web client's static files when a web root is configured, and the capability URLs for streams and artwork described below. A session is minted either from a username and password, or -- when `session.allow_anonymous` is on -- with no credentials at all, in which case it is bound to the `anonymous` account. Each session carries the roles of the account behind it, and every route is gated on those roles in one place before dispatch.
 
 Roles are capabilities rather than a ladder: `view_status` sees cluster health, `media_viewer` reads and plays media, `importer` acquires, `manager` changes files/namespaces/catalogue matches and resets cluster identity associations, `manage_users` administers accounts. `importer`, `manager` and `manage_users` each imply `media_viewer`, which implies `view_status`; nothing else implies anything. `view_status` is grantable alone, so health can be exposed without exposing media.
 
@@ -64,7 +64,7 @@ A password change, a role change or a deletion retires every session that accoun
 
 At least one account always holds `manage_users`. Removing the role from the last account that has it, or deleting that account, is refused — root included, whose roles are otherwise ordinary. The invariant is about the role rather than any particular account, so it moves as the role moves.
 
-Playback control requests use the ordinary API Bearer token. A successful session returns a separate high-entropy capability in each stream URL because native media players cannot reliably attach the permanent API header to every playlist, fragment and range request. Treat the returned stream URL as a temporary bearer secret: anyone who has it can read that session's media until the session is deleted or expires. Capability URLs are scoped to one playback session and generated HLS generation; they do not authenticate cluster RPC or catalogue mutation.
+Playback control requests use the ordinary API Bearer token. A successful session returns a separate high-entropy capability in each stream URL because native media players cannot reliably attach the permanent API header to every playlist, fragment and range request. Treat the returned stream URL as a temporary bearer secret: anyone who has it can read that session's media until the session is deleted or expires. Capability URLs are scoped to one playback session and generated HLS generation; they do not authenticate cluster RPC or catalogue mutation. Catalogue artwork URLs likewise need no header: each carries an HMAC signature under a cluster-key-derived key and an expiry bucketed to `catalogue.api.artwork_capability_ttl_ms` (30 days by default), so anyone holding one can fetch that artwork until it expires.
 
 Mixed protocol versions fail the handshake rather than downgrade, so a peer cannot be induced to speak an older, weaker version of the exchange.
 

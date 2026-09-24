@@ -111,6 +111,13 @@ flight, what is owed to whom, and the traps that cost time that day.
       (`:605`, a truncated object reported present), full suite only.
     - `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly`,
       once in a full laptop suite 2026-09-24, 60/60 alone.
+    - `rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`,
+      once in the full suite on fi-1 2026-09-24 (0.57.0 rebuilt with the
+      `/usr` prefix), `uncaught exception: metadata replica set forming:
+      waiting for bootstrap checkpoint survey`; 10/10 alone.
+    - `users/test_a_node_that_was_down_learns_a_deletion_not_a_resurrection`,
+      same run, `test_users.cpp:836` tombstone never arrived within 10 s;
+      10/10 alone. The first fi-1 run of the same code passed 533/533.
 11. **Transport backoff after a peer restart** (open product question from
     the 2026-09-23 barrier work): an inbound session from a peer does not
     clear the dial backoff for its other lanes, so a node refuses to dial a
@@ -122,8 +129,10 @@ flight, what is owed to whom, and the traps that cost time that day.
     The swarm test fails there every time; run torrent tests on es-1.
     Fixing the laptop is the operator's call.
 
-Then the older ordered items, unchanged: -3 (the P0 merge rollback), -2, -1,
-0 to 7 below.
+Then the older ordered items: -3 (the P0 merge rollback), -2, -1, 0 to 7
+below. Reconciled against 0.57.0 on 2026-09-24: what was found already done
+is ledgered in `COMPLETED.md` under "backlog reconciliation", and items only
+partly done now state what remains.
 
 ## Standing rules (learned the hard way; do not relearn)
 
@@ -236,8 +245,10 @@ a fact.**
    dies permanently when its node restarts mid-put -- `state='failed' error='object replication
    quorum unavailable'` -- rather than pausing and resuming. It survived three
    restarts today and failed on the fourth, so it is timing-dependent. Same
-   class as the read-only-window item under the metadata-stall P0. The job is
-   retried from the UI; completed files are skipped.
+   class as the read-only-window fix that shipped in 0.57.0, which blocks and
+   retries on `MetadataNotReady` only; this EIO from the object write quorum
+   is not covered by it. The job is retried from the UI; completed files are
+   skipped.
 
 -2. **What the disk resource audit left open, and the batching question
    (2026-09-23).** The audit itself is closed (`COMPLETED.md`, 0.53.0); these
@@ -331,11 +342,12 @@ a fact.**
    - Per-node free disk: already on `/api/v1/status` as
      `nodes[].storage.free_bytes`. Core had not read it.
    - Node id format: `unhex` takes even-length unseparated hex, either case.
-   - [ ] `node_id` on `/api/v1/torrents/jobs/{id}/{pause,resume,retry,cancel}`
-     responses (Core). The ingest route already does this; the torrent route
-     has the value in `TorrentActionResult::updated` and does not emit it.
-   - [ ] Structured `placement_failed`: `code`, target `node_id` as a field,
-     viewer-facing `detail` (Core). A host must never parse a message.
+   - [ ] Structured `placement_failed`: the code shipped in 0.56.0
+     (`error.reason`: `node_not_member`, `node_refused`, `node_unreachable`,
+     `node_did_not_start`, `missing_uri`, `add_failed` or the peer's own
+     code). Still open: the target `node_id` as a field, and the viewer-facing
+     `detail` (Core) -- 0.56.0 has no `error.detail`; weigh it against the
+     codes-are-primary rule. A host must never parse a message.
    - [ ] Surface the peer's own refusal text on a forwarded add. fi-1 has
      `torrent: enabled: false`, so a placement there is a correct 409 -- but
      the message says "refused the request" where the peer said "torrents not
@@ -349,28 +361,27 @@ a fact.**
      endpoints and can say which axis decided; a second ranking on different
      inputs would make placement unexplainable. Not doing it.
 
-0. **The namespace Merkle work**, the P-1 below. **Stage B is done**
-   (2026-09-21): the substrate is built, measured against the live head, and
-   the SM14 record shape now exists -- `namespace_root` on the snapshot,
-   `encode_snapshot_v14`, `decode_snapshot` dispatch, and
-   `detach_namespace`/`attach_namespace` to move between the two forms. On the
-   test fixture the record goes from 434,731 bytes to 590, and stays at 590
-   for a library twenty times larger. **Nothing authors one yet**: the commit
-   path, journal and delta encoders are untouched, so this ships as dead code
-   and a peer that does not know the magic refuses it. **Stage C is next** --
-   `mutate_impl` mutating the tree and carrying its change set into the commit
-   rather than rediscovering it. See
-   [the plan](2026-09-17-namespace-merkle-root-plan.md), which now carries the
-   arithmetic for whether it is worth doing at all: **56 ms of CPU per
-   namespace write today, ~3.1 s at the 100 TB target.** Not urgent today,
-   painful at 10x, inoperable at target.
+0. **The namespace Merkle work**, the P-1 below. **Stages B, C and E have
+   shipped** (ledgered in `COMPLETED.md`): the SM14 record in 0.49.0, the
+   commit path and every namespace reader and writer on the tree in 0.49.1 and
+   0.50.0, and the migration tool in 0.50.0 -- the live cluster was re-rooted
+   onto the tree at 12:41Z on 2026-09-22 (0.50.1: a 22.79 MiB record became
+   3.97 KiB). What the cutover cost is item -1. **What remains is Stage D**
+   (demand-loaded extent nodes on the `RetainedMemoryLedger`; persist
+   `file_media_id`) **and Stage F** (the dependent O(N) items under P1 scaling
+   cliffs, plus the tree-native merge that items -1 and -3 call for:
+   reconciliation still materialises both branches and publishes a full
+   record). See [the plan](2026-09-17-namespace-merkle-root-plan.md), which
+   carries the arithmetic that justified the work: 56 ms of CPU per namespace
+   write before the tree, ~3.1 s at the 100 TB target.
 1. **The other P-1, the cache-sizing invariant.** Still open, and note that
    the block-cache item under it was falsified and downgraded on 2026-09-21 —
    the cache works, it just could not be observed, and now can be.
 2. **The metadata-stall P0.** Its read-only blink was root-caused and fixed on
    2026-09-21 (a hung health probe was given the whole liveness budget); the
-   stall that provokes it is still unexplained, and making an ingest survive a
-   read-only window is still owed.
+   stall that provokes it is still unexplained. Making an ingest survive a
+   read-only window shipped in 0.57.0 (`MetadataNotReady` blocks and retries
+   instead of failing the job).
 3. The **rejoin/cache P0** after it — worked around on all three nodes on
    2026-09-20, not fixed, and the concrete instance of the first P-1.
 4. The **loader-I/O P0**. The node starves its own viewer I/O with loader
@@ -478,12 +489,13 @@ history that reads as work. What went, and why:
   (`StorageLock` is used at `cluster.hpp:77`; the scanner's
   `request_media_profiles` is invoked from `catalogue_api.cpp:441`).
 
-The governing laws are:
+The governing laws are stated, with their numbering, in
+[Principles and laws](../docs/principles-and-laws.md):
 
-1. Thou Shalt Not Make The Viewer Wait.
-2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
-3. Control traffic must remain promptly serviceable. Viewer priority is a large
-   configurable share (95:5 by default), not indefinite starvation of all other work.
+1. Thou Shalt Not Make Control Wait.
+2. Thou Shalt Not Make The Viewer Wait.
+3. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
+4. Thou Shalt Not Shoot Thyself In The Foot.
 
 ## P0 — A playback session is a resource, not a property of the bearer (opened 2026-09-21, DEPLOYED 0.48.0 — joint test outstanding)
 
@@ -541,24 +553,10 @@ GET    /api/v1/playback/sessions/{id}/stream/{token}/direct
 `GET /api/v1/playback/stream/...` is removed. `playback/status` and
 `playback/media` are different resources and do not change.
 
-- [ ] `POST` to the collection creates a member every time; the logical viewer
-  stops being keyed on the bearer.
-- [ ] `GET` on the collection, under `items`. **This is the piece that unblocks
-  handover** — it does not exist today, and without it a client that loses its
-  id cannot find its own session.
-- [ ] The stream moves under the session; the token stays in the path, because
-  it is a capability and media players send no application headers.
-- [ ] **The per-account cap ships in the same change, not after it.**
-  `reserve_session_slot` (`src/playback.cpp:1266-1271`) is node-wide only, and
-  the one-session-per-bearer rule was doing the per-account job by accident.
-  Removing it without a cap is exactly the media DoS the operator named as the
-  governing constraint. Transcode entitlements
-  (`reserve_resources`, `src/playback.cpp:1278+`) are per logical viewer and
-  must share the cap's key, or splitting a viewer into many sessions multiplies
-  them.
-- [ ] Supersession becomes an explicit refusal against that cap rather than a
-  silent replacement. This also absorbs the direct-session exemption item from
-  the seamless-handover P0.
+The five build checkboxes (collection `POST`, collection `GET`, stream under
+the session, per-account cap, supersession as refusal) shipped in 0.48.0 and
+are ledgered in `COMPLETED.md`. Still open here:
+
 - [ ] Brief the four client sessions **before** the release, not after.
 
 **Supersedes** item 2 of the seamless-handover P0 below, which said a
@@ -610,21 +608,12 @@ prevent, so shipping the cap without raising `max_sessions` leaves it dead.
 The example config and the configuration reference now pair 64 with 32; all
 three live nodes run 8.
 
-### Deploy checklist — none of this is done
+### Deploy checklist — what is left
 
-- [ ] **A current web bundle to `/etc/macha/web` on all three nodes, first or
-  with the cutover.** The nodes serve `index-BGrNH6KR.js`, which core reports
-  contains no `410` at all in 614,717 bytes. Under this change a superseded
-  generation stops being exotic — every regenerate, mode switch and rebuilding
-  seek makes one — so the deployed bundle would turn a routine event into
-  evidence against a healthy node. **Not the server session's to deploy.**
-- [ ] Build once on es-1, ship the tarball, all three nodes together. The
-  telemetry format is TEL3 with no compatibility, so a node left behind is
-  excluded from gossip rather than misreading it — which is the intended
-  behaviour, and the reason the cutover is not rolling.
-- [x] Raise `max_sessions` node-wide above `max_sessions_per_account` and
-  write both explicitly — done 2026-09-21, all three at 64/32, verified
-  against the pre-change backups.
+The web bundle, the build-once all-together cutover and the `max_sessions`
+raise were done on 2026-09-21 (see the top of this section) and are ledgered
+in `COMPLETED.md`.
+
 - [ ] Joint test with the clients afterwards, co-ordinated by core. One thing
   worth getting: a mode switch on a moved node, watched from a client, to make
   a real `410 generation_superseded` and see it classified. No amount of
@@ -918,27 +907,14 @@ afternoon on the one node that owns no extents, which is what moves this from
 the only thing standing between a seek on fi-1 and a WAN round trip, and we
 cannot see whether it works.
 
-- [x] **Falsified 2026-09-21** — the cache serves reads at 88x the cold path.
-  This is why the item is P1 and not P0. Putting it first was right: it cost
-  ten minutes and it stopped an instrumentation project being started on a
-  premise that was false.
-- [ ] Counters on `PersistentBlockCache` — hits, misses, evictions, entries.
-  The materialisation cache already has exactly these and they are what made
-  the 2026-09-20 rejoin failure diagnosable. Mirror them.
-- [ ] **Surface them on `GET /api/v1/status`, per node** — the per-node
-  `cache` block at `src/status_api.cpp:299`, which is `bytes_pair(used,
-  capacity)` today, gains hits/misses/evictions/entries. **For every node, not
-  only the one answering**: fi-1 is where the cache matters and it is behind
-  CGNAT, so the operator will be looking at es-1. Cheap now and not before —
-  TEL3 is tagged and length-delimited, so four added fields are additive and an
-  older node skips them by length. Monotonic counters are safe on this cached
-  payload in a way the live account session count is not: they are diffed, not
-  read absolutely. **Do not roll a hit rate up cluster-wide** — it would drown
-  the one storage-less node the number exists to expose.
+**Partly shipped (reconciled 2026-09-24).** The falsification, the counters
+(hits, misses, evictions, entries), their per-node surface on
+`GET /api/v1/status` (0.48.2, not rolled up cluster-wide) and a read-back test
+are done and ledgered in `COMPLETED.md`. The paragraphs above describing a
+cache that cannot be observed describe the state before 0.48.2. What remains:
+
 - [ ] A sustained zero-hit, high-eviction cache becomes a reportable
   condition, per the P-1 below.
-- [ ] A test that pins a block-cache read-back. Nothing currently fails if
-  `get` always returns empty.
 - [ ] Only then revisit fi-1 latency, including whether hydration runs at all:
   `enabled: true` with the `read_ahead` and `current_file` engines, and
   **zero** log lines in 40 minutes.
@@ -1079,24 +1055,18 @@ of `metadata_branch_floor`/`retention_baseline_complete`
 (`src/metadata.hpp:93-103`) rather than by loosening the recovery path. That
 interlock is the most dangerous single piece of the work.
 
+**Status 2026-09-24:** Stages B, C and E have shipped (0.49.0-0.50.1) and the
+live cluster has run on a tree-backed namespace since 2026-09-22; they are
+ledgered in `COMPLETED.md`. The paragraphs above describe the namespace before
+the cutover.
+
 - [x] Stage A: real numbers off es-1/fi-1 and `sizeof` confirmation on an ARM
   build. Done 2026-09-17; see "Stage A results" in the plan. One item remains
   open: the live `MetadataReplicaDiagnostics` counters
   (`src/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
   which needs an account holding `view_status`.
-- [~] Stage B: Merkle namespace as SM14, readable alongside SM13, not yet
-  authoritative. **Started 2026-09-17**: the tree substrate is in
-  `src/namespace_tree.{hpp,cpp}` with six green cases, history-independent
-  and key-only-chunked, extents addressed from the leaf rather than inlined.
-  Measured: one file's stat change rewrites <= 12 nodes instead of the whole
-  library; an extent appended to a 4,000-extent file rewrites 3 nodes of 15.
-  Still owed: the SM14 record shape and `decode_snapshot` dispatch, a journal-
-  style fuzz case, a stat-only read path proven to fetch no extent nodes, and
-  the `macha-metadata-dump` mode that runs it over the live es-1 head.
-- [ ] Stage C: commit path carries the change set instead of rediscovering it.
 - [ ] Stage D: demand-loaded extent nodes, on the `RetainedMemoryLedger`;
   persist `file_media_id`.
-- [ ] Stage E: the migration and its interlock.
 - [ ] Stage F: the dependent O(N) items now listed under P1 scaling cliffs.
 
 ## P0 — es-1 and fi-1 stall metadata RPCs at each other, and it is failing real ingests (opened 2026-09-20, READ-ONLY BLINK ROOT-CAUSED 2026-09-21; the stall itself is not)
@@ -1239,16 +1209,10 @@ odd/even request ids handled symmetrically on the dialled and accepted paths
 (`src/net.cpp:1492`, `:1574`, `:3330-3337`, `:4143-4149`) — so a 30 s idle
 really does mean zero bytes moved, and that part is still open.
 
-- [x] Root-cause the read-only blink. Done 2026-09-21: a hung health probe was
-  given the whole liveness budget, so it expired the peer it was proving alive.
-- [x] Regression test for the probe budget. Done 2026-09-21:
-  `rpc_cluster/test_a_hung_health_probe_is_retried_inside_the_liveness_budget`.
-  The stall fixture *does* reach the probe — `call_async_known` consults it
-  (`src/net.cpp:2231-2235`) and `health_loop` dials through that path — so
-  holding `MessageType::ping` hangs the probe exactly as the field did, and
-  `stalled_calls_for_tests()` counts the attempts. Three attempts inside one
-  liveness window with the fix, one without: verified failing against
-  `401cd04^`.
+Done and ledgered in `COMPLETED.md` (2026-09-24 reconciliation): the
+read-only blink's root cause and its regression test, the forever-dial
+non-issue, and an ingest surviving a read-only window (0.57.0).
+
 - [ ] **The stall itself is still unexplained.** Establish why an exchange
   moves zero bytes for tens of seconds on a link measured at 13.8 MB/s with 0%
   loss. It is now a latency question, not an availability one: the blink is
@@ -1256,18 +1220,12 @@ really does mean zero bytes moved, and that part is still open.
   none since the 0.47.0 restart.
 - [ ] **Do not treat a no-progress cancel as the bug.** That is discipline 2
   working: the deadline fires instead of waiting forever.
-- [ ] Make an ingest survive a transient read-only window. A ten-second blip
-  permanently failing a 6 GB job is the user-visible defect regardless of what
-  causes the blip, and it is separable from the transport question.
 - [ ] **`publish_commit` gathers the durability floor serially**
   (`src/metadata_manager.cpp:751-770`): `store_commit_on` per replica, stopping
   at `required`, no fan-out and no hedge. The slowest of the first `required`
   replicas sets the latency of every metadata commit, and a first choice that
   stalls costs a full deadline before the third node is tried at all. Found
   2026-09-21 while root-causing the above; not yet addressed.
-- [x] Stop the forever-dial loop at the offline node. Nothing to do: it was
-  ordinary bootstrap of a node that was down, and it stopped when gbni-1
-  rejoined.
 
 ## P0 — A replica that falls behind cannot rejoin: the materialisation cache is smaller than two snapshots (opened 2026-09-20, WORKED AROUND ON ALL THREE NODES, not fixed)
 
@@ -1423,14 +1381,12 @@ prevented this**, which is what makes it structural.
   `diskA` qualifies (Greys Anatomy S01-S18 and From S01-S03 are all already
   ingested, so they would dedupe). The three staged torrents are 51%, 24.6%
   and 0% complete.
-- [x] Harness built (`run-io-pressure.py`): three vantages, `CD--` counting,
-  node vitals on one clock. It falsified two of its own designs before it was
-  trustworthy (fork-per-sample measured the TLS handshake; an absolute
-  threshold on a WAN vantage failed an idle node) and then falsified stage 1's
-  premise. Idle baseline and two loaded baselines recorded.
-- [ ] Stage 1 (law 2): `DiskServiceMonitor`, the missing primitive; pressure
-  gates **loader/speculative admission on the backend under pressure**, never
-  interactive reads. Acceptance needs a probe account with `media_viewer` —
+- [ ] Stage 1 (law 2): **the mechanism shipped** -- `DiskServiceMonitor` in
+  0.51.0, pressure gating loader/speculative admission and never a viewer,
+  corrected in 0.52.0 and audited in 0.53.0 (ledgered). **What remains is the
+  acceptance**: a DATA-backed route holding its p99 through a real ingest,
+  which 0.51.0 recorded as not yet validated. Acceptance needs a probe
+  account with `media_viewer` —
   `anonymous` holds no roles, so every DATA-backed route is a 403 and the
   NVMe probe cannot stand in for one. **Account now exists** (`servertest`,
   all five roles, created by the operator 2026-09-20) and the harness takes
@@ -1452,10 +1408,10 @@ prevented this**, which is what makes it structural.
   very mutex a running ingest holds continuously — which explains the three
   longest aborts better than disk did. Own defect, own fix: cache the count on
   artwork publication/GC, or move the walk to diagnostics.
-- [ ] Stage 3 (law 3): hard background floor so pacing can never wedge an
-  ingest; pacing must not consume publication retry budgets.
-- [ ] Stage 4: service time and paced-admission counters in
-  `diagnostics.data_resources`, transition-only logging, docs.
+- [ ] Stage 3 (law 3): the background floor shipped in 0.51.0
+  (`io_pressure_min_background`: bounded, never stopped, so a loader that is
+  itself the reason the disk is busy drains at a trickle). Still open:
+  pacing must not consume publication retry budgets.
 
 Separate, do not conflate: `put_metadata_commit` to fi-1 takes 5.3–28.4 s and
 times out at 30–35 s (24 no-progress cancels in 6 h; metadata read-only
@@ -1724,14 +1680,6 @@ version of this file is resolved and ledgered in `COMPLETED.md`.
   what *it* cannot source, which is the first half of an answer; the other half
   is the cluster-wide join nobody has built (see P2 diagnostics). Stored bytes
   at removal: gbni-1 737 GB, es-1 1.82 TB.
-- [x] **es-1 has no persistent journal — NO LONGER TRUE, verified 2026-09-20:**
-  `/var/log/journal` exists and `journalctl --list-boots` shows two boots, so
-  the next reboot is diagnosable. (Originally: so reboots cannot be diagnosed.) It
-  rebooted at ~2026-09-13 12:41 (the outage this file opened with) and
-  `journalctl -b -1` answers "no persistent journal was found". The cause is
-  therefore unknowable after the fact, and will be again next time.
-  `Storage=persistent` in `journald.conf` is the whole fix. `last` is also not
-  installed there.
 - [ ] **A node with zero storage capacity reports itself healthy.** gbni-1 ran
   for a day as `state: "online"`, `data storage ready`, `storage_cap=0.0G`,
   because `NodeRuntime::recover_storage` marks the plane ready whether or not
@@ -1939,7 +1887,8 @@ Reproduce with:
 - [x] **2. Split lightweight status from expensive diagnostics — shipped
   in 0.39.1, deployed 2026-09-13. Ledgered in `COMPLETED.md`.** Kept as a
   numbered stub so the ordering of this list still reads. The question that
-  prompted it is a separate open item: see "Status took 10 s" under P1.
+  prompted it, "Status took 10 s", was retired on 2026-09-20 and is ledgered
+  in `COMPLETED.md` (2026-09-24 reconciliation).
 
 - [ ] **4. Make transformed output bandwidth-aware.** Auto negotiation selected
   H.264/AAC but, without a client maximum bitrate, CRF output expanded a roughly
@@ -1987,45 +1936,20 @@ Keep teardown active until UAT proves that seek, quality changes, disconnects,
 supersession, failure and failover cannot leak physical encoders or produce
 `transcode limit reached` for one viewer.
 
-## P0 — Seamless handover: three pieces left, in the operator's order (opened 2026-09-20)
+## P0 — Seamless handover: the three pieces have shipped; one open question (opened 2026-09-20)
 
 **Seamless handover is a business P0 and one of Macha's value propositions**
-(operator, 2026-09-20). The operator set the order; piece 1 shipped in 0.47.0
-and the rest are unstarted.
+(operator, 2026-09-20). The operator set the order of three pieces.
 
-1. ~~**Speed factor.**~~ Shipped in 0.47.0 as `stream.production`. Core has the
-   full brief, including the parked-producer trap, and has confirmed it back.
-
-2. - [~] **Superseded 2026-09-21 by the playback-session resource P0 at the
-   top of this file.** This item said a *client-supplied* session key should go
-   **in the route as a query parameter**. Both halves were wrong: no identifier
-   in this system is client-generated, and the id belongs in the path, not the
-   query string. The diagnosis it carried was right and survives — handover is
-   impossible because sessions are keyed on the bearer token
-   (`logical_session_for(request.session->id)`, `src/playback.cpp:2288`). The
-   operator's "no non-standard HTTP headers" rule also survives, and is why the
-   stream token stays a path segment. See
-   [the plan](2026-09-21-playback-sessions-as-a-resource-plan.md).
-
-3. - [~] **Absorbed into the playback-session resource P0** (2026-09-21): the
-   cap ships with that work, because removing one-session-per-bearer without it
-   is the DoS. Stated here in the operator's own words, unchanged:
-   **Direct-session exemption plus per-account caps.** Direct sessions
-   are exempt from supersession but **still counted against a per-account
-   cap**. The constraint that governs the design: *"we need to make sure a
-   rogue client cannot under any circumstances launch a media DoS against the
-   server"* — an exemption must not become a way for one viewer to occupy a
-   node. This is law 2's second clause as admission control: not making the
-   viewer wait also means not letting one viewer make another wait.
-
-**HELD, not forgotten: `410 generation_superseded`.** The operator asked for
-it to be held (2026-09-20) and the code is deliberately back on `404` with a
-comment at the site explaining why. It ships only after macha-client-core
-releases tolerance — core maps an unrecognised fragment status to `unknown`
-and treats `unknown` as endpoint evidence, so shipping first would make a
-superseded generation look like a failed node. **Re-applying it is a small
-change; the interlock is the release order, not the code.** Ask Core whether
-their tolerance has shipped before assuming this is still blocked.
+**Reconciled 2026-09-24: all three pieces have shipped** and are ledgered in
+`COMPLETED.md`: 1, the speed factor, in 0.47.0 (`stream.production`); 2, the
+session key, superseded by and shipped as the playback-session resource in
+0.48.0 (server-minted id in the path, not a client key in the query); 3, the
+per-account cap, in 0.48.0 (`max_sessions_per_account`, and supersession no
+longer exists to be exempted from). The held `410 generation_superseded` was
+released in 0.48.0 too. The operator's governing constraint stays on record:
+*"we need to make sure a rogue client cannot under any circumstances launch a
+media DoS against the server"*.
 
 An open question the operator raised and did not settle: whether it is useful
 for a client to know that a generation existed *anywhere* rather than on this
@@ -2124,106 +2048,12 @@ not inferred from docs. All are small and isolated; none require design work.
     directory tree, known contents, compare `stat`/`readdir` output across
     all three nodes, then delete it) before guessing further.
 
-- [x] **A hard failure in one subsystem takes down the entire macha process
-  — CLOSED by 0.41.0 ("FUSE cannot take the node down any more"), ticked
-  2026-09-20.** The FUSE mount is a supervised subsystem in
-  `libmacha-fuse`; a lost mount is a `faulted` subsystem that remounts, not
-  a process exit; `SIGHUP` reload works on a mounted node. Kept unticked
-  for five days after shipping, which is the checkbox-maintenance failure
-  this rationalisation exists to correct. Historical record follows.
-  (Originally: found 2026-09-05 live incident — foundation shipped in
-  0.25.0, FUSE/Torrent migration still open.) `FuseFrontend`'s durable-journal
-  replay throws `DecodeError` on any unexpected record, uncaught, which
-  crashes the whole node — including its unrelated metadata/RPC/API roles —
-  not just the local FUSE mount. Lived this directly: a 0.24.3 bug in
-  `skip_blocked_namespace_operation()`'s journal bookkeeping (fixed in 0.24.4)
-  crash-looped `corvus-es-1` 49 times because journal replay runs in the
-  constructor with no isolation. 0.25.0 shipped the mechanism (Phase 0 of
-  [subsystem crash isolation via a plugin architecture](2026-09-05-subsystem-plugin-isolation-plan.md)):
-  a mandatory `run_supervised` thread-entry guard on every subsystem thread
-  (~30 sites), `macha_core` as a shared library, the `Subsystem`/plugin ABI,
-  and `SubsystemSupervisor` (`dlopen` + version-checked load + backed-off
-  retry + disable-after-N-failures), verified against real fault-injecting
-  `.so`/`.dylib` test plugins. 0.28.0 shipped Phase 1: BitTorrent acquisition
-  is now a real `dlopen`'d module (`libmacha-torrent`), reached through
-  `TorrentService`/`SubsystemRegistry`, absent-or-faulted per node at runtime.
-  This item still does not close: `FuseFrontend`'s constructor — the one that
-  actually crash-looped es-1 — is exactly as unprotected as it was until
-  Phase 2 moves FUSE into its own plugin and off the main thread. Single
-  binary, single process throughout, no separate OS processes/IPC (considered
-  and rejected).
-  **Sized and re-planned 2026-09-14** as two stages in
-  [FUSE behind the subsystem supervisor, then out into a plugin](2026-09-14-fuse-supervised-subsystem-plan.md):
-  Stage A supervises FUSE in place (closes this P0), Stage B moves libfuse
-  into `libmacha-fuse`. The plugin boundary is `fuse_adapter.cpp`, not
-  `FuseFrontend`, so the FUSE tests keep linking `macha_core`.
 - [ ] **Terminal durability poisoning is never cleared.** `fuse_frontend.cpp`
   sets `durability_poisoned = true` on any exception during the durability
   batch and nothing ever resets it — one transient fsync failure disables all
   writes on that node for the rest of the process lifetime. Needs an explicit,
   deliberate recovery path (even if only "restart the process"), not silent
   permanent lockout.
-- [ ] **Unbounded startup wait with no escape.** `wait_for_initial_namespace()`
-  (`fuse_frontend.cpp`) busy-waits in 100ms sleeps forever, with no timeout or
-  cancellation, and runs from the `FuseFrontend` constructor before
-  `fuse_mount`. A node whose metadata replica never becomes available hangs
-  indefinitely with only a debug log line to show for it.
-- [x] **`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`
-  — FIXED 2026-09-15 (0.43.0), a test defect: two Services' maintenance
-  loops reconciled the divergence the test had just created. Verdict in the
-  deterministic-suite plan, step 3. Ticked 2026-09-20; the body below is the
-  diagnosis as it stood.** Originally: fails 40% of the time on aarch64,
-  reproducibly, in isolation — found 2026-09-13. This is the flake worth fixing first, because unlike the three
-  below it does not need load to reproduce.** Measured on both Pis at
-  `--serial` with nothing else running: **4 failures in 10 runs on gbni-1, and
-  4 in 10 on es-1**. It has never failed on macOS/clang locally across many
-  full-suite runs, so it is aarch64/GCC or simply timing on slower hardware.
-  **Not caused by the 0.39.1 status split**, which was the suspicion when it
-  surfaced: es-1 was rebuilt with `src/status_api.*` and the three touched test
-  files reverted to their 0.39.0 contents and scored *the same* 4 in 10, so the
-  behaviour predates that change.
-  It fails at `tests/test_rpc_cluster.cpp:2831`,
-  `REQUIRE(accepted_heads().size() == 2)` — the setup assertion, before the
-  test's actual subject. The test hand-builds two sibling metadata heads at the
-  same generation on one node and expects both to still be accepted when it
-  looks. Sometimes only one is. The obvious candidate is that the node
-  reconciles the divergence on its own between `make_sibling` returning and
-  that line — which is precisely what the test then goes on to measure, so a
-  race against it is plausible without any product defect. The other candidate
-  is that a head is genuinely being dropped, which would be a real bug.
-  Deciding which needs someone to instrument `accepted_heads()` over the gap;
-  both answers are useful, and a 40% reproduction rate makes it cheap.
-- [x] **`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`
-  — FIXED 2026-09-15 (0.43.0), a product defect: two concurrent imports both
-  created the shared scanner root and the loser's `EEXIST` failed its job.
-  Ticked 2026-09-20; the body below is the characterisation as it stood, and
-  its `exists` hypothesis was right.** Originally: fails 40-80% of the time
-  IN ISOLATION on both Pis — characterised 2026-09-13 during the 0.40.0
-  rollout. "Passes in isolation" is false, and has been the
-  accepted verdict five times.** This is the measurement the item below asked
-  for instead of a sixth sighting, so act on it rather than re-observing it.
-  Measured with `--serial --filter`, nothing running but the live node:
-  **gbni-1 on 0.40.0, 8 failures in 10; es-1 on 0.39.1, 4 failures in 10.**
-  It is therefore **not a 0.40.0 regression** — the unmodified 0.39.1 build on
-  es-1 reproduces it, and nothing in 0.40.0 touches ingest. Do not read the
-  80%-vs-40% difference as a version effect: the nodes differ in load, disk and
-  network, and no controlled comparison was run.
-  Every failure is the same shape: the case times out at its full 60 s having
-  logged `ingest started workers=4`, one job failing `ingest failed id=…:
-  exists`, and two of four copying successfully. An `exists` failure on a
-  concurrent import looks like a race between workers over a destination path —
-  `ingest.max_concurrent_jobs` and its claimed-set ownership shipped together in
-  0.37.0 — and that, not the harness deadline, is the first thing to read.
-  One hypothesis was tested and **refuted**: the failing runs also logged
-  `subsystem plugin 'libmacha-torrent' build identity mismatch: plugin=0.39.1
-  core=0.40.0; refusing to load`, because a freshly built test binary was
-  loading the older installed plugin. Installing 0.40.0 so the two matched
-  changed nothing — 8 in 10 before, 8 in 10 after. The mismatch is a real
-  artefact of building on a node mid-deploy, but it is not this.
-  A 40-80% reproduction rate on hardware that is sitting there makes this cheap
-  to root-cause, and it is the only one of these flakes that does not need load
-  to reproduce.
-
 - [ ] **Three load-dependent test flakes needing a real fix, not another
   isolation-pass shrug — second found 2026-09-08, third 2026-09-13.**
   The third is
@@ -2810,76 +2640,6 @@ instrumented.
   0.41.0, so a node with no mount simply omits it rather than reporting
   zeroes that look like an idle spool.
 
-- [x] **`GET /api/v1/status` took 10 seconds once — RETIRED 2026-09-20 on the
-  condition this item set itself:** the 0.43.0 reactor removed worker
-  starvation and it has not recurred in five days (zero `reactor stall`
-  lines on es-1 since 2026-09-15). The 2026-09-19 incident produced slow
-  status responses again, but with a *found* cause (loader disk I/O, the P0
-  at the top of this file), not this one. Diagnosis preserved below.
-  (Originally: observed by the operator 2026-09-13, cause not found, and the
-  obvious suspects are eliminated.)
-  What was ruled out by reading the code and measuring the live nodes, so that
-  nobody spends the time again:
-  - **It is not the handler computing.** `status_response` does no I/O and
-    makes no network call; every field is an atomic, an in-memory snapshot or
-    a short-held mutex. Ten seconds is a *wait*.
-  - **It is not connectivity or UPnP.** Status copies a cached
-    `PublicConnectivityStatus`; only `POST /status/connectivity/check` probes.
-    Confirmed against the journal — no connectivity or UPnP activity at all in
-    the two hours around the observation.
-  - **It is not the FUSE or metadata diagnostics providers.**
-    `FuseFrontend::diagnostics()` is ~60 relaxed atomic loads and `noexcept`;
-    `MetadataManager::cluster_status()` is atomics.
-  - **It is no longer the diagnostics locks**, because 0.39.1 moved them off
-    the polled route entirely. That is the experiment: if it recurs now, the
-    cause is not inside the handler.
-  **The remaining hypothesis, untested: HTTP worker starvation.** The API has
-  16 workers and a 15 s `keep_alive_idle_timeout`. A worker that has answered a
-  request and is waiting for the next one on a kept-alive connection blocks in
-  `recv_before` for up to that long, pinned. `queue_has_backlog()` exists to
-  close a connection rather than keep it alive when others are waiting, but it
-  is only consulted *between* requests — never while a worker is already
-  blocked waiting. Ten seconds sits inside that 15 s window, and three client
-  families each holding connections would do it. There was exactly one
-  established connection per node when measured, which is consistent with an
-  intermittent fault under client load rather than a standing one.
-  **The five-second test that tells them apart**, next time it is slow: hit
-  `/api/v1/health` and `/api/v1/status` on the same node. Health touches two
-  atomics and is ungated, so *both slow* means the request never reached a
-  handler and it is the worker pool; *health fast, status slow* means it is
-  inside the handler and deserves gdb stacks.
-  Instrumentation was offered and not built: per-section `elapsed_ms` in the
-  diagnostics assembly, plus slow-request logging in the HTTP layer. For an
-  intermittent fault that is what converts "saw it once" into an answer.
-  **2026-09-15:** the worker-starvation half of this is what the P0
-  [HTTP server reactor plan](2026-09-15-http-server-reactor-plan.md) removes
-  (idle keep-alive no longer costs a thread; control routes get their own
-  lane), and that plan builds the slow-request log. If it recurs after
-  Stage A ships, the cause is inside the handler and deserves gdb stacks.
-
-- [x] **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs
-  on aarch64 — NO LONGER REPRODUCES: the full suite was green on es-1 at
-  0.45.0 (468 + 10), 0.46.1 (475 + 10) and 0.46.2 (476 + 10), which includes
-  this case. Ticked 2026-09-20; nobody recorded which change fixed it, so if
-  it returns, bisect the 0.36.x-0.45.0 range. (Originally: pre-existing on
-  HEAD, confirmed not from the 0.36.0 work, 2026-09-08.)** The case times out at its full 60 s deadline on both
-  gbni-2 and es-1, in the full suite and in `--serial` isolation, on a build
-  of current HEAD. It passes in 372/372 on macOS (arm64, AppleClang) and
-  passes in 52 ms on gbni-1's older build tree (2026-09-07 04:10), so it is
-  both platform- and revision-sensitive: something between that build and
-  HEAD broke it on aarch64/Linux. Authorship was established rather than
-  assumed — reverting `media_segments.cpp`, `media_engine.cpp` and
-  `test_framework.cpp` to HEAD on gbni-2 and rebuilding reproduced the hang
-  identically, so the 0.36.0 changes are not the cause. The delta therefore
-  falls in the 0.34.x/0.35.0 line.
-  The hang is early: the captured output stops after `node metadata ready
-  generation=1`, before any RPC result, and no `REQUIRE` failure is printed,
-  so the body blocks rather than asserting. The case covers DATA credit and
-  viewer headroom reservation — governing-law-2 territory — so a genuine hang
-  there is worth root-causing rather than filing as flake. It is *not* a
-  flake: it reproduces serially, every run, on two separate machines.
-  Note the live cluster has been running affected code since 0.35.0; 0.36.0
-  neither introduces nor worsens it.
 - [ ] **A powered-off node is reported `state: "online"` (live, 2026-09-08).**
   While gbni-1 was physically dark — no ICMP response, incomplete ARP entry,
   SSH `Host is down` — both surviving nodes' `/api/v1/status` listed it as
@@ -3110,67 +2870,6 @@ P-1 above, in two other subsystems. They now have plans of their own —
 
 ## P2 — Code health and error-handling consistency (found 2026-09-05)
 
-- [ ] **Node-wide `max_sessions` is not on the wire, while
-  `max_sessions_per_account` is** (Android TV session, measured against the
-  live cluster 2026-09-21, verified here against source). The per-node
-  `playback` block of `GET /api/v1/status` carries five fields —
-  `startup_timeout_ms`, `segment_timeout_ms`, `pipeline_idle_ms`,
-  `session_idle_ms`, `max_sessions_per_account` (`src/status_api.cpp:362-380`,
-  `src/telemetry.hpp:94-113`). The node-wide cap is absent. **0.48.0 added
-  three of the four and missed this one**, which is how the asymmetry got in.
-  Put it on the same telemetry block. It is additive under TEL3 and costs
-  nothing.
-  The client consequence, in that session's words: a client that wants to tell
-  a viewer *"another screen on this account is playing"* versus *"this node is
-  full"* can state the per-account number and cannot state the other.
-
-- [ ] **The node-scoped session refusal carries no failure axes, while the
-  account-scoped one does** (found by the web client session via core,
-  2026-09-21, verified against source). `ResourceLimitError` answers
-  `http_error(429, "resource_limit", e.what())` with no `FailureAxes` at all,
-  whereas the account cap at `src/playback.cpp:3290` states `scope`,
-  `node_healthy` and `alternative_may_succeed`. The comment at
-  `src/playback.cpp:3287` says `scope: request` is what tells an axes-reading
-  client not to walk — this is the other half of that sentence: **until the
-  node-scoped path carries axes too, codes are the only complete signal**, and
-  a client reading axes rather than codes gets nothing on the node-scoped
-  refusal.
-  **Observed in the field 2026-09-21, hours after 0.48.0 deployed**, in a
-  smoke test of the deployed build: a mode switch to Transcode on a node whose
-  single video-transcode slot is taken answers `429 resource_limit`, the
-  refusal is shown to the viewer, the chosen mode is not applied, **and the
-  client does not walk to a node that could serve it** — though node-scoped is
-  exactly the case where walking is right. A fresh session takes the slot and
-  transcodes first time, so it is specific to the mode-switch path. Part of
-  that is a client question, but the server half is this item: the refusal
-  carries nothing that says "node-scoped, try elsewhere".
-  With `max_video_transcodes: 1` on these nodes this is not an edge case —
-  any second concurrent transcode, including a mode switch, hits it routinely.
-  Note the refusal itself is correct: `reserve_resources`
-  (`src/playback.cpp:1443-1456`) only demands a slot when the logical session
-  is not already entitled, so this is a genuine second transcode being refused,
-  not a session double-counting itself. What is wrong is how little the
-  refusal says.
-  Smaller than it looks today, and the reason is worth keeping: core does not
-  read the axes at all, it keys on codes
-  (`ACCOUNT_SCOPED_FAILURE_CODES`, one string, `resource_limit` deliberately
-  excluded with the reason written beside it), so every client going through
-  core is insulated. Only a client reading axes directly is exposed.
-  Related trap, same source: the cap refusal and the `410` carry **opposite**
-  `alternative_may_succeed` — `false` and `true` — on the same `scope:
-  request` and `node_healthy: true`. Both are correct; the pair misleads
-  anyone reading the axes as a set.
-
-  **Taken together with the missing `max_sessions` above, the asymmetry runs
-  the wrong way round.** The *account*-scoped refusal — where walking the
-  cluster is pointless, because every node answers identically — carries full
-  axes, states its limit and its live count in the refusal, and publishes its
-  limit for every node on `/api/v1/status`. The *node*-scoped refusal — the
-  one case where walking is exactly right — carries no axes at all and its
-  limit appears nowhere on the wire. A client is best equipped in the case it
-  can do nothing about, and worst equipped in the case it could act on. Fixing
-  either half alone leaves that backwards; they want doing together.
-
 Not urgent, but real debt worth chipping away at opportunistically. No design
 work needed for any of these.
 
@@ -3236,16 +2935,6 @@ work needed for any of these.
   (0.32.x–0.34.0) and SPA serving (0.35.0) are recorded in `CHANGELOG.md` but
   not in the ledger. Lower value than it looks: `CHANGELOG.md` covers that
   range properly, so this is tidiness, not lost information.
-- [x] **Done in 0.46.3 (2026-09-19/20).** `docs/streaming.md`, `README.md`
-  and `VALIDATION.md` were rewritten; `ROADMAP.md`'s "stale voters" was missed
-  in that pass and corrected on 2026-09-20. Originally: these four each
-  contain claims contradicted by shipped code or by each other (keep-alive
-  described as absent when it shipped in 0.23.3, a stale "0.19 metadata
-  availability" README headline at 0.23.11, `ROADMAP.md` referring to "stale
-  voters" from a voter model abolished in 0.19, and `VALIDATION.md`'s build
-  command not matching `CONTRIBUTING.md`/`tests/TESTING.md`). None of these
-  are load-bearing for engineering decisions right now, but they will mislead
-  the next person who reads them at face value.
 - [ ] `TODO/namespace-publication-and-metadata-efficiency.md`'s own checkboxes
   contradict its header ("Phases 0-5 ... complete" while Phase 4 shows all 16
   items unticked and Phase 3 shows 6 of 13 unticked, despite both phases having
@@ -3294,8 +2983,8 @@ cross-session and will not be in the next session's context.
   deploy verification is done. The rule it still keeps is the one that matters:
   no node id, no topology, nothing about the cluster. Anything beyond "is this
   node serving, and what is it running" needs `/api/v1/status` and
-  `view_status`. The code comment at `src/service.cpp:238-245` still claims no
-  version and is stale in the same way this entry was.
+  `view_status`. The code comment at `src/service.cpp:242` now says it carries
+  the running version, deliberately (checked 2026-09-24).
 - **An old node answers `401`, not `404`**, to that route, because
   authentication happens before routing. Core falls back to
   `/api/v1/catalogue/status` on *any* answer that is not a liveness answer,

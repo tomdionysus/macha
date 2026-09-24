@@ -81,7 +81,7 @@ and most of that is their extent tables; everything else is meant to be a
 rounding error. Three rules keep it that way:
 
 - **Tombstones** (`garbage`) are consumed by the maintenance sweep after
-  `maintenance.garbage_grace` and then erased from metadata; the vector is
+  `maintenance.garbage_grace_ms` and then erased from metadata; the vector is
   kept in canonical ObjectId order (DLT7) so a reconciliation's union is an
   ordinary delta rather than a full snapshot frame.
 - **Conflicts** leave the snapshot when decided: a later write to (or
@@ -97,7 +97,32 @@ rounding error. Three rules keep it that way:
 `macha-metadata-dump <key> history.log heads.meta --stats` prints the
 composition of each accepted head (entries, extents, tombstones, conflicts,
 and the encoded bytes each accounts for). Read it before concluding that a
-snapshot is large for a reason other than the library being large.
+snapshot is large for a reason other than the library being large. For a
+tree-backed head it reports the record and, given `--objects <path>`, the
+tree's shape.
+
+## The namespace tree
+
+A metadata record either inlines the namespace as an entry map or, once the
+node has been re-rooted with `macha-namespace-migrate` (see the operations
+guide), carries a 32-byte `namespace_root` addressing a content-addressed
+Merkle tree keyed by path, and never both. A cluster founds in the inline
+form; a tree-backed node stays tree-backed.
+
+- Tree nodes live in the control object store and follow the CONTROL rules:
+  a commit may reference a new root only once every node it wrote has
+  reached `metadata_min_write_replicas`, and only the nodes a commit wrote
+  are replicated, sending each peer just the objects it reports missing.
+- Node boundaries depend on keys only, so the same entry set yields the same
+  root however it was reached, and a value change rewrites one leaf and the
+  branches above it. Large extent lists live in their own spine, so a stat
+  reads at most the tree's depth and fetches no extent node.
+- "Has the namespace changed" is a root comparison.
+- History replay rebuilds a tree-backed head locally without asking a peer:
+  the commit already reached the floor when it was made.
+- Reconciliation materialises the base and both branches, merges them
+  path-wise as before, and re-roots the result, so a merge costs what it
+  costs for an inline namespace.
 
 ## Compatibility
 

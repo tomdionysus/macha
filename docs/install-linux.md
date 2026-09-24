@@ -9,8 +9,9 @@ systemd service.
 Macha requires:
 
 - CMake 3.20 or later and a C++20 compiler
-- OpenSSL, libcurl and yaml-cpp development files
-- FFmpeg 6 or later development libraries (`libavformat` 60 or later)
+- OpenSSL, libcurl, zlib and yaml-cpp development files
+- FFmpeg 6 or later development libraries (`libavformat` and `libavcodec`
+  60, `libavutil` 58, `libswscale` 7 and `libswresample` 4, or later)
 - pkg-config and POSIX threads
 
 FUSE 3 is required for the mounted filesystem. `miniupnpc` and
@@ -18,12 +19,18 @@ libtorrent-rasterbar 2.0 or later are optional at build time, but are needed
 for UPnP port mapping and BitTorrent acquisition respectively. CMake reports
 clearly when any optional feature is unavailable.
 
+libtorrent is compiled against a particular Boost, and the BitTorrent plugin
+must be built against the same Boost headers. Use the Boost development
+package your distribution's libtorrent-rasterbar package depends on, and do
+not install a different Boost version alongside it: a plugin built against
+mismatched Boost headers can crash at runtime.
+
 ### Debian 13 (Trixie) and later
 
 ```bash
 sudo apt update
 sudo apt install build-essential cmake pkg-config \
-  libssl-dev libcurl4-openssl-dev libyaml-cpp-dev \
+  libssl-dev libcurl4-openssl-dev libyaml-cpp-dev zlib1g-dev \
   fuse3 libfuse3-dev \
   libavformat-dev libavcodec-dev libavutil-dev \
   libswscale-dev libswresample-dev \
@@ -42,7 +49,7 @@ Enable `universe` if it is not already enabled, then install:
 sudo add-apt-repository universe
 sudo apt update
 sudo apt install build-essential cmake pkg-config \
-  libssl-dev libcurl4-openssl-dev libyaml-cpp-dev \
+  libssl-dev libcurl4-openssl-dev libyaml-cpp-dev zlib1g-dev \
   fuse3 libfuse3-dev \
   libavformat-dev libavcodec-dev libavutil-dev \
   libswscale-dev libswresample-dev \
@@ -55,7 +62,7 @@ Ubuntu 22.04's standard FFmpeg 4.4 packages do not meet Macha's requirement.
 
 ```bash
 sudo dnf install gcc-c++ cmake pkgconf-pkg-config \
-  openssl-devel libcurl-devel yaml-cpp-devel \
+  openssl-devel libcurl-devel yaml-cpp-devel zlib-devel \
   fuse3 fuse3-devel ffmpeg-free-devel \
   rb_libtorrent-devel miniupnpc-devel
 ```
@@ -69,7 +76,7 @@ Arch packages include their development files:
 
 ```bash
 sudo pacman -Syu --needed base-devel cmake pkgconf \
-  openssl curl yaml-cpp fuse3 ffmpeg \
+  openssl curl zlib yaml-cpp fuse3 ffmpeg \
   libtorrent-rasterbar miniupnpc
 ```
 
@@ -78,7 +85,8 @@ releases. Before building, this command verifies the FFmpeg API floor that
 Macha uses:
 
 ```bash
-pkg-config --atleast-version=60 libavformat && echo "FFmpeg API is suitable"
+pkg-config --exists 'libavformat >= 60' 'libavcodec >= 60' 'libavutil >= 58' \
+  'libswscale >= 7' 'libswresample >= 4' && echo "FFmpeg API is suitable"
 ```
 
 ## Build and test
@@ -94,8 +102,13 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Review the configure output. A full build should report FUSE support, UPnP
-port mapping and the BitTorrent acquisition plugin as enabled.
+`ctest` runs `macha-tests`, plus `macha-tests-runtime` and
+`macha-tests-torrent` when their dependencies were found; `./run-tests.sh
+build` runs the same executables directly.
+
+Review the configure output. A full build reports `FUSE mount plugin
+enabled`, `UPnP port mapping enabled` and `BitTorrent acquisition plugin
+enabled`.
 
 ## Install and configure
 
@@ -108,11 +121,15 @@ sudo cmake --install build
 With the `/usr` prefix, this installs:
 
 - `/usr/bin/macha`
+- `/usr/bin/macha-users`, `macha-recover`, `macha-metadata-dump`,
+  `macha-metadata-repair` and `macha-namespace-migrate` (administration tools)
 - `/usr/lib/macha/libmacha_core.so`
+- `/usr/lib/macha/plugins/libmacha-fuse.so` (when FUSE 3 was found)
 - `/usr/lib/macha/plugins/libmacha-torrent.so` (when libtorrent was found)
 - `/usr/lib/systemd/system/macha.service`
 - `/etc/macha/macha.yaml.example`
-- `/etc/macha/macha.yaml`
+- `/etc/macha/macha.yaml` (copied from the example only if absent)
+- documentation under `/usr/share/doc/macha`
 
 `libmacha_core` and the plugin directory are part of the deployment, not
 optional extras: an upgrade that copies only the executable leaves the node
@@ -123,7 +140,9 @@ The installer prints the actual configuration and service paths. An existing
 `macha.yaml` is always preserved during reinstall or upgrade.
 
 Edit `/etc/macha/macha.yaml` for this node. In particular, set its advertised
-address, storage paths, capacities and bootstrap peers. Copy the same secret
+address, storage paths, capacities and bootstrap peers; on the first node of
+a new cluster, remove the sample `bootstrap` list, since only a node with no
+bootstrap peers founds the cluster. Copy the same secret
 cluster-key file to every node, but keep node-local paths and addresses local.
 The sample configuration uses `/etc/macha.key`.
 
@@ -145,6 +164,21 @@ Follow startup and runtime logs with:
 ```bash
 journalctl -u macha.service -f
 ```
+
+Check that the node is serving (the sample configuration binds the API to
+`127.0.0.1:7438`):
+
+```bash
+curl http://127.0.0.1:7438/api/v1/health
+```
+
+The first node of a new cluster, the one with no `bootstrap` peers, creates
+the `root` and `anonymous` accounts on first start and writes root's
+generated password to `<state_path>/initial-root-password` (with the sample
+configuration, `/var/lib/macha/initial-root-password`), mode 0600. Read it,
+sign in, change the password and delete the file. Nodes that join through
+`bootstrap` receive the accounts by replication. See
+[Management](management.md#bootstrapping-and-recovery).
 
 If `systemctl` cannot find the unit, confirm that the configured installation
 prefix was `/usr`, then inspect the path printed by `cmake --install`. The
@@ -172,8 +206,9 @@ sudo cmake --build build --target uninstall
 sudo systemctl daemon-reload
 ```
 
-Uninstall removes installed program and documentation files, but deliberately
-preserves configuration, keys, state, cache, spool, mounts and media data.
+Uninstall removes the installed programs, libraries, plugins, systemd unit
+and documentation, but deliberately preserves configuration, keys, state,
+cache, spool, mounts and media data.
 
 ## Distribution package references
 

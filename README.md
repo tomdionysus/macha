@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.57.0*
+*v0.57.1*
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
@@ -19,10 +19,14 @@ placement and replicas in the background.
 ## This repository, and what sits around it
 
 This repository is **the node** — the daemon that stores, replicates and serves
-media. The `macha` binary is the whole server: DFS, FUSE mount, catalogue, HTTP
-API and playback engine, alongside `macha-metadata-dump` and
-`macha-metadata-repair` for offline forensics. A cluster is several nodes
-sharing a key.
+media. The `macha` binary is the server: DFS, catalogue, HTTP API and playback
+engine. The FUSE mount and BitTorrent acquisition are
+[subsystem plugins](docs/operations.md#subsystem-plugins) it loads at start,
+so a node without a plugin file simply lacks that capability. Alongside it sit
+offline tools: `macha-users` for accounts,
+`macha-metadata-dump` and `macha-metadata-repair` for forensics, and
+`macha-namespace-migrate` for re-rooting a namespace onto the tree. A cluster is
+several nodes sharing a key.
 
 Players are separate projects and are not in this tree. They reach a node over
 its HTTP API, and the division of responsibility between them is deliberate and
@@ -112,8 +116,9 @@ cmake --build build
 sudo make -C build install
 ```
 
-On Linux this installs the executable, a `macha.service` unit, the
-documentation and an initial `/etc/macha/macha.yaml` — copied from
+On Linux this installs the executables, the private `libmacha_core` library
+and plugins under `lib/macha`, a `macha.service` unit, the documentation and an
+initial `/etc/macha/macha.yaml` — copied from
 [`macha.yaml.example`](macha.yaml.example) only when no configuration exists,
 so upgrades never overwrite operator changes. Edit it, create the referenced
 storage/cache/state/spool paths and the cluster key, then start the service.
@@ -124,7 +129,9 @@ configuration, keys, state, cache, spool, mounts and media data.
 
 | | |
 |---|---|
-| [Quick start](docs/quickstart.md) | [Configuration](docs/configuration.md) |
+| [Principles and laws](docs/principles-and-laws.md) | [Quick start](docs/quickstart.md) |
+| [Install on Linux](docs/install-linux.md) | [Install on macOS](docs/install-macos.md) |
+| [Configuration](docs/configuration.md) | [Acquisition and ingest API](docs/acquisition.md) |
 | [Storage](docs/storage.md) | [Durability](docs/durability.md) |
 | [Metadata replication](docs/metadata.md) | [Cluster and recovery](docs/cluster.md) |
 | [Catalogue](docs/catalogue.md) | [Streaming](docs/streaming.md) |

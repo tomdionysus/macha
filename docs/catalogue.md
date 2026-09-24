@@ -54,9 +54,13 @@ GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/profile
 ```
 
 The response contains `schema_version` (currently 3), `media_id`, `format`,
-`duration_ms`, aggregate `bitrate`, and every stream's codec/profile, language,
-bitrate, dimensions/audio properties and default/forced/attached-picture flags.
-It is served with private immutable cache headers.
+`duration_ms`, aggregate `bitrate`, and per stream `index`, `type`, `codec`,
+`profile`, `language`, `width`, `height`, `channels`, `sample_rate`,
+`bit_depth`, `level`, `color_transfer`, `dolby_vision_profile`,
+`dolby_vision_compatibility`, `default`, `forced`, `bitrate` and
+`attached_picture`. Every field is present, with `0` or `""` for a fact the
+stream does not have. It is served with private immutable cache headers and the
+media ID as its `ETag`.
 
 Pre-session availability is guaranteed for a `macha:` identity, so a miss is
 not normally a deferral. The order is:
@@ -66,8 +70,8 @@ not normally a deferral. The order is:
 | not a `macha:` identity | `400 bad_media_id` |
 | a stored profile exists | `200` |
 | no stored profile | probed there and then at foreground priority, persisted, `200` |
-| the probe failed | `422 profile_failed` with a `reason` |
-| the media is not resolvable on this node | `202` with `Retry-After` and `Location` if background profiling was accepted, otherwise `404 not_found` |
+| the probe failed | `422 profile_failed`, with `error.reason` when the engine said why (`source_unreadable`, `source_unsupported`, `source_read_timed_out`) |
+| the media is not resolvable on this node | `202` with `{"status": "pending", "media_id"}`, `Retry-After: 1` and `Location` if background profiling was accepted, otherwise `404 not_found` |
 
 The `202` is a residual fallback rather than the ordinary miss path. It is
 advisory in either case: it does not prevent a client from starting normal
@@ -122,6 +126,33 @@ Failures are classified:
 - metadata/control write-floor or DATA availability failures defer without incrementing semantic failure count.
 
 This prevents a temporary cluster outage from permanently marking otherwise valid media as failed.
+
+`GET /api/v1/catalogue/hints` lists every hint with its `state` (`queued`,
+`processing`, `deferred`, `catalogued`, `no_match`, `failed`), attempt and
+failure counts, `candidate_cursor`, `provider`, `media_id`,
+`catalogue_item_ids` and `origins`. Since 0.56.0 `result` is a code rather than
+a sentence (`matched`, `outside_catalogue_roots`, `not_media_file`,
+`no_media_candidate`, `no_provider_match`, `already_stored`,
+`profile_prepared`, `media_not_live`, `manual_existing_item`,
+`manual_metadata`, or `null`), and `error_code` sits beside `error`
+(`path_missing`, `content_not_committed`, `provider_budget_exhausted`,
+`provider_unavailable`, `provider_error`, `catalogue_conflict`,
+`catalogue_unavailable`, `catalogue_error`, `artwork_durability_unavailable`,
+`no_immutable_identity`, `yielded_to_playback`, `media_information_error`).
+The `error` text is for people; act on the codes.
+
+## HTTP routes
+
+Reads need `media_viewer`; every mutation needs `manager`.
+
+- `GET /api/v1/catalogue/status` — `ready`, `metadata_generation`, `known_metadata_generation`, `root`, `items`, `artwork_objects`, `local_artwork_objects`, `last_sync_unix_ms`, and `error_code` (`converging`, `unavailable`) beside `error`.
+- `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...&limit=...` (limit up to 1000, default 50) — `{"items": [...]}`.
+- `GET|PUT|DELETE /api/v1/catalogue/items/{id}` — the item carries its revision as `ETag: "rev-N"`; `PUT` and `DELETE` honour `If-Match` with that value and answer a stale one with `409 conflict`.
+- `DELETE /api/v1/catalogue/items/{id}/metadata` — clears the item's metadata and queues its media for rematching.
+- `POST /api/v1/catalogue/items/{id}/artwork?role=...&mime=...` — stores the body as artwork (DATA, below) and answers `201` with `role`, `id`, `mime_type`.
+- `GET /api/v1/catalogue/artwork/{object id}` — artwork bytes. Items carry signed artwork URLs (`?exp=...&sig=...`) that need no bearer token and stay byte-identical inside a TTL bucket, so a browser cache keeps them; the response is `immutable` with the object id as its `ETag`.
+- `GET /api/v1/catalogue/media/{id}/profile` — above.
+- `GET /api/v1/catalogue/hints` — above.
 
 ## Maintenance liveness
 

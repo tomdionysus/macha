@@ -1,5 +1,47 @@
 # Current release
 
+## 0.57.1 — The server plays what it is told and chooses nothing (development)
+
+Operator, 2026-09-24: **"The server supplies facts, operations, then does what
+it's told."** Playback is by `media_id`: a catalogue item is a title, its
+`media_ids` are its files, and choosing the file, the mode, the streams and
+the container is the client's decision, made from
+`GET /api/v1/playback/media?item_id=`.
+
+**API changes. Every client must check what it sends and parses.**
+
+- **`POST /api/v1/playback/sessions` requires `media_id` and refuses
+  `item_id`**: `400 media_id_required`, `400 item_id_not_accepted`. `PATCH`
+  refuses `item_id` too and switches file only by `media_id`. Until now an
+  `item_id` alone made the server rank the item's files (direct over remux
+  over transcode, then list order) and play the winner. A file no title
+  references stays playable by its `media_id`.
+- **An open choice is refused, not filled.** One candidate is a fact and is
+  used. Several with no instruction, or an instruction matching none or
+  several, is `400` with `status` and `error.code` `choice_required` or
+  `choice_not_available`, `error.choice` (`video_stream`, `audio_stream`,
+  `subtitle_stream`, `container`) and `error.choices` (the candidates).
+  - `preferences.container` is **required for `remux` and `transcode`**; there
+    was a silent `fmp4` default.
+  - An `audio_language` or `subtitle_language` the media lacks is refused;
+    it used to fall back to the default track without saying so. A language
+    two streams share must be narrowed to an index.
+  - New `preferences.video_stream`; the first video stream was always used.
+  - `direct` refuses nothing unnamed: the file is served untouched and the
+    player picks its tracks, so `output` then names no selected stream.
+- **Session `options.media_ids` and `options.can_switch_media` are gone**, and
+  so is `item_id` on the session. A title's files come from the facts route.
+- **Facts: copy support is per stream.** `operations.copy_into_fmp4` and
+  `copy_into_mpegts` (which described the first video and audio stream only)
+  are replaced by `copy_into: {fmp4, mpegts}` on every video and audio stream.
+  Each file now gets the whole probe allowance instead of sharing one
+  deadline across a title.
+
+**A namespace node below the metadata write floor is `MetadataNotReady`.**
+On 2026-09-24 gbni-1 failed an ingest with "namespace node could not reach
+the metadata durability floor" while its only peer restarted. It was a bare
+`runtime_error`, so 0.57.0's block-and-retry did not apply; it now does.
+
 ## 0.57.0 — A torrent is imported once it is published, and a metadata outage no longer kills an ingest (development)
 
 Finishes stage 2 of `TODO/2026-09-23-torrent-disk-backend-plan.md`, and
@@ -1099,9 +1141,8 @@ and lived only in a dated plan file.
 **The laws do not simply rank, and saying so is the substance of the section.**
 Law 3 is subordinate to law 2 -- that is what its second clause is for, and why
 loader work yields to a viewer rather than negotiating with one. Law 1 is not
-subordinate to law 2: it is a floor law 2 may not eat through, which is the
-entire force of "a large configurable share, not indefinite starvation of all
-other work". A node serving viewers perfectly while unable to answer `ping` has
+subordinate to law 2: it is a floor law 2 may not eat through -- control's
+reservation is set aside first, not carved from the viewer's share. A node serving viewers perfectly while unable to answer `ping` has
 broken law 1, and peers who cannot see how well it was doing will record it as
 dead. So the resolution order is law 1's floor reserved first, law 2 taking
 priority within what remains, law 3 governing the rest.

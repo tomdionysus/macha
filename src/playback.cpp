@@ -91,6 +91,29 @@ class PlaybackCapabilityError final : public std::invalid_argument {
     using std::invalid_argument::invalid_argument;
 };
 
+// The instruction leaves a choice open, or names something the media does not
+// have, and the server does not fill the gap. Operator, 2026-09-24: "The
+// server supplies facts, operations, then does what it's told." One candidate
+// is a fact and is used; several with no instruction, or an instruction that
+// matches none or several, is refused with the candidates so the client can
+// choose. Reaches the client as 400 with `choice` naming what is open and
+// `choices` listing the candidates; every node would answer the same.
+class PlaybackChoiceError final : public std::invalid_argument {
+  public:
+    PlaybackChoiceError(std::string code, std::string choice, const std::string& message,
+                        Json::Array choices)
+        : std::invalid_argument(message), code_(std::move(code)), choice_(std::move(choice)),
+          choices_(std::move(choices)) {}
+    const std::string& code() const noexcept { return code_; }
+    const std::string& choice() const noexcept { return choice_; }
+    const Json::Array& choices() const noexcept { return choices_; }
+
+  private:
+    std::string code_;
+    std::string choice_;
+    Json::Array choices_;
+};
+
 // The account cap refuses differently from every other limit here, and the
 // difference is not cosmetic. A client recovering from a refusal decides
 // whether another node is worth trying; a node-wide or transcode limit is a
@@ -328,10 +351,12 @@ struct PlaybackPreferences {
     // without the server inferring anything.
     std::optional<std::string> video;
     std::optional<std::string> audio;
-    // HLS segment container: "fmp4" (default) or "mpegts".
-    std::string container{"fmp4"};
+    // HLS segment container, "fmp4" or "mpegts". Required for remux and
+    // transcode: there are always two, so a default would be a choice.
+    std::string container;
     std::optional<int> max_height;
     std::optional<uint64_t> max_bitrate;
+    std::optional<int> video_stream;
     std::optional<int> audio_stream;
     std::optional<int> subtitle_stream;
     std::string audio_language;
@@ -398,41 +423,78 @@ PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences cur
     }
     if (auto v = value->find("max_height")) current.max_height = optional_int(v);
     if (auto v = value->find("max_bitrate")) current.max_bitrate = optional_u64(v);
+    if (auto v = value->find("video_stream")) current.video_stream = optional_int(v);
     if (auto v = value->find("audio_stream")) current.audio_stream = optional_int(v);
     if (auto v = value->find("subtitle_stream")) current.subtitle_stream = optional_int(v);
     if (auto v = value->find("audio_language"); v && v->isString()) current.audio_language = lower(v->asString());
     if (auto v = value->find("subtitle_language"); v && v->isString()) current.subtitle_language = lower(v->asString());
     if (current.max_height && *current.max_height <= 0) throw std::invalid_argument("preferences.max_height must be positive");
     if (current.max_bitrate && *current.max_bitrate == 0) throw std::invalid_argument("preferences.max_bitrate must be positive");
+    if (current.video_stream && *current.video_stream < 0) throw std::invalid_argument("preferences.video_stream must be non-negative");
     if (current.audio_stream && *current.audio_stream < 0) throw std::invalid_argument("preferences.audio_stream must be non-negative");
     if (current.subtitle_stream && *current.subtitle_stream < 0) throw std::invalid_argument("preferences.subtitle_stream must be non-negative");
     return current;
 }
 
-const MediaStreamInfo* first_stream(const MediaProbeResult& probe, MediaStreamType type) {
-    const MediaStreamInfo* first = nullptr;
-    for (const auto& stream : probe.streams) {
-        if (stream.attached_picture) continue;
-        if (stream.type != type) continue;
-        if (!first) first = &stream;
-        if (stream.default_stream) return &stream;
-    }
-    return first;
+// The streams of a type a plan may use. An attached picture is artwork, not a
+// stream.
+std::vector<const MediaStreamInfo*> streams_of(const MediaProbeResult& probe, MediaStreamType type) {
+    std::vector<const MediaStreamInfo*> out;
+    for (const auto& stream : probe.streams)
+        if (stream.type == type && !stream.attached_picture) out.push_back(&stream);
+    return out;
 }
 
-const MediaStreamInfo* select_stream(const MediaProbeResult& probe, MediaStreamType type,
-                                     const std::optional<int>& explicit_index,
-                                     std::string_view language) {
-    if (explicit_index) {
-        for (const auto& stream : probe.streams)
-            if (stream.type == type && stream.index == *explicit_index) return &stream;
-        return nullptr;
+[[noreturn]] void refuse_stream_choice(std::string code, MediaStreamType type, const std::string& message,
+                                       const std::vector<const MediaStreamInfo*>& candidates) {
+    Json::Array choices;
+    for (const auto* stream : candidates) choices.emplace_back(stream->index);
+    throw PlaybackChoiceError(std::move(code), std::string(media_stream_type_name(type)) + "_stream",
+                              message, std::move(choices));
+}
+
+// The stream the instruction names, and only that. An index, or a language
+// matching exactly one stream, is used; a type with exactly one stream is a
+// fact and that stream is used. Several with no instruction, or an
+// instruction matching none or several, is refused with the candidates: the
+// server does not choose, and it never answers a language it does not have
+// with a different one (until 0.57.1 it fell back to the default stream).
+// `none_is_an_answer` is true where no instruction means "none of them":
+// subtitles, and every stream of media served untouched, whose tracks the
+// player chooses for itself.
+const MediaStreamInfo* chosen_stream(const MediaProbeResult& probe, MediaStreamType type,
+                                     const std::optional<int>& index, std::string_view language,
+                                     bool none_is_an_answer) {
+    const auto candidates = streams_of(probe, type);
+    const std::string kind = media_stream_type_name(type);
+    if (index) {
+        for (const auto* stream : candidates)
+            if (stream->index == *index) return stream;
+        refuse_stream_choice("choice_not_available", type,
+                             "preferences." + kind + "_stream " + std::to_string(*index) + " is not a " +
+                                 kind + " stream of this media",
+                             candidates);
     }
     if (!language.empty()) {
-        for (const auto& stream : probe.streams)
-            if (stream.type == type && lower(stream.language) == language) return &stream;
+        std::vector<const MediaStreamInfo*> matches;
+        for (const auto* stream : candidates)
+            if (lower(stream->language) == language) matches.push_back(stream);
+        if (matches.size() == 1) return matches.front();
+        if (matches.empty())
+            refuse_stream_choice("choice_not_available", type,
+                                 "this media has no " + kind + " stream in language " + std::string(language),
+                                 candidates);
+        refuse_stream_choice("choice_required", type,
+                             std::to_string(matches.size()) + " " + kind + " streams are in language " +
+                                 std::string(language) + ": name one with preferences." + kind + "_stream",
+                             matches);
     }
-    return first_stream(probe, type);
+    if (candidates.size() == 1) return candidates.front();
+    if (candidates.empty() || none_is_an_answer) return nullptr;
+    refuse_stream_choice("choice_required", type,
+                         "this media has " + std::to_string(candidates.size()) + " " + kind +
+                             " streams: name one with preferences." + kind + "_stream",
+                         candidates);
 }
 
 // Execute the client's instruction against the media's facts. The client's
@@ -440,26 +502,29 @@ const MediaStreamInfo* select_stream(const MediaProbeResult& probe, MediaStreamT
 // reports what the media is and performs what it is asked for, it does not
 // choose (operator, 2026-09-07).
 PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& prefs) {
-    auto video = first_stream(probe, MediaStreamType::video);
-    auto audio = select_stream(probe, MediaStreamType::audio, prefs.audio_stream, prefs.audio_language);
+    if (prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
+        throw std::invalid_argument(
+            "preferences.mode is required and must be direct, remux or transcode: the server "
+            "reports what the media is and performs what it is asked for, it does not choose");
+    if (streams_of(probe, MediaStreamType::video).empty() && streams_of(probe, MediaStreamType::audio).empty())
+        throw std::runtime_error("media contains no playable audio or video stream");
+    // Direct serves the file untouched and the player picks its own tracks,
+    // so there is nothing to choose unless the client names a stream.
+    const bool untouched = prefs.mode == "direct";
+    auto video = chosen_stream(probe, MediaStreamType::video, prefs.video_stream, {}, untouched);
+    auto audio = chosen_stream(probe, MediaStreamType::audio, prefs.audio_stream, prefs.audio_language,
+                               untouched);
     const MediaStreamInfo* subtitle = nullptr;
     if (prefs.subtitle_stream || !prefs.subtitle_language.empty())
-        subtitle = select_stream(probe, MediaStreamType::subtitle, prefs.subtitle_stream, prefs.subtitle_language);
-    if (prefs.audio_stream && !audio) throw std::invalid_argument("requested audio stream does not exist");
-    if (prefs.subtitle_stream && !subtitle) throw std::invalid_argument("requested subtitle stream does not exist");
+        subtitle = chosen_stream(probe, MediaStreamType::subtitle, prefs.subtitle_stream,
+                                 prefs.subtitle_language, true);
     if (subtitle && !webvtt_subtitle_supported(*subtitle))
         throw std::invalid_argument("requested subtitle stream cannot be converted to WebVTT");
-    if (!video && !audio) throw std::runtime_error("media contains no playable audio or video stream");
 
     PlaybackPlan plan;
     plan.video_stream = video ? video->index : -1;
     plan.audio_stream = audio ? audio->index : -1;
     plan.subtitle_stream = subtitle ? subtitle->index : -1;
-
-    if (prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
-        throw std::invalid_argument(
-            "preferences.mode is required and must be direct, remux or transcode: the server "
-            "reports what the media is and performs what it is asked for, it does not choose");
     plan.video = video ? MediaTransform::copy : MediaTransform::omit;
     plan.audio = audio ? MediaTransform::copy : MediaTransform::omit;
     plan.video_codec = video ? lower(video->codec) : std::string{};
@@ -481,8 +546,12 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
         return plan;
     }
 
-    // HLS. The segment container is the client's instruction too; fMP4
-    // unless it asked for MPEG-TS.
+    // HLS. The segment container is the client's instruction too, and there
+    // is no default: fMP4 and MPEG-TS are both real options.
+    if (prefs.container.empty())
+        throw PlaybackChoiceError("choice_required", "container",
+                                  "preferences.container is required for remux and transcode: fmp4 or mpegts",
+                                  Json::Array{Json("fmp4"), Json("mpegts")});
     plan.container = prefs.container == "mpegts" ? MediaContainer::mpegts : MediaContainer::fmp4;
 
     const auto source_video_codec = video ? lower(video->codec) : std::string{};
@@ -606,6 +675,7 @@ Json preferences_json(const PlaybackPreferences& preferences) {
                      {"container", preferences.container},
                      {"max_height", preferences.max_height ? Json(*preferences.max_height) : Json(nullptr)},
                      {"max_bitrate", preferences.max_bitrate ? Json(*preferences.max_bitrate) : Json(nullptr)},
+                     {"video_stream", preferences.video_stream ? Json(*preferences.video_stream) : Json(nullptr)},
                      {"audio_stream", preferences.audio_stream ? Json(*preferences.audio_stream) : Json(nullptr)},
                      {"subtitle_stream", preferences.subtitle_stream ? Json(*preferences.subtitle_stream) : Json(nullptr)},
                      {"audio_language", preferences.audio_language},
@@ -703,7 +773,6 @@ struct PlaybackManager::Impl {
     struct Session {
         std::string id;
         std::string token;
-        std::string item_id;
         PlaybackPreferences preferences;
         MediaSource source;
         FsEntry source_entry;
@@ -961,14 +1030,15 @@ struct PlaybackManager::Impl {
     }
 
     std::string creation_fingerprint(
-        std::string_view item_id, std::string_view media_id,
+        std::string_view media_id,
         const PlaybackPreferences& prefs,
         const std::optional<int64_t>& seek_ms,
         std::string_view session_id) const {
         std::ostringstream canonical;
-        canonical << "v2|item=" << item_id << "|media=" << media_id
+        canonical << "v3|media=" << media_id
                   << "|video=" << prefs.video.value_or("-")
                   << "|audio=" << prefs.audio.value_or("-")
+                  << "|vs=" << prefs.video_stream.value_or(-1)
                   << "|container=" << prefs.container
                   << "|mode=" << prefs.mode
                   << "|ph=" << prefs.max_height.value_or(-1)
@@ -1718,61 +1788,33 @@ struct PlaybackManager::Impl {
                                    "/manifest.json";
     }
 
-    std::shared_ptr<Session> resolve_session(std::string item_id, std::vector<std::string> media_ids,
-                                             PlaybackPreferences preferences,
+    // Playback is by media_id and nothing else (operator, 2026-09-24): the
+    // client reads a title's files and their facts from
+    // GET /api/v1/playback/media?item_id=, chooses the file, the mode and the
+    // codecs, and names them here. Until 0.57.1 an item_id alone made the
+    // server rank the item's files direct > remux > transcode and play the
+    // first winner -- a choice that was never the server's.
+    std::shared_ptr<Session> resolve_session(const std::string& media_id, PlaybackPreferences preferences,
                                              std::string_view trace,
                                              std::string existing_id = {}, std::string existing_token = {}) {
-        if (media_ids.empty()) throw std::runtime_error("no media representations are available");
-        struct Candidate {
-            SourceLease lease;
-            MediaProbeResult probe;
-            PlaybackPlan plan;
-            int rank{};
-        };
-        std::optional<Candidate> best;
-        std::exception_ptr last_exception;
-        const auto resolve_deadline = Clock::now() + config.probe_timeout;
-        for (const auto& media_id : media_ids) {
-            try {
-                auto lease = create_source(media_id);
-                const auto profile_started = Clock::now();
-                auto probe = probe_source(lease, trace, resolve_deadline);
-                const auto profile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now() - profile_started).count();
-                const auto selection_started = Clock::now();
-                auto plan = plan_for(probe, preferences);
-                require_plan_supported(plan);
-                const auto selection_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    Clock::now() - selection_started).count();
-                int rank = plan.mode == PlaybackMode::direct ? 0 : (plan.mode == PlaybackMode::remux ? 1 : 2);
-                Log::info("playback[" + std::string(trace) + "] admission candidate media=" +
-                          media_id + " mode=" + playback_mode_name(plan.mode) +
-                          " rank=" + std::to_string(rank) +
-                          " metadata_ms=" + std::to_string(profile_ms) +
-                          " selection_ms=" + std::to_string(selection_ms));
-                if (!best || rank < best->rank) best = Candidate{std::move(lease), std::move(probe), plan, rank};
-                if (rank == 0) break;
-            } catch (const std::exception& e) {
-                Log::debug("playback[" + std::string(trace) + "] candidate rejected media=" + media_id +
-                           " error=" + e.what());
-                last_exception = std::current_exception();
-                if (Clock::now() >= resolve_deadline) break;
-            }
-        }
-        if (!best) {
-            if (last_exception) std::rethrow_exception(last_exception);
-            throw std::runtime_error("no playable media representation");
-        }
+        auto lease = create_source(media_id);
+        const auto profile_started = Clock::now();
+        auto probe = probe_source(lease, trace, Clock::now() + config.probe_timeout);
+        const auto profile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - profile_started).count();
+        auto plan = plan_for(probe, preferences);
+        require_plan_supported(plan);
+        Log::info("playback[" + std::string(trace) + "] admission media=" + media_id +
+                  " mode=" + playback_mode_name(plan.mode) + " metadata_ms=" + std::to_string(profile_ms));
 
         auto session = std::make_shared<Session>();
         session->id = existing_id.empty() ? hex_token(16) : std::move(existing_id);
         session->token = existing_token.empty() ? hex_token() : std::move(existing_token);
-        session->item_id = std::move(item_id);
         session->preferences = std::move(preferences);
-        session->source_entry = best->lease.entry;
-        session->source = media_source(best->lease);
-        session->probe = std::move(best->probe);
-        session->plan = best->plan;
+        session->source_entry = lease.entry;
+        session->source = media_source(lease);
+        session->probe = std::move(probe);
+        session->plan = plan;
         session->touched = Clock::now();
         return session;
     }
@@ -1799,7 +1841,6 @@ struct PlaybackManager::Impl {
         auto session = std::make_shared<Session>();
         session->id = old.id;
         session->token = old.token;
-        session->item_id = old.item_id;
         session->preferences = old.preferences;
         session->source = old.source;
         session->source_entry = old.source_entry;
@@ -1824,10 +1865,8 @@ struct PlaybackManager::Impl {
                                                      std::string_view trace) {
         const MediaStreamInfo* subtitle = nullptr;
         if (preferences.subtitle_stream || !preferences.subtitle_language.empty())
-            subtitle = select_stream(old.probe, MediaStreamType::subtitle,
-                                     preferences.subtitle_stream, preferences.subtitle_language);
-        if (preferences.subtitle_stream && !subtitle)
-            throw std::invalid_argument("requested subtitle stream does not exist");
+            subtitle = chosen_stream(old.probe, MediaStreamType::subtitle, preferences.subtitle_stream,
+                                     preferences.subtitle_language, true);
         if (subtitle && !webvtt_subtitle_supported(*subtitle))
             throw std::invalid_argument("requested subtitle stream cannot be converted to WebVTT");
 
@@ -1838,7 +1877,6 @@ struct PlaybackManager::Impl {
         auto session = std::make_shared<Session>();
         session->id = old.id;
         session->token = old.token;
-        session->item_id = old.item_id;
         session->preferences = std::move(preferences);
         session->source = old.source;
         session->source_entry = old.source_entry;
@@ -1871,6 +1909,37 @@ struct PlaybackManager::Impl {
         return session;
     }
 
+    // Whether some explicit instruction built from `preferences` would be
+    // carried out, filling each choice it leaves open with every candidate in
+    // turn. For reporting what the media supports, never for playing it.
+    bool some_plan_supported(const MediaProbeResult& probe, PlaybackPreferences preferences) const {
+        const auto each = [&](MediaStreamType type, const std::optional<int>& named) {
+            std::vector<std::optional<int>> out;
+            if (named) return std::vector<std::optional<int>>{named};
+            for (const auto* stream : streams_of(probe, type)) out.emplace_back(stream->index);
+            if (out.empty()) out.emplace_back(std::nullopt);
+            return out;
+        };
+        std::vector<std::string> containers{preferences.container};
+        if (preferences.container.empty() && preferences.mode != "direct") containers = {"fmp4", "mpegts"};
+        const auto videos = each(MediaStreamType::video, preferences.video_stream);
+        const auto audios = preferences.audio_language.empty()
+                                ? each(MediaStreamType::audio, preferences.audio_stream)
+                                : std::vector<std::optional<int>>{preferences.audio_stream};
+        for (const auto& container : containers)
+            for (const auto& video : videos)
+                for (const auto& audio : audios) {
+                    auto candidate = preferences;
+                    candidate.container = container;
+                    candidate.video_stream = video;
+                    if (preferences.audio_language.empty()) candidate.audio_stream = audio;
+                    try {
+                        if (plan_supported(plan_for(probe, candidate))) return true;
+                    } catch (...) {}
+                }
+        return false;
+    }
+
     Json session_json(const Session& session) const {
         Json::Array streams;
         for (const auto& stream : session.probe.streams) streams.push_back(stream_json(stream));
@@ -1893,8 +1962,7 @@ struct PlaybackManager::Impl {
             auto preferences = without_mode_overrides(session.preferences);
             preferences.mode = candidate;
             try {
-                const auto plan = plan_for(session.probe, preferences);
-                if (plan_supported(plan)) modes.emplace_back(candidate);
+                if (some_plan_supported(session.probe, preferences)) modes.emplace_back(candidate);
             } catch (...) {}
         }
         Json::Array quality_heights;
@@ -1908,8 +1976,7 @@ struct PlaybackManager::Impl {
                 preferences.mode = "transcode";
                 preferences.max_height = height;
                 try {
-                    const auto plan = plan_for(session.probe, preferences);
-                    if (plan_supported(plan)) quality_heights.emplace_back(height);
+                    if (some_plan_supported(session.probe, preferences)) quality_heights.emplace_back(height);
                 } catch (...) {}
             }
         }
@@ -1920,8 +1987,7 @@ struct PlaybackManager::Impl {
                 preferences.audio_stream = stream.index;
                 preferences.audio_language.clear();
                 try {
-                    const auto plan = plan_for(session.probe, preferences);
-                    if (plan_supported(plan)) audio_streams.emplace_back(stream_json(stream));
+                    if (some_plan_supported(session.probe, preferences)) audio_streams.emplace_back(stream_json(stream));
                 } catch (...) {}
             }
             if (stream.type == MediaStreamType::subtitle) {
@@ -1929,42 +1995,18 @@ struct PlaybackManager::Impl {
                 preferences.subtitle_stream = stream.index;
                 preferences.subtitle_language.clear();
                 try {
-                    const auto plan = plan_for(session.probe, preferences);
-                    if (plan_supported(plan)) subtitle_streams.emplace_back(stream_json(stream));
+                    if (some_plan_supported(session.probe, preferences)) subtitle_streams.emplace_back(stream_json(stream));
                 } catch (...) {}
             }
         }
-        Json::Array media_ids;
-        if (!session.item_id.empty()) {
-            try {
-                for (const auto& media_id : item_media(session.item_id)) {
-                    // The active source remains valid for the lifetime of this
-                    // session lease. Alternate source controls should only expose
-                    // catalogue bindings that still resolve in the live namespace.
-                    if (media_id == session.source.media_id || fs.find_media(media_id))
-                        media_ids.emplace_back(media_id);
-                }
-            } catch (...) {
-                // Catalogue reconciliation may remove the item while an active
-                // session is still serving its immutable source lease. Keep that
-                // session usable rather than making serialization fail.
-            }
-        }
-        if (std::none_of(media_ids.begin(), media_ids.end(), [&](const Json& id) {
-                return id.isString() && id.asString() == session.source.media_id;
-            }))
-            media_ids.emplace_back(session.source.media_id);
         const bool can_change_quality = !quality_heights.empty() || session.preferences.max_height.has_value() ||
                                         session.preferences.max_bitrate.has_value();
-        const bool can_switch_media = media_ids.size() > 1;
         Json::Object options{{"modes", Json(std::move(modes))},
                              {"quality_heights", Json(std::move(quality_heights))},
-                             {"media_ids", Json(std::move(media_ids))},
                              {"audio_streams", Json(std::move(audio_streams))},
                              {"subtitle_streams", Json(std::move(subtitle_streams))},
                              {"can_seek", true},
-                             {"can_change_quality", can_change_quality},
-                             {"can_switch_media", can_switch_media}};
+                             {"can_change_quality", can_change_quality}};
         const auto mime_type = session.plan.mode == PlaybackMode::direct
                                    ? direct_mime(session.source.logical_path)
                                    : "application/vnd.apple.mpegurl";
@@ -2057,7 +2099,6 @@ struct PlaybackManager::Impl {
                                                 session.source.logical_path)},
                          {"stream", Json(std::move(stream))},
                          {"options", Json(std::move(options))}};
-        if (!session.item_id.empty()) out["item_id"] = session.item_id;
         return Json(std::move(out));
     }
 
@@ -2429,10 +2470,15 @@ struct PlaybackManager::Impl {
         Log::info("playback[" + trace + "] session create start");
         Json root = Json::parse(std::string_view(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
         if (!root.isObject()) return http_error(400, "bad_request", "JSON object required");
-        std::string item_id, media_id;
-        if (auto v = root.find("item_id"); v && v->isString()) item_id = v->asString();
+        // Playback is by media_id only. A title is not playable as such: its
+        // files are, and choosing one is the client's decision.
+        if (root.find("item_id"))
+            return http_error(400, "item_id_not_accepted",
+                              "playback is by media_id: read the title's files from "
+                              "GET /api/v1/playback/media?item_id= and send the chosen media_id");
+        std::string media_id;
         if (auto v = root.find("media_id"); v && v->isString()) media_id = v->asString();
-        if (item_id.empty() && media_id.empty()) return http_error(400, "bad_request", "item_id or media_id is required");
+        if (media_id.empty()) return http_error(400, "media_id_required", "media_id is required");
         auto prefs = parse_preferences(root.find("preferences"));
         std::optional<int64_t> seek_ms;
         if (auto seek = root.find("seek_ms")) {
@@ -2442,7 +2488,6 @@ struct PlaybackManager::Impl {
             } catch (...) {}
             if (!seek_ms) return http_error(400, "bad_seek", "seek_ms must be non-negative");
         }
-        auto media = media_id.empty() ? item_media(item_id) : std::vector<std::string>{media_id};
         const auto account = account_key(*request.session);
         std::string idempotency_key;
         if (auto it = request.query.find("idempotency_key"); it != request.query.end())
@@ -2460,7 +2505,7 @@ struct PlaybackManager::Impl {
         std::shared_ptr<IdempotentCreation> idempotent;
         bool idempotent_owner = false;
         if (!idempotency_key.empty()) {
-            fingerprint = creation_fingerprint(item_id, media_id, prefs, seek_ms,
+            fingerprint = creation_fingerprint(media_id, prefs, seek_ms,
                                                request.session->id);
             // Scoped to the account. The key is client-chosen and often
             // predictable ("retry-1"), and the map was global: any
@@ -2534,7 +2579,7 @@ struct PlaybackManager::Impl {
                 deterministic_id = std::move(credentials.first);
                 deterministic_token = std::move(credentials.second);
             }
-            session = resolve_session(item_id, std::move(media), std::move(prefs), trace,
+            session = resolve_session(media_id, std::move(prefs), trace,
                                       std::move(deterministic_id), std::move(deterministic_token));
             session->logical_session = logical_session;
             session->account = account;
@@ -2708,6 +2753,9 @@ struct PlaybackManager::Impl {
             } catch (...) {}
             if (!seek_ms) return http_error(400, "bad_seek", "seek_ms must be non-negative");
         }
+        if (root.find("item_id"))
+            return http_error(400, "item_id_not_accepted",
+                              "playback is by media_id: send the media_id to play");
         std::string media_override;
         if (auto media = root.find("media_id"); media && media->isString()) media_override = media->asString();
 
@@ -2756,12 +2804,9 @@ struct PlaybackManager::Impl {
                                                            : "media-override"));
 
         if (!replacement) {
-            auto media = media_override.empty()
-                             ? (old->item_id.empty() ? std::vector<std::string>{old->source.media_id}
-                                                     : item_media(old->item_id))
-                             : std::vector<std::string>{media_override};
-            replacement = resolve_session(old->item_id, std::move(media), prefs,
-                                          trace, old->id, old->token);
+            // The file being served unless the client names another.
+            replacement = resolve_session(media_override.empty() ? old->source.media_id : media_override,
+                                          prefs, trace, old->id, old->token);
             replacement->logical_session = old->logical_session;
             // Same rule as the subtitle and seek replacements: ownership
             // travels with the session. A mode change must not hand the
@@ -2987,7 +3032,6 @@ struct PlaybackManager::Impl {
             return http_error(400, "bad_request", "media_id or item_id is required");
         }
 
-        const auto deadline = Clock::now() + config.probe_timeout;
         Json::Array reported;
         // A media this node could not read is a fact too, and a different one
         // from a media that does not exist. Report both, per media, and let
@@ -2998,26 +3042,31 @@ struct PlaybackManager::Impl {
         for (const auto& id : media_ids) {
             try {
                 auto lease = create_source(id);
-                auto probe = probe_source(lease, "facts", deadline);
+                // Each file gets the whole probe allowance: one shared deadline
+                // let a slow first file push the rest into `unavailable`.
+                auto probe = probe_source(lease, "facts", Clock::now() + config.probe_timeout);
+                // What this media supports, as facts about the media and the
+                // muxers, not about any client: direct is always the bytes; a
+                // copy into a container depends on what that container can
+                // carry, and that is a fact about each stream, so it is stated
+                // on each stream rather than for whichever came first; a
+                // transcode depends on the encoders being present.
                 Json::Array streams;
-                for (const auto& stream : probe.streams) streams.emplace_back(stream_json(stream));
-                // What this media supports, as a fact about the media and the
-                // muxers, not about any client: direct is always the bytes;
-                // a copy into a container depends on what that container can
-                // carry; a transcode depends on the encoders being present.
-                const auto* video = first_stream(probe, MediaStreamType::video);
-                const auto* audio = first_stream(probe, MediaStreamType::audio);
+                for (const auto& stream : probe.streams) {
+                    auto value = stream_json(stream);
+                    if (!stream.attached_picture && stream.type == MediaStreamType::video)
+                        value.asObject()["copy_into"] = Json::Object{
+                            {"fmp4", fmp4_video_copy_supported(lower(stream.codec))},
+                            {"mpegts", mpegts_video_copy_supported(lower(stream.codec))}};
+                    else if (stream.type == MediaStreamType::audio)
+                        value.asObject()["copy_into"] = Json::Object{
+                            {"fmp4", fmp4_audio_copy_supported(lower(stream.codec))},
+                            {"mpegts", mpegts_audio_copy_supported(lower(stream.codec))}};
+                    streams.emplace_back(std::move(value));
+                }
                 const auto engine_state = engine ? engine->status() : MediaEngineStatus{};
-                Json::Object copy_fmp4{
-                    {"video", !video || fmp4_video_copy_supported(lower(video->codec))},
-                    {"audio", !audio || fmp4_audio_copy_supported(lower(audio->codec))}};
-                Json::Object copy_mpegts{
-                    {"video", !video || mpegts_video_copy_supported(lower(video->codec))},
-                    {"audio", !audio || mpegts_audio_copy_supported(lower(audio->codec))}};
                 Json::Object operations{
                     {"direct", true},
-                    {"copy_into_fmp4", Json(std::move(copy_fmp4))},
-                    {"copy_into_mpegts", Json(std::move(copy_mpegts))},
                     {"transcode_video", engine_state.h264_encoder},
                     {"transcode_audio", engine_state.aac_encoder}};
                 Json::Object entry{
@@ -3345,6 +3394,20 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         return impl_->handle_api(request);
     } catch (const JsonError& e) {
         return http_error(400, "bad_json", e.what());
+    } catch (const PlaybackChoiceError& e) {
+        // The instruction leaves open, or names wrongly, something the client
+        // has to choose. Every node would say the same, so do not walk.
+        Json::Object error{{"code", e.code()},
+                           {"message", std::string(e.what())},
+                           {"choice", e.choice()},
+                           {"choices", Json(e.choices())},
+                           {"scope", std::string("request")},
+                           {"node_healthy", true},
+                           {"alternative_may_succeed", false}};
+        Json::Object root;
+        root["status"] = e.code();
+        root["error"] = std::move(error);
+        return http_json(400, Json(std::move(root)).dump());
     } catch (const PlaybackCapabilityError& e) {
         // Well-formed, coherent, and this node cannot do it: 422 rather than
         // 400, because nothing about the request is malformed. Another node on

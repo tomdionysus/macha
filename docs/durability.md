@@ -44,7 +44,9 @@ Immediate versus batchable urgency changes scheduling, not correctness. Both use
 
 ## Distributed DATA publication
 
-The writer ranks preferred owners and deterministic fallbacks. It obtains placements until at least `min_write_replicas` have accepted and become durably covered. Only then may MachaDFS namespace metadata reference the new extents.
+The writer ranks preferred owners and deterministic fallbacks, trying its own store first when it is an eligible candidate. It obtains placements until at least `min_write_replicas` have accepted and become durably covered. Only then may MachaDFS namespace metadata reference the new extents.
+
+`min_write_replicas` is also the DATA retention floor. Before a metadata commit is published, every DATA object named by the entries it changes must carry a durable retention claim on that many nodes holding it, and every CONTROL object it introduces (catalogue shards, namespace tree nodes) a claim on `metadata_min_write_replicas` nodes. A commit that cannot meet either floor is refused (`DATA retention floor unavailable before metadata publication` / `CONTROL retention floor unavailable before metadata publication`) rather than published over missing copies.
 
 `replicas` can be larger than the publication floor. Missing desired copies remain repair debt and are converged by maintenance.
 
@@ -60,7 +62,7 @@ Metadata durability is independent of DATA `dht.replicas` and `dht.min_write_rep
 
 ## Catalogue control durability
 
-Catalogue manifest/shard objects are CONTROL. Before namespace metadata can point at a new catalogue manifest:
+Catalogue manifest/shard objects are CONTROL, as are the nodes of a tree-backed namespace: a new namespace root may be referenced only once every tree node it introduces has durably reached `metadata_min_write_replicas`, exactly as a manifest may not name a shard that has not. Before namespace metadata can point at a new catalogue manifest:
 
 1. newly referenced artwork DATA must be readable through the normal DATA store;
 2. changed catalogue shards must be durable on at least `metadata_min_write_replicas` active nodes;
@@ -128,7 +130,7 @@ Namespace deletion completion is not physical deletion completion. The accepted
 metadata mutation and grouped FUSE journal markers establish the namespace
 result; physical DATA reclamation occurs later, after grace and retention
 fences, through a resumable cursor capped at 64 examined objects per maintenance
-slice. Foreground playback or mounted-filesystem activity makes the slice yield.
+slice. Foreground playback, mounted-filesystem or loader activity makes the slice yield.
 This bound affects reclamation latency, not namespace publication latency.
 
 For packed objects, deletion is a logical tombstone and dead physical bytes are reclaimed by compaction.

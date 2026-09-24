@@ -10,7 +10,7 @@ DATA contains immutable payload objects: media extents, catalogue artwork, subti
 
 ### CONTROL / metadata
 
-Namespace metadata and content-addressed catalogue control objects are control-plane authority. Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards must satisfy `dht.metadata_min_write_replicas` distinct active durable copies before publication. There is no permanent metadata voter subset.
+Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards must satisfy `dht.metadata_min_write_replicas` distinct active durable copies before publication. There is no permanent metadata voter subset.
 
 CONTROL storage does not consume DATA quota.
 
@@ -59,7 +59,9 @@ preferred owner 2
 
 Configured capacity, not momentary free space, determines the stable placement weight. This prevents object ownership from churning continuously as disks fill.
 
-If a preferred node is full, offline or cannot complete the write inside the placement stall policy, the writer tries the next deterministic candidate. A small node therefore does not cap an R=1 cluster.
+Only nodes that host extents (`storage.hosts_extents`) are candidates. The writing node tries its own store first when it is one, then this order; repair later converges copies onto the preferred owners.
+
+If a preferred node is full, offline or cannot complete the write inside the placement stall policy (`dht.write_stall_ms`), the writer tries the next deterministic candidate. A small node therefore does not cap an R=1 cluster.
 
 For example:
 
@@ -82,7 +84,7 @@ dht:
   min_write_replicas: 1
 ```
 
-`min_write_replicas` is the number of durable authoritative DATA copies required before foreground publication. `replicas` is the desired converged replica count.
+These are the defaults. `min_write_replicas` is the number of durable authoritative DATA copies required before foreground publication, and the number of nodes that must hold a retention claim on each DATA object before metadata may reference it. `replicas` is the desired converged replica count.
 
 Thus an R=3/W=1 write may publish after one durable copy during a degraded topology. That object is under-replicated, not falsely considered converged. Maintenance repair creates the missing preferred replicas when eligible nodes/capacity return.
 
@@ -163,7 +165,7 @@ The cache may retain a useful fetched copy independently, but that cache copy do
 
 ## Garbage collection
 
-Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards contribute to a separate CONTROL live set.
+Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards, and every namespace tree node reachable from a tree-backed root, contribute to a separate CONTROL live set; a tree node that cannot be read marks that set incomplete and nothing is released against it.
 
 Objects that become unreachable are protected for `maintenance.garbage_grace_ms` before physical reclamation. This protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
 

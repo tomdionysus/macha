@@ -4,18 +4,18 @@
 
 ## Unmatched media
 
-`GET /api/v1/manage/unmatched` returns only terminal semantic `no_match` records that still resolve to the same immutable `macha:` media identity. Deferred provider outages, queued work, active matching, files outside configured catalogue roots, and stale paths are not presented as files requiring manual matching.
+`GET /api/v1/manage/unmatched` returns only terminal semantic `no_match` records that still resolve to the same immutable `macha:` media identity. Deferred provider outages, queued work, active matching, files outside configured catalogue roots, and stale paths are not presented as files requiring manual matching. The response is `{count, items}`; each item's `result` is the code the scanner recorded (for example `no_provider_match`, `no_media_candidate` or `media_not_live`), not a sentence.
 
 For one unmatched record:
 
 - `GET /api/v1/manage/unmatched/{id}` returns the failure plus local filename/tag probe hypotheses;
 - `GET /api/v1/manage/unmatched/{id}/matches?q=...` searches existing catalogue leaf items as prospective manual bindings;
-- `POST /api/v1/manage/unmatched/{id}/match` binds the immutable media identity to an existing movie, episode or track;
+- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode or track (`400 not_playable_item` for any other kind);
 - `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy as required) and binds the file;
-- `POST /api/v1/manage/unmatched/{id}/retry` reopens normal scanner work at manual-rescan priority;
+- `POST /api/v1/manage/unmatched/{id}/retry` reopens normal scanner work at manual-rescan priority (`202`);
 - `DELETE /api/v1/manage/unmatched/{id}` deletes the media file through MachaDFS and clears the exception record.
 
-Every destructive/resolution operation verifies that the current path still has the media identity recorded when matching failed. A replaced or moved path therefore returns a conflict instead of acting on different bytes.
+Every destructive/resolution operation verifies that the current path still has the media identity recorded when matching failed. A replaced or moved path therefore returns `409 stale_unmatched` instead of acting on different bytes.
 
 Artwork for manually created metadata uses the ordinary catalogue artwork endpoint. It remains DATA and follows normal placement, replication, repair and GC.
 
@@ -32,6 +32,8 @@ Namespace mutations use the ordinary MachaDFS operations:
 Rename is also the move primitive. It changes namespace metadata, including a directory subtree, without copying or re-hashing unchanged media extents. The management API defaults to no-replace semantics so a stale browser cannot overwrite an existing target accidentally. Empty-directory removal follows ordinary MachaDFS `rmdir` semantics.
 
 Unmatched hint paths are migrated with management-initiated namespace renames, while their immutable media identities remain unchanged.
+
+A FUSE namespace operation wedged on a non-retryable backend error blocks the publication queue behind it, and is never skipped automatically. `GET /api/v1/manage/filesystem/blocked-namespace-operation` reports it (`sequence`, `kind`, `path`, optional `destination_path`, `error_code`, `error_message`, `blocked_for_ms`; `404 not_found` when nothing is blocked), and `POST /api/v1/manage/filesystem/blocked-namespace-operation/skip?sequence=N` abandons it (`204`; `409 not_blocked` unless `N` is the operation still blocked).
 
 ### Parked publications
 
@@ -60,7 +62,7 @@ root — the later write *is* the resolution, and the record is pruned at the
 next commit or merge), or an operator resolves it here.
 
 - `GET /api/v1/manage/metadata/conflicts` → `{"generation": N, "conflicts": [{id, kind: "namespace_entry"|"catalogue_root", key, left_head, right_head, base, left, right}]}` — for a namespace entry `base`/`left`/`right` are `{type, size, mtime_ns, version, extents}` or `null` (absent on that side); for a catalogue root they are object ids or `null`.
-- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` — installs that alternative for the subject and drops the record in one metadata commit (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`).
+- `POST /api/v1/manage/metadata/conflicts/{id}/resolve?choice=left|right|base` — installs that alternative for the subject and drops the record in one metadata commit (`204`; `409 not_standing` if the conflict is no longer standing; `400 bad_choice`). Both routes answer `503 metadata_unavailable` while no metadata snapshot is available.
 
 `diagnostics.metadata.{conflicts, namespace_conflicts, catalogue_conflicts}`
 in `GET /api/v1/status` are the standing counts;
@@ -95,7 +97,7 @@ The tombstone is a freshness boundary. Pre-reset gossip cannot recreate the inva
 
 ## Accounts and roles
 
-Every HTTP route requires a session bearer token from `POST /api/v1/session`, which is the only route reachable without one. A session carries the roles of the account behind it, and each route is gated on those roles in one place before dispatch. Hiding a section in a client is presentation; the gate is the enforcement.
+Every HTTP route requires a session bearer token from `POST /api/v1/session`. The only routes reachable without one are that route itself, `GET /api/v1/health`, the web client's static files, and capability URLs that carry their own authority in the path or query (playback stream URLs and signed artwork URLs). A session carries the roles of the account behind it, and each route is gated on those roles in one place before dispatch. Hiding a section in a client is presentation; the gate is the enforcement.
 
 Roles are capabilities rather than a ladder — importing does not imply managing, and managing does not imply handing out accounts. There are exactly two implications: `importer`, `manager` and `manage_users` each imply `media_viewer`, and `media_viewer` implies `view_status`.
 
@@ -104,12 +106,12 @@ Roles are capabilities rather than a ladder — importing does not imply managin
 | `view_status` | cluster and node health |
 | `media_viewer` | every read, playback, and your own password |
 | `importer` | acquisition and ingest |
-| `manager` | files, namespaces, catalogue matches, identity-association reset |
+| `manager` | files, namespaces, catalogue edits and matches, identity-association reset, status connectivity checks |
 | `manage_users` | add, edit and remove accounts |
 
 `view_status` is the weakest capability: everything implies it, it implies nothing, and it is grantable on its own. That is what makes cluster health independently addressable — an operator who wants it visible to unauthenticated visitors grants the `anonymous` account `view_status` and nothing else, while an account granted nothing at all cannot see health either. Implication is resolved when a session is minted rather than when the account is written, so a change to these rules reaches accounts created before it without a migration.
 
-Two accounts exist on every cluster. `root` holds every role; `anonymous` is what an unauthenticated visitor is, and holds `media_viewer` at first. Neither can be renamed or deleted, and in every other respect they are ordinary accounts. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration, so it takes effect on the next session rather than on restart — this is what decides what a television, which cannot practically type a password, is able to reach. `session.allow_anonymous: false` turns the mechanism off entirely.
+Two accounts exist on every cluster. `root` holds every role; `anonymous` is what an unauthenticated visitor is, and holds `media_viewer` at first. Neither can be renamed or deleted, and `anonymous` has no password and cannot be given one (`409 no_password`); in every other respect they are ordinary accounts. Anonymous access is controlled by editing the `anonymous` account's roles, not by configuration, so it takes effect on the next session rather than on restart — this is what decides what a television, which cannot practically type a password, is able to reach. `session.allow_anonymous: false` turns the mechanism off entirely.
 
 At least one account always holds `manage_users`. Removing the role from the last account that has it, or deleting that account, is refused with `last_user_manager` — `root` included, whose roles are otherwise ordinary. The rule is about the role, not any particular account, so it moves as the role moves.
 
@@ -118,7 +120,7 @@ At least one account always holds `manage_users`. Removing the role from the las
 - `GET /api/v1/users` — list. No password material is ever returned; there is no route that reads a credential back.
 - `POST /api/v1/users` — `{username, password, roles}`.
 - `GET|PATCH|DELETE /api/v1/users/{id}` — `PATCH` accepts `password` and/or `roles`.
-- `GET|PATCH /api/v1/users/me` — anyone's own account. `PATCH` accepts `password` only; a `roles` change here is `403`, since otherwise it would be an escalation route for every account. Changing your own password returns a fresh token in the same response, so you are not signed out by your own change.
+- `GET|PATCH /api/v1/users/me` — anyone's own account. `PATCH` accepts `password` only; a `roles` change here is `403`, since otherwise it would be an escalation route for every account. Changing your own password returns a fresh session in the same response (`token`, `token_type`, `session_id`), so you are not signed out by your own change. An anonymous session has no account here and gets `404 no_account`.
 
 Every user record carries a `mutable` block stating what may be changed about it — `rename`, `delete`, `set_password`, `set_roles`, and `required_roles` for roles pinned to that account. Read it rather than testing the username: a client that hardcodes `root` breaks the moment these names are configurable, and disables the wrong controls everywhere at once.
 

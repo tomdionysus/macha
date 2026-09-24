@@ -1,4 +1,4 @@
-# Macha 0.21.0
+# Macha 0.57.1
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -130,7 +130,8 @@ fuse:
   # Aggregate heap ownership of copied writes waiting to enter the disk spool.
   max_pending_write_bytes: 32M
   commit_workers: 8
-  # Compatibility setting retained for older configurations.
+  # Compatibility settings retained for older configurations.
+  recovery_commit_workers: 2
   foreground_commit_workers: 1
   # Genuine streaming/viewer activity receives the dominant relative service
   # share. FUSE is ingest/convenience traffic and always uses loader priority.
@@ -143,13 +144,27 @@ fuse:
   publication_quantum_bytes: 32M
   publication_inflight_bytes: 256M
   publication_pipeline_bytes: 8M
+  # Files holding a provisional writer at once. 0 derives it from
+  # runtime.loader_memory_reserve_bytes / (extent_size + pipeline), never
+  # fewer than commit_workers. A soft bound: it can be overshot by up to
+  # commit_workers - 1.
+  publication_max_open_writers: 0
+  # A publication worker blocked on retained-memory admission fails with
+  # EAGAIN (and enters the retry path below) after this long with no quantum
+  # completing anywhere in the pipeline. Not a time limit on publishing. 0
+  # waits forever.
+  publication_no_progress_deadline_ms: 30000
   max_pending_operations: 4096
   # DataOp/checksum history plus one concurrent publication snapshot.
   max_operation_metadata_bytes: 64M
+  # Ordered namespace operations that may share one metadata publication.
+  namespace_batch_operations: 256
+  namespace_batch_bytes: 256K
 
   # Retry budgets. A publication (or namespace operation) that keeps failing
-  # backs off exponentially between attempts; once it has failed
-  # max_failures times inside window_ms it is *parked* — kept on disk, shown
+  # backs off exponentially between attempts; once it has failed more than
+  # max_failures times inside window_ms, or has not succeeded once for
+  # max_failing_ms (0 disables that backstop), it is *parked* — kept on disk, shown
   # in status and GET /api/v1/manage/filesystem/parked-publications, and left
   # for an operator to retry or abandon — so one poisoned file can never hold
   # the loader queue or spin the log forever. The namespace queue cannot be
@@ -159,10 +174,12 @@ fuse:
   publication_retry_window_ms: 1800000
   publication_retry_initial_backoff_ms: 250
   publication_retry_max_backoff_ms: 30000
+  publication_retry_max_failing_ms: 3600000
   namespace_retry_max_failures: 200
   namespace_retry_window_ms: 1800000
   namespace_retry_initial_backoff_ms: 50
   namespace_retry_max_backoff_ms: 5000
+  namespace_retry_max_failing_ms: 3600000
 
   # Aggregate local write-back and recovery bounds. max_spool_bytes is the
   # durable burst/backlog budget, not an ENOSPC threshold: admission is fast
@@ -215,6 +232,9 @@ network:
   failure_domain: site-a
 
   heartbeat_ms: 5000
+  # How often this node gossips its telemetry set, and so how stale a peer's
+  # view of it in /api/v1/status can be.
+  telemetry_interval_ms: 10000
   dead_after_ms: 30000
   connect_timeout_ms: 2500
 
@@ -280,10 +300,11 @@ dht:
   data_inflight_bytes: 128M
   data_viewer_reserve_bytes: 32M
 
-  # Measured device service time the DATA backends defend. Above the target,
-  # loader and speculative admission for those backends is held to
-  # io_pressure_min_background leases until the measured mean falls back below
-  # the release floor. A viewer is never gated by this: if the disk is slow,
+  # Measured device service time the DATA backends defend. Above
+  # io_pressure_slowdown_percent, loader and speculative admission for those
+  # backends is held to io_pressure_min_background leases until the measured
+  # average falls back below io_pressure_release_percent. A viewer is never
+  # gated by this: if the disk is slow,
   # the person waiting on it gets all of it.
   #
   # This bounds service *time*, which the byte reserves above do not. On
@@ -293,7 +314,6 @@ dht:
   # queued behind the write. No setting available at the time would have
   # prevented it.
   #
-  # target 0 disables the mechanism entirely.
   # What an operation on a coping device should cost: a fixed per-operation
   # budget plus a budget per MiB. Pressure is the moving average of
   # actual/expected, so a 4 MiB extent write and a 4 KiB read are each judged
@@ -302,18 +322,23 @@ dht:
   # ordinary writes.
   #
   # Under pressure, speculative work stands aside always, and the loader stands
-  # aside only when a viewer is present: law 3 says the loader waits only when
+  # aside only when a viewer is present (a viewer read within
+  # maintenance.foreground_quiet_ms): law 3 says the loader waits only when
   # it would otherwise make a viewer wait.
   #
-  # io_pressure_slowdown_percent: 0 disables the mechanism entirely.
+  # io_pressure_slowdown_percent: 0 disables the mechanism entirely; release
+  # must then be below slowdown, the two expectations cannot both be 0, and
+  # io_pressure_min_background must be at least 1.
   io_pressure_overhead_ms: 25
   io_pressure_per_mib_ms: 120
   io_pressure_slowdown_percent: 300
   io_pressure_release_percent: 150
-  # One operation this slow trips pressure immediately, whatever the average
-  # says: a 17.7 s extent write barely moves a moving average and starves a
-  # viewer completely.
-  io_pressure_outlier_ms: 2000
+  # One operation this far past its own expected cost trips pressure
+  # immediately, whatever the average says: a 17.7 s extent write barely moves
+  # a moving average and starves a viewer completely. A ratio, like the two
+  # thresholds above (until 0.53.0 it was an absolute io_pressure_outlier_ms,
+  # which is no longer read). 0 disables the single-operation trip.
+  io_pressure_outlier_percent: 1000
   io_pressure_min_background: 1
   # How long a DATA credit wait may make no progress before it fails instead
   # of waiting for ever. "No progress" means not one lease was released
@@ -505,6 +530,17 @@ catalogue:
     slow_request_threshold_ms: 1000
     reactor_stall_threshold_ms: 50
 
+    # gzip for complete in-memory text bodies (API JSON, the web client's
+    # HTML/CSS/JS) above compression_min_bytes (>= 64), at zlib level 1..9.
+    # Media is never compressed. A web-client asset with no precompressed .gz
+    # sibling is compressed on demand up to compression_max_asset_bytes (<= 64M)
+    # and streamed unchanged above it. Set compression: false behind a proxy
+    # that already compresses.
+    compression: true
+    compression_min_bytes: 1K
+    compression_level: 6
+    compression_max_asset_bytes: 4M
+
     # Lifetime of a signed artwork capability URL (?exp=...&sig=...) embedded
     # in catalogue responses, letting a client load artwork via a plain
     # <img src> without a bearer header. Artwork is content-addressed/immutable
@@ -658,10 +694,18 @@ streaming:
   # x264 frame threads per video transcode; 0 = every hardware thread.
   video_encoder_threads: 0
   session_idle_ms: 1800000
+  # A session that has never served a stream object (no playlist, fragment,
+  # subtitle or Direct Play body) expires on this shorter clock instead, so an
+  # abandoned create cannot hold a transcode slot for session_idle_ms.
+  session_unused_idle_ms: 120000
   # Stop an abandoned physical remux/transcode pipeline after one minute
   # without a valid current-generation stream request. The logical session is
   # retained until session_idle_ms for retry/reconciliation.
   pipeline_idle_ms: 60000
+  # A session with no stream activity for this long releases its transcode
+  # entitlement and reacquires it (possibly refused) on resume. Meaningful
+  # only between pipeline_idle_ms and session_idle_ms.
+  transcode_entitlement_idle_ms: 300000
   startup_timeout_ms: 15000
   segment_duration_ms: 4000
   max_ahead_segments: 8
@@ -676,19 +720,17 @@ streaming:
   # still be held, in fragments. It matches max_ahead_segments deliberately: a
   # request inside it is one production is authorised to reach, and one outside
   # it is one nothing is working toward. Beyond it the answer is an immediate
-  # retryable 503 rather than a wait.
+  # retryable 500 segment_not_ready with Retry-After: 1 rather than a wait.
   segment_hold_window: 8
   # Outstanding holds per session: one in flight plus one prefetch. A player
   # that queues thirty fragment requests gets one hold and twenty-nine prompt
   # refusals, rather than thirty sequential waits on the encoder.
   max_session_holds: 2
-  # Outstanding holds across the whole node. Deliberately small: HttpServer
-  # runs a fixed worker pool shared with Status, catalogue and manage traffic,
-  # so a held request costs a worker for the whole of its wait and an unbounded
-  # number of them stops the node answering anything. Raise this substantially
-  # if HttpServer ever moves to an async runtime, where a hold costs a
-  # continuation instead of a thread.
-  max_concurrent_holds: 8
+  # Outstanding holds across the whole node, every session together. A fairness
+  # and memory bound: since 0.43.0 a held request is parked as a continuation
+  # costing an fd and a small struct, not a worker thread, so holds are the
+  # ordinary case during steady-state transcoding rather than the exception.
+  max_concurrent_holds: 64
   # How long a held request may wait before answering. This must stay under
   # the tightest time-to-first-byte deadline across the clients: a held request
   # sends no bytes, so a client that gives up first never receives the answer

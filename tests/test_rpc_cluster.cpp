@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "namespace_control_store.hpp"
 #include "placement.hpp"
 #include "startup_progress.hpp"
 
@@ -1945,6 +1946,28 @@ MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_survives_genuine_contention
 
     auto third = arbiter.acquire(context, chunk);
     CHECK(third.has_value());
+}
+
+MACHA_TEST("rpc_cluster", test_a_namespace_node_below_the_floor_is_metadata_not_ready) {
+    // 2026-09-24, gbni-1: "ingest failed: namespace node could not reach the
+    // metadata durability floor" while its only peer restarted. The failure
+    // is transient cluster state and must carry the type callers retry on;
+    // as a bare runtime_error it failed the ingest that 0.57.0 was meant to
+    // keep alive.
+    TestService fixture("namespace-node-below-floor", ConfigProfile::isolated);
+    fixture.config().replication = 1;
+    fixture.config().metadata_min_write_replicas = 1;
+    auto& service = fixture.start();
+    auto nodes = ControlNamespaceNodeStore::for_commit(service.node(), service.filesystem().store(), 2);
+    const auto bytes = pattern(512, 17);
+    bool not_ready = false;
+    try {
+        (void)nodes.put(bytes);
+    } catch (const MetadataNotReady&) {
+        not_ready = true;
+    }
+    CHECK(not_ready);
+    CHECK(nodes.written().empty());
 }
 
 MACHA_TEST("rpc_cluster", test_a_local_control_object_is_found_while_data_credit_is_exhausted) {

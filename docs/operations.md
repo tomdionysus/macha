@@ -10,6 +10,8 @@ Copy the same cluster key to every node. Configure reachable advertised addresse
 
 DATA capacity is a cluster property derived from eligible node capacities and the desired replica count. For R=1, heterogeneous node capacities aggregate; a small node does not define the whole cluster's capacity. For larger R, the same bytes must fit on multiple distinct owners/failure domains, so logical capacity is necessarily lower.
 
+The mount reports that logical figure to `statfs` (what `df` shows): the largest amount that can be stored `dht.replicas` times across distinct failure domains (distinct nodes when there are fewer domains than replicas), counting only extent-hosting nodes, with used space shown as physical usage divided by the replica count.
+
 Each local backend also has two independent admission limits:
 
 - configured DATA `limit`;
@@ -27,7 +29,7 @@ Do not increase metadata/control quota merely to work around a full DATA disk; t
 
 With fewer than `metadata_min_write_replicas` active nodes, namespace/catalogue mutations cannot publish. Nodes may continue serving a persisted/readable snapshot where the operation supports it.
 
-Catalogue scanner infrastructure failures are deferred rather than counted as semantic provider failures. Once the write floor is available, work resumes.
+Catalogue scanner infrastructure failures are deferred rather than counted as semantic provider failures. An ingest job that meets unwritable metadata (no write floor, or a DATA or CONTROL retention floor not met) goes to `blocked` with `error_code` `metadata_unavailable` and is retried every `ingest.blocked_retry_ms` rather than failing. Once the write floor is available, work resumes.
 
 ## Maintenance
 
@@ -39,7 +41,7 @@ Maintenance is bounded and low priority. It performs:
 - catalogue control-object convergence and CONTROL GC;
 - scheduled physical integrity scrub.
 
-A complete no-progress pass backs off instead of repeatedly scanning a settled store. Foreground playback and mounted MachaDFS activity suppress speculative work according to policy.
+A complete no-progress pass backs off instead of repeatedly scanning a settled store. Foreground playback, mounted MachaDFS activity and loader (ingest) activity suppress speculative work according to policy.
 
 ## Garbage collection
 
@@ -49,8 +51,8 @@ Namespace deletion and physical reclamation are deliberately separate. Once a
 namespace batch is durably accepted and its operation journal is confirmed, the
 FUSE operation can complete without waiting for DATA objects to be unlinked.
 Physical GC later walks a persistent local-store cursor in slices of at most 64
-objects. A slice yields as soon as playback or mounted-filesystem activity
-appears; destructive work is also fenced on complete cluster reachability,
+objects. A slice yields as soon as playback, mounted-filesystem or loader
+activity appears; destructive work is also fenced on complete cluster reachability,
 stable metadata, catalogue liveness, retention claims, and the configured grace
 period. A completed no-progress sweep parks until a real event or an exact grace
 deadline rather than polling the settled object store.
@@ -182,7 +184,15 @@ under `diagnostics`:
   frontend; and
 - `convergence` reports semantic events, scheduled/completed runs, requested and
   completed epochs, the diagnostic generation high-water mark, and whether a
-  run is currently scheduled.
+  run is currently scheduled;
+- `data_resources` reports DATA admission by class (viewer, loader,
+  speculative), the background lease ceiling and its use, and the disk
+  pressure monitor (below);
+- `repair` reports objects repair could not source from any peer and local
+  copies that could not be read; and
+- `data_store` reports local store presence-index and pack-recovery counters.
+
+`rpc_transport`, `retained_memory`, `http` and `auth` sit beside them.
 
 These are bounded counters, not a request history. Reading them does not start
 a sampler, publish metadata, or add gossip traffic. Derive an interval rate or
@@ -204,6 +214,25 @@ descriptor and operation admission before returning, then `published` and
 `done`: four journal append barriers. Restart recovery begins after admission is
 already durable, so a one-operation recovered publication records only the
 grouped `published` and `done` barriers.
+
+### DATA device pressure
+
+Every DATA store operation, including the torrent disk backend's reads, writes
+and hashes when staging shares the DATA device, is timed against what an
+operation of its size should cost (`dht.io_pressure_*`; see
+[configuration](configuration.md)). Under pressure speculative work stands
+aside and loader work is held to `io_pressure_min_background` leases only
+while a viewer is present; a viewer is never gated. Each transition is logged
+once at `INFO`:
+
+```
+DATA device pressure onset slowdown_percent=… last_percent=… last_us=… last_bytes=…
+DATA device pressure released slowdown_percent=… last_percent=… last_us=… last_bytes=…
+```
+
+`diagnostics.data_resources` carries `device_pressured`, `device_service_us`,
+`device_worst_us`, `device_slowdown_percent`, `device_pressure_onsets` and
+`pressure_refusals`, so a throttled node can be told apart from an unwell one.
 
 ## RPC execution isolation
 
@@ -350,8 +379,8 @@ How to read Status: `nodes[]` carries `inbound_capable`, `hosts_extents` and
 (the configured values) on the local node. `connectivity` carries the local
 resolution (`inbound_capable`, `inbound_capable_source` -- `configured`,
 `persisted`, `default` or `probe:<peer>` -- and the last dial-back result under
-`dial_back`). `cluster.conditions` reports `N node(s) accept no inbound
-connections` (information), `no inbound-capable node hosts extents`
+`dial_back`). `cluster.conditions` reports `N node accepts` / `N nodes accept
+no inbound connections` (information), `no inbound-capable node hosts extents`
 (critical) and `replication N requires N extent-hosting nodes; M known`
 (degraded). A `DEBUG` line is logged for every `dial_request` round trip and
 every dial-back probe.
@@ -384,9 +413,13 @@ under useful load. Received notifications enter the bounded speculative RPC
 executor, so decoding and telemetry-store mutation do not occupy socket-reader
 threads. The last-known cache is periodically replaced only after a long
 interactive-idle interval and never mutates the MachaDFS namespace or enters
-metadata publication. The API marks observations as live, stale, unavailable,
-or last-known so an online node cannot disappear merely because optional
-telemetry was dropped.
+metadata publication. Each node's `telemetry_freshness` is `live`, `stale`,
+`last_known` or `unavailable`, so an online node cannot disappear merely
+because optional telemetry was dropped.
+
+The wire format is `TEL3`: every field tagged and length-delimited, and a
+default-valued field omitted, so a newer node can add a field an older one
+skips. There is no compatibility with the positional formats before it.
 
 Storage and cache byte objects include an `available` boolean. When coherent
 telemetry is unavailable, Status may still report membership-known storage
@@ -446,12 +479,16 @@ re-anchored in place (`INFO metadata history re-anchored … ` followed by
 needed unless no peer can materialize the record either, in which case the
 `WARN`/`DEBUG metadata head repair:` lines say so on every maintenance cycle.
 
-`macha-metadata-dump KEY_FILE HISTORY_LOG [HEADS_META] [--all]` is a
-read-only forensic decoder for a stopped node's or a quarantined
-(`*.corrupt.<timestamp>`) metadata directory. It never constructs a replica,
-so it cannot trigger recovery. It decodes every history frame, reports
-anomalies, and for each accepted head walks the delta chain with the
-production succession rule and states where materialization would fail.
+`macha-metadata-dump KEY_FILE HISTORY_LOG [HEADS_META] [--all] [--stats]
+[--tree] [--objects PATH]` is a read-only forensic decoder for a stopped
+node's or a quarantined (`*.corrupt.<timestamp>`) metadata directory. It never
+constructs a replica, so it cannot trigger recovery. It decodes every history
+frame, reports anomalies, and for each accepted head walks the delta chain with
+the production succession rule and states where materialization would fail.
+`--stats` prints what each reconstructible head is made of. A tree-backed head
+carries only its root; `--objects` names the control object store so the tree
+can be walked, the delta chain actually replayed (naming the first frame that
+diverges), and a stat timed against it.
 
 ## Manual metadata ancestry repair
 
@@ -476,3 +513,31 @@ This operation does not choose the numerically newest head. The state comes
 only from strict causal dominance, while the subsumed accepted head remains an
 authenticated additional parent of the repair record. Concurrent heads require
 a separate conflict-preserving repair and must not use this command.
+
+That repair is `--plan-conflict-merge`, `--stage-conflict-merge` and
+`--accept-conflict-merge STATE_PATH KEY_FILE WITNESS...`, run in the same
+plan-everywhere, stage-everywhere, accept-everywhere order. The tool also
+offers `--diff-heads`, and `--export-acceptance` / `--import-acceptance` to
+carry one accepted head's certificate to a replica that already holds the
+record. Run it with no arguments for the full usage.
+
+## Re-rooting the namespace onto the tree
+
+A cluster founds with the namespace inlined in its metadata record.
+`macha-namespace-migrate STATE_PATH KEY_FILE` re-roots one stopped node's
+namespace onto the content-addressed Merkle tree in the control store, after
+which the record carries only the tree's root and a commit rewrites the
+changed leaf and the branches above it. Once re-rooted, a node stays
+tree-backed; nothing migrates by installing a release.
+
+It is offline and deliberate. Stop every node, let them converge on one head
+first, then run it on each node: the new record is a pure function of the
+converged namespace, so every node computes the same one independently.
+`--expect-hash` makes a node refuse any record other than the one the first
+node produced, `--witness NODE_ID` (once per node, at least the write floor)
+names the nodes being re-rooted, `--adopt FILE` installs a record written by
+`--export-record` on the node migrated first (for a node that stopped a few
+commits behind it, after proving this node's namespace produces the same tree
+root), and `--dry-run` installs nothing. The previous checkpoint, journal, history, heads and
+acceptance proof are kept beside the originals with a `.pre-migration.<ns>`
+suffix rather than deleted; no extent is touched.

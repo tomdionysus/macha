@@ -1267,9 +1267,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
         case MessageType::have_control_objects: {
             // The CONTROL counterpart, and deliberately not a variant of the
             // case above: it answers from control_store(), and it takes no
-            // DATA admission at all. Law 1 -- control traffic must remain
-            // promptly serviceable whatever the DATA devices are doing, and
-            // an index lookup on the control device has no business waiting
+            // DATA admission at all. Law 1 -- control never queues behind or
+            // runs inline with bulk data work, whatever the DATA devices are
+            // doing, and an index lookup on the control device has no business waiting
             // on the DATA arbiter.
             Reader reader(request.payload);
             const auto count = reader.u32();

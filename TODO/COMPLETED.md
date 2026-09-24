@@ -2,6 +2,128 @@
 
 Last updated: 2026-09-24
 
+## 2026-09-24 -- backlog reconciliation: items found already done
+
+Every item in `ACTIVE.md` below the day's queue was checked against
+`CHANGELOG.md` and the code at 0.57.0. These were found done; partly done
+items were rewritten in place there to state only what remains.
+
+**Namespace Merkle work (item 0 and the namespace P-1)**
+- **Stage B: Merkle namespace as SM14, readable alongside SM13.** SM14 record
+  shape and `decode_snapshot` dispatch (0.49.0); stat-only read proven to fetch
+  no extent nodes and a corrupt-node fuzz case
+  (`tests/test_namespace_tree.cpp`); `macha-metadata-dump --objects` over a
+  tree-backed head (0.50.0, replay added 0.51.0).
+- **Stage C: commit path carries the change set instead of rediscovering it.**
+  0.49.1 (delta applied to the tree, incremental root byte-identical to a
+  rebuild, history replay on the tree); 0.50.0 (all nine mutations through a
+  working set, every reader/writer converted, prefix scan descends); 0.52.0
+  moved the last non-exact `mutate()` caller.
+- **Stage E: the migration and its interlock.** `macha-namespace-migrate`
+  with `--witness`/`--expect-hash` (0.50.0); live cluster re-rooted 12:41Z
+  2026-09-22, 22.79 MiB record to 3.97 KiB (0.50.1).
+
+**Playback session as a resource (P0, 0.48.0)**
+- **`POST` to the collection creates a member every time; the logical viewer
+  stops being keyed on the bearer.** 0.48.0.
+- **`GET` on the collection, under `items`** (the piece that unblocks
+  handover). 0.48.0.
+- **The stream moves under the session; the token stays in the path.** 0.48.0.
+- **The per-account cap ships in the same change**, sharing the transcode
+  entitlement key. 0.48.0 (`streaming.max_sessions_per_account`, 429
+  `account_session_limit`).
+- **Supersession becomes an explicit refusal against that cap.** 0.48.0: a
+  second `POST` is a second session; over the cap is `account_session_limit`.
+- **Deploy: current web bundle first, build once and cut all three over
+  together, `max_sessions` raised to 64/32.** Done 2026-09-21, recorded in
+  that section's own deploy note and the 0.48.0 cutover entries below; the
+  compiled `max_sessions` default moved to 64 in 0.48.1.
+
+**Seamless handover (P0)**
+- **Piece 1, speed factor** -- shipped in 0.47.0 as `stream.production`; Core
+  briefed and confirmed.
+- **Piece 2, session key in the route** -- superseded by and shipped as the
+  server-minted session id in the path (0.48.0).
+- **Piece 3, direct-session exemption plus per-account caps** -- the cap
+  shipped in 0.48.0; supersession no longer exists to be exempted from.
+- **"HELD, not forgotten: `410 generation_superseded`"** -- released in 0.48.0
+  with `scope: request`, `node_healthy: true`, `alternative_may_succeed: true`.
+
+**Block cache observability (P1)**
+- **Falsified 2026-09-21** -- the cache serves reads at 88x the cold path; why
+  the item is P1 and not P0.
+- **Counters on `PersistentBlockCache` -- hits, misses, evictions, entries.**
+  `stats()`, 0.48.2.
+- **Surface them on `GET /api/v1/status`, per node, not rolled up
+  cluster-wide.** 0.48.2 (per-node `cache` block).
+- **A test that pins a block-cache read-back.** `tests/test_invariants.cpp`
+  (a `get` hit on a resident block, counted in `stats().hits`).
+
+**Metadata-stall P0**
+- **Root-cause the read-only blink** -- a hung health probe was given the whole
+  liveness budget (2026-09-21, per-attempt budget `dead_after / 3`).
+- **Regression test for the probe budget** --
+  `rpc_cluster/test_a_hung_health_probe_is_retried_inside_the_liveness_budget`.
+- **Stop the forever-dial loop at the offline node** -- nothing to do: ordinary
+  bootstrap of a node that was down.
+- **Make an ingest survive a transient read-only window.** 0.57.0: the
+  durability-floor errors are `MetadataNotReady`
+  (`src/metadata_manager.cpp:786`), and the ingest now blocks with
+  `metadata_unavailable` and retries (`src/ingest.cpp:1246`).
+
+**Loader-I/O P0**
+- **Harness built (`run-io-pressure.py`)**: three vantages, `CD--` counting,
+  node vitals on one clock; idle and loaded baselines recorded.
+- **Stage 4: service-time and paced-admission counters, transition-only
+  logging, docs.** `device_service_us`/`device_worst_us`/
+  `device_pressure_onsets` (0.51.0), `device_slowdown_percent` (0.52.0),
+  `pressure_refusals` (0.53.0) on the per-node data-resource block of
+  `/api/v1/status` rather than in diagnostics; onset/release logged once per
+  transition (0.57.0); `io_pressure_*` in `docs/configuration.md`.
+
+**Cluster P0**
+- **es-1 has no persistent journal -- no longer true**, verified 2026-09-20
+  (`/var/log/journal` exists, two boots listed).
+
+**Verified correctness defects (P0)**
+- **Unbounded startup wait with no escape** (`wait_for_initial_namespace()`).
+  0.41.0: takes the supervisor's stop token and
+  `fuse.initial_namespace_timeout_ms` (default 10 minutes).
+- **A hard failure in one subsystem takes down the entire macha process** --
+  closed by 0.41.0 ("FUSE cannot take the node down any more"): FUSE is a
+  supervised `libmacha-fuse` subsystem; a lost mount remounts.
+- **`rpc_cluster/test_concurrent_reads_during_divergence_produce_one_reconciliation`**
+  -- fixed 2026-09-15 (0.43.0), a test defect.
+- **`hydration_catalogue/test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool`**
+  -- fixed 2026-09-15 (0.43.0), a product defect (concurrent imports racing to
+  create the shared scanner root).
+
+**Cluster connectivity, status and operations (P1)**
+- **`GET /api/v1/status` took 10 seconds once** -- retired 2026-09-20: the
+  0.43.0 reactor removed worker starvation and it had not recurred.
+- **`test_storage_data_credit_reserves_viewer_headroom_and_control` hangs on
+  aarch64** -- no longer reproduces: full suite green on es-1 at 0.45.0,
+  0.46.1 and 0.46.2. Which change fixed it was never recorded.
+
+**Client asks from the placement API round (item -1)**
+- **`node_id` on `/api/v1/torrents/jobs/{id}/{pause,resume,retry,cancel}`
+  responses (Core).** The torrent route already emits it
+  (`src/acquisition_api.cpp:267`, present at 0.48.0), so the item's premise
+  that it did not was wrong.
+
+**Code health (P2)**
+- **Node-wide `max_sessions` is not on the wire, while
+  `max_sessions_per_account` is.** 0.48.1 added `max_sessions` (and
+  `transcode_entitlement_idle_ms`) to the per-node `playback` block.
+- **The node-scoped session refusal carries no failure axes.** 0.48.1:
+  `resource_limit` carries axes -- `scope: node` on create, `scope: request` on
+  update, both `node_healthy: true`, `alternative_may_succeed: true`.
+
+**Documentation hygiene (P2)**
+- **`docs/streaming.md`, `README.md`, `VALIDATION.md` and `ROADMAP.md`
+  contradicted shipped code** -- done in 0.46.3 (2026-09-19/20); `ROADMAP.md`'s
+  "stale voters" corrected 2026-09-20.
+
 ## 2026-09-24 -- 0.54.0 to 0.57.0
 
 All deployed and verified except 0.56.0 (committed and pushed, `60ce47a`;
