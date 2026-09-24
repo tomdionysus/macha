@@ -56,6 +56,10 @@ the folders, which the planner apparently does not use. Not diagnosed.
 **Codes are primary (operator rule, 2026-09-24).** Every response carries a
 snake_case status code, success included. Normal flow: the code and no message.
 Errors and warnings: the code plus an English message, never the message alone.
+- [ ] **Rollout (operator, 2026-09-24): announce every change to Core and
+  every client session** (web client, Android TV, and any other), naming the
+  version, the routes and fields, old and new shape; they must check
+  everything that parses them. Send with the deploy, not after.
 - [ ] **Audit every route for a status code on success.** Not yet done: many
   success bodies are probably bare data with no status field.
 - [ ] Catalogue hint `result` is prose in normal flow ("already stored",
