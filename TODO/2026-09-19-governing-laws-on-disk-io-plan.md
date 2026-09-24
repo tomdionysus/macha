@@ -54,7 +54,7 @@ it.
 
 ## What the harness measured, and how it re-aimed this plan (2026-09-20)
 
-**Stage 1 as first written targeted law 3 and the control lane. That was wrong,
+**Stage 1 as first written targeted law 1 and the control lane. That was wrong,
 and the harness proved it before a line of it was built.**
 
 Three runs on es-1 with `./run-io-pressure.py`, an idle control and two 8 GB
@@ -79,10 +79,10 @@ reactor — 0.43.0 already closed those, and five days of zero `reactor stall`
 lines plus these numbers confirm it. It is contention for one physical device,
 between loader writes and interactive reads, with nothing arbitrating.
 
-**Law 3 is already enforced everywhere it can be**, because control touches no
-disk. The law that is broken is **law 1**, on the DATA backend.
+**Law 1 is already enforced everywhere it can be**, because control touches no
+disk. The law that is broken is **law 2**, on the DATA backend.
 
-## Stage 1 — Law 1: an interactive read does not queue behind a bulk write
+## Stage 1 — Law 2: an interactive read does not queue behind a bulk write
 
 **Rule: loader and speculative writes yield the DATA backend to reads a person
 is waiting for. No other class of work may be the reason a viewer's read
@@ -128,7 +128,7 @@ Either a probe account with `media_viewer`, or a signed artwork URL, has to be
 supplied before this stage can be proved. The `web.root` probe cannot do it —
 being on the other disk is exactly what made it useful here.
 
-## Stage 2 — Law 1: the viewer keeps its service time
+## Stage 2 — Law 2: the viewer keeps its service time
 
 **Rule: no other class may be the reason a viewer waits on the disk.**
 
@@ -151,7 +151,7 @@ with ingest depth. The bounded-exceptions contract in `docs/streaming.md`
 still holds: the only waits a viewer sees are its own frontier and its own
 holds.
 
-## Stage 3 — Law 2: the loader is bounded, never stopped
+## Stage 3 — Law 3: the loader is bounded, never stopped
 
 **Rule: loader work yields, and keeps going. "Not yet" must not become
 "forever".**
@@ -185,16 +185,16 @@ Nothing above is trustworthy if an operator cannot see it working.
   target service time. Transition-only, following the
   `metadata availability changed` precedent — never per-decision.
 - Document in `docs/configuration.md` beside the existing reserves, and in
-  `docs/operations.md` as the law-3 mechanism on disk. The
+  `docs/operations.md` as the law-1 mechanism on disk. The
   [governing laws](../ARCHITECTURE.md#governing-laws) table gains its fourth
   row.
 
 ## Ordering and sizing
 
-**Re-ordered 2026-09-20 on the measurements above.** Law 1 first, because it
-is the law actually broken and the one the incident's aborts belong to. Law 3
+**Re-ordered 2026-09-20 on the measurements above.** Law 2 first, because it
+is the law actually broken and the one the incident's aborts belong to. Law 1
 needs nothing: control touches no disk and measured 1.2-1.6 ms p99 through an
-ingest at 86% iowait. Law 2's floor ships alongside stage 1 rather than after
+ingest at 86% iowait. Law 3's floor ships alongside stage 1 rather than after
 it, because a throttle that can reach zero is a different outage and must not
 be able to exist even briefly. Diagnostics last, describing whatever the first
 two settle on. Stage 1 is the only one that adds a new primitive.

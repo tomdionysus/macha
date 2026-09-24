@@ -115,7 +115,7 @@ libtorrent::disk_io_constructor_type macha_disk_io_constructor(TorrentDiskHooks 
 
 // TorrentDiskHooks::admit backed by the node's DATA arbiter at loader class:
 // an acquisition is durable work the user asked for, so it yields to a slow
-// device only when a viewer would otherwise wait (law 2). It waits in
+// device only when a viewer would otherwise wait (law 3). It waits in
 // one-second slices so an abort is seen promptly; a slice that ends early is
 // the arbiter stopping or refusing outright, and then it returns nullptr.
 std::function<std::shared_ptr<void>(uint64_t, const std::atomic_bool&)>

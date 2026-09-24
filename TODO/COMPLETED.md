@@ -227,7 +227,7 @@ wrong in five more places, all fixed:
    the tree. Every read was judged against the flat 25 ms overhead: the
    founding bug, surviving inside its own fix. es-1 had entered and left
    pressure twelve times in the thirty-four minutes it ran 0.52.0.
-2. **The torrent clamp never had law 2's second clause** -- it clamped on
+2. **The torrent clamp never had law 3's second clause** -- it clamped on
    `pressured()` alone. Now clamps only when a viewer is present.
 3. **Maintenance was invisible to the signal.** Pool rebalance/scrub/GC read
    backends directly, bypassing the timer. Now timed.
@@ -239,7 +239,7 @@ wrong in five more places, all fixed:
 
 Plus `pressure_refusals` on `/api/v1/status` (the counter had existed as a
 private member, incremented nowhere) and dead `records_activity()` removed.
-Laws 1, 3 and 4 were confirmed rather than assumed, with the device each store
+Laws 1, 2 and 4 were confirmed rather than assumed, with the device each store
 sits on measured per node (control on `nvme0n1p2`, DATA on `sdb1`, on all
 three). The parts recorded rather than fixed are item -2 in `ACTIVE.md`.
 
@@ -255,7 +255,7 @@ Original entry, unchanged:
    fixed. The gate is lifted.**
 
    The audit was called for after the mechanism had been wrong twice on the
-   day it shipped -- a threshold invented rather than derived, and law 2
+   day it shipped -- a threshold invented rather than derived, and law 3
    flattened so the loader yielded to a slow device with no viewer present --
    and it found that neither correction had reached the read path at all.
 
@@ -274,7 +274,7 @@ Original entry, unchanged:
       since it started 0.52.0, clamping an operator's torrent each time with
       nobody watching anything.
 
-   2. **The torrent rate clamp never had law 2's second clause.**
+   2. **The torrent rate clamp never had law 3's second clause.**
       `TorrentManager::follow_device_pressure()` clamped on `pressured()`
       alone. An acquisition is durable work the user asked for, so it is
       loader-class and yields to a slow device only when a viewer would
@@ -302,21 +302,21 @@ Original entry, unchanged:
 
    **What it confirmed rather than assumed.**
 
-   - **Law 1.** Admission-wise, there is no path by which this mechanism delays
+   - **Law 2.** Admission-wise, there is no path by which this mechanism delays
      a viewer read. `available()` returns true for `foreground` and
      `read_ahead` before pressure is consulted, on both `acquire()` and
      `try_acquire()`, and a viewer arriving while pressure is engaged takes the
      same path; the viewer reserve is subtracted from lower-class capacity so
      background work can never occupy it. One physical path remains and is
      deliberate: `min_background` (floor 1) means one background operation may
-     be on the spindle ahead of a viewer's read. That is law 2's trickle bought
-     at law 1's expense, and it is now stated rather than implied.
-   - **Law 3.** The control store is a separate `LocalStore` at
+     be on the spindle ahead of a viewer's read. That is law 3's trickle bought
+     at law 2's expense, and it is now stated rather than implied.
+   - **Law 1.** The control store is a separate `LocalStore` at
      `metadata_store.path`, constructed outside `StoragePool`, with no timer
      anywhere on its path, and `acquire()` throws on `FrameType::control`.
      Measured on the hardware: control sits on `nvme0n1p2` (ROTA=0) on all
      three nodes, DATA on `sdb1` (9.1 T, ROTA=1) on gbni-1 and es-1, and fi-1
-     holds no extents at all. **Law 3 holds by configuration, not by
+     holds no extents at all. **Law 1 holds by configuration, not by
      construction** -- nothing stops an operator pointing `metadata_store.path`
      at a DATA spindle, and the FUSE spool (`/mnt/diskB/spool`) and ingest
      staging (`/mnt/diskB/ingest`) already sit on the DATA spindle, as plain
@@ -402,7 +402,7 @@ Original entry, unchanged:
    feeds neither**, so during an import the node reports itself idle and
    maintenance takes its idle share of a disk somebody is waiting on.
 
-   That is law 2 in a third place: the loader must outrank background work, and
+   That is law 3 in a third place: the loader must outrank background work, and
    here background work cannot even see it.
 
    - [x] A loader activity clock on `DistributedStore` beside the foreground
@@ -461,7 +461,7 @@ what named the real one.
 A commit now asks each peer which referenced objects it is missing over a new
 CONTROL-plane `have_control_objects` message (`have_objects` reads
 `local_store()` and cannot answer for control objects; the new handler takes
-no DATA admission, per law 3) and sends only those. Bytes are read lazily. The
+no DATA admission, per law 1) and sends only those. Bytes are read lazily. The
 publication is also bounded to a quarter of the smaller of the connection's
 two budgets. The test asserts via per-message-type RPC counters: 1024 sent on
 the first commit, **zero on the second**, exactly 10 on the third after
@@ -776,7 +776,7 @@ each** against a 15 s startup budget.
 Viewer-visible: a control freezes for a quarter of a minute and then errors.
 Clients recover, sometimes unaided, so it is survivable — but the viewer is
 waiting behind a generation they have already abandoned, which is governing
-law 1.
+law 2.
 
 - [ ] **First: run a PATCH seek on es-1 or gbni-1**, which own their extents.
   If the timeout does not reproduce there, it is WAN contention during the
@@ -867,7 +867,7 @@ kind of waiting the server does** — a kept-alive connection idling up to 15 s,
 held segment request waiting on the encoder, a slow viewer draining a segment
 over the WAN, a direct-play read fetching from a remote replica. Only running a
 handler is work. When the pool was gone the node stopped answering health and
-status, which is a governing-law-3 violation, and `max_concurrent_holds` was 8
+status, which is a governing-law-1 violation, and `max_concurrent_holds` was 8
 purely to ration that pool.
 
 Shipped in 0.43.0 (2026-09-15): one reactor thread owns every socket and never
@@ -1118,7 +1118,7 @@ reintroduced by accident, and `macha-recover` ships saying so.
   waiting. Fixed with `runtime.reassembly_memory_reserve_bytes` (32 MB),
   placed below the control/viewer waiter gate and above the loader gate and
   durable-lower budget — both halves load-bearing, since above every gate it
-  inverts the deadlock and above the viewer gate it breaks governing law 1.
+  inverts the deadlock and above the viewer gate it breaks governing law 2.
   Separately, the publication `DataWorkContext` carried no deadline at all, so
   the wait took the unbounded `cv_.wait` branch and all eight commit workers
   sat in `ensure_buffer_memory` holding 492 MB between them.
@@ -1146,7 +1146,7 @@ reintroduced by accident, and `macha-recover` ships saying so.
   cluster published ~475 GB with `parked_publications` 0, `waits.loader` 0 on
   every node, peak ledger use 156 MB of 768 MB, and zero warnings or errors.
   A viewer request had been failing on this node with `viewer fragment memory
-  admission unavailable` before the fix, so governing law 1 was being violated
+  admission unavailable` before the fix, so governing law 2 was being violated
   in practice, not merely at risk.
 
   Two defects **in the fix itself** were found the next day and remain open in
@@ -1204,7 +1204,7 @@ reintroduced by accident, and `macha-recover` ships saying so.
   per-extent `has_on` loop, each call either a full local decrypt+hash or a
   synchronous control-plane RPC, producing a hard `retention claim … control
   RPC deadline exceeded` against an unrelated peer — a direct
-  governing-law-3 violation. Plan, root-cause trace and the correction the
+  governing-law-1 violation. Plan, root-cause trace and the correction the
   test suite caught mid-implementation (`rebalance_step`/`repair_step`'s
   presence checks could *not* move to the cheap path, having no downstream
   re-verification) in
@@ -2415,7 +2415,7 @@ that were buried inside these items were promoted to their own entries in
   `FuseFrontend::note_viewer_activity()` is declared, documented as "called by
   the kernel adapter before viewer-critical open/read callbacks", and defined
   — but is never called anywhere. FUSE reads open with `FrameType::loader`
-  unconditionally, so the viewer/loader duty-cycle gate that governing law 1
+  unconditionally, so the viewer/loader duty-cycle gate that governing law 2
   depends on is driven exclusively by the HTTP playback path today. If any
   client reads media via the FUSE mount directly (rather than through HTTP
   streaming), it currently gets loader priority, not viewer priority. Confirm

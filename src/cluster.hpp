@@ -335,7 +335,7 @@ class NodeRuntime {
     uint64_t take_activity_bytes(FrameType);
     std::chrono::milliseconds activity_idle_for(FrameType) const;
     // Is somebody watching right now, within `window`? The arbiter and the
-    // torrent rate clamp both need law 2's "unless it would make the viewer
+    // torrent rate clamp both need law 3's "unless it would make the viewer
     // wait" clause, and neither can reach the filesystem to ask.
     bool viewer_recently_active(std::chrono::milliseconds window) const;
     uint64_t remote_metadata_generation() const {

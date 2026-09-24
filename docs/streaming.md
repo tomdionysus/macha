@@ -172,12 +172,12 @@ is 95:5, so publication continues without being allowed to consume the
 execution/storage service needed to start or seek a stream. Either class borrows
 unused DATA capacity work-conservingly when the other is idle.
 
-This is [governing law 1](../ARCHITECTURE.md#governing-laws) in the playback
+This is [governing law 2](principles-and-laws.md#scheduling-laws) in the playback
 path: no other class of work may be the reason a viewer waits.
 
 ### The two places a viewer does wait
 
-Law 1 forbids another class of work making a viewer wait. It does not promise
+Law 2 forbids another class of work making a viewer wait. It does not promise
 that a viewer never blocks on its own stream being produced, and there are
 exactly two places where it does. Both are bounded, both are published to the
 client, and neither is precedent for a third.
@@ -198,7 +198,7 @@ refused. The bound is `segment_timeout_ms`, published per node on
 In both cases the wait is on production that this viewer itself demanded, which
 is the distinction that matters: the work in front of it is its own. A change
 that makes a viewer wait on anything else — a publication, a repair, a scrub, a
-catalogue scan — is a law-1 violation however favourable its throughput numbers
+catalogue scan — is a law-2 violation however favourable its throughput numbers
 are.
 
 Publication traffic has its own loader transport class below viewer foreground

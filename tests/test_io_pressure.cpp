@@ -283,7 +283,7 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_is_never_refused_because_the_disk_i
 }
 
 MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_no_viewer) {
-    // Law 2: "Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would
+    // Law 3: "Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would
     // Make The Viewer Wait." A slow device with nobody reading from it is a
     // device doing its job, and holding an operator's import back for it is the
     // violation the law names. It cost a 36 GB import an afternoon at 2 MB/s on
@@ -315,7 +315,7 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
 }
 
 MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_device) {
-    // The other half of law 2: once a viewer is in the picture, the loader does
+    // The other half of law 3: once a viewer is in the picture, the loader does
     // yield, and to a trickle rather than a stop so an import still drains.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
@@ -382,7 +382,7 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_between_two_extents_is_still_a_view
     CHECK(viewer.has_value());
 
     // Once the stream really has stopped -- the window lapses and the last
-    // viewer credit goes with it -- the import takes the disk back. Law 2 is
+    // viewer credit goes with it -- the import takes the disk back. Law 3 is
     // not a licence to throttle for ever.
     watching = false;
     viewer.reset();
@@ -426,7 +426,7 @@ MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured
 }
 
 MACHA_FAST_TEST("io_pressure", test_control_cannot_enter_the_data_arbiter_at_all) {
-    // Law 3. Control traffic must remain promptly serviceable whatever the
+    // Law 1. Control traffic must remain promptly serviceable whatever the
     // DATA devices are doing, and the structural guarantee is that it never
     // enters this object: the control store is a separate LocalStore on a
     // separate device, nothing on its path feeds the monitor, and an attempt

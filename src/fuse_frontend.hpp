@@ -488,7 +488,7 @@ struct ParkedPublication {
 //
 // FUSE traffic is loader traffic, deliberately. Reads through the mount open
 // with FrameType::loader and never advance the foreground clock that gates
-// loader publication under governing law 1 -- a mount is a convenience and an
+// loader publication under governing law 2 -- a mount is a convenience and an
 // import path, not a viewer, and the viewer priority it would claim belongs to
 // real playback. The foreground clock is driven by the HTTP playback path via
 // FileSystem::note_foreground_activity(), which is what the publication

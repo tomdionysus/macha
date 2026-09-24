@@ -476,7 +476,7 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
                 cfg_.io_pressure_outlier_percent});
             data_resources_.observe_device(&local_->service_monitor(),
                                           cfg_.io_pressure_min_background);
-            // Law 2's second clause, read the way the rest of the system reads
+            // Law 3's second clause, read the way the rest of the system reads
             // it. "A viewer is present" was byte credit held at this instant,
             // which playback does not hold between extents, so every gap in a
             // stream readmitted the loader at full concurrency onto a disk the
@@ -1267,7 +1267,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
         case MessageType::have_control_objects: {
             // The CONTROL counterpart, and deliberately not a variant of the
             // case above: it answers from control_store(), and it takes no
-            // DATA admission at all. Law 3 -- control traffic must remain
+            // DATA admission at all. Law 1 -- control traffic must remain
             // promptly serviceable whatever the DATA devices are doing, and
             // an index lookup on the control device has no business waiting
             // on the DATA arbiter.

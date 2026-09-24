@@ -72,7 +72,7 @@ Catalogue trees use semantic three-way item merges, with genuine collisions reta
 ## What a snapshot carries, and what leaves it
 
 A snapshot's size is a function of the live namespace. That sentence is
-[discipline 4](../ARCHITECTURE.md#the-self-healing-disciplines), and it is a
+[discipline 4](principles-and-laws.md#self-healing-disciplines), and it is a
 requirement rather than an observation: read, merge, replay and transfer cost
 must scale with the library, not with how long the cluster has been running.
 

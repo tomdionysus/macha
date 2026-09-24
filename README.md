@@ -49,16 +49,16 @@ discovered.
 ## Governing laws
 
 Four laws govern Macha, and they are the first thing to understand about why
-the node is built the way it is. The first three order every scheduling,
-admission and priority decision and are cited by number in the source; the
-fourth is a veto over all of them rather than a rank among them:
+the node is built the way it is. They are shared by the server, the client
+core and every client, with the same numbering, and cited by number in the
+source. The first three order every scheduling, admission and priority
+decision; the fourth is a veto over all of them rather than a rank among them:
 
-1. **Thou Shalt Not Make The Viewer Wait.**
-2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
+1. **Thou Shalt Not Make Control Wait.**
+2. **Thou Shalt Not Make The Viewer Wait.** And no viewer may be allowed to
+   make another viewer wait.
+3. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
    Viewer Wait.**
-3. **Control traffic must remain promptly serviceable** — viewer priority is a
-   large configurable share (95:5 by default), not indefinite starvation of
-   everything else.
 4. **Thou Shalt Not Shoot Thyself In The Foot** — no operation, code path or
    subsystem may leave the node in a state it cannot recover from on its own.
    The test: if this goes wrong on the node furthest away, does it come back
@@ -70,7 +70,9 @@ a backoff and a parked state, recover by resolving rather than refusing, keep
 snapshot size a function of the live namespace rather than of history, and
 never set a bound smaller than one unit of the work it bounds.
 
-[Architecture](ARCHITECTURE.md) states all nine and what each one costs.
+[Principles and laws](docs/principles-and-laws.md) states all nine, with the
+conceptual principles they come from; [Architecture](ARCHITECTURE.md#governing-laws)
+says how each one applies in the node.
 
 ## Storage model
 

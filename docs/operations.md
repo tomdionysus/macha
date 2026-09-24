@@ -81,7 +81,7 @@ Preserve the FUSE spool/journal when diagnosing recovery errors. A missing journ
 ### What recovery resolves on its own
 
 This is
-[discipline 3, recover by resolving](../ARCHITECTURE.md#the-self-healing-disciplines).
+[discipline 3, recover by resolving](principles-and-laws.md#self-healing-disciplines).
 Recovery never refuses to start over the *contents* of the journal; only a
 missing or unreadable journal header is fatal. Everything else has a
 deterministic resolution, is applied once, journaled so the next start does
@@ -207,7 +207,7 @@ grouped `published` and `done` barriers.
 
 ## RPC execution isolation
 
-This is how [governing law 3](../ARCHITECTURE.md#governing-laws) is enforced on
+This is how [governing law 1](principles-and-laws.md#scheduling-laws) is enforced on
 the RPC path: control traffic stays answerable whatever else the node is doing,
 because it is how the cluster and the operator find out anything at all. A node
 that cannot answer `ping` under load is indistinguishable from a dead one.
@@ -226,7 +226,7 @@ dedicated metadata executor. All other CONTROL messages use the ordinary control
 executor; object work remains on the priority-aware DATA executors.
 
 DATA execution priority is viewer foreground, viewer read-ahead, user loader,
-then speculative maintenance — laws 1 and 2 as an execution order. Durable FUSE
+then speculative maintenance — laws 2 and 3 as an execution order. Durable FUSE
 spool publication uses the loader class even when its journal records were
 reconstructed after restart. Recovery provenance affects replay validation and
 cache policy, not scheduling priority: work the user asked for does not become
@@ -290,7 +290,7 @@ The practical consequences for an operator:
 ## Durability tokens and restarts
 
 This section is
-[discipline 1, re-derive don't assert](../ARCHITECTURE.md#the-self-healing-disciplines),
+[discipline 1, re-derive don't assert](principles-and-laws.md#self-healing-disciplines),
 in its most load-bearing form: the durability contract treats "present after a
 restart" as durable, justified by the store's pack validation on open plus an
 explicit flush inside the probe.

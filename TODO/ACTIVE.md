@@ -260,7 +260,7 @@ a fact.**
      anywhere between stays pressured, and the EWMA does not decay without
      traffic. The trickle drains so it does not wedge, but "pressure always
      releases on a device that recovers" is only true past 150%.
-   - Law 3 holds **by configuration, not by construction**: control on
+   - Law 1 holds **by configuration, not by construction**: control on
      `nvme0n1p2` and DATA on `sdb1` on every node, but nothing stops
      `metadata_store.path` being pointed at a DATA spindle, and the FUSE spool
      and ingest staging already sit on the DATA spindle as plain file I/O the
@@ -310,12 +310,12 @@ a fact.**
      absolute 2 s outlier trip. The outlier exists because the tests showed the
      ratio alone would have let the founding 17.7 s write through: against
      fifty healthy samples it moves the average to 237%, under the 300% line.
-     0.51.0 also flattened law 2 by making the loader yield to pressure with no
+     0.51.0 also flattened law 3 by making the loader yield to pressure with no
      viewer present; it now yields only when a viewer is waiting or holding
      credit. **Superseded by the 0.53.0 audit** (`COMPLETED.md`): the read
      path was still measuring every read as zero bytes, the outlier is now a
      ratio (`io_pressure_outlier_percent`, 1000), and the torrent clamp gained
-     law 2's second clause. Still untested against a genuinely pathological
+     law 3's second clause. Still untested against a genuinely pathological
      device.
    - **Every catalogue route returned 503 on every node and all clients
      reported "no API"** (0.51.0, fixed in 0.52.0). `catalogue.cpp` committed a
@@ -375,7 +375,7 @@ a fact.**
    2026-09-20, not fixed, and the concrete instance of the first P-1.
 4. The **loader-I/O P0**. The node starves its own viewer I/O with loader
    work: one ingest took es-1 to 91% iowait and aborted twelve client requests
-   at ~8 s. Governing law 1 is violated on the DATA backend, and no
+   at ~8 s. Governing law 2 is violated on the DATA backend, and no
    configuration available prevents it. **Its reproduction is blocked** — read
    that item's first bullet before attempting one.
 5. The **P0 cluster section**. The live cluster is **three** nodes as of
@@ -1379,7 +1379,7 @@ contention and **not** the reactor (0.43.0 closed those; zero `reactor stall`
 lines in five days). It is contention for one physical device between loader
 writes and interactive reads, arbitrated by nothing.
 
-**Law 3 is not violated** — control touches no disk. **Law 1 is**, on the DATA
+**Law 1 is not violated** — control touches no disk. **Law 2 is**, on the DATA
 backend. Stage 1 is re-aimed accordingly.
 
 Six of the twelve aborts are disk-bound and belong here (artwork ×5, one
@@ -1387,7 +1387,7 @@ playback segment). **`catalogue/items` does not** — it is the in-memory
 whole-catalogue copy, i.e. the next P0 down. **`catalogue/status` ×3 does not
 either**, and the first reading of it here was wrong: see the bullet below.
 
-Law 3 is enforced in memory (`control_memory_reserve_bytes`), in HTTP threads
+Law 1 is enforced in memory (`control_memory_reserve_bytes`), in HTTP threads
 (the control lane) and in RPC (the fast-control allow-list). It is enforced
 nowhere on the disk, which sits underneath all three:
 
@@ -1428,7 +1428,7 @@ prevented this**, which is what makes it structural.
   trustworthy (fork-per-sample measured the TLS handshake; an absolute
   threshold on a WAN vantage failed an idle node) and then falsified stage 1's
   premise. Idle baseline and two loaded baselines recorded.
-- [ ] Stage 1 (law 1): `DiskServiceMonitor`, the missing primitive; pressure
+- [ ] Stage 1 (law 2): `DiskServiceMonitor`, the missing primitive; pressure
   gates **loader/speculative admission on the backend under pressure**, never
   interactive reads. Acceptance needs a probe account with `media_viewer` —
   `anonymous` holds no roles, so every DATA-backed route is a 403 and the
@@ -1440,7 +1440,7 @@ prevented this**, which is what makes it structural.
   web assets live in page cache permanently and measured 0.8 ms under load,
   proving nothing. Idle floor with the real probe: health 0.4 ms,
   `catalogue/status` 13.6 ms p99, **viewer read 129.6 ms p99**.
-- [ ] Stage 2 (law 1): viewer *latency* as well as viewer *bytes*.
+- [ ] Stage 2 (law 2): viewer *latency* as well as viewer *bytes*.
   `data_viewer_reserve_bytes` reserves bytes at admission; a viewer holding
   byte credit still queued behind a 17 s write.
 - [ ] **`/api/v1/catalogue/status` walks every artwork id per call** (~418
@@ -1452,7 +1452,7 @@ prevented this**, which is what makes it structural.
   very mutex a running ingest holds continuously — which explains the three
   longest aborts better than disk did. Own defect, own fix: cache the count on
   artwork publication/GC, or move the walk to diagnostics.
-- [ ] Stage 3 (law 2): hard background floor so pacing can never wedge an
+- [ ] Stage 3 (law 3): hard background floor so pacing can never wedge an
   ingest; pacing must not consume publication retry budgets.
 - [ ] Stage 4: service time and paced-admission counters in
   `diagnostics.data_resources`, transition-only logging, docs.
@@ -2015,7 +2015,7 @@ and the rest are unstarted.
    cap**. The constraint that governs the design: *"we need to make sure a
    rogue client cannot under any circumstances launch a media DoS against the
    server"* — an exemption must not become a way for one viewer to occupy a
-   node. This is law 1's second clause as admission control: not making the
+   node. This is law 2's second clause as admission control: not making the
    viewer wait also means not letting one viewer make another wait.
 
 **HELD, not forgotten: `410 generation_superseded`.** The operator asked for
@@ -2620,7 +2620,7 @@ number that is authoritative for new generations and wrong for this one.
 **The harm is a viewer wait taken unknowingly.** Arriving beyond the real
 gate does not refuse; production is sequential, so the node encodes its way
 there at roughly real time while the viewer waits. That is a lawful bounded
-exception to law 1 *when the client chose it*. Here the client declined to
+exception to law 2 *when the client chose it*. Here the client declined to
 choose it, on the node's own figure.
 
 **A second divergence, same root.** `segment_hold_window` is read live at
@@ -2645,7 +2645,7 @@ Options, in preference order:
   is no store (direct play, pre-pipeline).
 - [ ] Make the gate live: give `MediaSegmentStore` a setter and notify the
   condition variable. Larger change, and it silently retimes a generation
-  under a viewer, which is the thing law 1 dislikes.
+  under a viewer, which is the thing law 2 dislikes.
 - [ ] Decide the knobs are not live for playback at all and say so in
   `reload_config`, alongside the `streaming_restart_required` set that already
   exists for exactly this reason.
@@ -2875,7 +2875,7 @@ instrumented.
   The hang is early: the captured output stops after `node metadata ready
   generation=1`, before any RPC result, and no `REQUIRE` failure is printed,
   so the body blocks rather than asserting. The case covers DATA credit and
-  viewer headroom reservation — governing-law-1 territory — so a genuine hang
+  viewer headroom reservation — governing-law-2 territory — so a genuine hang
   there is worth root-causing rather than filing as flake. It is *not* a
   flake: it reproduces serially, every run, on two separate machines.
   Note the live cluster has been running affected code since 0.35.0; 0.36.0
@@ -3088,7 +3088,7 @@ P-1 above, in two other subsystems. They now have plans of their own —
 
   Constraints that are not negotiable, because this is a publisher on a node
   that serves viewers:
-  - **Law 3.** Publishing is control-class work, not viewer-class. A broker
+  - **Law 1.** Publishing is control-class work, not viewer-class. A broker
     that is slow, unreachable or backed up must not delay anything, must not
     accumulate unbounded state, and must not turn into a second way for the
     node to make itself unreachable. Snapshot, publish, drop on backpressure.

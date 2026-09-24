@@ -383,7 +383,7 @@ MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_o
     // write must not look like a viewer -- viewer reserves and the DATA
     // pressure gate key off the viewer clocks, and conflating them would make
     // an import look like a viewer and gate other loader work behind it -- but
-    // it must be visible *somewhere*, because law 2 puts it above background
+    // it must be visible *somewhere*, because law 3 puts it above background
     // maintenance and maintenance decides it is idle from these clocks.
     //
     // Until 0.53.0 there was no loader clock at all, so a node in the middle

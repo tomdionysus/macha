@@ -981,7 +981,7 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     CHECK(refused_elapsed < 200ms);
 
     // And the node is still answering control traffic while both holds are
-    // outstanding. This is the governing-law-3 gate. A hold no longer costs a
+    // outstanding. This is the governing-law-1 gate. A hold no longer costs a
     // worker (0.43.0: it is a parked continuation), so the budget is now a
     // fairness bound; control traffic staying prompt is still the point.
     HttpRequest status_request;

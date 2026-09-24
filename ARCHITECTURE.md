@@ -2,143 +2,86 @@
 
 ## Governing laws
 
-Three laws order every scheduling, admission and priority decision in the
-system. They are cited by number in the source and in review.
+Four laws govern every Macha project, and five self-healing disciplines go
+with them. Their text is shared by the server, the client core and the clients,
+with the same numbering everywhere, in
+[Principles and laws](docs/principles-and-laws.md). Read that first. The source
+and reviews cite them by number: "law 2", "discipline 5".
 
-1. **Thou Shalt Not Make The Viewer Wait.** And no viewer may be allowed to
+1. **Thou Shalt Not Make Control Wait.**
+2. **Thou Shalt Not Make The Viewer Wait.** And no viewer may be allowed to
    make another viewer wait.
-2. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
+3. **Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The
    Viewer Wait.**
-3. **Control traffic must remain promptly serviceable.** Viewer priority is a
-   large configurable share (95:5 by default), not indefinite starvation of all
-   other work.
-4. **Thou Shalt Not Shoot Thyself In The Foot.** No operation, code path or
-   subsystem may leave the node in a state it cannot recover from on its own.
+4. **Thou Shalt Not Shoot Thyself In The Foot.**
 
-**Law 4 is different in kind from the first three and is numbered last only so
-that the existing numbering keeps working** — laws 1 to 3 are cited by number
-throughout the source. It does not take part in their contention at all. Laws
-1 to 3 decide *who goes first*; law 4 decides *what may not be done at any
-priority*. It is a veto over all three, and where it conflicts with them it
-wins: a node that has destroyed itself serves no viewer at all.
+This section is how they apply in the node.
 
-"Non-recoverable" is deliberately broad, and means any of these:
+**Resolution order.** Law 1's reservation is set aside first, law 2 takes
+priority within what remains, and law 3 governs everything left. Law 4 takes
+no part in that contention; it is a veto over all three.
 
-- it needs physical access to fix, which on a remote node means an outage
-  lasting until somebody travels;
-- it needs manual state surgery, or an operator who knows an undocumented
-  incantation;
-- it loses data the node already acknowledged;
-- it cannot be stopped or restarted cleanly, so the ordinary remedy is
-  unavailable;
-- it degrades without bound and offers no path back — a loop that will not
-  finish, a queue that will not drain, a budget that cannot admit one item.
+**Where each law lives in the node.** The laws are why the node has three
+memory reserves rather than one budget (`runtime.control_memory_reserve_bytes`,
+`viewer_memory_reserve_bytes`, `loader_memory_reserve_bytes`), why DATA
+execution priority is viewer foreground, viewer read-ahead, user loader, then
+speculative maintenance, why the HTTP server runs separate control and data
+lanes, and why the fast-control RPC executor has a closed allow-list. Each of
+those is one law expressed in a different resource. A change to any of them is
+a change to a law and should be argued as one.
 
-The last of those is the easiest to ship by accident and the hardest to see,
-because the node stays up and reports itself healthy the whole time. All five
-have been observed in this system, several of them on one afternoon:
-2026-09-20 produced a replica that could not rejoin (a cache smaller than its
-own unit of work), that could not be stopped without `SIGKILL` (a loop that
-never checked its stop token), on hardware that browns out unrecoverably under
-sustained load and has no remote power control. Any one of those is law 4. The
-combination is why it is a law rather than a preference.
+**Law 3's share.** While a viewer and loader publication are both runnable,
+FUSE service is weighted `fuse.viewer_weight: 95` to `fuse.loader_weight: 5`
+by default: the loader keeps a non-zero share and is never stopped, and either
+class takes everything while the other is idle.
 
-The practical test, before shipping anything: **if this goes wrong on the node
-furthest away, does it come back without me?** If the honest answer is no, it
-does not ship in that form.
+**Law 2's second clause, in the node.** A resource that is rationed against
+background work but unrationed *per account* is a law-2 violation waiting for
+a rogue or merely enthusiastic client, and the node cannot tell those apart.
+Every per-viewer resource has a per-account bound as well as a node-wide one,
+and a session cheap enough to be exempt from one limit is not thereby exempt
+from being counted against the others.
 
-They do not simply rank. Law 2 is explicitly subordinate to law 1 — that is
-what its second clause says, and it is why loader work yields to a viewer
-rather than negotiating with one. Law 3 is not subordinate to law 1: it is a
-floor that law 1 may not eat through. "A large configurable share, not
-indefinite starvation" is the whole point of the sentence. A node that serves
-viewers perfectly while failing to answer `ping` has broken law 3, and it will
-be recorded as dead by peers who cannot see how well it was doing.
+**Law 2's two sanctioned waits.** Law 2 is not absolute in the sense that a
+viewer never blocks on anything; it is absolute in the sense that no *other
+class of work* may be the reason a viewer blocks. Where a viewer genuinely
+waits — a request beyond the produced frontier, a held segment — the wait is on
+production that viewer itself demanded, it is bounded by configuration, and the
+bound is published to the client. Those two cases are documented as such in
+[Streaming](docs/streaming.md); they are the exceptions, and they are not
+precedent for a third.
 
-So the resolution order is: law 3's floor is reserved first, law 1 takes
-priority within what remains, and law 2 governs everything left.
+**Why law 4 exists.** All five kinds of non-recoverable state have been
+observed in this system, several of them on one afternoon: 2026-09-20 produced
+a replica that could not rejoin (a cache smaller than its own unit of work),
+that could not be stopped without `SIGKILL` (a loop that never checked its stop
+token), on hardware that browns out unrecoverably under sustained load and has
+no remote power control. Any one of those is law 4. The combination is why it
+is a law rather than a preference.
 
-Law 1's second clause is not a footnote. Protecting viewers as a *class*
-against loader and speculative work is only half of it: one viewer must not be
-able to consume a shared resource to the point where another cannot start. A
-resource that is rationed against background work but unrationed *per account*
-is a law-1 violation waiting for a rogue or merely enthusiastic client, and
-the node cannot tell those apart. So every per-viewer resource needs a
-per-account bound as well as a node-wide one, and a session that is cheap
-enough to be exempt from one limit is not thereby exempt from being counted
-against the others.
-
-A viewer is someone watching or listening right now. A loader is durable work
-the user asked for — FUSE publication, ingest, acquisition — which must finish
-but need not finish first. Control is health, membership, status and session
-traffic, which must stay answerable whatever else the node is doing, because it
-is how the cluster and the operator find out anything at all.
-
-The laws are why the node has three memory reserves rather than one budget
-(`runtime.control_memory_reserve_bytes`, `viewer_memory_reserve_bytes`,
-`loader_memory_reserve_bytes`), why DATA execution priority is viewer
-foreground, viewer read-ahead, user loader, then speculative maintenance, why
-the HTTP server runs separate control and data lanes, and why the fast-control
-RPC executor has a closed allow-list. Each of those is one law expressed in a
-different resource. A change to any of them is a change to a law and should be
-argued as one.
-
-Law 1 is not absolute in the sense that a viewer never blocks on anything; it is
-absolute in the sense that no *other class of work* may be the reason a viewer
-blocks. Where a viewer genuinely waits — a request beyond the produced frontier,
-a held segment — the wait is on production that viewer itself demanded, it is
-bounded by configuration, and the bound is published to the client. Those two
-cases are documented as such in [Streaming](docs/streaming.md); they are the
-exceptions, and they are not precedent for a third.
-
-## The self-healing disciplines
-
-A separate set of rules governs how the node behaves when something is wrong.
-They exist because a system whose failures do not fail loudly produces outages
-that are only visible one at a time, each hiding the next.
+### The disciplines in the node
 
 1. **Re-derive, don't assert.** A durability, placement or confirmation check
-   that fails against recorded evidence probes the content-addressed truth and
-   re-stamps the evidence. It never retries the stale assertion. Content
-   addressing makes ground truth one `has(id)` away, so bookkeeping that could
-   be cheaply re-derived is never trusted over it.
-2. **One work-item policy.** Every retried unit of work has backoff, a failure
-   budget, a parked state visible in Status, and an operator action. No loop
-   retries at a fixed interval, and no RPC waits without a deadline. "Not yet"
-   must never silently become "forever".
-3. **Recover by resolving.** Recovery paths do not throw on an inconsistency
-   that has a deterministic resolution: they resolve it, log one line,
-   re-journal the outcome so the next start does not see it again, and count it
-   in Status. Only a genuinely fatal condition — key mismatch, header
-   corruption — may refuse to start. A node that stays up with a counter to
-   read beats a node that exits correctly.
-4. **Compact history out of the hot path.** A snapshot's size is a function of
-   the live namespace. Retirement history and resolved conflicts belong in
-   separately compacted structures, so that read, merge, replay and transfer
-   cost scales with the library rather than with its history.
-5. **A bound smaller than one unit of its own work is not a bound.** A cache
-   whose eviction policy can evict everything a running operation needs to
-   make progress is not a cache; it is a mechanism for converting a linear
-   operation into a quadratic one, silently. The same holds for any budget: if
-   it cannot admit one item, it does not degrade gracefully, it fails
-   superlinearly and without a log line. Prefer a bound derived from the
-   observed unit size over a byte count chosen when the unit was smaller, make
-   a budget that cannot admit one item a startup-visible error, and count
-   pinned or exempt entries against the budget rather than reporting a
-   capacity the caller cannot actually use.
-
-Discipline 3 is also an operational rule: a node is expected to settle bad
-input and stay online. Repairing state by hand on a node is not the remedy for
-a recovery path that refuses.
-
-Discipline 5 arrived on 2026-09-20 from a replica that could not rejoin the
-cluster: one materialisation of its namespace was ~51 MB against a 128 MiB
-cache whose two slots were already pinned, so catch-up ran with **zero usable
-cache**, replayed the delta chain from a snapshot on every single import, and
-made 28 bytes per second of progress while pegging a core. Raising the limit
-made it 577 times faster, but the number was never the point: nothing in the
-system detected, reported or refused a budget smaller than one unit of its own
-work, and the counters that said so unambiguously were read by nobody.
+   that fails against recorded evidence probes the content-addressed truth.
+   Content addressing makes ground truth one `has(id)` away.
+2. **One work-item policy.** The parked state is visible in Status, and no RPC
+   waits without a deadline.
+3. **Recover by resolving.** The outcome is re-journalled and counted in
+   Status. Only key mismatch or header corruption may refuse to start. This is
+   also an operational rule: a node is expected to settle bad input and stay
+   online, and repairing state by hand on a node is not the remedy for a
+   recovery path that refuses.
+4. **Compact history out of the hot path.** A metadata snapshot's size is a
+   function of the live namespace.
+5. **A bound smaller than one unit of its own work is not a bound.** It
+   arrived on 2026-09-20 from a replica that could not rejoin the cluster: one
+   materialisation of its namespace was ~51 MB against a 128 MiB cache whose two
+   slots were already pinned, so catch-up ran with **zero usable cache**,
+   replayed the delta chain from a snapshot on every single import, and made 28
+   bytes per second of progress while pegging a core. Raising the limit made it
+   577 times faster, but the number was never the point: nothing in the system
+   detected, reported or refused a budget smaller than one unit of its own work,
+   and the counters that said so unambiguously were read by nobody.
 
 ## Design boundary
 

@@ -1213,7 +1213,7 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
         std::this_thread::sleep_for(1ms);
     CHECK(ledger.stats().waits[2] > 0);
 
-    // Governing law 1 first: a queued VIEWER outranks reassembly, always. The
+    // Governing law 2 first: a queued VIEWER outranks reassembly, always. The
     // reserve sits below the control/viewer waiter gate precisely so that a
     // frame can never be admitted ahead of playback, and a viewer cannot be
     // the party publication is deadlocked against in any case -- the viewer

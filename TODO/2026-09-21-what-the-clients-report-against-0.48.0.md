@@ -92,7 +92,7 @@ their extents — if the timeout is WAN contention it should not reproduce there
 **Why it is not simply "raise `startup_timeout_ms` on fi-1".** That treats the
 symptom and it makes the viewer wait longer before being told the same thing.
 The interesting question is whether the outgoing pipeline should be draining
-WAN bandwidth at all once its replacement is committed — governing law 1 says
+WAN bandwidth at all once its replacement is committed — governing law 2 says
 do not make the viewer wait, and here the viewer is waiting behind a generation
 they have already abandoned.
 

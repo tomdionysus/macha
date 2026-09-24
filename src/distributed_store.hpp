@@ -258,7 +258,7 @@ class DistributedStore {
         return n_.activity_idle_for(FrameType::read_ahead);
     }
     // Durable work the user asked for -- FUSE publication, ingest, acquisition
-    // -- which must finish but need not finish first. Law 2 puts it above
+    // -- which must finish but need not finish first. Law 3 puts it above
     // background maintenance, so maintenance has to be able to see it.
     std::chrono::milliseconds loader_idle_for() const {
         return n_.activity_idle_for(FrameType::loader);

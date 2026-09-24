@@ -1179,7 +1179,7 @@ void Service::loop(std::stop_token stop) {
             playback_bytes > 0 || store_->foreground_idle_for() < policy.foreground_quiet;
         const bool interactive_busy =
             interactive_bytes > 0 || store_->interactive_idle_for() < policy.foreground_quiet;
-        // Law 2: the loader outranks background work, so background work has to
+        // Law 3: the loader outranks background work, so background work has to
         // be able to see it. Until 0.53.0 this decision was the two viewer
         // classes alone, and an ingest feeds neither -- so a node importing
         // 36 GB called itself idle and handed maintenance its idle share of a

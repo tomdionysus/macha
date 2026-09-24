@@ -164,7 +164,7 @@ client launches a media DoS against the node, which the operator named as the
 governing constraint for this work.
 
 So the per-account cap is not a follow-up item: it ships in the same change.
-It is law 1's second clause as admission control — not making a viewer wait
+It is law 2's second clause as admission control — not making a viewer wait
 also means not letting one viewer make another wait.
 
 `reserve_resources` (`:1278+`) already meters transcodes per logical viewer via

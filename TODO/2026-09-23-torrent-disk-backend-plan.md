@@ -128,11 +128,11 @@ A bounded worker pool of macha's own (two or three on a four-core node, a
 config knob stated rather than inherited), every slot write, read-back and
 hash read admitted through `DataResourceArbiter` at loader class with the
 job's context. When the device is pressured the loader yields to a viewer
-only, per law 2; libtorrent's `max_queued_disk_bytes` then stalls peers, so
+only, per law 3; libtorrent's `max_queued_disk_bytes` then stalls peers, so
 the network rate follows what the disk admits. `follow_device_pressure` and
 `pressure_download_rate` are deleted.
 
-### Time to watch (law 1)
+### Time to watch (law 2)
 
 This is the point of publishing during the download, not just its side
 effect. Today a torrent is watchable after the download *and then* the
@@ -224,4 +224,4 @@ torrents to each other):
 - Commits per torrent (stage 3).
 - Any `CONTROL retention floor unavailable` (should be zero).
 - **Time from torrent added to first playable second**, today against each
-  stage. This is the number law 1 cares about.
+  stage. This is the number law 2 cares about.
