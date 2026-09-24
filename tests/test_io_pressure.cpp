@@ -45,6 +45,44 @@ MACHA_FAST_TEST("io_pressure", test_an_ordinary_large_write_is_not_a_slow_device
     CHECK(small.pressured());
 }
 
+MACHA_FAST_TEST("io_pressure", test_pressure_onset_and_release_are_each_logged_once) {
+    // 2026-09-23: the only evidence of DATA pressure was the torrent clamp
+    // line, which fired only with a viewer. Each transition is now one line,
+    // and staying in a state says nothing more.
+    struct Capture final : Logger {
+        std::mutex mutex;
+        std::vector<std::string> lines;
+        bool enabled(LogLevel) const noexcept override { return true; }
+        void log(LogLevel, const std::string& line) override {
+            std::lock_guard lock(mutex);
+            lines.push_back(line);
+        }
+        size_t count(std::string_view what) {
+            std::lock_guard lock(mutex);
+            return static_cast<size_t>(std::count_if(lines.begin(), lines.end(), [&](const auto& line) {
+                return line.find(what) != std::string::npos;
+            }));
+        }
+    };
+    auto capture = std::make_shared<Capture>();
+    Log::set_logger(capture);
+
+    DiskServiceMonitor monitor(defaults);
+    for (int i = 0; i < 20; ++i) monitor.note(100ms, 4 * 1024 * 1024);
+    CHECK(capture->count("pressure") == 0);
+
+    for (int i = 0; i < 20; ++i) monitor.note(3000ms, 4 * 1024 * 1024);
+    CHECK(monitor.pressured());
+    CHECK(capture->count("DATA device pressure onset") == 1);
+
+    for (int i = 0; i < 200; ++i) monitor.note(10ms, 4 * 1024 * 1024);
+    CHECK(!monitor.pressured());
+    CHECK(capture->count("DATA device pressure released") == 1);
+    CHECK(capture->count("DATA device pressure onset") == 1);
+
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+}
+
 MACHA_FAST_TEST("io_pressure", test_a_device_far_slower_than_it_should_be_is_noticed) {
     DiskServiceMonitor monitor(defaults);
     CHECK(!monitor.pressured());

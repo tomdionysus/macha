@@ -1,5 +1,57 @@
 # Current release
 
+## 0.57.0 — A torrent is imported once it is published, and a metadata outage no longer kills an ingest (development)
+
+Finishes stage 2 of `TODO/2026-09-23-torrent-disk-backend-plan.md`, and
+ships the three fixes that plan promised with stage 1.
+
+**A downloaded torrent is handed to the ingest only once every extent is
+published.** On 2026-09-24 Pretty Woman finished downloading with
+publication still 30-odd extents behind; the ingest was submitted at once,
+found an incomplete extent journal, and copied the whole film without saying
+why. The torrent manager now keeps a finished torrent paused in `downloaded`
+until the disk backend reports all its extents published, then submits the
+ingest, which adopts them. If publication makes no progress for 10 minutes the
+manager gives up waiting, logs a `WARN`, and imports anyway; what is missing
+is copied.
+
+- Logged: `torrent downloaded; import waits for extent publication ...`, then
+  `torrent extents published; importing ...` (or the stall `WARN`).
+- The ingest now says why it copies a file whose torrent has a journal:
+  `ingest copying path=...: no published extents journalled` or `...: extent
+  journal incomplete bytes=N of M`.
+
+**An ingest that meets unwritable metadata blocks and retries instead of
+failing.** `MetadataNotReady` (no metadata quorum, a DATA or CONTROL retention
+floor not met) is a cluster condition that usually passes in minutes; on
+2026-09-23 it killed seven ingests. The job now goes to `blocked` with
+`error_code` `metadata_unavailable` and is retried every `blocked_retry`, and
+it completes when metadata is writable again (tested with a peer stopped and
+restarted). One `WARN ingest blocked ...` when it blocks; retries log at
+`DEBUG`. An adoption that fails this way still falls back to copying,
+because a missing object and an unreachable peer look the same from here.
+
+**`ensure_control_local` no longer waits for DATA credit.** It took a 4 MiB
+speculative DATA credit to check a local control object of a few KB, so under
+DATA pressure the wait was abandoned and the commit that needed the object
+failed with `CONTROL retention floor unavailable`. The control store is not
+on the DATA device, and no other control-store access takes that credit.
+When no peer can supply a missing control object it now logs `WARN control
+object unavailable id=... peers_asked=N last_failure=...` instead of
+returning false silently.
+
+**DATA device pressure onset and release are logged**, once per transition:
+`DATA device pressure onset slowdown_percent=...` and `DATA device pressure
+released ...`.
+
+**API: clients must check.** No field or code is new, but two states now
+last longer or appear where they did not:
+- A torrent job stays `downloaded` for as long as its publication takes
+  (seconds to minutes) instead of passing straight to `importing`.
+- An ingest job, and the torrent job linked to it, can be `blocked` with
+  `error_code` `metadata_unavailable` and recover by itself, where before it
+  became `failed`.
+
 ## 0.56.0 — Every response has a status code; codes are primary (development)
 
 Operator rule, 2026-09-24: **every response carries a snake_case status code,

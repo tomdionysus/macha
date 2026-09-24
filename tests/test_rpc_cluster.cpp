@@ -1947,6 +1947,37 @@ MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_survives_genuine_contention
     CHECK(third.has_value());
 }
 
+MACHA_TEST("rpc_cluster", test_a_local_control_object_is_found_while_data_credit_is_exhausted) {
+    // 2026-09-23: ensure_control_local took a 4 MiB speculative DATA credit to
+    // validate an 18 KB local control object; under DATA pressure the wait
+    // was abandoned, retain_control failed, and seven ingests died with
+    // "CONTROL retention floor unavailable". The control store is not on the
+    // DATA device and must not wait for its credit.
+    TestService fixture("control-local-without-data-credit", ConfigProfile::isolated);
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    const auto extent = config.extent_size;
+    // One extent of non-viewer credit in all, held below by a loader.
+    config.data_inflight_bytes = 2 * extent;
+    config.data_viewer_reserve_bytes = extent;
+    config.maintenance.background_concurrency = 1;
+    auto& service = fixture.start();
+
+    const auto bytes = pattern(18 * 1024, 91);
+    const auto id = object_id(bytes);
+    REQUIRE(service.node().control_store().put(id, bytes));
+
+    auto held = service.node().data_resources().acquire(DataWorkContext(FrameType::loader, extent), extent);
+    REQUIRE(held.has_value());
+    auto found = std::async(std::launch::async,
+                            [&] { return service.filesystem().store().ensure_control_local(id); });
+    const bool prompt = found.wait_for(2s) == std::future_status::ready;
+    held.reset(); // lets a regressed build finish rather than hang the suite
+    CHECK(prompt);
+    CHECK(found.get());
+}
+
 MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_control) {
     TestNode fixture("data-resource-viewer-reserve", ConfigProfile::functional);
     auto& config = fixture.config();
@@ -3198,6 +3229,73 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
 
     s3->stop();
     s2.stop();
+    s1.stop();
+}
+
+MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_resumes_when_it_returns) {
+    // 2026-09-23: seven ingests died with "CONTROL retention floor
+    // unavailable" -- MetadataNotReady, a cluster condition that passed within
+    // minutes. An ingest that meets it now blocks with metadata_unavailable and
+    // is retried, and completes once metadata is writable again.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->replication = 1;
+        config->min_write_replicas = 1;
+        config->metadata_min_write_replicas = 2;
+        config->heartbeat = 50ms;
+        config->dead_after = 200ms;
+        config->catalogue.scanner.enabled = false;
+        config->ingest.enabled = false;
+    }
+    Service s1(c1, keys);
+    auto s2 = std::make_unique<Service>(c2, keys);
+    s1.start();
+    s2->start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 && s2->node().membership().active().size() == 2;
+    }));
+    s2->stop();
+    s2.reset();
+    REQUIRE(wait_until([&] { return s1.node().membership().active().size() == 1; }));
+
+    const auto root = cluster.path() / "source";
+    std::filesystem::create_directories(root);
+    const auto bytes = pattern(256 * 1024, 5);
+    {
+        std::ofstream out(root / "Blocked Movie 2024.mkv", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = cluster.path() / "staging";
+    ingest_config.source_roots = {root};
+    ingest_config.blocked_retry = 200ms;
+    IngestManager ingest(s1.node(), s1.filesystem(), s1.catalogue_hints(), ingest_config);
+    const auto id = ingest.submit_path(root);
+    ingest.start();
+
+    REQUIRE(wait_until([&] {
+        const auto job = ingest.job(id);
+        return job && job->state == IngestJobState::blocked && job->error_code == "metadata_unavailable";
+    }, 30s));
+    // Retried, and still waiting rather than failed.
+    std::this_thread::sleep_for(1s);
+    CHECK(ingest.job(id)->state != IngestJobState::failed);
+
+    s2 = std::make_unique<Service>(c2, keys);
+    s2->start();
+    REQUIRE(wait_until([&] {
+        const auto job = ingest.job(id);
+        return job && job->files_total == 1 && job->files_completed == 1;
+    }, 60s));
+    CHECK(ingest.job(id)->state != IngestJobState::failed);
+    ingest.stop();
+    s2->stop();
     s1.stop();
 }
 

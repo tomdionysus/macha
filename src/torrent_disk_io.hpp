@@ -41,27 +41,48 @@
 
 namespace macha {
 
+// How many of a torrent's planned extents are published so far.
+struct TorrentPublicationProgress {
+    size_t published{};
+    size_t extents{};
+    bool complete() const { return published >= extents; }
+};
+
 // Pieces libtorrent has verified, routed from the session's alerts (on the
-// torrent manager's thread) to the disk backend that owns the storage. A torrent
-// is named by its save path, which is unique per job.
+// torrent manager's thread) to the disk backend that owns the storage, and
+// the backend's publication progress answered back. A torrent is named by its
+// save path, which is unique per job.
 class TorrentPieceVerifications {
   public:
+    using Sink = std::function<void(const std::string&, int)>;
+    using Progress = std::function<std::optional<TorrentPublicationProgress>(const std::string&)>;
+
     void piece_verified(const std::string& save_path, int piece) {
         std::lock_guard lock(mutex_);
         if (sink_) sink_(save_path, piece);
     }
-    void attach(std::function<void(const std::string&, int)> sink) {
+    // Nothing when no backend is publishing, or the backend does not hold
+    // this torrent.
+    std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
+        std::lock_guard lock(mutex_);
+        if (!progress_) return std::nullopt;
+        return progress_(save_path);
+    }
+    void attach(Sink sink, Progress progress) {
         std::lock_guard lock(mutex_);
         sink_ = std::move(sink);
+        progress_ = std::move(progress);
     }
     void detach() {
         std::lock_guard lock(mutex_);
         sink_ = nullptr;
+        progress_ = nullptr;
     }
 
   private:
     std::mutex mutex_;
-    std::function<void(const std::string&, int)> sink_;
+    Sink sink_;
+    Progress progress_;
 };
 
 struct TorrentDiskHooks {

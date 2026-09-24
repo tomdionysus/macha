@@ -1190,6 +1190,8 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             job.state == IngestJobState::cataloguing)
             return;
     }
+    const bool retrying_metadata =
+        job.state == IngestJobState::blocked && job.error_code == "metadata_unavailable";
 
     try {
         if (job.files.empty() && !plan_job(job, stop)) return;
@@ -1237,12 +1239,28 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             }
             return;
         }
+        // Metadata not writable (no quorum, a retention floor not met) is a
+        // cluster condition, not this job's fault: it blocks and is retried
+        // after blocked_retry. On 2026-09-23 seven ingests died on it instead.
+        // Its code stays metadata_unavailable, as before.
+        if (dynamic_cast<const MetadataNotReady*>(&e)) {
+            // Said once when the job blocks, not on every retry.
+            const auto line = "ingest blocked id=" + id + ": " + e.what() + "; retrying";
+            if (retrying_metadata)
+                Log::debug(line);
+            else
+                Log::warn(line);
+            try {
+                set_blocked(job, "metadata_unavailable", e.what());
+            } catch (const std::exception& save) {
+                Log::warn("ingest state save failed id=" + id + ": " + save.what());
+            }
+            return;
+        }
         job.state = IngestJobState::failed;
         job.error = e.what();
         if (const auto* failure = dynamic_cast<const IngestError*>(&e))
             job.error_code = failure->code();
-        else if (dynamic_cast<const MetadataNotReady*>(&e))
-            job.error_code = "metadata_unavailable";
         else if (dynamic_cast<const FsError*>(&e))
             job.error_code = "filesystem_error";
         else
@@ -1697,16 +1715,30 @@ std::optional<std::vector<ExtentRef>> IngestManager::published_extents(
     std::lock_guard lock(extent_journals_mutex_);
     auto found = extent_journals_.find(job.id);
     // Loaded once per run of a job, and released when process_job returns:
-    // by the time a torrent's ingest runs, its download has finished and the
-    // journal is complete.
+    // the torrent manager submits a torrent's ingest only once every extent
+    // is published (or publication has stalled), so the journal is final.
     if (found == extent_journals_.end())
         found = extent_journals_.emplace(job.id, TorrentExtentJournal::load(job.source_path)).first;
     if (found->second.empty()) return std::nullopt;
+    // From here the source has a journal, so a copy is a missed adoption and
+    // says why: on 2026-09-24 a torrent copied silently for want of this.
     const auto relative =
         std::filesystem::path(file.source_path).lexically_relative(job.source_path).generic_string();
     const auto entry = found->second.find(relative);
-    if (entry == found->second.end()) return std::nullopt;
-    return TorrentExtentJournal::manifest(entry->second, file.size);
+    if (entry == found->second.end()) {
+        Log::info("ingest copying path=" + file.destination_path + ": no published extents journalled");
+        return std::nullopt;
+    }
+    auto manifest = TorrentExtentJournal::manifest(entry->second, file.size);
+    if (!manifest) {
+        uint64_t journalled = 0;
+        for (const auto& [_, extent] : entry->second.extents) journalled += extent.length;
+        Log::info("ingest copying path=" + file.destination_path + ": extent journal incomplete bytes=" +
+                  std::to_string(journalled) + " of " + std::to_string(file.size) +
+                  (entry->second.size != file.size ? " (journalled size " + std::to_string(entry->second.size) + ")"
+                                                   : std::string{}));
+    }
+    return manifest;
 }
 
 void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,

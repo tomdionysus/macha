@@ -458,6 +458,47 @@ MACHA_TEST("torrent_disk_io", test_extents_publish_once_their_pieces_verify_and_
     }
 }
 
+MACHA_TEST("torrent_disk_io", test_publication_progress_is_reported_until_every_extent_is_published) {
+    // The torrent manager hands a downloaded torrent to the ingest only when
+    // this says every extent is published; Pretty Woman (2026-09-24) was
+    // handed over 30-odd extents early and copied. Publication is held back
+    // here so the incomplete state is observable, then released.
+    TempDir dir;
+    std::atomic_bool release{false};
+    TorrentDiskHooks hooks;
+    hooks.extent_size = 3 * block;
+    hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+    hooks.publish_retry = 20ms;
+    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        if (!release.load()) return std::nullopt;
+        return object_id(bytes);
+    };
+    const auto verifications = hooks.verifications;
+    Harness h(layout({100000}, 2 * block), dir.path(), hooks);
+    REQUIRE(h.write_all(pattern_bytes(100000, 12)));
+    // A torrent the backend does not hold reports nothing.
+    CHECK(!verifications->publication(h.save_path + "-other").has_value());
+
+    auto progress = verifications->publication(h.save_path);
+    REQUIRE(progress.has_value());
+    CHECK(progress->published == 0);
+    CHECK(progress->extents == 3);
+    CHECK(!progress->complete());
+
+    for (int piece = 0; piece < h.files.num_pieces(); ++piece)
+        verifications->piece_verified(h.save_path, piece);
+    std::this_thread::sleep_for(100ms);
+    progress = verifications->publication(h.save_path);
+    REQUIRE(progress.has_value());
+    CHECK(!progress->complete());
+
+    release = true;
+    REQUIRE(wait_for([&] {
+        const auto now = verifications->publication(h.save_path);
+        return now && now->complete() && now->published == 3;
+    }, 5s));
+}
+
 MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held_bitfield) {
     // Trainspotting, 2026-09-24: publication stopped at 162 of 436 extents
     // with the publisher idle, because verifications for the rest never

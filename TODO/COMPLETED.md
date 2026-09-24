@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-24
 
-## 2026-09-24 -- 0.54.0 to 0.56.0
+## 2026-09-24 -- 0.54.0 to 0.57.0
 
 All deployed and verified except 0.56.0 (committed and pushed, `60ce47a`;
 deploy blocked by es-1/fi-1 being unreachable). Full detail in `CHANGELOG.md`.
@@ -31,6 +31,14 @@ deploy blocked by es-1/fi-1 being unreachable). Full detail in `CHANGELOG.md`.
   response; `error_code` beside every text error (ingest, torrent,
   placement reason, hints, status diagnostics); hint `result` is a code.
   Core, web, Android TV and mobile clients notified before deploy.
+- **0.57.0 -- a torrent is imported once it is published; a metadata outage
+  no longer kills an ingest** (committed, not deployed). The torrent manager
+  holds a finished torrent in `downloaded` until every extent is published
+  (10-minute no-progress fallback); the ingest logs why it copies despite a
+  journal; `ensure_control_local` takes no DATA credit and logs failure;
+  `MetadataNotReady` blocks and retries an ingest; DATA pressure onset and
+  release are logged. Laptop suite 533/533; torrent suite 13/14 (the swarm
+  test cannot run on the laptop). Each fix has a test that fails without it.
 - **README version line** under the header, enforced at configure time.
 - **Also fixed, test-only:** the durability-barrier restart tests ask again
   until the answer is definitive; the data-credit test's bare client gets an

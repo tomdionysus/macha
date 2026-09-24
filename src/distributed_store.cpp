@@ -2070,15 +2070,13 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
 }
 
 bool DistributedStore::ensure_control_local(const ObjectId& id) {
-    {
-        auto resource = n_.data_resources().acquire(
-            DataWorkContext(FrameType::speculative, n_.config().extent_size),
-            n_.config().extent_size);
-        if (!resource)
-            return false;
-        if (n_.control_store().valid(id))
-            return true;
-    }
+    // No DATA credit: the control store is not on the DATA device, and no
+    // other control-store access takes one. This took a 4 MiB speculative
+    // credit to check an 18 KB object, and when the wait was abandoned under
+    // DATA pressure the commit that asked failed with it
+    // (TODO/2026-09-23-torrent-writes-starve-publication-incident.md).
+    if (n_.control_store().valid(id))
+        return true;
 
     Writer writer;
     writer.fixed(id.bytes);
@@ -2088,15 +2086,20 @@ bool DistributedStore::ensure_control_local(const ObjectId& id) {
     // replicas. Search every currently active peer and keep the transfer on the
     // CONTROL transport while using speculative worker priority so it cannot
     // block health/quorum traffic or require a DATA session to exist.
+    size_t asked = 0;
+    std::string last_failure = "no active peer";
     for (const auto& target : n_.membership().active()) {
         if (target.id == n_.node_id())
             continue;
+        ++asked;
         try {
             auto started = Clock::now();
             auto reply = n_.call(target, MessageType::get_control_object, payload,
                                  FrameType::speculative);
-            if (reply.message.type != MessageType::control_object_reply)
+            if (reply.message.type != MessageType::control_object_reply) {
+                last_failure = target.host + ": " + message_type_name(reply.message.type);
                 continue;
+            }
 
             Reader reader(reply.message.payload);
             ObjectId returned{reader.fixed<32>()};
@@ -2104,18 +2107,20 @@ bool DistributedStore::ensure_control_local(const ObjectId& id) {
             reader.finish();
             if (returned != id || object_id(data) != id) {
                 Log::debug("control object read " + target.host + ": integrity failure");
+                last_failure = target.host + ": integrity failure";
                 continue;
             }
             note_network(data.size(), Clock::now() - started);
-            auto resource = n_.data_resources().acquire(
-                DataWorkContext(FrameType::speculative, n_.config().extent_size),
-                n_.config().extent_size);
-            if (resource && n_.control_store().put(id, data))
+            if (n_.control_store().put(id, data))
                 return true;
+            last_failure = "local control store put failed";
         } catch (const std::exception& e) {
             Log::debug("control object read " + target.host + ": " + e.what());
+            last_failure = target.host + ": " + e.what();
         }
     }
+    Log::warn("control object unavailable id=" + hex(id.bytes) + " peers_asked=" + std::to_string(asked) +
+              " last_failure=" + last_failure);
     return false;
 }
 
