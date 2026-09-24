@@ -360,6 +360,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             out += ",\"artwork_objects\":" + std::to_string(status.artwork_objects);
             out += ",\"local_artwork_objects\":" + std::to_string(status.local_artwork_objects);
             out += ",\"last_sync_unix_ms\":" + std::to_string(status.last_sync_unix_ms);
+            out += ",\"error_code\":" + (status.error_code.empty() ? "null" : json_escape(status.error_code));
             out += ",\"error\":" + (status.error.empty() ? "null" : json_escape(status.error)) + "}";
             return json(200, std::move(out));
         }
@@ -379,6 +380,7 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 item["provider"] = hint.provider.empty() ? Json(nullptr) : Json(hint.provider);
                 item["media_id"] = hint.media_id.empty() ? Json(nullptr) : Json(hint.media_id);
                 item["result"] = hint.result.empty() ? Json(nullptr) : Json(hint.result);
+                item["error_code"] = hint.error_code.empty() ? Json(nullptr) : Json(hint.error_code);
                 item["error"] = hint.error.empty() ? Json(nullptr) : Json(hint.error);
                 Json::Array catalogue_ids;
                 for (const auto& id : hint.catalogue_item_ids) catalogue_ids.emplace_back(id);

@@ -1,5 +1,65 @@
 # Current release
 
+## 0.56.0 — Every response has a status code; codes are primary (development)
+
+Operator rule, 2026-09-24: **every response carries a snake_case status code,
+success included. Normal flow has the code and no message. Errors and warnings
+have the code plus an English message; the code is what clients act on, the
+message is for people and is never the only signal.** Clients are responsible
+for sorting and presentation; the server sends data and codes.
+
+**API changes. Every client must check what it parses.**
+
+1. **`status` on every JSON object response.** Stamped once, centrally, on the
+   HTTP worker before compression: `"status":"ok"` on a success that does not
+   state its own; a handler's own `status` is kept (e.g. catalogue media-info
+   `"pending"`); every `http_error` response has `"status"` equal to its
+   `error.code` (e.g. `"not_found"`); any other error body gets `"error"`.
+   Streams, 204/304 and non-JSON bodies are unchanged. The key is added at
+   the start of the object; no existing key moves.
+2. **Error envelope unchanged**, plus the top-level `status`: `error.code`,
+   `error.message`, optional `error.reason` and the failure axes. There is
+   no `error.detail`.
+3. **`placement_failed` (409) now carries `error.reason`**: `node_not_member`,
+   `node_refused`, `node_unreachable`, `node_did_not_start`, `missing_uri`,
+   `add_failed`, or the peer's own code.
+4. **Ingest jobs: `error_code` beside `error`** (null when none). Blocked:
+   `source_unavailable`, `source_not_regular`, `source_scan_interrupted`,
+   `source_changed_during_scan`, `source_disappeared`, `source_changed`,
+   `source_unreadable`, `source_seek_failed`, `source_short_read`. Failed:
+   `source_is_symlink`, `no_supported_media`, `destination_parent_not_directory`,
+   `partial_not_file`, `destination_conflict`, `namespace_short_write`,
+   `size_mismatch`, `metadata_unavailable`, `filesystem_error`,
+   `import_failed` (also given to jobs recorded before this release).
+5. **Torrent jobs: `error_code` beside `error`**: `restore_failed`,
+   `ingest_missing`, `ingest_cancelled`, `torrent_error` (libtorrent's),
+   `staging_full` (blocked), `ingest_submit_failed`, `torrent_failed` (jobs
+   recorded before this release); a job that failed because its ingest did
+   carries **the ingest's own code** (e.g. `no_supported_media`), else
+   `ingest_failed`. While importing, a torrent mirrors its ingest's code
+   and message.
+6. **Catalogue hints: `result` is now a code, not a sentence**: `matched`
+   (was empty), `outside_catalogue_roots`, `not_media_file`,
+   `no_media_candidate`, `no_provider_match` (the "after N candidates"
+   suffix is gone; `candidate_cursor` still says how far it got),
+   `already_stored`, `profile_prepared`, `media_not_live`,
+   `manual_existing_item`, `manual_metadata`. **`error_code` beside
+   `error`**: `path_missing`, `content_not_committed`,
+   `provider_budget_exhausted`, `provider_unavailable`, `provider_error`,
+   `catalogue_conflict`, `catalogue_unavailable`, `catalogue_error`,
+   `artwork_durability_unavailable`, `no_immutable_identity`,
+   `yielded_to_playback`, `media_information_error`.
+7. **Status diagnostics: `error_code` beside `error`**: `upnp`
+   (`igd_not_connected`, `port_mapped_elsewhere`,
+   `mapping_verification_failed`, `add_mapping_failed`, `discovery_failed`,
+   `support_not_built`); `external_ip` (`lookup_failed`); `startup`
+   (`recovery_failed`); node reachability items (`rpc_failed`);
+   `/api/v1/catalogue/status` (`converging`, `unavailable`). `check` already
+   had its code in `self_probe`.
+
+A cluster-wide torrent add between peers now carries `error_code` too, so a
+refusal on the far node reaches the client as the same code.
+
 ## 0.55.1 — Extent publication does not depend on piece alerts (development)
 
 **On its first real torrent, stage 2 stopped publishing at 162 of 436 extents

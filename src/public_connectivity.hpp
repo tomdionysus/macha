@@ -23,6 +23,10 @@ struct UpnpStatus {
     uint16_t external_port{};
     uint32_t lease_seconds{};
     int igd_status{};
+    // igd_not_connected, port_mapped_elsewhere, mapping_verification_failed,
+    // add_mapping_failed, discovery_failed, support_not_built; `error` is the
+    // English message beside it.
+    std::string error_code;
     std::string error;
 };
 
@@ -30,6 +34,7 @@ struct ExternalIpStatus {
     bool enabled{};
     bool attempted{};
     std::string address;
+    std::string error_code; // lookup_failed
     std::string error;
 };
 

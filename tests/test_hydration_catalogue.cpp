@@ -1826,7 +1826,7 @@ MACHA_TEST("hydration_catalogue", test_terminal_media_profile_job_is_not_requeue
     auto hints = service.catalogue_hints().list();
     REQUIRE(hints.size() == 1);
     CHECK(hints.front().state == CatalogueHintState::queued);
-    service.catalogue_hints().fail(hints.front().id, "synthetic profile failure");
+    service.catalogue_hints().fail(hints.front().id, "synthetic_failure", "synthetic profile failure");
 
     // A retry observes the terminal result instead of reopening the same
     // immutable profile job and reporting an endless pending state. Playback
@@ -2192,13 +2192,13 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
         failure_id = failure_queue.submit("/Movies/Broken.mkv", "scanner", "macha:broken",
                                           CatalogueHintPriority::periodic_scan);
         REQUIRE(failure_queue.claim_next().has_value());
-        CHECK(!failure_queue.record_failure(failure_id, "first failure", 0, 2));
+        CHECK(!failure_queue.record_failure(failure_id, "synthetic_failure", "first failure", 0, 2));
         auto once = failure_queue.get(failure_id);
         REQUIRE(once.has_value());
         CHECK(once->state == CatalogueHintState::deferred);
         CHECK(once->failures == 1);
         REQUIRE(failure_queue.claim_next().has_value());
-        CHECK(failure_queue.record_failure(failure_id, "second failure", 0, 2));
+        CHECK(failure_queue.record_failure(failure_id, "synthetic_failure", "second failure", 0, 2));
         auto dead = failure_queue.get(failure_id);
         REQUIRE(dead.has_value());
         CHECK(dead->state == CatalogueHintState::failed);
@@ -2225,17 +2225,20 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
         const auto id = queue.submit("/Movies/Retry.mkv", "scanner", "macha:retry",
                                      CatalogueHintPriority::periodic_scan);
         REQUIRE(queue.claim_next().has_value());
-        CHECK(!queue.record_failure(id, "provider parse failure", 0, 5));
+        CHECK(!queue.record_failure(id, "provider_error", "provider parse failure", 0, 5));
         auto failed_once = queue.get(id);
         REQUIRE(failed_once.has_value());
         CHECK(failed_once->failures == 1);
         REQUIRE(queue.claim_next().has_value());
-        queue.defer(id, "metadata durability temporarily unavailable", unix_ms() + 1000);
+        queue.defer(id, "catalogue_unavailable", "metadata durability temporarily unavailable", unix_ms() + 1000);
         auto deferred = queue.get(id);
         REQUIRE(deferred.has_value());
         CHECK(deferred->state == CatalogueHintState::deferred);
         CHECK(deferred->failures == 1);
         CHECK(deferred->error == "metadata durability temporarily unavailable");
+        // The code is primary, and it survives a restart of the queue.
+        CHECK(deferred->error_code == "catalogue_unavailable");
+        CHECK(failed_once->error_code == "provider_error");
     }
 
     // Equal-priority work is fair across top-level catalogue roots rather than
