@@ -13,8 +13,8 @@ serialised storage, or uncharged retained memory.
 
 The two project laws remain the acceptance authority:
 
-1. Thou Shalt Not Make The Viewer Wait.
-2. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
+2. Thou Shalt Not Make The Viewer Wait.
+3. Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would Make The Viewer Wait.
 
 No throughput result is acceptable if it bypasses control/viewer priority,
 allows unbounded retained memory, or relies on longer timeouts.

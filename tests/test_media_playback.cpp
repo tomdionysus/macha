@@ -443,7 +443,7 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
                              std::move(engine));
     playback.start();
 
-    Json::Object preferences{{"mode", "remux"}};
+    Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -927,7 +927,7 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
                              std::move(engine));
     playback.start();
 
-    Json::Object preferences{{"mode", "remux"}};
+    Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -2015,7 +2015,7 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
-    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -2157,7 +2157,7 @@ MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
-    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -2257,7 +2257,7 @@ MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_o
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
-    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -2357,7 +2357,7 @@ MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
-    Json::Object preferences{{"mode", "transcode"}};
+    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -2442,7 +2442,7 @@ MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_
                              std::make_unique<GatedSubtitleMediaEngine>(gate));
     playback.start();
 
-    Json::Object preferences{{"mode", "remux"}, {"subtitle_stream", 2}};
+    Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}, {"subtitle_stream", 2}};
     Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
     auto text = Json(std::move(root)).dump();
     HttpRequest create;
@@ -2598,6 +2598,145 @@ MACHA_FAST_TEST("media_playback", test_older_video_profiles_are_stale_and_regene
     CHECK(valid_catalogue_media_profile("macha:abc", profile));
 }
 
+namespace {
+// Two audio tracks, English and French, beside the fake engine's one video
+// and two English subtitles: a file where every choice is a real one.
+class TwoAudioFakeMediaEngine final : public FakeMediaEngine {
+  public:
+    MediaProbeResult probe(const MediaSource& source, std::chrono::milliseconds timeout = {}) override {
+        auto result = FakeMediaEngine::probe(source, timeout);
+        result.streams.push_back(MediaStreamInfo{4, MediaStreamType::audio, "ac3", "", "fra", 0, 0, 6, 48000, 0,
+                                                 false, false, 384'000, false, 0, ""});
+        return result;
+    }
+};
+} // namespace
+
+MACHA_TEST("media_playback", test_the_server_plays_what_it_is_told_and_chooses_nothing) {
+    // Operator, 2026-09-24: "The server supplies facts, operations, then does
+    // what it's told." Playback is by media_id; a stream, a language or a
+    // container left open when there are several is refused with the
+    // candidates, and a language the media lacks is never answered with
+    // another track.
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    auto keys = load_cluster_keys(keyfile);
+    auto c = config_for(t.path() / "node", keyfile, free_port());
+    c.replication = 1;
+    c.metadata_min_write_replicas = 1;
+    c.catalogue.api.enabled = false;
+    Service service(c, keys);
+    service.start();
+    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    service.filesystem().create_file("/media/two.mkv", 0644, getuid(), getgid());
+    auto bytes = pattern(128 * 1024 + 17);
+    auto writer = service.filesystem().open_write("/media/two.mkv", true);
+    REQUIRE(writer->write(0, bytes) == bytes.size());
+    writer->commit();
+    auto media_id = file_media_id(service.filesystem().getattr("/media/two.mkv"));
+
+    CatalogueApiConfig api;
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.temp_path = t.path() / "playback";
+    streaming.startup_timeout = 2s;
+    streaming.max_video_transcodes = 4;
+    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+                             std::make_unique<TwoAudioFakeMediaEngine>());
+    playback.start();
+
+    const auto create = [&](Json::Object root, int expect) {
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        request.body.assign(text.begin(), text.end());
+        auto response = playback.handle(request);
+        REQUIRE(response.status == expect);
+        auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
+        if (const auto* id = parsed.find("session_id")) {
+            HttpRequest remove;
+            remove.method = "DELETE";
+            remove.path = "/api/v1/playback/sessions/" + id->asString();
+            remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+            playback.handle(remove);
+        }
+        return parsed;
+    };
+    const auto instruct = [&](Json::Object preferences, int expect = 201) {
+        return create(Json::Object{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}}, expect);
+    };
+    const auto refusal = [](const Json& body, std::string code, std::string choice) {
+        CHECK(body.find("status")->asString() == code);
+        CHECK(body.find("error")->find("code")->asString() == code);
+        CHECK(body.find("error")->find("choice")->asString() == choice);
+        return body.find("error")->find("choices")->asArray();
+    };
+
+    // A title is not playable as such: only a file is, named by media_id.
+    auto by_item = create(Json::Object{{"item_id", "tmdb:movie:603"}, {"media_id", media_id},
+                                       {"preferences", Json(Json::Object{{"mode", "direct"}})}},
+                          400);
+    CHECK(by_item.find("error")->find("code")->asString() == "item_id_not_accepted");
+    auto nothing = create(Json::Object{{"preferences", Json(Json::Object{{"mode", "direct"}})}}, 400);
+    CHECK(nothing.find("error")->find("code")->asString() == "media_id_required");
+
+    // Two audio tracks and no instruction: refused with both, not the default.
+    auto open = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}}, 400),
+                        "choice_required", "audio_stream");
+    REQUIRE(open.size() == 2);
+    CHECK(open[0].asInt64() == 1);
+    CHECK(open[1].asInt64() == 4);
+    // Named by index or by a language only one track has: performed.
+    auto french = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 4}});
+    CHECK(french.find("output")->find("audio")->find("source_stream")->asInt64() == 4);
+    auto english = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_language", "eng"}});
+    CHECK(english.find("output")->find("audio")->find("source_stream")->asInt64() == 1);
+    // A language the media lacks is refused, never answered with another.
+    auto german = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"},
+                                                {"audio_language", "deu"}},
+                                   400),
+                          "choice_not_available", "audio_stream");
+    CHECK(german.size() == 2);
+    auto bogus = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 9}}, 400),
+                         "choice_not_available", "audio_stream");
+    CHECK(bogus.size() == 2);
+    // Two English subtitles: a language that matches both picks neither.
+    auto subtitles = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 1},
+                                                   {"subtitle_language", "eng"}},
+                                      400),
+                             "choice_required", "subtitle_stream");
+    CHECK(subtitles.size() == 2);
+    // Direct serves the file untouched and the player picks its own tracks:
+    // there is nothing for the server to choose, so nothing is refused.
+    auto direct = instruct(Json::Object{{"mode", "direct"}});
+    CHECK(direct.find("mode")->asString() == "direct");
+    CHECK(direct.find("output")->find("audio") == nullptr);
+    // The session still reports every mode the media supports.
+    const auto& modes = direct.find("options")->find("modes")->asArray();
+    CHECK(modes.size() == 3);
+
+    // Copy support is a fact about each stream, not about whichever came first.
+    HttpRequest facts;
+    facts.method = "GET";
+    facts.path = "/api/v1/playback/media";
+    facts.query["media_id"] = media_id;
+    facts.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+    auto response = playback.handle(facts);
+    REQUIRE(response.status == 200);
+    auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
+    const auto& media = parsed.find("media")->asArray().front();
+    CHECK(media.find("operations")->find("copy_into_fmp4") == nullptr);
+    size_t audio_with_facts = 0;
+    for (const auto& stream : media.find("streams")->asArray())
+        if (stream.find("type")->asString() == "audio" && stream.find("copy_into")) ++audio_with_facts;
+    CHECK(audio_with_facts == 2);
+    playback.stop();
+    service.stop();
+}
+
 MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -2651,7 +2790,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     };
 
     // A transcode instruction re-encodes both streams and says what it served.
-    auto transcoded = instruct(Json::Object{{"mode", "transcode"}});
+    auto transcoded = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}});
     CHECK(transcoded.find("mode")->asString() == "transcode");
     CHECK(transcoded.find("output")->find("video")->find("codec")->asString() == "h264");
     CHECK(transcoded.find("output")->find("video")->find("color_transfer")->asString() == "bt709");
@@ -2664,7 +2803,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
 
     // A remux instruction copies both, 10-bit PQ HEVC and E-AC-3 included:
     // the server does not second-guess the client's decoder.
-    auto remuxed = instruct(Json::Object{{"mode", "remux"}});
+    auto remuxed = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
     CHECK(remuxed.find("mode")->asString() == "remux");
     CHECK(remuxed.find("output")->find("video")->find("codec")->asString() == "hevc");
     CHECK(remuxed.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
@@ -2672,7 +2811,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
 
     // The mixture: copy the video, re-encode the audio. It is a transcode,
     // because something is being re-encoded, and it says so in the request.
-    auto mixed = instruct(Json::Object{{"mode", "transcode"}, {"video", "copy"}});
+    auto mixed = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
     CHECK(mixed.find("mode")->asString() == "transcode");
     CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
@@ -2683,7 +2822,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(transcoded.find("output")->find("audio")->find("channels")->asUInt64() == 6);
 
     // The other mixture: re-encode the video, copy the audio.
-    auto video_only = instruct(Json::Object{{"mode", "transcode"}, {"audio", "copy"}});
+    auto video_only = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
     CHECK(video_only.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(video_only.find("output")->find("audio")->find("transform")->asString() == "copy");
 
@@ -2697,33 +2836,39 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(ts_copy.find("output")->find("container")->asString() == "mpegts");
     CHECK(ts_copy.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(ts_copy.find("output")->find("audio")->find("transform")->asString() == "copy");
-    auto fmp4 = instruct(Json::Object{{"mode", "remux"}});
+    // No default container: fMP4 and MPEG-TS are both real options, so an
+    // HLS instruction without one is refused with both listed.
+    auto fmp4 = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
     CHECK(fmp4.find("output")->find("container")->asString() == "fmp4");
+    auto unnamed = instruct(Json::Object{{"mode", "remux"}}, 400);
+    CHECK(unnamed.find("error")->find("code")->asString() == "choice_required");
+    CHECK(unnamed.find("error")->find("choice")->asString() == "container");
+    CHECK(unnamed.find("error")->find("choices")->asArray().size() == 2);
     auto direct_container = instruct(Json::Object{{"mode", "direct"}});
     CHECK(direct_container.find("output")->find("container")->asString() == "matroska");
 
     // A mode is required, and a copy cannot also be a quality change.
     instruct(Json::Object{{"max_height", 720}}, 400);
     instruct(Json::Object{{"mode", "auto"}}, 400);
-    instruct(Json::Object{{"mode", "remux"}, {"video", "copy"}, {"max_height", 720}}, 400);
+    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"max_height", 720}}, 400);
 
     // The mode has to describe what is being done. direct and remux copy
     // every stream; transcode re-encodes at least one. A mode naming
     // something it is not doing is refused, not reinterpreted (2026-09-07).
-    instruct(Json::Object{{"mode", "remux"}, {"audio", "transcode"}}, 400);
-    instruct(Json::Object{{"mode", "remux"}, {"video", "transcode"}}, 400);
-    instruct(Json::Object{{"mode", "remux"}, {"max_height", 720}}, 400);
+    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio", "transcode"}}, 400);
+    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "transcode"}}, 400);
+    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"max_height", 720}}, 400);
     instruct(Json::Object{{"mode", "direct"}, {"audio", "transcode"}}, 400);
     instruct(Json::Object{{"mode", "direct"}, {"video", "transcode"}}, 400);
     instruct(Json::Object{{"mode", "direct"}, {"max_height", 720}}, 400);
-    instruct(Json::Object{{"mode", "transcode"}, {"video", "copy"}, {"audio", "copy"}}, 400);
+    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}}, 400);
 
     // And the legal permutations stay legal.
     instruct(Json::Object{{"mode", "direct"}, {"video", "copy"}, {"audio", "copy"}});
-    instruct(Json::Object{{"mode", "remux"}, {"video", "copy"}, {"audio", "copy"}});
-    instruct(Json::Object{{"mode", "transcode"}, {"video", "transcode"}, {"audio", "transcode"}});
-    instruct(Json::Object{{"mode", "transcode"}, {"video", "copy"}, {"audio", "transcode"}});
-    instruct(Json::Object{{"mode", "transcode"}, {"video", "transcode"}, {"audio", "copy"}});
+    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}});
+    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "transcode"}});
+    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "transcode"}});
+    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "copy"}});
 }
 
 MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_quality_change) {
@@ -2815,7 +2960,7 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
     // A remux session advertises direct unconditionally and honours an
     // explicit switch back to it.
     Json::Object remux_root{{"media_id", media_id},
-                            {"preferences", Json(Json::Object{{"mode", "remux"}})}};
+                            {"preferences", Json(Json::Object{{"mode", "remux"}, {"container", "fmp4"}})}};
     auto remux_text = Json(std::move(remux_root)).dump();
     HttpRequest remux_create;
     remux_create.method = "POST";
@@ -2925,7 +3070,7 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
     };
 
     // The mixture the chooser actually produces: transcode, video copied.
-    auto mixed = create(Json::Object{{"mode", "transcode"}, {"video", "copy"}});
+    auto mixed = create(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
     CHECK(mixed.find("mode")->asString() == "transcode");
     CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
@@ -2939,7 +3084,7 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
     CHECK(direct.find("preferences")->find("audio")->isNull());
     id = direct.find("session_id")->asString();
 
-    auto remuxed = update(id, Json::Object{{"mode", "remux"}});
+    auto remuxed = update(id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
     CHECK(remuxed.find("mode")->asString() == "remux");
     CHECK(remuxed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(remuxed.find("output")->find("audio")->find("transform")->asString() == "copy");
@@ -2947,7 +3092,7 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
 
     // An update that names both sets both: this drops only what the same
     // update does not restate.
-    auto restated = update(id, Json::Object{{"mode", "transcode"}, {"audio", "copy"}});
+    auto restated = update(id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
     CHECK(restated.find("mode")->asString() == "transcode");
     CHECK(restated.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(restated.find("output")->find("audio")->find("transform")->asString() == "copy");
@@ -2956,7 +3101,7 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
     // A quality instruction belongs to the mode that was asked for too, and
     // is refused outright under direct, so it cannot be allowed to outlive a
     // transcode either.
-    auto capped = create(Json::Object{{"mode", "transcode"}, {"max_height", 720}});
+    auto capped = create(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}});
     CHECK(capped.find("preferences")->find("max_height")->asInt64() == 720);
     auto uncapped = update(capped.find("session_id")->asString(), Json::Object{{"mode", "direct"}});
     CHECK(uncapped.find("mode")->asString() == "direct");
@@ -3002,7 +3147,7 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     playback.start();
 
     auto request_for = [&](const std::string& id) {
-        Json::Object preferences{{"mode", "transcode"}};
+        Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
         Json::Object root{{"media_id", id}, {"preferences", Json(std::move(preferences))}};
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
@@ -3086,7 +3231,7 @@ MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_ent
     playback.start();
 
     auto create = [&](std::string mode, std::string viewer, std::string attempt) {
-        Json::Object preferences{{"mode", std::move(mode)}};
+        Json::Object preferences{{"mode", std::move(mode)}, {"container", "fmp4"}};
         Json::Object root{{"media_id", media_id},
                           {"preferences", Json(std::move(preferences))}};
         auto text = Json(std::move(root)).dump();
@@ -3227,7 +3372,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     // A transformed stream can begin at its resume point in the initial POST.
     // This avoids creating a generation at zero only to destroy it immediately
     // with a PATCH before the player has loaded anything.
-    Json::Object initial_seek_preferences{{"mode", "remux"}};
+    Json::Object initial_seek_preferences{{"mode", "remux"}, {"container", "fmp4"}};
     Json::Object initial_seek_root{{"media_id", media_id},
                                    {"seek_ms", 23000},
                                    {"preferences", Json(std::move(initial_seek_preferences))}};
@@ -3273,7 +3418,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     // The web client may include its current preferences in every PATCH.  If
     // those preferences are unchanged, the request is still semantically a
     // seek-only update and must retain the reusable random-access plan.
-    Json::Object redundant_seek_preferences{{"mode", "remux"}};
+    Json::Object redundant_seek_preferences{{"mode", "remux"}, {"container", "fmp4"}};
     Json::Object redundant_seek_root{{"seek_ms", 47000},
                                      {"preferences", Json(std::move(redundant_seek_preferences))}};
     auto redundant_seek_text = Json(std::move(redundant_seek_root)).dump();
@@ -3356,8 +3501,10 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(options->find("subtitle_streams")->isArray());
     REQUIRE(options->find("subtitle_streams")->asArray().size() == 1);
     CHECK(options->find("subtitle_streams")->asArray().front().find("index")->asInt64() == 2);
-    REQUIRE(options->find("media_ids") != nullptr);
-    CHECK(options->find("media_ids")->asArray().size() == 1);
+    // A title's other files are not the session's to offer: the client
+    // chooses among them from GET /api/v1/playback/media?item_id=.
+    CHECK(options->find("media_ids") == nullptr);
+    CHECK(options->find("can_switch_media") == nullptr);
     REQUIRE(options->find("quality_heights") != nullptr);
     CHECK(!options->find("quality_heights")->asArray().empty());
     auto session_id = created_json.find("session_id")->asString();
@@ -3468,7 +3615,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     // 720p must rebuild the negotiated Auto session at 720p. Remux is not a
     // valid quality-preserving choice here, while Direct remains exposed as the
     // explicit byte-stream override and deliberately ignores quality constraints.
-    Json::Object quality_preferences{{"mode", "transcode"}, {"max_height", 720}};
+    Json::Object quality_preferences{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}};
     Json::Object quality_root{{"preferences", Json(std::move(quality_preferences))}};
     auto quality_text = Json(std::move(quality_root)).dump();
     HttpRequest quality;
@@ -3514,7 +3661,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
                                   {"video_codecs", Json::Array{Json("vp9")}},
                                   {"audio_codecs", Json::Array{Json("opus")}},
                                   {"hls_fmp4", true}};
-    Json::Object unsupported_prefs{{"mode", "transcode"}};
+    Json::Object unsupported_prefs{{"mode", "transcode"}, {"container", "fmp4"}};
     Json::Object unsupported_root{{"media_id", media_id},
                                   {"capabilities", Json(std::move(unsupported_caps))},
                                   {"preferences", Json(std::move(unsupported_prefs))}};
@@ -3533,7 +3680,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     auto unsupported_response = playback.handle(unsupported);
     CHECK(unsupported_response.status == 429);
 
-    Json::Object preferences{{"mode", "transcode"}, {"subtitle_stream", 2}};
+    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}, {"subtitle_stream", 2}};
     Json::Object patch_root{{"preferences", Json(std::move(preferences))}, {"seek_ms", 12000}};
     auto patch_text = Json(std::move(patch_root)).dump();
     HttpRequest patch;
@@ -3607,7 +3754,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     CHECK(transformed_subtitle_off_json.find("stream")->find("subtitle_url")->isNull());
     CHECK(fake_engine_ptr->started_plans().size() == plans_before_transformed_subtitle_off);
 
-    Json::Object second_preferences{{"mode", "transcode"}};
+    Json::Object second_preferences{{"mode", "transcode"}, {"container", "fmp4"}};
     Json::Object second_root{{"media_id", media_id}, {"preferences", Json(std::move(second_preferences))}};
     auto second_text = Json(std::move(second_root)).dump();
     HttpRequest second;
@@ -3811,7 +3958,7 @@ struct PlaybackFixture {
     }
 
     HttpResponse create(const SessionIdentity& who, std::string_view key = {}) {
-        Json::Object preferences{{"mode", "remux"}};
+        Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}};
         Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
@@ -3931,7 +4078,7 @@ MACHA_TEST("media_playback", test_ownership_survives_a_session_replacement) {
     auto id = PlaybackFixture::id_of(created);
 
     auto switched = fixture.control("PATCH", id, alice,
-                                    R"({"preferences":{"mode":"transcode"}})");
+                                    R"({"preferences":{"mode":"transcode","container":"fmp4"}})");
     REQUIRE(switched.status == 200);
     id = PlaybackFixture::body_of(switched).find("session_id")->asString();
 
@@ -4051,7 +4198,7 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
 
     auto create_session = [&](const char* mode) {
         Json::Object root{{"media_id", media_id},
-                          {"preferences", Json(Json::Object{{"mode", mode}})}};
+                          {"preferences", Json(Json::Object{{"mode", mode}, {"container", "fmp4"}})}};
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
         request.method = "POST";
@@ -4234,7 +4381,7 @@ MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
     auto create = [&](const char* mode, int64_t seek_ms) {
         Json::Object root{{"media_id", media_id},
                           {"seek_ms", seek_ms},
-                          {"preferences", Json(Json::Object{{"mode", mode}})}};
+                          {"preferences", Json(Json::Object{{"mode", mode}, {"container", "fmp4"}})}};
         auto text = Json(std::move(root)).dump();
         HttpRequest request;
         request.method = "POST";

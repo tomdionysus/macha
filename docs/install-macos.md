@@ -13,9 +13,16 @@ xcode-select --install
 ```
 
 Macha requires CMake 3.20 or later, a C++20 compiler, OpenSSL, libcurl,
-yaml-cpp and FFmpeg 6 or later development libraries. macFUSE supplies the
-mounted filesystem. miniupnpc enables UPnP port mapping, and
-libtorrent-rasterbar 2.0 or later enables BitTorrent acquisition.
+zlib, yaml-cpp and FFmpeg 6 or later development libraries. zlib comes with
+the macOS SDK. macFUSE supplies the mounted filesystem. miniupnpc enables UPnP
+port mapping, and libtorrent-rasterbar 2.0 or later enables BitTorrent
+acquisition.
+
+The BitTorrent plugin must be built against the same Boost headers that
+libtorrent-rasterbar was built with: Homebrew's `boost` for Homebrew's
+libtorrent-rasterbar, MacPorts' for MacPorts'. Do not point CMake at a
+different Boost installation; a plugin built against mismatched Boost headers
+can crash at runtime.
 
 macFUSE may require approval in **System Settings > Privacy & Security** and a
 restart before its system extension can load.
@@ -47,8 +54,9 @@ cmake --build build-homebrew --parallel
 ctest --test-dir build-homebrew --output-on-failure
 ```
 
-Review the configure output. A full build should report the Homebrew FFmpeg,
-libtorrent and miniupnpc prefixes, as well as macFUSE support.
+Review the configure output. A full build reports the Homebrew FFmpeg,
+libtorrent and miniupnpc prefixes, followed by `FUSE mount plugin enabled`,
+`UPnP port mapping enabled` and `BitTorrent acquisition plugin enabled`.
 
 ## MacPorts dependencies
 
@@ -93,19 +101,29 @@ For the Homebrew build:
 sudo cmake --install build-homebrew
 ```
 
-This installs the executable at `/usr/local/bin/macha` and the configuration
-at `/usr/local/etc/macha/macha.yaml`. For the MacPorts build:
+This installs the executable at `/usr/local/bin/macha`, the administration
+tools (`macha-users`, `macha-recover`, `macha-metadata-dump`,
+`macha-metadata-repair`, `macha-namespace-migrate`) beside it,
+`libmacha_core.dylib` under `/usr/local/lib/macha`, the FUSE and BitTorrent
+plugins that were built under `/usr/local/lib/macha/plugins`, and the
+configuration at `/usr/local/etc/macha/macha.yaml`. The library and plugin
+directory are part of the installation: an upgrade that copies only the
+executable leaves it running against the old core, or without its plugins.
+For the MacPorts build:
 
 ```bash
 sudo cmake --install build-macports
 ```
 
-That installation uses `/opt/local/bin/macha` and
-`/opt/local/etc/macha/macha.yaml`. The installer prints the exact paths and
-preserves an existing configuration during reinstall or upgrade.
+That installation uses the same layout under `/opt/local`, with
+`/opt/local/bin/macha` and `/opt/local/etc/macha/macha.yaml`. The installer
+prints the exact paths and preserves an existing configuration during
+reinstall or upgrade.
 
 Edit the installed `macha.yaml` for this node. Set its advertised address,
-storage paths, capacities and bootstrap peers; install the same secret
+storage paths, capacities and bootstrap peers (on the first node of a new
+cluster, remove the sample `bootstrap` list, since only a node with no
+bootstrap peers founds the cluster); install the same secret
 cluster-key file on every node. Create all configured state, cache, spool,
 mount and storage directories before starting the server. See
 [Configuration](configuration.md) for the complete schema.
@@ -127,7 +145,19 @@ MacPorts installation:
 sudo /opt/local/bin/macha --config /opt/local/etc/macha/macha.yaml
 ```
 
-Stop it with `Ctrl-C` after verifying that the node starts and mounts.
+Verify that the node is serving (the sample configuration binds the API to
+`127.0.0.1:7438`), then stop it with `Ctrl-C` once it has also mounted:
+
+```bash
+curl http://127.0.0.1:7438/api/v1/health
+```
+
+The first node of a new cluster, the one with no `bootstrap` peers, creates
+the `root` and `anonymous` accounts on first start and writes root's
+generated password to `<state_path>/initial-root-password`, mode 0600. Read
+it, sign in, change the password and delete the file. Nodes that join through
+`bootstrap` receive the accounts by replication. See
+[Management](management.md#bootstrapping-and-recovery).
 
 ## Run with launchd
 
@@ -157,8 +187,8 @@ Reconfigure and rebuild as your normal user, run the tests, then repeat the
 appropriate `sudo cmake --install` command. Restart the launchd service if it
 is in use.
 
-To remove installed program and documentation files while preserving
-configuration and runtime data:
+To remove the installed programs, libraries, plugins and documentation while
+preserving configuration and runtime data:
 
 ```bash
 sudo cmake --build build-homebrew --target uninstall

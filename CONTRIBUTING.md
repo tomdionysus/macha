@@ -61,7 +61,7 @@ cmake --build build -j
 whole tree under a sanitizer; see `tests/TESTING.md`. Changes to threading,
 lock ordering or ownership should be run under both before submitting.
 
-Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics need a regression or fault-injection test. Do not weaken quorum safety, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
+Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics need a regression or fault-injection test. Do not weaken the metadata write floor, object integrity, crash durability or foreground I/O behaviour to simplify an error path.
 
 ## Style
 
@@ -75,7 +75,7 @@ Changes to cluster, metadata, storage, crypto, transport or MachaDFS semantics n
 
 ## Dependencies
 
-The dependency-light core/test set is C++20, OpenSSL and libcurl. Building the server and runtime-adapter tests additionally requires yaml-cpp and the FFmpeg/libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE is the mount dependency. libtorrent-rasterbar >= 2.0 enables the optional integrated BitTorrent acquisition component; generic filesystem ingest remains available without it. The FFmpeg command-line tools are not invoked by Macha. Boost is not otherwise required by Macha.
+The dependency-light core/test set (`macha_core`, `macha-tests`) is C++20, OpenSSL, libcurl and zlib. Building the server and runtime-adapter tests additionally requires yaml-cpp and the FFmpeg 6 or later libavformat, libavcodec, libavutil, libswscale and libswresample development libraries. FUSE3/macFUSE builds the mount plugin. libtorrent-rasterbar >= 2.0 builds the optional BitTorrent acquisition plugin and `macha-tests-torrent`; generic filesystem ingest remains available without it. miniupnpc, when found, enables UPnP port mapping. The FFmpeg command-line tools are not invoked by Macha. Boost is not otherwise required by Macha.
 
 ## Security
 

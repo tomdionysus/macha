@@ -57,8 +57,12 @@ mounted filesystem is refused and never unmounted.
 
 ## Dependencies for a complete run
 
-`macha-tests` links the full server, so a host without yaml-cpp, the FFmpeg
-development libraries or the userspace FUSE headers stops at
-`find_package(yaml-cpp REQUIRED)` and cannot build the suite. A partial
-compile of individual translation units is a useful smoke check while
-developing; it is not a suite run and must not be reported as one.
+`run-tests.sh` runs every test executable the build produced and nothing
+else, so a complete run needs all three built: `macha-tests` (links only
+`macha_core`), `macha-tests-runtime` (built only when yaml-cpp and the FFmpeg
+development libraries are found) and `macha-tests-torrent` (built only with
+libtorrent-rasterbar >= 2.0). With the default `MACHA_BUILD_SERVER=ON`,
+configure stops with a fatal error when yaml-cpp or FFmpeg is missing. The
+FUSE and torrent plugin cases in `macha-tests` depend on those plugins being
+built too. A partial compile of individual translation units is a useful smoke
+check while developing; it is not a suite run and must not be reported as one.

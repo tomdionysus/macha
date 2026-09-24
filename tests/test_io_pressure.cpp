@@ -426,8 +426,8 @@ MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured
 }
 
 MACHA_FAST_TEST("io_pressure", test_control_cannot_enter_the_data_arbiter_at_all) {
-    // Law 1. Control traffic must remain promptly serviceable whatever the
-    // DATA devices are doing, and the structural guarantee is that it never
+    // Law 1. Control never queues behind or runs inline with bulk data work,
+    // whatever the DATA devices are doing, and the structural guarantee is that it never
     // enters this object: the control store is a separate LocalStore on a
     // separate device, nothing on its path feeds the monitor, and an attempt
     // to take DATA credit for control work is a programming error rather than
