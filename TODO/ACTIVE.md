@@ -24,7 +24,8 @@ verified, under the DATA arbiter at loader class. Four stages, the first of
 which alone removes the mechanism.
 
 **Stage 2 in production, first torrent (Trainspotting, gbni-1, 2026-09-24
-09:14Z): publication stalled at 162 of 436 extents, NOT FIXED.** Download and
+09:14Z): publication stalled at 162 of 436 extents -- fixed in 0.55.1 by
+taking verified pieces from the torrent's bitfield; confirm on the next torrent.** Download and
 publication started together (39 -> 121 extents in 40 s), then publication
 stopped with no error while the download finished. A gdb stack showed the
 publisher idle in its empty-queue wait: the remaining extents were never

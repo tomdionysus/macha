@@ -1,5 +1,29 @@
 # Current release
 
+## 0.55.1 — Extent publication does not depend on piece alerts (development)
+
+**On its first real torrent, stage 2 stopped publishing at 162 of 436 extents
+and never resumed** (Trainspotting, gbni-1, 2026-09-24). The download
+finished; a stack trace showed the publisher idle on an empty queue: the
+remaining extents were never queued, because the verifications of their
+pieces never reached the disk backend. The ingest fell back to copying, as
+designed, so the film imported correctly -- the old way.
+
+Verification rode on one `piece_finished_alert` per piece, and libtorrent's
+alert queue is bounded and drops on overflow. Whether it dropped here cannot
+be proven after the fact: `alerts_dropped_alert` went to the alert bridge at
+`DEBUG` and the nodes run `torrent.log_level: INFO`.
+
+The torrent's own have-bitfield is now the record and alerts are a hint:
+every held piece is reported to the backend when a torrent is checked, when it
+finishes (`torrent_finished_alert`), and every 10 s while the manager runs.
+A lost alert delays an extent by at most that interval. Reporting a piece
+again publishes nothing twice (tested).
+
+`alerts_dropped_alert` is now a `WARN`, so the next occurrence says so, and
+the backend logs `torrent extents all published save_path=... extents=N` when
+a torrent's last extent is published.
+
 ## 0.55.0 — A torrent's extents are published as they verify (development)
 
 Stage 2 of `TODO/2026-09-23-torrent-disk-backend-plan.md`. **The torrent's

@@ -877,14 +877,26 @@ void TorrentManager::drain_alerts() {
                 verifications_->piece_verified(*path, static_cast<int>(finished->piece_index));
             continue;
         }
-        // A check (a resume, or a recheck) reports no per-piece alerts, so
-        // every piece the torrent already has is reported here instead.
+        // A check (a resume, or a recheck) reports no per-piece alerts, and
+        // piece alerts can be dropped (below), so at these two points every
+        // piece the torrent holds is reported from its own bitfield.
         if (const auto* checked = lt::alert_cast<lt::torrent_checked_alert>(alert)) {
-            if (const auto path = save_path_of(checked->handle)) {
-                const auto have = checked->handle.status(lt::torrent_handle::query_pieces).pieces;
-                for (int piece = 0; piece < have.size(); ++piece)
-                    if (have.get_bit(lt::piece_index_t(piece))) verifications_->piece_verified(*path, piece);
-            }
+            report_held_pieces(checked->handle);
+            continue;
+        }
+        if (const auto* finished = lt::alert_cast<lt::torrent_finished_alert>(alert)) {
+            report_held_pieces(finished->handle);
+            continue;
+        }
+        // libtorrent's alert queue is bounded and drops on overflow. On
+        // 2026-09-24 Trainspotting's publication stopped at 162 of 436
+        // extents with the publisher idle and nothing logged; a lost
+        // piece_finished_alert is the likely cause, and until this line a
+        // drop was invisible below debug.
+        if (const auto* dropped = lt::alert_cast<lt::alerts_dropped_alert>(alert)) {
+            Log::warn("torrent alert queue overflowed: " + std::to_string(dropped->dropped_alerts.count()) +
+                      " alert types lost; verified pieces are also taken from each torrent's own "
+                      "bitfield, so extent publication does not depend on them");
             continue;
         }
         // Having no inbound port is an operational fact, not churn: the node
@@ -939,6 +951,14 @@ void TorrentManager::drain_alerts() {
                       "network.advertise names a live link on this node.");
         }
     }
+}
+
+void TorrentManager::report_held_pieces(const lt::torrent_handle& handle) {
+    const auto path = save_path_of(handle);
+    if (!path) return;
+    const auto held = handle.status(lt::torrent_handle::query_pieces).pieces;
+    for (int piece = 0; piece < held.size(); ++piece)
+        if (held.get_bit(lt::piece_index_t(piece))) verifications_->piece_verified(*path, piece);
 }
 
 std::optional<std::string> TorrentManager::save_path_of(const lt::torrent_handle& handle) const {
@@ -1003,6 +1023,13 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
 void TorrentManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         drain_alerts();
+        // Piece alerts are a hint; the bitfield is the record. Every few
+        // seconds every torrent's held pieces are reported again, so a lost
+        // alert delays an extent's publication by at most this interval.
+        if (impl_ && Clock::now() - last_held_pieces_report_ >= held_pieces_report_interval) {
+            last_held_pieces_report_ = Clock::now();
+            for (const auto& [_, handle] : impl_->handles) report_held_pieces(handle);
+        }
         update_jobs();
         std::unique_lock lock(mutex_);
         if (has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire)) {

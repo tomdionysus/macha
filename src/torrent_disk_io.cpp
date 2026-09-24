@@ -109,6 +109,7 @@ struct Storage {
     std::vector<std::vector<size_t>> piece_extents;
     std::mutex publish_mutex;
     std::vector<bool> verified; // guarded by publish_mutex
+    size_t published_count{};   // guarded by publish_mutex
     // Touched only by the publisher thread.
     std::unique_ptr<TorrentExtentJournal> journal;
     // Touched only by the job currently running for this storage, and jobs
@@ -465,6 +466,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                     const auto it = known->second.extents.find(offset);
                     extent.published = it != known->second.extents.end() && it->second.length == extent.length;
                 }
+                if (extent.published) ++storage.published_count;
                 const auto index = storage.extents.size();
                 storage.extents.push_back(std::move(extent));
                 for (int piece = storage.extents[index].first_piece; piece <= storage.extents[index].last_piece; ++piece)
@@ -564,6 +566,9 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         std::lock_guard lock(storage.publish_mutex);
         storage.extents[job.extent].published = true;
         storage.extents[job.extent].queued = false;
+        if (++storage.published_count == storage.extents.size())
+            Log::info("torrent extents all published save_path=" + storage.save_path +
+                      " extents=" + std::to_string(storage.extents.size()));
         return true;
     }
 
