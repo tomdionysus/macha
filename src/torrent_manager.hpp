@@ -71,6 +71,19 @@ class TorrentManager final : public TorrentService {
     void report_held_pieces(const libtorrent::torrent_handle&);
     static constexpr auto held_pieces_report_interval = std::chrono::seconds(10);
     Clock::time_point last_held_pieces_report_{};
+    // A downloaded torrent is handed to the ingest only once the disk backend
+    // has published every extent of it, so the ingest adopts them rather than
+    // copying. Per job: the progress last seen, and when it last advanced.
+    struct PublicationWait {
+        size_t published{};
+        Clock::time_point advanced{};
+    };
+    std::map<std::string, PublicationWait, std::less<>> publication_waits_;
+    // Publication that stops advancing for this long is given up on: the
+    // ingest runs and copies what is missing, rather than the job waiting for
+    // ever on a put that will not succeed.
+    static constexpr auto publication_stall_limit = std::chrono::minutes(10);
+    bool publication_settled_locked(const std::string& id, const TorrentJob& job);
     // The save path of the job a session handle belongs to, if any.
     std::optional<std::string> save_path_of(const libtorrent::torrent_handle&) const;
     void update_jobs();

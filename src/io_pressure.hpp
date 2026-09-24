@@ -5,6 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <string>
+
+#include "log.hpp"
 
 namespace macha {
 
@@ -164,12 +167,19 @@ class DiskServiceMonitor {
 
         // Hysteresis, evaluated here so the admission path is a single relaxed
         // load rather than a comparison it has to get right at every call site.
+        //
+        // Onset and release are logged, once each per transition. Until they
+        // were, the only evidence of pressure was the torrent clamp line, and
+        // that fired only with a viewer (2026-09-23 incident).
         if (next_slowdown > thresholds_.slowdown_percent ||
             (thresholds_.outlier_percent && ratio > thresholds_.outlier_percent)) {
-            if (!pressured_.exchange(true, std::memory_order_relaxed))
+            if (!pressured_.exchange(true, std::memory_order_relaxed)) {
                 pressure_onsets_.fetch_add(1, std::memory_order_relaxed);
+                log_transition("DATA device pressure onset", next_slowdown, ratio, micros, bytes);
+            }
         } else if (next_slowdown < thresholds_.release_percent) {
-            pressured_.store(false, std::memory_order_relaxed);
+            if (pressured_.exchange(false, std::memory_order_relaxed))
+                log_transition("DATA device pressure released", next_slowdown, ratio, micros, bytes);
         }
     }
 
@@ -205,6 +215,17 @@ class DiskServiceMonitor {
     }
 
   private:
+    static void log_transition(const char* what, uint64_t slowdown, uint64_t ratio, uint64_t micros,
+                               uint64_t bytes) noexcept {
+        try {
+            Log::info(std::string(what) + " slowdown_percent=" + std::to_string(slowdown) +
+                      " last_percent=" + std::to_string(ratio) + " last_us=" + std::to_string(micros) +
+                      " last_bytes=" + std::to_string(bytes));
+        } catch (...) {
+            // A log line must never fail the I/O it describes.
+        }
+    }
+
     // 1/16 weight on each new sample. A modest outlier is absorbed -- one
     // 200 ms write against a 2 ms mean does not gate anything -- while a
     // catastrophic one moves the mean past the target on its own, which is
