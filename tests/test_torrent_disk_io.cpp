@@ -798,7 +798,7 @@ MACHA_TEST("torrent_disk_io", test_a_three_hundred_file_torrent_holds_a_bounded_
 
 MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_on_abort) {
     // The arbiter-backed admission the node installs: loader class, so it
-    // is admitted on a pressured device with no viewer (law 2), waits while
+    // is admitted on a pressured device with no viewer (law 3), waits while
     // the loader ceiling is full, proceeds when a lease is released, and gives
     // up promptly once the backend aborts.
     DiskServiceMonitor monitor;

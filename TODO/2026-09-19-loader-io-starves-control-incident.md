@@ -63,7 +63,7 @@ And **`catalogue/status` doing O(artwork) disk probes on a polled route is its
 own defect**, filed separately below.
 
 Requests that are normally sub-millisecond took eight seconds. **Governing law
-1 is violated on the DATA backend by the node's own loader work. Law 3 is not
+2 is violated on the DATA backend by the node's own loader work. Law 1 is not
 violated**: control touches no disk and held 1.2-1.6 ms p99 through a
 reproduction at 86% iowait.
 
@@ -74,7 +74,7 @@ node manufactures.
 
 ## Why nothing stopped it
 
-Law 3 is enforced in three resources and absent from a fourth.
+Law 1 is enforced in three resources and absent from a fourth.
 
 | resource | protected | mechanism |
 |---|---|---|
@@ -94,8 +94,8 @@ Law 3 is enforced in three resources and absent from a fourth.
 - **Nothing observes I/O latency.** There is no feedback from measured service
   time into loader admission anywhere in the tree.
 
-Law 2 is work-conserving on purpose: with no viewer present the loader takes
-everything. "Everything" silently includes the headroom law 3 needs. The laws
+Law 3 is work-conserving on purpose: with no viewer present the loader takes
+everything. "Everything" silently includes the headroom law 1 needs. The laws
 are mediated against each other in memory and in threads; on disk they compete
 unmediated, and the loader wins because nothing tells it not to.
 

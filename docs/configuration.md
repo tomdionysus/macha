@@ -46,9 +46,9 @@ which survive an asynchronous boundary, including FUSE write/operation state,
 RPC queues and active playback fragment stores.
 
 The three reserves are headroom within that total, and they are the
-[governing laws](../ARCHITECTURE.md#governing-laws) expressed as memory: durable
-loader work cannot consume viewer or control headroom (laws 1 and 3), and
-speculative work preserves a loader floor beneath it (law 2). Reconstructible
+[governing laws](principles-and-laws.md#scheduling-laws) expressed as memory: durable
+loader work cannot consume viewer or control headroom (laws 1 and 2), and
+speculative work preserves a loader floor beneath it (law 3). Reconstructible
 caches may borrow otherwise idle capacity only when they can be shed before
 higher-priority admission. Sizing a reserve is therefore a policy decision about
 which class of work is allowed to fail first, not a tuning knob: shrinking
@@ -313,15 +313,15 @@ Under simultaneous demand, bounded loader bursts yield at 256 KiB spool chunk
 boundaries and receive a proportional event-driven cooldown; loader progress is
 never stopped indefinitely.
 
-These two weights are the [governing laws](../ARCHITECTURE.md#governing-laws)
+These two weights are the [governing laws](principles-and-laws.md#scheduling-laws)
 made configurable, and the configuration is wider than the laws are. Each is
 validated only as 1..10000 independently, so a pair such as `viewer_weight: 5`
-with `loader_weight: 95` is accepted and inverts law 1: a bulk import would
+with `loader_weight: 95` is accepted and inverts law 2: a bulk import would
 then outrank playback on the same node. Keep `viewer_weight` well above
 `loader_weight`. Raising `loader_weight` is the right move for a node doing a
 large one-off import with nobody watching, and it should be put back afterwards;
 it is not a way to make imports finish faster on a node that is also serving
-viewers, because that is precisely what law 1 forbids.
+viewers, because that is precisely what law 2 forbids.
 
 FUSE spool policy is fixed when the frontend starts; changing these values
 requires a server restart. Status exposes current bytes, configured limit,
@@ -334,7 +334,7 @@ executor worker, queue, active and peak counts.
 ### Retry budgets and parking
 
 These settings are
-[discipline 2, one work-item policy](../ARCHITECTURE.md#the-self-healing-disciplines):
+[discipline 2, one work-item policy](principles-and-laws.md#self-healing-disciplines):
 every retried unit of work gets backoff, a failure budget, a parked state
 visible in Status, and an operator action, so that "not yet" cannot silently
 become "forever".

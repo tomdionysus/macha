@@ -217,7 +217,7 @@ The backend (`src/torrent_disk_io.cpp`) implements libtorrent's
 
 - **Admitted as a loader.** An acquisition is durable work someone asked for,
   so it yields to a slow device only when a viewer would otherwise wait
-  (law 2), like the ingest that follows it.
+  (law 3), like the ingest that follows it.
 - **Measured on the right device.** The torrent's I/O is fed to the DATA
   device's monitor only when staging shares that device, which it does on
   every node today. The monitor's verdict now describes the load that is
@@ -287,7 +287,7 @@ A commit now asks each peer which of the referenced objects it is missing and
 sends only those, over a new CONTROL-plane `have_control_objects` message.
 `have_objects` could not answer this: it reads `local_store()`, so it can say
 nothing about control objects. The new handler reads `control_store()` and
-takes no DATA admission at all, because law 3 does not let a control index
+takes no DATA admission at all, because law 1 does not let a control index
 lookup wait on the DATA arbiter. A peer too old to know the message answers
 with an error and is sent the whole graph, exactly as before.
 
@@ -333,7 +333,7 @@ left pressure **twelve times in the thirty-four minutes** since it started
 watched anywhere on the cluster. `test_a_read_is_measured_with_the_bytes_it_returned`
 drives real objects through a real pool and fails without the call.
 
-**The torrent rate clamp never had law 2's second clause.**
+**The torrent rate clamp never had law 3's second clause.**
 `TorrentManager::follow_device_pressure()` clamped the download rate whenever
 the device was pressured. An acquisition is durable work the user asked for —
 loader class — so it yields to a slow device only when a viewer would
@@ -385,8 +385,8 @@ not be answered during the 2026-09-22 incident. `DataWorkContext::records_activi
 was dead in the same way and is removed.
 
 **What the audit confirmed rather than assumed**, and what it left open, is
-recorded in `TODO/ACTIVE.md`: law 1 has no admission path to a delayed viewer
-read; law 3 holds on the hardware (control on NVMe, DATA on the spinner, on all
+recorded in `TODO/ACTIVE.md`: law 2 has no admission path to a delayed viewer
+read; law 1 holds on the hardware (control on NVMe, DATA on the spinner, on all
 three nodes) but by configuration rather than by construction; law 4 does not
 wedge, though the 150–300% hysteresis band is a latch. Two things stay open —
 one monitor covers a whole `StoragePool` rather than one device, and local disk
@@ -427,7 +427,7 @@ expectation. Setting `io_pressure_slowdown_percent: 0` disables the mechanism.
 19% to 237% against fifty healthy samples — *under* the 300% line. The ratio
 catches sustained degradation and would have let the founding case through.
 
-**Law 2 is enforced instead of flattened.** "Thou Shalt Not Make The
+**Law 3 is enforced instead of flattened.** "Thou Shalt Not Make The
 Ingester/Loader Wait, Unless It Would Make The Viewer Wait." 0.51.0 made the
 loader yield whenever the device was slow, with no viewer anywhere. Now the
 loader yields only when a viewer is present — waiting for credit or holding it
@@ -505,7 +505,7 @@ lane, same workers, same moment.
 **DATA admission consults it.** While a device is pressured, loader and
 speculative admission for it is held to `io_pressure_min_background` leases.
 **A viewer is never gated by pressure**: if the disk is slow, the person waiting
-on it gets all of it. Law 2 is kept — bounded, never stopped — so a loader that
+on it gets all of it. Law 3 is kept — bounded, never stopped — so a loader that
 is itself the reason the disk is busy drains at a trickle instead of
 deadlocking on its own publication.
 
@@ -1086,10 +1086,10 @@ producing".
 were written down anywhere a reader could reach.** They were stated once, in
 `TODO/ACTIVE.md`, a backlog file whose own header warns it will mislead anyone
 who reads it as guidance. Meanwhile the source cites them by number as settled
-authority: `src/retained_memory.hpp:212` ("Governing law 1 is that the viewer
-never waits"), `src/config.hpp:333` ("governing law 3, as a data structure"),
+authority: `src/retained_memory.hpp:212` ("Governing law 2 is that the viewer
+never waits"), `src/config.hpp:333` ("governing law 1, as a data structure"),
 `src/fuse_frontend.hpp:491`, `tests/test_foundations.cpp:1115`. A contributor
-who hit "governing law 3" in a header had nowhere to look it up. Zero
+who hit "governing law 1" in a header had nowhere to look it up. Zero
 occurrences across `docs/` and every root document.
 
 They now open `ARCHITECTURE.md`, above the design boundary, with the numbering
@@ -1097,20 +1097,20 @@ intact, alongside the four self-healing disciplines that had the same problem
 and lived only in a dated plan file.
 
 **The laws do not simply rank, and saying so is the substance of the section.**
-Law 2 is subordinate to law 1 -- that is what its second clause is for, and why
-loader work yields to a viewer rather than negotiating with one. Law 3 is not
-subordinate to law 1: it is a floor law 1 may not eat through, which is the
+Law 3 is subordinate to law 2 -- that is what its second clause is for, and why
+loader work yields to a viewer rather than negotiating with one. Law 1 is not
+subordinate to law 2: it is a floor law 2 may not eat through, which is the
 entire force of "a large configurable share, not indefinite starvation of all
 other work". A node serving viewers perfectly while unable to answer `ping` has
-broken law 3, and peers who cannot see how well it was doing will record it as
-dead. So the resolution order is law 3's floor reserved first, law 1 taking
-priority within what remains, law 2 governing the rest.
+broken law 1, and peers who cannot see how well it was doing will record it as
+dead. So the resolution order is law 1's floor reserved first, law 2 taking
+priority within what remains, law 3 governing the rest.
 
 **Named at the point of application** rather than stated once and left to be
 spotted. The three `runtime.*_memory_reserve_bytes` settings are the laws
 expressed as memory, which reframes sizing them as a decision about which class
-of work is allowed to fail first. The fast-control allow-list is law 3 on the
-RPC path. The DATA priority ordering is laws 1 and 2 as an execution order. The
+of work is allowed to fail first. The fast-control allow-list is law 1 on the
+RPC path. The DATA priority ordering is laws 2 and 3 as an execution order. The
 durability-token probe is discipline 1, the recovery-resolution table
 discipline 3, the retry budgets discipline 2, snapshot composition discipline 4.
 
@@ -1154,7 +1154,7 @@ keys still parsed are documented as aliases without the backstory.
 **One gap documented rather than fixed.** `viewer_weight` and `loader_weight`
 are validated only as 1..10000 independently
 (`src/config_base.cpp:158-160`), so `viewer_weight: 5` with
-`loader_weight: 95` is accepted and inverts law 1: a bulk import outranking
+`loader_weight: 95` is accepted and inverts law 2: a bulk import outranking
 playback on the same node. `docs/configuration.md` now warns. Rejecting the
 inversion in `validate_config` is the other half and is not in this release.
 
@@ -1544,7 +1544,7 @@ What changed, in the order a request meets it:
   routes and every body read that can block on a disk or a replica. The
   control lane (`catalogue.api.control_workers`, 2) runs health, status,
   session and account routes, so a node saturated serving fragments still
-  says what is wrong with it: governing law 3 as a data structure rather
+  says what is wrong with it: governing law 1 as a data structure rather
   than a hope. A lane with `max_queued_requests` (256) waiting answers
   `503 overloaded` with `Retry-After: 1` instead of queueing without bound;
   the body carries `service: macha` and `status: busy` alongside the error

@@ -164,13 +164,13 @@ class DataResourceArbiter {
     // Measured device service time, or null where there is no device to
     // measure (tests, and any arbiter not fronting a store).
     const DiskServiceMonitor* service_monitor_{};
-    // Law 2: the loader is bounded, never stopped. Under pressure this many
+    // Law 3: the loader is bounded, never stopped. Under pressure this many
     // background leases are still admitted, so publication and repair make
     // progress at a trickle instead of deadlocking behind a disk that is busy
     // because of them.
     uint64_t min_background_under_pressure_{1};
     uint64_t pressure_refusals_{};
-    // Law 2 asks whether a viewer is *present*, not whether one happens to be
+    // Law 3 asks whether a viewer is *present*, not whether one happens to be
     // holding byte credit at this instant. Playback is bursty: between two
     // extents a viewer holds nothing, so deciding on credit alone readmitted
     // the loader at full concurrency in every gap and a viewer's next read
@@ -271,7 +271,7 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes,
         return true;
     if (waiting_viewers_)
         return false;
-    // Law 2: the loader yields only when it would otherwise make a viewer
+    // Law 3: the loader yields only when it would otherwise make a viewer
     // wait. A slow device with nobody reading from it is a device doing its
     // job, and holding an operator's import back for it is exactly the
     // violation the law names -- it cost a 36 GB import an afternoon at 2 MB/s

@@ -95,7 +95,7 @@ that wait on the media pipeline.
 A single deeply prefetching native player can take the whole pool; three
 client families each holding one kept-alive connection take most of it.
 When the pool is gone the node stops answering `/api/v1/health` and
-`/api/v1/status`, which is a governing-law-3 violation.
+`/api/v1/status`, which is a governing-law-1 violation.
 
 ## The design
 
@@ -140,7 +140,7 @@ Two lanes, mirroring the request classes the RPC layer already has
 (`RequestClass` in `src/net.hpp:546`): a **control** lane for health,
 status, session and users, and a **data** lane for catalogue, playback and
 web assets. Each lane is a small pool. Control traffic never queues behind
-playback, which is governing law 3 stated as a data structure rather than
+playback, which is governing law 1 stated as a data structure rather than
 as a hope. Whether this is two pools or one pool with a priority queue is an
 open decision below; the recommendation is two pools, because starvation of
 a lane is then impossible rather than merely unlikely.

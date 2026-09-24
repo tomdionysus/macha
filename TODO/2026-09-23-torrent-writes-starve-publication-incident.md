@@ -127,12 +127,12 @@ Decided 2026-09-23 evening: see [the backend plan](2026-09-23-torrent-disk-backe
 - Does the torrent feed belong under the same admission as everything else
   that writes the DATA spindle: a bounded, pressure-aware rate held for as
   long as the device is slow, rather than a clamp gated on a 2 s viewer
-  window? Or should staging not share the DATA spindle at all? Law 3 holds
+  window? Or should staging not share the DATA spindle at all? Law 1 holds
   by configuration, not construction, and this is the first time it bit.
 - Should a DATA credit ever be held across a peer RPC? Today a slow peer
   becomes local starvation, and two nodes replicating to each other hold
   each other's only slot.
-- Should the loader share the background concurrency ceiling? Law 2 says
+- Should the loader share the background concurrency ceiling? Law 3 says
   the loader yields only to a viewer; under pressure it currently yields to
   the ceiling.
 
