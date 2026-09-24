@@ -458,6 +458,37 @@ MACHA_TEST("torrent_disk_io", test_extents_publish_once_their_pieces_verify_and_
     }
 }
 
+MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held_bitfield) {
+    // Trainspotting, 2026-09-24: publication stopped at 162 of 436 extents
+    // with the publisher idle, because verifications for the rest never
+    // arrived. Only some pieces are reported here, as alerts would be when
+    // the queue drops them; then every held piece is reported again, as the
+    // manager now does from the torrent's bitfield. Everything publishes,
+    // exactly once.
+    TempDir dir;
+    std::atomic<int> publishes{0};
+    TorrentDiskHooks hooks;
+    hooks.extent_size = 3 * block;
+    hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        ++publishes;
+        return object_id(bytes);
+    };
+    const auto verifications = hooks.verifications;
+    Harness h(layout({300000}, 2 * block), dir.path(), hooks);
+    REQUIRE(h.write_all(pattern_bytes(300000, 11)));
+    const int pieces = h.files.num_pieces();
+    constexpr int extents = (300000 + 3 * block - 1) / (3 * block);
+    for (int piece = 0; piece < pieces; piece += 3) verifications->piece_verified(h.save_path, piece);
+    std::this_thread::sleep_for(200ms);
+    CHECK(publishes.load() < extents);
+    for (int piece = 0; piece < pieces; ++piece) verifications->piece_verified(h.save_path, piece);
+    REQUIRE(wait_for([&] { return publishes.load() == extents; }, 5s));
+    for (int piece = 0; piece < pieces; ++piece) verifications->piece_verified(h.save_path, piece);
+    std::this_thread::sleep_for(200ms);
+    CHECK(publishes.load() == extents);
+}
+
 MACHA_TEST("torrent_disk_io", test_a_restarted_backend_does_not_republish_journalled_extents) {
     // Resume: extents the journal already records are not published again
     // when the same payload is added to a new backend and its pieces verify.
