@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "torrent_extent_journal.hpp"
 #include "test_backend_support.hpp"
 #include "acquisition_api.hpp"
 #include "subsystem_abi.hpp"
@@ -2657,6 +2658,134 @@ bool all_imports_copied(const IngestManager& ingest, const std::vector<std::stri
 }
 
 } // namespace
+
+namespace {
+
+// A source root holding one file whose bytes are `bytes`, and an extent
+// journal beside it recording the extents a torrent's disk backend would
+// have published. When `store_them` is false the journal names objects that
+// were never stored.
+struct PublishedSource {
+    std::filesystem::path root;
+    std::string name;
+    std::vector<ObjectId> ids;
+};
+
+PublishedSource make_published_source(TestService& fixture, Service& service, const Bytes& bytes,
+                                      bool store_them) {
+    PublishedSource out;
+    out.root = fixture.path() / (store_them ? "published-import" : "unpublished-import");
+    out.name = "Published Movie 2024.mkv";
+    std::filesystem::create_directories(out.root);
+    std::ofstream(out.root / out.name, std::ios::binary)
+        .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    const auto extent_size = fixture.config().extent_size;
+    TorrentExtentJournal journal(out.root);
+    for (uint64_t offset = 0; offset < bytes.size(); offset += extent_size) {
+        const auto length = std::min<uint64_t>(extent_size, bytes.size() - offset);
+        const std::span<const uint8_t> slice(bytes.data() + offset, static_cast<size_t>(length));
+        ObjectId id;
+        if (store_them) {
+            id = service.filesystem().store().put(slice, FrameType::loader);
+        } else {
+            // A different object of the same length, never stored.
+            Bytes other(slice.begin(), slice.end());
+            other[0] ^= 0xff;
+            id = object_id(other);
+        }
+        journal.append(out.name, bytes.size(), {offset, length, id});
+        out.ids.push_back(id);
+    }
+    return out;
+}
+
+Bytes read_whole(FileSystem& fs, const std::string& path, uint64_t size) {
+    Bytes out(static_cast<size_t>(size));
+    auto reader = fs.open_read(path);
+    size_t done = 0;
+    while (done < out.size()) {
+        const auto got = reader->read(done, std::span<uint8_t>(out.data() + done, out.size() - done));
+        if (!got) break;
+        done += got;
+    }
+    out.resize(done);
+    return out;
+}
+
+} // namespace
+
+MACHA_TEST("hydration_catalogue", test_ingest_commits_published_torrent_extents_without_copying) {
+    // Stage 2 of the torrent disk backend: a torrent publishes each extent as
+    // its pieces verify and records it in the job's extent journal. The ingest
+    // then commits the file by naming those extents -- the committed manifest
+    // is exactly the journal's -- instead of copying the bytes a second time.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+    auto& service = fixture.start();
+
+    const auto bytes = pattern(2 * fixture.config().extent_size + 1000);
+    const auto source = make_published_source(fixture, service, bytes, true);
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = {source.root};
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(), ingest_config);
+    const auto id = ingest.submit_path(source.root);
+    ingest.start();
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+
+    const auto job = ingest.job(id);
+    REQUIRE(job.has_value());
+    // The journal is not media and is not imported.
+    REQUIRE(job->files.size() == 1);
+    const auto destination = job->files.front().destination_path;
+    const auto entry = service.filesystem().getattr(destination);
+    CHECK(entry.size == bytes.size());
+    REQUIRE(entry.extents.size() == source.ids.size());
+    for (size_t i = 0; i < source.ids.size(); ++i) CHECK(entry.extents[i].id == source.ids[i]);
+    CHECK(read_whole(service.filesystem(), destination, bytes.size()) == bytes);
+    ingest.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_missing) {
+    // The journal is a claim, not proof. A manifest naming objects the store
+    // does not hold must never be committed: the ingest falls back to copying,
+    // and the file holds the real bytes.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+    auto& service = fixture.start();
+
+    const auto bytes = pattern(2 * fixture.config().extent_size + 1000);
+    const auto source = make_published_source(fixture, service, bytes, false);
+
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = {source.root};
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(), ingest_config);
+    const auto id = ingest.submit_path(source.root);
+    ingest.start();
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+
+    const auto job = ingest.job(id);
+    REQUIRE(job.has_value());
+    const auto destination = job->files.front().destination_path;
+    const auto entry = service.filesystem().getattr(destination);
+    CHECK(entry.size == bytes.size());
+    for (const auto& extent : entry.extents)
+        for (const auto& bogus : source.ids) CHECK(extent.id != bogus);
+    CHECK(read_whole(service.filesystem(), destination, bytes.size()) == bytes);
+    ingest.stop();
+}
 
 MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_configured_bound) {
     // Ingest was strictly serial: one worker thread taking one job at a time

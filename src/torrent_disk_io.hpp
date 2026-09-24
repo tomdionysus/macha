@@ -14,11 +14,18 @@
 // and timed into the monitor, so the torrent is one more loader under the laws
 // rather than an unmetered writer beside them.
 //
-// Stage 1 of TODO/2026-09-23-torrent-disk-backend-plan.md: payload is still
-// written in the torrent's own file layout under the save path, so the ingest
-// that follows a finished download is unchanged.
+// Stage 1 of TODO/2026-09-23-torrent-disk-backend-plan.md: payload is written
+// in the torrent's own file layout under the save path.
+//
+// Stage 2: each file-relative extent of that payload is published to the store
+// as soon as every piece covering it has verified, and recorded in the job's
+// TorrentExtentJournal, so the ingest commits the file by naming its extents
+// instead of copying it. The payload file is the assembly area for its
+// extents; reading an extent back goes through one function (read_extent),
+// which is the seam where a staging format of macha's own would replace it.
 
 #include "data_work.hpp"
+#include "types.hpp"
 
 #include <libtorrent/session_params.hpp>
 
@@ -27,8 +34,35 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <string>
 
 namespace macha {
+
+// Pieces libtorrent has verified, routed from the session's alerts (on the
+// torrent manager's thread) to the disk backend that owns the storage. A torrent
+// is named by its save path, which is unique per job.
+class TorrentPieceVerifications {
+  public:
+    void piece_verified(const std::string& save_path, int piece) {
+        std::lock_guard lock(mutex_);
+        if (sink_) sink_(save_path, piece);
+    }
+    void attach(std::function<void(const std::string&, int)> sink) {
+        std::lock_guard lock(mutex_);
+        sink_ = std::move(sink);
+    }
+    void detach() {
+        std::lock_guard lock(mutex_);
+        sink_ = nullptr;
+    }
+
+  private:
+    std::mutex mutex_;
+    std::function<void(const std::string&, int)> sink_;
+};
 
 struct TorrentDiskHooks {
     // Blocks until `bytes` of loader-class DATA credit is held, and returns
@@ -44,6 +78,16 @@ struct TorrentDiskHooks {
     // spindle; libtorrent's own default of ten queued thirty-odd requests deep
     // on es-1.
     size_t threads{2};
+    // Stage 2. With extent_size, publish and verifications all set, every
+    // extent of the payload is published once its pieces verify. Unset, the
+    // backend only writes payload files (stage 1 behaviour, and tests).
+    uint64_t extent_size{};
+    // Stores one extent's bytes durably and returns its object id, or nothing
+    // on failure (the backend retries).
+    std::function<std::optional<ObjectId>(std::span<const uint8_t>)> publish;
+    std::shared_ptr<TorrentPieceVerifications> verifications;
+    // How long a failed publication waits before it is tried again.
+    std::chrono::milliseconds publish_retry{std::chrono::seconds(30)};
 };
 
 libtorrent::disk_io_constructor_type macha_disk_io_constructor(TorrentDiskHooks hooks);

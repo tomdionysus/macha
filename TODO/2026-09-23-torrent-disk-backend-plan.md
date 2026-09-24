@@ -6,6 +6,14 @@ deployed** (0.54.0 in the tree): es-1 full suite 525/525 + runtime 10/10 +
 there, including a loopback swarm through the backend. Stages 2-4 not
 started.
 
+**Stage 2 built 2026-09-24 as 0.55.0** (es-1: 528/528 + 10/10 + 12/12,
+torrent binary 120/120 over ten repeats including a loopback swarm with
+publication). Built on the payload files as the assembly area ("option A");
+the operator has not chosen between that and a staging format of macha's own
+("option B"), and everything specific to A is behind `read_extent`. Open
+risk to measure in production: one publisher thread may trail a fast
+download, and a file incomplete at finish is copied as before.
+
 **The laptop cannot host a real libtorrent session** (the swarm test fails
 there, every time): `/usr/local/include/boost` is a manual Boost 1.91 install
 that shadows Homebrew's 1.92, and CMake finds it

@@ -1162,6 +1162,16 @@ void IngestManager::catalogue_loop(std::stop_token stop) {
 }
 
 void IngestManager::process_job(const std::string& id, std::stop_token stop) {
+    // The job's extent journal (published_extents) is cached only for the
+    // life of this call, whichever way it leaves.
+    struct ForgetExtentJournal {
+        IngestManager& self;
+        const std::string& id;
+        ~ForgetExtentJournal() {
+            std::lock_guard lock(self.extent_journals_mutex_);
+            self.extent_journals_.erase(id);
+        }
+    } forget_extent_journal{*this, id};
     IngestJob job;
     {
         std::lock_guard lock(mutex_);
@@ -1517,6 +1527,41 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         file.copied = 0;
     }
 
+    // A torrent has usually published every extent of this file already, as
+    // its pieces verified (TODO/2026-09-23-torrent-disk-backend-plan.md,
+    // stage 2): commit the file by naming them, and do not copy it. The
+    // commit's DATA retention barrier refuses a manifest naming objects the
+    // cluster does not hold, so a refused commit costs a copy, never data.
+    if (file.copied == 0) {
+        if (auto extents = published_extents(job, file)) {
+            try {
+                const auto partial = fs_.getattr(file.temporary_path);
+                fs_.commit_file(file.temporary_path, partial, file.size, *extents, nullptr);
+                fs_.rename(file.temporary_path, file.destination_path, true);
+                file.copied = file.size;
+                file.completed = true;
+                Log::info("ingest adopted published extents path=" + file.destination_path +
+                          " extents=" + std::to_string(extents->size()) +
+                          " bytes=" + std::to_string(file.size));
+                if (file.catalogue_candidate) {
+                    (void)hints_.submit(file.destination_path, "ingest", job.id, CatalogueHintPriority::ingest);
+                    if (media_information_)
+                        (void)media_information_->request_path(file.destination_path);
+                }
+                ++job.files_completed;
+                refresh_progress(job);
+                return true;
+            } catch (const std::exception& e) {
+                Log::warn("ingest could not adopt published extents path=" + file.destination_path +
+                          "; copying instead: " + e.what());
+                try {
+                    fs_.truncate_file(file.temporary_path, 0);
+                } catch (const std::exception&) {
+                }
+            }
+        }
+    }
+
     std::ifstream input(source, std::ios::binary);
     if (!input) {
         set_blocked(job, "source is not readable: " + source.string());
@@ -1625,6 +1670,25 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     ++job.files_completed;
     refresh_progress(job);
     return true;
+}
+
+std::optional<std::vector<ExtentRef>> IngestManager::published_extents(
+    const IngestJob& job, const IngestFileProgress& file) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(job.source_path, ec)) return std::nullopt;
+    std::lock_guard lock(extent_journals_mutex_);
+    auto found = extent_journals_.find(job.id);
+    // Loaded once per run of a job, and released when process_job returns:
+    // by the time a torrent's ingest runs, its download has finished and the
+    // journal is complete.
+    if (found == extent_journals_.end())
+        found = extent_journals_.emplace(job.id, TorrentExtentJournal::load(job.source_path)).first;
+    if (found->second.empty()) return std::nullopt;
+    const auto relative =
+        std::filesystem::path(file.source_path).lexically_relative(job.source_path).generic_string();
+    const auto entry = found->second.find(relative);
+    if (entry == found->second.end()) return std::nullopt;
+    return TorrentExtentJournal::manifest(entry->second, file.size);
 }
 
 void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,

@@ -1,5 +1,41 @@
 # Current release
 
+## 0.55.0 — A torrent's extents are published as they verify (development)
+
+Stage 2 of `TODO/2026-09-23-torrent-disk-backend-plan.md`. **The torrent's
+disk backend now publishes each file-relative extent of the payload to the
+store the moment every piece covering it has verified**, and records it in an
+extent journal (`.macha-extents`) in the job's staging directory. When the
+download finishes, **the ingest commits each file by naming those extents
+instead of copying the file a second time**: one metadata commit per file,
+no checkpoints, no copy pass.
+
+- Extents are the node's `extent_size` (4 MiB), file-relative, so they are
+  exactly the objects a copy would have produced, and deduplicate the same
+  way. An extent may span several pieces, or parts of two.
+- Publication is loader-class, durable (`put`, not deferred), and runs on its
+  own thread, off the I/O strand, so a slow put never holds up the torrent's
+  disk writes. A failed put is retried after 30 s.
+- Verification comes from libtorrent's `piece_finished_alert`; after a resume
+  or a recheck, which report no per-piece alerts, every piece the torrent
+  already has is reported from `torrent_checked_alert`. Extents the journal
+  already records are not published again.
+- **The journal is a claim, not proof.** The commit's DATA retention barrier
+  refuses a manifest naming objects the cluster does not hold; the ingest
+  then logs `could not adopt published extents ...; copying instead` and
+  copies. Tested both ways.
+- Torrents now download **sequentially**, so extents complete in order and are
+  read back for publication while still in page cache.
+- Deleting a torrent's files deletes its journal.
+
+The payload file is still the assembly area for its extents; the one function
+that reads an extent back (`read_extent`) is where a staging format of
+macha's own would replace it.
+
+Watch for: `ingest adopted published extents` against `could not adopt ...
+copying instead`. If publication falls behind a fast download, files still
+incomplete when it finishes are copied as before.
+
 ## 0.54.1 — Artwork is downloaded once, not once a day (development)
 
 **Every artwork URL changed at UTC midnight, and every browser downloaded every

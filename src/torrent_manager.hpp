@@ -16,9 +16,14 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <thread>
+
+namespace libtorrent {
+struct torrent_handle;
+}
 
 namespace macha {
 
@@ -33,6 +38,9 @@ class TorrentManager final : public TorrentService {
     std::condition_variable_any cv_;
     std::map<std::string, TorrentJob, std::less<>> jobs_;
     std::unique_ptr<Impl> impl_;
+    // Routes verified pieces from the alert drain to the disk backend.
+    std::shared_ptr<TorrentPieceVerifications> verifications_ =
+        std::make_shared<TorrentPieceVerifications>();
     std::atomic_bool alerts_pending_{false};
     // torrent.log_level, readable from the alert drain without the mutex.
     std::atomic<LogLevel> alert_log_level_{LogLevel::info};
@@ -58,6 +66,8 @@ class TorrentManager final : public TorrentService {
     // Drains libtorrent's alert queue into the journal. Also the only place
     // that can observe whether the session actually bound a usable interface.
     void drain_alerts();
+    // The save path of the job a session handle belongs to, if any.
+    std::optional<std::string> save_path_of(const libtorrent::torrent_handle&) const;
     void update_jobs();
     bool has_active_jobs_locked() const;
     std::string add_impl(std::string uri, bool allow_fetch);
