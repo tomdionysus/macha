@@ -1128,6 +1128,21 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         std::this_thread::sleep_for(std::chrono::nanoseconds(before_deadline_ns - 50'000'000));
     CHECK(service.node().local_store().has(retired_ids.back()));
     const auto before_grace = service.metadata_convergence_diagnostics();
+    // This check has failed twice in full macOS suite runs and never in
+    // isolation (TODO/ACTIVE.md, known-bad rates). The bare expression said
+    // nothing about which way it was wrong, so say it: an extra run means a
+    // metadata or topology event arrived after the follow-up began, a missing
+    // one means the unlinks coalesced differently.
+    if (before_grace.runs_scheduled != before.runs_scheduled + 2 ||
+        before_grace.runs_completed != before.runs_completed + 2) {
+        std::cerr << "convergence before grace: runs_scheduled " << before.runs_scheduled
+                  << " -> " << before_grace.runs_scheduled << ", runs_completed "
+                  << before.runs_completed << " -> " << before_grace.runs_completed
+                  << ", events " << before.events_received << " -> "
+                  << before_grace.events_received << ", epoch requested/completed "
+                  << before_grace.requested_epoch << "/" << before_grace.completed_epoch
+                  << ", scheduled " << before_grace.scheduled << "\n";
+    }
     CHECK(before_grace.runs_scheduled == before.runs_scheduled + 2);
     CHECK(before_grace.runs_completed == before.runs_completed + 2);
 
