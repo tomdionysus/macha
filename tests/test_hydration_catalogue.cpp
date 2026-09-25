@@ -2328,6 +2328,79 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
 // there is no download engine to load, and the capability is absent by
 // design rather than differently compiled.
 #ifdef MACHA_TEST_TORRENT_PLUGIN
+MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_search_results_can_be_placed) {
+    // 0.58.2. info_hash was persisted and serialised but never set, so every
+    // job reported null; a job saved without one is backfilled from its magnet
+    // on load. And a search result's URI now reaches add_search_result, which
+    // may fetch a provider's .torrent URL; until now every placement went
+    // through add(), magnets only, and such a result could never be started.
+    TestNode fixture("torrent-identity");
+    fixture.prepare();
+    const auto state_path = fixture.config().state_path;
+    const auto staging_path = fixture.path() / "staging";
+    const auto payload = staging_path / "torrents" / "torrent-done";
+    std::filesystem::create_directories(payload);
+    std::filesystem::create_directories(state_path / "torrent");
+    {
+        Json::Object done;
+        done["id"] = "torrent-done";
+        done["name"] = "Finished Movie";
+        done["source_uri"] = "magnet:?xt=urn:btih:3333333333333333333333333333333333333333";
+        done["save_path"] = payload.string();
+        done["state"] = "completed";
+        done["created_unix_ms"] = static_cast<uint64_t>(1);
+        done["updated_unix_ms"] = static_cast<uint64_t>(2);
+        done["error"] = "";
+        Json::Array jobs;
+        jobs.emplace_back(std::move(done));
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(1);
+        root["jobs"] = std::move(jobs);
+        std::ofstream out(state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out << Json(std::move(root)).dump();
+    }
+    fixture.start();
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = staging_path;
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    TorrentConfig torrent_config;
+    torrent_config.enabled = true;
+    torrent_config.dht = false;
+    torrent_config.pex = false;
+    torrent_config.lsd = false;
+    Config plugin_config = fixture.node().config();
+    plugin_config.torrent = torrent_config;
+    plugin_config.state_path = state_path;
+    SubsystemRegistry registry;
+    SubsystemContext context;
+    context.config = &plugin_config;
+    context.node = &fixture.node();
+    context.ingest = &ingest;
+    context.registry = &registry;
+    LoadedTorrentPlugin plugin(context);
+    auto torrents_owner = registry.torrent();
+    REQUIRE(torrents_owner);
+    auto& torrents = *torrents_owner;
+
+    auto done = torrents.job("torrent-done");
+    REQUIRE(done.has_value());
+    CHECK(done->info_hash == "3333333333333333333333333333333333333333");
+
+    plugin.subsystem().start();
+    const std::string url = "https://127.0.0.1:1/result.torrent";
+    auto as_magnet = torrents.add_on(NodeId{}, url, false);
+    CHECK(!as_magnet.placed);
+    CHECK(as_magnet.error.find("requires a magnet") != std::string::npos);
+    auto as_result = torrents.add_on(NodeId{}, url, true);
+    CHECK(!as_result.placed);
+    CHECK(as_result.error.find("requires a magnet") == std::string::npos);
+    plugin.subsystem().stop();
+}
+
 MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_intent) {
     TestNode fixture("torrent-recovery");
     fixture.prepare();

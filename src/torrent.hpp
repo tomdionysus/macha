@@ -196,7 +196,11 @@ class TorrentService {
         std::string reason;
         std::string error;
     };
-    virtual Placement add_on(const NodeId& node, std::string_view magnet_or_uri) = 0;
+    // `search_result` is true only for a URI resolved from a torrent search
+    // result (an acquisition_ref), which may be a trusted provider's .torrent
+    // URL the placing node fetches; anything else must be a magnet.
+    virtual Placement add_on(const NodeId& node, std::string_view magnet_or_uri,
+                             bool search_result) = 0;
 
     virtual std::vector<ClusterTorrentJob> jobs_cluster_wide() const = 0;
     // Local job(id) first (zero added latency for the common owned-here

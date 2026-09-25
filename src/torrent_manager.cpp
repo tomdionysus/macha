@@ -51,6 +51,19 @@ bool safe_tracker_url(std::string_view value) {
     return value.starts_with("http://") || value.starts_with("https://") || value.starts_with("udp://");
 }
 
+// A torrent's identity as lowercase hex: its v1 SHA-1 when it has one,
+// otherwise its v2 SHA-256; empty when neither is known yet. Until 0.58.2 a
+// job's info_hash was declared, serialised and persisted, and never set, so
+// every job reported null.
+std::string info_hash_hex(const lt::info_hash_t& hashes) {
+    const auto text = [](const auto& digest) {
+        return hex(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(digest.data()), digest.size()));
+    };
+    if (hashes.has_v1()) return text(hashes.v1);
+    if (hashes.has_v2()) return text(hashes.v2);
+    return {};
+}
+
 std::string sanitize_text(std::string value, size_t limit = 1024) {
     std::erase_if(value, [](unsigned char c) { return c < 0x20 && c != '\t'; });
     if (value.size() > limit) value.resize(limit);
@@ -287,11 +300,13 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
     // node, so this is where the job is created.
     if (action == "add") {
         std::string uri;
+        bool search_result = false;
         try {
             const std::string text(reinterpret_cast<const char*>(request_payload.data()),
                                    request_payload.size());
             auto request = Json::parse(text);
             if (const auto* u = request.find("uri"); u && u->isString()) uri = u->asString();
+            if (const auto* s = request.find("search_result"); s && s->isBool()) search_result = s->asBool();
         } catch (const std::exception&) {
         }
         Json::Object added;
@@ -301,7 +316,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
             added["error"] = std::string("a magnet or torrent uri is required");
         } else {
             try {
-                added["job_id"] = add(uri);
+                added["job_id"] = search_result ? add_search_result(uri) : add(uri);
                 added["exists"] = true;
             } catch (const std::exception& error) {
                 added["exists"] = false;
@@ -333,14 +348,20 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
     return Bytes(text.begin(), text.end());
 }
 
+// A search result's URI may be a provider's .torrent URL, which only
+// add_search_result will fetch. Until 0.58.2 every placement went through
+// add(), magnets only, so a search result backed by a .torrent URL could
+// never be started (409 placement_failed / add_failed).
 TorrentService::Placement TorrentManager::add_on(const NodeId& node,
-                                                std::string_view magnet_or_uri) {
+                                                std::string_view magnet_or_uri,
+                                                bool search_result) {
     Placement placement;
     placement.node_id = node;
     if (node == NodeId{} || node == node_.node_id()) {
         placement.node_id = node_.node_id();
         try {
-            placement.job_id = add(std::string(magnet_or_uri));
+            placement.job_id = search_result ? add_search_result(std::string(magnet_or_uri))
+                                             : add(std::string(magnet_or_uri));
             placement.placed = true;
         } catch (const std::exception& error) {
             placement.reason = "add_failed";
@@ -364,6 +385,8 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
     Json::Object request;
     request["action"] = std::string("add");
     request["uri"] = std::string(magnet_or_uri);
+    // An older peer ignores this and adds magnets only, as it always did.
+    request["search_result"] = search_result;
     const auto request_text = Json(std::move(request)).dump();
     const Bytes request_bytes(request_text.begin(), request_text.end());
     try {
@@ -524,6 +547,12 @@ void TorrentManager::load_state() {
         for (const auto& value : jobs->asArray()) {
             auto job = parse_torrent_job(value);
             if (job.id.empty()) continue;
+            if (job.info_hash.empty() && !job.source_uri.empty()) {
+                try {
+                    job.info_hash = info_hash_hex(lt::parse_magnet_uri(job.source_uri).info_hashes);
+                } catch (const std::exception&) {
+                }
+            }
             if (job.state == TorrentJobState::metadata || job.state == TorrentJobState::downloading ||
                 job.state == TorrentJobState::verifying || job.state == TorrentJobState::downloaded)
                 job.state = TorrentJobState::queued;
@@ -655,6 +684,7 @@ std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
     auto handle = impl_->session.add_torrent(std::move(atp));
     auto status = handle.status(lt::torrent_handle::query_name);
     job.name = sanitize_text(status.name, 1024);
+    job.info_hash = info_hash_hex(status.info_hashes);
     job.state = status.state == lt::torrent_status::downloading_metadata ? TorrentJobState::metadata : TorrentJobState::queued;
     {
         std::lock_guard lock(mutex_);
@@ -1162,6 +1192,7 @@ void TorrentManager::update_jobs() {
         if (hit == impl_->handles.end()) continue;
         auto status = hit->second.status(lt::torrent_handle::query_name | lt::torrent_handle::query_accurate_download_counters);
         job.name = sanitize_text(status.name, 1024);
+        if (job.info_hash.empty()) job.info_hash = info_hash_hex(status.info_hashes);
         job.bytes_total = status.total_wanted > 0 ? static_cast<uint64_t>(status.total_wanted) : 0;
         job.bytes_completed = status.total_wanted_done > 0 ? static_cast<uint64_t>(status.total_wanted_done) : 0;
         job.download_rate = status.download_rate > 0 ? static_cast<uint64_t>(status.download_rate) : 0;
