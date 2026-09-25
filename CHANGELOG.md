@@ -1,5 +1,18 @@
 # Current release
 
+## 0.62.3 — Why repair did not run is visible (development)
+
+After 0.62.2 gbni-1's repair examined nothing at all, while the maintenance
+thread spent each pass in metadata convergence with fi-1 (about 19 s a run
+during an import, rescheduled every time). Which condition then kept the data
+repair step from running could not be seen. `diagnostics.repair` adds
+`pass_gates` -- per pass, whether the step `ran` or was turned away by the
+weighted `share`, a `quiescent` wait, or `credit` -- and `last_credit_bytes`.
+
+Test-only: the cluster torrent-visibility case now waits for node 2's torrent
+subsystem before acting through it; it answered 503 "torrent subsystem is not
+available on this node" when it was still starting. 60/60 on fi-1 after.
+
 ## 0.62.2 — A released torrent is not held by its own resume data; repair progress is visible (development)
 
 **Smallville stayed held after 0.62.1.** Resume data restores the flags it was

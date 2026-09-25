@@ -4983,6 +4983,11 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     // ready rather than synchronously with it.
     std::shared_ptr<TorrentService> s1_torrents;
     REQUIRE(wait_until([&] { return (s1_torrents = s1.torrents()) != nullptr; }, 5s));
+    // The cases below list and act through node 2, whose own torrent
+    // subsystem must be running too: until it is, node 2 correctly answers
+    // 503 "torrent subsystem is not available on this node" (fi-1,
+    // 2026-09-25, caught by the status print at the list request).
+    REQUIRE(wait_until([&] { return s2.torrents() != nullptr; }, 5s));
     const auto torrent_id = s1_torrents->add(
         "magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
     // A torrent job has no equivalent fast-fail path (add() only creates the
