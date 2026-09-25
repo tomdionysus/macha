@@ -2222,6 +2222,11 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
     out.bytes_transferred = repair_bytes_total_.load(std::memory_order_relaxed);
     out.passes_completed = repair_passes_completed_.load(std::memory_order_relaxed);
     out.push_phase_complete = repair_push_phase_complete_.load(std::memory_order_relaxed);
+    out.gate_ran = repair_gate_ran_.load(std::memory_order_relaxed);
+    out.gate_share = repair_gate_share_.load(std::memory_order_relaxed);
+    out.gate_quiescent = repair_gate_quiescent_.load(std::memory_order_relaxed);
+    out.gate_credit = repair_gate_credit_.load(std::memory_order_relaxed);
+    out.last_credit_bytes = repair_last_credit_.load(std::memory_order_relaxed);
     std::lock_guard lock(repair_sample_mutex_);
     out.unsourceable_sample.assign(repair_unsourceable_sample_.begin(),
                                    repair_unsourceable_sample_.end());

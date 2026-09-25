@@ -1385,6 +1385,13 @@ HttpResponse ClusterStatusService::diagnostics_response() {
             repair_diagnostics["bytes_transferred"] = values.bytes_transferred;
             repair_diagnostics["passes_completed"] = values.passes_completed;
             repair_diagnostics["push_phase_complete"] = values.push_phase_complete;
+            Json::Object gates;
+            gates["ran"] = values.gate_ran;
+            gates["share"] = values.gate_share;
+            gates["quiescent"] = values.gate_quiescent;
+            gates["credit"] = values.gate_credit;
+            repair_diagnostics["pass_gates"] = std::move(gates);
+            repair_diagnostics["last_credit_bytes"] = values.last_credit_bytes;
         } catch (const std::exception& error) {
             Log::debug("status repair diagnostics unavailable: " + std::string(error.what()));
         }
