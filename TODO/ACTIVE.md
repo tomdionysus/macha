@@ -1677,7 +1677,7 @@ The remaining known-bad rates, all to be driven to zero:
 | `storage_v18/.../durability_barrier_reports_objects...` | 10/20 | macOS only, green on es-1 |
 | `storage_v18/.../durability_barrier_rederives_placement...` | intermittent | macOS only, green on es-1 |
 | `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; **fired once on es-1**, 2026-09-22 |
-| `filesystem_fuse/.../coalesced_delete_burst_wakes_at_exact_garbage_grace` | 1 full run; 0/8 isolated | macOS, 2026-09-22 |
+| `filesystem_fuse/.../coalesced_delete_burst_wakes_at_exact_garbage_grace` | 2 full runs (2026-09-22; 2026-09-25 on 0.60.0-pre: `runs_scheduled`/`runs_completed` before grace were not `before + 2`, lines 1131-1132); 0/8 + 0/50 isolated, incl. 40 at `--jobs 16` | macOS |
 
 **The `storage_data_credit` case is no longer macOS-only (2026-09-22).** It
 failed once in the 0.49.0 full suite on es-1 -- 1/492, at 125 ms, with
