@@ -1377,6 +1377,14 @@ HttpResponse ClusterStatusService::diagnostics_response() {
             for (const auto& id : values.unsourceable_sample)
                 sample.push_back(to_string(id));
             repair_diagnostics["unsourceable_sample"] = std::move(sample);
+            // Is repair moving, and where is it? push walks this node's store,
+            // then pull walks the live set; only the pull finds and counts
+            // what this node lacks.
+            repair_diagnostics["push_examined"] = values.push_examined;
+            repair_diagnostics["pull_examined"] = values.pull_examined;
+            repair_diagnostics["bytes_transferred"] = values.bytes_transferred;
+            repair_diagnostics["passes_completed"] = values.passes_completed;
+            repair_diagnostics["push_phase_complete"] = values.push_phase_complete;
         } catch (const std::exception& error) {
             Log::debug("status repair diagnostics unavailable: " + std::string(error.what()));
         }

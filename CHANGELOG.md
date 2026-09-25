@@ -1,5 +1,21 @@
 # Current release
 
+## 0.62.2 — A released torrent is not held by its own resume data; repair progress is visible (development)
+
+**Smallville stayed held after 0.62.1.** Resume data restores the flags it was
+saved with, so a torrent saved while held came back paused and not
+auto-managed whatever its job said. Restore now sets both from the job:
+held only if the job is `paused`.
+
+**Repair's progress is visible.** `diagnostics.repair` adds `push_examined`,
+`pull_examined`, `bytes_transferred`, `passes_completed` and
+`push_phase_complete`, cumulative since start. Until now whether repair was
+moving at all could be told only from a trace-level log line.
+
+Correction to 0.62.1's notes: the probes and puts fi-1 kept receiving were
+mostly an import's own writes (every new extent goes to both owners), not
+repair; 0.62.1's skip covers repair only.
+
 ## 0.62.1 — Repair skips a peer with no room; a staging-blocked torrent is not held at start (development)
 
 **Repair spent its whole budget on a full peer.** With repair's local check

@@ -25,6 +25,10 @@ namespace macha {
 void hold_torrent(libtorrent::torrent_handle&);
 void release_torrent(libtorrent::torrent_handle&);
 void hold_at_add(libtorrent::add_torrent_params&);
+// Sets both flags from Macha's intent, whatever the params carried. Resume
+// data restores the flags it was saved with, so a torrent saved while held
+// came back held even once its job no longer was (Smallville, 0.62.1).
+void set_hold_at_add(libtorrent::add_torrent_params&, bool held);
 
 // A torrent's identity as lowercase hex: its v1 SHA-1 when it has one,
 // otherwise its v2 SHA-256; empty when neither is known yet.

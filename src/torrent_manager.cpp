@@ -711,8 +711,7 @@ void TorrentManager::restore_jobs() {
             // staging check that would release it never runs (Smallville,
             // gbni-1, 2026-09-25, stuck after 0.61.0). Added normally, the
             // check holds it again as soon as its size is known.
-            if (job.state == TorrentJobState::paused)
-                hold_at_add(atp);
+            set_hold_at_add(atp, job.state == TorrentJobState::paused);
             auto handle = impl_->session.add_torrent(std::move(atp));
             impl_->handles[job.id] = std::move(handle);
         } catch (const std::exception& e) {

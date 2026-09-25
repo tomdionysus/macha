@@ -1018,6 +1018,45 @@ MACHA_TEST("torrent_disk_io", test_resume_data_lets_a_restart_skip_the_recheck) 
     CHECK(second.read_bytes.load() == 0);
 }
 
+MACHA_TEST("torrent_disk_io", test_resume_data_saved_while_held_does_not_keep_a_released_job_held) {
+    // Smallville, gbni-1, 2026-09-25: resume data written while the torrent
+    // was held restores paused and not auto-managed, so after a restart it
+    // stayed held although its job no longer was, and a magnet that never
+    // fetches its metadata never leaves `staging_full`. The job decides.
+    TempDir dir;
+    const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
+    const auto resume_file = dir.path() / "resume" / "job.resume";
+    const auto expected = torrent_info_hash_hex(torrent->info_hashes());
+    {
+        CountingSession first;
+        lt::add_torrent_params add;
+        add.ti = torrent;
+        add.save_path = (dir.path() / "t").string();
+        hold_at_add(add);
+        auto handle = first.session->add_torrent(add);
+        handle.save_resume_data(lt::torrent_handle::save_info_dict);
+        bool stored = false;
+        REQUIRE(wait_for([&] {
+            std::vector<lt::alert*> alerts;
+            first.session->pop_alerts(&alerts);
+            for (auto* alert : alerts)
+                if (auto* saved = lt::alert_cast<lt::save_resume_data_alert>(alert)) {
+                    store_torrent_resume(resume_file, saved->params);
+                    stored = true;
+                }
+            return stored;
+        }, 10s));
+    }
+    auto resumed = load_torrent_resume(resume_file, expected);
+    REQUIRE(resumed.has_value());
+    REQUIRE(bool(resumed->flags & lt::torrent_flags::paused));
+    set_hold_at_add(*resumed, false);
+    resumed->save_path = (dir.path() / "t").string();
+    CountingSession second;
+    auto handle = second.session->add_torrent(*resumed);
+    CHECK(wait_for([&] { return handle.status().is_seeding; }, 10s));
+}
+
 MACHA_FAST_TEST("torrent_disk_io", test_a_queued_check_is_told_apart_from_a_running_one) {
     lt::torrent_status status;
     status.state = lt::torrent_status::downloading;

@@ -42,6 +42,13 @@ class DistributedStore {
         uint64_t pull_unsourceable{};
         uint64_t local_unreadable{};
         std::vector<ObjectId> unsourceable_sample;
+        // Progress, cumulative since start (0.62.2). Until then the only view
+        // of whether repair was moving was a trace-level log line.
+        uint64_t push_examined{};
+        uint64_t pull_examined{};
+        uint64_t bytes_transferred{};
+        uint64_t passes_completed{};
+        bool push_phase_complete{};
     };
 
     struct DurableReplica {
@@ -119,6 +126,11 @@ class DistributedStore {
     // A total that keeps climbing across passes, or the same ids reappearing
     // in the sample, is the signal.
     std::atomic_uint64_t repair_pull_unsourceable_{};
+    std::atomic_uint64_t repair_push_examined_total_{};
+    std::atomic_uint64_t repair_pull_examined_total_{};
+    std::atomic_uint64_t repair_bytes_total_{};
+    std::atomic_uint64_t repair_passes_completed_{};
+    std::atomic_bool repair_push_phase_complete_{};
     std::atomic_uint64_t repair_local_unreadable_{};
     mutable std::mutex repair_sample_mutex_;
     std::deque<ObjectId> repair_unsourceable_sample_;

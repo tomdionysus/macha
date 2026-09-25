@@ -34,6 +34,15 @@ void hold_at_add(lt::add_torrent_params& params) {
     params.flags &= ~lt::torrent_flags::auto_managed;
 }
 
+void set_hold_at_add(lt::add_torrent_params& params, bool held) {
+    if (held) {
+        hold_at_add(params);
+        return;
+    }
+    params.flags &= ~lt::torrent_flags::paused;
+    params.flags |= lt::torrent_flags::auto_managed;
+}
+
 std::string torrent_info_hash_hex(const lt::info_hash_t& hashes) {
     const auto text = [](const auto& digest) {
         return hex(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(digest.data()),
