@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.60.0 LANGUAGES CXX)
+project(macha VERSION 0.61.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -365,7 +365,7 @@ file(RELATIVE_PATH MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR
      "${MACHA_PLUGIN_INSTALL_DIR_FULL}"
      "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
 if(MACHA_LIBTORRENT_TARGET)
-    add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_plugin.cpp
+    add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_session_policy.cpp src/torrent_plugin.cpp
         src/torrent_disk_io.cpp)
     target_link_libraries(macha-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
     set_target_properties(macha-torrent PROPERTIES
@@ -655,7 +655,8 @@ if(MACHA_BUILD_TESTS)
             tests/main.cpp
             tests/test_framework.cpp
             tests/test_torrent_disk_io.cpp
-            src/torrent_disk_io.cpp)
+            src/torrent_disk_io.cpp
+            src/torrent_session_policy.cpp)
         target_link_libraries(macha-tests-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
         target_compile_definitions(macha-tests-torrent PRIVATE
             MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

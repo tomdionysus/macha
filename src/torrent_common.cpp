@@ -158,6 +158,7 @@ std::string torrent_job_state_name(TorrentJobState state) {
     case TorrentJobState::queued: return "queued";
     case TorrentJobState::metadata: return "metadata";
     case TorrentJobState::downloading: return "downloading";
+    case TorrentJobState::verify_queued: return "verify_queued";
     case TorrentJobState::verifying: return "verifying";
     case TorrentJobState::downloaded: return "downloaded";
     case TorrentJobState::importing: return "importing";
@@ -175,6 +176,7 @@ std::optional<TorrentJobState> parse_torrent_job_state(std::string_view state) {
     if (state == "queued") return TorrentJobState::queued;
     if (state == "metadata") return TorrentJobState::metadata;
     if (state == "downloading") return TorrentJobState::downloading;
+    if (state == "verify_queued") return TorrentJobState::verify_queued;
     if (state == "verifying") return TorrentJobState::verifying;
     if (state == "downloaded") return TorrentJobState::downloaded;
     if (state == "importing") return TorrentJobState::importing;
