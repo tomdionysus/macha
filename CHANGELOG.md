@@ -1,5 +1,21 @@
 # Current release
 
+## 0.58.3 — Two files of one ingest job never share a destination (development)
+
+**Rome's ingest failed `destination_conflict` on every retry.** The planner
+checked only the filesystem for a collision, so two source files of one job
+could be planned onto the same path: Rome's two seasons each had an
+`Extras/Menu Art.mkv`, both planned `/Movies/Menu Art/Menu Art.mkv`, and the
+second failed once the first was in (gbni-1, 2026-09-25, job `b0f01a83`).
+
+- Destinations already given to earlier files of the job now count as taken,
+  for media and sidecars.
+- A job planned before this is resolved on resume: unfinished files sharing a
+  destination get the next free suffix and a fresh partial, logged once each
+  as `ingest destination shared within job`.
+
+Nothing changes on the wire.
+
 ## 0.58.2 — Torrent jobs carry their info_hash; search results backed by a .torrent can be started (development)
 
 - **`info_hash` is set.** It was declared, serialised and persisted, and never
