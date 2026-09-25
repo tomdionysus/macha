@@ -517,7 +517,7 @@ A named node that cannot take the job is refused; the job is never started somew
 | `cancelled` | `failed` | `ingest_cancelled` |
 | no longer exists | `failed` | `ingest_missing` |
 
-So a linked torrent job that is `blocked` with `metadata_unavailable` recovers on the ingest's schedule, as the ingest does. The linked ingest job also appears in `GET /api/v1/ingest/jobs`, with `source_type` `torrent`, `source_ref` the torrent job's `id` and `source_owned` true. Acting on it there (cancelling or clearing it) is reflected in the torrent job as the table says.
+So a linked torrent job that is `blocked` with `metadata_unavailable` recovers on the ingest's schedule, as the ingest does. **A `failed` torrent job follows its ingest back (0.62.0):** if the linked ingest is resumed by any route (the torrent's `retry`, the ingest's own `resume`, or a peer's action), the torrent job leaves `failed` and mirrors it again, and releases its staging when the ingest completes. Before 0.62.0 only `retry` did this; resuming the ingest directly left the torrent job `failed` for good, holding its staging reservation. The linked ingest job also appears in `GET /api/v1/ingest/jobs`, with `source_type` `torrent`, `source_ref` the torrent job's `id` and `source_owned` true. Acting on it there (cancelling or clearing it) is reflected in the torrent job as the table says.
 
 Operator actions:
 
