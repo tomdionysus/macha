@@ -20,6 +20,7 @@ enum class TorrentJobState {
     queued,
     metadata,
     downloading,
+    verify_queued,
     verifying,
     downloaded,
     importing,

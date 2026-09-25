@@ -1,5 +1,31 @@
 # Current release
 
+## 0.61.0 — Torrents no longer re-check everything on restart, and paused means paused (development)
+
+**After a restart, torrents sat in `verifying` with no progress and no ETA.**
+gbni-1, 2026-09-25: the disk backend was re-hashing a paused torrent's staged
+payload at the disk's full 90 MB/s, and every other torrent was queued behind
+it for what would have been about an hour.
+
+- **Resume data is kept.** Nothing was saved, so each restart re-added every
+  torrent from its magnet and re-hashed every staged byte. Each job's resume
+  data is now written when a check or download finishes, on pause, every
+  five minutes and at shutdown, to `state/torrent/resume/<job>.resume`, and a
+  restart adds from it: the pieces it names are trusted while their files are
+  intact. Data for another torrent, or a damaged file, is refused and the
+  torrent is checked in full as before. The first start of 0.61.0 has no
+  resume data yet and still checks.
+- **Paused means paused.** Every pause (operator, `staging_full`, restore at
+  start, and the wait for publication after a download) was a plain pause of
+  an auto-managed torrent, and libtorrent's queue manager restarts those:
+  measured on fi-1, a torrent paused straight after being added was running,
+  fully checked and seeding three seconds later. A held torrent is now taken
+  out of the queue as well as paused, and paused and blocked jobs are added
+  held at start.
+- **`verify_queued`**, a new torrent job state: waiting for another torrent's
+  check (libtorrent checks one at a time). `verifying` is now only the check
+  in progress, with `eta_seconds` estimated from the check's own rate.
+
 ## 0.60.0 — Close a session from a page that is going away; leaving transcode frees the slot (development)
 
 **A page reload left its session, and the node's transcode slot, held.**

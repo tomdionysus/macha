@@ -12,6 +12,7 @@
 #include "io_pressure.hpp"
 #include "torrent_disk_io.hpp"
 #include "torrent_extent_journal.hpp"
+#include "torrent_session_policy.hpp"
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/address.hpp>
@@ -33,6 +34,7 @@
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/version.hpp>
+#include <libtorrent/write_resume_data.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -907,4 +909,135 @@ MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_
     CHECK(std::chrono::steady_clock::now() - started < 1500ms);
 }
 
+} // namespace macha
+
+namespace macha {
+namespace {
+
+// Shared by the session-policy cases (0.61.0): a session on macha's disk
+// backend that counts every byte the backend reads, which is how a check
+// shows itself.
+struct CountingSession {
+    DataResourceArbiter arbiter{64 * 1024 * 1024, 16 * 1024 * 1024, 2, 500ms};
+    std::atomic<uint64_t> read_bytes{0};
+    TorrentDiskHooks hooks;
+    std::unique_ptr<lt::session> session;
+    CountingSession() {
+        hooks.admit = loader_admission(arbiter);
+        hooks.observe = [this](std::chrono::nanoseconds, uint64_t bytes) { read_bytes += bytes; };
+        auto params = loopback_session_params();
+        params.disk_io_constructor = macha_disk_io_constructor(hooks);
+        session = std::make_unique<lt::session>(std::move(params));
+    }
+};
+
+const std::vector<int64_t> policy_sizes{4 * 1024 * 1024, 3 * 1024 * 1024};
+
+MACHA_TEST("torrent_disk_io", test_a_held_torrent_is_not_restarted_by_the_queue) {
+    // Measured on fi-1, 2026-09-25: a torrent paused straight after add
+    // while auto-managed was running, fully re-checked and seeding three
+    // seconds later -- libtorrent's queue manager overrides pause(). Every
+    // Macha pause was that. A hold clears auto-management first.
+    TempDir dir;
+    const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
+    CountingSession s;
+    lt::add_torrent_params add;
+    add.ti = torrent;
+    add.save_path = (dir.path() / "t").string();
+    auto handle = s.session->add_torrent(add);
+    hold_torrent(handle);
+    std::this_thread::sleep_for(3s);
+    const auto held = handle.status();
+    CHECK(bool(held.flags & lt::torrent_flags::paused));
+    CHECK(!held.is_seeding);
+    CHECK(torrent_check_phase(held) == TorrentCheckPhase::none);
+
+    release_torrent(handle);
+    REQUIRE(wait_for([&] { return handle.status().is_seeding; }, 10s));
+    CHECK(s.read_bytes.load() > 0);
+}
+
+MACHA_TEST("torrent_disk_io", test_a_torrent_held_at_add_is_never_checked) {
+    TempDir dir;
+    const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
+    CountingSession s;
+    lt::add_torrent_params add;
+    add.ti = torrent;
+    add.save_path = (dir.path() / "t").string();
+    hold_at_add(add);
+    auto handle = s.session->add_torrent(add);
+    std::this_thread::sleep_for(3s);
+    CHECK(s.read_bytes.load() == 0);
+    CHECK(bool(handle.status().flags & lt::torrent_flags::paused));
+}
+
+MACHA_TEST("torrent_disk_io", test_resume_data_lets_a_restart_skip_the_recheck) {
+    // gbni-1, 2026-09-25: with no resume data every restart re-hashed every
+    // staged byte of every torrent -- an hour at the disk's full 90 MB/s --
+    // with all the others queued behind it.
+    TempDir dir;
+    const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
+    const auto resume_file = dir.path() / "resume" / "job.resume";
+    const auto expected = torrent_info_hash_hex(torrent->info_hashes());
+    {
+        CountingSession first;
+        lt::add_torrent_params add;
+        add.ti = torrent;
+        add.save_path = (dir.path() / "t").string();
+        auto handle = first.session->add_torrent(add);
+        REQUIRE(wait_for([&] { return handle.status().is_seeding; }, 10s));
+        REQUIRE(first.read_bytes.load() > 0);
+        handle.save_resume_data(lt::torrent_handle::save_info_dict);
+        bool stored = false;
+        REQUIRE(wait_for([&] {
+            std::vector<lt::alert*> alerts;
+            first.session->pop_alerts(&alerts);
+            for (auto* alert : alerts)
+                if (auto* saved = lt::alert_cast<lt::save_resume_data_alert>(alert)) {
+                    store_torrent_resume(resume_file, saved->params);
+                    stored = true;
+                }
+            return stored;
+        }, 10s));
+    }
+
+    // Another torrent's resume data, or a damaged file, is refused.
+    CHECK(!load_torrent_resume(resume_file, std::string(expected.size(), '0')).has_value());
+    CHECK(!load_torrent_resume(dir.path() / "resume" / "absent.resume", expected).has_value());
+    {
+        std::ofstream(dir.path() / "resume" / "junk.resume") << "not bencode";
+        CHECK(!load_torrent_resume(dir.path() / "resume" / "junk.resume", expected).has_value());
+    }
+
+    auto resumed = load_torrent_resume(resume_file, expected);
+    REQUIRE(resumed.has_value());
+    CountingSession second;
+    resumed->save_path = (dir.path() / "t").string();
+    auto handle = second.session->add_torrent(*resumed);
+    REQUIRE(wait_for([&] { return handle.status().is_seeding; }, 10s));
+    CHECK(second.read_bytes.load() == 0);
+}
+
+MACHA_FAST_TEST("torrent_disk_io", test_a_queued_check_is_told_apart_from_a_running_one) {
+    lt::torrent_status status;
+    status.state = lt::torrent_status::downloading;
+    CHECK(torrent_check_phase(status) == TorrentCheckPhase::none);
+
+    status.state = lt::torrent_status::checking_files;
+    status.flags = lt::torrent_flags::auto_managed;
+    CHECK(torrent_check_phase(status) == TorrentCheckPhase::checking);
+    // Waiting its turn: libtorrent checks one at a time, and the rest sit
+    // paused under the queue manager.
+    status.flags = lt::torrent_flags::auto_managed | lt::torrent_flags::paused;
+    CHECK(torrent_check_phase(status) == TorrentCheckPhase::queued);
+    // Held by Macha: paused and not auto-managed is not waiting for anything.
+    status.flags = lt::torrent_flags::paused;
+    CHECK(torrent_check_phase(status) == TorrentCheckPhase::none);
+
+    status.state = lt::torrent_status::checking_resume_data;
+    status.flags = {};
+    CHECK(torrent_check_phase(status) == TorrentCheckPhase::checking);
+}
+
+} // namespace
 } // namespace macha
