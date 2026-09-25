@@ -186,6 +186,38 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_edge_node_needs_no_data_backen
     CHECK(refused);
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_a_repair_weight_of_zero) {
+    // A zero repair weight is a repair that stops whenever the node is busy,
+    // which the weight pair exists to rule out (0.59.0).
+    TempDir t;
+    auto keyfile = (t.path() / "key").string();
+    auto yaml = t.path() / "node.yaml";
+    auto write = [&](const char* weight) {
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile << "\n"
+            << "storage:\n"
+            << "  hosts_extents: false\n"
+            << "  metadata:\n"
+            << "    limit: 1G\n"
+            << "maintenance:\n"
+            << "  repair_weight: " << weight << "\n"
+            << "bootstrap:\n"
+            << "  - seed1.example:7437\n";
+    };
+    write("1");
+    CHECK(load_yaml_config(yaml).maintenance.repair_weight == 1);
+    write("0");
+    bool refused = false;
+    try {
+        (void)load_yaml_config(yaml);
+    } catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find("repair_weight must be 1..10000") !=
+                  std::string::npos;
+    }
+    CHECK(refused);
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     TempDir t;
 #ifdef MACHA_HAVE_LIBTORRENT
@@ -311,6 +343,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  garbage_grace_ms: 1234\n"
             << "  busy_bandwidth_fraction: 0.03\n"
             << "  idle_bandwidth_fraction: 0.60\n"
+            << "  foreground_weight: 80\n"
+            << "  repair_weight: 20\n"
             << "  cpu_target: 0.40\n"
             << "  scrub_interval_ms: 7776000000\n"
             << "hydration:\n"
@@ -509,6 +543,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.maintenance.interval == 250ms);
     CHECK(yc.maintenance.garbage_grace == 1234ms);
     CHECK(yc.maintenance.busy_bandwidth_fraction == 0.03);
+    CHECK(yc.maintenance.foreground_weight == 80);
+    CHECK(yc.maintenance.repair_weight == 20);
     CHECK(yc.maintenance.scrub_interval == std::chrono::hours(24 * 90));
     CHECK(yc.hydration.enabled);
     CHECK(yc.hydration.interval == 75ms);

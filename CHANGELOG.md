@@ -1,5 +1,34 @@
 # Current release
 
+## 0.59.0 — Replica repair is paced, never stopped (development)
+
+**Repair stopped whenever the node was busy, and gbni-1 was always busy.**
+From 0.53.0, any loader byte in the 2 s quiet window counted as busy, and a
+busy node gave repair nothing: its byte budget was `busy_bandwidth_fraction`
+(0.0, the default and the cluster's setting), and its slice ended, cancelling
+anything in flight, on any viewer, mount or loader activity. With torrents
+and ingest running on gbni-1 almost all the time, it was still roughly 0.9 TB
+short of a copy of es-1's data when es-1 left on 2026-09-24. That data went
+with es-1: files dated 2026-08-31 and earlier now fail `extent unavailable`
+on both nodes.
+
+- **Weighted, like viewer and loader.** While a viewer, the mount or the
+  loader is busy, repair runs in bounded turns with a proportional cooldown,
+  `repair_weight` time for every `foreground_weight` of theirs:
+  `maintenance.foreground_weight: 95` and `maintenance.repair_weight: 5` by
+  default, 1..10000 each, zero refused at startup. Idle, it runs within
+  `idle_bandwidth_fraction` as before.
+- **Its budget no longer drops to zero.** Repair earns credit at
+  `idle_bandwidth_fraction` at all times, and the weights decide its share of
+  the time. `busy_bandwidth_fraction` now governs rebalance and scrub only.
+- **A turn ends between operations.** An extent probe, push or pull already
+  in flight completes and is kept. A pull in flight when the node became busy
+  was abandoned, or its bytes discarded after they had arrived.
+- Maintenance wakes when repair's next turn is due instead of waiting for an
+  unrelated event.
+
+Nothing changes on the wire.
+
 ## 0.58.3 — Two files of one ingest job never share a destination (development)
 
 **Rome's ingest failed `destination_conflict` on every retry.** The planner

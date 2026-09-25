@@ -573,6 +573,8 @@ maintenance:
   foreground_quiet_ms: 2000
   busy_bandwidth_fraction: 0.0
   idle_bandwidth_fraction: 0.10
+  foreground_weight: 95
+  repair_weight: 5
   cpu_target: 0.10
   background_concurrency: 0
   initial_bandwidth: 32M
@@ -587,6 +589,10 @@ maintenance:
 
 
 Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted MachaDFS activity take priority.
+
+**Replica repair is paced, never stopped.** While any higher class is busy -- a viewer, mounted reads, or the loader (ingest, torrents, FUSE publication) -- repair runs in bounded turns followed by a proportional cooldown, receiving `repair_weight` time for every `foreground_weight` of theirs (95:5 by default, the same duty-cycle form as `fuse.viewer_weight`/`loader_weight`). When nothing else is busy it runs unrestricted within `idle_bandwidth_fraction`. Its turns end between operations: an extent already in flight completes and is kept. Both weights must be 1..10000; zero is refused, because a repair that stops while the node is busy never restores a copy on a node that is always busy, and a lost copy is lost data (law 4). Until 0.59.0 repair was switched off entirely while anything was busy, which is how gbni-1 was still about 0.9 TB short of a second copy when es-1 left the cluster on 2026-09-24.
+
+`busy_bandwidth_fraction` now governs rebalance and scrub only; repair always earns credit at `idle_bandwidth_fraction` and shares time by the weights.
 
 ## Catalogue
 

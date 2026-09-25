@@ -491,6 +491,66 @@ MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retaine
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_turn_ended) {
+    // Repair yields between operations, never inside one. Until 0.59.0 the
+    // yield predicate was also polled while a pull was in flight: the fetch
+    // was abandoned, or its bytes discarded once they had arrived, so on a
+    // node that was never quiet -- gbni-1, ingesting all day -- a WAN pull
+    // longer than repair's turn could never complete. Here the turn ends the
+    // moment the peer receives the request; the extent must still land.
+    TestNode fixture("repair-in-flight-pull", ConfigProfile::functional);
+    auto& config = fixture.config();
+    config.replication = 2;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    config.heartbeat = 30s;
+    auto& node = fixture.start();
+
+    const auto bytes = pattern(512 * 1024, 77);
+    const auto id = object_id(bytes);
+    const auto port = free_port();
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "127.0.0.1";
+    peer.port = port;
+    peer.failure_domain = "remote";
+    peer.capacity = 1024ULL * 1024 * 1024;
+    peer.seen_unix_ms = unix_ms();
+
+    std::atomic_uint fetches{};
+    RpcServer server(
+        "127.0.0.1", port, fixture.keys(), peer,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::get_object) {
+                ++fetches;
+                // Long enough for a poll of the yield predicate to see it.
+                std::this_thread::sleep_for(150ms);
+                Writer writer;
+                writer.fixed(id.bytes);
+                writer.bytes(bytes);
+                return RpcMessage{MessageType::object_reply, writer.take()};
+            }
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+    server.start();
+    node.membership().observe(peer, true);
+
+    DistributedStore store(node);
+    REQUIRE(store.should_own(id));
+    REQUIRE(!node.local_store().has(id));
+    const std::vector<ObjectId> live{id};
+
+    auto result = store.repair_step(8ULL * 1024 * 1024, 8, &live, nullptr,
+                                    [&] { return fetches.load() > 0; });
+    CHECK(fetches.load() == 1);
+    CHECK(result.bytes_transferred == bytes.size());
+    REQUIRE(node.local_store().valid(id));
+    CHECK(*node.local_store().get(id) == bytes);
+
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -3610,6 +3670,68 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     s3->stop();
     s2.stop();
     s1.stop();
+}
+
+MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_quiet) {
+    // Repair is paced by weight against busier classes, never stopped by
+    // them. Until 0.59.0 any loader byte in the quiet window zeroed repair's
+    // budget (busy_bandwidth_fraction 0.0, the shipped default and the
+    // cluster's setting) and ended its slice, so a node that was always
+    // ingesting never restored a copy: gbni-1 was still ~0.9 TB short of
+    // es-1's data when es-1 went on 2026-09-24. Here the loader is active for
+    // the whole test and the missing copy must still come back.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->replication = 1;
+        config->min_write_replicas = 1;
+        config->metadata_min_write_replicas = 1;
+        config->maintenance.interval = 50ms;
+        config->maintenance.foreground_quiet = 500ms;
+        config->maintenance.no_progress_backoff = 500ms;
+        config->maintenance.busy_bandwidth_fraction = 0.0;
+    }
+
+    Service s1(c1, keys);
+    Service s2(c2, keys);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_until([&] {
+        return s1.node().membership().active().size() == 2 &&
+               s2.node().membership().active().size() == 2;
+    }));
+    REQUIRE(s1.node().wait_local_state_ready(std::chrono::seconds{10}));
+    REQUIRE(s2.node().wait_local_state_ready(std::chrono::seconds{10}));
+
+    std::atomic_bool loading{true};
+    std::thread loader([&] {
+        while (loading.load()) {
+            s2.node().note_activity(FrameType::loader, 64 * 1024);
+            std::this_thread::sleep_for(5ms);
+        }
+    });
+
+    const auto bytes = pattern(96 * 1024 + 29);
+    const auto id = object_id(bytes);
+    REQUIRE(s1.node().local_store().put(id, bytes));
+    const RetentionDot claim{s1.node().node_id(), 0xbeef};
+    s1.node().retention_store().retain(RetentionClass::data, id, claim);
+    s2.node().retention_store().retain(RetentionClass::data, id, claim);
+    REQUIRE(!s2.node().local_store().valid(id));
+    s2.node().notify_storage_mutation();
+
+    CHECK(s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    const bool restored = wait_until([&] { return s2.node().local_store().valid(id); }, 10s);
+    // The loader never paused: this copy came back during a busy period.
+    CHECK(s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    loading = false;
+    loader.join();
+    REQUIRE(restored);
+    CHECK(*s2.node().local_store().get(id) == bytes);
 }
 
 MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_reachability) {

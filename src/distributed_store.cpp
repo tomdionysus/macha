@@ -2300,13 +2300,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         Writer writer;
         writer.fixed(id.bytes);
         try {
+            // Yield is taken between operations, never inside one: a probe
+            // already sent completes (one bounded control round trip).
             auto rpc = n_.call_async(target, MessageType::have_object, writer.data(), FrameType::speculative);
-            while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
-                if (yielded()) {
-                    rpc.cancel();
-                    return std::nullopt;
-                }
-            }
             auto reply = rpc.get();
             if (reply.message.type != MessageType::bool_reply)
                 return false;
@@ -2336,14 +2332,11 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         writer.bytes(data);
         auto started = Clock::now();
         try {
+            // One extent in flight is the bounded non-pre-emptible work the
+            // laws allow a lower class. Cancelling it on every yield meant a
+            // WAN transfer longer than the slice never completed at all.
             auto rpc = n_.call_async(target, MessageType::put_object, writer.data(),
                                      FrameType::speculative);
-            while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
-                if (yielded()) {
-                    rpc.cancel();
-                    return std::nullopt;
-                }
-            }
             bool ok = rpc.get().message.type == MessageType::ok;
             if (ok)
                 note_network(data.size(), Clock::now() - started);
@@ -2529,10 +2522,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
             if (!reserve_operation())
                 break;
-            auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr,
-                                   should_yield);
-            if (yielded())
-                break;
+            // The fetch runs to completion and is kept: until 0.59.0 a yield
+            // during it abandoned the transfer, or discarded the bytes once
+            // they had arrived, so a node that was never quiet never pulled.
+            auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr);
             if (data) {
                 auto resource = n_.data_resources().acquire(
                     DataWorkContext(FrameType::speculative, data->bytes.size()),

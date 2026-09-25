@@ -205,6 +205,10 @@ void parse_maintenance(const YAML::Node& root, Config& c) {
     if (m["idle_bandwidth_fraction"])
         c.maintenance.idle_bandwidth_fraction =
             parse_fraction(m["idle_bandwidth_fraction"], "idle_bandwidth_fraction");
+    if (m["foreground_weight"])
+        c.maintenance.foreground_weight = m["foreground_weight"].as<size_t>();
+    if (m["repair_weight"])
+        c.maintenance.repair_weight = m["repair_weight"].as<size_t>();
     if (m["cpu_target"])
         c.maintenance.cpu_target = parse_fraction(m["cpu_target"], "cpu_target");
     if (m["background_concurrency"])

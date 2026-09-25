@@ -1,4 +1,4 @@
-# Macha 0.58.3
+# Macha 0.59.0
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -392,8 +392,13 @@ maintenance:
   # Background work is byte-budgeted and adaptive. Foreground I/O wins.
   interval_ms: 1000
   foreground_quiet_ms: 2000
-  busy_bandwidth_fraction: 0.0
+  busy_bandwidth_fraction: 0.0   # rebalance and scrub only
   idle_bandwidth_fraction: 0.10
+  # Replica repair is paced, never stopped: while a viewer, the mount or the
+  # loader is busy, repair gets repair_weight time for every
+  # foreground_weight of theirs. Both 1..10000.
+  foreground_weight: 95
+  repair_weight: 5
   cpu_target: 0.10
   # Loader/speculative DATA operations (publication, repair; one extent
   # each) active at once. 0 = half the hardware threads, minimum 1.

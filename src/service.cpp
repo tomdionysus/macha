@@ -1105,6 +1105,14 @@ void Service::loop(std::stop_token stop) {
     auto scrub_due_unix_ms = initialise_scrub_due(node_.config().state_path, policy.scrub_interval);
     double network_credit = 0.0;
     double local_credit = 0.0;
+    // Replica repair shares time with every higher class by weight, in the
+    // same duty-cycle form the FUSE frontend uses for viewer:loader. Until
+    // 0.59.0 repair was switched off outright while anything was busy (a zero
+    // busy fraction, and a yield on any activity), so a node that was always
+    // ingesting never repaired: gbni-1 was still short of a copy of roughly
+    // 0.9 TB when es-1 went on 2026-09-24, and that data was lost with it.
+    WeightedLoaderService repair_share(policy.foreground_weight, policy.repair_weight,
+                                       std::chrono::milliseconds(25));
     double scrub_credit = 0.0;
     std::optional<ObjectId> retained_data_repair_after;
     std::optional<ObjectId> retained_control_repair_after;
@@ -1209,8 +1217,12 @@ void Service::loop(std::stop_token stop) {
             cpu_scale = std::clamp(policy.cpu_target / cpu_load, 0.0, 1.0);
 
         double rate = bandwidth * fraction * cpu_scale;
+        // Repair's byte rate does not drop with busyness; repair_share decides
+        // how much of the time it gets. busy_bandwidth_fraction governs
+        // rebalance and scrub only.
+        const double repair_rate = bandwidth * policy.idle_bandwidth_fraction * cpu_scale;
         double burst_cap = std::max<double>(node_.config().extent_size, bandwidth * 5.0);
-        network_credit = std::min(burst_cap, network_credit + rate * wall_seconds);
+        network_credit = std::min(burst_cap, network_credit + repair_rate * wall_seconds);
         local_credit = std::min(burst_cap, local_credit + rate * wall_seconds);
         const auto wall_now_ms = unix_ms();
         const bool scrub_due = policy.scrub_fraction > 0.0 && wall_now_ms >= scrub_due_unix_ms;
@@ -1336,7 +1348,7 @@ void Service::loop(std::stop_token stop) {
                 log_slow_stage("catalogue-repair", stage);
             }
 
-            const bool allow_network_repair = !busy || policy.busy_bandwidth_fraction > 0.0;
+            const bool allow_network_repair = repair_share.can_start(now, busy);
             const bool network_due = allow_network_repair && now >= network_quiescent_until &&
                                      network_credit >= node_.config().extent_size;
             const bool garbage_due = !busy && !metadata_dirty;
@@ -1441,6 +1453,21 @@ void Service::loop(std::stop_token stop) {
                             }
                         }
                     };
+                    const auto higher_class_active = [this, &policy] {
+                        const auto quiet = policy.foreground_quiet;
+                        return store_->foreground_idle_for() < quiet ||
+                               store_->interactive_idle_for() < quiet ||
+                               store_->loader_idle_for() < quiet;
+                    };
+                    repair_share.started(Clock::now(), busy);
+                    // A throw from either repair stage must still close the
+                    // turn, or the pacer counts it active forever and never
+                    // computes another cooldown.
+                    struct RepairTurn {
+                        WeightedLoaderService& share;
+                        const decltype(higher_class_active)& active;
+                        ~RepairTurn() { share.finished(Clock::now(), active()); }
+                    } repair_turn{repair_share, higher_class_active};
                     enter_stage("retention-repair");
                     repair_retained(RetentionClass::data, retained_data_repair_after);
                     repair_retained(RetentionClass::control, retained_control_repair_after);
@@ -1457,14 +1484,11 @@ void Service::loop(std::stop_token stop) {
                     auto repair = store_->repair_step(
                         byte_budget, operation_budget, maintenance_live_.get(),
                         maintenance_universal_.get(),
-                        [this] {
-                            // End the current maintenance slice as soon as any
-                            // foreground I/O appears. The next scheduler pass
-                            // will re-evaluate busy_bandwidth_fraction normally.
-                            const auto quiet = node_.config().maintenance.foreground_quiet;
-                            return store_->foreground_idle_for() < quiet ||
-                                   store_->interactive_idle_for() < quiet ||
-                                   store_->loader_idle_for() < quiet;
+                        [&] {
+                            // Repair's turn ends at the next operation boundary
+                            // once its weighted slice is spent; it is paced,
+                            // never stopped.
+                            return repair_share.should_yield(Clock::now(), higher_class_active());
                         },
                         maintenance_inventory_generation_);
                     log_slow_stage("network-repair", repair_stage,
@@ -1987,7 +2011,25 @@ void Service::loop(std::stop_token stop) {
                                     now_after_work + std::chrono::duration_cast<Clock::duration>(
                                                          std::chrono::duration<double>(seconds)));
         };
-        credit_deadline(network_credit, network_quiescent_until);
+        {
+            // Credit alone is not enough while repair is cooling down behind a
+            // busy class: wake when its next turn is due, not on the next
+            // unrelated event.
+            if (network_quiescent_until != Clock::time_point::max() && repair_rate > 0.0 &&
+                network_credit < node_.config().extent_size) {
+                const auto seconds =
+                    (static_cast<double>(node_.config().extent_size) - network_credit) / repair_rate;
+                if (std::isfinite(seconds) && seconds > 0.0)
+                    deadline = std::min(deadline,
+                                        now_after_work + std::chrono::duration_cast<Clock::duration>(
+                                                             std::chrono::duration<double>(seconds)));
+            }
+            if (network_quiescent_until != Clock::time_point::max()) {
+                const auto turn = repair_share.wait_for(now_after_work, busy);
+                if (turn > Clock::duration{})
+                    deadline = std::min(deadline, now_after_work + turn);
+            }
+        }
         credit_deadline(local_credit, local_quiescent_until);
 
         // A maintenance action can itself commit metadata (for example,
