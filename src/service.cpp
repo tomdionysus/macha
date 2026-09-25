@@ -1351,6 +1351,12 @@ void Service::loop(std::stop_token stop) {
             const bool allow_network_repair = repair_share.can_start(now, busy);
             const bool network_due = allow_network_repair && now >= network_quiescent_until &&
                                      network_credit >= node_.config().extent_size;
+            store_->note_repair_gate(
+                network_due                        ? DistributedStore::RepairGate::ran
+                : !allow_network_repair            ? DistributedStore::RepairGate::share
+                : now < network_quiescent_until    ? DistributedStore::RepairGate::quiescent
+                                                   : DistributedStore::RepairGate::credit,
+                network_credit);
             const bool garbage_due = !busy && !metadata_dirty;
             const bool gc_due = !busy && now >= gc_quiescent_until;
             gc_due_this_pass = gc_due;

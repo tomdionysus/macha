@@ -49,6 +49,14 @@ class DistributedStore {
         uint64_t bytes_transferred{};
         uint64_t passes_completed{};
         bool push_phase_complete{};
+        // Why the maintenance loop did or did not run a repair step, per
+        // pass. With progress stuck at zero there was no way to tell a gate
+        // from a loop that never got here.
+        uint64_t gate_ran{};
+        uint64_t gate_share{};
+        uint64_t gate_quiescent{};
+        uint64_t gate_credit{};
+        uint64_t last_credit_bytes{};
     };
 
     struct DurableReplica {
@@ -131,6 +139,28 @@ class DistributedStore {
     std::atomic_uint64_t repair_bytes_total_{};
     std::atomic_uint64_t repair_passes_completed_{};
     std::atomic_bool repair_push_phase_complete_{};
+    std::atomic_uint64_t repair_gate_ran_{};
+    std::atomic_uint64_t repair_gate_share_{};
+    std::atomic_uint64_t repair_gate_quiescent_{};
+    std::atomic_uint64_t repair_gate_credit_{};
+    std::atomic_uint64_t repair_last_credit_{};
+
+  public:
+    enum class RepairGate { ran, share, quiescent, credit };
+    void note_repair_gate(RepairGate gate, double credit) noexcept {
+        repair_last_credit_.store(static_cast<uint64_t>(std::max(0.0, credit)),
+                                  std::memory_order_relaxed);
+        switch (gate) {
+        case RepairGate::ran: repair_gate_ran_.fetch_add(1, std::memory_order_relaxed); break;
+        case RepairGate::share: repair_gate_share_.fetch_add(1, std::memory_order_relaxed); break;
+        case RepairGate::quiescent:
+            repair_gate_quiescent_.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case RepairGate::credit: repair_gate_credit_.fetch_add(1, std::memory_order_relaxed); break;
+        }
+    }
+
+  private:
     std::atomic_uint64_t repair_local_unreadable_{};
     mutable std::mutex repair_sample_mutex_;
     std::deque<ObjectId> repair_unsourceable_sample_;
