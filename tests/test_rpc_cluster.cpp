@@ -586,6 +586,8 @@ MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_e
     }
     CHECK(examined >= live.size());
     CHECK(node.data_resources().stats().speculative_admissions == before);
+    // And the progress is visible, not just in a trace line.
+    CHECK(store.repair_diagnostics().pull_examined == examined);
 }
 
 MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_turn_ended) {
