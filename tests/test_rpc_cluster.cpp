@@ -4973,6 +4973,9 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     // --- Torrent: list visibility from the non-owning node ---
     {
         const auto response = get(s2.acquisition_api(), "/api/v1/torrents/jobs");
+        if (response.status != 200)
+            std::cerr << "torrent list from the non-owning node: " << response.status << " "
+                      << std::string(response.body.begin(), response.body.end()) << "\n";
         REQUIRE(response.status == 200);
         const auto parsed = body_json(response);
         const auto* jobs = parsed.find("jobs");
@@ -5003,7 +5006,14 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         CHECK(node_id->asString() == node1_id);
         const auto* state = parsed.find("state");
         REQUIRE(state != nullptr);
-        CHECK(state->asString() == "queued");
+        // As with the ingest resume above: the reply is node 1's job re-read
+        // after resume() released its lock, and the worker may already have
+        // moved it on -- a released magnet is started by libtorrent at once
+        // and reads `metadata`. What it must never say is a state resume
+        // cannot lead to.
+        const auto reported = state->asString();
+        CHECK((reported == "queued" || reported == "metadata" || reported == "downloading" ||
+               reported == "verify_queued" || reported == "verifying"));
     }
 
     // --- A job that exists nowhere still 404s cluster-wide, not just locally ---
