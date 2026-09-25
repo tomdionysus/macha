@@ -3180,6 +3180,139 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     service.stop();
 }
 
+namespace {
+// One node, one tiny file and a PlaybackManager admitting a single video
+// transcode: the shape of fi-1 when a held slot refuses everybody else.
+struct SingleSlotPlayback {
+    TempDir t;
+    std::unique_ptr<Service> service;
+    std::unique_ptr<PlaybackManager> playback;
+    std::string media_id;
+
+    SingleSlotPlayback() {
+        auto keyfile = t.path() / "key";
+        write_key(keyfile);
+        auto keys = load_cluster_keys(keyfile);
+        auto c = config_for(t.path() / "node", keyfile, free_port());
+        c.replication = 1;
+        c.metadata_min_write_replicas = 1;
+        c.catalogue.api.enabled = false;
+        service = std::make_unique<Service>(c, keys);
+        service->start();
+        service->filesystem().mkdir("/media", 0755, getuid(), getgid());
+        service->filesystem().create_file("/media/slot.mp4", 0644, getuid(), getgid());
+        auto writer = service->filesystem().open_write("/media/slot.mp4", true);
+        auto bytes = pattern(64 * 1024);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        media_id = file_media_id(service->filesystem().getattr("/media/slot.mp4"));
+
+        CatalogueApiConfig api;
+        StreamingConfig streaming;
+        streaming.enabled = true;
+        streaming.temp_path = t.path() / "playback";
+        streaming.max_sessions = 4;
+        streaming.max_video_transcodes = 1;
+        streaming.max_audio_transcodes = 1;
+        streaming.startup_timeout = 2s;
+        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->catalogue(),
+                                                     api, streaming,
+                                                     std::make_unique<FakeMediaEngine>());
+        playback->start();
+    }
+
+    HttpResponse create(const std::string& mode, const std::string& viewer,
+                        const std::string& attempt) {
+        Json::Object preferences{{"mode", mode}, {"container", "fmp4"}};
+        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = SessionIdentity{.id = viewer, .roles = {"anonymous"}};
+        request.query["idempotency_key"] = attempt;
+        request.body.assign(text.begin(), text.end());
+        return playback->handle(request);
+    }
+
+    Json status() {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/playback/status";
+        auto response = playback->handle(request);
+        REQUIRE(response.status == 200);
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    }
+
+    static Json body(const HttpResponse& response) {
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    }
+};
+} // namespace
+
+MACHA_TEST("media_playback", test_a_patch_out_of_transcode_releases_the_slot) {
+    // Until 0.60.0 the entitlement outlived the transcode: a session PATCHed
+    // to direct kept the node's only slot while it streamed, plus the idle
+    // period, and refused every other viewer (fi-1, 2026-09-25 08:57Z).
+    SingleSlotPlayback fixture;
+    auto first = fixture.create("transcode", "viewer-1", "a1");
+    REQUIRE(first.status == 201);
+    const auto id = SingleSlotPlayback::body(first).find("session_id")->asString();
+    CHECK(fixture.status().find("video_transcodes")->asUInt64() == 1);
+    CHECK(fixture.create("transcode", "viewer-2", "b1").status == 429);
+
+    HttpRequest patch;
+    patch.method = "PATCH";
+    patch.path = "/api/v1/playback/sessions/" + id;
+    patch.session = SessionIdentity{.id = "viewer-1", .roles = {"anonymous"}};
+    const std::string text = R"({"preferences":{"mode":"direct"}})";
+    patch.body.assign(text.begin(), text.end());
+    auto patched = fixture.playback->handle(patch);
+    REQUIRE(patched.status == 200);
+
+    CHECK(fixture.status().find("video_transcodes")->asUInt64() == 0);
+    CHECK(fixture.create("transcode", "viewer-2", "b2").status == 201);
+}
+
+MACHA_TEST("media_playback", test_the_signed_stream_url_closes_its_session_without_a_bearer) {
+    // The page-exit close (0.60.0): a browser unloading a page cannot finish
+    // a preflighted DELETE, so the session is closed through its own signed
+    // stream URL with no Authorization header -- a CORS simple request.
+    SingleSlotPlayback fixture;
+    auto created = fixture.create("transcode", "viewer-1", "a1");
+    REQUIRE(created.status == 201);
+    const auto body = SingleSlotPlayback::body(created);
+    const auto id = body.find("session_id")->asString();
+    const auto url = body.find("stream")->find("url")->asString();
+    const std::string prefix = "/api/v1/playback/sessions/" + id + "/stream/";
+    REQUIRE(url.starts_with(prefix));
+    const auto token = url.substr(prefix.size(), url.find('/', prefix.size()) - prefix.size());
+    REQUIRE(!token.empty());
+
+    auto close = [&](const std::string& method, const std::string& with_token) {
+        HttpRequest request;
+        request.method = method;
+        request.path = prefix + with_token + "/close";
+        // No bearer: the token in the path is the whole authorisation.
+        CHECK(fixture.playback->capability_request(request));
+        return fixture.playback->handle(request);
+    };
+
+    CHECK(close("GET", token).status == 405);
+    std::string wrong = token;
+    wrong.back() = wrong.back() == '0' ? '1' : '0';
+    CHECK(close("POST", wrong).status == 404);
+    CHECK(fixture.status().find("sessions")->asUInt64() == 1);
+
+    CHECK(close("POST", token).status == 204);
+    CHECK(fixture.status().find("sessions")->asUInt64() == 0);
+    CHECK(fixture.status().find("video_transcodes")->asUInt64() == 0);
+    CHECK(fixture.create("transcode", "viewer-2", "b1").status == 201);
+
+    // Idempotent: the session is already gone, which is what was asked for.
+    CHECK(close("POST", token).status == 204);
+}
+
 MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_entitlement) {
     // This case used to assert the opposite, and the name it had --
     // "logical viewer keeps one transcode entitlement across replacements" --
@@ -3671,14 +3804,22 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     unsupported.path = "/api/v1/playback/sessions";
     unsupported.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     unsupported.body.assign(unsupported_text.begin(), unsupported_text.end());
-    // Capabilities are advisory: the instruction is performed and the
-    // contradiction is reported, rather than refused.
-    // Capabilities are advisory: the instruction is not refused for
-    // contradicting them. (This node already holds its single transcode
-    // slot from the session above, so the refusal here is admission, not
-    // negotiation -- which is itself the point.)
+    // Capabilities are advisory: the instruction is performed, not refused
+    // for contradicting them. Until 0.60.0 this was asserted as a 429 because
+    // the session above kept its transcode slot after being PATCHed to direct;
+    // leaving transcode now releases the slot, so the create is admitted.
     auto unsupported_response = playback.handle(unsupported);
-    CHECK(unsupported_response.status == 429);
+    REQUIRE(unsupported_response.status == 201);
+    {
+        // Give the slot back so the session above can PATCH into transcode.
+        auto body = Json::parse(std::string(unsupported_response.body.begin(),
+                                            unsupported_response.body.end()));
+        HttpRequest erase;
+        erase.method = "DELETE";
+        erase.path = "/api/v1/playback/sessions/" + body.find("session_id")->asString();
+        erase.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
+        REQUIRE(playback.handle(erase).status == 204);
+    }
 
     Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}, {"subtitle_stream", 2}};
     Json::Object patch_root{{"preferences", Json(std::move(preferences))}, {"seek_ms", 12000}};

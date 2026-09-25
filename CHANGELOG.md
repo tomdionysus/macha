@@ -1,5 +1,31 @@
 # Current release
 
+## 0.60.0 — Close a session from a page that is going away; leaving transcode frees the slot (development)
+
+**A page reload left its session, and the node's transcode slot, held.**
+A browser unloading a page does not complete a preflighted request, and a
+cross-origin `DELETE` carrying a bearer is always preflighted, so the close
+the web client sent on page exit never arrived (fi-1, 2026-09-25 11:31Z: the
+next transcode was refused 429 until the idle rule).
+
+- **`POST /api/v1/playback/sessions/{id}/stream/{token}/close`**, new. The same
+  teardown as `DELETE`, authorised by the session's signed stream URL (the
+  prefix of `stream.url`) with no `Authorization` header and no body: a CORS
+  simple request, for `sendBeacon` or a keepalive `fetch` on page exit. `204`
+  when closed or already gone, `404 not_found` for a live session with the
+  wrong token, `405` for anything but `POST`.
+
+**A session switched out of transcode kept the slot.** The entitlement was
+released only on `DELETE`, expiry or `transcode_entitlement_idle_ms` without
+stream activity, so a viewer who changed to direct play held the node's only
+transcode slot while watching and refused everyone else (fi-1, 2026-09-25
+08:57Z).
+
+- A `PATCH` that leaves transcode now releases the entitlement: video when the
+  new plan no longer transcodes video, audio likewise. A sibling session on the
+  same logical viewer keeps it, as with the idle release. Switching back
+  reacquires it and may be refused `resource_limit`, as any `PATCH` may.
+
 ## 0.59.0 — Replica repair is paced, never stopped (development)
 
 **Repair stopped whenever the node was busy, and gbni-1 was always busy.**

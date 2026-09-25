@@ -1581,6 +1581,26 @@ struct PlaybackManager::Impl {
                   session.id);
     }
 
+    // A session PATCHed out of transcode no longer needs the slot it was
+    // entitled to. Until 0.60.0 the entitlement stayed until the session went
+    // idle, so a viewer who switched to direct play held the node's only
+    // transcode slot for as long as they watched plus the idle period, and
+    // every other viewer's transcode was refused (fi-1, 2026-09-25 08:57Z).
+    // A sibling on the same logical viewer keeps it, as in the idle release.
+    void release_unused_transcode_entitlements_locked(Session& session) {
+        if (!session.logical_session || !sole_session_for_logical_locked(session)) return;
+        auto& logical = *session.logical_session;
+        const bool video = logical.video_transcode_entitled &&
+                           session.plan.video != MediaTransform::transcode;
+        const bool audio = logical.audio_transcode_entitled &&
+                           session.plan.audio != MediaTransform::transcode;
+        if (video) logical.video_transcode_entitled = false;
+        if (audio) logical.audio_transcode_entitled = false;
+        if (video || audio)
+            Log::info("playback transcode entitlement released: session no longer transcodes session=" +
+                      session.id + (video ? " video" : "") + (audio ? " audio" : ""));
+    }
+
     void commit_resources_locked(const ResourceReservation& reservation) {
         if (reservation.video && reserved_video_transcodes) --reserved_video_transcodes;
         if (reservation.audio && reserved_audio_transcodes) --reserved_audio_transcodes;
@@ -2847,6 +2867,7 @@ struct PlaybackManager::Impl {
                 signal_cleanup_locked();
                 commit_resources_locked(resource_reservation);
                 resource_reservation = {};
+                release_unused_transcode_entitlements_locked(*replacement);
             }
         } catch (...) {
             if (old_active) old_active->segments()->mark_superseded(false);
@@ -2871,22 +2892,56 @@ struct PlaybackManager::Impl {
                 return http_error(404, "not_found", "playback session not found");
             session = it->second;
         }
+        if (!tear_down_session(id, session))
+            return http_error(404, "not_found", "playback session not found");
+        return {204, "application/json; charset=utf-8", {}, {}, {}};
+    }
+
+    // The page-exit close (0.60.0). A browser tearing down a page cannot
+    // complete a preflighted request, and a cross-origin DELETE carrying an
+    // Authorization header is always preflighted, so a reload left its session
+    // -- and the node's transcode slot -- held until the idle rule. This route
+    // is authorised by the stream token in its path, the same capability that
+    // already grants the stream, so it needs no header and is a CORS simple
+    // request that survives unload (sendBeacon, fetch keepalive). Closing is
+    // idempotent: a session already gone is the outcome the caller wanted.
+    HttpResponse close_by_capability(std::string_view id, std::string_view token) {
+        std::shared_ptr<Session> session;
+        {
+            std::lock_guard lock(mutex);
+            auto it = sessions.find(id);
+            if (it == sessions.end()) return {204, "application/json; charset=utf-8", {}, {}, {}};
+            if (!stream_token_matches(it->second->token, std::string(token)))
+                return http_error(404, "not_found", "stream not found");
+            session = it->second;
+        }
+        (void)tear_down_session(id, session);
+        return {204, "application/json; charset=utf-8", {}, {}, {}};
+    }
+
+    // Removes the session the caller has already authorised and releases
+    // everything it holds. False when it was removed meanwhile.
+    bool tear_down_session(std::string_view id, std::shared_ptr<Session> session) {
+        std::shared_ptr<Session> removed;
         std::unique_lock logical_operation(session->logical_session->operation_mutex);
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
-            if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
-            session = it->second;
+            if (it == sessions.end()) return false;
+            // Whatever holds the id now, which may be a recreate of the one
+            // authorised. `session` keeps the locked logical session alive
+            // until the lock above is released.
+            removed = it->second;
             sessions.erase(it);
             erase_idempotency_for_session_locked(id);
-            if (!session->logical_session->client_key.empty())
-                logical_sessions.erase(session->logical_session->client_key);
+            if (!removed->logical_session->client_key.empty())
+                logical_sessions.erase(removed->logical_session->client_key);
             signal_cleanup_locked();
         }
-        stop_pipeline(*session);
+        stop_pipeline(*removed);
         std::error_code ec;
-        std::filesystem::remove_all(*config.temp_path / session->id, ec);
-        return {204, "application/json; charset=utf-8", {}, {}, {}};
+        std::filesystem::remove_all(*config.temp_path / removed->id, ec);
+        return true;
     }
 
     HttpResponse status() const {
@@ -3130,6 +3185,11 @@ struct PlaybackManager::Impl {
             auto stream = parse_stream_route(request.path);
             if (!stream)
                 return http_error(404, "not_found", "endpoint not found");
+            if (const auto close = stream->stream_path.find('/');
+                close != std::string_view::npos && stream->stream_path.substr(close) == "/close") {
+                if (request.method != "POST") return http_error(405, "method", "POST required");
+                return close_by_capability(stream->session_id, stream->stream_path.substr(0, close));
+            }
             return session_stream_response(request, stream->session_id, stream->stream_path);
         }
         if (request.path == "/api/v1/playback/media" && request.method == "GET")
