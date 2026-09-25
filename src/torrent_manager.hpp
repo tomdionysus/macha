@@ -108,6 +108,10 @@ class TorrentManager final : public TorrentService {
     std::optional<std::string> save_path_of(const libtorrent::torrent_handle&) const;
     void update_jobs();
     bool has_active_jobs_locked() const;
+    // A failed job whose ingest has been resumed (through the ingest's own
+    // route, a peer, or retry) and is running again. It must follow the
+    // ingest back rather than stay failed with its staging held.
+    bool linked_ingest_revived(const TorrentJob&) const;
     std::string add_impl(std::string uri, bool allow_fetch);
 
     // NodeRuntime::set_torrent_bridge() handler bodies. Local-only -- never

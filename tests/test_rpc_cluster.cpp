@@ -491,6 +491,40 @@ MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retaine
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_extent) {
+    // Until 0.62.0 repair decided "this node already holds it" by reading,
+    // decrypting and hashing the whole extent, under a DATA lease, for every
+    // live object on every pass. On gbni-1 that made one pass a full read of
+    // its 1.5 TB store; at a busy node's share it checked about one extent
+    // every thirty seconds and never reached the ones it lacked. Presence is
+    // an index lookup; corruption belongs to scrub and the read path.
+    TestNode fixture("repair-presence-by-index", ConfigProfile::functional);
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    auto& node = fixture.start();
+
+    std::vector<ObjectId> live;
+    for (int i = 0; i < 24; ++i) {
+        const auto bytes = pattern(64 * 1024, 200 + i);
+        const auto id = object_id(bytes);
+        REQUIRE(node.local_store().put(id, bytes));
+        live.push_back(id);
+    }
+    std::sort(live.begin(), live.end());
+
+    DistributedStore store(node);
+    const auto before = node.data_resources().stats().speculative_admissions;
+    size_t examined = 0;
+    for (int pass = 0; pass < 8 && examined < live.size(); ++pass) {
+        const auto result = store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+        examined += result.pull_examined;
+    }
+    CHECK(examined >= live.size());
+    CHECK(node.data_resources().stats().speculative_admissions == before);
+}
+
 MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_turn_ended) {
     // Repair yields between operations, never inside one. Until 0.59.0 the
     // yield predicate was also polled while a pull was in flight: the fetch

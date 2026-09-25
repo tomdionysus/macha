@@ -202,6 +202,9 @@ TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, Torrent
         [this](std::span<const uint8_t> payload) { return handle_jobs_query(payload); },
         [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
     if (!config_.enabled) return;
+    // The only event that says a failed job's ingest is running again: a
+    // settled manager is otherwise asleep until an API call on a torrent.
+    ingest_.set_resume_listener([this](std::string_view) { cv_.notify_all(); });
     std::filesystem::create_directories(state_file_.parent_path());
     impl_ = std::make_unique<Impl>(config_, node_.config().advertise_host, disk_hooks());
     // Alerts arrive on libtorrent's own thread; this only wakes the worker,
@@ -221,6 +224,7 @@ TorrentManager::~TorrentManager() {
     // into freed memory. Clear before stopping so no new call is admitted
     // while the worker is winding down.
     node_.set_torrent_bridge({}, {});
+    ingest_.set_resume_listener({});
     stop();
 }
 
@@ -974,11 +978,19 @@ bool TorrentManager::clear(std::string_view id) {
     return true;
 }
 
+bool TorrentManager::linked_ingest_revived(const TorrentJob& job) const {
+    if (job.state != TorrentJobState::failed || !job.ingest_job_id) return false;
+    const auto linked = ingest_.job(*job.ingest_job_id);
+    return linked && linked->state != IngestJobState::failed &&
+           linked->state != IngestJobState::cancelled;
+}
+
 bool TorrentManager::has_active_jobs_locked() const {
-    return std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
+    return std::any_of(jobs_.begin(), jobs_.end(), [this](const auto& pair) {
         const auto state = pair.second.state;
+        if (state == TorrentJobState::failed) return linked_ingest_revived(pair.second);
         return state != TorrentJobState::completed && state != TorrentJobState::cancelled &&
-               state != TorrentJobState::failed && state != TorrentJobState::paused;
+               state != TorrentJobState::paused;
     });
 }
 
@@ -1233,8 +1245,13 @@ void TorrentManager::update_jobs() {
     std::lock_guard lock(mutex_);
     bool changed = false;
     for (auto& [id, job] : jobs_) {
-        if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed ||
-            job.state == TorrentJobState::failed)
+        if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed)
+            continue;
+        // Until 0.62.0 a failed job was never looked at again, so resuming
+        // its ingest directly left it failed for good, with its staging
+        // reservation held (Rome, gbni-1, 2026-09-25). One whose ingest is
+        // running again falls through to the linked-ingest sync below.
+        if (job.state == TorrentJobState::failed && !linked_ingest_revived(job))
             continue;
 
         // Macha's explicit pause is operator intent. libtorrent applies

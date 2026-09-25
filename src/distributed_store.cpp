@@ -2283,16 +2283,14 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     auto maintenance_has_on = [&](const NodeInfo& target,
                                   const ObjectId& id) -> std::optional<bool> {
         if (target.id == n_.node_id()) {
-            auto resource = n_.data_resources().acquire(
-                DataWorkContext(FrameType::speculative, n_.config().extent_size),
-                n_.config().extent_size);
-            if (!resource)
-                return std::nullopt;
-            // Unlike has_on()'s local branch, this decides whether a *repair
-            // push* target already holds a healthy copy, with no downstream
-            // re-verification step -- a corrupt-but-present local object must
-            // not be counted as satisfying placement, or it never gets healed.
-            return n_.local_store().valid(id);
+            // Presence, from the index. Until 0.62.0 this read, decrypted and
+            // hashed the whole extent to decide "already here", once per
+            // object per pass: on gbni-1 a pass over its 1.5 TB store was a
+            // full read of it, and under a busy node's share about one extent
+            // every thirty seconds. A corrupt local copy is found by scrub
+            // and by reads, which verify every object they consume, and is
+            // removed there; repair then sees it absent and restores it.
+            return n_.local_store().has(id);
         }
         if (!reserve_operation() || yielded())
             return std::nullopt;
@@ -2484,16 +2482,11 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                                     std::binary_search(universal->begin(), universal->end(), id);
             bool local_valid = false;
             if (everywhere || should_own(id)) {
-                auto resource = n_.data_resources().acquire(
-                    DataWorkContext(FrameType::speculative, n_.config().extent_size),
-                    n_.config().extent_size);
-                if (!resource)
-                    break;
-                // No downstream re-verification follows this decision (unlike
-                // has_on()'s callers): a corrupt local copy must not be
-                // treated as "already own it, skip the pull", or a locally
-                // rotted object this node should own is never re-fetched.
-                local_valid = n_.local_store().valid(id);
+                // An index lookup, as in the push above: a pass that read
+                // every extent it already held could never reach the ones it
+                // lacks (gbni-1, 2026-09-25: years to cover its store). Scrub
+                // and the read path own corruption.
+                local_valid = n_.local_store().has(id);
             }
             if ((!everywhere && !should_own(id)) || local_valid) {
                 repair_pull_after_ = id;

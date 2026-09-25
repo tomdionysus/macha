@@ -2401,10 +2401,11 @@ MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_se
     plugin.subsystem().stop();
 }
 
-MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_intent) {
-    TestNode fixture("torrent-recovery");
-    fixture.prepare();
-
+namespace {
+// A failed torrent job linked to a failed ingest, plus a queued one to pause,
+// written as the node would have persisted them. Shared by the retry case and
+// the resume-through-the-ingest case.
+void write_torrent_recovery_state(TestNode& fixture) {
     const auto state_path = fixture.config().state_path;
     const auto staging_path = fixture.path() / "staging";
     const auto retry_payload = staging_path / "torrents" / "torrent-retry";
@@ -2481,6 +2482,17 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
         REQUIRE(out.good());
     }
 
+}
+} // namespace
+
+MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_intent) {
+    TestNode fixture("torrent-recovery");
+    fixture.prepare();
+
+    write_torrent_recovery_state(fixture);
+    const auto state_path = fixture.config().state_path;
+    const auto staging_path = fixture.path() / "staging";
+
     fixture.start();
 
     CatalogueHintQueue hints(state_path / "catalogue-hints");
@@ -2556,6 +2568,70 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     paused = torrents.job("torrent-pause");
     REQUIRE(paused.has_value());
     CHECK(paused->state == TorrentJobState::paused);
+    plugin.subsystem().stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resumed_directly) {
+    // Rome, gbni-1, 2026-09-25: the torrent's ingest was resumed through the
+    // ingest's own route rather than by retrying the torrent. The ingest ran;
+    // the torrent job stayed failed, because a failed job was never looked at
+    // again, and its staging reservation was never released. It must follow
+    // the ingest back without anybody touching the torrent.
+    TestNode fixture("torrent-follows-ingest");
+    fixture.prepare();
+    write_torrent_recovery_state(fixture);
+    const auto state_path = fixture.config().state_path;
+    const auto staging_path = fixture.path() / "staging";
+    fixture.start();
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = staging_path;
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+
+    TorrentConfig torrent_config;
+    torrent_config.enabled = true;
+    torrent_config.dht = false;
+    torrent_config.pex = false;
+    torrent_config.lsd = false;
+    Config plugin_config = fixture.node().config();
+    plugin_config.torrent = torrent_config;
+    plugin_config.state_path = state_path;
+    SubsystemRegistry registry;
+    SubsystemContext context;
+    context.config = &plugin_config;
+    context.node = &fixture.node();
+    context.ingest = &ingest;
+    context.registry = &registry;
+    LoadedTorrentPlugin plugin(context);
+    auto torrents_owner = registry.torrent();
+    REQUIRE(torrents_owner);
+    auto& torrents = *torrents_owner;
+    plugin.subsystem().start();
+
+    auto before = torrents.job("torrent-retry");
+    REQUIRE(before.has_value());
+    REQUIRE(before->state == TorrentJobState::failed);
+    // Settled: with its ingest failed too, nothing brings it back by itself.
+    std::this_thread::sleep_for(600ms);
+    CHECK(torrents.job("torrent-retry")->state == TorrentJobState::failed);
+
+    TorrentSearchManager search(torrent_config);
+    AcquisitionApi acquisition(ingest, registry, search);
+    HttpRequest resume;
+    resume.method = "POST";
+    resume.path = "/api/v1/ingest/jobs/ingest-retry/resume";
+    REQUIRE(acquisition.handle(resume).status == 200);
+
+    // The ingest is queued (its workers are not running here); the torrent
+    // job mirrors it as importing, with the old failure cleared.
+    REQUIRE(wait_until([&] {
+        return torrents.job("torrent-retry")->state == TorrentJobState::importing;
+    }, 5s));
+    const auto after = torrents.job("torrent-retry");
+    CHECK(after->error.empty());
+    CHECK(after->error_code.empty());
     plugin.subsystem().stop();
 }
 #endif // MACHA_TEST_TORRENT_PLUGIN

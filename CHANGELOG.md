@@ -1,5 +1,28 @@
 # Current release
 
+## 0.62.0 — Repair reaches what is missing; a failed torrent follows its resumed ingest (development)
+
+**Repair read every extent it already had.** To decide "this node holds it",
+both repair passes read, decrypted and hashed the whole extent under a DATA
+lease. On gbni-1 one pass was a full read of its 1.5 TB store, and at a busy
+node's share (0.59.0) it checked about one extent every thirty seconds: years
+to reach the extents it lacked, which is why it never reported the data lost
+with es-1. Presence is now an index lookup. A corrupt local copy is found by
+scrub and by reads, which verify every object they consume, and removed there;
+repair then restores it.
+
+**A failed torrent job stayed failed after its ingest was resumed.** Only the
+torrent's own `retry` brought it back; resuming the ingest through its own
+route (Rome, gbni-1, 2026-09-25) ran the import while the torrent job stayed
+`failed`, and its staging reservation was never released, which kept
+Smallville `blocked` with `staging_full`. A failed job whose linked ingest is
+running again now mirrors it, and releases staging when it completes. The
+ingest tells the torrent manager when it resumes a job, so an idle manager
+wakes for it.
+
+Nothing on the wire changes; a torrent job may now leave `failed` without a
+torrent action.
+
 ## 0.61.0 — Torrents no longer re-check everything on restart, and paused means paused (development)
 
 **After a restart, torrents sat in `verifying` with no progress and no ETA.**
