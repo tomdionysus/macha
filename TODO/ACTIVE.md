@@ -1,75 +1,82 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-25 ~08:30Z, after 0.58.2 was deployed and the ingest
-collision fix committed (`06c387d`, unreleased).
+Last updated: 2026-09-25 ~16:00Z, after 0.62.3 was deployed on both nodes.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
 **Start here after a clear: read [the 2026-09-25 handover](HANDOVER-2026-09-25.md).**
-It says what is in flight, how to build and deploy now that es-1 is gone,
-what is owed to whom, and the decisions waiting on the operator.
+It says what is in flight, how to build and deploy, what is owed to whom, and
+the decisions waiting on the operator.
 
-## Cluster state (2026-09-25 ~08:30Z)
+## Cluster state (2026-09-25 ~16:00Z)
 
-- **gbni-1** (10.44.1.50) and **fi-1** (10.35.1.10) both run **0.58.2**
-  (`c9ef513`, tagged; `main` = `develop` there). Metadata writable, 2/2
-  replicas against `metadata_min_write_replicas: 2`: **restarting either node
-  makes metadata read-only until it is back.**
-- **es-1 (ramaroja) is offline for the foreseeable future** (operator). fi-1
-  is the build node; never build on gbni-1.
-- **fi-1**: eth0 has had no carrier since 2026-09-24 11:37Z, so it is on wifi
-  at 10.35.1.10 (not .50); the operator says it should be wired (on site).
-  It hosts a 10G DATA backend (`/var/lib/macha/data`) since 2026-09-24, which
-  makes `/mnt/machamedia` report 10G total and 100% full on both nodes
-  (logical capacity for two copies is capped by the smaller node); the
-  operator has not chosen between reverting it and `replication: 1`.
-- **gbni-1 keeps core dumps** in `/mnt/diskB/crash` (runtime
-  `kernel.core_pattern`, lost on reboot, plus the systemd drop-in
-  `macha.service.d/core-dumps.conf`). Three cores there, all the torrent
-  use-after-free fixed in 0.58.1.
-- **Clients**: 0.58.0 made playback `media_id`-only and refuses open choices.
-  Core `develop` speaks it; released TV 0.7.0 and phone 0.9.0 (core 0.19.0)
-  cannot play on these nodes until a core release ships -- accepted by the
-  operator for the test cluster.
+- **gbni-1** (10.44.1.50) and **fi-1** (10.35.1.10, also answering on .50
+  again) both run **0.62.3** (`f3bf8d7`, tagged; `main` there). Metadata
+  writable 2/2 against `metadata_min_write_replicas: 2`: restarting either node
+  makes metadata read-only until it is back.
+- **es-1 is offline for the foreseeable future**; fi-1 is the build node.
+- **Data lost with es-1.** Many files dated 2026-08-31 and earlier have extents
+  no node holds (~0.9 TB never reached gbni-1 before es-1 went). Of 49 films
+  and episodes with 2+ files, only 11 have every file readable at offset 0,
+  and whole-file readability is worse (The Martian's 7b5743ad, Dark S01E06
+  fail mid-file). The server still lists them as playable.
+- **fi-1's 10G DATA backend is full** (81 bytes free) and still counts as an
+  owner of every extent at replicas 2; every new import write also goes to it
+  and is refused. Operator decision pending (item 5).
+- **The operator's account for Claude**: `claude`, all roles, credentials
+  on-box in `/root/.macha-claude-credentials` on both nodes.
+- **Torrents**: Rome (`e0fec4b2`) importing ~95% and following its ingest
+  since 0.62.0; Smallville (`c448626e`, 366 GB) `blocked staging_full`
+  legitimately; the rest paused and now truly held.
 
 ## The queue
 
-1. **Release the ingest collision fix** (`06c387d`, committed, not
-   released): two files of one job were planned onto one destination (Rome's
-   two `Extras/Menu Art.mkv`), and the second failed `destination_conflict`
-   on every retry. Next version (0.58.3): build and suite on fi-1, deploy both
-   nodes, tag, advance `main`. Then **retry the Rome ingest job
-   `b0f01a830fd4d0dbe7f10ee9aeaff6ca`** (its torrent job is failed with it):
-   on resume its two duplicate entries are re-planned with a suffix (logged
-   `ingest destination shared within job`), and it should complete. Its
-   record was saved as `/root/ingest-jobs-0741.json` on gbni-1 before any
-   retry. Nothing changes on the wire: tell Core the version only.
-2. **A media-type context on torrent add** (operator, 2026-09-25: "on torrent
+1. **Repair's credit gates stock-taking, not just transfer (measured, fix
+   proposed, awaiting the operator's go).** 0.62.3's `diagnostics.repair
+   .pass_gates` on gbni-1: every pass turned away by `credit` (46 of 46 in
+   3 min), credit growing ~6 KB/s, a step needing 4 MB, so one step per ~11
+   min of at most 64 objects over ~570k live extents. Nothing is examined and
+   no lost extent is ever counted. Proposed 0.63.0: a step runs whenever the
+   weighted share allows; index lookups and presence probes (`have_object`, no
+   data) always proceed; a 4 MB fetch or push only when credit covers it; an
+   extent no peer holds is counted unsourceable without spending credit. Also
+   verify why the bandwidth estimate is so low (likely the slow WAN puts to
+   fi-1). Code: `src/service.cpp` network_due / byte_budget,
+   `DistributedStore::repair_step`.
+2. **Per-file readability (designed, operator to choose where it goes).**
+   Every extent of a file present on some reachable node: local
+   `LocalStore::has()` (index), then one batched `have_objects` per peer (the
+   peer answers from `has()` too, `src/cluster.cpp:1264`); cache per
+   `media_id`. Uses: a fact in `playback/media`, a clean refusal at session
+   create, a manage report of damaged files by path (the cluster-wide "what
+   no node holds" join wanted since gbni-2's removal). The first two are wire
+   changes: announce to Core and every client first.
+3. **Startup timeout contract (operator decision).** `startup_timeout_ms`
+   covers only the wait for the first fMP4 segment; VOD planning before it is
+   outside the clock (11.1 s for Dark on fi-1, fetching each 4 MB extent from
+   gbni-1 in 4.7-6.3 s). Core budgets exactly the stated figure and will not
+   stretch it. Either the figure covers the whole create or the node answers
+   within it.
+4. **A media-type context on torrent add** (operator, 2026-09-25: "on torrent
    add, we need a 'context' -- whether this torrent contains Movie, TV Show or
    Music", and "tell client about the new selector"). Why: the planner
    classifies each file alone, so Rome's extras became seven "movies" under
    `/Movies/` while its episodes went to `/TV/Rome/`, and My Name Is Earl's
-   episodes without `SxxEyy` became movies too (was item 6). To do, in order:
-   design the field (a required or optional `kind` of `movie`, `show`,
-   `music` on `POST /api/v1/torrents/jobs` and on ingest submit, carried to
-   the planner, which then places every file of the job by that kind, e.g. a
-   show's extras under `/TV/<series>/Extras/`); **send the exact shape to Core
-   and every client before shipping** (API rule); implement with tests;
-   decide with the operator what happens to Rome's seven extras already in
-   `/Movies/`. Planner: `choose_destination` in `src/ingest.cpp`.
-3. **Torrent job state rewritten twice a second** (measured 2026-09-25 on
-   gbni-1: 40 rewrites of the 28.6 KB `state/torrent/jobs.json` in 20 s while
-   nothing downloaded -- 19 paused, 1 blocked, 1 failed). `update_jobs` sets
-   `updated_unix_ms` and `changed` for every non-terminal job on each 500 ms
-   tick, and a blocked job keeps the loop polling. Fix: save only when a
-   persisted field other than live counters changed (rates, peers, seeds,
-   ETA), progress at most every 30 s, and move `updated_unix_ms` only when the
-   job's serialised form changed. Not started.
-4. **Decisions waiting on the operator** (do not act without them):
-   - fi-1's 10G DATA backend: revert, or `replication: 1` (cluster-state
-     note above).
+   episodes without `SxxEyy` became movies too. To do, in order: design the
+   field (a `kind` of `movie`, `show`, `music` on `POST /api/v1/torrents/jobs`
+   and on ingest submit, carried to the planner, which then places every file
+   of the job by that kind, e.g. a show's extras under `/TV/<series>/Extras/`);
+   **send the exact shape to Core and every client before shipping**;
+   implement with tests; decide with the operator what happens to Rome's
+   extras already in `/Movies/` (Rome's retry placed two more there as
+   `Menu Art (2).mkv` and `Previews for all episodes (2).mkv`). Planner:
+   `choose_destination` in `src/ingest.cpp`.
+5. **Decisions waiting on the operator** (do not act without them):
+   - fi-1's 10G DATA backend: revert, or `replication: 1`. It is full and
+     refuses every import write and would-be repair push (0.62.1 skips it for
+     repair only).
    - Discipline 3 wording: "only key mismatch or header corruption may
      refuse to start", yet unversioned storage and two `inbound_capable`
      misconfigurations also refuse. Proposed: recovery may refuse only on
@@ -92,7 +99,14 @@ what is owed to whom, and the decisions waiting on the operator.
      directories, then "there's files"; confirm which should hold a film.
    - Torrent staging option A vs B (stage 2 of the disk backend plan); stages
      3-4 of that plan.
-5. **Known defects found 2026-09-24/25, not yet fixed:**
+6. **Torrent job state rewritten twice a second** (measured 2026-09-25 on
+   gbni-1: 40 rewrites of the 28.6 KB `state/torrent/jobs.json` in 20 s while
+   nothing downloaded). `update_jobs` sets `updated_unix_ms` and `changed` for
+   every non-terminal job on each 500 ms tick. Fix: save only when a persisted
+   field other than live counters changed, progress at most every 30 s, and
+   move `updated_unix_ms` only when the job's serialised form changed. Not
+   started.
+7. **Known defects found 2026-09-24/25, not yet fixed:**
    - `catalogue_api` maps every exception to `503 catalogue_unavailable`
      (`src/catalogue_api.cpp` ~590): bad JSON, bad `If-Match`, artwork for a
      missing item all answer 503 instead of 400/404.
@@ -109,12 +123,12 @@ what is owed to whom, and the decisions waiting on the operator.
      ingest `catalogue.state` rules disagree; a remote job's
      `catalogue.items` is empty; server-side sort of search results by
      seeders (clients own sorting); a pause or cancel landing while an ingest
-     fails is overwritten; a node without the torrent plugin answers 503 even
-     for the cluster-wide list.
+     fails is overwritten; a node without the torrent plugin (or whose
+     plugin is still starting) answers 503 even for the cluster-wide list.
    - `macos/macha.plist.example` fixed; Fedora and MacPorts package names in
      the install docs unverified.
 
-6. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
+8. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
    switchable in config under the API section (`enabled: true|false`).
    **There is no route table today**: each API class (catalogue, playback,
    session, status, manage, users, acquisition, web) dispatches through its
@@ -122,38 +136,37 @@ what is owed to whom, and the decisions waiting on the operator.
    generate the document from the route table so it cannot drift, so the
    first step is a declarative route table that dispatch actually runs from.
    Document the status and error codes from 0.56.0 with it.
-7. **Search `kind` filter** (approved; Core asked). Repeated `kind`
+9. **Search `kind` filter** (approved; Core asked). Repeated `kind`
    parameter (`movie`, `show`, `season`, `episode`, `artist`, `album`,
    `track`), filtered before `limit`; absent means all; unknown is a 400.
    `src/catalogue_api.cpp` around line 417. Tell Core the version.
-8. **People on catalogue items -- directors, cast** (approved), with a
+10. **People on catalogue items -- directors, cast** (approved), with a
    **required backfill**: TMDB `append_to_response=credits` on the requests
    the scanner already makes (`src/media_catalogue.cpp` ~1544); store on
    `CatalogueItem` (versioned record change); expose in the API; a
    background, rate-limited, resumable, visible pass over every item with a
    `tmdb` id and no credits, fetched by id. Announce to every client.
-9. **Artwork (business P0, shipped half):** 0.54.1 verified on all nodes.
+11. **Artwork (business P0, shipped half):** 0.54.1 verified on all nodes.
    Still open: a **cold read is slow** (1.1 s for 77 KB from gbni-1 at ~1
    Mbit/s); `CatalogueManager::artwork` fetches the whole object before the
    first byte, likely queued behind loader I/O on a busy DATA disk (item 12
    of the old list, the loader-I/O P0) -- inference until timed under load.
    And **sized variants** (`?w=300`) -- a feature, operator's priority.
-10. **Deploy viewer check has a blind spot.** From logs, the only sound gate
+12. **Deploy viewer check has a blind spot.** From logs, the only sound gate
    is "no playback line in the last 30 minutes" (`session_idle_ms` is
    1800000; a used session is erased silently; a pipeline reclaim is not a
    session end). A client polling a paused session is invisible to it. The
-   status API sees sessions but needs `view_status`, which the anonymous
-   session lacks. **Operator's call:** a credential for deploy checks.
-11. **Test failures, undiagnosed** (no known flakes -- each is P0 work):
+   status API sees sessions and the `claude` account (all roles, 2026-09-25)
+   can now read it: make the deploy gate ask `playback/status` instead of
+   grepping the journal.
+13. **Test failures, undiagnosed** (no known flakes -- each is P0 work):
     - `media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`,
       9/20 on the laptop at `--jobs 12` at `eea4795`.
-    - `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`,
-      1/20 at `eea4795`, and 1/20 again on the laptop at `06c387d`
-      (2026-09-25).
     - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`
       (`:605`, a truncated object reported present), full suite only.
-    - `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly`,
-      once in a full laptop suite 2026-09-24, 60/60 alone.
+    - `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace`,
+      twice in full macOS runs (2026-09-22, 2026-09-25), 0/58 isolated; since
+      `3569529` it prints its convergence counts and epochs when it fails.
     - `rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`,
       once in the full suite on fi-1 2026-09-24 (0.57.0 rebuilt with the
       `/usr` prefix), `uncaught exception: metadata replica set forming:
@@ -161,17 +174,18 @@ what is owed to whom, and the decisions waiting on the operator.
     - `users/test_a_node_that_was_down_learns_a_deletion_not_a_resurrection`,
       same run, `test_users.cpp:836` tombstone never arrived within 10 s;
       10/10 alone. The first fi-1 run of the same code passed 533/533.
-12. **Transport backoff after a peer restart** (open product question from
+14. **Transport backoff after a peer restart** (open product question from
     the 2026-09-23 barrier work): an inbound session from a peer does not
     clear the dial backoff for its other lanes, so a node refuses to dial a
     restarted peer for up to 4 s. Everything that hits it is transient and
     retried; costs latency, not correctness.
-13. **The developer laptop cannot host a libtorrent session**:
+15. **The developer laptop cannot host a libtorrent session**:
     `/usr/local/include/boost` is a manual Boost 1.91 shadowing Homebrew's
     1.92, which Homebrew's libtorrent 2.1.1 was built with; CMake finds 1.91.
-    The swarm test fails there every time; run torrent tests on fi-1 (es-1 is gone).
+    Every test that starts a session (swarm, held, resume) segfaults there;
+    run torrent tests on fi-1 (es-1 is gone).
     Fixing the laptop is the operator's call.
-14. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
+16. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
     "later"). A movie may belong to more than one set (a franchise, a
     collection, a director's box set). Nothing exists today: `CatalogueItem`
     has a single `parent_id`, which is a hierarchy (show > season > episode,
@@ -182,7 +196,7 @@ what is owed to whom, and the decisions waiting on the operator.
     list sets and their members. The server gives membership as data;
     ordering and presentation stay the client's. Announce to Core and every
     client when it ships.
-15. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
+17. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
     [docs/macha-ebooks-proposal.md](../docs/macha-ebooks-proposal.md),
     dated 2026-09-24, status Proposal: ebooks as another class of immutable
     media, several formats grouped under one library entry, book metadata and
@@ -1672,7 +1686,6 @@ The remaining known-bad rates, all to be driven to zero:
 
 | case | rate | where |
 |---|---|---|
-| `rpc_cluster/.../ingest_torrent_jobs_visible...` | 7/20 in isolation, 1/3 full runs (es-1). fi-1 2026-09-25 on 0.61.0: 3/20 serial -- 1x line 5006 (resume reply re-read after the worker moved the job on; fixed by accepting any state resume leads to, as the ingest half already did) and 2x line 4976 (non-owning node's torrent list not 200; cause unknown). Then 0/80. Line 4976 now prints status and body when it fails | es-1, fi-1 |
 | `storage_v18/.../durability_barrier_reports_objects...` | 10/20 | macOS only, green on es-1 |
 | `storage_v18/.../durability_barrier_rederives_placement...` | intermittent | macOS only, green on es-1 |
 | `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; **fired once on es-1**, 2026-09-22 |

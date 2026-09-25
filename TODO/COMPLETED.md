@@ -2,6 +2,44 @@
 
 Last updated: 2026-09-25
 
+## 2026-09-25 -- 0.58.3 to 0.62.3: eight releases in one day
+
+All deployed on gbni-1 and fi-1, tagged, `main` at `f3bf8d7` (0.62.3).
+
+- **0.58.3** -- two files of one ingest job never share a destination. Rome's
+  ingest `b0f01a83` resumed and its duplicates re-planned with `(2)`.
+- **0.59.0** -- repair is paced by weight (95:5 against viewer, mount and
+  loader), never stopped; turns end between operations; in-flight pulls are
+  kept. Measured cause: `busy_bandwidth_fraction 0.0` plus a yield on any
+  loader byte had switched repair off whenever gbni-1 was ingesting.
+- **0.60.0** -- `POST /api/v1/playback/sessions/{id}/stream/{token}/close`
+  (page-exit close by signed URL, no bearer); a PATCH out of transcode frees
+  the slot. Web client verified both; the reload leak was its own bfcache bug.
+- **0.61.0** -- torrent resume data kept (a restart no longer re-hashes every
+  staged byte: gbni-1 had spent an hour at 90 MB/s after each restart);
+  paused means paused (a plain `pause()` of an auto-managed torrent is
+  undone by libtorrent's queue: measured on fi-1); `verify_queued` state and
+  a check ETA. Announced; Core `bde9393`, web `8c09aa3`.
+- **0.62.0** -- repair decides "already held" by index lookup, not a full read
+  and hash of every extent; a failed torrent job follows its resumed ingest
+  and releases staging (Rome).
+- **0.62.1** -- repair skips a peer with no advertised room (fi-1, 81 bytes
+  free); staging-blocked jobs not held at start.
+- **0.62.2** -- restore sets hold flags from the job (resume data restored the
+  held flags: Smallville); `diagnostics.repair` progress counters.
+- **0.62.3** -- `diagnostics.repair.pass_gates` and `last_credit_bytes`, which
+  showed the credit gate (ACTIVE item 1).
+
+Tests fixed the same day: `http_server/...closes_mid_body...` (read a
+per-pass gauge without waiting; 200/200 after) and
+`rpc_cluster/...ingest_torrent_jobs_visible...` (two races: a resume reply
+re-read after the worker moved on, and node 2's torrent plugin still
+starting, caught by the status print it gained that day; 60/60 on fi-1).
+
+Wrong turns worth not repeating: the fi-1 put traffic under 0.62.0 was mostly
+an import's own writes, not repair; a first-64-KiB read called The Martian
+readable when an extent further in was lost.
+
 ## 2026-09-25 -- `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly` fixed
 
 A test race, not a server leak. `connections_open` is a gauge the reactor
