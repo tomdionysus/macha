@@ -119,7 +119,7 @@ class TorrentManager final : public TorrentService {
     bool cancel(std::string_view id) override;
     bool clear(std::string_view id) override;
 
-    Placement add_on(const NodeId&, std::string_view) override;
+    Placement add_on(const NodeId&, std::string_view, bool search_result) override;
     std::vector<ClusterTorrentJob> jobs_cluster_wide() const override;
     std::optional<ClusterTorrentJob> job_cluster_wide(std::string_view id) const override;
     TorrentActionResult pause_cluster_wide(std::string_view id) override;

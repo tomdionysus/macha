@@ -184,6 +184,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             }
 
             std::string uri;
+            bool search_result = false;
             if (const auto* magnet = body.find("magnet"); magnet && magnet->isString()) {
                 uri = magnet->asString();
             } else if (const auto* ref = body.find("acquisition_ref"); ref && ref->isString()) {
@@ -192,11 +193,12 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                     return http_error(404, "not_found",
                                       "torrent search result expired or not found");
                 uri = std::move(*resolved);
+                search_result = true;
             } else {
                 return http_error(400, "bad_request", "magnet or acquisition_ref is required");
             }
 
-            const auto placement = torrents->add_on(target, uri);
+            const auto placement = torrents->add_on(target, uri, search_result);
             if (!placement.placed) {
                 // An unreachable or unknown target is refused rather than
                 // quietly downloaded here. A job that lands somewhere the

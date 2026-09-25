@@ -55,10 +55,22 @@ flight, what is owed to whom, and the traps that cost time that day.
    and logs failure; `MetadataNotReady` blocks and retries an ingest; DATA
    pressure onset and release are logged). Each fix has a test that fails
    without it.
-   - [ ] **An adopted torrent in production**: after the deploy, a torrent
-     should log `torrent downloaded; import waits ...`, `torrent extents
-     published; importing`, then `ingest adopted published extents` for
-     every file and no `ingest copying`. Only gbni-1 runs torrents.
+   - [x] **An adopted torrent in production**, 2026-09-24 21:12-21:28Z on
+     gbni-1 (0.57.0): The Snowman (69 extents), Fern Gully (177) and Frozen
+     (419, 1.76 GB) each logged `import waits for extent publication`,
+     `extents published; importing`, then `ingest adopted published
+     extents`, and no copy.
+   - [x] **The torrent disk backend crashed the node** (fixed in 0.58.1):
+     its publisher read a torrent's libtorrent `file_storage` by reference
+     without holding the torrent that owns it. Three gbni-1 cores prove it:
+     two aborts at service stop (2026-09-24 22:50Z, 23:03Z) and a SEGV at
+     2026-09-25 03:49:56Z, 16 s after a finished torrent was removed; all
+     `publisher()` -> `file_storage::file_path`. The five crashes earlier on
+     2026-09-24 had no cores (the soft core limit was 0); two followed a
+     torrent removal within seconds. Cores are now kept in
+     `/mnt/diskB/crash` on gbni-1 (systemd drop-in
+     `macha.service.d/core-dumps.conf`); gdb against a sysroot unpacked from
+     the matching tarball.
    - [ ] **Operator's call, open:** option A (payload files are the assembly
      area -- what is built) or option B (a staging format of macha's own).
      Everything A-specific is behind `read_extent`.
@@ -87,9 +99,10 @@ flight, what is owed to whom, and the traps that cost time that day.
    Badge.avi` planned to `/Movies/122 Stole a Badge/`. The episode filename
    has no `SxxEyy`; the series and season are only in folder names, which the
    planner apparently ignores. Not diagnosed.
-7. **Torrent job `info_hash` is null** on finished and imported jobs (web
-   client, e.g. 014ea49d..., 5eccf2d2...): dropped after metadata, or never
-   stored? Not checked.
+7. **Torrent job `info_hash` is null**: never stored -- declared, serialised
+   and persisted but assigned nowhere. Fixed in 0.58.2: set from libtorrent's
+   status, and backfilled on load from each job's magnet, finished jobs
+   included.
 8. **Artwork (business P0, shipped half):** 0.54.1 verified on all nodes.
    Still open: a **cold read is slow** (1.1 s for 77 KB from gbni-1 at ~1
    Mbit/s); `CatalogueManager::artwork` fetches the whole object before the

@@ -1,5 +1,26 @@
 # Current release
 
+## 0.58.2 — Torrent jobs carry their info_hash; search results backed by a .torrent can be started (development)
+
+- **`info_hash` is set.** It was declared, serialised and persisted, and never
+  assigned, so every torrent job reported `null`. It is now taken from
+  libtorrent's status when a torrent is added, and jobs saved without one,
+  finished ones included, are backfilled from their magnet at start. Lowercase
+  hex: the v1 SHA-1 when the torrent has one, otherwise the v2 SHA-256.
+- **A search result backed by a `.torrent` URL can be started.** Resolving an
+  `acquisition_ref` can yield a trusted provider's `.torrent` URL, but every
+  placement went through the magnet-only path, so such a result always failed
+  with `409 placement_failed` / `add_failed`. A resolved search result now
+  goes to the path that fetches it, locally or on the node it is placed on
+  (an older peer ignores the flag and behaves as before). A magnet sent by a
+  client is still never fetched.
+
+**The daytime crashes of 2026-09-24 were 0.58.1's bug.** A core from a SEGV
+on gbni-1 at 2026-09-25 03:49:56Z, on 0.58.0 and 16 s after a finished
+torrent was removed, has the same stack as the two shutdown aborts:
+`publisher()` -> `file_storage::file_path` on a freed torrent. 0.58.1, which
+removes that read, has been live on both nodes since 07:26Z.
+
 ## 0.58.1 — A torrent's publisher no longer reads a torrent that has gone (development)
 
 **gbni-1 aborted on every service stop and crashed repeatedly on
