@@ -829,8 +829,22 @@ bool IngestManager::pause(std::string_view id) {
     return true;
 }
 
+void IngestManager::set_resume_listener(std::function<void(std::string_view)> listener) {
+    std::lock_guard lock(resume_listener_mutex_);
+    resume_listener_ = std::move(listener);
+}
+
 bool IngestManager::resume(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    {
+        std::lock_guard lock(mutex_);
+        if (!resume_locked(id)) return false;
+    }
+    std::lock_guard listener_lock(resume_listener_mutex_);
+    if (resume_listener_) resume_listener_(id);
+    return true;
+}
+
+bool IngestManager::resume_locked(std::string_view id) {
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     if (it->second.state != IngestJobState::paused && it->second.state != IngestJobState::blocked &&

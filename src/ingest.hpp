@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -152,6 +153,9 @@ class IngestManager {
     StagingArea staging_;
     std::filesystem::path state_file_;
     mutable std::mutex mutex_;
+    std::mutex resume_listener_mutex_;
+    std::function<void(std::string_view)> resume_listener_;
+    bool resume_locked(std::string_view id);
     std::condition_variable_any cv_;
     std::map<std::string, IngestJob, std::less<>> jobs_;
     // Jobs currently claimed by a worker. A job is inserted under mutex_ in
@@ -231,6 +235,12 @@ class IngestManager {
     std::optional<IngestJob> job(std::string_view id) const;
     bool pause(std::string_view id);
     bool resume(std::string_view id);
+    // Told the id of every job resume() brings back, by whichever path: the
+    // API, a peer's action or a torrent retry. The torrent manager needs it:
+    // a torrent job that failed with its ingest must follow the ingest back,
+    // and nothing else would wake it (0.62.0). Called without the ingest lock
+    // held; set once, cleared before the listener goes away.
+    void set_resume_listener(std::function<void(std::string_view)>);
     bool cancel(std::string_view id);
     bool clear(std::string_view id);
     CatalogueHintSummary catalogue_summary(std::string_view id) const;
