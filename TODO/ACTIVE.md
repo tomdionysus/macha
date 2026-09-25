@@ -1,82 +1,120 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-24 ~15:20Z, after 0.57.0 (committed, not deployed).
+Last updated: 2026-09-25 ~08:30Z, after 0.58.2 was deployed and the ingest
+collision fix committed (`06c387d`, unreleased).
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here if you are new to this work: read
-[the 2026-09-24 handover](HANDOVER-2026-09-24.md) first.** It says what is in
-flight, what is owed to whom, and the traps that cost time that day.
+**Start here after a clear: read [the 2026-09-25 handover](HANDOVER-2026-09-25.md).**
+It says what is in flight, how to build and deploy now that es-1 is gone,
+what is owed to whom, and the decisions waiting on the operator.
 
-## Cluster state (2026-09-24 ~15:20Z)
+## Cluster state (2026-09-25 ~08:30Z)
 
-- **es-1 (ramaroja) is offline for the foreseeable future** (operator). Do
-  not wait for it and do not plan deploys around it.
-- **fi-1** runs 0.55.1 and is healthy, but its **eth0 has no carrier since
-  11:37:19Z**, so it is on wifi at **10.35.1.10** (and .20), not 10.35.1.50.
-  The operator says it should not be on wifi: cable or switch port, on site.
-  fi-1 is now the only node that can build.
-- **fi-1 hosts DATA since 15:25:44Z**: `hosts_extents: true`, one backend
-  at `/var/lib/macha/data`, `limit: 10G` (config backed up as
-  `macha.yaml.bak-pre-data-10g`). Live from a restart at 15:25:44Z (not from
-  this session); restarted again gated at 16:05Z. 5.4 GB used by 16:06Z;
-  writable, replicas 2/2. It logs `extents hosted here are reachable from
-  inbound-capable peers only`: fi-1 is behind CGNAT, so no peer can dial it
-  to fetch what it holds.
-- **gbni-1** runs 0.55.1. With es-1 gone, gbni-1 and fi-1 are the only
-  metadata replicas against `metadata_min_write_replicas: 2`: **restarting
-  either makes metadata read-only until it is back.**
-- **0.56.0 (`60ce47a`) and 0.57.0 are committed, NOT deployed.** Core, the
-  web client, the Android TV client and the mobile client have the 0.56.0
-  notice marked "not yet deployed"; each is owed a message when it is live,
-  and the 0.57.0 notice (below) with it.
-- gbni-2 is defunct for months (operator). Every node's config carries
-  `torrent.log_level: INFO`.
+- **gbni-1** (10.44.1.50) and **fi-1** (10.35.1.10) both run **0.58.2**
+  (`c9ef513`, tagged; `main` = `develop` there). Metadata writable, 2/2
+  replicas against `metadata_min_write_replicas: 2`: **restarting either node
+  makes metadata read-only until it is back.**
+- **es-1 (ramaroja) is offline for the foreseeable future** (operator). fi-1
+  is the build node; never build on gbni-1.
+- **fi-1**: eth0 has had no carrier since 2026-09-24 11:37Z, so it is on wifi
+  at 10.35.1.10 (not .50); the operator says it should be wired (on site).
+  It hosts a 10G DATA backend (`/var/lib/macha/data`) since 2026-09-24, which
+  makes `/mnt/machamedia` report 10G total and 100% full on both nodes
+  (logical capacity for two copies is capped by the smaller node); the
+  operator has not chosen between reverting it and `replication: 1`.
+- **gbni-1 keeps core dumps** in `/mnt/diskB/crash` (runtime
+  `kernel.core_pattern`, lost on reboot, plus the systemd drop-in
+  `macha.service.d/core-dumps.conf`). Three cores there, all the torrent
+  use-after-free fixed in 0.58.1.
+- **Clients**: 0.58.0 made playback `media_id`-only and refuses open choices.
+  Core `develop` speaks it; released TV 0.7.0 and phone 0.9.0 (core 0.19.0)
+  cannot play on these nodes until a core release ships -- accepted by the
+  operator for the test cluster.
 
 ## The queue
 
-1. **Deploy 0.56.0 and 0.57.0 together** to fi-1 and gbni-1: build and
-   suite on **fi-1** (es-1 is gone; never gbni-1), tarball to gbni-1, gated
-   restarts. Each restart is a metadata read-only window (two replicas, W=2),
-   so do them back to back once both are gated clear. Then tell the four
-   Macha client sessions both versions are live, per node, with 0.57.0's API
-   notes (a torrent job stays `downloaded` while its extents publish; an
-   ingest and its torrent job can be `blocked` with `metadata_unavailable`
-   and recover by themselves instead of `failed`). Verify on the wire that a
-   success body starts `{"status":"ok"`. The swarm test must pass on fi-1:
-   it has never run against the 0.57.0 backend.
-2. **Torrent disk backend: prove stage 2 in production**
-   ([plan](2026-09-23-torrent-disk-backend-plan.md)). 0.57.0 finishes the
-   code: a downloaded torrent is imported only once every extent is published
-   (10 min no-progress fallback), the ingest logs why it copies, and the three
-   promised side fixes are in (`ensure_control_local` takes no DATA credit
-   and logs failure; `MetadataNotReady` blocks and retries an ingest; DATA
-   pressure onset and release are logged). Each fix has a test that fails
-   without it.
-   - [x] **An adopted torrent in production**, 2026-09-24 21:12-21:28Z on
-     gbni-1 (0.57.0): The Snowman (69 extents), Fern Gully (177) and Frozen
-     (419, 1.76 GB) each logged `import waits for extent publication`,
-     `extents published; importing`, then `ingest adopted published
-     extents`, and no copy.
-   - [x] **The torrent disk backend crashed the node** (fixed in 0.58.1):
-     its publisher read a torrent's libtorrent `file_storage` by reference
-     without holding the torrent that owns it. Three gbni-1 cores prove it:
-     two aborts at service stop (2026-09-24 22:50Z, 23:03Z) and a SEGV at
-     2026-09-25 03:49:56Z, 16 s after a finished torrent was removed; all
-     `publisher()` -> `file_storage::file_path`. The five crashes earlier on
-     2026-09-24 had no cores (the soft core limit was 0); two followed a
-     torrent removal within seconds. Cores are now kept in
-     `/mnt/diskB/crash` on gbni-1 (systemd drop-in
-     `macha.service.d/core-dumps.conf`); gdb against a sysroot unpacked from
-     the matching tarball.
-   - [ ] **Operator's call, open:** option A (payload files are the assembly
-     area -- what is built) or option B (a staging format of macha's own).
-     Everything A-specific is behind `read_extent`.
-   - [ ] Stages 3-4 of the plan (random order, commit batching,
-     watch-while-downloading, cleanup proof).
-3. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
+1. **Release the ingest collision fix** (`06c387d`, committed, not
+   released): two files of one job were planned onto one destination (Rome's
+   two `Extras/Menu Art.mkv`), and the second failed `destination_conflict`
+   on every retry. Next version (0.58.3): build and suite on fi-1, deploy both
+   nodes, tag, advance `main`. Then **retry the Rome ingest job
+   `b0f01a830fd4d0dbe7f10ee9aeaff6ca`** (its torrent job is failed with it):
+   on resume its two duplicate entries are re-planned with a suffix (logged
+   `ingest destination shared within job`), and it should complete. Its
+   record was saved as `/root/ingest-jobs-0741.json` on gbni-1 before any
+   retry. Nothing changes on the wire: tell Core the version only.
+2. **A media-type context on torrent add** (operator, 2026-09-25: "on torrent
+   add, we need a 'context' -- whether this torrent contains Movie, TV Show or
+   Music", and "tell client about the new selector"). Why: the planner
+   classifies each file alone, so Rome's extras became seven "movies" under
+   `/Movies/` while its episodes went to `/TV/Rome/`, and My Name Is Earl's
+   episodes without `SxxEyy` became movies too (was item 6). To do, in order:
+   design the field (a required or optional `kind` of `movie`, `show`,
+   `music` on `POST /api/v1/torrents/jobs` and on ingest submit, carried to
+   the planner, which then places every file of the job by that kind, e.g. a
+   show's extras under `/TV/<series>/Extras/`); **send the exact shape to Core
+   and every client before shipping** (API rule); implement with tests;
+   decide with the operator what happens to Rome's seven extras already in
+   `/Movies/`. Planner: `choose_destination` in `src/ingest.cpp`.
+3. **Torrent job state rewritten twice a second** (measured 2026-09-25 on
+   gbni-1: 40 rewrites of the 28.6 KB `state/torrent/jobs.json` in 20 s while
+   nothing downloaded -- 19 paused, 1 blocked, 1 failed). `update_jobs` sets
+   `updated_unix_ms` and `changed` for every non-terminal job on each 500 ms
+   tick, and a blocked job keeps the loop polling. Fix: save only when a
+   persisted field other than live counters changed (rates, peers, seeds,
+   ETA), progress at most every 30 s, and move `updated_unix_ms` only when the
+   job's serialised form changed. Not started.
+4. **Decisions waiting on the operator** (do not act without them):
+   - fi-1's 10G DATA backend: revert, or `replication: 1` (cluster-state
+     note above).
+   - Discipline 3 wording: "only key mismatch or header corruption may
+     refuse to start", yet unversioned storage and two `inbound_capable`
+     misconfigurations also refuse. Proposed: recovery may refuse only on
+     those two; an unworkable configuration is refused at startup as a
+     separate matter.
+   - The web client's metadata-editor proposal (A-G in the 2026-09-24
+     session: provider search, match by provider ref with parent chain,
+     manual parents by id, artwork options, search kind/parent filter,
+     partial update and validation) and the multi-file fixes (media_id
+     belongs to item on PATCH, manual items pruning dead files, flag a
+     media_id bound to two items). Core owns the client side and wants the
+     version and wire shape of each as it ships.
+   - Transcode entitlements are per session (`src/playback.cpp` create
+     path): one account can open up to 32 sessions and take every transcode
+     slot on a node. A law 2 second-clause gap; needs a per-account bound.
+   - 317 directories under `/Movies` and `/Music` on gbni-1 list empty
+     (list in `/root/empty-dirs.txt` there). Some are leftovers beside the
+     film (Airplane); others (Pitch Black, Police Academy, Predator 2) have
+     no file anywhere at the top level. The operator first reported empty
+     directories, then "there's files"; confirm which should hold a film.
+   - Torrent staging option A vs B (stage 2 of the disk backend plan); stages
+     3-4 of that plan.
+5. **Known defects found 2026-09-24/25, not yet fixed:**
+   - `catalogue_api` maps every exception to `503 catalogue_unavailable`
+     (`src/catalogue_api.cpp` ~590): bad JSON, bad `If-Match`, artwork for a
+     missing item all answer 503 instead of 400/404.
+   - `PUT /api/v1/catalogue/items/{id}` is a full replacement with no
+     validation: parent may not exist or form a cycle, and omitting
+     `media_ids` unbinds every file.
+   - Three more transient conditions still raise a bare `runtime_error`
+     that an ingest would fail on rather than block: `object replication
+     quorum unavailable` (`src/distributed_store.cpp` 163, 195), `metadata
+     replica is still recovering` (`src/cluster.cpp` 445), `local metadata
+     replica unavailable` (`src/filesystem.cpp` 2356). None seen failing an
+     ingest yet.
+   - From the acquisition API audit (`docs/acquisition.md`): the torrent and
+     ingest `catalogue.state` rules disagree; a remote job's
+     `catalogue.items` is empty; server-side sort of search results by
+     seeders (clients own sorting); a pause or cancel landing while an ingest
+     fails is overwritten; a node without the torrent plugin answers 503 even
+     for the cluster-wide list.
+   - `macos/macha.plist.example` fixed; Fedora and MacPorts package names in
+     the install docs unverified.
+
+6. **OpenAPI endpoint, now (operator, 2026-09-24).** Served by the API,
    switchable in config under the API section (`enabled: true|false`).
    **There is no route table today**: each API class (catalogue, playback,
    session, status, manage, users, acquisition, web) dispatches through its
@@ -84,42 +122,34 @@ flight, what is owed to whom, and the traps that cost time that day.
    generate the document from the route table so it cannot drift, so the
    first step is a declarative route table that dispatch actually runs from.
    Document the status and error codes from 0.56.0 with it.
-4. **Search `kind` filter** (approved; Core asked). Repeated `kind`
+7. **Search `kind` filter** (approved; Core asked). Repeated `kind`
    parameter (`movie`, `show`, `season`, `episode`, `artist`, `album`,
    `track`), filtered before `limit`; absent means all; unknown is a 400.
    `src/catalogue_api.cpp` around line 417. Tell Core the version.
-5. **People on catalogue items -- directors, cast** (approved), with a
+8. **People on catalogue items -- directors, cast** (approved), with a
    **required backfill**: TMDB `append_to_response=credits` on the requests
    the scanner already makes (`src/media_catalogue.cpp` ~1544); store on
    `CatalogueItem` (versioned record change); expose in the API; a
    background, rate-limited, resumable, visible pass over every item with a
    `tmdb` id and no credits, fetched by id. Announce to every client.
-6. **Catalogue misclassification (operator TODO):** "My Name Is Earl" was
-   imported as a Movie: `.../My Name Is Earl/Season 1/122 - Stole a
-   Badge.avi` planned to `/Movies/122 Stole a Badge/`. The episode filename
-   has no `SxxEyy`; the series and season are only in folder names, which the
-   planner apparently ignores. Not diagnosed.
-7. **Torrent job `info_hash` is null**: never stored -- declared, serialised
-   and persisted but assigned nowhere. Fixed in 0.58.2: set from libtorrent's
-   status, and backfilled on load from each job's magnet, finished jobs
-   included.
-8. **Artwork (business P0, shipped half):** 0.54.1 verified on all nodes.
+9. **Artwork (business P0, shipped half):** 0.54.1 verified on all nodes.
    Still open: a **cold read is slow** (1.1 s for 77 KB from gbni-1 at ~1
    Mbit/s); `CatalogueManager::artwork` fetches the whole object before the
    first byte, likely queued behind loader I/O on a busy DATA disk (item 12
    of the old list, the loader-I/O P0) -- inference until timed under load.
    And **sized variants** (`?w=300`) -- a feature, operator's priority.
-9. **Deploy viewer check has a blind spot.** From logs, the only sound gate
+10. **Deploy viewer check has a blind spot.** From logs, the only sound gate
    is "no playback line in the last 30 minutes" (`session_idle_ms` is
    1800000; a used session is erased silently; a pipeline reclaim is not a
    session end). A client polling a paused session is invisible to it. The
    status API sees sessions but needs `view_status`, which the anonymous
    session lacks. **Operator's call:** a credential for deploy checks.
-10. **Test failures, undiagnosed** (no known flakes -- each is P0 work):
+11. **Test failures, undiagnosed** (no known flakes -- each is P0 work):
     - `media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`,
       9/20 on the laptop at `--jobs 12` at `eea4795`.
     - `rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node`,
-      1/20 at `eea4795`.
+      1/20 at `eea4795`, and 1/20 again on the laptop at `06c387d`
+      (2026-09-25).
     - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`
       (`:605`, a truncated object reported present), full suite only.
     - `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly`,
@@ -131,17 +161,17 @@ flight, what is owed to whom, and the traps that cost time that day.
     - `users/test_a_node_that_was_down_learns_a_deletion_not_a_resurrection`,
       same run, `test_users.cpp:836` tombstone never arrived within 10 s;
       10/10 alone. The first fi-1 run of the same code passed 533/533.
-11. **Transport backoff after a peer restart** (open product question from
+12. **Transport backoff after a peer restart** (open product question from
     the 2026-09-23 barrier work): an inbound session from a peer does not
     clear the dial backoff for its other lanes, so a node refuses to dial a
     restarted peer for up to 4 s. Everything that hits it is transient and
     retried; costs latency, not correctness.
-12. **The developer laptop cannot host a libtorrent session**:
+13. **The developer laptop cannot host a libtorrent session**:
     `/usr/local/include/boost` is a manual Boost 1.91 shadowing Homebrew's
     1.92, which Homebrew's libtorrent 2.1.1 was built with; CMake finds 1.91.
-    The swarm test fails there every time; run torrent tests on es-1.
+    The swarm test fails there every time; run torrent tests on fi-1 (es-1 is gone).
     Fixing the laptop is the operator's call.
-13. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
+14. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
     "later"). A movie may belong to more than one set (a franchise, a
     collection, a director's box set). Nothing exists today: `CatalogueItem`
     has a single `parent_id`, which is a hierarchy (show > season > episode,
@@ -152,7 +182,7 @@ flight, what is owed to whom, and the traps that cost time that day.
     list sets and their members. The server gives membership as data;
     ordering and presentation stay the client's. Announce to Core and every
     client when it ships.
-14. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
+15. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
     [docs/macha-ebooks-proposal.md](../docs/macha-ebooks-proposal.md),
     dated 2026-09-24, status Proposal: ebooks as another class of immutable
     media, several formats grouped under one library entry, book metadata and

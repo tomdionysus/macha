@@ -1,6 +1,54 @@
 # Completed and tested
 
-Last updated: 2026-09-24
+Last updated: 2026-09-25
+
+## 2026-09-24/25 -- 0.57.0 to 0.58.2, the laws standardised, the docs audited
+
+All deployed to gbni-1 and fi-1 (es-1 is offline), built and suite-tested on
+fi-1, tagged, `main` advanced. Full detail in `CHANGELOG.md`.
+
+- **0.57.0 -- a torrent is imported once it is published; a metadata outage
+  no longer kills an ingest.** Deployed 2026-09-24 18:57Z. **Stage 2 proven
+  in production:** The Snowman, Fern Gully and Frozen (419 extents, 1.76 GB)
+  waited for publication and were adopted, not copied (21:12-21:28Z).
+  `ensure_control_local` takes no DATA credit (it caused the 17:49Z and
+  17:51Z "CONTROL retention floor unavailable" ingest failures: a 120 s DATA
+  credit wait abandoned in the same second); `MetadataNotReady` blocks and
+  retries an ingest; DATA pressure transitions are logged.
+- **0.58.0 -- the server plays what it is told and chooses nothing**
+  (first built as "0.57.1", renumbered because it breaks clients). Playback
+  is by `media_id` only (`item_id_not_accepted`, `media_id_required`); open
+  stream, language and container choices are refused with `choice_required` /
+  `choice_not_available` and the candidates; per-stream `copy_into` on the
+  facts route; each file its own probe deadline; a namespace node below the
+  write floor is `MetadataNotReady`. Core and every client told; core
+  `develop` speaks it.
+- **0.58.1 -- the torrent disk backend's use-after-free.** Its publisher
+  read libtorrent's `file_storage` without holding the torrent owner. Proven
+  by three gbni-1 cores (two aborts at stop, one SEGV 16 s after a torrent's
+  removal); it caused the day's repeated crashes of gbni-1 and, through each
+  restart, metadata read-only windows. Owner held, planned path read,
+  removed torrents' jobs dropped, publication exceptions caught.
+- **0.58.2 -- torrent `info_hash` set** (was always null; all 21 jobs on
+  gbni-1 backfilled) and **search results backed by a `.torrent` URL can be
+  started** (they always failed 409 `add_failed`).
+- **Committed, unreleased (`06c387d`): two files of one ingest job never
+  share a destination** (Rome). See ACTIVE item 1.
+- **The four laws standardised on core's numbering** (`c85ba51`): control 1,
+  viewer 2, loader 3, law 4 unchanged; 136 citations renumbered by meaning,
+  CHANGELOG included, and every citation checked against the canonical text.
+  The server's statement is `docs/principles-and-laws.md`; each repo keeps
+  its own text with the same numbers (operator ruling via core).
+- **Documentation audit** (`7c44643`): every doc checked against the code;
+  new `docs/acquisition.md` for the ingest and torrent API; streaming,
+  catalogue and management API docs corrected (illegal examples, missing
+  codes); configuration docs gained about 30 undocumented keys and a renamed
+  and obsolete keys section; install docs gained zlib, the Boost rule, the
+  plugin path and first-run steps; 37 finished backlog items moved here from
+  ACTIVE.
+- **fi-1 became the build node** (dev packages installed, `/root/macha`,
+  configured with `-DCMAKE_INSTALL_PREFIX=/usr`) and gained a 10G DATA
+  backend; gbni-1 gained core-dump capture.
 
 ## 2026-09-24 -- backlog reconciliation: items found already done
 
