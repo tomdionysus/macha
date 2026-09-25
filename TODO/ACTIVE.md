@@ -1672,7 +1672,7 @@ The remaining known-bad rates, all to be driven to zero:
 
 | case | rate | where |
 |---|---|---|
-| `rpc_cluster/.../ingest_torrent_jobs_visible...` | 7/20 in isolation, 1/3 full runs | es-1 |
+| `rpc_cluster/.../ingest_torrent_jobs_visible...` | 7/20 in isolation, 1/3 full runs (es-1). fi-1 2026-09-25 on 0.61.0: 3/20 serial -- 1x line 5006 (resume reply re-read after the worker moved the job on; fixed by accepting any state resume leads to, as the ingest half already did) and 2x line 4976 (non-owning node's torrent list not 200; cause unknown). Then 0/80. Line 4976 now prints status and body when it fails | es-1, fi-1 |
 | `storage_v18/.../durability_barrier_reports_objects...` | 10/20 | macOS only, green on es-1 |
 | `storage_v18/.../durability_barrier_rederives_placement...` | intermittent | macOS only, green on es-1 |
 | `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; **fired once on es-1**, 2026-09-22 |
