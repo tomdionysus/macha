@@ -2407,6 +2407,15 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             for (const auto& peer : nodes) {
                 if (keepers.size() >= target)
                     break;
+                // A peer whose advertised free space cannot take an extent is
+                // not probed or sent one. Until 0.62.1 every live object cost a
+                // WAN probe and a refused 4 MB put to fi-1, whose 10G store was
+                // full: that spent repair's whole operation budget, so the pull
+                // never reached the extents this node lacked. The copy stays
+                // under-replicated, which placement already reports.
+                if (peer.id != n_.node_id() && peer.capacity &&
+                    peer.used + n_.config().extent_size > peer.capacity)
+                    continue;
                 auto present_result = maintenance_has_on(peer, id);
                 if (!present_result) {
                     retry = true;

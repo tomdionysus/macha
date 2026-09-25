@@ -1,5 +1,23 @@
 # Current release
 
+## 0.62.1 — Repair skips a peer with no room; a staging-blocked torrent is not held at start (development)
+
+**Repair spent its whole budget on a full peer.** With repair's local check
+cheap in 0.62.0, the push pass reached fi-1: a 10G store with 81 bytes free,
+still an owner of every extent at replicas 2 on two nodes. Every live object
+cost gbni-1 a WAN probe and a refused 4 MB put (fi-1 received 12 of each a
+minute, its store unchanged), and the pull never reached an extent gbni-1
+lacked. A peer whose advertised free space cannot take an extent is no longer
+probed or sent one; the copy stays under-replicated.
+
+**Smallville stayed blocked after 0.61.0.** 0.61.0 added `blocked` jobs held at
+start. A held magnet never fetches its metadata, so its size stayed 0 and the
+staging check that releases it never ran. Only operator-paused jobs are held at
+start now; a `staging_full` job is added normally and held again by the staging
+check once its size is known, as before 0.61.0.
+
+Nothing on the wire changes.
+
 ## 0.62.0 — Repair reaches what is missing; a failed torrent follows its resumed ingest (development)
 
 **Repair read every extent it already had.** To decide "this node holds it",

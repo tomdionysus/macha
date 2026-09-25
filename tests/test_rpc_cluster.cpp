@@ -491,6 +491,69 @@ MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retaine
     server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
+    // fi-1, 2026-09-25: a 10G store with 81 bytes free, still an owner of
+    // every extent at replicas 2 on two nodes. Each live object cost gbni-1 a
+    // WAN probe and a refused 4 MB put, which spent repair's whole operation
+    // budget; the pull never ran. A peer that advertises no room for an
+    // extent is not a push target.
+    TestNode fixture("repair-full-peer", ConfigProfile::functional);
+    auto& config = fixture.config();
+    config.replication = 2;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    config.heartbeat = 30s;
+    auto& node = fixture.start();
+
+    std::atomic_uint probes{};
+    std::atomic_uint puts{};
+    const auto port = free_port();
+    NodeInfo peer;
+    peer.id = random_node_id();
+    peer.host = "127.0.0.1";
+    peer.port = port;
+    peer.failure_domain = "remote";
+    peer.capacity = 10ULL * 1024 * 1024 * 1024;
+    peer.used = peer.capacity - 81;
+    peer.seen_unix_ms = unix_ms();
+    RpcServer server(
+        "127.0.0.1", port, fixture.keys(), peer,
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::have_object) {
+                ++probes;
+                Writer writer;
+                writer.u8(0);
+                return RpcMessage{MessageType::bool_reply, writer.take()};
+            }
+            if (request.type == MessageType::put_object) ++puts;
+            return RpcMessage{MessageType::ok, {}};
+        },
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+    server.start();
+    node.membership().observe(peer, true);
+
+    const auto bytes = pattern(256 * 1024, 31);
+    const auto id = object_id(bytes);
+    REQUIRE(node.local_store().put(id, bytes));
+    const std::vector<ObjectId> live{id};
+    DistributedStore store(node);
+    for (int pass = 0; pass < 4; ++pass)
+        (void)store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+    CHECK(probes.load() == 0);
+    CHECK(puts.load() == 0);
+    // Never dropped for want of a second copy.
+    CHECK(node.local_store().has(id));
+
+    // With room, the same peer is pushed to.
+    peer.used = 0;
+    peer.seen_unix_ms = unix_ms();
+    node.membership().observe(peer, true);
+    for (int pass = 0; pass < 4 && puts.load() == 0; ++pass)
+        (void)store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+    CHECK(puts.load() > 0);
+    server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_extent) {
     // Until 0.62.0 repair decided "this node already holds it" by reading,
     // decrypting and hashing the whole extent, under a DATA lease, for every

@@ -706,7 +706,12 @@ void TorrentManager::restore_jobs() {
             // Held from the moment it is added. Paused after add, an
             // auto-managed torrent was started by libtorrent's queue anyway:
             // re-checked, downloading and seeding while Macha said paused.
-            if (job.state == TorrentJobState::paused || job.state == TorrentJobState::blocked)
+            // Operator pauses only. A staging_full job is not held here: held,
+            // a magnet never fetches its metadata, its size stays 0, and the
+            // staging check that would release it never runs (Smallville,
+            // gbni-1, 2026-09-25, stuck after 0.61.0). Added normally, the
+            // check holds it again as soon as its size is known.
+            if (job.state == TorrentJobState::paused)
                 hold_at_add(atp);
             auto handle = impl_->session.add_torrent(std::move(atp));
             impl_->handles[job.id] = std::move(handle);
