@@ -23,6 +23,7 @@
 
 namespace libtorrent {
 struct torrent_handle;
+struct add_torrent_params;
 }
 
 namespace macha {
@@ -54,6 +55,25 @@ class TorrentManager final : public TorrentService {
     bool logged_portmap_{};
     bool warned_portmap_failed_{};
     std::jthread worker_;
+
+    // Each job's libtorrent resume data (0.61.0): without it every restart
+    // re-hashed every staged byte of every torrent before any could download.
+    std::filesystem::path resume_dir_;
+    std::filesystem::path resume_path(std::string_view id) const;
+    static constexpr auto resume_save_interval = std::chrono::minutes(5);
+    Clock::time_point last_resume_save_{};
+    // Asks libtorrent for a job's resume data; it arrives as an alert.
+    static void request_resume_save(const libtorrent::torrent_handle&);
+    // At stop: request resume data for every torrent and wait, bounded, for it.
+    void save_all_resume_data();
+    void write_resume_alert(const libtorrent::torrent_handle&, const libtorrent::add_torrent_params&);
+    // Per job: the check's position when last sampled, for its rate and ETA.
+    struct CheckSample {
+        uint64_t checked{};
+        Clock::time_point at{};
+        double rate{};
+    };
+    std::map<std::string, CheckSample, std::less<>> check_samples_;
 
     void load_state();
     void save_state_locked() const;

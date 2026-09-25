@@ -485,7 +485,8 @@ A named node that cannot take the job is refused; the job is never started somew
 | `queued` | added and not yet in one of the states below | no |
 | `metadata` | fetching the torrent's metadata from peers | no |
 | `downloading` | downloading the payload | no |
-| `verifying` | checking pieces already on disk | no |
+| `verify_queued` | waiting to check pieces already on disk: the download engine checks **one torrent at a time**, and another is being checked. New in 0.61.0; until then this read as `verifying` with no progress and no ETA | no |
+| `verifying` | checking pieces already on disk. `eta_seconds` is the check's own estimate (from 0.61.0), `progress` counts the pieces found valid so far | no |
 | `downloaded` | the payload is complete; **waiting for its extents to be published** before import | no |
 | `importing` | the payload has been submitted as an ingest job, which is queued, scanning or importing | no |
 | `cataloguing` | the linked ingest is `cataloguing` | no |
@@ -495,7 +496,11 @@ A named node that cannot take the job is refused; the job is never started somew
 | `cancelled` | stopped by an operator | yes |
 | `failed` | stopped by an error | yes (`retry` restarts an import failure) |
 
-**Before handover** the state follows the download engine: `metadata`, `downloading`, `verifying`, `downloaded`, or `queued` for anything else. A job that was `metadata`, `downloading`, `verifying` or `downloaded` when its node stopped is `queued` again at start, and the download resumes from what is on disk.
+**Before handover** the state follows the download engine: `metadata`, `downloading`, `verify_queued`, `verifying`, `downloaded`, or `queued` for anything else. A job that was `metadata`, `downloading`, `verify_queued`, `verifying` or `downloaded` when its node stopped is `queued` again at start, and the download resumes from what is on disk.
+
+**A restart does not re-check what was already verified (0.61.0).** The node keeps each job's resume data, saved when a check or download finishes, on pause, every five minutes and at shutdown, and restarts from it. Without it (a job last saved before 0.61.0, or a damaged file) the payload on disk is checked in full, which on a large torrent takes minutes to an hour and queues every other check behind it.
+
+**`paused` means paused (0.61.0).** A paused or `blocked` torrent is held out of the download engine's queue entirely. Before 0.61.0 the engine's queue could restart a paused torrent: it was checked, and could download and seed, while its job read `paused`.
 
 **Handover, since 0.57.0.** A finished download is paused in `downloaded` until every extent of its payload has been published into the store the ingest commits into. Then its ingest job is submitted, `ingest_job_id` is set and the job becomes `importing`; the ingest adopts the published extents rather than copying the bytes again. This takes seconds to minutes. If publication makes no progress for 10 minutes the job is submitted anyway, and whatever was not published is copied. If there is nothing to wait for (the payload is not being published), submission is immediate.
 
