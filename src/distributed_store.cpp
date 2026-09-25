@@ -2217,6 +2217,11 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
     RepairDiagnostics out;
     out.pull_unsourceable = repair_pull_unsourceable_.load(std::memory_order_relaxed);
     out.local_unreadable = repair_local_unreadable_.load(std::memory_order_relaxed);
+    out.push_examined = repair_push_examined_total_.load(std::memory_order_relaxed);
+    out.pull_examined = repair_pull_examined_total_.load(std::memory_order_relaxed);
+    out.bytes_transferred = repair_bytes_total_.load(std::memory_order_relaxed);
+    out.passes_completed = repair_passes_completed_.load(std::memory_order_relaxed);
+    out.push_phase_complete = repair_push_phase_complete_.load(std::memory_order_relaxed);
     std::lock_guard lock(repair_sample_mutex_);
     out.unsourceable_sample.assign(repair_unsourceable_sample_.begin(),
                                    repair_unsourceable_sample_.end());
@@ -2559,8 +2564,13 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     }
 
     result.remote_operations = operations;
+    repair_push_examined_total_.fetch_add(result.push_examined, std::memory_order_relaxed);
+    repair_pull_examined_total_.fetch_add(result.pull_examined, std::memory_order_relaxed);
+    repair_bytes_total_.fetch_add(result.bytes_transferred, std::memory_order_relaxed);
+    repair_push_phase_complete_.store(repair_push_complete_, std::memory_order_relaxed);
     if (repair_push_complete_ && repair_pull_complete_) {
         result.complete = true;
+        repair_passes_completed_.fetch_add(1, std::memory_order_relaxed);
         reset_completed_pass();
     }
     return result;
