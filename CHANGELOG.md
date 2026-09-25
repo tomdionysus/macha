@@ -1,5 +1,33 @@
 # Current release
 
+## 0.58.1 — A torrent's publisher no longer reads a torrent that has gone (development)
+
+**gbni-1 aborted on every service stop and crashed repeatedly on
+2026-09-24.** Two core dumps, captured once core files were enabled, show the
+same stack: the torrent disk backend's publisher thread calling
+`file_storage::file_path` on a torrent already freed, a garbage string
+length, an allocation throwing, and nothing on that thread to catch it.
+
+libtorrent hands a disk backend its file list by reference together with the
+torrent as an owner, and its own backend keeps that owner. Macha's kept only
+the reference, so a publication still queued when the torrent went -- freed
+at session shutdown, or removed after a finished download -- read freed
+memory.
+
+- The storage holds the torrent owner, as libtorrent's backend does.
+- Extents are read back through the path planned when the torrent was added,
+  never through libtorrent's file list.
+- Publications queued for a removed torrent are dropped, not retried for
+  ever.
+- An exception in a publication is logged and retried; it can no longer end
+  the process.
+
+Tested by removing a torrent with a publication in flight and two queued: the
+file list stays alive until the in-flight one finishes, the queued ones are
+dropped, and it is then released. The test fails against 0.58.0. Two of the
+day's five crashes followed a finished torrent's removal within two seconds;
+whether the other three were this too, the next core will say.
+
 ## 0.58.0 — The server plays what it is told and chooses nothing (development)
 
 Operator, 2026-09-24: **"The server supplies facts, operations, then does what

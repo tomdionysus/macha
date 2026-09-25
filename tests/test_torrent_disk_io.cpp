@@ -499,6 +499,70 @@ MACHA_TEST("torrent_disk_io", test_publication_progress_is_reported_until_every_
     }, 5s));
 }
 
+MACHA_TEST("torrent_disk_io", test_a_removed_torrent_keeps_its_files_alive_until_publication_lets_go) {
+    // gbni-1, 2026-09-24: two core dumps, both publisher() ->
+    // file_storage::file_path on a torrent already freed -- at every service
+    // stop, and very likely behind the day's crashes after a finished torrent
+    // was removed. The storage now holds libtorrent's torrent owner, as
+    // libtorrent's own backend does, and a removed torrent's queued
+    // publications are dropped rather than retried.
+    TempDir dir;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool open = false;
+    std::atomic<int> started{0};
+    std::atomic<int> published{0};
+    TorrentDiskHooks hooks;
+    hooks.extent_size = 3 * block;
+    hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+    hooks.publish_retry = 20ms;
+    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        if (started.fetch_add(1) == 0) {
+            std::unique_lock lock(gate_mutex);
+            gate_cv.wait(lock, [&] { return open; });
+        }
+        ++published;
+        return object_id(bytes);
+    };
+    const auto verifications = hooks.verifications;
+    Harness h(layout({1000}, 2 * block), dir.path() / "unused", hooks);
+
+    // A torrent whose file list lives in a heap object owned by the torrent,
+    // as libtorrent's does, handed to the backend with that owner.
+    auto files = std::make_shared<lt::file_storage>(layout({100000}, 2 * block));
+    const std::weak_ptr<lt::file_storage> alive = files;
+    const std::string save = (dir.path() / "torrent").string();
+    std::filesystem::create_directories(std::filesystem::path(save) / "payload");
+    {
+        const auto payload = pattern_bytes(100000, 21);
+        std::ofstream out(std::filesystem::path(save) / "payload" / "f0", std::ios::binary);
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+#if LIBTORRENT_VERSION_NUM >= 20100
+    lt::storage_params params(*files, h.renamed, save, "", lt::storage_mode_sparse, h.priorities,
+                              lt::sha1_hash(), true, false);
+#else
+    lt::storage_params params(*files, nullptr, save, lt::storage_mode_sparse, h.priorities, lt::sha1_hash());
+#endif
+    auto holder = h.disk->new_torrent(params, files);
+    for (int piece = 0; piece < files->num_pieces(); ++piece) verifications->piece_verified(save, piece);
+    REQUIRE(wait_for([&] { return started.load() == 1; }, 5s));
+
+    // Remove the torrent and let go of the file list while a publication of
+    // it is in flight and two more are queued.
+    holder.reset();
+    files.reset();
+    CHECK(!alive.expired());
+    {
+        std::lock_guard lock(gate_mutex);
+        open = true;
+    }
+    gate_cv.notify_all();
+    std::this_thread::sleep_for(300ms);
+    CHECK(published.load() == 1);
+    CHECK(wait_for([&] { return alive.expired(); }, 5s));
+}
+
 MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held_bitfield) {
     // Trainspotting, 2026-09-24: publication stopped at 162 of 436 extents
     // with the publisher idle, because verifications for the rest never

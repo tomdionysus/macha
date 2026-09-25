@@ -102,8 +102,21 @@ struct PlannedExtent {
 };
 
 struct Storage {
+    // libtorrent hands this over by reference and keeps it alive only while
+    // the torrent lives. `owner` is that torrent, held for as long as this
+    // storage exists, exactly as libtorrent's own backend does
+    // (mmap_storage::set_owner). Without it a publication still queued when
+    // the torrent went -- removed at download finish, or freed at session
+    // shutdown -- read a freed file_storage: gbni-1 aborted on every stop and
+    // crashed through the day on 2026-09-24 (core dumps, publisher() ->
+    // file_storage::file_path -> operator new throwing on a garbage length).
     const lt::file_storage& files;
+    std::shared_ptr<void> owner;
     std::string save_path;
+    // Set by remove_torrent. Publications still queued for a removed torrent
+    // are dropped, not retried: nothing will adopt them, and retrying would
+    // keep the torrent alive for ever.
+    std::atomic_bool removed{false};
     // Stage 2 (empty when publication is off).
     std::vector<PlannedExtent> extents;
     std::vector<std::vector<size_t>> piece_extents;
@@ -164,8 +177,9 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     }
 
     lt::storage_holder new_torrent(const lt::storage_params& params,
-                                   const std::shared_ptr<void>&) override {
+                                   const std::shared_ptr<void>& torrent) override {
         auto storage = std::make_shared<Storage>(params.files, std::string(params.path));
+        storage->owner = torrent;
         if (publishing()) plan(*storage);
         int index;
         if (!free_slots_.empty()) {
@@ -186,6 +200,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     void remove_torrent(lt::storage_index_t index) override {
         // Queued jobs hold their own reference; the storage closes its files
         // when the last of them has run.
+        if (storages_[slot(index)]) storages_[slot(index)]->removed.store(true);
         if (publishing() && storages_[slot(index)]) {
             std::lock_guard lock(by_path_mutex_);
             by_path_.erase(storages_[slot(index)]->save_path);
@@ -539,10 +554,19 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             }
             auto job = std::move(*due);
             publish_queue_.erase(due);
+            if (job.storage->removed.load()) continue;
             lock.unlock();
-            const bool published = publish(job);
+            // Nothing a publication does may end the process: an exception
+            // here used to escape the thread and call std::terminate.
+            bool published = false;
+            try {
+                published = publish(job);
+            } catch (const std::exception& e) {
+                Log::warn("torrent extent publication failed path=" +
+                          job.storage->extents[job.extent].relative_path + ": " + e.what() + "; retrying");
+            }
             lock.lock();
-            if (!published && !publisher_stopping_) {
+            if (!published && !publisher_stopping_ && !job.storage->removed.load()) {
                 job.not_before = Clock::now() + hooks_.publish_retry;
                 publish_queue_.push_back(std::move(job));
             }
@@ -592,7 +616,9 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     // macha's own would replace this function and nothing else.
     bool read_extent(Storage& storage, const PlannedExtent& extent, std::vector<uint8_t>& out,
                      lt::storage_error& error) {
-        const auto path = storage.files.file_path(extent.file, storage.save_path);
+        // The path planned when the torrent was added, never libtorrent's
+        // file_storage: the publisher must not depend on the torrent's memory.
+        const auto path = (std::filesystem::path(storage.save_path) / extent.relative_path).string();
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
             error = lt::storage_error(errno_code(errno), extent.file, lt::operation_t::file_open);
