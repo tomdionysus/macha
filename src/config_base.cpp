@@ -173,6 +173,12 @@ void validate(Config& config) {
     if (!config.fuse.viewer_weight || config.fuse.viewer_weight > 10000 ||
         !config.fuse.loader_weight || config.fuse.loader_weight > 10000)
         throw std::runtime_error("fuse viewer_weight and loader_weight must be 1..10000");
+    // A zero repair weight would be a repair that stops whenever the node is
+    // busy, which is exactly what this pair exists to rule out.
+    if (!config.maintenance.foreground_weight || config.maintenance.foreground_weight > 10000 ||
+        !config.maintenance.repair_weight || config.maintenance.repair_weight > 10000)
+        throw std::runtime_error(
+            "maintenance foreground_weight and repair_weight must be 1..10000");
     constexpr uint64_t publication_chunk = 256ULL * 1024;
     if (config.fuse.publication_quantum_bytes < publication_chunk ||
         config.fuse.publication_quantum_bytes > 1024ULL * 1024 * 1024 ||

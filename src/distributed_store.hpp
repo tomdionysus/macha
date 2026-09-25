@@ -240,6 +240,9 @@ class DistributedStore {
     // this node has become an owner. Bounded repair_step() calls retain push/pull
     // cursors across scheduler slices; they never rebuild complete object vectors.
     // The byte limit is network transfer, not block count; zero means unlimited.
+    // should_yield is consulted between operations only: an extent already in
+    // flight completes and is kept, so a pacer can shorten repair's turns
+    // without ever making them fruitless.
     uint64_t repair_once(uint64_t byte_budget = 0, const std::vector<ObjectId>* live = nullptr,
                          const std::vector<ObjectId>* universal = nullptr);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
