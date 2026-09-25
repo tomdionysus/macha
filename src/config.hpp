@@ -60,8 +60,17 @@ struct MaintenanceConfig {
     // Minimum retirement/orphan age before authoritative reachability GC may
     // reclaim an unreferenced physical object.
     std::chrono::milliseconds garbage_grace{std::chrono::hours(24)};
+    // Rebalance and scrub only. Repair is not a busy/idle choice: it always
+    // earns credit at the idle fraction and shares time by the weights below.
     double busy_bandwidth_fraction{0.0};
     double idle_bandwidth_fraction{0.10};
+    // Relative service weights while replica repair and any higher class
+    // (viewer, interactive, loader) are both runnable, in the same duty-cycle
+    // form as fuse.viewer_weight/loader_weight. Repair is paced, never
+    // stopped: a node that is always ingesting or always being watched must
+    // still restore copies it lost (law 4 over laws 2 and 3's ordering).
+    size_t foreground_weight{95};
+    size_t repair_weight{5};
     double cpu_target{0.10};
     uint64_t initial_bandwidth{32ULL * 1024 * 1024};
     uint64_t max_bandwidth{}; // 0 = no configured cap; observed bandwidth is still used.
