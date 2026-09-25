@@ -1673,7 +1673,7 @@ The remaining known-bad rates, all to be driven to zero:
 | case | rate | where |
 |---|---|---|
 | `rpc_cluster/.../ingest_torrent_jobs_visible...` | 7/20 in isolation, 1/3 full runs | node-e |
-| `http_server/.../closes_mid_body...` | <= 1/20, did not fire in 1,455 | node-e |
+| `http_server/.../closes_mid_body...` | <= 1/20, did not fire in 1,455 (node-e); **1/40 in isolation on macOS 2026-09-25** at `--jobs 8`, always `connections_open == 0` (line 372) -- reproducible, so diagnosable | node-e, macOS |
 | `storage_v18/.../durability_barrier_reports_objects...` | 10/20 | macOS only, green on node-e |
 | `storage_v18/.../durability_barrier_rederives_placement...` | intermittent | macOS only, green on node-e |
 | `rpc_cluster/.../storage_data_credit...` | ~1/3 in isolation | macOS; **fired once on node-e**, 2026-09-22 |
