@@ -178,6 +178,10 @@ class IngestManager {
     void process_job(const std::string&, std::stop_token);
     bool plan_job(IngestJob&, std::stop_token);
     bool import_job(IngestJob&, std::stop_token);
+    // Gives every unfinished file of a planned job a destination no other
+    // file of the job uses. Jobs planned before 0.58.3 could give two source
+    // files one destination; this resolves them on resume.
+    void resolve_duplicate_destinations(IngestJob&);
     bool copy_file(IngestJob&, IngestFileProgress&, std::stop_token);
     // A torrent-sourced file whose every extent the torrent's disk backend has
     // already published: its manifest, from the job's TorrentExtentJournal.

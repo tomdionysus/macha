@@ -1351,6 +1351,22 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     }
 
     std::map<std::filesystem::path, std::vector<size_t>> media_by_parent;
+    // A destination is taken if the filesystem already has it or an earlier
+    // file of this job was given it. Checking only the filesystem let two
+    // files of one torrent plan the same path -- the extras of Rome's two
+    // seasons, each with a "Menu Art.mkv" -- and the second then failed with
+    // destination_conflict once the first had been imported (2026-09-25).
+    std::set<std::string> planned_destinations;
+    const auto taken = [&](const std::string& path) {
+        if (planned_destinations.contains(path)) return true;
+        try {
+            (void)fs_.getattr(path);
+            return true;
+        } catch (const FsError& e) {
+            if (e.code() == ENOENT) return false;
+            throw;
+        }
+    };
 
     for (const auto& source : host_files) {
         std::error_code size_error;
@@ -1362,15 +1378,9 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         // Resolve collisions once and persist the selected path. Resume never
         // re-runs this choice for a planned job.
         std::string candidate = destination;
-        for (unsigned suffix = 2;; ++suffix) {
-            try {
-                (void)fs_.getattr(candidate);
-                candidate = append_collision_suffix(destination, suffix);
-            } catch (const FsError& e) {
-                if (e.code() == ENOENT) break;
-                throw;
-            }
-        }
+        for (unsigned suffix = 2; taken(candidate); ++suffix)
+            candidate = append_collision_suffix(destination, suffix);
+        planned_destinations.insert(candidate);
 
         IngestFileProgress planned;
         planned.source_path = source.string();
@@ -1412,15 +1422,9 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         const auto base_destination = normalize_path(
             *destination_parent + "/" + safe_component(source.filename().string()));
         planned.destination_path = base_destination;
-        for (unsigned suffix = 2;; ++suffix) {
-            try {
-                (void)fs_.getattr(planned.destination_path);
-                planned.destination_path = append_collision_suffix(base_destination, suffix);
-            } catch (const FsError& e) {
-                if (e.code() == ENOENT) break;
-                throw;
-            }
-        }
+        for (unsigned suffix = 2; taken(planned.destination_path); ++suffix)
+            planned.destination_path = append_collision_suffix(base_destination, suffix);
+        planned_destinations.insert(planned.destination_path);
         planned.temporary_path = planned.destination_path + ".macha-ingest-" + job.id.substr(0, 12) + ".part";
         planned.size = size;
         planned.source_mtime_ns = host_mtime(source);
@@ -1765,7 +1769,44 @@ void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,
         job.eta_seconds.reset();
 }
 
+void IngestManager::resolve_duplicate_destinations(IngestJob& job) {
+    // Discipline 3: a plan that gives two files one destination has a
+    // deterministic resolution, so it is resolved, logged and persisted
+    // rather than failing the job on every retry. Completed files keep their
+    // paths; an unfinished file that shares one gets the next free suffix and
+    // a fresh partial, since a shared partial cannot be trusted.
+    std::set<std::string> used;
+    for (const auto& file : job.files)
+        if (file.completed) used.insert(file.destination_path);
+    for (auto& file : job.files) {
+        if (file.completed) continue;
+        if (!used.contains(file.destination_path)) {
+            used.insert(file.destination_path);
+            continue;
+        }
+        const auto base = file.destination_path;
+        std::string candidate = base;
+        for (unsigned suffix = 2;; ++suffix) {
+            candidate = append_collision_suffix(base, suffix);
+            if (used.contains(candidate)) continue;
+            try {
+                (void)fs_.getattr(candidate);
+            } catch (const FsError& e) {
+                if (e.code() == ENOENT) break;
+                throw;
+            }
+        }
+        Log::info("ingest destination shared within job id=" + job.id + " path=" + base +
+                  "; planned " + candidate + " instead");
+        file.destination_path = candidate;
+        file.temporary_path = candidate + ".macha-ingest-" + job.id.substr(0, 12) + ".part";
+        file.copied = 0;
+        used.insert(candidate);
+    }
+}
+
 bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
+    resolve_duplicate_destinations(job);
     job.state = IngestJobState::importing;
     job.error.clear();
     job.error_code.clear();

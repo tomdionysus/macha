@@ -2790,6 +2790,48 @@ Bytes read_whole(FileSystem& fs, const std::string& path, uint64_t size) {
 
 } // namespace
 
+MACHA_TEST("hydration_catalogue", test_two_files_of_one_job_never_share_a_destination) {
+    // Rome, 2026-09-25: each season's Extras held a "Menu Art.mkv". The
+    // planner checked only the filesystem for a collision, so both were given
+    // /Movies/Menu Art/Menu Art.mkv; the first imported and the second failed
+    // destination_conflict on every retry. Each file now gets its own path.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+    auto& service = fixture.start();
+
+    const auto root = fixture.path() / "rome";
+    const auto first = pattern(64 * 1024 + 11, 3);
+    const auto second = pattern(96 * 1024 + 7, 4);
+    for (const auto& [dir, bytes] : {std::pair{std::string("Season 1/Extras"), first},
+                                     std::pair{std::string("Season 2/Extras"), second}}) {
+        std::filesystem::create_directories(root / dir);
+        std::ofstream out(root / dir / "Menu Art.mkv", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = {root};
+    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(), ingest_config);
+    const auto id = ingest.submit_path(root);
+    ingest.start();
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+
+    const auto job = ingest.job(id);
+    REQUIRE(job.has_value());
+    REQUIRE(job->files.size() == 2);
+    CHECK(job->files[0].destination_path != job->files[1].destination_path);
+    for (const auto& file : job->files) {
+        const auto& bytes = file.size == first.size() ? first : second;
+        CHECK(read_whole(service.filesystem(), file.destination_path, bytes.size()) == bytes);
+    }
+    ingest.stop();
+}
+
 MACHA_TEST("hydration_catalogue", test_ingest_commits_published_torrent_extents_without_copying) {
     // Stage 2 of the torrent disk backend: a torrent publishes each extent as
     // its pieces verify and records it in the job's extent journal. The ingest
