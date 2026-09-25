@@ -2,6 +2,16 @@
 
 Last updated: 2026-09-25
 
+## 2026-09-25 -- `http_server/test_a_client_that_closes_mid_body_releases_the_body_source_promptly` fixed
+
+A test race, not a server leak. `connections_open` is a gauge the reactor
+publishes at the end of each pass (`src/http.cpp:1406`), while the body source
+is destroyed mid-pass by `close_connection`; the case checked the gauge the
+instant it saw the source destroyed, so it could read the previous pass's 1.
+Measured 1/40 in isolation on macOS (<= 1/20 on es-1 earlier), always line
+372. The check now waits for the gauge as every other gauge check in the file
+does: 200/200 at `--jobs 8`.
+
 ## 2026-09-24/25 -- 0.57.0 to 0.58.2, the laws standardised, the docs audited
 
 All deployed to gbni-1 and fi-1 (es-1 is offline), built and suite-tested on

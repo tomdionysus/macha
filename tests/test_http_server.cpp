@@ -369,7 +369,12 @@ MACHA_TEST("http_server", test_a_client_that_closes_mid_body_releases_the_body_s
     // connection; the source is destroyed with it. Nothing waits for a
     // send timeout.
     CHECK(wait_until([&] { return destroyed->load(); }, 2s));
-    CHECK(server.diagnostics().connections_open == 0);
+    // connections_open is a gauge the reactor publishes at the end of each
+    // pass, and the source is destroyed mid-pass by close_connection. Read
+    // immediately, it could still say 1 from the pass before: 1/40 on macOS
+    // and <= 1/20 on es-1, always this line. The promptness this case exists
+    // for is the destruction above; the gauge only has to follow.
+    CHECK(wait_until([&] { return server.diagnostics().connections_open == 0; }, 2s));
     server.stop();
 }
 
