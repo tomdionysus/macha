@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
-#include "data_work.hpp"
-#include "io_pressure.hpp"
-#include "storage_pool.hpp"
+#include "cluster/data_work.hpp"
+#include "storage/io_pressure.hpp"
+#include "storage/storage_pool.hpp"
 
 #include <chrono>
 #include <thread>

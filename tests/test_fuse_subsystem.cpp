@@ -12,10 +12,10 @@
 // libfuse is behind FuseMountDriver so these run without a kernel mount, which
 // is what lets them run at all: no test host here has ever had one, and the
 // mount lifecycle is precisely the part that was never covered.
-#include "fuse_frontend.hpp"
-#include "fuse_subsystem.hpp"
-#include "subsystem_registry.hpp"
-#include "subsystem_supervisor.hpp"
+#include "fuse/fuse_frontend.hpp"
+#include "fuse/fuse_subsystem.hpp"
+#include "subsystem/subsystem_registry.hpp"
+#include "subsystem/subsystem_supervisor.hpp"
 #include "test_backend_support.hpp"
 
 #include <atomic>

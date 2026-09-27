@@ -20,10 +20,10 @@
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
-#include "metadata.hpp"
-#include "local_store.hpp"
-#include "namespace_control_store.hpp"
-#include "namespace_tree.hpp"
+#include "metadata/metadata.hpp"
+#include "storage/local_store.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "metadata/namespace_tree.hpp"
 
 #include <algorithm>
 #include <chrono>

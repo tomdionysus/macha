@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "json.hpp"
-#include "manage_api.hpp"
-#include "status_api.hpp"
+#include "api/manage_api.hpp"
+#include "api/status_api.hpp"
 #include "supervised.hpp"
 #include "test_backend_support.hpp"
-#include "users_api.hpp"
+#include "api/users_api.hpp"
 
 #if defined(__linux__)
 #include <sys/syscall.h>

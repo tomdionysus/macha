@@ -24,7 +24,7 @@
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "durable_file.hpp"
-#include "users.hpp"
+#include "auth/users.hpp"
 
 #include <termios.h>
 #include <unistd.h>

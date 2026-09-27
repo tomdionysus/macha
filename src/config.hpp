@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "ffmpeg_log.hpp"
+#include "media/ffmpeg_log.hpp"
 #include "log.hpp"
 #include "retry_policy.hpp"
 #include "types.hpp"
@@ -478,7 +478,7 @@ struct TorrentConfig {
     uint64_t max_upload_rate{};   // bytes/s, 0 = unlimited
     // Threads doing the torrent's file I/O. Every read, write and hash they
     // perform is admitted by the DATA arbiter at loader class and timed into
-    // the disk service monitor (src/torrent_disk_io.hpp). libtorrent's own
+    // the disk service monitor (src/torrent/torrent_disk_io.hpp). libtorrent's own
     // backend ran ten, outside both, and on 2026-09-23 they wrote 65 MB/s onto
     // es-1's DATA spindle while macha's own writes waited behind them.
     //

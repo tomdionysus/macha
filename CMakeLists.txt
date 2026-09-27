@@ -144,7 +144,7 @@ find_package(PkgConfig REQUIRED)
 find_package(CURL REQUIRED)
 # Response compression for the API and the web client. zlib is already a
 # transitive dependency of both OpenSSL and libcurl; this names it directly
-# because src/http_compression.cpp calls deflate() itself.
+# because src/http/http_compression.cpp calls deflate() itself.
 find_package(ZLIB REQUIRED)
 find_package(yaml-cpp QUIET)
 
@@ -267,67 +267,67 @@ set(MACHA_CORE_SOURCES
     src/process_allocator.cpp
     src/log.cpp
     src/supervised.cpp
-    src/subsystem.cpp
-    src/subsystem_registry.cpp
-    src/subsystem_supervisor.cpp
-    src/media_metadata_registry.cpp
-    src/ffmpeg_log_base.cpp
     src/diagnostics.cpp
-    src/telemetry.cpp
-    src/session.cpp
-    src/status_api.cpp
-    src/public_connectivity.cpp
     src/durable_file.cpp
-    src/durability_domain.cpp
-    src/placement.cpp
-    src/membership.cpp
-    src/local_store.cpp
-    src/storage_pool.cpp
-    src/retention.cpp
-    src/persistent_cache.cpp
-    src/metadata.cpp
-    src/namespace_tree.cpp
-    src/namespace_control_store.cpp
-    src/net.cpp
-    src/cluster.cpp
-    src/cluster_jobs.cpp
-    src/torrent_coordinator.cpp
-    src/distributed_store.cpp
-    src/replica_selector.cpp
-    src/metadata_manager.cpp
     src/json.cpp
-    src/http.cpp
-    src/http_compression.cpp
-    src/media_segments.cpp
-    src/media_timestamps.cpp
-    src/media_vod.cpp
-    src/subtitle_text.cpp
-    src/media_containers.cpp
-    src/media_engine_common.cpp
-    src/media_information.cpp
-    src/playback.cpp
-    src/catalogue.cpp
-    src/catalogue_hints.cpp
-    src/catalogue_api.cpp
-    src/manage_api.cpp
-    src/session_api.cpp
-    src/users.cpp
-    src/users_api.cpp
-    src/web_api.cpp
-    src/acquisition_api.cpp
-    src/media_catalogue.cpp
-    src/ingest.cpp
-    src/torrent_extent_journal.cpp
-    src/torrent_common.cpp
-    src/torrent_request.cpp
-    src/macos_unicode.cpp
-    src/hydration.cpp
-    src/filesystem.cpp
-    src/fuse_journal.cpp
-    src/fuse_frontend.cpp
-    src/fuse_mountpoint.cpp
-    src/fuse_subsystem.cpp
-    src/service.cpp
+    src/subsystem/subsystem.cpp
+    src/subsystem/subsystem_registry.cpp
+    src/subsystem/subsystem_supervisor.cpp
+    src/storage/durability_domain.cpp
+    src/storage/local_store.cpp
+    src/storage/storage_pool.cpp
+    src/storage/retention.cpp
+    src/storage/persistent_cache.cpp
+    src/cluster/telemetry.cpp
+    src/cluster/public_connectivity.cpp
+    src/cluster/placement.cpp
+    src/cluster/membership.cpp
+    src/cluster/net.cpp
+    src/cluster/cluster.cpp
+    src/cluster/distributed_store.cpp
+    src/cluster/replica_selector.cpp
+    src/metadata/metadata.cpp
+    src/metadata/namespace_tree.cpp
+    src/metadata/namespace_control_store.cpp
+    src/metadata/metadata_manager.cpp
+    src/auth/session.cpp
+    src/auth/users.cpp
+    src/http/http.cpp
+    src/http/http_compression.cpp
+    src/api/status_api.cpp
+    src/api/catalogue_api.cpp
+    src/api/manage_api.cpp
+    src/api/session_api.cpp
+    src/api/users_api.cpp
+    src/api/web_api.cpp
+    src/api/acquisition_api.cpp
+    src/filesystem/macos_unicode.cpp
+    src/filesystem/hydration.cpp
+    src/filesystem/filesystem.cpp
+    src/fuse/fuse_journal.cpp
+    src/fuse/fuse_frontend.cpp
+    src/fuse/fuse_mountpoint.cpp
+    src/fuse/fuse_subsystem.cpp
+    src/media/media_metadata_registry.cpp
+    src/media/ffmpeg_log_base.cpp
+    src/media/media_segments.cpp
+    src/media/media_timestamps.cpp
+    src/media/media_vod.cpp
+    src/media/subtitle_text.cpp
+    src/media/media_containers.cpp
+    src/media/media_engine_common.cpp
+    src/playback/playback.cpp
+    src/catalogue/media_information.cpp
+    src/catalogue/catalogue.cpp
+    src/catalogue/catalogue_hints.cpp
+    src/catalogue/media_catalogue.cpp
+    src/acquisition/cluster_jobs.cpp
+    src/acquisition/ingest.cpp
+    src/torrent/torrent_coordinator.cpp
+    src/torrent/torrent_extent_journal.cpp
+    src/torrent/torrent_common.cpp
+    src/torrent/torrent_request.cpp
+    src/service/service.cpp
 )
 
 add_library(macha_core SHARED ${MACHA_CORE_SOURCES})
@@ -368,8 +368,8 @@ file(RELATIVE_PATH MACHA_PLUGINDIR_TO_PRIVATE_LIBDIR
      "${MACHA_PLUGIN_INSTALL_DIR_FULL}"
      "${CMAKE_INSTALL_PREFIX}/${MACHA_PRIVATE_LIBDIR}")
 if(MACHA_LIBTORRENT_TARGET)
-    add_library(macha-torrent MODULE src/torrent_manager.cpp src/torrent_session_policy.cpp src/torrent_plugin.cpp
-        src/torrent_disk_io.cpp)
+    add_library(macha-torrent MODULE src/torrent/torrent_manager.cpp src/torrent/torrent_session_policy.cpp src/torrent/torrent_plugin.cpp
+        src/torrent/torrent_disk_io.cpp)
     target_link_libraries(macha-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
     set_target_properties(macha-torrent PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${MACHA_PLUGIN_BUILD_DIR}"
@@ -412,12 +412,12 @@ endif()
 
 if(MACHA_BUILD_SERVER)
     add_executable(macha
-        src/main.cpp
+        src/service/main.cpp
         src/config.cpp
-        src/ffmpeg_log.cpp
-        src/media_engine.cpp
-        src/media_metadata_ffmpeg.cpp
-        src/service_config.cpp)
+        src/media/ffmpeg_log.cpp
+        src/media/media_engine.cpp
+        src/media/media_metadata_ffmpeg.cpp
+        src/service/service_config.cpp)
     target_link_libraries(macha PRIVATE macha_core ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
     set_target_properties(macha PROPERTIES
         INSTALL_RPATH "${MACHA_RPATH_ORIGIN}/${MACHA_BINDIR_TO_PRIVATE_LIBDIR}"
@@ -436,7 +436,7 @@ if(MACHA_BUILD_SERVER)
         pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
         if(TARGET PkgConfig::FUSE3)
             set(MACHA_FUSE_FOUND ON)
-            add_library(macha-fuse MODULE src/fuse_adapter.cpp src/fuse_plugin.cpp)
+            add_library(macha-fuse MODULE src/fuse/fuse_adapter.cpp src/fuse/fuse_plugin.cpp)
             target_link_libraries(macha-fuse PRIVATE macha_core)
             # On macOS, /usr/local/include is searched by Clang before -isystem
             # directories.  If both legacy FUSE 2 headers and FUSE 3 are installed,
@@ -471,7 +471,7 @@ if(MACHA_BUILD_SERVER)
             )
             if(FUSE3_INCLUDE_DIR AND FUSE3_LIBRARY)
                 set(MACHA_FUSE_FOUND ON)
-                add_library(macha-fuse MODULE src/fuse_adapter.cpp src/fuse_plugin.cpp)
+                add_library(macha-fuse MODULE src/fuse/fuse_adapter.cpp src/fuse/fuse_plugin.cpp)
                 target_link_libraries(macha-fuse PRIVATE macha_core ${FUSE3_LIBRARY})
                 target_include_directories(macha-fuse PRIVATE ${FUSE3_INCLUDE_DIR})
             endif()
@@ -622,9 +622,9 @@ if(MACHA_BUILD_TESTS)
             tests/test_runtime_dependencies.cpp
             tests/test_transcode_timeline.cpp
             src/config.cpp
-            src/ffmpeg_log.cpp
-            src/media_engine.cpp
-            src/media_metadata_ffmpeg.cpp)
+            src/media/ffmpeg_log.cpp
+            src/media/media_engine.cpp
+            src/media/media_metadata_ffmpeg.cpp)
         target_link_libraries(macha-tests-runtime PRIVATE
             macha_core ${MACHA_YAML_TARGET} PkgConfig::LIBAV)
         target_compile_definitions(macha-tests-runtime PRIVATE
@@ -658,8 +658,8 @@ if(MACHA_BUILD_TESTS)
             tests/main.cpp
             tests/test_framework.cpp
             tests/test_torrent_disk_io.cpp
-            src/torrent_disk_io.cpp
-            src/torrent_session_policy.cpp)
+            src/torrent/torrent_disk_io.cpp
+            src/torrent/torrent_session_policy.cpp)
         target_link_libraries(macha-tests-torrent PRIVATE macha_core ${MACHA_LIBTORRENT_TARGET})
         target_compile_definitions(macha-tests-torrent PRIVATE
             MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

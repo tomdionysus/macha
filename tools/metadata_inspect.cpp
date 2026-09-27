@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "crypto.hpp"
-#include "metadata.hpp"
+#include "metadata/metadata.hpp"
 
 #include <algorithm>
 #include <filesystem>

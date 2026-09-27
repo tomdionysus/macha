@@ -51,7 +51,7 @@ the decisions waiting on the operator.
      the film and catalogued as a fourth source of `tmdb:movie:286217`
      (removed by hand at the operator's request). The ingest must skip
      samples: a `Sample` directory, or a name with a `-sample` / `.sample` /
-     `sample.` component (case-insensitive). Planner: `src/ingest.cpp`.
+     `sample.` component (case-insensitive). Planner: `src/acquisition/ingest.cpp`.
    - **A namespace-wide case policy, to design** (operator: "Macha will have
      to handle case insensitivity for the eventual Windows port"):
      case-preserving, case-insensitive lookups, collisions and renames
@@ -84,12 +84,12 @@ the decisions waiting on the operator.
    data) always proceed; a 4 MB fetch or push only when credit covers it; an
    extent no peer holds is counted unsourceable without spending credit. Also
    verify why the bandwidth estimate is so low (fi-1's site link measured
-   congested on 2026-09-27, independently of Macha: the likely cause). Code: `src/service.cpp` network_due / byte_budget,
+   congested on 2026-09-27, independently of Macha: the likely cause). Code: `src/service/service.cpp` network_due / byte_budget,
    `DistributedStore::repair_step`.
 2. **Per-file readability (designed, operator to choose where it goes).**
    Every extent of a file present on some reachable node: local
    `LocalStore::has()` (index), then one batched `have_objects` per peer (the
-   peer answers from `has()` too, `src/cluster.cpp:1264`); cache per
+   peer answers from `has()` too, `src/cluster/cluster.cpp:1264`); cache per
    `media_id`. Uses: a fact in `playback/media`, a clean refusal at session
    create, a manage report of damaged files by path (the cluster-wide "what
    no node holds" join wanted since gbni-2's removal). The first two are wire
@@ -113,7 +113,7 @@ the decisions waiting on the operator.
    implement with tests; decide with the operator what happens to Rome's
    extras already in `/Movies/` (Rome's retry placed two more there as
    `Menu Art (2).mkv` and `Previews for all episodes (2).mkv`). Planner:
-   `choose_destination` in `src/ingest.cpp`.
+   `choose_destination` in `src/acquisition/ingest.cpp`.
 5. **Decisions waiting on the operator** (do not act without them):
    - fi-1's 10G DATA backend: revert, or `replication: 1`. It is full and
      refuses every import write. Repair (0.62.1) and prompt replication
@@ -130,7 +130,7 @@ the decisions waiting on the operator.
      belongs to item on PATCH, manual items pruning dead files, flag a
      media_id bound to two items). Core owns the client side and wants the
      version and wire shape of each as it ships.
-   - Transcode entitlements are per session (`src/playback.cpp` create
+   - Transcode entitlements are per session (`src/playback/playback.cpp` create
      path): one account can open up to 32 sessions and take every transcode
      slot on a node. A law 2 second-clause gap; needs a per-account bound.
    - 317 directories under `/Movies` and `/Music` on gbni-1 list empty
@@ -149,16 +149,16 @@ the decisions waiting on the operator.
    started.
 7. **Known defects found 2026-09-24/25, not yet fixed:**
    - `catalogue_api` maps every exception to `503 catalogue_unavailable`
-     (`src/catalogue_api.cpp` ~590): bad JSON, bad `If-Match`, artwork for a
+     (`src/api/catalogue_api.cpp` ~590): bad JSON, bad `If-Match`, artwork for a
      missing item all answer 503 instead of 400/404.
    - `PUT /api/v1/catalogue/items/{id}` is a full replacement with no
      validation: parent may not exist or form a cycle, and omitting
      `media_ids` unbinds every file.
    - Three more transient conditions still raise a bare `runtime_error`
      that an ingest would fail on rather than block: `object replication
-     quorum unavailable` (`src/distributed_store.cpp` 163, 195), `metadata
-     replica is still recovering` (`src/cluster.cpp` 445), `local metadata
-     replica unavailable` (`src/filesystem.cpp` 2356). None seen failing an
+     quorum unavailable` (`src/cluster/distributed_store.cpp` 163, 195), `metadata
+     replica is still recovering` (`src/cluster/cluster.cpp` 445), `local metadata
+     replica unavailable` (`src/filesystem/filesystem.cpp` 2356). None seen failing an
      ingest yet.
    - From the acquisition API audit (`docs/acquisition.md`): the torrent and
      ingest `catalogue.state` rules disagree; a remote job's
@@ -180,10 +180,10 @@ the decisions waiting on the operator.
 9. **Search `kind` filter** (approved; Core asked). Repeated `kind`
    parameter (`movie`, `show`, `season`, `episode`, `artist`, `album`,
    `track`), filtered before `limit`; absent means all; unknown is a 400.
-   `src/catalogue_api.cpp` around line 417. Tell Core the version.
+   `src/api/catalogue_api.cpp` around line 417. Tell Core the version.
 10. **People on catalogue items -- directors, cast** (approved), with a
    **required backfill**: TMDB `append_to_response=credits` on the requests
-   the scanner already makes (`src/media_catalogue.cpp` ~1544); store on
+   the scanner already makes (`src/catalogue/media_catalogue.cpp` ~1544); store on
    `CatalogueItem` (versioned record change); expose in the API; a
    background, rate-limited, resumable, visible pass over every item with a
    `tmdb` id and no credits, fetched by id. Announce to every client.
@@ -298,14 +298,14 @@ a fact.**
    seconds of a `metadata histories reconciled ... conflicts=1 superseded=1`
    line; the last one in the same second.
 
-   **Mechanism.** `src/metadata.cpp:2040-2046`: on a genuine three-way
+   **Mechanism.** `src/metadata/metadata.cpp:2040-2046`: on a genuine three-way
    conflict the merge installs the **common-ancestor value** at the path and
    records a conflict ("Keep the common-ancestor value visible until explicit
    resolution"). The ingest's open `WriteHandle` still carries its last
    committed basis; the entry now has an older size and older extents under a
-   newer version; `commit_file`'s basis check (`src/filesystem.cpp:2294`)
+   newer version; `commit_file`'s basis check (`src/filesystem/filesystem.cpp:2294`)
    fails EAGAIN; `IngestManager::process_job` marks the job `failed`
-   (`src/ingest.cpp:1221`). No bytes are lost -- extents are on disk and
+   (`src/acquisition/ingest.cpp:1221`). No bytes are lost -- extents are on disk and
    `copy_file` resumes from the namespace size -- but the job is dead and a
    retry re-copies 64-128 MB.
 
@@ -314,7 +314,7 @@ a fact.**
    two or three records at the *same* generation (36470 x3, 36477 x3, 36480 x3,
    36484 x3). All three nodes reconcile, each sorts the accepted heads by hash
    from its own view and folds `heads[0]`/`heads[1]`
-   (`src/metadata_manager.cpp:1248-1251`), so with three or more heads they
+   (`src/metadata/metadata_manager.cpp:1248-1251`), so with three or more heads they
    merge *different pairs* and manufacture sibling merges of each other's
    merges. In that braid `history_common_ancestor` (which does follow
    `merge_parents`) lands well below both heads, so es-1's checkpoint N (left)
@@ -379,7 +379,7 @@ a fact.**
      destination device, which it cannot: admission happens before placement.
    - [ ] **Local disk maintenance is budgeted from a network measurement.**
      `estimated_network_bps()` feeds `local_credit` as well as
-     `network_credit` (`src/service.cpp` maintenance loop), which is how a
+     `network_credit` (`src/service/service.cpp` maintenance loop), which is how a
      GC/repair pass once took 51.6 MB/s of one spindle. The loader clock stops
      maintenance during an import, which was the case that hurt, but the
      budget still means nothing on a node with one spindle. No number is
@@ -638,7 +638,7 @@ repository blocks it.
 **This is the active work.** Agreed with the operator on 2026-09-21. Full
 specification: [playback sessions as a
 resource](2026-09-21-playback-sessions-as-a-resource-plan.md) — read that
-before touching `src/playback.cpp`.
+before touching `src/playback/playback.cpp`.
 
 **It breaks the client contract on purpose.** Every node is under our control,
 there is no fallback to an old version, and there is no dual-serve window. Two
@@ -649,8 +649,8 @@ not an identifier), and **backward compatibility is not a design input**.
 The defect is that a playback session belongs to the bearer rather than
 existing as a resource. `create` resolves the logical viewer from the auth
 session id (`logical_session_for(request.session->id)`,
-`src/playback.cpp:2288`), and `session_for_logical_locked`
-(`src/playback.cpp:916-921`) returns *the* session of a viewer, singular. One
+`src/playback/playback.cpp:2288`), and `session_for_logical_locked`
+(`src/playback/playback.cpp:916-921`) returns *the* session of a viewer, singular. One
 bearer therefore has one playback session and a second `POST` supersedes the
 first — which is why the Web Client cannot hand over, and is not what `POST` to
 a collection means.
@@ -682,7 +682,7 @@ That was wrong on both counts and is corrected there.
 
 ### What is built, and where
 
-- Routes, collection `GET`, stream as a subresource: `src/playback.cpp`.
+- Routes, collection `GET`, stream as a subresource: `src/playback/playback.cpp`.
 - Per-account cap, `streaming.max_sessions_per_account`, default **32** with
   its arithmetic in the config comment (`src/config.hpp`). Refuses `429` with
   code `account_session_limit`, `scope: request`, `node_healthy: true`, and
@@ -777,7 +777,7 @@ measured.)*
   node.
 - [ ] Ruled out already without a reproduction: it is **not** probe
   coalescing, which throws its own distinct "timed out waiting for concurrent
-  media inspection" (`src/playback.cpp:1225`).
+  media inspection" (`src/playback/playback.cpp:1225`).
 - [ ] First candidate to eliminate: retained memory held by a pipeline not yet
   reclaimed. It would stall without recording an error, and the throw site is
   reached only when the wait failed, no error was recorded, and the pipeline
@@ -933,7 +933,7 @@ It does, and the instance is much larger:
 | fi-1 | none | 0 | — | — |
 
 `WriteHandle` stages a write in `state_path/tmp/write.<node-id>.XXXXXX`, from
-`begin_sparse_overlay` (`src/filesystem.cpp:645-656`) or `materialize_step`
+`begin_sparse_overlay` (`src/filesystem/filesystem.cpp:645-656`) or `materialize_step`
 (`:690-698`). `WriteHandle::cleanup` (`:1449-1458`) removes it, and the
 destructor calls `cleanup` (`:364-374`). So an orderly close always removes
 the file, and **an unclean exit never does**: the path lives only in the
@@ -994,7 +994,7 @@ observation, not chased further.
 
 **What stands, and is the whole of what is left:** The entire observable surface of `PersistentBlockCache` is a function
 of writes. `blocks()` is the only accessor, `cache_used` in telemetry is
-`blocks() * extent_size` (`src/cluster.cpp:1614-1619`), no test asserts a
+`blocks() * extent_size` (`src/cluster/cluster.cpp:1614-1619`), no test asserts a
 read-back from it, and the one log line that would show a hit only fires for
 foreground reads taking **≥250 ms** — so a working cache is silent by
 construction. A cache that has never returned a byte reports identically to
@@ -1108,7 +1108,7 @@ cluster. It does not currently do that, and the reason is structural rather
 than a bug: `MetadataSnapshot::entries` is a `std::map<std::string, FsEntry>`
 holding the whole namespace, the record payload *is* that map serialised, and
 the record's identity *is* a SHA-256 over those bytes
-(`metadata_hash`, `src/metadata.cpp:1334`). So nothing can be demand-loaded —
+(`metadata_hash`, `src/metadata/metadata.cpp:1334`). So nothing can be demand-loaded —
 the whole structure must be materialised to produce the hash — and every commit
 re-serialises and re-hashes the library.
 
@@ -1127,7 +1127,7 @@ Two corrections Stage A forced:
 
 - **The 128 MiB `materialization_cache_limit_bytes` budget never bounded the
   namespace.** `cur_` and `committed_` are pinned and exempt
-  (`src/metadata.cpp:3203`, `:3210-3212`, `:3230-3231`), so residency is
+  (`src/metadata/metadata.cpp:3203`, `:3210-3212`, `:3230-3231`), so residency is
   unbounded by design and the LRU only governs historical materialisations.
   One materialisation equals the whole budget at ~4.6 TiB, not the 9 TB
   estimated — near-term, not target-scale.
@@ -1144,32 +1144,32 @@ of disk in total, and holds a byte-identical 47 MB materialisation describing
 424,222 extents of content it does not store.
 
 And a single file write, through `mutate_impl`
-(`src/metadata_manager.cpp:1622`), costs four full traversals: a full
+(`src/metadata/metadata_manager.cpp:1622`), costs four full traversals: a full
 `decode_snapshot` (`:1669`), a full `encode_snapshot`, a full `metadata_hash`,
 and a full element-wise `entries != entries` comparison (`:228`). The
 `before.emplace` deep copy at `:1698-1700` is already skipped, because every
 namespace write path uses `mutate_delta`.
 
 The fix is to make the record a root pointer over a content-addressed Merkle
-tree, the way `std::optional<ObjectId> catalogue_root` (`src/metadata.hpp:109`)
+tree, the way `std::optional<ObjectId> catalogue_root` (`src/metadata/metadata.hpp:109`)
 already works three lines above `entries` in the same struct. That takes a
 commit from O(library) to O(log n) per changed path, and only then does moving
 extents off the heap buy anything.
 
 **This is not a new discipline for this codebase.** `repair_step`'s comment
-(`src/distributed_store.cpp:2132-2136`) diagnoses exactly this pathology in the
+(`src/cluster/distributed_store.cpp:2132-2136`) diagnoses exactly this pathology in the
 object store and records the fix — cursor-based, budgeted, "they never rebuild
-complete object vectors" (`src/distributed_store.hpp:238-241`). The namespace
+complete object vectors" (`src/cluster/distributed_store.hpp:238-241`). The namespace
 never received it, and `maintenance_objects_cached`
-(`src/filesystem.cpp:2392-2455`) still builds the complete ~26-million-id live
+(`src/filesystem/filesystem.cpp:2392-2455`) still builds the complete ~26-million-id live
 vector that `repair_step` is handed (~840 MB transient at 100 TB).
 
 Migration is a re-root, not a rebuild: ObjectIds address content that no
 metadata format change touches, so the library survives and only ancestry is
 discarded. It is a flag day across every node, and it needs an authority-granting
-variant of `recover_from_seed` (`src/metadata.cpp:2097-2131`) built in the shape
+variant of `recover_from_seed` (`src/metadata/metadata.cpp:2097-2131`) built in the shape
 of `metadata_branch_floor`/`retention_baseline_complete`
-(`src/metadata.hpp:93-103`) rather than by loosening the recovery path. That
+(`src/metadata/metadata.hpp:93-103`) rather than by loosening the recovery path. That
 interlock is the most dangerous single piece of the work.
 
 **Status 2026-09-24:** Stages B, C and E have shipped (0.49.0-0.50.1) and the
@@ -1180,7 +1180,7 @@ the cutover.
 - [x] Stage A: real numbers off es-1/fi-1 and `sizeof` confirmation on an ARM
   build. Done 2026-09-17; see "Stage A results" in the plan. One item remains
   open: the live `MetadataReplicaDiagnostics` counters
-  (`src/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
+  (`src/metadata/metadata.hpp:415-431`) are reachable only through `GET /api/v1/status`,
   which needs an account holding `view_status`.
 - [ ] Stage D: demand-loaded extent nodes, on the `RetainedMemoryLedger`;
   persist `file_media_id`.
@@ -1251,15 +1251,15 @@ the time:
 **Root cause of the read-only windows, found 2026-09-21. The stall was never
 the whole story: the cluster had no margin to absorb one.** A peer counts as
 live only while it has been observed inside `dead_after`
-(`src/membership.cpp:292,315`). The mechanism that refreshes that observation
-is `RpcClient::health_loop` (`src/net.cpp:2694`): every `heartbeat` it pings
+(`src/cluster/membership.cpp:292,315`). The mechanism that refreshes that observation
+is `RpcClient::health_loop` (`src/cluster/net.cpp:2694`): every `heartbeat` it pings
 each peer's CONTROL lane and, on an `ok`, calls `peer_observer_(reply.peer)` →
-`members_.observe(peer, true)` (`src/net.cpp:2812`, `src/cluster.cpp:264,305`).
+`members_.observe(peer, true)` (`src/cluster/net.cpp:2812`, `src/cluster/cluster.cpp:264,305`).
 A membership exchange from `NodeRuntime::loop` also observes, but the probe is
 the primary path.
 
 **Each probe round is given exactly `dead_after` to succeed in**: the probes
-are constructed with `deadline = started + dead_after_` (`src/net.cpp:2755-2758`),
+are constructed with `deadline = started + dead_after_` (`src/cluster/net.cpp:2755-2758`),
 and the abandon message says so — `"health could not be established before
 dead_after"`. A probe that *fails* is fine: `next_attempt = now + 50 ms` retries
 it for the rest of the window. A probe that **hangs** is not, because
@@ -1267,7 +1267,7 @@ it for the rest of the window. A probe that **hangs** is not, because
 attempt sat there until the round deadline — and the round deadline is the
 liveness budget. **The peer expired at the instant the probe proving it alive
 was abandoned, with no retry able to land first, by construction.** That
-dropped `online` below `required` (`src/metadata_manager.cpp:99-111`), took
+dropped `online` below `required` (`src/metadata/metadata_manager.cpp:99-111`), took
 metadata read-only, and killed any commit in the window.
 
 That explains what this item called unexplained: both ends healthy, link
@@ -1323,7 +1323,7 @@ since the 0.47.0 restart at 21:46:57 on 2026-09-20** (40 that day before it,
 247 on 2026-09-19). Progress accounting was audited and is sound in both
 directions — `touch()` fires per partial write from the writer and the reader,
 odd/even request ids handled symmetrically on the dialled and accepted paths
-(`src/net.cpp:1492`, `:1574`, `:3330-3337`, `:4143-4149`) — so a 30 s idle
+(`src/cluster/net.cpp:1492`, `:1574`, `:3330-3337`, `:4143-4149`) — so a 30 s idle
 really does mean zero bytes moved, and that part is still open.
 
 Done and ledgered in `COMPLETED.md` (2026-09-24 reconciliation): the
@@ -1338,7 +1338,7 @@ non-issue, and an ingest surviving a read-only window (0.57.0).
 - [ ] **Do not treat a no-progress cancel as the bug.** That is discipline 2
   working: the deadline fires instead of waiting forever.
 - [ ] **`publish_commit` gathers the durability floor serially**
-  (`src/metadata_manager.cpp:751-770`): `store_commit_on` per replica, stopping
+  (`src/metadata/metadata_manager.cpp:751-770`): `store_commit_on` per replica, stopping
   at `required`, no fan-out and no hedge. The slowest of the first `required`
   replicas sets the latency of every metadata commit, and a first choice that
   stalls costs a full deadline before the third node is tried at all. Found
@@ -1362,7 +1362,7 @@ repair_once() -> read_group() -> import_history_from_peer()
 of this namespace is **~51 MB**. The default
 `dht.metadata_materialization_cache_bytes` is **128 MiB**, so exactly two fit —
 and `cur_` and `committed_` are pinned and exempt from eviction
-(`src/metadata.cpp`), so they *are* those two. A replica catching up therefore
+(`src/metadata/metadata.cpp`), so they *are* those two. A replica catching up therefore
 has **zero usable cache**. Every `materialized()` misses, walks back the delta
 chain to a full snapshot because no ancestor is cached, replays it, and is
 evicted before the next call can use it.
@@ -1476,7 +1476,7 @@ nowhere on the disk, which sits underneath all three:
   'service_time|io_latency|write_latency|disk_ms' src/` returns nothing.
 
 `DataResourceArbiter` says *"CONTROL does not enter this object"*
-(`src/data_work.hpp:95`). That protects control when the pool is the contended
+(`src/cluster/data_work.hpp:95`). That protects control when the pool is the contended
 resource, and the disk is contended, shared and modelled nowhere — so control
 is not protected by exclusion, only invisible. Note a
 `data_control_reserve_bytes` is **the wrong fix** and must not be built:
@@ -1553,7 +1553,7 @@ INFO node connection inbound peer=97f6b5a35753 lane=data
 uncaught exception: no inbound RPC handler installed
 ```
 
-`src/net.cpp:1378` (`dispatch_request`) and `src/net.cpp:1898`
+`src/cluster/net.cpp:1378` (`dispatch_request`) and `src/cluster/net.cpp:1898`
 (`RpcClient::dispatch_inbound`) both throw when `inbound_handler_` is unset.
 Nothing before them refuses the connection politely or defers it; the node has
 advertised itself as listening and then fails the first thing asked of it.
@@ -1588,8 +1588,8 @@ The same failure as P-1 in a smaller organ, and — the important difference —
 [catalogue demand-loaded shards](2026-09-17-catalogue-shard-demand-load-plan.md).
 
 The catalogue already has the structure the namespace is being given: a root
-pointer (`catalogue_root`, `src/metadata.hpp:109`), a manifest of
-content-addressed shards (`src/catalogue.cpp:127-129`), a hash selecting a shard
+pointer (`catalogue_root`, `src/metadata/metadata.hpp:109`), a manifest of
+content-addressed shards (`src/catalogue/catalogue.cpp:127-129`), a hash selecting a shard
 per id (`:131-136`), and a commit that replicates only shards whose id changed
 (`:1070-1071`, `:1084-1089`). It then discards the benefit twice: `load_root`
 (`:543-571`) merges all 64 shards back into one map, and `commit` re-shards and
@@ -1604,7 +1604,7 @@ copies every item and returns the entire filtered set with no paging; `search()`
 (`:1001-1020`) scores every item with no index. Estimated ~150-250 MB resident
 at 100,000 titles, deep-copied per mutation — but **nothing measures it**: there
 is no catalogue equivalent of `snapshot_resident_bytes`
-(`src/metadata.cpp:55-91`), which is why that figure is derived from struct
+(`src/metadata/metadata.cpp:55-91`), which is why that figure is derived from struct
 shapes rather than read off a node. Stage A fixes that first.
 
 Because identity is already a root `ObjectId`, a catalogue written by the new
@@ -1619,9 +1619,9 @@ Two findings worth carrying forward on their own:
   (`:155-156`). Making it growable is a vector and a range check; old manifests
   keep decoding.
 - **Profile publication is one commit at a time.**
-  `MediaInformationService::publish_one` (`src/media_information.cpp:337-350`)
+  `MediaInformationService::publish_one` (`src/catalogue/media_information.cpp:337-350`)
   uses the singular `put_media_profile` while the batch form
-  `put_media_profiles` (`src/catalogue.cpp:932-954`) exists and is used by
+  `put_media_profiles` (`src/catalogue/catalogue.cpp:932-954`) exists and is used by
   `reconcile_scanner`. Any future field added to `MediaProfile` means a
   per-title backfill: 20,000 commits instead of ~200.
 
@@ -2521,7 +2521,7 @@ If it revives, that run's 01:02:43 requests should have succeeded and something
 else broke them. **If it does not, then any client that takes more than 60 s
 between its manifest and its first fragment loses its generation with no way
 back** -- and a client that is slow to start is not doing anything illegal, even
-if the client that exposed this was slow for a reason no viewer will ever hit. Read the reclamation path in `src/playback.cpp` (the log line is at
+if the client that exposed this was slow for a reason no viewer will ever hit. Read the reclamation path in `src/playback/playback.cpp` (the log line is at
 `playback pipeline reclaimed after stream inactivity`) against the segment route
 before touching either.
 
@@ -2545,15 +2545,15 @@ could move, not by a failure.** The answer is worse than "it can move": the
 reported figure and the generation's actual behaviour move independently.
 
 `session_json` computes `look_ahead_ms` from the live configuration
-(`src/playback.cpp:1768`, `config.max_ahead_segments *
+(`src/playback/playback.cpp:1768`, `config.max_ahead_segments *
 config.segment_duration`), and `PlaybackManager::reconfigure`
-(`src/playback.cpp:2987`) updates both knobs on a `reload_config` — its own
+(`src/playback/playback.cpp:2987`) updates both knobs on a `reload_config` — its own
 comment says "playback timing appl[ies] to subsequent sessions immediately".
 
 But a running generation's producer gate is not live. `MediaSegmentStore`
 takes `max_ahead_segments` as a constructor argument and stores it in
-`impl_->max_ahead` (`src/media_segments.cpp:212`); there is no setter and no
-`reconfigure`. The `cv.wait` predicate at `src/media_segments.cpp:146` uses
+`impl_->max_ahead` (`src/media/media_segments.cpp:212`); there is no setter and no
+`reconfigure`. The `cv.wait` predicate at `src/media/media_segments.cpp:146` uses
 that construction-time value for the life of the generation.
 
 **So after a SIGHUP that changes `max_ahead_segments`, an in-flight session
@@ -2569,8 +2569,8 @@ exception to law 2 *when the client chose it*. Here the client declined to
 choose it, on the node's own figure.
 
 **A second divergence, same root.** `segment_hold_window` is read live at
-request time (`src/playback.cpp:2136`) while the producer gate is not, and the
-comment at `src/playback.cpp:1757` states the invariant they are supposed to
+request time (`src/playback/playback.cpp:2136`) while the producer gate is not, and the
+comment at `src/playback/playback.cpp:1757` states the invariant they are supposed to
 maintain: "segment_hold_window is deliberately the same distance, so a request
 inside this window is one production is authorised to reach and a request
 outside it is one nothing is working toward". After a reload of
@@ -2656,7 +2656,7 @@ sparser GOP anywhere else in a long title rejects a seek point that would play
 perfectly well. The transcode branch of that same function already carries a
 comment warning the check "can spuriously reject an otherwise perfectly usable
 seek point if any other part of a long file has a sparser GOP"
-(`src/media_engine_common.cpp`) — that warning describes the remux branch's
+(`src/media/media_engine_common.cpp`) — that warning describes the remux branch's
 behaviour and was never applied to it.
 
 Not asserted as the cause: it is the branch that remains, not a proof. 0.46.0
@@ -2888,7 +2888,7 @@ P-1 above, in two other subsystems. They now have plans of their own —
   the frontend doesn't use for this. This is the single worst scaling property
   found in the codebase audit. *(2026-09-17: independent of storage format and
   fixable now; listed as Stage F work in the P-1 plan but does not wait on it.
-  `FileSystem::readdir`, `src/filesystem.cpp:1633-1642`, shows the shape.)*
+  `FileSystem::readdir`, `src/filesystem/filesystem.cpp:1633-1642`, shows the shape.)*
 - [ ] **SHA-256 plus a heap allocation inside a `std::sort` comparator.**
   `placement.cpp`'s `fallback_score()` allocates and hashes twice per
   comparison, and `StoragePool::ranked()` — hit on every put/get/has/valid/
@@ -3107,7 +3107,7 @@ cross-session and will not be in the next session's context.
   deploy verification is done. The rule it still keeps is the one that matters:
   no node id, no topology, nothing about the cluster. Anything beyond "is this
   node serving, and what is it running" needs `/api/v1/status` and
-  `view_status`. The code comment at `src/service.cpp:242` now says it carries
+  `view_status`. The code comment at `src/service/service.cpp:242` now says it carries
   the running version, deliberately (checked 2026-09-24).
 - **An old node answers `401`, not `404`**, to that route, because
   authentication happens before routing. Core falls back to

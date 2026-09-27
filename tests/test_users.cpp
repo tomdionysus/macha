@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "session_api.hpp"
+#include "api/session_api.hpp"
 #include "test_backend_support.hpp"
-#include "users_api.hpp"
+#include "api/users_api.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;

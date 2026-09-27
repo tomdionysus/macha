@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
-#include "local_store.hpp"
-#include "metadata.hpp"
-#include "namespace_control_store.hpp"
-#include "namespace_tree.hpp"
-#include "service.hpp"
+#include "storage/local_store.hpp"
+#include "metadata/metadata.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "metadata/namespace_tree.hpp"
+#include "service/service.hpp"
 
 #include <filesystem>
 #include <set>

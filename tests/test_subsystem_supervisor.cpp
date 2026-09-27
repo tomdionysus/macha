@@ -10,7 +10,7 @@
 // own isolated child process, so if the supervisor ever let such an
 // exception escape, that would show up as this test process crashing, not as
 // an ordinary CHECK failure.
-#include "subsystem_supervisor.hpp"
+#include "subsystem/subsystem_supervisor.hpp"
 #include "test_backend_support.hpp" // ConcurrentCapturingLogger
 
 #include <atomic>

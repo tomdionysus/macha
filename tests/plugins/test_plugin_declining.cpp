@@ -4,8 +4,8 @@
 // torrent plugin does when torrent.enabled is false. That is an operator
 // choice, not a fault: the supervisor must report `unavailable` and stop,
 // never enter the backoff/retry path it uses for a plugin that threw.
-#include "subsystem.hpp"
-#include "subsystem_abi.hpp"
+#include "subsystem/subsystem.hpp"
+#include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"
 
 namespace {

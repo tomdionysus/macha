@@ -10,8 +10,8 @@
 // Each instance faults once, shortly after start(), so the supervisor is
 // driven through faulted -> restarting -> running for as many cycles as the
 // retry policy allows.
-#include "subsystem.hpp"
-#include "subsystem_abi.hpp"
+#include "subsystem/subsystem.hpp"
+#include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"
 
 #include <atomic>

@@ -24,7 +24,7 @@
 
 #include "test_backend_support.hpp"
 
-#include "media_engine.hpp"
+#include "media/media_engine.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>

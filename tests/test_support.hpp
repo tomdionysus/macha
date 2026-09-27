@@ -3,11 +3,11 @@
 
 #include "config.hpp"
 #include "crypto.hpp"
-#include "distributed_store.hpp"
-#include "filesystem.hpp"
-#include "fuse_frontend.hpp"
-#include "metadata_manager.hpp"
-#include "service.hpp"
+#include "cluster/distributed_store.hpp"
+#include "filesystem/filesystem.hpp"
+#include "fuse/fuse_frontend.hpp"
+#include "metadata/metadata_manager.hpp"
+#include "service/service.hpp"
 #include "test_framework.hpp"
 #include "types.hpp"
 
@@ -177,7 +177,7 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     // (2026-09-17) made the suite log `plugin=0.43.0 core=0.43.1 ... refusing to
     // load (partial deploy?)` and exposed it. An engaged empty path is the only
     // way to say "builtin subsystems only" -- see Service's
-    // `plugin_path.value_or({})` at `src/service.cpp:99`.
+    // `plugin_path.value_or({})` at `src/service/service.cpp:99`.
     c.plugin_path = std::filesystem::path{};
 
     if (profile == ConfigProfile::functional) {
