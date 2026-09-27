@@ -228,6 +228,8 @@ class IngestManager {
     void enqueue_catalogue_hints(IngestJob&);
     void cleanup_source(const IngestJob&);
     std::string choose_destination(const std::filesystem::path&, uint64_t);
+    std::string with_existing_case(const std::string& destination);
+    bool exists_ignoring_case(const std::string& path);
     bool allowed_external_source(const std::filesystem::path&) const;
     void ensure_namespace_parents(std::string_view path);
     bool should_pause_or_cancel(const IngestJob&) const;
