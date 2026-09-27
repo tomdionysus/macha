@@ -66,8 +66,12 @@ is a law rather than a preference.
 2. **One work-item policy.** The parked state is visible in Status, and no RPC
    waits without a deadline.
 3. **Recover by resolving.** The outcome is re-journalled and counted in
-   Status. Only key mismatch or header corruption may refuse to start. This is
-   also an operational rule: a node is expected to settle bad input and stay
+   Status. Recovery may refuse to start only on key mismatch or header
+   corruption. A configuration the node cannot work with -- unknown keys,
+   unversioned storage, an `inbound_capable` setting that contradicts the
+   network -- is refused at startup as a separate matter: it is the
+   operator's to correct, not state to recover. This is also an operational
+   rule: a node is expected to settle bad input and stay
    online, and repairing state by hand on a node is not the remedy for a
    recovery path that refuses.
 4. **Compact history out of the hot path.** A metadata snapshot's size is a

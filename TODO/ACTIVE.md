@@ -43,22 +43,32 @@ the decisions waiting on the operator.
 
 ## The queue
 
-0. **Push and deploy 0.64.2** (above), on the operator's go. No wire change,
-   nothing to announce.
+0. **Deploy 0.66.0** (uncommitted, operator's call): gbni-1 runs 0.65.0,
+   fi-1 0.64.1. 0.64.2 and 0.65.0 are pushed and tagged. Rebuild on fi-1
+   (niced, after a viewer check) and run its suites before installing.
 
-0a. **Open from 2026-09-27, not yet fixed:**
-   - **Release samples are imported as library media.** The 720p NeZu
-     torrent's `Sample/...x264-sample.mkv` (11 MB, 63 s) was imported beside
-     the film and catalogued as a fourth source of `tmdb:movie:286217`
-     (removed by hand at the operator's request). The ingest must skip
-     samples: a `Sample` directory, or a name with a `-sample` / `.sample` /
-     `sample.` component (case-insensitive). Planner: `src/acquisition/ingest.cpp`.
-   - **A namespace-wide case policy, to design** (operator: "Macha will have
-     to handle case insensitivity for the eventual Windows port"):
-     case-preserving, case-insensitive lookups, collisions and renames
-     everywhere (FUSE, manage API, metadata keys), Unicode folding, and a
-     self-healing merge of existing case-only duplicates. 0.64.2 covers only
-     import destinations (ASCII folding). Needs a plan before code.
+0b-. **Degraded operation is the normal case (operator, 2026-09-28).** With
+   es-1 away and fi-1 full, new objects have one copy; that is accepted until
+   es-1 returns. More generally: "Macha needs to work properly degraded like
+   this, as best it can, indefinitely." Review what still waits on absent
+   replicas or full nodes (imports still try fi-1; repair's credit gate,
+   item 1) against that.
+
+0a. **Intermittent tests found 2026-09-27: resolved in 0.65.1 (uncommitted).** Each cause was proven from the code (and,
+   for the RPC race, by a test forcing the exact state), not by repetition:
+   - Product: simultaneous connect left a call with no route (RPC now waits
+     for the peer's session); ingest `clear()` deleted an active worker's
+     partials and the worker failed the cancelled job (worker now owns its
+     cleanup, a failure cannot replace a cancel); a reopened store reported a
+     zero-byte object present (empty object files are now pruned on read,
+     stat and scan).
+   - Tests only: spool pressure and terminal recovery held publication with a
+     clock (now `FuseFrontend::set_viewer_active_for_tests` and a zero loader
+     weight); the transport-lane test treated the server's rejection-by-close
+     as a failure; the retention test waited for membership, not for the
+     nodes to take DATA.
+
+0b. **Open from 2026-09-27, not yet fixed:**
    - **The web client gates its torrent page on the answering node's
      `/torrents/status`** and shows "This server was built without
      libtorrent-rasterbar." when pointed at fi-1. Client-side: told
@@ -68,12 +78,6 @@ the decisions waiting on the operator.
      operator's call): availability is `/torrents/nodes` only; "No node in
      this cluster can download torrents." when it names none;
      `/torrents/status` only against pre-0.64 servers.
-   - **The Martian's damaged copy `macha:7b5743ad` left the namespace** some
-     time between 2026-09-26 13:29Z and 2026-09-27 08:15Z; namespace
-     deletions are not logged by path. Asked the operator whether he deleted
-     it; unanswered. If not, investigate (and consider logging namespace
-     deletions by path).
-   - **Torrent job state still rewritten twice a second** (item 6).
    - **60 of 296 movie posters are held by no online node, and new writes
      get one copy.** All 60 from items updated 2026-09-06..10; on es-1 or
      gbni-2, unknown until es-1 returns. gbni-1's prompt replication skipped
@@ -141,15 +145,6 @@ the decisions waiting on the operator.
    `Menu Art (2).mkv` and `Previews for all episodes (2).mkv`). Planner:
    `choose_destination` in `src/acquisition/ingest.cpp`.
 5. **Decisions waiting on the operator** (do not act without them):
-   - fi-1's 10G DATA backend: revert, or `replication: 1`. It is full and
-     refuses every import write. Repair (0.62.1) and prompt replication
-     (0.64.1) skip it; imports still try. With es-1 away, it also means every
-     new object has one copy (687 on gbni-1 by 2026-09-27 19:2xZ).
-   - Discipline 3 wording: "only key mismatch or header corruption may
-     refuse to start", yet unversioned storage and two `inbound_capable`
-     misconfigurations also refuse. Proposed: recovery may refuse only on
-     those two; an unworkable configuration is refused at startup as a
-     separate matter.
    - The web client's metadata-editor proposal (A-G in the 2026-09-24
      session: provider search, match by provider ref with parent chain,
      manual parents by id, artwork options, search kind/parent filter,
@@ -167,13 +162,7 @@ the decisions waiting on the operator.
      directories, then "there's files"; confirm which should hold a film.
    - Torrent staging option A vs B (stage 2 of the disk backend plan); stages
      3-4 of that plan.
-6. **Torrent job state rewritten twice a second** (measured 2026-09-25 on
-   gbni-1: 40 rewrites of the 28.6 KB `state/torrent/jobs.json` in 20 s while
-   nothing downloaded). `update_jobs` sets `updated_unix_ms` and `changed` for
-   every non-terminal job on each 500 ms tick. Fix: save only when a persisted
-   field other than live counters changed, progress at most every 30 s, and
-   move `updated_unix_ms` only when the job's serialised form changed. Not
-   started.
+6. **Torrent job state rewritten twice a second: fixed in 0.66.0 (uncommitted).**
 7. **Known defects found 2026-09-24/25, not yet fixed:**
    - `catalogue_api` maps every exception to `503 catalogue_unavailable`
      (`src/api/catalogue_api.cpp` ~590): bad JSON, bad `If-Match`, artwork for a
@@ -248,13 +237,7 @@ the decisions waiting on the operator.
     clear the dial backoff for its other lanes, so a node refuses to dial a
     restarted peer for up to 4 s. Everything that hits it is transient and
     retried; costs latency, not correctness.
-15. **The developer laptop cannot host a libtorrent session**:
-    `/usr/local/include/boost` is a manual Boost 1.91 shadowing Homebrew's
-    1.92, which Homebrew's libtorrent 2.1.1 was built with; CMake finds 1.91.
-    Every test that starts a session (swarm, held, resume) segfaults there;
-    run torrent tests on fi-1 (es-1 is gone).
-    Fixing the laptop is the operator's call.
-16. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
+15. **Movie sets: grouping titles, many to many** (operator, 2026-09-25,
     "later"). A movie may belong to more than one set (a franchise, a
     collection, a director's box set). Nothing exists today: `CatalogueItem`
     has a single `parent_id`, which is a hierarchy (show > season > episode,
@@ -265,7 +248,7 @@ the decisions waiting on the operator.
     list sets and their members. The server gives membership as data;
     ordering and presentation stay the client's. Announce to Core and every
     client when it ships.
-17. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
+16. **Ebooks** (operator, 2026-09-25, "later: consider the ebook proposal").
     [docs/macha-ebooks-proposal.md](../docs/macha-ebooks-proposal.md),
     dated 2026-09-24, status Proposal: ebooks as another class of immutable
     media, several formats grouped under one library entry, book metadata and
