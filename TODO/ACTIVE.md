@@ -1,75 +1,78 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-25 ~16:00Z, after 0.62.3 was deployed on both nodes.
+Last updated: 2026-09-27 ~15:00Z, after 0.64.1 was deployed on both nodes.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here after a clear: read [the 2026-09-25 handover](HANDOVER-2026-09-25.md).**
+**Start here after a clear: read [the 2026-09-27 handover](HANDOVER-2026-09-27.md).**
 It says what is in flight, how to build and deploy, what is owed to whom, and
 the decisions waiting on the operator.
 
-## Cluster state (2026-09-25 ~16:00Z)
+## Cluster state (2026-09-27 ~15:00Z)
 
-- **gbni-1** (10.44.1.50) and **fi-1** (10.35.1.10, also answering on .50
-  again) both run **0.62.3** (`f3bf8d7`, tagged; `main` there). Metadata
-  writable 2/2 against `metadata_min_write_replicas: 2`: restarting either node
-  makes metadata read-only until it is back.
+- **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1** (10.35.1.10,
+  also .50) both run **0.64.1** (`3c3e11a`, tagged; `main` there), **cluster
+  protocol 22**: a protocol-21 node cannot join, so a protocol change means
+  both nodes installed back to back. Metadata writable 2/2 against
+  `metadata_min_write_replicas: 2`: restarting either node makes metadata
+  read-only until it is back.
+- **0.64.2 is committed on `develop` (unpushed), built and tested (561/11/20
+  on fi-1), NOT deployed**: import destinations ignore case. Push, rolling
+  deploy (still protocol 22), tag -- on the operator's go.
+- **Torrents belong to the cluster** since 0.64.0: requests in metadata,
+  claimed by any torrent-capable node (gbni-1 is the only one; fi-1 has
+  `torrent.enabled: false`). Three jobs: two Martian copies completed, Wake Up
+  Dead Man paused (its payload was deleted on 2026-09-26; resuming downloads
+  from zero).
 - **es-1 is offline for the foreseeable future**; fi-1 is the build node.
-- **Data lost with es-1.** Many files dated 2026-08-31 and earlier have extents
-  no node holds (~0.9 TB never reached gbni-1 before es-1 went). Of 49 films
-  and episodes with 2+ files, only 11 have every file readable at offset 0,
-  and whole-file readability is worse (The Martian's 7b5743ad, Dark S01E06
-  fail mid-file). The server still lists them as playable.
-- **fi-1's 10G DATA backend is full** (81 bytes free) and still counts as an
-  owner of every extent at replicas 2; every new import write also goes to it
-  and is refused. Operator decision pending (item 5).
+- **fi-1's site link is congested independently of Macha** (measured
+  2026-09-27 after 0.64.0: fi-1 itself 5 KiB/s in / 3 KiB/s out, gateway
+  0.5 ms, internet 63-552 ms; gbni-1 to fi-1 averages ~430 ms). Every
+  synchronous call to fi-1 pays it. The API no longer waits on fi-1 for job
+  lists (0.64.0).
+- **Data lost with es-1** (unchanged): many files dated 2026-08-31 and earlier
+  have extents no node holds; the server still lists them as playable (item 2).
+- **fi-1's 10G DATA backend is full** (81 bytes free) and still an owner of
+  every extent at replicas 2. Since 0.64.1 prompt replication no longer sends
+  it anything; import writes still try. Operator decision pending (item 5).
 - **The operator's account for Claude**: `claude`, all roles, credentials
   on-box in `/root/.macha-claude-credentials` on both nodes.
-- **Torrents**: Rome (`e0fec4b2`) importing ~95% and following its ingest
-  since 0.62.0; Smallville (`c448626e`, 366 GB) `blocked staging_full`
-  legitimately; the rest paused and now truly held.
 
 ## The queue
 
-0. **Torrents belong to the cluster (0.64.0), built, not yet deployed.**
-   Plan and spec in
-   [2026-09-27-cluster-torrent-queue-plan.md](2026-09-27-cluster-torrent-queue-plan.md).
-   Protocol 22: both nodes must be upgraded together. Announce the final
-   API (differences listed at the end of the plan) before deploying.
+0. **Push and deploy 0.64.2** (above), on the operator's go. No wire change,
+   nothing to announce.
 
-0a. **Found 2026-09-27 watching the Martian imports, not yet fixed:**
+0a. **Open from 2026-09-27, not yet fixed:**
    - **Release samples are imported as library media.** The 720p NeZu
      torrent's `Sample/...x264-sample.mkv` (11 MB, 63 s) was imported beside
-     the film and catalogued as a fourth source of `tmdb:movie:286217`. The
-     ingest must skip samples: a `Sample` directory, or a name with a
-     `-sample` / `.sample` / `sample.` component (case-insensitive). Removed
-     from the library by hand at the operator's request, 2026-09-27.
-   - **Destination folders are matched case-sensitively.** The same film
-     landed in `/Movies/the martian (2015)/` beside `/Movies/The Martian
-     (2015)/`, because the folder name came from a lowercase release name.
-     Reuse an existing folder that matches case-insensitively, keeping its
-     spelling. The 720p file is still in the lowercase folder.
-   - (Fixed in 0.64.0: batch race, failed hints kept on clear, clear's
-     payload delete off the request path.)
-   - **Catalogue batch judges hints against an older snapshot.** A batch
-     takes one namespace snapshot at its first hint and keeps claiming hints
-     enqueued after it; a file created mid-batch reads `path_missing`, which
-     is terminal. Colony S02E13 (`macha:2950679dabef...`) is uncatalogued
-     this way, and its hint was then deleted when Colony was cleared, so
-     nothing will retry it. Fix: a hint newer than the batch snapshot waits
-     for the next batch; missing from an older snapshot defers, not fails.
-   - **Clearing a job deletes the catalogue's hints** (above), and **clear
-     deletes the payload in the request thread**: 6-34 s on a busy DATA
-     disk, stacks captured at `__wait_on_buffer` under `unlinkat`. Both are
-     in the cluster-torrent plan, phase 4.
-   - **Prompt replication pushes into a full node for ever.** Every new
-     object is sent to fi-1, whose 10G backend is full; the refused put is
-     retried every 30 s with no limit (up to 4096 queued), about 2 MB/s of
-     WAN traffic into Finland, and the loop's counters are exposed nowhere.
-     Check the destination's gossiped free space, back off after a
-     no-space refusal, expose `prompt_replication_stats()`.
+     the film and catalogued as a fourth source of `tmdb:movie:286217`
+     (removed by hand at the operator's request). The ingest must skip
+     samples: a `Sample` directory, or a name with a `-sample` / `.sample` /
+     `sample.` component (case-insensitive). Planner: `src/ingest.cpp`.
+   - **A namespace-wide case policy, to design** (operator: "Macha will have
+     to handle case insensitivity for the eventual Windows port"):
+     case-preserving, case-insensitive lookups, collisions and renames
+     everywhere (FUSE, manage API, metadata keys), Unicode folding, and a
+     self-healing merge of existing case-only duplicates. 0.64.2 covers only
+     import destinations (ASCII folding). Needs a plan before code.
+   - **The web client gates its torrent page on the answering node's
+     `/torrents/status`** and shows "This server was built without
+     libtorrent-rasterbar." when pointed at fi-1. Client-side: told
+     2026-09-27 to gate on `GET /api/v1/torrents/nodes` instead (my 0.64.0
+     announcement did not say `/torrents/status` stays per-node). **Fixed in
+     the web client (commit bd68eb7) the same day, not yet deployed** (the
+     operator's call): availability is `/torrents/nodes` only; "No node in
+     this cluster can download torrents." when it names none;
+     `/torrents/status` only against pre-0.64 servers.
+   - **The Martian's damaged copy `macha:7b5743ad` left the namespace** some
+     time between 2026-09-26 13:29Z and 2026-09-27 08:15Z; namespace
+     deletions are not logged by path. Asked the operator whether he deleted
+     it; unanswered. If not, investigate (and consider logging namespace
+     deletions by path).
+   - **Torrent job state still rewritten twice a second** (item 6).
 
 1. **Repair's credit gates stock-taking, not just transfer (measured, fix
    proposed, awaiting the operator's go).** 0.62.3's `diagnostics.repair
@@ -80,8 +83,8 @@ the decisions waiting on the operator.
    weighted share allows; index lookups and presence probes (`have_object`, no
    data) always proceed; a 4 MB fetch or push only when credit covers it; an
    extent no peer holds is counted unsourceable without spending credit. Also
-   verify why the bandwidth estimate is so low (likely the slow WAN puts to
-   fi-1). Code: `src/service.cpp` network_due / byte_budget,
+   verify why the bandwidth estimate is so low (fi-1's site link measured
+   congested on 2026-09-27, independently of Macha: the likely cause). Code: `src/service.cpp` network_due / byte_budget,
    `DistributedStore::repair_step`.
 2. **Per-file readability (designed, operator to choose where it goes).**
    Every extent of a file present on some reachable node: local
@@ -113,8 +116,8 @@ the decisions waiting on the operator.
    `choose_destination` in `src/ingest.cpp`.
 5. **Decisions waiting on the operator** (do not act without them):
    - fi-1's 10G DATA backend: revert, or `replication: 1`. It is full and
-     refuses every import write and would-be repair push (0.62.1 skips it for
-     repair only).
+     refuses every import write. Repair (0.62.1) and prompt replication
+     (0.64.1) skip it; imports still try.
    - Discipline 3 wording: "only key mismatch or header corruption may
      refuse to start", yet unversioned storage and two `inbound_capable`
      misconfigurations also refuse. Proposed: recovery may refuse only on
@@ -161,8 +164,8 @@ the decisions waiting on the operator.
      ingest `catalogue.state` rules disagree; a remote job's
      `catalogue.items` is empty; server-side sort of search results by
      seeders (clients own sorting); a pause or cancel landing while an ingest
-     fails is overwritten; a node without the torrent plugin (or whose
-     plugin is still starting) answers 503 even for the cluster-wide list.
+     fails is overwritten. (A node without the torrent plugin answering 503
+     for the cluster-wide list is fixed in 0.64.0.)
    - `macos/macha.plist.example` fixed; Fedora and MacPorts package names in
      the install docs unverified.
 
@@ -190,7 +193,8 @@ the decisions waiting on the operator.
    first byte, likely queued behind loader I/O on a busy DATA disk (item 12
    of the old list, the loader-I/O P0) -- inference until timed under load.
    And **sized variants** (`?w=300`) -- a feature, operator's priority.
-12. **Deploy viewer check has a blind spot.** From logs, the only sound gate
+12. **Deploy viewer check has a blind spot** (it did catch a live viewer on
+    gbni-1 on 2026-09-27; the operator chose to deploy anyway). From logs, the only sound gate
    is "no playback line in the last 30 minutes" (`session_idle_ms` is
    1800000; a used session is erased silently; a pipeline reclaim is not a
    session end). A client polling a paused session is invisible to it. The

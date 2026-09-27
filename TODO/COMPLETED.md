@@ -1,6 +1,54 @@
 # Completed and tested
 
-Last updated: 2026-09-25
+Last updated: 2026-09-27
+
+## 2026-09-27 -- 0.63.0 to 0.64.1: the torrent worker incident, and torrents belong to the cluster
+
+All deployed on gbni-1 and fi-1, tagged, `main` at `3c3e11a` (0.64.1).
+0.64.2 built and tested, not committed (see ACTIVE item 0).
+
+- **Incident (2026-09-26 09:33Z to 2026-09-27 08:15Z):** gbni-1's torrent
+  worker thread died on `invalid torrent handle used [libtorrent:20]` and
+  every torrent sat unchanged for a day while Status said `running`. Cause:
+  a torrent added twice became two jobs on one libtorrent torrent (a second
+  add returns the first handle); cancelling one removed the torrent and
+  deleted the other's payload; the other's stale handle threw in the
+  held-pieces walk; `run_supervised` logged and let the thread end.
+- **0.63.0** -- `run_supervised` replaced by `run_supervised_loop` (restart
+  with backoff), `_once` (tasks) and `_escalating` (plugin threads), chosen
+  at all 42 thread sites; a `threads` block in Status. Torrents: one job per
+  info hash (`409 torrent_already_added`), one retire path, handles touched
+  only under the lock, per-job fault isolation (`torrent_fault`), the worker
+  escalates through the plugin fault sink. Mutation-tested: the incident
+  test reproduced the production error with the fix removed.
+- **0.64.0** -- torrents belong to the cluster (plan:
+  `2026-09-27-cluster-torrent-queue-plan.md`): requests in metadata
+  (SM15/SM16, DLT9, protocol 22) merged as a join; a scheduler per capable
+  node claims, drives and reports; leases of 10 min; owner-applied intent
+  during metadata outages (`torrent_intent`); `/torrents/nodes`, PATCH,
+  removal after completion (off by default, 0-24 h),
+  `torrent.accept_new_jobs`. Job lists answer from an in-memory view polled
+  every 5 s, on every node. Also: a clear moves its payload to staging's
+  trash (the 14-34 s clears: stacks showed `__wait_on_buffer` under
+  `unlinkat` on a saturated DATA disk); a catalogue hint newer than its
+  batch snapshot is deferred (`path_not_yet_visible`; Colony S02E13); a
+  cleared job keeps its failed hints. Spec reviewed by Core, web, TV and
+  mobile before building; no blockers.
+- **0.64.1** -- prompt replication skips an owner with no gossiped room and
+  gives up after five refusals; `diagnostics.prompt_replication`.
+
+Wrong turns worth not repeating:
+- **fi-1's latency is not Macha's.** I attributed 300+ ms round trips to
+  prompt replication's refused puts; after the stream stopped, fi-1 carried
+  5 KiB/s and the round trips were unchanged. Measure the node's own traffic
+  before blaming it for its link.
+- **"Colony S02E13 will never be retried" was wrong:** namespace-mutation
+  discovery re-queues uncatalogued files; it matched at 10:07Z.
+- A range-for over `body_json(...).find("jobs")->asArray()` read freed memory
+  (pre-C++23 temporaries); a read-your-writes overlay was built on that
+  misdiagnosis and then removed. Store the parsed JSON in a variable.
+- GCC's `-Wdangling-reference` (not in clang) failed the fi-1 build once;
+  always build on fi-1 before shipping.
 
 ## 2026-09-25 -- 0.58.3 to 0.62.3: eight releases in one day
 
