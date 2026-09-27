@@ -310,7 +310,7 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
     constexpr uint64_t extent_size = 64 * 1024;
     hooks.extent_size = extent_size;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
-    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+    hooks.publish = [&](std::span<const uint8_t> bytes, std::atomic_bool&) -> std::optional<ObjectId> {
         const auto id = object_id(bytes);
         std::lock_guard lock(published_mutex);
         published[id] = Bytes(bytes.begin(), bytes.end());
@@ -406,7 +406,7 @@ MACHA_TEST("torrent_disk_io", test_extents_publish_once_their_pieces_verify_and_
     hooks.extent_size = 3 * block;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish_retry = 50ms;
-    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+    hooks.publish = [&](std::span<const uint8_t> bytes, std::atomic_bool&) -> std::optional<ObjectId> {
         if (attempts.fetch_add(1) == 0) return std::nullopt;
         const auto id = object_id(bytes);
         std::lock_guard lock(published_mutex);
@@ -471,7 +471,7 @@ MACHA_TEST("torrent_disk_io", test_publication_progress_is_reported_until_every_
     hooks.extent_size = 3 * block;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish_retry = 20ms;
-    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+    hooks.publish = [&](std::span<const uint8_t> bytes, std::atomic_bool&) -> std::optional<ObjectId> {
         if (!release.load()) return std::nullopt;
         return object_id(bytes);
     };
@@ -518,7 +518,7 @@ MACHA_TEST("torrent_disk_io", test_a_removed_torrent_keeps_its_files_alive_until
     hooks.extent_size = 3 * block;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
     hooks.publish_retry = 20ms;
-    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+    hooks.publish = [&](std::span<const uint8_t> bytes, std::atomic_bool&) -> std::optional<ObjectId> {
         if (started.fetch_add(1) == 0) {
             std::unique_lock lock(gate_mutex);
             gate_cv.wait(lock, [&] { return open; });
@@ -577,7 +577,7 @@ MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held
     TorrentDiskHooks hooks;
     hooks.extent_size = 3 * block;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
-    hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+    hooks.publish = [&](std::span<const uint8_t> bytes, std::atomic_bool&) -> std::optional<ObjectId> {
         ++publishes;
         return object_id(bytes);
     };
@@ -605,7 +605,7 @@ MACHA_TEST("torrent_disk_io", test_a_restarted_backend_does_not_republish_journa
         TorrentDiskHooks hooks;
         hooks.extent_size = 3 * block;
         hooks.verifications = std::make_shared<TorrentPieceVerifications>();
-        hooks.publish = [&](std::span<const uint8_t> bytes) -> std::optional<ObjectId> {
+        hooks.publish = [&](std::span<const uint8_t> bytes, std::atomic_bool&) -> std::optional<ObjectId> {
             ++publishes;
             return object_id(bytes);
         };
@@ -1076,6 +1076,39 @@ MACHA_FAST_TEST("torrent_disk_io", test_a_queued_check_is_told_apart_from_a_runn
     status.state = lt::torrent_status::checking_resume_data;
     status.flags = {};
     CHECK(torrent_check_phase(status) == TorrentCheckPhase::checking);
+}
+
+MACHA_TEST("torrent_disk_io", test_shutdown_cancels_a_publication_in_flight) {
+    // A node stopping while an extent is being stored must not wait on that
+    // write: the publish hook is handed the backend's abort flag, set when the
+    // backend shuts down, so a store honouring it returns at once. The extent
+    // is left out of the journal and is published again on resume.
+    TempDir dir;
+    std::atomic_bool entered{false};
+    std::atomic_bool saw_abort{false};
+    TorrentDiskHooks hooks;
+    hooks.extent_size = 3 * block;
+    hooks.verifications = std::make_shared<TorrentPieceVerifications>();
+    hooks.publish = [&](std::span<const uint8_t>, std::atomic_bool& abort) -> std::optional<ObjectId> {
+        entered.store(true);
+        const auto give_up = std::chrono::steady_clock::now() + 10s;
+        while (!abort.load() && std::chrono::steady_clock::now() < give_up)
+            std::this_thread::sleep_for(5ms);
+        saw_abort.store(abort.load());
+        return std::nullopt;
+    };
+    const auto verifications = hooks.verifications;
+    Harness h(layout({100000}, 2 * block), dir.path(), hooks);
+    REQUIRE(h.write_all(pattern_bytes(100000, 12)));
+    for (int piece = 0; piece < h.files.num_pieces(); ++piece)
+        verifications->piece_verified(h.save_path, piece);
+    REQUIRE(wait_for([&] { return entered.load(); }, 5s));
+
+    const auto started = std::chrono::steady_clock::now();
+    h.disk->abort(true);
+    CHECK(std::chrono::steady_clock::now() - started < 2s);
+    CHECK(saw_abort.load());
+    CHECK(TorrentExtentJournal::load(dir.path()).empty());
 }
 
 } // namespace

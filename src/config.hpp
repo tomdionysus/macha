@@ -430,6 +430,11 @@ struct CatalogueScannerConfig {
     size_t max_provider_requests_per_scan{32};
     std::chrono::milliseconds provider_batch_delay{30000};
     size_t max_artwork_bytes{16 * 1024 * 1024};
+    // A file is not catalogued when a word of its path below the scanner root
+    // equals one of these, ignoring case. Words are the runs of letters and
+    // digits, so "sample" matches `Sample/film.mkv` and `film-sample.mkv` but
+    // not `Samples of Joy.mkv`.
+    std::vector<std::string> ignore_terms{"sample"};
     CatalogueMovieProviderConfig movies;
     CatalogueTvProviderConfig tv;
     CatalogueMusicProviderConfig music;

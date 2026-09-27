@@ -1717,6 +1717,73 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     service.stop();
 }
 
+MACHA_TEST("hydration_catalogue", test_catalogue_ignores_paths_carrying_an_ignore_term) {
+    // Release samples sit beside the film they sample, in a Sample directory
+    // or with a -sample suffix, and name the same title. The default
+    // ignore_terms keeps them out, so the title binds only the film itself.
+    TestService fixture("catalogue-ignore-terms");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+    auto write = [&](const std::string& path, uint8_t seed) {
+        service.filesystem().create_file(path, 0644, getuid(), getgid());
+        const auto bytes = pattern(32768, seed);
+        auto writer = service.filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        return file_media_id(service.filesystem().getattr(path));
+    };
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    service.filesystem().mkdir("/Movies/Sample", 0755, getuid(), getgid());
+    const auto film = write("/Movies/Blade.Runner.2049.2017.1080p.mkv", 1);
+    (void)write("/Movies/Sample/Blade.Runner.2049.2017.1080p.mkv", 2);
+    (void)write("/Movies/Blade.Runner.2049.2017.1080p-sample.mkv", 3);
+
+    const auto token = fixture.path() / "scanner-tmdb.token";
+    {
+        std::ofstream out(token);
+        out << "scanner-token\n";
+    }
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("/search/movie", 200, "application/json",
+              R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+    http->add("/movie/335984", 200, "application/json",
+              R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::move(http), 5s,
+                             std::make_shared<FakeMediaEngine>());
+    CHECK(scanner.scan_once() == 1);
+    const auto item = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(item.has_value());
+    CHECK(item->media_ids == std::vector<std::string>{film});
+
+    // With no terms, the same scan binds all three.
+    auto everything_http = std::make_unique<FakeHttpClient>();
+    everything_http->add("/search/movie", 200, "application/json",
+                         R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+    everything_http->add("/movie/335984", 200, "application/json",
+                         R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
+    auto everything_config = scanner_config;
+    everything_config.ignore_terms.clear();
+    CatalogueScanner everything(service.node(), service.filesystem(), service.catalogue(),
+                                service.catalogue_hints(), everything_config,
+                                std::move(everything_http), 5s,
+                                std::make_shared<FakeMediaEngine>());
+    (void)everything.scan_once();
+    const auto all = service.catalogue().get("tmdb:movie:335984");
+    REQUIRE(all.has_value());
+    CHECK(all->media_ids.size() == 3);
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_zero_length_files_wait_for_committed_content) {
     TestService fixture("node");
     auto& config = fixture.config();
@@ -2400,6 +2467,43 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
 // there is no download engine to load, and the capability is absent by
 // design rather than differently compiled.
 #ifdef MACHA_TEST_TORRENT_PLUGIN
+MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_job_is_saved_only_when_its_record_changes) {
+    // The manager's tick compares each job before and after: nothing changed
+    // is no write; moving transfer counters alone are saved on an interval;
+    // anything else in the persisted record is saved at once.
+    TorrentJob job;
+    job.id = "job";
+    job.name = "Film";
+    job.state = TorrentJobState::downloading;
+    job.bytes_total = 1000;
+    job.bytes_completed = 100;
+    job.updated_unix_ms = 1;
+
+    auto same = job;
+    same.updated_unix_ms = 2;       // the timestamp is not the record
+    same.download_rate = 5000;      // nor are the live counters
+    same.peers = 12;
+    same.eta_seconds = 60;
+    CHECK(torrent_job_change(job, same) == TorrentJobChange::none);
+
+    auto progressed = job;
+    progressed.bytes_completed = 200;
+    CHECK(torrent_job_change(job, progressed) == TorrentJobChange::progress);
+    auto uploaded = job;
+    uploaded.uploaded_total = 10;
+    CHECK(torrent_job_change(job, uploaded) == TorrentJobChange::progress);
+
+    auto state = progressed;
+    state.state = TorrentJobState::downloaded;
+    CHECK(torrent_job_change(job, state) == TorrentJobChange::record);
+    auto failed = job;
+    failed.error_code = "torrent_error";
+    CHECK(torrent_job_change(job, failed) == TorrentJobChange::record);
+    auto catalogued = job;
+    catalogued.catalogue_catalogued = 1;
+    CHECK(torrent_job_change(job, catalogued) == TorrentJobChange::record);
+}
+
 MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_search_results_can_be_placed) {
     // 0.58.2. info_hash was persisted and serialised but never set, so every
     // job reported null; a job saved without one is backfilled from its magnet
@@ -2725,6 +2829,12 @@ uint64_t torrent_thread_faults() {
     return 0;
 }
 
+size_t torrent_thread_running() {
+    for (const auto& status : supervised_thread_statuses())
+        if (status.name == "torrent") return status.running;
+    return 0;
+}
+
 // The plugin loaded against a fixture node, as the tests above set it up.
 struct TorrentPluginFixture {
     TestNode fixture;
@@ -2888,13 +2998,11 @@ MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore
     // Past the held-pieces interval (10 s), where the stale handle threw.
     std::this_thread::sleep_for(11s);
     CHECK(torrent_thread_faults() == faults_before);
-    // The worker is still running: a new job is picked up and sampled.
+    // The worker is still inside its loop, and a new job is still taken.
+    CHECK(torrent_thread_running() == 1);
     const auto fresh = torrents.place("magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
     REQUIRE(fresh.placed);
-    REQUIRE(wait_until([&] {
-        const auto job = torrents.job(fresh.job_id);
-        return job && job->updated_unix_ms > job->created_unix_ms;
-    }, 5s));
+    CHECK(torrents.job(fresh.job_id).has_value());
 }
 
 MACHA_TEST("hydration_catalogue", test_a_cluster_torrent_is_claimed_and_driven_by_its_owner) {
@@ -3156,14 +3264,21 @@ MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_whi
     ingest.start();
     const auto job_id = ingest.submit_path(source_root);
 
+    std::string partial;
     REQUIRE(wait_until([&] {
         auto job = ingest.job(job_id);
-        return job && job->state == IngestJobState::importing;
+        if (!job || job->state != IngestJobState::importing || job->files.empty() ||
+            job->files.front().temporary_path.empty())
+            return false;
+        partial = job->files.front().temporary_path;
+        return true;
     }, 10s));
 
     // cancel() writes the terminal state into the map immediately, without
     // waiting for the worker to notice -- exactly the window that used to
-    // let clear() erase the job out from under a still-running worker.
+    // let clear() erase the job out from under a still-running worker. The
+    // worker's partial stays its own until it lets go: clear() must not
+    // remove it underneath the copy, which failed the cancelled job instead.
     REQUIRE(ingest.cancel(job_id));
     REQUIRE(ingest.clear(job_id));
     CHECK(!ingest.job(job_id).has_value());
@@ -3175,6 +3290,17 @@ MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_whi
     CHECK(!ingest.job(job_id).has_value());
     REQUIRE(wait_until([&] { return !ingest.job(job_id).has_value(); }, 2s));
     CHECK(ingest.jobs().empty());
+
+    // The cleanup clear() owed is done by the worker as it lets go.
+    const auto gone = [&] {
+        try {
+            (void)service.filesystem().getattr(partial);
+            return false;
+        } catch (const FsError& error) {
+            return error.code() == ENOENT;
+        }
+    };
+    CHECK(wait_until(gone, 10s));
 
     ingest.stop();
     CHECK(!ingest.job(job_id).has_value());

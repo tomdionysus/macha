@@ -257,6 +257,22 @@ Json torrent_job_json(const TorrentJob& job) {
     return o;
 }
 
+TorrentJobChange torrent_job_change(const TorrentJob& before, const TorrentJob& after) {
+    const auto record = [](const TorrentJob& job) {
+        auto json = torrent_job_json(job);
+        auto& o = json.asObject();
+        o.erase("updated_unix_ms");
+        o.erase("bytes_completed");
+        o.erase("uploaded_total");
+        return json.dump();
+    };
+    if (record(before) != record(after)) return TorrentJobChange::record;
+    if (before.bytes_completed != after.bytes_completed ||
+        before.uploaded_total != after.uploaded_total)
+        return TorrentJobChange::progress;
+    return TorrentJobChange::none;
+}
+
 TorrentJob parse_torrent_job(const Json& value) {
     TorrentJob job;
     if (const auto* v = value.find("id")) job.id = v->asString();

@@ -2725,6 +2725,32 @@ std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
     return out;
 }
 
+namespace {
+// Whether a word of `relative` -- a run of ASCII letters and digits -- equals
+// one of `terms`, ignoring case.
+bool path_has_ignored_term(std::string_view relative, const std::vector<std::string>& terms) {
+    if (terms.empty()) return false;
+    const auto equal_ignoring_case = [](std::string_view word, std::string_view term) {
+        return word.size() == term.size() &&
+               std::equal(word.begin(), word.end(), term.begin(), [](char a, char b) {
+                   return std::tolower(static_cast<unsigned char>(a)) ==
+                          std::tolower(static_cast<unsigned char>(b));
+               });
+    };
+    size_t start = 0;
+    for (size_t i = 0; i <= relative.size(); ++i) {
+        if (i < relative.size() && std::isalnum(static_cast<unsigned char>(relative[i]))) continue;
+        if (i > start) {
+            const auto word = relative.substr(start, i - start);
+            for (const auto& term : terms)
+                if (equal_ignoring_case(word, term)) return true;
+        }
+        start = i + 1;
+    }
+    return false;
+}
+} // namespace
+
 CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path,
                                                            std::string& root) const {
     CatalogueScanProvider* selected = nullptr;
@@ -2743,6 +2769,10 @@ CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path
             root = candidate_root;
         }
     }
+    if (selected &&
+        path_has_ignored_term(std::string_view(normalized).substr(selected_root_length),
+                              config_.ignore_terms))
+        return nullptr;
     return selected;
 }
 
@@ -2761,7 +2791,10 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     std::string root;
     auto* provider = provider_for_path(hint.path, root);
     if (!provider) {
-        hints_.mark_no_match(hint.id, {}, {}, "outside_catalogue_roots");
+        hints_.mark_no_match(hint.id, {}, {},
+                             path_has_ignored_term(hint.path, config.ignore_terms)
+                                 ? "ignored_term"
+                                 : "outside_catalogue_roots");
         return {};
     }
 

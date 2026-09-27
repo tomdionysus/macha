@@ -67,6 +67,10 @@ class TorrentManager final : public TorrentService {
     std::filesystem::path resume_path(std::string_view id) const;
     static constexpr auto resume_save_interval = std::chrono::minutes(5);
     Clock::time_point last_resume_save_{};
+    // jobs.json is saved when a job's record changes; transfer counters alone
+    // are saved at most this often.
+    static constexpr auto progress_save_interval = std::chrono::seconds(30);
+    Clock::time_point last_progress_save_{};
     // Asks libtorrent for a job's resume data; it arrives as an alert.
     static void request_resume_save(const libtorrent::torrent_handle&);
     // At stop: request resume data for every torrent and wait, bounded, for it.

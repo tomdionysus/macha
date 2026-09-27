@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.65.0*
+*v0.66.0*
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
@@ -50,6 +50,16 @@ ranking, session lifecycle, playback negotiation. Phone and TV players build on
 that core. A change to the wire shape, an error code or a default is a change
 to those projects too, and is worth saying out loud rather than leaving to be
 discovered.
+
+The other Macha repositories:
+
+| Repository | What it is |
+| --- | --- |
+| [macha-core-npm](https://github.com/tomdionysus/macha-core-npm) | `@machafoundation/core`, the platform-independent client library every player is built on: the node's REST API families and session lifecycle, cluster endpoint routing and health, playback resolution and failover, and persisted client state such as Continue Watching. |
+| [macha-client](https://github.com/tomdionysus/macha-client) | The React/TypeScript web and TV client, also built for Samsung Tizen. Browses the catalogue and plays, and carries catalogue editing, ingest and cluster administration. |
+| [macha-client-rn](https://github.com/tomdionysus/macha-client-rn) | The React Native phone client for iOS and Android: a viewer, playing through AVPlayer and ExoPlayer. |
+| [macha-client-rn-android-tv](https://github.com/tomdionysus/macha-client-rn-android-tv) | The React Native Android TV client: leanback, D-pad only. |
+| [macha-site](https://github.com/tomdionysus/macha-site) | The project's landing and documentation site. |
 
 ## Governing laws
 

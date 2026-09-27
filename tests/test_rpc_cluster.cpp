@@ -3563,8 +3563,16 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     s1.start();
     s2.start();
     s3->start();
+    // The write below needs all three to place and accept DATA: every service
+    // ready, and the writer seeing three members that host extents. Membership
+    // alone arrives before either.
+    const auto hosting = [](Service& service) {
+        const auto active = service.node().membership().active();
+        return std::count_if(active.begin(), active.end(),
+                             [](const NodeInfo& node) { return node_hosts_extents(node); });
+    };
     REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 3 &&
+        return s1.ready() && s2.ready() && s3->ready() && hosting(s1) == 3 &&
                s2.node().membership().active().size() == 3 &&
                s3->node().membership().active().size() == 3;
     }));
@@ -5772,6 +5780,73 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
 // `network.inbound_capable: auto` on a whole node: resolved from what a peer
 // reports after dialling back, persisted, and reversed once the address
 // becomes dialable. The site advertises a black-hole address first.
+MACHA_TEST("rpc_cluster", test_a_call_whose_dial_is_retired_by_a_simultaneous_connect_waits_for_the_peer) {
+    // Two nodes that dial each other at once keep one session: the lower id
+    // keeps the one it dialled and retires the other. The higher id's call can
+    // find its own dial already retired and the peer's session not yet
+    // registered. That gap is forced here and the call must wait it out.
+    struct Node {
+        NodeInfo info;
+        RpcClient client;
+        RpcServer server;
+        Node(ClusterKeys keys, NodeInfo node)
+            : info(std::move(node)),
+              client(
+                  keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 2s,
+                  100ms, 30s),
+              server(
+                  "127.0.0.1", info.port, keys, info,
+                  [](const NodeInfo&, FrameType, const RpcMessage& request) {
+                      return RpcMessage{MessageType::ok, request.payload};
+                  },
+                  [](const NodeInfo&) {}) {
+            server.attach_client(client);
+            server.start();
+        }
+        ~Node() {
+            server.stop();
+            client.stop();
+        }
+    };
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto info = [] {
+        NodeInfo node;
+        node.id = random_node_id();
+        node.host = "127.0.0.1";
+        node.port = free_port();
+        node.failure_domain = "loopback";
+        return node;
+    };
+    auto a = info();
+    auto b = info();
+    if (b.id < a.id) std::swap(a, b);
+    Node low(keys, a);
+    Node high(keys, b);
+
+    // The low node's session reaches the high node but is not registered there
+    // yet.
+    high.client.hold_inbound_for_tests(low.info.id);
+    REQUIRE(low.client.call(high.info, MessageType::members, Bytes{1}, 2s).message.payload ==
+            Bytes{1});
+    REQUIRE(!high.client.has_route(low.info.id, TransportLane::control));
+
+    // The high node dials; the low node keeps its own session and retires the
+    // new one. The high node's call proceeds only once that has reached it.
+    std::atomic_bool retired{false};
+    high.client.set_after_dial_for_tests([&] {
+        retired.store(wait_until(
+            [&] { return !high.client.has_route(low.info.id, TransportLane::control); }, 5s));
+    });
+    auto call = std::async(std::launch::async, [&] {
+        return high.client.call(low.info, MessageType::members, Bytes{2}, 5s);
+    });
+    REQUIRE(wait_until([&] { return retired.load(); }, 5s));
+    // The low node's session now registers, as it would a moment later.
+    high.client.release_inbound_for_tests(low.info.id);
+    CHECK(call.get().message.payload == Bytes{2});
+}
+
 MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives_restart) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto& keys = cluster.keys();

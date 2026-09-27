@@ -804,18 +804,36 @@ void Service::request_stop() {
 
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
-    request_stop();
-    if (startup_.joinable())
-        startup_.join();
     // Before ingest: a subsystem plugin holds references to the services
     // below it (the torrent plugin submits completed downloads to ingest), so
     // every plugin instance must be destroyed while they are all still alive.
-    // It calls into ingest and the torrent plugin, so it stops first.
-    if (torrent_coordinator_)
-        torrent_coordinator_->stop();
-    if (cluster_jobs_)
-        cluster_jobs_->stop();
-    subsystems_.stop();
+    // The coordinator calls into ingest and the torrent plugin, so it stops
+    // first.
+    const auto stop_producers = [this] {
+        if (torrent_coordinator_)
+            torrent_coordinator_->stop();
+        if (cluster_jobs_)
+            cluster_jobs_->stop();
+        subsystems_.stop();
+    };
+    // Plugins write into the store until they are stopped -- the torrent
+    // subsystem publishes each verified extent as it goes -- so they stop
+    // while the node still admits DATA work and outbound RPC. Filesystem I/O
+    // is cancelled first, so a FUSE publication in flight ends promptly
+    // rather than holding the stop on a slow peer. Once startup has finished
+    // its thread has returned; a stop during startup keeps the order below,
+    // since startup may be waiting on recovery that request_stop() ends.
+    if (services_ready_.load(std::memory_order_acquire)) {
+        if (startup_.joinable())
+            startup_.join();
+        if (fs_)
+            fs_->request_io_cancellation();
+        stop_producers();
+    }
+    request_stop();
+    if (startup_.joinable())
+        startup_.join();
+    stop_producers();
     if (ingest_)
         ingest_->stop();
     if (scanner_)

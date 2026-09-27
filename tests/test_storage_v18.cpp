@@ -584,25 +584,31 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     CHECK(!store.has(ObjectId{}));
 
     // A loose write is temp-file-then-rename, so a real object is never
-    // observed partially written; a zero-byte file only happens after a
-    // crash (rename durable, data not) or external truncation. Since 0.32.9
-    // has() remembers what this process installed instead of stat'ing it
-    // again (3,201 cold stats took 16 s per quantum commit on a saturated
-    // disk), so the zero-byte file is caught where it can actually appear:
-    // by the next process to open the store, and by any read.
+    // observed partially written, and every object carries a fixed header, so
+    // an empty object file is never an object: only a crash (rename durable,
+    // data not) or external truncation leaves one. has() remembers what this
+    // process installed instead of stat'ing it again (3,201 cold stats took
+    // 16 s per quantum commit on a saturated disk), and a reopened store warms
+    // presence from directory names alone, so the empty file is found where it
+    // is read: the first read prunes it and reports the object absent, and
+    // nothing claims it afterwards.
     auto truncated = pattern(512 * 1024, 0x73);
     auto truncated_id = object_id(truncated);
     REQUIRE(store.put(truncated_id, truncated));
     REQUIRE(store.has(truncated_id));
+    const auto truncated_path = store.object_path(truncated_id);
     {
-        std::ofstream truncate(store.object_path(truncated_id),
-                              std::ios::binary | std::ios::trunc);
+        std::ofstream truncate(truncated_path, std::ios::binary | std::ios::trunc);
         REQUIRE(truncate.good());
     }
-    CHECK(!store.valid(truncated_id));
     store_holder.reset();
     LocalStore reopened(t.path() / "store", options, keys.storage);
+    CHECK(!reopened.get(truncated_id).has_value());
+    CHECK(!std::filesystem::exists(truncated_path));
     CHECK(!reopened.has(truncated_id));
+    // The same object stored again is present again.
+    REQUIRE(reopened.put(truncated_id, truncated));
+    CHECK(reopened.has(truncated_id));
     CHECK(reopened.has(loose_id));
 }
 
