@@ -1014,6 +1014,11 @@ void NodeRuntime::set_torrent_bridge(JobsQueryHandler jobs, JobActionHandler act
     torrent_action_handler_ = std::move(action);
 }
 
+void NodeRuntime::set_torrent_intent_handler(JobActionHandler handler) {
+    std::lock_guard lock(job_bridge_mutex_);
+    torrent_intent_handler_ = std::move(handler);
+}
+
 void NodeRuntime::notify_storage_mutation() {
     signal_service_event(ServiceEvent::storage);
 }
@@ -1573,6 +1578,15 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             }
             if (!handler) return error_reply("torrents not available on this node");
             return {MessageType::torrent_job_action_reply, handler(request.payload)};
+        }
+        case MessageType::torrent_intent: {
+            JobActionHandler handler;
+            {
+                std::lock_guard lock(job_bridge_mutex_);
+                handler = torrent_intent_handler_;
+            }
+            if (!handler) return error_reply("torrents not available on this node");
+            return {MessageType::torrent_intent_reply, handler(request.payload)};
         }
         case MessageType::put_metadata_commit: {
             auto entry = decode_metadata_history_entry(request.payload);

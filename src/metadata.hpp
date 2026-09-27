@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "crypto.hpp"
+#include "torrent_request.hpp"
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -133,6 +134,9 @@ struct MetadataSnapshot {
     // namespace/catalogue remains at its common-ancestor value. Unrelated work
     // may continue; explicit conflict resolution is a later metadata mutation.
     std::map<std::string, MetadataConflict, std::less<>> conflicts;
+    // Torrents the cluster has been asked to download, by request id
+    // (0.64.0, SM15/SM16). See torrent_request.hpp.
+    std::map<std::string, TorrentRequest, std::less<>> torrent_requests;
 };
 // Metadata records are immutable once constructed. Their canonical snapshot payload can
 // be hundreds of megabytes on large media namespaces, so copying a MetadataRecord must
@@ -323,6 +327,10 @@ struct MetadataDelta {
     std::vector<GarbageRef> upsert_garbage;
     std::map<NodeId, PersistedNodeStatus> upsert_node_status;
     std::map<std::string, IdentityAssociationReset, std::less<>> upsert_identity_resets;
+    // DLT9 (0.64.0): torrent requests written whole, and tombstones erased
+    // after their grace.
+    std::map<std::string, TorrentRequest, std::less<>> upsert_torrent_requests;
+    std::vector<std::string> erase_torrent_requests;
     // Whole-set replacements for the branch topology. Ordinary mutations leave
     // both unset and retain the rolling-compatible DLT5 encoding. DLT7 carries
     // a presence flag for each, so a merge or a conflict resolution sends only

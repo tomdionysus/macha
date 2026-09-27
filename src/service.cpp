@@ -641,8 +641,11 @@ void Service::initialise_services(std::stop_token stop) {
         auto ingest = std::make_unique<IngestManager>(
             node_, *fs, *catalogue_hints, node_.config().ingest, media_information.get());
         auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
-        auto acquisition_api =
-            std::make_unique<AcquisitionApi>(*ingest, registry_, *torrent_search);
+        auto cluster_jobs = std::make_unique<ClusterJobView>(node_, *ingest, registry_);
+        auto torrent_coordinator = std::make_unique<TorrentCoordinator>(
+            node_, *metadata, registry_, *cluster_jobs, node_.config().state_path);
+        auto acquisition_api = std::make_unique<AcquisitionApi>(*ingest, registry_, *torrent_search,
+                                                                *cluster_jobs, *torrent_coordinator);
         auto catalogue_api = std::make_unique<CatalogueApi>(
             *catalogue, *catalogue_hints,
             [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
@@ -691,6 +694,8 @@ void Service::initialise_services(std::stop_token stop) {
         hydration_ = std::move(hydration);
         ingest_ = std::move(ingest);
         torrent_search_ = std::move(torrent_search);
+        cluster_jobs_ = std::move(cluster_jobs);
+        torrent_coordinator_ = std::move(torrent_coordinator);
         acquisition_api_ = std::move(acquisition_api);
         catalogue_api_ = std::move(catalogue_api);
         manage_api_ = std::move(manage_api);
@@ -701,6 +706,8 @@ void Service::initialise_services(std::stop_token stop) {
 
         media_information_->start();
         ingest_->start();
+        cluster_jobs_->start();
+        torrent_coordinator_->start();
         // Only now: a subsystem plugin's context hands out references to the
         // services above (the torrent plugin needs IngestManager), and none
         // of them existed when this Service was constructed.
@@ -803,6 +810,11 @@ void Service::stop() {
     // Before ingest: a subsystem plugin holds references to the services
     // below it (the torrent plugin submits completed downloads to ingest), so
     // every plugin instance must be destroyed while they are all still alive.
+    // It calls into ingest and the torrent plugin, so it stops first.
+    if (torrent_coordinator_)
+        torrent_coordinator_->stop();
+    if (cluster_jobs_)
+        cluster_jobs_->stop();
     subsystems_.stop();
     if (ingest_)
         ingest_->stop();

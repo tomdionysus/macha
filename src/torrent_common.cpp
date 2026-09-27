@@ -230,6 +230,87 @@ Json torrent_job_api_json(const TorrentJob& job) {
     return Json(std::move(out));
 }
 
+// The persistence shape of jobs.json and, with the transient fields added,
+// the cluster RPC shape. In core since 0.64.0 so a node without the plugin
+// can decode a peer's jobs.
+Json torrent_job_json(const TorrentJob& job) {
+    Json::Object o;
+    o["id"] = job.id;
+    o["name"] = job.name;
+    o["source_uri"] = job.source_uri;
+    o["info_hash"] = job.info_hash;
+    o["save_path"] = job.save_path.string();
+    o["state"] = torrent_job_state_name(job.state);
+    o["bytes_total"] = job.bytes_total;
+    o["bytes_completed"] = job.bytes_completed;
+    o["uploaded_total"] = job.uploaded_total;
+    o["catalogue_total"] = static_cast<uint64_t>(job.catalogue_total);
+    o["catalogue_pending"] = static_cast<uint64_t>(job.catalogue_pending);
+    o["catalogue_catalogued"] = static_cast<uint64_t>(job.catalogue_catalogued);
+    o["catalogue_no_match"] = static_cast<uint64_t>(job.catalogue_no_match);
+    o["catalogue_failed"] = static_cast<uint64_t>(job.catalogue_failed);
+    o["ingest_job_id"] = job.ingest_job_id ? Json(*job.ingest_job_id) : Json(nullptr);
+    o["created_unix_ms"] = job.created_unix_ms;
+    o["updated_unix_ms"] = job.updated_unix_ms;
+    o["error_code"] = job.error_code;
+    o["error"] = job.error;
+    return o;
+}
+
+TorrentJob parse_torrent_job(const Json& value) {
+    TorrentJob job;
+    if (const auto* v = value.find("id")) job.id = v->asString();
+    if (const auto* v = value.find("name")) job.name = v->asString();
+    if (const auto* v = value.find("source_uri")) job.source_uri = v->asString();
+    if (const auto* v = value.find("info_hash")) job.info_hash = v->asString();
+    if (const auto* v = value.find("save_path")) job.save_path = v->asString();
+    if (const auto* v = value.find("state")) {
+        if (auto state = parse_torrent_job_state(v->asString())) job.state = *state;
+    }
+    if (const auto* v = value.find("bytes_total")) job.bytes_total = v->asUInt64();
+    if (const auto* v = value.find("bytes_completed")) job.bytes_completed = v->asUInt64();
+    if (const auto* v = value.find("uploaded_total")) job.uploaded_total = v->asUInt64();
+    if (const auto* v = value.find("catalogue_total")) job.catalogue_total = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_pending")) job.catalogue_pending = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_catalogued")) job.catalogue_catalogued = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_no_match")) job.catalogue_no_match = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("catalogue_failed")) job.catalogue_failed = static_cast<size_t>(v->asUInt64());
+    if (const auto* v = value.find("ingest_job_id"); v && !v->isNull()) job.ingest_job_id = v->asString();
+    if (const auto* v = value.find("created_unix_ms")) job.created_unix_ms = v->asUInt64();
+    if (const auto* v = value.find("updated_unix_ms")) job.updated_unix_ms = v->asUInt64();
+    if (const auto* v = value.find("error")) job.error = v->asString();
+    if (const auto* v = value.find("error_code")) job.error_code = v->asString();
+    // Recorded before error codes existed: an error is never shown without one.
+    if (!job.error.empty() && job.error_code.empty()) job.error_code = "torrent_failed";
+    return job;
+}
+
+// Wire shape for the cluster RPC survey: the persistence shape
+// (torrent_job_json/parse_torrent_job) plus the transient fields it
+// deliberately never persists (download_rate, upload_rate, peers, seeds,
+// eta_seconds -- resetting those across a local restart is intentional; a
+// remote peer answering a live survey should still report its own current
+// values).
+Json torrent_job_wire_json(const TorrentJob& job) {
+    auto out = torrent_job_json(job);
+    out["download_rate"] = job.download_rate;
+    out["upload_rate"] = job.upload_rate;
+    out["peers"] = static_cast<uint64_t>(job.peers);
+    out["seeds"] = static_cast<uint64_t>(job.seeds);
+    out["eta_seconds"] = optional_u64(job.eta_seconds);
+    return out;
+}
+
+TorrentJob parse_torrent_job_wire(const Json& value) {
+    auto job = parse_torrent_job(value);
+    if (const auto* v = value.find("download_rate")) job.download_rate = v->asUInt64();
+    if (const auto* v = value.find("upload_rate")) job.upload_rate = v->asUInt64();
+    if (const auto* v = value.find("peers")) job.peers = static_cast<unsigned>(v->asUInt64());
+    if (const auto* v = value.find("seeds")) job.seeds = static_cast<unsigned>(v->asUInt64());
+    if (const auto* v = value.find("eta_seconds"); v && !v->isNull()) job.eta_seconds = v->asUInt64();
+    return job;
+}
+
 std::optional<std::string> http_origin(std::string_view value) {
     const auto scheme_end = value.find("://");
     if (scheme_end == std::string_view::npos) return {};

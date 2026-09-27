@@ -73,6 +73,10 @@ enum class MessageType : uint16_t {
     // peer that does not know this message answers with an error, and the
     // caller falls back to sending the whole graph as it always did.
     have_control_objects = 45,
+    // 0.64.0: an action on a claimed torrent while metadata cannot be
+    // written. The owner applies it at once and journals the intent until it
+    // can be published. Reply: torrent_intent_reply.
+    torrent_intent = 46,
     // 0.27.0: the immutable record for a history hash as a self-contained
     // full-body entry, materialized by the serving peer (get_metadata_history_entry
     // returns the peer's *stored* frame, which may be exactly the delta the
@@ -108,7 +112,8 @@ enum class MessageType : uint16_t {
     have_objects_reply = 118,
     user_sync_reply = 119,
     dial_back_probe_reply = 120,
-    have_control_objects_reply = 121
+    have_control_objects_reply = 121,
+    torrent_intent_reply = 122
 };
 
 // Transport priority is a property of the frame type itself. There is no

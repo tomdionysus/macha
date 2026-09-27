@@ -127,6 +127,8 @@ Failures are classified:
 
 This prevents a temporary cluster outage from permanently marking otherwise valid media as failed.
 
+A batch reads one namespace snapshot for all its hints. A hint created after that snapshot was taken may name a file the snapshot cannot contain; it is deferred with `path_not_yet_visible` and looked at again in the next batch, rather than failed with `path_missing` (0.64.0). Clearing the ingest job that raised a hint removes only that origin: a `failed` hint stays, as the record that its file was never catalogued.
+
 `GET /api/v1/catalogue/hints` lists every hint with its `state` (`queued`,
 `processing`, `deferred`, `catalogued`, `no_match`, `failed`), attempt and
 failure counts, `candidate_cursor`, `provider`, `media_id`,
@@ -135,7 +137,7 @@ a sentence (`matched`, `outside_catalogue_roots`, `not_media_file`,
 `no_media_candidate`, `no_provider_match`, `already_stored`,
 `profile_prepared`, `media_not_live`, `manual_existing_item`,
 `manual_metadata`, or `null`), and `error_code` sits beside `error`
-(`path_missing`, `content_not_committed`, `provider_budget_exhausted`,
+(`path_missing`, `path_not_yet_visible`, `content_not_committed`, `provider_budget_exhausted`,
 `provider_unavailable`, `provider_error`, `catalogue_conflict`,
 `catalogue_unavailable`, `catalogue_error`, `artwork_durability_unavailable`,
 `no_immutable_identity`, `yielded_to_playback`, `media_information_error`).
