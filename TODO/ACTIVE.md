@@ -94,6 +94,11 @@ the decisions waiting on the operator.
    create, a manage report of damaged files by path (the cluster-wide "what
    no node holds" join wanted since node-d's removal). The first two are wire
    changes: announce to Core and every client first.
+   Known unreadable titles listed as playable: The Lunarian `7b5743ad`, two
+   from the web client's retry, and The Cannonball Dash `11c474bb` (AV1;
+   2026-09-27 15:28:53Z, session create refused on node-f and live-a with
+   503 `playback_unavailable` "read media: extent unavailable", reported by
+   the phone client and Core).
 3. **Startup timeout contract (operator decision).** `startup_timeout_ms`
    covers only the wait for the first fMP4 segment; VOD planning before it is
    outside the clock (11.1 s for Dark on node-f, fetching each 4 MB extent from
