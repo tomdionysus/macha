@@ -226,3 +226,27 @@ These are the invariants the storage implementation exists to preserve. Each is 
 - pack restart/torn-tail/compaction preserve logical objects;
 - unversioned non-empty storage is refused;
 - metadata mutation memory remains bounded rather than multiplying whole namespace buffers.
+
+## Source layout
+
+`src/` holds only what every subsystem uses: value types, codecs, crypto, JSON, logging, configuration, durable file replacement, diagnostics, the supervised-thread guard, the retry policy and the process allocator. Everything else lives in a folder for its subsystem, and includes are written relative to `src/` (`#include "cluster/net.hpp"`).
+
+| Folder | Contents |
+| --- | --- |
+| `subsystem/` | Subsystem interface, plugin ABI, registry and supervisor |
+| `storage/` | Local stores, storage pool, durability domains, I/O pressure, block cache, retention |
+| `cluster/` | Node runtime, RPC transport, membership, placement, replica selection, distributed store, telemetry, UPnP |
+| `metadata/` | Metadata snapshots and history, metadata manager, namespace tree and control store |
+| `auth/` | Users, roles and sessions |
+| `http/` | HTTP server and response compression |
+| `api/` | HTTP API endpoints (status, manage, catalogue, acquisition, session, users, web) |
+| `filesystem/` | Filesystem model, hydration, macOS name normalisation |
+| `fuse/` | FUSE frontend in core, mount adapter and plugin |
+| `media/` | Media engine, containers, segments, timestamps, VOD, subtitles, FFmpeg logging and tag probing |
+| `playback/` | Playback sessions and segment holds |
+| `catalogue/` | Catalogue, hints, media catalogue, media information |
+| `acquisition/` | Ingest and the cluster-wide job view |
+| `torrent/` | Torrent requests and coordinator (core) and the libtorrent plugin |
+| `service/` | Service wiring, server configuration and `main` |
+
+Put new code in the folder of the subsystem that owns it. Something moves into the root only when it has no subsystem of its own and several subsystems depend on it.

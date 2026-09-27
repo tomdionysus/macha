@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The torrent's disk backend (src/torrent_disk_io.cpp), driven through
+// The torrent's disk backend (src/torrent/torrent_disk_io.cpp), driven through
 // libtorrent's disk_interface exactly as a session drives it: jobs issued on
 // one thread, completions arriving on the io_context.
 
@@ -8,11 +8,11 @@
 #include "test_support.hpp"
 
 #include "crypto.hpp"
-#include "data_work.hpp"
-#include "io_pressure.hpp"
-#include "torrent_disk_io.hpp"
-#include "torrent_extent_journal.hpp"
-#include "torrent_session_policy.hpp"
+#include "cluster/data_work.hpp"
+#include "storage/io_pressure.hpp"
+#include "torrent/torrent_disk_io.hpp"
+#include "torrent/torrent_extent_journal.hpp"
+#include "torrent/torrent_session_policy.hpp"
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/address.hpp>

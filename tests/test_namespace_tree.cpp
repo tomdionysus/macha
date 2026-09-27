@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
 
-#include "metadata_manager.hpp"
-#include "namespace_tree.hpp"
+#include "metadata/metadata_manager.hpp"
+#include "metadata/namespace_tree.hpp"
 
 #include <algorithm>
 #include <set>
@@ -163,7 +163,7 @@ MACHA_TEST("namespace_tree", test_appending_an_extent_does_not_rewrite_the_exten
     // extents already written. Without that, every write to a large file would
     // rewrite its whole extent list -- which is the pathology
     // record_entry_change already goes out of its way to avoid at the delta
-    // level (src/metadata.cpp:483-501).
+    // level (src/metadata/metadata.cpp:483-501).
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     entries["/film.mkv"] = make_file(7, 4000);

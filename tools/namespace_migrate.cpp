@@ -31,10 +31,10 @@
 // for a namespace nobody else has.
 #include "codec.hpp"
 #include "crypto.hpp"
-#include "local_store.hpp"
-#include "metadata.hpp"
-#include "namespace_control_store.hpp"
-#include "namespace_tree.hpp"
+#include "storage/local_store.hpp"
+#include "metadata/metadata.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "metadata/namespace_tree.hpp"
 
 #include <filesystem>
 #include <set>
