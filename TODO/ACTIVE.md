@@ -26,7 +26,8 @@ the decisions waiting on the operator.
   `torrent.enabled: false`). Three jobs: two Martian copies completed, Wake Up
   Dead Man paused (its payload was deleted on 2026-09-26; resuming downloads
   from zero).
-- **node-e is offline for the foreseeable future**; node-f is the build node.
+- **node-e is offline until November 2026 at the earliest** (in site-e; the
+  operator cannot reach it sooner); node-f is the build node.
 - **node-f's site link is congested independently of Macha** (measured
   2026-09-27 after 0.64.0: node-f itself 5 KiB/s in / 3 KiB/s out, gateway
   0.5 ms, internet 63-552 ms; node-c to node-f averages ~430 ms). Every
@@ -73,6 +74,12 @@ the decisions waiting on the operator.
      it; unanswered. If not, investigate (and consider logging namespace
      deletions by path).
    - **Torrent job state still rewritten twice a second** (item 6).
+   - **60 of 296 movie posters are held by no online node, and new writes
+     get one copy.** All 60 from items updated 2026-09-06..10; on node-e or
+     node-d, unknown until node-e returns. node-c's prompt replication skipped
+     687 of 687 for want of a destination with room (node-f full). Nothing
+     re-fetches lost artwork. Written up, parked:
+     [`2026-09-27-missing-artwork-and-single-copy-writes.md`](2026-09-27-missing-artwork-and-single-copy-writes.md).
 
 1. **Repair's credit gates stock-taking, not just transfer (measured, fix
    proposed, awaiting the operator's go).** 0.62.3's `diagnostics.repair
@@ -99,12 +106,26 @@ the decisions waiting on the operator.
    2026-09-27 15:28:53Z, session create refused on node-f and live-a with
    503 `playback_unavailable` "read media: extent unavailable", reported by
    the phone client and Core).
-3. **Startup timeout contract (operator decision).** `startup_timeout_ms`
+3. **Startup timeout contract: decided 2026-09-27, replace the guessed
+   budget with reported progress.** Plan:
+   [`2026-09-27-playback-start-progress-plan.md`](2026-09-27-playback-start-progress-plan.md)
+   (opt-in `start=async`, stage codes and raw counters, long-poll, fail on
+   no progress). The last client-facing change before the clients' release
+   lockdown. History of the question: `startup_timeout_ms`
    covers only the wait for the first fMP4 segment; VOD planning before it is
    outside the clock (11.1 s for Dark on node-f, fetching each 4 MB extent from
    node-c in 4.7-6.3 s). Core budgets exactly the stated figure and will not
    stretch it. Either the figure covers the whole create or the node answers
    within it.
+   Second instance (TV client, 2026-09-27 ~17:15Z, node-f on 0.64.1): PATCH to
+   The Martian 4K HEVC HDR remux `1e763547` (47 Mbps, transcode to 1440p
+   H.264, TrueHD to AAC 7.1) with `seek_ms` 2008000 answers 503
+   `playback_pipeline_start_failed` "timed out waiting for first
+   fragmented-MP4 segment" in 15.0 s (trace `be72a4fa`); the same PATCH
+   without a seek answers 200 in 7.4 s. Reproducible. Cause not measured:
+   the candidates are remote extent fetches from node-c over node-f's
+   congested link for the seek target, and the tone-mapped transcode's own
+   start cost.
 4. **A media-type context on torrent add** (operator, 2026-09-25: "on torrent
    add, we need a 'context' -- whether this torrent contains Movie, TV Show or
    Music", and "tell client about the new selector"). Why: the planner
@@ -122,7 +143,8 @@ the decisions waiting on the operator.
 5. **Decisions waiting on the operator** (do not act without them):
    - node-f's 10G DATA backend: revert, or `replication: 1`. It is full and
      refuses every import write. Repair (0.62.1) and prompt replication
-     (0.64.1) skip it; imports still try.
+     (0.64.1) skip it; imports still try. With node-e away, it also means every
+     new object has one copy (687 on node-c by 2026-09-27 19:2xZ).
    - Discipline 3 wording: "only key mismatch or header corruption may
      refuse to start", yet unversioned storage and two `inbound_capable`
      misconfigurations also refuse. Proposed: recovery may refuse only on
