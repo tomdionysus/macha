@@ -3016,6 +3016,15 @@ work needed for any of these.
 
 ## What the client sessions now depend on (settled 2026-09-13)
 
+**0.63.0 (announced 2026-09-27 to Core, web, Android TV and mobile, before
+deploy).** `POST /api/v1/torrents/jobs` can answer `409
+torrent_already_added` with the holding job's `id` and `node_id` at top level
+(same fields as the 202) and no `error.reason`; a job holds its torrent in any
+state until cleared. New torrent job `error_code`s `duplicate_torrent` and
+`torrent_fault` (both `failed`, not retryable). New always-present
+`threads` array in `GET /api/v1/status` (`name`, `running`, `restarting`,
+`faults`, `last_fault_code`, `last_fault`, `last_fault_unix_ms`).
+
 **Mobile walks and charges healthy nodes on any mid-stream player error, and
 has done all along** (core, 2026-09-21). This is not a contract and not a
 request; it is a standing client defect the server session needs to know
