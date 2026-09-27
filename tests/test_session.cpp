@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "session_api.hpp"
+#include "api/session_api.hpp"
 #include "test_backend_support.hpp"
 
 using namespace macha;

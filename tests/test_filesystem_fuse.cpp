@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "fuse_journal.hpp"
-#include "fuse_adapter.hpp"
+#include "fuse/fuse_journal.hpp"
+#include "fuse/fuse_adapter.hpp"
 #include "test_backend_support.hpp"
 #include <cerrno>
 #include <iostream>

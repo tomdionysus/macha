@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "json.hpp"
 #include "test_backend_support.hpp"
-#include "web_api.hpp"
+#include "api/web_api.hpp"
 
 #include <fstream>
 

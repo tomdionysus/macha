@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
-#include "namespace_control_store.hpp"
-#include "placement.hpp"
+#include "metadata/namespace_control_store.hpp"
+#include "cluster/placement.hpp"
 #include "startup_progress.hpp"
 
 using namespace macha;

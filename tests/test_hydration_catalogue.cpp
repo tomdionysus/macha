@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "torrent_extent_journal.hpp"
+#include "torrent/torrent_extent_journal.hpp"
 #include "test_backend_support.hpp"
-#include "acquisition_api.hpp"
-#include "subsystem_abi.hpp"
-#include "subsystem_registry.hpp"
+#include "api/acquisition_api.hpp"
+#include "subsystem/subsystem_abi.hpp"
+#include "subsystem/subsystem_registry.hpp"
 #include "supervised.hpp"
-#include "torrent_coordinator.hpp"
+#include "torrent/torrent_coordinator.hpp"
 
 #ifdef MACHA_TEST_TORRENT_PLUGIN
 #include <dlfcn.h>

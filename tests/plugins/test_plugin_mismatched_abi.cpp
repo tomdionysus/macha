@@ -4,8 +4,8 @@
 // match any real core build, used only by
 // foundations/test_subsystem_supervisor_refuses_a_mismatched_plugin to prove
 // a partial-deploy-style ABI skew is refused at load time rather than run.
-#include "subsystem.hpp"
-#include "subsystem_abi.hpp"
+#include "subsystem/subsystem.hpp"
+#include "subsystem/subsystem_abi.hpp"
 
 namespace {
 

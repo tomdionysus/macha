@@ -4,8 +4,8 @@
 // foundations/test_subsystem_supervisor_loads_and_stops_a_real_plugin. Starts
 // and stops cleanly, proving the real dlopen -> version-check -> construct ->
 // start -> stop path works end to end, not just in-process mocks.
-#include "subsystem.hpp"
-#include "subsystem_abi.hpp"
+#include "subsystem/subsystem.hpp"
+#include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"
 
 namespace {

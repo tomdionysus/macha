@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "config.hpp"
 
-#include "users.hpp"
+#include "auth/users.hpp"
 
 #include <yaml-cpp/yaml.h>
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "fuse_mountpoint.hpp"
+#include "fuse/fuse_mountpoint.hpp"
 #include "macha_version.hpp"
-#include "miniupnpc_compat.hpp"
+#include "cluster/miniupnpc_compat.hpp"
 #include "test_backend_support.hpp"
 #include "retained_memory.hpp"
 #include "supervised.hpp"
@@ -1300,7 +1300,7 @@ MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
     // An exception escaping a std::jthread/std::thread lambda does not reach
     // any caller's try/catch -- it calls std::terminate() and aborts the
     // whole process. run_supervised() is the one place that boundary is
-    // guarded (see src/supervised.hpp). This scans every src/*.cpp for a raw
+    // guarded (see src/supervised.hpp). This scans every .cpp under src/ for a raw
     // thread/worker-pool construction site and fails if run_supervised does
     // not appear within the next couple of lines, so a new thread can't be
     // added later that silently bypasses the guard.
@@ -1308,7 +1308,7 @@ MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
     const std::filesystem::path src_dir = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src";
     std::vector<std::string> unguarded;
 
-    for (const auto& entry : std::filesystem::directory_iterator(src_dir)) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(src_dir)) {
         if (entry.path().extension() != ".cpp")
             continue;
         // The guard's own implementation is exempt: it does not call itself.
@@ -1685,7 +1685,7 @@ MACHA_TEST("foundations", test_main_owns_signals_and_never_runs_the_mount_itself
     // (TODO/2026-09-14-fuse-supervised-subsystem-plan.md); this keeps main()
     // from growing the branch back.
     const std::filesystem::path main_cpp =
-        std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src" / "main.cpp";
+        std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src" / "service" / "main.cpp";
     std::ifstream file(main_cpp);
     REQUIRE(file.is_open());
     const std::string source((std::istreambuf_iterator<char>(file)),

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
-#include "media_containers.hpp"
-#include "segment_holds.hpp"
-#include "media_information.hpp"
+#include "media/media_containers.hpp"
+#include "playback/segment_holds.hpp"
+#include "catalogue/media_information.hpp"
 
 using namespace macha;
 using namespace std::chrono_literals;
