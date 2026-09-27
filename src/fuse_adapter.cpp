@@ -627,7 +627,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
         std::atomic_bool mount_seen{true};
 
         std::jthread mount_watchdog([&](std::stop_token watchdog_stop) {
-          run_supervised("fuse-mount-watchdog", [&] {
+          run_supervised_once("fuse-mount-watchdog", [&] {
             size_t consecutive_misses = 0;
             size_t consecutive_probe_errors = 0;
             constexpr size_t missing_threshold = 3;

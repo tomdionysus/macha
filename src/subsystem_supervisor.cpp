@@ -88,7 +88,7 @@ void SubsystemSupervisor::start(SubsystemContext context) {
             continue; // failed to load above; nothing to run.
         Entry* raw = entry.get();
         raw->lifecycle = std::jthread([this, raw](std::stop_token stop) {
-            run_supervised(raw->name, [this, raw, stop] { run_entry(*raw, stop); });
+            run_supervised_loop(raw->name, stop, [this, raw, stop] { run_entry(*raw, stop); });
         });
     }
 }

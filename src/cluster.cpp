@@ -637,22 +637,22 @@ void NodeRuntime::start() {
     }
 
     telemetry_worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-telemetry", [this, stop] { telemetry_loop(stop); });
+        run_supervised_loop("cluster-telemetry", stop, [this, stop] { telemetry_loop(stop); });
     });
     local_writer_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-local-writer", [this, stop] { local_writer_loop(stop); });
+        run_supervised_loop("cluster-local-writer", stop, [this, stop] { local_writer_loop(stop); });
     });
     maintenance_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-maintenance", [this, stop] { loop(stop); });
+        run_supervised_loop("cluster-maintenance", stop, [this, stop] { loop(stop); });
     });
     storage_recovery_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-storage-recovery", [this, stop] { recover_storage(stop); });
+        run_supervised_once("cluster-storage-recovery", [this, stop] { recover_storage(stop); });
     });
     state_recovery_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-state-recovery", [this, stop] { recover_state(stop); });
+        run_supervised_once("cluster-state-recovery", [this, stop] { recover_state(stop); });
     });
     connectivity_worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("cluster-connectivity", [this, stop] { connectivity_loop(stop); });
+        run_supervised_loop("cluster-connectivity", stop, [this, stop] { connectivity_loop(stop); });
     });
 }
 

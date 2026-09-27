@@ -339,7 +339,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
     if (mode_ == LocalStoreMode::ephemeral) {
         durability_domain_.reset();
         scan_thread_ = std::jthread([this](std::stop_token stop) {
-            run_supervised("local-store-scan", [this, stop] {
+            run_supervised_once("local-store-scan", [this, stop] {
                 try {
                     scan(stop);
                 } catch (const std::exception& error) {
@@ -392,7 +392,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
                       " (dirty checkpoint; admitting writes while the scan reconciles)");
         }
         scan_thread_ = std::jthread([this](std::stop_token stop) {
-            run_supervised("local-store-scan", [this, stop] {
+            run_supervised_once("local-store-scan", [this, stop] {
                 try {
                     scan(stop);
                 } catch (const std::exception& error) {
@@ -412,7 +412,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
         });
     }
     presence_thread_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("local-store-presence", [this, stop] { warm_presence_index(stop); });
+        run_supervised_once("local-store-presence", [this, stop] { warm_presence_index(stop); });
     });
 }
 

@@ -75,7 +75,7 @@ void FuseSubsystem::start() {
     if (mount_.joinable())
         return;
     mount_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("fuse-mount", [this, stop] { run_mount(stop); });
+        run_supervised_once("fuse-mount", [this, stop] { run_mount(stop); });
     });
 }
 

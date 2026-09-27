@@ -493,7 +493,7 @@ void ClusterStatusService::start() {
     if (persistence_.joinable())
         return;
     persistence_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("status-persistence", [this, stop] { persistence_loop(stop); });
+        run_supervised_loop("status-persistence", stop, [this, stop] { persistence_loop(stop); });
     });
 }
 
@@ -914,6 +914,24 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
     }
     root["subsystems"] = std::move(subsystems);
+    // Every supervised thread by name (0.63.0). A thread that faults is
+    // restarted, escalated or ended according to what it is (supervised.hpp);
+    // until this, one that ended said so once in the journal and nowhere else.
+    Json::Array threads;
+    for (const auto& status : supervised_thread_statuses()) {
+        Json::Object entry;
+        entry["name"] = status.name;
+        entry["running"] = static_cast<uint64_t>(status.running);
+        entry["restarting"] = static_cast<uint64_t>(status.restarting);
+        entry["faults"] = status.faults;
+        entry["last_fault_code"] =
+            status.last_fault_code.empty() ? Json(nullptr) : Json(status.last_fault_code);
+        entry["last_fault"] = status.last_fault.empty() ? Json(nullptr) : Json(status.last_fault);
+        entry["last_fault_unix_ms"] =
+            status.last_fault_unix_ms ? Json(status.last_fault_unix_ms) : Json(nullptr);
+        threads.push_back(std::move(entry));
+    }
+    root["threads"] = std::move(threads);
     // Named rather than assumed: a client that was reading `diagnostics` off
     // this response and now finds it absent would otherwise get `undefined`
     // and no explanation, which is the silent-nothing failure this project has

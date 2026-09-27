@@ -37,6 +37,12 @@ class TorrentSubsystem final : public Subsystem {
 
     std::string_view name() const noexcept override { return "torrent"; }
 
+    // The worker reports a fault it cannot contain to one job here, and the
+    // supervisor rebuilds this subsystem from jobs.json. Until 0.63.0 this was
+    // the default no-op: the worker died on 2026-09-26 and Status still said
+    // `running`.
+    void attach_fault_sink(FaultSink sink) override { manager_->set_fault_sink(std::move(sink)); }
+
     void start() override { manager_->start(); }
 
     void stop() override {

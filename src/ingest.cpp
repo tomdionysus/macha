@@ -684,11 +684,11 @@ void IngestManager::start() {
     workers_.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         workers_.emplace_back([this](std::stop_token stop) {
-            run_supervised("ingest", [this, stop] { loop(stop); });
+            run_supervised_loop("ingest", stop, [this, stop] { loop(stop); });
         });
     }
     catalogue_worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("ingest-catalogue", [this, stop] { catalogue_loop(stop); });
+        run_supervised_loop("ingest-catalogue", stop, [this, stop] { catalogue_loop(stop); });
     });
     Log::info("ingest started workers=" + std::to_string(count));
 }
