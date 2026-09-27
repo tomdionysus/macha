@@ -670,12 +670,10 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     REQUIRE(listed.status == 200);
     CHECK(json_body(listed).find("frank") != std::string::npos);
     CHECK(json_body(listed).find("password_hash") == std::string::npos);
-    // Every collection in this API answers under "items". This one answered
-    // under "users" until 0.40.0, and each client had to learn that separately.
+    // Every collection in this API answers under "items".
     auto listed_body = Json::parse(json_body(listed));
     REQUIRE(listed_body.find("items") != nullptr);
     CHECK(listed_body.find("items")->isArray());
-    CHECK(listed_body.find("users") == nullptr);
 
     // An unknown role is refused rather than stored as an unenforceable string.
     auto bogus = api.handle(
@@ -886,8 +884,7 @@ MACHA_TEST("users", test_login_does_not_wait_on_an_unreachable_peer) {
 }
 
 MACHA_FAST_TEST("users", test_recovery_key_machinery_is_dormant_but_sound) {
-    // Nothing issues a recovery key: genesis does not, and no route accepts
-    // one (see test_no_recovery_route_is_exposed). The machinery is kept for a
+    // Nothing issues or accepts a recovery key yet. The machinery is kept for a
     // deployment model that does not exist yet -- one where the operator
     // cannot get a shell on a node -- so it is tested rather than left to rot.
     //

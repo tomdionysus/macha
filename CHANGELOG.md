@@ -1,5 +1,28 @@
 # Current release
 
+## 0.65.0 — Unknown configuration keys are refused; playback headers moved into the body (development)
+
+Three custom headers had crept into playback:
+
+- `X-Macha-Idempotency: created|replayed` on a keyed session create is now
+  the body field `idempotency` (`"created"` or `"replayed"`), present when the
+  request carried an `idempotency_key`. **Clients reading the header must read
+  the field.**
+- `X-Macha-Playback-Trace` on a create, and `X-Macha-Playback-Trace` and
+  `X-Macha-Playback-Stage` on a stage error, are gone. They repeated
+  `trace_id` and `error.trace` / `error.stage`, which are unchanged.
+
+**A node does not start on a configuration key it does not know.** Until now
+an unrecognised key was ignored, so a misspelt one left its setting at the
+default without a word. The loader now records every key it reads and refuses
+the file if it contains any other, naming each one with its full path (for
+example `storage.data.backends[0].reserve`). A `SIGHUP` reload of such a file
+is refused the same way. **Check each node's `macha.yaml` before upgrading.**
+
+Tests and documentation describe current behaviour only: tests that checked
+removed code stayed removed are gone, and the documentation no longer
+recounts superseded behaviour.
+
 ## 0.64.2 — Import destinations ignore case (development)
 
 **A lowercase release made a second folder for one film.** The 720p
