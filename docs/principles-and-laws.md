@@ -186,8 +186,11 @@ next. They are cited by number like the laws.
 3. **Recover by resolving.** Recovery paths do not throw on an inconsistency
    that has a deterministic resolution: they resolve it, log one line, record
    the outcome so the next start does not see it again, and count it. Only a
-   genuinely fatal condition may refuse to start. A component that stays up
-   with a counter to read beats one that exits correctly.
+   genuinely fatal condition may refuse to start: for recovery, that is key
+   mismatch or header corruption. A configuration the node cannot work with
+   is a separate matter, refused at startup for the operator to correct. A
+   component that stays up with a counter to read beats one that exits
+   correctly.
 4. **Compact history out of the hot path.** The size of live state is a
    function of what is live, not of its history. Retirement history and
    resolved conflicts belong in separately compacted structures, so that read,
