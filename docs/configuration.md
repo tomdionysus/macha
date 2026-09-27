@@ -2,6 +2,8 @@
 
 Macha uses one YAML configuration file per node. Node-local paths, endpoints and capacities may differ. Cluster policy and the cluster key must agree across participating nodes.
 
+Every key in the file must be one Macha reads. A node refuses to start on a file carrying any other key, and names each one with its full path, for example `storage.data.backends[0].reserve`. A `SIGHUP` reload of such a file is refused and the running configuration is kept. Invalid values are refused the same way.
+
 `storage` is a mapping of storage classes. A configuration using a top-level `storage: [ ... ]` sequence is rejected.
 
 ## Required identity and paths
@@ -134,7 +136,7 @@ dht:
 
 - `replicas`: desired converged authoritative DATA copies.
 - `min_write_replicas`: durable DATA copies required before foreground publication; must be `<= replicas`.
-- `metadata_min_write_replicas`: minimum distinct active nodes that must durably accept a namespace/control mutation before publication. Every node is metadata-capable; this is a write durability floor, not a voter count or convergence target. The legacy `metadata_replicas` key is accepted as an alias, translated to the majority of the voter count it named; the two keys are mutually exclusive.
+- `metadata_min_write_replicas`: minimum distinct active nodes that must durably accept a namespace/control mutation before publication. Every node is metadata-capable; this is a write durability floor, not a convergence target. `metadata_replicas` is accepted as an alias and translated to the majority of the count it gives; the two keys are mutually exclusive.
 - `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted.
 - `extent_size`: maximum ordinary file extent size, `1M`..`64M`, default `16M` (the examples here use `4M`). It is fixed once a namespace exists; live reload refuses a change. It is unrelated to small-object pack allocation.
 - `data_inflight_bytes`: node-wide byte budget for blocking DATA object reads, writes, and transfers.
@@ -287,6 +289,8 @@ fuse:
   watchdog_interval_ms: 1000
   initial_namespace_timeout_ms: 600000
 ```
+
+`allow_other`, `entry_timeout_ms`, `attr_timeout_ms` and `negative_timeout_ms` are also accepted under `filesystem`.
 
 `unmount_if_mounted` controls startup recovery from an unclean daemon exit. When true, Macha inspects the mount table before starting cluster/storage services and removes a mount only if it is identified as Macha/FUSE. An unrelated filesystem at the configured mount path is a hard startup error.
 
@@ -590,11 +594,11 @@ maintenance:
 
 Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted MachaDFS activity take priority.
 
-**A new object's second copy is sent at once, but only where there is room.** Each object written to a single node is pushed straight to another placement owner by prompt replication, ahead of repair. It skips an owner whose gossiped storage has less than an extent free, and gives up on an object after five refused sends (30 s doubling to 4 min), leaving it to repair. `diagnostics.prompt_replication` in `GET /api/v1/status/diagnostics` counts `copies`, `failures`, `skipped_no_room`, `dropped` and `queued`. Until 0.64.1 it sent every new object to a full owner and resent each refusal every 30 s indefinitely.
+**A new object's second copy is sent at once, but only where there is room.** Each object written to a single node is pushed straight to another placement owner by prompt replication, ahead of repair. It skips an owner whose gossiped storage has less than an extent free, and gives up on an object after five refused sends (30 s doubling to 4 min), leaving it to repair. `diagnostics.prompt_replication` in `GET /api/v1/status/diagnostics` counts `copies`, `failures`, `skipped_no_room`, `dropped` and `queued`.
 
-**Replica repair is paced, never stopped.** While any higher class is busy -- a viewer, mounted reads, or the loader (ingest, torrents, FUSE publication) -- repair runs in bounded turns followed by a proportional cooldown, receiving `repair_weight` time for every `foreground_weight` of theirs (95:5 by default, the same duty-cycle form as `fuse.viewer_weight`/`loader_weight`). When nothing else is busy it runs unrestricted within `idle_bandwidth_fraction`. Its turns end between operations: an extent already in flight completes and is kept. Both weights must be 1..10000; zero is refused, because a repair that stops while the node is busy never restores a copy on a node that is always busy, and a lost copy is lost data (law 4). Until 0.59.0 repair was switched off entirely while anything was busy, which is how gbni-1 was still about 0.9 TB short of a second copy when es-1 left the cluster on 2026-09-24.
+**Replica repair is paced, never stopped.** While any higher class is busy -- a viewer, mounted reads, or the loader (ingest, torrents, FUSE publication) -- repair runs in bounded turns followed by a proportional cooldown, receiving `repair_weight` time for every `foreground_weight` of theirs (95:5 by default, the same duty-cycle form as `fuse.viewer_weight`/`loader_weight`). When nothing else is busy it runs unrestricted within `idle_bandwidth_fraction`. Its turns end between operations: an extent already in flight completes and is kept. Both weights must be 1..10000; zero is refused, because a repair that stops while the node is busy never restores a copy on a node that is always busy, and a lost copy is lost data (law 4).
 
-`busy_bandwidth_fraction` now governs rebalance and scrub only; repair always earns credit at `idle_bandwidth_fraction` and shares time by the weights.
+`busy_bandwidth_fraction` governs rebalance and scrub only; repair always earns credit at `idle_bandwidth_fraction` and shares time by the weights.
 
 ## Catalogue
 
@@ -696,11 +700,10 @@ and `torrent.max_active` 1..64 (default 4).
 `torrent.disk_threads` (default 2, at least 1) is the number of threads doing
 the torrent's file I/O. Every read, write and hash they perform is admitted by
 the DATA arbiter as loader work and timed into the disk-pressure monitor above,
-so a download yields to a viewer on a slow device. It replaced
-`torrent.pressure_download_rate`, which is no longer read. It takes effect at
+so a download yields to a viewer on a slow device. It takes effect at
 restart; `max_active`, the rate limits and `log_level` apply on live reload.
 
-`torrent.accept_new_jobs` (default true; 0.64.0) set false drains a node: it
+`torrent.accept_new_jobs` (default true) set false drains a node: it
 keeps the torrent jobs it has, takes no new one, and stays listed in
 `GET /api/v1/torrents/nodes` with `not_accepting_reason` `draining`.
 `torrent.remove_on_complete_after_ms` (absent or null = off; 0..86400000) is
@@ -709,7 +712,7 @@ how long after a torrent completes it is removed; it is reported as
 
 ## Web client
 
-`web.root` names a directory of built web-client assets to serve at the server's root. It is unset by default, and a node with no `web.root` answers non-API paths exactly as before: `404`.
+`web.root` names a directory of built web-client assets to serve at the server's root. It is unset by default, and a node with no `web.root` answers non-API paths with `404`.
 
 ```yaml
 web:
@@ -733,18 +736,6 @@ Client assets are served without a bearer token, since a browser has none until 
 The client is served while local services are still recovering, because it is static files and depends on none of them. That is deliberate: the client loads and shows what `/api/v1/status` reports, rather than failing to load at all during a recovery.
 
 A node configured with a `root` that does not exist, or one with no index document, answers `503 web_client_unavailable` rather than `404` — a misconfigured node says so instead of pretending the route was never there, and starts serving as soon as the files appear, without a restart.
-
-## Renamed and obsolete keys
-
-`verbose`, top-level `mount_path` (now `fuse.mount_path`),
-`network.control_timeout_ms` and `network.data_timeout_ms` are refused at
-startup. Accepted as aliases: `dht.metadata_replicas` (see DHT policy),
-`catalogue.api.max_queued_connections`, and `allow_other`, `entry_timeout_ms`,
-`attr_timeout_ms` and `negative_timeout_ms` under `filesystem` (the 0.12.x
-spellings of the `fuse` keys). `dht.io_pressure_outlier_ms` (replaced by
-`io_pressure_outlier_percent` in 0.53.0) and `torrent.pressure_download_rate`
-(removed in 0.54.0) are no longer read; a file that still sets them starts, and the value is
-ignored.
 
 ## Logging
 

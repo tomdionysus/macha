@@ -1,8 +1,8 @@
 # High availability without the homework
 
 Macha is happiest when it has at least three nodes in places that are unlikely
-to fail together. The nodes form one peer cluster: there is no master to keep
-alive and no special failover server to promote.
+to fail together. The nodes form one cluster of equal peers: when one fails,
+the others carry on as they are, with nothing to promote.
 
 For a straightforward highly available setup, use this policy on every node:
 

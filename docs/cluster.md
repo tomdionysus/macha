@@ -17,7 +17,7 @@ them.
 
 ## Metadata replicas and write floor
 
-Every node is a metadata replica. There is no configured voter subset, witness role, leader or permanent metadata authority.
+Every node is a metadata replica, and every replica has the same standing: any active node can store commits, count towards the write floor and serve metadata.
 
 `dht.metadata_min_write_replicas` is the publication durability floor. A namespace commit becomes accepted after the exact immutable commit has been durably stored on that many distinct active nodes and the resulting acceptance certificate has been durably retained. For example, with three known nodes and `metadata_min_write_replicas: 2`, any surviving pair remains writable.
 

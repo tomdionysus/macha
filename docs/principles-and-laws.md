@@ -9,10 +9,7 @@ conceptual boundary of the product and the priority contract every component
 must preserve. They are constraints on design and implementation, not
 performance aspirations.
 
-The numbering is canonical across all projects from 2026-09-24. Before that the
-server numbered the first three laws differently (viewer 1, loader 2, control
-3); its citations have been renumbered in place, and the laws themselves did
-not change.
+The numbering is canonical across all projects.
 
 ## Conceptual principles
 
@@ -131,8 +128,7 @@ preloaded or embedded.
    with one.
 4. **Thou Shalt Not Shoot Thyself In The Foot.** No operation, code path or
    subsystem may leave the node — or the client — in a state it cannot recover
-   from on its own. *Added by the server on 2026-09-20 and adopted by the
-   clients unchanged.* It is different in kind from the three above: laws 1-3
+   from on its own. It is different in kind from the three above: laws 1-3
    decide who goes first, this one decides what may not be done **at any
    priority**. It is a veto over all three and where it conflicts it wins,
    because a component that has destroyed itself serves no viewer.

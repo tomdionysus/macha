@@ -308,7 +308,7 @@ The practical consequences for an operator:
   `parked-publications`) answer "nothing to report" while the mount is
   faulted rather than erroring.
 - **A thread that faults is on record, and runs again when it is a service
-  loop (0.63.0).** Every thread Macha starts runs under one of three
+  loop.** Every thread Macha starts runs under one of three
   supervisions, chosen per thread (`src/supervised.hpp`): a *service loop*
   (ingest, hydration, the RPC workers, maintenance, ...) that throws is run
   again after a backoff of 1 s doubling to 60 s; a *task* (a connection, a
@@ -321,10 +321,7 @@ The practical consequences for an operator:
   `threads` block of `GET /api/v1/status`, one entry per thread name:
   `running` and `restarting` (threads of that name in their body, and waiting
   out a backoff), `faults`, `last_fault_code` (`exception`,
-  `unknown_exception`), `last_fault` and `last_fault_unix_ms`. Until 0.63.0 a
-  thread that threw logged `thread stopped on exception` once and ended; on
-  gbni-1 on 2026-09-26 that was the torrent worker, and every torrent sat
-  unchanged for a day while `subsystems` said `running`.
+  `unknown_exception`), `last_fault` and `last_fault_unix_ms`.
 - **A lost mount is a `faulted` subsystem, not a process exit.** A FUSE mount
   that disappears under a running node (`umount -l`, a kernel module reload)
   is remounted in place, with `restart_count` climbing and `last_fault` naming
@@ -387,9 +384,10 @@ The shape rules:
   each other. Metadata reaches both through the capable replicas, and the
   destructive-GC fence (`all_known_reachable`) excludes such pairs rather than
   counting them as a fault.
-- There is no relay. A cluster with no inbound-capable storage node is
-  refused: a founding node with `inbound_capable: false`, or a joining node
-  whose every bootstrap peer is known to be incapable, exits at start-up.
+- Nodes exchange traffic only over direct connections, so a cluster needs
+  an inbound-capable storage node. One without is refused: a founding node
+  with `inbound_capable: false`, or a joining node whose every bootstrap peer
+  is known to be incapable, exits at start-up.
 - `dht.replicas` must be satisfiable from extent-hosting nodes alone.
 
 How to read Status: `nodes[]` carries `inbound_capable`, `hosts_extents` and
@@ -403,9 +401,7 @@ no inbound connections` (information), `no inbound-capable node hosts extents`
 (degraded). A `DEBUG` line is logged for every `dial_request` round trip and
 every dial-back probe.
 
-Every node in a cluster must run the same protocol version, so introducing a
-node that declares either bit to a cluster that predates them is a rolling
-upgrade of the whole cluster, not a per-node change.
+Every node in a cluster must run the same protocol version.
 
 An `auto` resolution is sticky: it is persisted under
 `state_path/connectivity/inbound.bin`, changes only after two consecutive
@@ -437,7 +433,7 @@ because optional telemetry was dropped.
 
 The wire format is `TEL3`: every field tagged and length-delimited, and a
 default-valued field omitted, so a newer node can add a field an older one
-skips. There is no compatibility with the positional formats before it.
+skips.
 
 Storage and cache byte objects include an `available` boolean. When coherent
 telemetry is unavailable, Status may still report membership-known storage

@@ -117,7 +117,7 @@ At least one account always holds `manage_users`. Removing the role from the las
 
 ### Routes
 
-- `GET /api/v1/users` — list. No password material is ever returned; there is no route that reads a credential back.
+- `GET /api/v1/users` — list. Credentials are write-only: this and every other route returns account records without password material.
 - `POST /api/v1/users` — `{username, password, roles}`.
 - `GET|PATCH|DELETE /api/v1/users/{id}` — `PATCH` accepts `password` and/or `roles`.
 - `GET|PATCH /api/v1/users/me` — anyone's own account. `PATCH` accepts `password` only; a `roles` change here is `403`, since otherwise it would be an escalation route for every account. Changing your own password returns a fresh session in the same response (`token`, `token_type`, `session_id`), so you are not signed out by your own change. An anonymous session has no account here and gets `404 no_account`.
@@ -130,7 +130,7 @@ A password change, a role change or a deletion retires every session that accoun
 
 A node founding a new cluster creates both accounts on first start and writes root's generated password to `<state_path>/initial-root-password`, mode 0600.
 
-An existing cluster upgrading into the accounts system does not, because it has bootstrap peers and is therefore not founding anything. Such a node starts with an empty user table, which means nothing can sign in — the node says so at startup and reports `accounts_initialised: false` in `GET /api/v1/status`. Stop one node and run:
+A node with bootstrap peers is joining rather than founding, so it creates neither. If the cluster it joins holds no accounts, it starts with an empty user table, which means nothing can sign in — the node says so at startup and reports `accounts_initialised: false` in `GET /api/v1/status`. Stop one node and run:
 
 ```
 macha-users <state_path> <cluster.key> init
@@ -144,4 +144,4 @@ If root's password is lost and no `manage_users` account can sign in, reset it t
 macha-users <state_path> <cluster.key> passwd root
 ```
 
-There is deliberately no recovery key and no recovery endpoint. One would have to be presentable without an account to be useful, which means a standing unauthenticated path to the most privileged account in the cluster; and anyone able to use it already has root on a node, where the command above does the same job. `macha-users` itself is not a weakness: it needs the node's state directory and the cluster key, which is root on a node — and that party already holds every byte in the cluster.
+Recovery is deliberately offline only, through `macha-users` on a stopped node. An online recovery key or endpoint would have to be presentable without an account to be useful, which means a standing unauthenticated path to the most privileged account in the cluster; and anyone able to use it already has root on a node, where the command above does the same job. `macha-users` itself is not a weakness: it needs the node's state directory and the cluster key, which is root on a node — and that party already holds every byte in the cluster.

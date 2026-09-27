@@ -218,6 +218,62 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_a_repair_weight_of_zer
     CHECK(refused);
 }
 
+MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_unknown_keys) {
+    // A node does not start on a configuration it does not understand: a
+    // misspelt key would otherwise leave its setting at the default, silently.
+    // Every unknown key is named, at whatever depth, including inside a list.
+    TempDir t;
+    auto keyfile = (t.path() / "key").string();
+    auto yaml = t.path() / "node.yaml";
+    {
+        std::ofstream out(yaml);
+        out << "state_path: " << (t.path() / "state").string() << "\n"
+            << "key_file: " << keyfile << "\n"
+            << "log_levle: debug\n"
+            << "storage:\n"
+            << "  hosts_extents: true\n"
+            << "  data:\n"
+            << "    backends:\n"
+            << "      - path: " << (t.path() / "data").string() << "\n"
+            << "        limit: 1G\n"
+            << "        reserve: 1G\n"
+            << "  metadata:\n"
+            << "    limit: 1G\n"
+            << "streaming:\n"
+            << "  startup_timeout: 15000\n"
+            << "bootstrap:\n"
+            << "  - seed1.example:7437\n";
+    }
+    std::string message;
+    try {
+        (void)load_yaml_config(yaml);
+    } catch (const std::runtime_error& error) {
+        message = error.what();
+    }
+    CHECK(message.find("unknown configuration keys") != std::string::npos);
+    CHECK(message.find("log_levle") != std::string::npos);
+    CHECK(message.find("storage.data.backends[0].reserve") != std::string::npos);
+    CHECK(message.find("streaming.startup_timeout") != std::string::npos);
+    // A key that exists is not reported because a sibling is wrong.
+    CHECK(message.find("storage.data.backends[0].limit") == std::string::npos);
+}
+
+MACHA_FAST_TEST("runtime_dependencies", test_example_configuration_loads) {
+    // The shipped example is what operators copy; every key in it must be one
+    // the loader reads.
+    const auto example = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "macha.yaml.example";
+    REQUIRE(std::filesystem::exists(example));
+    std::string message;
+    try {
+        (void)load_yaml_config(example);
+    } catch (const std::exception& error) {
+        message = error.what();
+    }
+    CHECK(message.find("unknown configuration key") == std::string::npos);
+    if (!message.empty())
+        std::cerr << "macha.yaml.example: " << message << "\n";
+}
+
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     TempDir t;
 #ifdef MACHA_HAVE_LIBTORRENT
@@ -295,7 +351,6 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  read_ahead_extents: 4\n"
             << "  hint_lifetime_ms: 4500\n"
             << "  write_through_cache: false\n"
-            << "  refresh_interval_ms: 750\n" // legacy key: accepted and ignored
             << "  fail_closed_mountpoint: true\n"
             << "  watchdog_interval_ms: 650\n"
             << "  timeouts:\n"
@@ -434,8 +489,6 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "  failed_login_lockout_ms: 45000\n"
             << "streaming:\n"
             << "  enabled: true\n"
-            << "  ffmpeg: /legacy/ignored/ffmpeg\n"
-            << "  ffprobe: /legacy/ignored/ffprobe\n"
             << "  temp_path: " << (t.path() / "streams").string() << "\n"
             << "  max_sessions: 9\n"
             << "  max_video_transcodes: 2\n"
@@ -722,51 +775,24 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(overridden.log_level == LogLevel::debug);
     CHECK(overridden.ffmpeg_log_level == FfmpegLogLevel::warning);
 
-    // Obsolete configuration surfaces are rejected rather than silently
-    // translated onto current semantics.
-    for (const auto& legacy : std::vector<std::vector<std::string>>{
-             {"--verbose"}, {"--control-timeout", "1000"}, {"--data-timeout", "1000"},
-             {"--path", disk1.string()}, {"--limit", "10G"}}) {
-        std::vector<std::string> legacy_args{"macha", "--config", yaml.string()};
-        legacy_args.insert(legacy_args.end(), legacy.begin(), legacy.end());
-        std::vector<char*> legacy_argv;
-        for (auto& arg : legacy_args)
-            legacy_argv.push_back(arg.data());
-        bool rejected = false;
-        try {
-            (void)parse_config(static_cast<int>(legacy_argv.size()), legacy_argv.data());
-        } catch (const std::exception&) {
-            rejected = true;
-        }
-        CHECK(rejected);
-    }
-
-    for (size_t i = 0; i < 4; ++i) {
-        auto legacy_yaml = t.path() / ("legacy-" + std::to_string(i) + ".yaml");
-        std::ofstream out(legacy_yaml);
+    {
+        // `storage` must be a mapping; a sequence of backends is refused.
+        auto sequence_yaml = t.path() / "storage-sequence.yaml";
+        std::ofstream out(sequence_yaml);
         out << "state_path: " << state.string() << "\n"
             << "key_file: " << keyfile << "\n"
             << "storage:\n"
             << "  - path: " << disk1.string() << "\n"
             << "    limit: 10G\n";
-        if (i == 0)
-            out << "verbose: true\n";
-        else if (i == 1)
-            out << "network:\n  control_timeout_ms: 1000\n";
-        else if (i == 2)
-            out << "network:\n  data_timeout_ms: 1000\n";
-        // i == 3 is deliberately only the pre-0.18 storage sequence. The
-        // fresh storage contract rejects it without relying on another
-        // obsolete key to trigger the failure.
         out.close();
 
-        std::vector<std::string> old_args{"macha", "--config", legacy_yaml.string()};
-        std::vector<char*> old_argv;
-        for (auto& arg : old_args)
-            old_argv.push_back(arg.data());
+        std::vector<std::string> sequence_args{"macha", "--config", sequence_yaml.string()};
+        std::vector<char*> sequence_argv;
+        for (auto& arg : sequence_args)
+            sequence_argv.push_back(arg.data());
         bool rejected = false;
         try {
-            (void)parse_config(static_cast<int>(old_argv.size()), old_argv.data());
+            (void)parse_config(static_cast<int>(sequence_argv.size()), sequence_argv.data());
         } catch (const std::exception&) {
             rejected = true;
         }

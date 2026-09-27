@@ -116,9 +116,9 @@ POST /api/v1/ingest/jobs/{id}/clear
 |---|---|---|
 | `path` | yes | a file or directory on the node that receives the request |
 | `display_name` | no | defaults to the last component of the resolved path |
-| `delete_source_on_clear` | no | overrides `ingest.cleanup.delete_external_source_on_clear` for this job. `remove_source` is accepted as an older name for the same field |
+| `delete_source_on_clear` | no | overrides `ingest.cleanup.delete_external_source_on_clear` for this job. `remove_source` is accepted as an alias |
 
-The job is created on the node that receives the request, because the path is that node's. There is no placement field.
+The job is created on the node that receives the request, because the path is that node's.
 
 The response is `202`:
 
@@ -239,7 +239,7 @@ Each `catalogue.items` entry:
 | `error_code`, `error` | string or null | why this file failed |
 | `catalogue_item_ids` | array of strings | catalogue items the file became |
 
-Destinations are compared ignoring case (0.64.2): a folder that already exists under another spelling is reused as spelt (a lowercase release goes into `/Movies/The Martian (2015)/`, not a new `/Movies/the martian (2015)/`), and a file whose name differs from one already there only by case gets a ` (2)` suffix like any other collision.
+Destinations are compared ignoring case: a folder that already exists under another spelling is reused as spelt (a lowercase release goes into `/Movies/The Martian (2015)/`, not a new `/Movies/the martian (2015)/`), and a file whose name differs from one already there only by case gets a ` (2)` suffix like any other collision.
 
 Each `files` entry: `source_path`, `destination_path` (strings), `size`, `copied` (integers), `completed`, `skipped`, `catalogue_candidate` (bools). A file that is not a catalogue candidate (a sidecar) is imported but not sent to the catalogue.
 
@@ -292,7 +292,7 @@ A `blocked` job is retried every `ingest.blocked_retry_ms` until it succeeds or 
 | `source_seek_failed` | a source file could not be positioned to resume a copy |
 | `source_short_read` | a source file returned fewer bytes than expected |
 
-Before 0.57.0 `metadata_unavailable` made the job `failed`. It is now `blocked` and the job completes once metadata is writable again.
+`metadata_unavailable` makes the job `blocked`, and the job completes once metadata is writable again.
 
 | `error_code` (failed) | cause |
 |---|---|
@@ -328,7 +328,7 @@ POST /api/v1/torrents/jobs/{id}/cancel
 POST /api/v1/torrents/jobs/{id}/clear
 ```
 
-The download engine is the `libmacha-torrent` subsystem plugin. **Every route answers on every node** (0.64.0), whether or not the plugin runs there: lists and lookups come from the answering node's view of the cluster, and actions and adds go to the node concerned. Only an add that must run on the answering node itself needs the plugin there; see [When the torrent subsystem is not running](#when-the-torrent-subsystem-is-not-running).
+The download engine is the `libmacha-torrent` subsystem plugin. **Every route answers on every node**, whether or not the plugin runs there: lists and lookups come from the answering node's view of the cluster, and actions and adds go to the node concerned. Only an add that must run on the answering node itself needs the plugin there; see [When the torrent subsystem is not running](#when-the-torrent-subsystem-is-not-running).
 
 ### Torrent-capable nodes
 
@@ -356,7 +356,7 @@ A node without the plugin is not listed. `accepting` is whether it would take a 
 | field | meaning |
 |---|---|
 | `enabled` | the plugin is running here and `torrent.enabled` is on |
-| `build_available` | the plugin is loaded and running here. The name predates 0.28.0, when it meant "compiled in" |
+| `build_available` | the plugin is loaded and running here |
 | `search_enabled` | at least one search provider is configured and enabled on this node |
 
 ### Search
@@ -401,7 +401,7 @@ The server returns results ordered by `seeders`, highest first, with unknown cou
 
 ### Start a job
 
-A torrent is added to the **cluster** (0.64.0): the add is recorded as a request in cluster metadata, it waits there, and any node that runs the torrent subsystem may claim and download it. A node that runs no torrents takes adds like any other.
+A torrent is added to the **cluster**: the add is recorded as a request in cluster metadata, it waits there, and any node that runs the torrent subsystem may claim and download it. A node that runs no torrents takes adds like any other.
 
 `POST /api/v1/torrents/jobs`
 
@@ -452,9 +452,7 @@ Every torrent-capable node runs a scheduler. It claims a waiting job when the jo
 
 A claim holds while its node is a cluster member. **A node absent for 10 minutes loses it**, and another capable node claims the job and starts it again from nothing (staging and resume data are the node's own). A node that returns to find its claim taken over deletes its copy.
 
-Metadata writes are not compare-and-swap, so two nodes can change one job at once; every field merges by a fixed rule and none ever needs an operator: `cancel` beats any pause or resume, a job never moves backwards within one claim, and of two claims the later takeover wins, then the earlier claim. In a cluster of three or more nodes, a network partition can let two nodes download the same job; if both reach import before the partition heals, the second file lands beside the first as `... (2)`. Nothing is lost or corrupted.
-
-Jobs a node held before 0.64.0 become cluster jobs it has already claimed, the first time it runs.
+Metadata writes merge, so two nodes can change one job at once; every field merges by a fixed rule and none ever needs an operator: `cancel` beats any pause or resume, a job never moves backwards within one claim, and of two claims the later takeover wins, then the earlier claim. In a cluster of three or more nodes, a network partition can let two nodes download the same job; if both reach import before the partition heals, the second file lands beside the first as `... (2)`. Nothing is lost or corrupted.
 
 ### List and inspect
 
@@ -466,7 +464,7 @@ Jobs a node held before 0.64.0 become cluster jobs it has already claimed, the f
 
 `POST /api/v1/torrents/jobs/{id}/{action}`, where `action` is `pause`, `resume`, `retry`, `cancel` or `clear`. No body.
 
-**Actions record intent** (0.64.0): they answer `202` with the whole job, `desired` already changed, and the owning node applies it within a few seconds; `state` follows. `desired_applied` says when it has. `clear` answers `202 {"status": "ok", "cleared": true}`.
+**Actions record intent**: they answer `202` with the whole job, `desired` already changed, and the owning node applies it within a few seconds; `state` follows. `desired_applied` says when it has. `clear` answers `202 {"status": "ok", "cleared": true}`.
 
 | action | allowed | result |
 |---|---|---|
@@ -534,7 +532,7 @@ A job with `remove_after_ms` set is removed that long after it completes -- afte
 |---|---|---|
 | `id` | string | 32 hex characters |
 | `info_hash` | string | the torrent's v1 info hash, else its v2, in lowercase hex |
-| `phase` | string | where the job stands in the cluster (0.64.0): `awaiting_node`, `downloading`, `importing`, `completed`, `failed`, `cancelled`. Always present |
+| `phase` | string | where the job stands in the cluster: `awaiting_node`, `downloading`, `importing`, `completed`, `failed`, `cancelled`. Always present |
 | `state` | string | the owner's fine-grained state, see [Torrent job states](#torrent-job-states); `awaiting_node` exactly when `phase` is |
 | `desired` | string | what the operator asked for: `active`, `paused`, `cancelled` |
 | `desired_changed_unix_ms` | integer | when `desired` last changed |
@@ -568,8 +566,8 @@ A job with `remove_after_ms` set is removed that long after it completes -- afte
 | `queued` | added and not yet in one of the states below | no |
 | `metadata` | fetching the torrent's metadata from peers | no |
 | `downloading` | downloading the payload | no |
-| `verify_queued` | waiting to check pieces already on disk: the download engine checks **one torrent at a time**, and another is being checked. New in 0.61.0; until then this read as `verifying` with no progress and no ETA | no |
-| `verifying` | checking pieces already on disk. `eta_seconds` is the check's own estimate (from 0.61.0), `progress` counts the pieces found valid so far | no |
+| `verify_queued` | waiting to check pieces already on disk: the download engine checks **one torrent at a time**, and another is being checked | no |
+| `verifying` | checking pieces already on disk. `eta_seconds` is the check's own estimate, `progress` counts the pieces found valid so far | no |
 | `downloaded` | the payload is complete; **waiting for its extents to be published** before import | no |
 | `importing` | the payload has been submitted as an ingest job, which is queued, scanning or importing | no |
 | `cataloguing` | the linked ingest is `cataloguing` | no |
@@ -581,11 +579,11 @@ A job with `remove_after_ms` set is removed that long after it completes -- afte
 
 **Before handover** the state follows the download engine: `metadata`, `downloading`, `verify_queued`, `verifying`, `downloaded`, or `queued` for anything else. A job that was `metadata`, `downloading`, `verify_queued`, `verifying` or `downloaded` when its node stopped is `queued` again at start, and the download resumes from what is on disk.
 
-**A restart does not re-check what was already verified (0.61.0).** The node keeps each job's resume data, saved when a check or download finishes, on pause, every five minutes and at shutdown, and restarts from it. Without it (a job last saved before 0.61.0, or a damaged file) the payload on disk is checked in full, which on a large torrent takes minutes to an hour and queues every other check behind it.
+**A restart resumes from what was already verified.** The node keeps each job's resume data, saved when a check or download finishes, on pause, every five minutes and at shutdown, and restarts from it. Without usable resume data (a missing or damaged file) the payload on disk is checked in full, which on a large torrent takes minutes to an hour and queues every other check behind it.
 
-**`paused` means paused (0.61.0).** A paused or `blocked` torrent is held out of the download engine's queue entirely. Before 0.61.0 the engine's queue could restart a paused torrent: it was checked, and could download and seed, while its job read `paused`.
+**`paused` means paused.** A paused or `blocked` torrent is held out of the download engine's queue entirely: it is not checked, downloaded or seeded until it is resumed.
 
-**Handover, since 0.57.0.** A finished download is paused in `downloaded` until every extent of its payload has been published into the store the ingest commits into. Then its ingest job is submitted, `ingest_job_id` is set and the job becomes `importing`; the ingest adopts the published extents rather than copying the bytes again. This takes seconds to minutes. If publication makes no progress for 10 minutes the job is submitted anyway, and whatever was not published is copied. If there is nothing to wait for (the payload is not being published), submission is immediate.
+**Handover.** A finished download is paused in `downloaded` until every extent of its payload has been published into the store the ingest commits into. Then its ingest job is submitted, `ingest_job_id` is set and the job becomes `importing`; the ingest adopts the published extents rather than copying the bytes again. This takes seconds to minutes. If publication makes no progress for 10 minutes the job is submitted anyway, and whatever was not published is copied. If there is nothing to wait for (the payload is not being published), submission is immediate.
 
 **After handover** the torrent job mirrors its ingest:
 
@@ -600,7 +598,7 @@ A job with `remove_after_ms` set is removed that long after it completes -- afte
 | `cancelled` | `failed` | `ingest_cancelled` |
 | no longer exists | `failed` | `ingest_missing` |
 
-So a linked torrent job that is `blocked` with `metadata_unavailable` recovers on the ingest's schedule, as the ingest does. **A `failed` torrent job follows its ingest back (0.62.0):** if the linked ingest is resumed by any route (the torrent's `retry`, the ingest's own `resume`, or a peer's action), the torrent job leaves `failed` and mirrors it again, and releases its staging when the ingest completes. Before 0.62.0 only `retry` did this; resuming the ingest directly left the torrent job `failed` for good, holding its staging reservation. The linked ingest job also appears in `GET /api/v1/ingest/jobs`, with `source_type` `torrent`, `source_ref` the torrent job's `id` and `source_owned` true. Acting on it there (cancelling or clearing it) is reflected in the torrent job as the table says.
+So a linked torrent job that is `blocked` with `metadata_unavailable` recovers on the ingest's schedule, as the ingest does. **A `failed` torrent job follows its ingest back:** if the linked ingest is resumed by any route (the torrent's `retry`, the ingest's own `resume`, or a peer's action), the torrent job leaves `failed` and mirrors it again, and releases its staging when the ingest completes. The linked ingest job also appears in `GET /api/v1/ingest/jobs`, with `source_type` `torrent`, `source_ref` the torrent job's `id` and `source_owned` true. Acting on it there (cancelling or clearing it) is reflected in the torrent job as the table says.
 
 Operator actions:
 
@@ -622,28 +620,28 @@ A failure before handover (`torrent_error`, `torrent_fault`, `ingest_submit_fail
 | `torrent_error` | `failed` | the download engine reported an error on the torrent | no |
 | `ingest_submit_failed` | `failed` | the finished payload could not be submitted to ingest | no |
 | `restore_failed` | `failed` | the job could not be re-added to the download engine when the node started | no |
-| `duplicate_torrent` | `failed`, or `cancelled` | another job holds the same torrent: recorded on one node before 0.63.0 refused duplicates, or added through two nodes at once (0.64.0); the older job keeps it | no |
-| `adopt_failed` | `failed` | the node that claimed the job could not start it (0.64.0) | no |
-| `torrent_fault` | `failed` | the download engine faulted on this job (0.63.0); the job's download is removed and every other job carries on. A linked job still follows its ingest | no; clear it and add the torrent again |
+| `duplicate_torrent` | `failed`, or `cancelled` | another job holds the same torrent, for example one added through two nodes at once; the older job keeps it | no |
+| `adopt_failed` | `failed` | the node that claimed the job could not start it | no |
+| `torrent_fault` | `failed` | the download engine faulted on this job; the job's download is removed and every other job carries on. A linked job still follows its ingest | no; clear it and add the torrent again |
 | `ingest_failed` | `failed` | the linked ingest failed without a code | via `retry` |
 | `ingest_cancelled` | `failed` | the linked ingest was cancelled | no |
 | `ingest_missing` | `failed` | the linked ingest no longer exists | no |
-| `torrent_failed` | `failed` | a job recorded as failed before error codes existed | no |
+| `torrent_failed` | `failed` | the job failed with an error message and no more specific code | no |
 | any ingest code | `blocked` or `failed` | mirrored from the linked ingest, as above | as the ingest does |
 
 ### What clear and cancel delete
 
 `cancel` removes the torrent from the download engine and releases its staging reservation. When `ingest.cleanup.delete_owned_source_on_cancel` is true it also deletes the downloaded payload.
 
-The payload is not deleted in the request (0.64.0): it is moved into the staging area's `.trash` at once and deleted in the background, and it counts against `ingest.staging_limit` until it is gone. A clear that deleted a 75 GB payload in the request took 34 s on a busy disk.
+The payload is moved into the staging area's `.trash` at once and deleted in the background, so the request returns promptly however large the payload; it counts against `ingest.staging_limit` until it is gone.
 
 `clear` on a linked job clears the linked ingest, which deletes the payload under the ingest rules (it is an owned source, so `ingest.cleanup.delete_owned_source_on_clear` decides). On a job with no ingest, `clear` deletes the payload when `ingest.cleanup.delete_owned_source_on_clear` is true. If the linked ingest cannot be cleared, the torrent job is not either (`409 invalid_state`).
 
 ## Cluster-wide behaviour
 
-**A torrent job belongs to the cluster** (0.64.0; see [Who downloads it](#who-downloads-it)). **An ingest job belongs to the node that runs it**, and every node can list and act on every other node's.
+**A torrent job belongs to the cluster** (see [Who downloads it](#who-downloads-it)). **An ingest job belongs to the node that runs it**, and every node can list and act on every other node's.
 
-- **Every node keeps a view of the cluster's jobs** (0.64.0). Torrent jobs come from its copy of the metadata. Its own live figures are read directly; every other member's live torrent figures and ingest jobs are polled in the background every `refresh_interval_ms` (5 s). Lists and lookups answer from that and never wait on another node. Until 0.64.0 each request asked every member in turn while the client waited, and a member that could not be reached was silently left out.
+- **Every node keeps a view of the cluster's jobs.** Torrent jobs come from its copy of the metadata. Its own live figures are read directly; every other member's live torrent figures and ingest jobs are polled in the background every `refresh_interval_ms` (5 s). Lists and lookups answer from that and never wait on another node.
 - **Listing** (`GET .../jobs`): the answering node's own jobs plus every other member's from the view, with `sources` saying how old each node's are and whether it was reachable.
 - **Inspecting** (`GET .../jobs/{id}`): answered from the view; `404 not_found` if no node the answering node has heard from owns it. A job placed on another node very recently is known at once when the add went through the answering node, and otherwise within `refresh_interval_ms`.
 - **Acting** (`POST .../jobs/{id}/{action}`): the action runs on the owning node, found in the view, and the job returned is that node's answer. `503 node_unreachable` if the owner cannot be reached.
@@ -656,7 +654,7 @@ On a node where the `libmacha-torrent` plugin is not installed, declined to star
 
 - `GET /api/v1/torrents/status` answers `200` with `enabled: false` and `build_available: false`.
 - `GET /api/v1/torrents/search` works as normal.
-- Lists, lookups and actions work as on any other node, from its view of the cluster (0.64.0; until then they answered `503 unavailable`).
+- Lists, lookups and actions work as on any other node, from its view of the cluster.
 - `GET /api/v1/torrents/nodes` does not list it.
 - Adds are taken as on any node and claimed by a node that runs torrents; an add pinned to this node is refused with `409 placement_failed`, reason `node_not_torrent_capable`.
 - Jobs it had claimed keep their claim for 10 minutes and are then taken over by another capable node.

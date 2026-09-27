@@ -10,7 +10,7 @@ DATA contains immutable payload objects: media extents, catalogue artwork, subti
 
 ### CONTROL / metadata
 
-Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards must satisfy `dht.metadata_min_write_replicas` distinct active durable copies before publication. There is no permanent metadata voter subset.
+Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards must satisfy `dht.metadata_min_write_replicas` distinct active durable copies before publication, and every active node counts equally towards that floor.
 
 CONTROL storage does not consume DATA quota.
 

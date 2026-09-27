@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <set>
 #include <stdexcept>
 
 namespace macha {
@@ -68,7 +70,60 @@ Tristate yaml_tristate(const YAML::Node& node, const char* what) {
     return parse_tristate(node.as<std::string>(), what);
 }
 
-void parse_network(const YAML::Node& root, Config& c) {
+// A YAML node that records the path of every key the loader reads, so that
+// load_yaml_config() can refuse a file carrying a key nothing read. The set
+// of known keys is therefore exactly the set the parsers below consult.
+class ConfigNode {
+  public:
+    ConfigNode(YAML::Node node, std::string path, std::shared_ptr<std::set<std::string>> read)
+        : node_(std::move(node)), path_(std::move(path)), read_(std::move(read)) {}
+
+    ConfigNode operator[](std::string_view key) const {
+        auto child = path_.empty() ? std::string(key) : path_ + "." + std::string(key);
+        read_->insert(child);
+        const YAML::Node& node = node_;
+        return {node[std::string(key)], std::move(child), read_};
+    }
+    std::vector<ConfigNode> elements() const {
+        std::vector<ConfigNode> out;
+        for (size_t i = 0; i < node_.size(); ++i)
+            out.emplace_back(node_[i], path_ + "[" + std::to_string(i) + "]", read_);
+        return out;
+    }
+    explicit operator bool() const { return static_cast<bool>(node_); }
+    operator const YAML::Node&() const { return node_; }
+    bool IsMap() const { return node_.IsMap(); }
+    bool IsSequence() const { return node_.IsSequence(); }
+    bool IsScalar() const { return node_.IsScalar(); }
+    bool IsNull() const { return node_.IsNull(); }
+    size_t size() const { return node_.size(); }
+    template <typename T>
+    T as() const { return node_.template as<T>(); }
+
+  private:
+    YAML::Node node_;
+    std::string path_;
+    std::shared_ptr<std::set<std::string>> read_;
+};
+
+void collect_unknown_keys(const YAML::Node& node, const std::string& path,
+                          const std::set<std::string>& read, std::vector<std::string>& unknown) {
+    if (node.IsMap()) {
+        for (const auto& entry : node) {
+            const auto key = entry.first.as<std::string>();
+            const auto child = path.empty() ? key : path + "." + key;
+            if (!read.contains(child))
+                unknown.push_back(child);
+            else
+                collect_unknown_keys(entry.second, child, read, unknown);
+        }
+    } else if (node.IsSequence()) {
+        for (size_t i = 0; i < node.size(); ++i)
+            collect_unknown_keys(node[i], path + "[" + std::to_string(i) + "]", read, unknown);
+    }
+}
+
+void parse_network(const ConfigNode& root, Config& c) {
     auto n = root["network"];
     if (!n)
         return;
@@ -132,7 +187,7 @@ void parse_network(const YAML::Node& root, Config& c) {
     }
 }
 
-void parse_dht(const YAML::Node& root, Config& c) {
+void parse_dht(const ConfigNode& root, Config& c) {
     auto d = root["dht"];
     if (!d)
         return;
@@ -187,7 +242,7 @@ void parse_dht(const YAML::Node& root, Config& c) {
             yaml_size(d["metadata_materialization_cache_bytes"]);
 }
 
-void parse_maintenance(const YAML::Node& root, Config& c) {
+void parse_maintenance(const ConfigNode& root, Config& c) {
     auto m = root["maintenance"];
     if (!m)
         return;
@@ -227,7 +282,7 @@ void parse_maintenance(const YAML::Node& root, Config& c) {
             milliseconds(m["no_progress_backoff_ms"], "maintenance.no_progress_backoff_ms");
 }
 
-void parse_filesystem(const YAML::Node& root, Config& c) {
+void parse_filesystem(const ConfigNode& root, Config& c) {
     auto f = root["filesystem"];
     if (!f)
         return;
@@ -245,7 +300,7 @@ void parse_filesystem(const YAML::Node& root, Config& c) {
     if (f["negative_timeout_ms"]) c.fuse.negative_timeout = milliseconds(f["negative_timeout_ms"], "filesystem.negative_timeout_ms");
 }
 
-void parse_fuse(const YAML::Node& root, Config& c) {
+void parse_fuse(const ConfigNode& root, Config& c) {
     auto f = root["fuse"];
     if (!f) return;
     if (f["mount_path"]) c.fuse.mount_path = std::filesystem::path(f["mount_path"].as<std::string>());
@@ -338,7 +393,7 @@ void parse_fuse(const YAML::Node& root, Config& c) {
     }
 }
 
-void parse_catalogue(const YAML::Node& root, Config& c) {
+void parse_catalogue(const ConfigNode& root, Config& c) {
     auto catalogue = root["catalogue"];
     if (!catalogue)
         return;
@@ -454,7 +509,7 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
         if (scanner["max_artwork_bytes"])
             c.catalogue.scanner.max_artwork_bytes = yaml_size(scanner["max_artwork_bytes"]);
         if (auto providers = scanner["providers"]) {
-            const auto parse_roots = [](const YAML::Node& provider,
+            const auto parse_roots = [](const ConfigNode& provider,
                                         std::vector<std::string>& roots,
                                         std::string_view name) {
                 auto configured = provider["roots"];
@@ -463,10 +518,10 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
                     throw std::runtime_error("catalogue.scanner.providers." +
                                              std::string(name) + ".roots must be a sequence");
                 roots.clear();
-                for (const auto& root : configured)
+                for (const auto& root : configured.elements())
                     roots.push_back(root.as<std::string>());
             };
-            const auto parse_tmdb = [](const YAML::Node& tmdb, CatalogueTmdbConfig& config) {
+            const auto parse_tmdb = [](const ConfigNode& tmdb, CatalogueTmdbConfig& config) {
                 if (!tmdb) return;
                 if (tmdb["enabled"]) config.enabled = tmdb["enabled"].as<bool>();
                 if (tmdb["token_file"])
@@ -504,7 +559,7 @@ void parse_catalogue(const YAML::Node& root, Config& c) {
     }
 }
 
-void parse_ingest(const YAML::Node& root, Config& c) {
+void parse_ingest(const ConfigNode& root, Config& c) {
     auto ingest = root["ingest"];
     if (!ingest) return;
     if (ingest["enabled"]) c.ingest.enabled = ingest["enabled"].as<bool>();
@@ -528,12 +583,12 @@ void parse_ingest(const YAML::Node& root, Config& c) {
     if (auto roots = ingest["source_roots"]) {
         if (!roots.IsSequence()) throw std::runtime_error("ingest.source_roots must be a sequence");
         c.ingest.source_roots.clear();
-        for (const auto& value : roots)
+        for (const auto& value : roots.elements())
             c.ingest.source_roots.emplace_back(value.as<std::string>());
     }
 }
 
-void parse_torrent(const YAML::Node& root, Config& c) {
+void parse_torrent(const ConfigNode& root, Config& c) {
     auto torrent = root["torrent"];
     if (!torrent) return;
     if (torrent["enabled"]) c.torrent.enabled = torrent["enabled"].as<bool>();
@@ -570,7 +625,7 @@ void parse_torrent(const YAML::Node& root, Config& c) {
                 if (!providers.IsSequence())
                     throw std::runtime_error("torrent.search.providers must be a sequence");
                 c.torrent.search_providers.clear();
-                for (const auto& value : providers) {
+                for (const auto& value : providers.elements()) {
                     TorrentSearchProviderConfig provider;
                     if (value["enabled"]) provider.enabled = value["enabled"].as<bool>();
                     if (value["name"]) provider.name = value["name"].as<std::string>();
@@ -586,7 +641,7 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     }
 }
 
-void parse_streaming(const YAML::Node& root, Config& c) {
+void parse_streaming(const ConfigNode& root, Config& c) {
     auto streaming = root["streaming"];
     if (!streaming)
         return;
@@ -647,7 +702,7 @@ void parse_streaming(const YAML::Node& root, Config& c) {
             milliseconds(streaming["probe_timeout_ms"], "streaming.probe_timeout_ms");
 }
 
-void parse_runtime(const YAML::Node& root, Config& c) {
+void parse_runtime(const ConfigNode& root, Config& c) {
     auto runtime = root["runtime"];
     if (!runtime)
         return;
@@ -669,7 +724,7 @@ void parse_runtime(const YAML::Node& root, Config& c) {
             yaml_size(runtime["loader_memory_reserve_bytes"]);
 }
 
-void parse_web(const YAML::Node& root, Config& c) {
+void parse_web(const ConfigNode& root, Config& c) {
     auto web = root["web"];
     if (!web)
         return;
@@ -685,7 +740,7 @@ void parse_web(const YAML::Node& root, Config& c) {
         throw std::runtime_error("web.index must be a file name inside web.root");
 }
 
-void parse_session(const YAML::Node& root, Config& c) {
+void parse_session(const ConfigNode& root, Config& c) {
     auto session = root["session"];
     if (!session)
         return;
@@ -707,7 +762,7 @@ void parse_session(const YAML::Node& root, Config& c) {
             milliseconds(session["failed_login_lockout_ms"], "session.failed_login_lockout_ms");
 }
 
-void parse_hydration_engine(const YAML::Node& engines, const char* name,
+void parse_hydration_engine(const ConfigNode& engines, const char* name,
                             HydrationEngineConfig& engine) {
     auto node = engines[name];
     if (!node)
@@ -718,7 +773,7 @@ void parse_hydration_engine(const YAML::Node& engines, const char* name,
         engine.priority = node["priority"].as<uint32_t>();
 }
 
-void parse_hydration(const YAML::Node& root, Config& c) {
+void parse_hydration(const ConfigNode& root, Config& c) {
     auto hydration = root["hydration"];
     if (!hydration)
         return;
@@ -742,20 +797,11 @@ void parse_hydration(const YAML::Node& root, Config& c) {
 } // namespace
 
 Config load_yaml_config(const std::filesystem::path& path) {
-    auto root = YAML::LoadFile(path.string());
+    const auto document = YAML::LoadFile(path.string());
+    auto read = std::make_shared<std::set<std::string>>();
+    const ConfigNode root(document, {}, read);
     if (!root.IsMap())
         throw std::runtime_error("configuration root must be a mapping");
-
-    if (root["verbose"])
-        throw std::runtime_error("obsolete configuration key: verbose");
-    if (root["mount_path"])
-        throw std::runtime_error("obsolete configuration key: mount_path (moved to fuse.mount_path)");
-    if (auto network = root["network"]) {
-        if (network["control_timeout_ms"])
-            throw std::runtime_error("obsolete configuration key: network.control_timeout_ms");
-        if (network["data_timeout_ms"])
-            throw std::runtime_error("obsolete configuration key: network.data_timeout_ms");
-    }
 
     Config c;
     c.config_file = path;
@@ -792,7 +838,7 @@ Config load_yaml_config(const std::filesystem::path& path) {
         if (backends && !backends.IsSequence())
             throw std::runtime_error("storage.data.backends must be a sequence");
         if (backends) {
-            for (const auto& item : backends) {
+            for (const auto& item : backends.elements()) {
                 StorageBackendConfig backend;
                 if (!item["path"] || !item["limit"])
                     throw std::runtime_error("storage.data backend requires path and limit");
@@ -852,8 +898,18 @@ Config load_yaml_config(const std::filesystem::path& path) {
     if (auto bootstrap = root["bootstrap"]) {
         if (!bootstrap.IsSequence())
             throw std::runtime_error("bootstrap must be a sequence");
-        for (const auto& item : bootstrap)
+        for (const auto& item : bootstrap.elements())
             c.bootstrap.push_back(parse_endpoint(item.as<std::string>(), c.port));
+    }
+
+    std::vector<std::string> unknown;
+    collect_unknown_keys(document, {}, *read, unknown);
+    if (!unknown.empty()) {
+        std::string list;
+        for (const auto& key : unknown)
+            list += (list.empty() ? "" : ", ") + key;
+        throw std::runtime_error("unknown configuration key" +
+                                 std::string(unknown.size() == 1 ? "" : "s") + ": " + list);
     }
     return normalize_config(std::move(c));
 }
