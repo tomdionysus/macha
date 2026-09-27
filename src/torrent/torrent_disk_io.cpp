@@ -562,8 +562,10 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             try {
                 published = publish(job);
             } catch (const std::exception& e) {
-                Log::warn("torrent extent publication failed path=" +
-                          job.storage->extents[job.extent].relative_path + ": " + e.what() + "; retrying");
+                if (!aborting_.load())
+                    Log::warn("torrent extent publication failed path=" +
+                              job.storage->extents[job.extent].relative_path + ": " + e.what() +
+                              "; retrying");
             }
             lock.lock();
             if (!published && !publisher_stopping_ && !job.storage->removed.load()) {
@@ -588,8 +590,11 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                 return false;
             }
         } // the read's credit is released before the put, which admits itself
-        const auto id = hooks_.publish(bytes);
+        const auto id = hooks_.publish(bytes, aborting_);
         if (!id) {
+            // Shutting down: the write was cancelled, not failed. The extent is
+            // not journalled, so the torrent publishes it again on resume.
+            if (aborting_.load()) return false;
             Log::warn("torrent extent publication failed path=" + extent.relative_path + " offset=" +
                       std::to_string(extent.offset) + "; retrying");
             return false;

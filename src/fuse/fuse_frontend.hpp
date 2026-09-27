@@ -666,6 +666,10 @@ class FuseFrontend final : public HydrationHintProvider {
     bool abandon_parked_publication(uint64_t inode);
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));
     void stop();
+    // Tests only: whether a viewer is active is decided by this rather than by
+    // the foreground clock, so a test can hold loader publication and release
+    // it at a point of its choosing. nullopt returns the decision to the clock.
+    void set_viewer_active_for_tests(std::optional<bool> active);
 };
 
 } // namespace macha

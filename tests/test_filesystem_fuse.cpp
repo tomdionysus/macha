@@ -1915,7 +1915,6 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retiremen
     config.fuse.publication_quantum_bytes = config.extent_size;
     config.fuse.publication_inflight_bytes = config.extent_size;
     config.fuse.publication_pipeline_bytes = config.extent_size;
-    config.fuse.publication_quiet = 500ms;
     config.fuse.suspend_loader_for_tests = true;
     config.fuse.max_spool_bytes = 16 * config.extent_size;
     config.fuse.spool_reserve_free = 0;
@@ -1931,12 +1930,14 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retiremen
     auto blocked_follower = frontend->create("/blocked-follower.bin", 0644, getuid(), getgid(),
                                              false, true, false);
     REQUIRE(frontend->wait_for_idle(10s));
+    // From here a viewer holds loader publication (its weight is zero) until
+    // the test lets go below, however long the setup takes.
+    frontend->set_viewer_active_for_tests(true);
 
-    // Hold publication while the queue is populated in deliberately bad FIFO
-    // order. The three generations fill the spool exactly to its 50% pressure
-    // threshold: an open pathological inode, then a large closed file, then a
-    // much nearer closed retirement.
-    service.filesystem().store().foreground_activity(1);
+    // The queue is populated in deliberately bad FIFO order. The three
+    // generations fill the spool exactly to its 50% pressure threshold: an
+    // open pathological inode, then a large closed file, then a much nearer
+    // closed retirement.
     const auto open_bytes = pattern(3 * config.extent_size, 81);
     const auto large_bytes = pattern(4 * config.extent_size, 82);
     const auto small_bytes = pattern(config.extent_size, 83);
@@ -1950,23 +1951,29 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retiremen
     frontend->release(closed_small.inode, true);
 
     // The first byte above the pressure threshold is event-driven
-    // backpressure and asserts the single pressure drain transition. Once the
-    // viewer window expires, the closest closed retirement must run before the
-    // earlier queued large generation and create admission progress.
+    // backpressure: while publication is held, nothing can retire, so the
+    // byte cannot be admitted.
     auto admitted = std::async(std::launch::async, [&] {
         const auto byte = pattern(1, 84);
         return frontend->write(blocked_follower.inode, 0, byte);
     });
     CHECK(admitted.wait_for(100ms) == std::future_status::timeout);
+    CHECK(service.filesystem().getattr("/closed-small.bin").size == 0);
+    CHECK(service.filesystem().getattr("/closed-large.bin").size == 0);
+
+    // Released, the pressure drain selects the nearest closed retirement ahead
+    // of the earlier queued large generation, and that retirement is what
+    // admits the byte.
+    frontend->set_viewer_active_for_tests(false);
+    REQUIRE(admitted.wait_for(10s) == std::future_status::ready);
+    CHECK(admitted.get() == 1);
+    // Retiring its data is what freed the spool; its size reaches the
+    // namespace with the namespace publication that follows.
     REQUIRE(wait_until(
         [&] {
-            return service.filesystem().getattr("/closed-small.bin").size ==
-                       small_bytes.size() &&
-                   service.filesystem().getattr("/closed-large.bin").size == 0;
+            return service.filesystem().getattr("/closed-small.bin").size == small_bytes.size();
         },
         10s));
-    REQUIRE(admitted.wait_for(5s) == std::future_status::ready);
-    CHECK(admitted.get() == 1);
 
     const auto selected = frontend->status();
     CHECK(selected.spool_pressure_publication_sweeps == 1);
@@ -2373,8 +2380,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmit
 
     const auto contents = pattern(256 * 1024 + 17, 91);
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
-        service.filesystem().store().foreground_activity(1);
+        // Publication is held outright, so the write is still pending when this
+        // frontend stops: a viewer is active and the loader's share is zero.
+        auto held = config.fuse;
+        held.suspend_loader_for_tests = true;
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), held);
+        frontend->set_viewer_active_for_tests(true);
         auto handle = frontend->open("/removed-before-replay.bin", true, true, false, false);
         REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
         frontend->release(handle.inode, true);
@@ -2401,6 +2412,102 @@ MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmit
     CHECK(recovered->status().backend_failures == settled.backend_failures);
     CHECK(recovered->getattr("/healthy.bin").type == EntryType::file);
     recovered->stop();
+}
+
+MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_keeps_the_node_up) {
+    // 2026-09-28, gbni-1 on 0.65.0: removing empty directories from the FUSE
+    // mount with `find -depth -type d -empty -delete` took the node down after
+    // 45 removals in 11 s -- SIGSEGV in malloc, heap already corrupt, while
+    // the media-information service walked the namespace in prune(). Every
+    // removal is a metadata change and every metadata change asks for a prune.
+    // A library-shaped tree is built and emptied the same way.
+    TestService fixture("fuse-empty-directory-burst");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.fuse.publication_quiet = 0ms;
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+
+    constexpr int titles = 60;
+    frontend->mkdir("/Movies", 0755, getuid(), getgid());
+    for (int i = 0; i < titles; ++i) {
+        const auto title = "/Movies/Title " + std::to_string(i);
+        frontend->mkdir(title, 0755, getuid(), getgid());
+        frontend->mkdir(title + "/Subs", 0755, getuid(), getgid());
+        frontend->mkdir(title + "/Featurettes", 0755, getuid(), getgid());
+        if (i % 2 == 0) {
+            auto handle = frontend->create(title + "/film.mkv", 0644, getuid(), getgid(), false,
+                                           true, false);
+            const auto bytes = pattern(4096 + static_cast<size_t>(i), static_cast<uint8_t>(i));
+            REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+            frontend->release(handle.inode, true);
+        }
+    }
+    REQUIRE(frontend->wait_for_idle(60s));
+
+    // A mounted filesystem is served by several threads at once: while one
+    // request removes a directory, the kernel is statting and listing its
+    // neighbours on others. Readers here do the same throughout.
+    std::mutex unexpected_mutex;
+    std::vector<std::string> unexpected;
+    const auto note_unexpected = [&](std::string what) {
+        std::lock_guard lock(unexpected_mutex);
+        unexpected.push_back(std::move(what));
+    };
+    // jthreads, so that a failure on the removing thread below stops and joins
+    // them on the way out rather than destroying joinable threads.
+    std::vector<std::jthread> readers;
+    for (int r = 0; r < 4; ++r) {
+        readers.emplace_back([&, r](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                for (int i = r; i < titles; i += 4) {
+                    const auto title = "/Movies/Title " + std::to_string(i);
+                    for (const auto& path : {title, title + "/Subs", title + "/Featurettes"}) {
+                        try {
+                            (void)frontend->getattr(path);
+                            (void)frontend->readdir(path);
+                        } catch (const FsError& error) {
+                            // The path went while it was being read: ENOENT.
+                            if (error.code() != ENOENT)
+                                note_unexpected(path + ": FsError " + std::to_string(error.code()) +
+                                                " " + error.what());
+                        } catch (const std::exception& error) {
+                            note_unexpected(path + ": " + error.what());
+                        }
+                    }
+                }
+                try {
+                    (void)frontend->readdir("/Movies");
+                } catch (const std::exception& error) {
+                    note_unexpected(std::string("/Movies: ") + error.what());
+                }
+            }
+        });
+    }
+
+    // Bottom-up, as find -depth does: each directory is listed, then removed.
+    for (int i = 0; i < titles; ++i) {
+        const auto title = "/Movies/Title " + std::to_string(i);
+        (void)frontend->readdir(title);
+        frontend->rmdir(title + "/Subs");
+        frontend->rmdir(title + "/Featurettes");
+        if (i % 2 == 1) frontend->rmdir(title);
+    }
+    REQUIRE(frontend->wait_for_idle(60s));
+    for (auto& reader : readers) reader.request_stop();
+    readers.clear();
+    for (const auto& what : unexpected) std::cerr << "unexpected: " << what << "\n";
+    CHECK(unexpected.empty());
+
+    const auto listed = frontend->readdir("/Movies");
+    size_t directories = 0;
+    for (const auto& [name, attributes] : listed)
+        if (name != "." && name != "..") ++directories;
+    CHECK(directories == titles / 2);
+    CHECK(service.filesystem().getattr("/Movies/Title 0/film.mkv").type == EntryType::file);
+    frontend->stop();
 }
 
 MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace_and_data) {

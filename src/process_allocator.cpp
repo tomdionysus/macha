@@ -12,12 +12,23 @@
 #endif
 #endif
 
+// A sanitizer build (MACHA_SANITIZE) replaces malloc with its own allocator,
+// so glibc's arena setting has nothing to apply to; the bound is reported as
+// unsupported, as on a system without glibc, instead of refusing to start.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define MACHA_SANITIZER_ALLOCATOR 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define MACHA_SANITIZER_ALLOCATOR 1
+#endif
+#endif
+
 namespace macha {
 
 ProcessAllocatorPolicy configure_process_allocator(size_t arena_max) {
     if (!arena_max || arena_max > static_cast<size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("allocator arena limit is out of range");
-#if defined(MACHA_HAS_GLIBC_MALLOPT)
+#if defined(MACHA_HAS_GLIBC_MALLOPT) && !defined(MACHA_SANITIZER_ALLOCATOR)
     if (::mallopt(M_ARENA_MAX, static_cast<int>(arena_max)) == 0)
         throw std::runtime_error("cannot apply glibc allocator arena limit");
     return {true, arena_max};

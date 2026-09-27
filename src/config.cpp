@@ -508,6 +508,17 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
                 scanner["provider_batch_delay_ms"], "catalogue.scanner.provider_batch_delay_ms");
         if (scanner["max_artwork_bytes"])
             c.catalogue.scanner.max_artwork_bytes = yaml_size(scanner["max_artwork_bytes"]);
+        if (auto terms = scanner["ignore_terms"]) {
+            if (!terms.IsSequence())
+                throw std::runtime_error("catalogue.scanner.ignore_terms must be a sequence");
+            c.catalogue.scanner.ignore_terms.clear();
+            for (const auto& term : terms.elements()) {
+                auto value = term.as<std::string>();
+                if (value.empty())
+                    throw std::runtime_error("catalogue.scanner.ignore_terms must not contain an empty term");
+                c.catalogue.scanner.ignore_terms.push_back(std::move(value));
+            }
+        }
         if (auto providers = scanner["providers"]) {
             const auto parse_roots = [](const ConfigNode& provider,
                                         std::vector<std::string>& roots,

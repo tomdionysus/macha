@@ -613,6 +613,22 @@ void LocalStore::forget_verified_loose_locked(const ObjectId& id) const {
     present_loose_.erase(id);
 }
 
+bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::path& p) const {
+    std::error_code error;
+    if (std::filesystem::file_size(p, error) != 0 || error)
+        return false;
+    // Zero bytes hold nothing to account for: usage is unchanged.
+    if (!std::filesystem::remove(p, error) || error)
+        return false;
+    {
+        std::lock_guard lock(m_);
+        forget_verified_loose_locked(id);
+        pruned_loose_.insert(id);
+    }
+    Log::warn("storage pruned an empty object file id=" + to_string(id) + " path=" + p.string());
+    return true;
+}
+
 void LocalStore::select_active_pack_locked(uint64_t next_record_size) {
     if (!pack_threshold_) throw std::runtime_error("packing is disabled");
     if (active_pack_.empty() ||
@@ -958,6 +974,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         used_.fetch_add(need, std::memory_order_relaxed);
         remember_verified_loose_locked(id, *installed_stamp);
         present_loose_.insert(id);
+        pruned_loose_.erase(id);
         uint64_t generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
@@ -1170,6 +1187,7 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     if (!std::filesystem::exists(p)) return {};
     if (before_read) before_read(id);
     auto encoded = rf(p);
+    if (encoded.empty() && prune_empty_loose(id, p)) return {};
     Reader r(encoded);
     auto magic = r.raw(M.size());
     if (!std::equal(magic.begin(), magic.end(), M.begin()))
@@ -1199,11 +1217,14 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
                 return true;
         }
         std::error_code error;
-        const auto size = std::filesystem::file_size(path(id), error);
+        const auto p = path(id);
+        const auto size = std::filesystem::file_size(p, error);
         const bool present = !error && size > 0;
         if (present) {
             std::lock_guard lock(m_);
             present_loose_.insert(id);
+        } else if (!error) {
+            (void)prune_empty_loose(id, p);
         }
         return present;
     } catch (...) {
@@ -1739,7 +1760,8 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
     const auto flush = [&] {
         if (batch.empty()) return;
         std::lock_guard lock(m_);
-        for (const auto& id : batch) present_loose_.insert(id);
+        for (const auto& id : batch)
+            if (!pruned_loose_.contains(id)) present_loose_.insert(id);
         entries += batch.size();
         batch.clear();
     };
@@ -1782,10 +1804,16 @@ void LocalStore::scan(std::stop_token stop) {
             std::error_code size_error;
             const auto size = it->file_size(size_error);
             if (!size_error) total += size;
-            if (root == objects_ && size > 0) {
+            if (root == objects_) {
                 if (auto id = object_id_from_file_name(name)) {
-                    std::lock_guard lock(m_);
-                    present_loose_.insert(*id);
+                    if (!size_error && size == 0) {
+                        auto object_lock = object_mutex(*id);
+                        std::lock_guard object_guard(*object_lock);
+                        (void)prune_empty_loose(*id, it->path());
+                    } else if (size > 0) {
+                        std::lock_guard lock(m_);
+                        present_loose_.insert(*id);
+                    }
                 }
             }
         }

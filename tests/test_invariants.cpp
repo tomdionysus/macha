@@ -2817,8 +2817,22 @@ MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
     NodeInfo client_info{random_node_id(), "127.0.0.1", "client", free_port()};
     SecureChannel channel(fd, keys, client_info, 64 * 1024);
     (void)channel.client_handshake(TransportLane::control);
-    channel.send_fragment(1, FrameType::foreground, MessageType::get_object, true, true, {});
-    std::this_thread::sleep_for(100ms);
+    // The receiver rejects the frame on its header and closes the session
+    // with the rest unread, so the remainder of this send may meet a closed
+    // socket: that is the rejection, seen from this side.
+    try {
+        channel.send_fragment(1, FrameType::foreground, MessageType::get_object, true, true, {});
+    } catch (const std::runtime_error&) {
+    }
+
+    // The session ends without a reply; once it has, nothing can be dispatched.
+    timeval timeout{5, 0};
+    REQUIRE(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    uint8_t byte = 0;
+    const auto received = ::recv(fd, &byte, 1, 0);
+    const bool timed_out = received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+    CHECK(received <= 0);
+    CHECK(!timed_out);
 
     // Object traffic on a negotiated CONTROL channel must be rejected before
     // dispatch; sender-side lane selection alone is not protocol enforcement.

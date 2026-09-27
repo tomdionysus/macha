@@ -15,6 +15,15 @@ extern "C" {
 #define MACHA_TEST_GLIBC 1
 #endif
 #endif
+// Under a sanitizer, malloc is the sanitizer's: glibc's arena bound does not
+// apply and is reported unsupported.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#undef MACHA_TEST_GLIBC
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#undef MACHA_TEST_GLIBC
+#endif
+#endif
 
 using namespace macha::test_support;
 

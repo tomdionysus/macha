@@ -1,5 +1,83 @@
 # Current release
 
+## 0.66.0 — Catalogue ignore terms; torrent jobs saved on change; shutdown order, simultaneous connects, ingest clear, empty objects (development)
+
+**The cataloguer skips release samples.** `catalogue.scanner.ignore_terms`
+(default `[sample]`) lists words that keep a file out of the catalogue: a file
+is not catalogued when a word of its path below the scanner root -- a run of
+letters and digits -- equals a term, ignoring case. `Sample/film.mkv` and
+`film-sample.mkv` are skipped, `Samples of Joy.mkv` is not. An ingest hint for
+such a file ends `no_match` with the new result code `ignored_term`.
+
+**The HTTP reactor no longer reads a connection it has just closed.** After
+`on_readable()` or `flush()` the loop asked whether the connection survived by
+reading `connection.id` -- from the `Connection` those calls may just have
+destroyed, on any client that disconnected mid-request. A heap-use-after-free,
+found when an AddressSanitizer build of the node crashed within seconds of
+serving clients; the existing HTTP tests catch it under ASan (six reports,
+none now). The loop now asks by the id it took before the call.
+
+**A sanitizer build of the node starts.** `MACHA_SANITIZE` builds replace
+malloc, so glibc's arena bound has nothing to apply to; a node refused to
+start with "cannot apply glibc allocator arena limit". The bound is now
+reported unsupported there, as on a system without glibc.
+
+**A peer connection's threads start once the connection is owned.** Each
+connection started its reader and writer from its constructor, so an inbound
+request arriving straight after the handshake could be dispatched before the
+connection had an owner (`shared_from_this()` threw after the request was
+counted, losing it and leaving the in-flight count high), and a writer
+retiring early could reach `close()` while the thread handles were still being
+assigned. Found by ThreadSanitizer (82 reports across the RPC and invariant
+tests, none after). The threads now start from the owner once construction
+has finished, and each waits until both handles are assigned.
+
+**Torrent job state is written when it changes.** The torrent worker stamped
+and saved every active job on every 500 ms tick: 40 rewrites of a 28.6 KB
+`jobs.json` in 20 s on gbni-1 with nothing downloading. A job's
+`updated_unix_ms` now moves only when its persisted record changes, and the
+file is written when a record changes; transfer counters alone are written at
+most every 30 s.
+
+
+**Restarting gbni-1 failed 38 torrent extent publications.** `Service::stop`
+withdrew DATA admission, stopped the local writer and cancelled outbound RPC
+before it stopped the subsystem plugins, so for the seconds between, the
+torrent subsystem went on publishing verified extents into a node that
+refused every write ("object replication quorum unavailable", each logged
+as failed and retried). Nothing was lost: an extent that is not journalled is
+published again when the torrent resumes.
+
+- Once startup has finished, a stopping node cancels filesystem I/O, then
+  stops the torrent coordinator, the cluster job view and every plugin while
+  it still admits DATA work and outbound RPC, and only then tears itself
+  down. A stop during startup keeps the old order.
+- The torrent backend hands its publish hook the backend's abort flag, which
+  the store honours, so a write in flight when the torrent subsystem stops
+  ends at once instead of holding the stop; such a write is not reported as
+  a failure.
+
+**A call made while two nodes connect to each other waits for the survivor.**
+Two nodes that dial each other at once keep one session per lane: the lower
+id keeps the one it dialled and retires the other. The higher id's call could
+find its own dial already retired and the peer's session not yet registered,
+and failed with "no canonical RPC route to peer". It now waits, up to the
+connect timeout, for the peer's session.
+
+**Clearing a cancelled ingest job no longer fails it.** `clear()` removed the
+staging files of a job whose worker was still copying, so the worker's next
+write failed and recorded the cancelled job as failed, and the clear returned
+false. Files of an active job are now left to its worker, which removes them
+as it lets go, and a failure met after the operator's cancel no longer
+replaces it.
+
+**Empty object files are pruned.** Every stored object carries a fixed header,
+so a zero-byte object file is never an object; only a crash (rename durable,
+data not) or external truncation leaves one. A read, a presence check that
+stats, or the startup accounting scan that finds one now removes it and
+reports the object absent, so repair fetches a good copy; before, a reopened
+store reported it present by name and every read of it failed.
+
 ## 0.65.0 — Unknown configuration keys are refused; playback headers moved into the body (development)
 
 Three custom headers had crept into playback:

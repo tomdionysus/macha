@@ -190,6 +190,14 @@ class IngestManager {
     // claim the same job, and cancel() can still tell whether cleanup is its
     // own responsibility or the owning worker's.
     std::set<std::string, std::less<>> active_job_ids_;
+    // Cleanup a clear() owes a job whose worker was still inside it: its
+    // partials (and, per the clear, its source) are removed by the worker as
+    // it lets go of the job, never underneath it.
+    struct ClearedWhileActive {
+        IngestJob job;
+        bool delete_source{};
+    };
+    std::map<std::string, ClearedWhileActive, std::less<>> cleared_while_active_;
     // High-water mark of concurrently claimed jobs. Monotonic, so it answers
     // "did this pool ever actually run jobs in parallel?" without having to
     // catch the moment in a sample.

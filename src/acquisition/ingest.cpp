@@ -940,6 +940,7 @@ bool IngestManager::cancel(std::string_view id) {
 
 bool IngestManager::clear(std::string_view id) {
     IngestJob terminal_job;
+    bool active = false;
     {
         std::lock_guard lock(mutex_);
         auto it = jobs_.find(std::string(id));
@@ -949,14 +950,20 @@ bool IngestManager::clear(std::string_view id) {
             it->second.state != IngestJobState::failed)
             return false;
         terminal_job = it->second;
+        active = active_job_ids_.contains(it->first);
     }
 
     const bool delete_source = terminal_job.delete_source_on_clear &&
         (terminal_job.state == IngestJobState::completed || terminal_job.source_owned);
-    if (delete_source) cleanup_source(terminal_job);
-    cleanup_partials(terminal_job);
+    // A cancelled job's worker may still be copying: its files are its own
+    // until it lets go, which it does at its next control check.
+    if (!active) {
+        if (delete_source) cleanup_source(terminal_job);
+        cleanup_partials(terminal_job);
+    }
     (void)hints_.erase_origin("ingest", terminal_job.id);
 
+    bool owed = false;
     {
         std::lock_guard lock(mutex_);
         auto it = jobs_.find(std::string(id));
@@ -964,6 +971,16 @@ bool IngestManager::clear(std::string_view id) {
         if (it->second.state != terminal_job.state) return false;
         jobs_.erase(it);
         save_state_locked();
+        if (active) {
+            if (active_job_ids_.contains(terminal_job.id))
+                cleared_while_active_[terminal_job.id] = {terminal_job, delete_source};
+            else
+                owed = true; // the worker let go in between
+        }
+    }
+    if (owed) {
+        if (delete_source) cleanup_source(terminal_job);
+        cleanup_partials(terminal_job);
     }
     Log::info("ingest cleared id=" + terminal_job.id +
               (delete_source ? " source_deleted=true" : " source_deleted=false"));
@@ -1109,12 +1126,25 @@ void IngestManager::loop(std::stop_token stop) {
         process_job(selected, stop);
         IngestJob after;
         bool have_after = false;
+        std::optional<ClearedWhileActive> cleared;
         {
             std::lock_guard lock(mutex_);
             active_job_ids_.erase(selected);
             if (auto it = jobs_.find(selected); it != jobs_.end()) {
                 after = it->second;
                 have_after = true;
+            }
+            if (auto owed = cleared_while_active_.find(selected); owed != cleared_while_active_.end()) {
+                cleared = std::move(owed->second);
+                cleared_while_active_.erase(owed);
+            }
+        }
+        if (cleared) {
+            try {
+                if (cleared->delete_source) cleanup_source(cleared->job);
+                cleanup_partials(cleared->job);
+            } catch (const std::exception& e) {
+                Log::warn("ingest clear cleanup failed id=" + cleared->job.id + ": " + e.what());
             }
         }
         // Releasing a claim can make a blocked/queued job selectable to a
@@ -1253,10 +1283,13 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.eta_seconds.reset();
         job.updated_unix_ms = now_ms();
         std::lock_guard lock(mutex_);
-        if (auto it = jobs_.find(id); it != jobs_.end()) {
-            it->second = job;
-            try { save_state_locked(); } catch (...) {}
-        }
+        auto it = jobs_.find(id);
+        // The operator's cancel stands: a failure met while the worker had not
+        // yet noticed it is not the job's outcome.
+        if (it == jobs_.end() || it->second.state == IngestJobState::cancelled)
+            return;
+        it->second = job;
+        try { save_state_locked(); } catch (...) {}
         Log::warn("ingest failed id=" + id + ": " + e.what());
     }
 }

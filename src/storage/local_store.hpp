@@ -126,6 +126,9 @@ class LocalStore {
     // cost ~5 ms each: 3,201 extents took 16 s per commit (gbni-1,
     // 2026-09-07). ~40 B per object; a 200k-object node spends ~8 MB.
     mutable std::set<ObjectId> present_loose_;
+    // Objects pruned as empty files, so the presence index warmed from
+    // directory names does not claim them again; a put clears the entry.
+    mutable std::set<ObjectId> pruned_loose_;
     mutable std::deque<std::pair<uint64_t, ObjectId>> verified_loose_order_;
     mutable uint64_t verified_loose_sequence_{};
     std::atomic_uint64_t loose_reaffirmation_fast_paths_{};
@@ -197,6 +200,11 @@ class LocalStore {
     static std::optional<LooseStamp> loose_stamp(const std::filesystem::path&);
     void remember_verified_loose_locked(const ObjectId&, const LooseStamp&) const;
     void forget_verified_loose_locked(const ObjectId&) const;
+    // Removes a zero-byte loose object file and forgets the object. Every
+    // stored object carries a fixed header, so an empty file is never an
+    // object: only a crash (rename durable, data not) or external truncation
+    // leaves one. Caller holds the object's mutex, not m_. True if pruned.
+    bool prune_empty_loose(const ObjectId&, const std::filesystem::path&) const;
     std::shared_ptr<std::mutex> object_mutex(const ObjectId&) const;
 
   public:

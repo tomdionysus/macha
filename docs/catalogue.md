@@ -133,7 +133,7 @@ A batch reads one namespace snapshot for all its hints. A hint created after tha
 `processing`, `deferred`, `catalogued`, `no_match`, `failed`), attempt and
 failure counts, `candidate_cursor`, `provider`, `media_id`,
 `catalogue_item_ids` and `origins`. `result` is a code
-(`matched`, `outside_catalogue_roots`, `not_media_file`,
+(`matched`, `outside_catalogue_roots`, `ignored_term`, `not_media_file`,
 `no_media_candidate`, `no_provider_match`, `already_stored`,
 `profile_prepared`, `media_not_live`, `manual_existing_item`,
 `manual_metadata`, or `null`), and `error_code` sits beside `error`
