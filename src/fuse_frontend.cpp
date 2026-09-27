@@ -5188,7 +5188,7 @@ struct FuseFrontend::State {
         // Local write durability is independent of distributed publication. It
         // must be available before broker write workers can accept callbacks.
         durability_worker = std::jthread([this](std::stop_token stop) {
-            run_supervised("fuse-durability", [this, stop] { durability_loop(stop); });
+            run_supervised_loop("fuse-durability", stop, [this, stop] { durability_loop(stop); });
         });
 
         // Guarantee at least one independent worker for each operation class,
@@ -5207,12 +5207,12 @@ struct FuseFrontend::State {
         }
 
         namespace_worker = std::jthread([this](std::stop_token stop) {
-            run_supervised("fuse-namespace", [this, stop] { namespace_loop(stop); });
+            run_supervised_loop("fuse-namespace", stop, [this, stop] { namespace_loop(stop); });
         });
         data_workers.reserve(config.commit_workers);
         for (size_t i = 0; i < config.commit_workers; ++i)
             data_workers.emplace_back([this](std::stop_token stop) {
-                run_supervised("fuse-data", [this, stop] { data_loop(stop); });
+                run_supervised_loop("fuse-data", stop, [this, stop] { data_loop(stop); });
             });
         // The bound and its worst-case memory cost, so an operator can compare
         // it against runtime.loader_memory_reserve_bytes without arithmetic.

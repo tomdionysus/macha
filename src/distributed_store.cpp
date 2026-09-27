@@ -1222,7 +1222,7 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
 
 DistributedStore::DistributedStore(NodeRuntime& n) : n_(n) {
     prompt_thread_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("prompt-replication", [this, stop] { prompt_replication_loop(stop); });
+        run_supervised_loop("prompt-replication", stop, [this, stop] { prompt_replication_loop(stop); });
     });
 }
 

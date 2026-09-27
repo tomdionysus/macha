@@ -193,7 +193,9 @@ class TorrentService {
         bool placed{};
         // Why it was not placed: a snake_case code (node_not_member,
         // node_refused, node_unreachable, node_did_not_start, missing_uri,
-        // add_failed, or the peer's own), and the English message beside it.
+        // add_failed, torrent_already_added, or the peer's own), and the
+        // English message beside it. For torrent_already_added, job_id is
+        // the job on node_id that already holds the torrent.
         std::string reason;
         std::string error;
     };

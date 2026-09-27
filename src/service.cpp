@@ -729,7 +729,7 @@ void Service::initialise_services(std::stop_token stop) {
         metadata_convergence_.request(node_.known_metadata_generation());
         node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
         maintenance_ = std::jthread([this](std::stop_token maintenance_stop) {
-            run_supervised("service-maintenance", [this, maintenance_stop] { loop(maintenance_stop); });
+            run_supervised_loop("service-maintenance", maintenance_stop, [this, maintenance_stop] { loop(maintenance_stop); });
         });
 
         services_ready_.store(true, std::memory_order_release);
@@ -757,7 +757,7 @@ void Service::start() {
 
     node_.start();
     startup_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("service-startup", [this, stop] { initialise_services(stop); });
+        run_supervised_once("service-startup", [this, stop] { initialise_services(stop); });
     });
 }
 

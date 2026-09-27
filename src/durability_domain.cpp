@@ -63,7 +63,7 @@ DurabilityDomain::DurabilityDomain(uint64_t id, std::filesystem::path representa
         throw std::runtime_error("durability batch window cannot be negative");
     add_representative(std::move(representative));
     worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("durability-domain", [this, stop] { loop(stop); });
+        run_supervised_loop("durability-domain", stop, [this, stop] { loop(stop); });
     });
 }
 

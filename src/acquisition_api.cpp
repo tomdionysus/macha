@@ -199,6 +199,18 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             }
 
             const auto placement = torrents->add_on(target, uri, search_result);
+            if (!placement.placed && placement.reason == "torrent_already_added") {
+                // One job per torrent per node (0.63.0). The holder is named
+                // in the same fields a 202 uses, so a client can go straight
+                // to it.
+                Json::Object root;
+                root["status"] = std::string("torrent_already_added");
+                root["error"] = Json::Object{{"code", std::string("torrent_already_added")},
+                                             {"message", placement.error}};
+                root["id"] = placement.job_id;
+                root["node_id"] = to_string(placement.node_id);
+                return http_json(409, Json(std::move(root)).dump());
+            }
             if (!placement.placed) {
                 // An unreachable or unknown target is refused rather than
                 // quietly downloaded here. A job that lands somewhere the
