@@ -336,13 +336,18 @@ class CatalogueScanner {
         size_t catalogued{};
     };
 
-    std::optional<PreparedHintMatch> prepare_hint(
-        const CatalogueHint&, std::stop_token, const MetadataSnapshot& namespace_snapshot,
-        DistributedStore::DurabilityBatch& artwork_batch);
     HintBatchResult process_hint_batch(std::stop_token, size_t max_hints);
     CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const;
 
   public:
+    // One hint against one namespace snapshot, as a batch prepares it. Public
+    // so a test can hand it the snapshot and its age. `snapshot_taken_unix_ms`:
+    // when the batch took the snapshot; a hint created after it may name a
+    // file the snapshot cannot contain, and is deferred rather than failed.
+    std::optional<PreparedHintMatch> prepare_hint(
+        const CatalogueHint&, std::stop_token, const MetadataSnapshot& namespace_snapshot,
+        uint64_t snapshot_taken_unix_ms, DistributedStore::DurabilityBatch& artwork_batch);
+
     CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueHintQueue&,
                      CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
                      std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5),

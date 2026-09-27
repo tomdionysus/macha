@@ -37,6 +37,7 @@ void check_snapshot_equal(const MetadataSnapshot& actual, const MetadataSnapshot
     CHECK(actual.identity_resets == expected.identity_resets);
     CHECK(actual.merge_parents == expected.merge_parents);
     CHECK(actual.conflicts == expected.conflicts);
+    CHECK(actual.torrent_requests == expected.torrent_requests);
 }
 
 MACHA_FAST_TEST("models", test_metadata_delta_state_model) {

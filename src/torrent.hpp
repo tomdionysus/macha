@@ -72,6 +72,13 @@ struct TorrentJob {
 // parse_torrent_job() in torrent.cpp (the on-disk jobs.json persistence
 // shape, file-local) since both live in that translation unit.
 Json torrent_job_api_json(const TorrentJob&);
+// jobs.json persistence shape, and the cluster RPC shape (persistence plus
+// the transient rates, peers and ETA). Core decodes peers' replies with the
+// wire parser; the plugin writes both.
+Json torrent_job_json(const TorrentJob&);
+TorrentJob parse_torrent_job(const Json&);
+Json torrent_job_wire_json(const TorrentJob&);
+TorrentJob parse_torrent_job_wire(const Json&);
 
 // The listen_interfaces string the download engine binds, in libtorrent's own
 // syntax. An explicit torrent.listen_interfaces wins; otherwise the node's
@@ -88,6 +95,8 @@ struct ClusterTorrentJob {
 struct TorrentActionResult {
     bool exists{};
     bool changed{};
+    // The job is known to be on a node that could not be reached.
+    bool unreachable{};
     std::optional<ClusterTorrentJob> updated;
 };
 
@@ -174,49 +183,48 @@ class TorrentService {
     virtual bool cancel(std::string_view id) = 0;
     virtual bool clear(std::string_view id) = 0;
 
-    // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
-    // RPC survey per active peer. An unreachable/erroring peer is logged and
-    // skipped, never fails the whole call.
-    // Starts a job on a named node rather than on whichever node happened to
-    // receive the request. Until this existed, placement was "wherever the
-    // POST landed", which is invisible from a client configured with one
-    // address and impossible to control from a UI behind a proxy -- and there
-    // is every reason to care which node downloads: they differ in disk, in
-    // memory, and in what else they are serving at the time.
-    //
-    // An empty node id means here. An unknown or unreachable node is reported
-    // rather than silently downloaded locally, because a job that quietly
-    // lands somewhere else is worse than one that fails to start.
+    // Adds a torrent on this node, the one the placement chose. Which node
+    // downloads is decided by the caller (ClusterJobView), never here: they
+    // differ in disk, in memory, and in what else they are serving.
     struct Placement {
         NodeId node_id;
         std::string job_id;
         bool placed{};
         // Why it was not placed: a snake_case code (node_not_member,
-        // node_refused, node_unreachable, node_did_not_start, missing_uri,
-        // add_failed, torrent_already_added, or the peer's own), and the
-        // English message beside it. For torrent_already_added, job_id is
-        // the job on node_id that already holds the torrent.
+        // node_not_torrent_capable, node_refused, node_unreachable,
+        // node_did_not_start, missing_uri, add_failed,
+        // torrent_already_added, or the peer's own), and the English message
+        // beside it. For torrent_already_added, job_id is the job on node_id
+        // that already holds the torrent.
         std::string reason;
         std::string error;
+        // The job as the placing node recorded it, when it was placed.
+        std::optional<TorrentJob> job;
     };
     // `search_result` is true only for a URI resolved from a torrent search
     // result (an acquisition_ref), which may be a trusted provider's .torrent
-    // URL the placing node fetches; anything else must be a magnet.
-    virtual Placement add_on(const NodeId& node, std::string_view magnet_or_uri,
-                             bool search_result) = 0;
-
-    virtual std::vector<ClusterTorrentJob> jobs_cluster_wide() const = 0;
-    // Local job(id) first (zero added latency for the common owned-here
-    // case); only surveys peers when the job is locally absent.
-    virtual std::optional<ClusterTorrentJob> job_cluster_wide(std::string_view id) const = 0;
-    // Each: local action first; only surveys peers when the job is locally
-    // absent. The first peer reporting the job exists is authoritative,
-    // preserving the local 404-vs-409 distinction cluster-wide.
-    virtual TorrentActionResult pause_cluster_wide(std::string_view id) = 0;
-    virtual TorrentActionResult resume_cluster_wide(std::string_view id) = 0;
-    virtual TorrentActionResult retry_cluster_wide(std::string_view id) = 0;
-    virtual TorrentActionResult cancel_cluster_wide(std::string_view id) = 0;
-    virtual TorrentActionResult clear_cluster_wide(std::string_view id) = 0;
+    // URL this node fetches; anything else must be a magnet.
+    virtual Placement place(std::string_view magnet_or_uri, bool search_result) = 0;
+    // What this node offers for new jobs, for GET /api/v1/torrents/nodes.
+    struct Offer {
+        bool accepting{};
+        std::string not_accepting_reason; // slots_full, staging_full, draining
+        size_t max_active{};
+        size_t active_jobs{};
+    };
+    virtual Offer offer() const = 0;
+    // A URI's canonical magnet, info hash and name, without adding it. A
+    // search result's .torrent URL is fetched here (0.64.0): only a node
+    // running the plugin can parse metainfo.
+    struct Resolved {
+        std::string magnet;
+        std::string info_hash;
+        std::string name;
+    };
+    virtual Resolved resolve(std::string_view uri, bool search_result) = 0;
+    // Adds the torrent of a cluster request this node has claimed, under the
+    // request's id; a job with that id already here is left as it is.
+    virtual std::string adopt(std::string_view id, std::string_view magnet, bool held) = 0;
 };
 
 std::optional<std::string> sanitize_magnet_uri(std::string_view);

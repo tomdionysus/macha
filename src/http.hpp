@@ -133,7 +133,9 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
 // labelled content (which says a client bug is a property of the viewer's
 // film) or node (which sends the client round the whole cluster collecting
 // its own mistake).
-enum class FailureScope { content, node, request };
+// `cluster` (0.64.0): the fault is cluster-wide -- every node would answer
+// the same, so walking to another node gains nothing.
+enum class FailureScope { content, node, request, cluster };
 const char* failure_scope_name(FailureScope) noexcept;
 
 // The axes a client needs from a failure, stated rather than inferred.

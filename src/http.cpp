@@ -401,6 +401,7 @@ const char* failure_scope_name(FailureScope scope) noexcept {
     case FailureScope::content: return "content";
     case FailureScope::node: return "node";
     case FailureScope::request: return "request";
+    case FailureScope::cluster: return "cluster";
     }
     return "node";
 }

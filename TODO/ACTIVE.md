@@ -33,6 +33,44 @@ the decisions waiting on the operator.
 
 ## The queue
 
+0. **Torrents belong to the cluster (0.64.0), built, not yet deployed.**
+   Plan and spec in
+   [2026-09-27-cluster-torrent-queue-plan.md](2026-09-27-cluster-torrent-queue-plan.md).
+   Protocol 22: both nodes must be upgraded together. Announce the final
+   API (differences listed at the end of the plan) before deploying.
+
+0a. **Found 2026-09-27 watching the Martian imports, not yet fixed:**
+   - **Release samples are imported as library media.** The 720p NeZu
+     torrent's `Sample/...x264-sample.mkv` (11 MB, 63 s) was imported beside
+     the film and catalogued as a fourth source of `tmdb:movie:286217`. The
+     ingest must skip samples: a `Sample` directory, or a name with a
+     `-sample` / `.sample` / `sample.` component (case-insensitive). Removed
+     from the library by hand at the operator's request, 2026-09-27.
+   - **Destination folders are matched case-sensitively.** The same film
+     landed in `/Movies/the martian (2015)/` beside `/Movies/The Martian
+     (2015)/`, because the folder name came from a lowercase release name.
+     Reuse an existing folder that matches case-insensitively, keeping its
+     spelling. The 720p file is still in the lowercase folder.
+   - (Fixed in 0.64.0: batch race, failed hints kept on clear, clear's
+     payload delete off the request path.)
+   - **Catalogue batch judges hints against an older snapshot.** A batch
+     takes one namespace snapshot at its first hint and keeps claiming hints
+     enqueued after it; a file created mid-batch reads `path_missing`, which
+     is terminal. Colony S02E13 (`macha:2950679dabef...`) is uncatalogued
+     this way, and its hint was then deleted when Colony was cleared, so
+     nothing will retry it. Fix: a hint newer than the batch snapshot waits
+     for the next batch; missing from an older snapshot defers, not fails.
+   - **Clearing a job deletes the catalogue's hints** (above), and **clear
+     deletes the payload in the request thread**: 6-34 s on a busy DATA
+     disk, stacks captured at `__wait_on_buffer` under `unlinkat`. Both are
+     in the cluster-torrent plan, phase 4.
+   - **Prompt replication pushes into a full node for ever.** Every new
+     object is sent to fi-1, whose 10G backend is full; the refused put is
+     retried every 30 s with no limit (up to 4096 queued), about 2 MB/s of
+     WAN traffic into Finland, and the loop's counters are exposed nowhere.
+     Check the destination's gossiped free space, back off after a
+     no-space refusal, expose `prompt_replication_stats()`.
+
 1. **Repair's credit gates stock-taking, not just transfer (measured, fix
    proposed, awaiting the operator's go).** 0.62.3's `diagnostics.repair
    .pass_gates` on gbni-1: every pass turned away by `credit` (46 of 46 in

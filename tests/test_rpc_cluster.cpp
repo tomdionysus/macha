@@ -4920,7 +4920,11 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
     c1.ingest.enabled = c2.ingest.enabled = true;
     c1.ingest.source_roots = {source_dir};
-    c1.torrent.enabled = c2.torrent.enabled = true;
+    // Node 2 runs no torrents (0.64.0): it must still list node 1's, act on
+    // them, place a new one there, and refuse one pinned to itself -- the
+    // fi-1 case, which until 0.64.0 answered every torrent route 503.
+    c1.torrent.enabled = true;
+    c2.torrent.enabled = false;
     // The download engine is a plugin: load the one this build produced, so
     // the test exercises the real dlopen/build-identity/factory path rather
     // than anything linked into the test binary. It gets a directory holding
@@ -4983,11 +4987,6 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     // ready rather than synchronously with it.
     std::shared_ptr<TorrentService> s1_torrents;
     REQUIRE(wait_until([&] { return (s1_torrents = s1.torrents()) != nullptr; }, 5s));
-    // The cases below list and act through node 2, whose own torrent
-    // subsystem must be running too: until it is, node 2 correctly answers
-    // 503 "torrent subsystem is not available on this node" (fi-1,
-    // 2026-09-25, caught by the status print at the list request).
-    REQUIRE(wait_until([&] { return s2.torrents() != nullptr; }, 5s));
     const auto torrent_id = s1_torrents->add(
         "magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
     // A torrent job has no equivalent fast-fail path (add() only creates the
@@ -5010,6 +5009,10 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         return Json::parse(
             std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     };
+
+    // Node 2 answers from its view of the cluster, refreshed every 5 s in the
+    // background; take a poll now rather than sleep through an interval.
+    s2.cluster_jobs().refresh_now();
 
     // --- Ingest: list visibility from the non-owning node ---
     {
@@ -5074,50 +5077,108 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
                reported == "failed"));
     }
 
-    // --- Torrent: list visibility from the non-owning node ---
+    // --- Torrent: a job node 1 already had becomes a cluster request its
+    // coordinator claims for itself (0.64.0), visible from node 2 ---
+    s1.torrent_coordinator().pass_now();
+    REQUIRE(wait_until([&] { return s2.torrent_coordinator().request(torrent_id).has_value(); }, 10s));
+    s2.cluster_jobs().refresh_now();
     {
         const auto response = get(s2.acquisition_api(), "/api/v1/torrents/jobs");
-        if (response.status != 200)
-            std::cerr << "torrent list from the non-owning node: " << response.status << " "
-                      << std::string(response.body.begin(), response.body.end()) << "\n";
         REQUIRE(response.status == 200);
         const auto parsed = body_json(response);
-        const auto* jobs = parsed.find("jobs");
-        REQUIRE(jobs != nullptr);
         bool found = false;
-        for (const auto& job : jobs->asArray()) {
-            const auto* id = job.find("id");
-            if (!id || id->asString() != torrent_id) continue;
+        for (const auto& job : parsed.find("jobs")->asArray()) {
+            if (job.find("id")->asString() != torrent_id) continue;
             found = true;
-            const auto* node_id = job.find("node_id");
-            REQUIRE(node_id != nullptr);
-            CHECK(node_id->asString() == node1_id);
-            const auto* state = job.find("state");
-            REQUIRE(state != nullptr);
-            CHECK(state->asString() == "paused");
+            CHECK(job.find("node_id")->asString() == node1_id);
+            CHECK(job.find("phase")->asString() == "downloading");
+            CHECK(job.find("desired")->asString() == "paused");
+            CHECK(job.find("state")->asString() == "paused"); // node 1's live state, via the view
+            CHECK(job.find("desired_applied")->asBool());
+            CHECK(!job.find("live_as_of_unix_ms")->isNull());
         }
         CHECK(found);
     }
 
-    // --- Torrent: resume from the non-owning node actually lands on node 1 ---
+    // --- Torrent: resume through node 2 is intent; node 1 applies it ---
     {
         const auto response =
             post(s2.acquisition_api(), "/api/v1/torrents/jobs/" + torrent_id + "/resume");
-        REQUIRE(response.status == 200);
+        REQUIRE(response.status == 202);
         const auto parsed = body_json(response);
-        const auto* node_id = parsed.find("node_id");
-        REQUIRE(node_id != nullptr);
-        CHECK(node_id->asString() == node1_id);
-        const auto* state = parsed.find("state");
-        REQUIRE(state != nullptr);
-        // As with the ingest resume above: the reply is node 1's job re-read
-        // after resume() released its lock, and the worker may already have
-        // moved it on -- a released magnet is started by libtorrent at once
-        // and reads `metadata`. What it must never say is a state resume
-        // cannot lead to.
-        const auto reported = state->asString();
-        CHECK((reported == "queued" || reported == "metadata" || reported == "downloading" ||
-               reported == "verify_queued" || reported == "verifying"));
+        CHECK(parsed.find("desired")->asString() == "active");
+        CHECK(parsed.find("node_id")->asString() == node1_id);
+        REQUIRE(wait_until([&] {
+            s1.torrent_coordinator().pass_now();
+            const auto job = s1_torrents->job(torrent_id);
+            return job && job->state != TorrentJobState::paused;
+        }, 10s));
+    }
+
+    // --- Torrent: the capable nodes, as node 2 sees them: node 1 only ---
+    {
+        const auto response = get(s2.acquisition_api(), "/api/v1/torrents/nodes");
+        REQUIRE(response.status == 200);
+        const auto nodes = body_json(response).find("nodes")->asArray();
+        REQUIRE(nodes.size() == 1);
+        CHECK(nodes.front().find("node_id")->asString() == node1_id);
+        CHECK(!nodes.front().find("local")->asBool());
+        CHECK(nodes.front().find("reachable")->asBool());
+        CHECK(nodes.front().find("accepting")->asBool());
+        CHECK(nodes.front().find("max_active")->asUInt64() == c1.torrent.max_active);
+        CHECK(nodes.front().find("staging")->find("limit_bytes")->asUInt64() > 0);
+    }
+
+    // --- Torrent: added through node 2, which runs none; node 1 claims it ---
+    {
+        auto add = [&](const std::string& body) {
+            HttpRequest request;
+            request.method = "POST";
+            request.path = "/api/v1/torrents/jobs";
+            request.body = Bytes(body.begin(), body.end());
+            return s2.acquisition_api().handle(request);
+        };
+        // Pinned to node 2 itself: it cannot run torrents.
+        const auto here = add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444","node_id":")" +
+                              to_string(s2.node().node_id()) + R"("})");
+        CHECK(here.status == 409);
+        CHECK(body_json(here).find("error")->find("reason")->asString() == "node_not_torrent_capable");
+
+        const auto queued = add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Queued"})");
+        REQUIRE(queued.status == 202);
+        const auto body = body_json(queued);
+        CHECK(body.find("node_id")->isNull()); // the cluster chooses
+        const auto queued_id = body.find("id")->asString();
+        REQUIRE(body.find("job")->isObject());
+        CHECK(body.find("job")->find("phase")->asString() == "awaiting_node");
+        // Listed on node 2 at once: the 202 came after metadata acceptance.
+        bool listed = false;
+        const auto listing = body_json(get(s2.acquisition_api(), "/api/v1/torrents/jobs"));
+        for (const auto& job : listing.find("jobs")->asArray())
+            if (job.find("id")->asString() == queued_id) listed = true;
+        CHECK(listed);
+        // Node 1, the only capable node, claims and starts it.
+        REQUIRE(wait_until([&] {
+            s1.torrent_coordinator().pass_now();
+            return s1_torrents->job(queued_id).has_value();
+        }, 15s));
+        REQUIRE(wait_until([&] {
+            const auto r = s2.torrent_coordinator().request(queued_id);
+            return r && r->claim && to_string(r->claim->node_id) == node1_id;
+        }, 10s));
+
+        // The same torrent again, through either node, is the one job.
+        const auto again = add(R"({"magnet":"magnet:?xt=urn:btih:4444444444444444444444444444444444444444"})");
+        CHECK(again.status == 409);
+        CHECK(body_json(again).find("id")->asString() == queued_id);
+
+        // Cancelled through node 2; node 1 stops it and says so.
+        REQUIRE(post(s2.acquisition_api(), "/api/v1/torrents/jobs/" + queued_id + "/cancel").status == 202);
+        REQUIRE(wait_until([&] {
+            s1.torrent_coordinator().pass_now();
+            const auto r = s2.torrent_coordinator().request(queued_id);
+            return r && r->phase == TorrentPhase::cancelled;
+        }, 15s));
     }
 
     // --- A job that exists nowhere still 404s cluster-wide, not just locally ---
@@ -5128,11 +5189,23 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 
     // --- Partial-peer-failure tolerance: node 1 alone still answers with its
     // own jobs once node 2 is unreachable, instead of erroring the request ---
+    const auto node2_id = to_string(s2.node().node_id());
+    s1.cluster_jobs().refresh_now(); // node 1 has now heard from node 2 at least once
     s2.stop();
+    s1.cluster_jobs().refresh_now(); // and now cannot reach it
     {
         const auto response = get(s1.acquisition_api(), "/api/v1/ingest/jobs");
         REQUIRE(response.status == 200);
         const auto parsed = body_json(response);
+        // Node 2 is still accounted for, as unreachable, not silently dropped.
+        bool node2_listed = false;
+        for (const auto& source : parsed.find("sources")->asArray())
+            if (source.find("node_id")->asString() == node2_id) {
+                node2_listed = true;
+                CHECK(!source.find("reachable")->asBool());
+                CHECK(!source.find("as_of_unix_ms")->isNull());
+            }
+        CHECK(node2_listed);
         const auto* jobs = parsed.find("jobs");
         REQUIRE(jobs != nullptr);
         bool found = false;

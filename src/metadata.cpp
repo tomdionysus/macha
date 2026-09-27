@@ -23,6 +23,11 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'}, SM11{'D', 'H', 'T', 'M', 'E', 'T', 'B', '1'},
     SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'}, SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
     SM14{'D', 'H', 'T', 'M', 'E', 'T', 'B', '4'},
+    // 0.64.0: the torrent-request collection. SM15 is the SM13 layout with
+    // every section present, then the requests; SM16 is SM14 then the
+    // requests. Each is written only while the collection is non-empty, so a
+    // cluster that never queues a torrent keeps its exact encodings.
+    SM15{'D', 'H', 'T', 'M', 'E', 'T', 'B', '5'}, SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
     MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'};
@@ -71,6 +76,17 @@ uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
         account_string(total, status.failure_domain);
     }
     account_map_nodes(total, snapshot.identity_resets);
+    account_map_nodes(total, snapshot.torrent_requests);
+    for (const auto& [id, request] : snapshot.torrent_requests) {
+        account_string(total, id);
+        account_string(total, request.id);
+        account_string(total, request.info_hash);
+        account_string(total, request.source);
+        account_string(total, request.name);
+        account_string(total, request.ingest_job_id);
+        account_string(total, request.error_code);
+        account_string(total, request.error);
+    }
     for (const auto& [key, reset] : snapshot.identity_resets) {
         account_string(total, key);
         account_string(total, reset.host);
@@ -349,7 +365,7 @@ int metadata_delta_version(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
     if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
         return 0;
-    if (data[7] < '1' || data[7] > '8')
+    if (data[7] < '1' || data[7] > '9')
         return 0;
     return static_cast<int>(data[7] - '0');
 }
@@ -371,6 +387,7 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 6:
     case 7:
     case 8:
+    case 9:
         // A tree-backed successor encodes as SM14. Without this every delta
         // body fails to reconstruct its record -- encode_snapshot refuses a
         // namespace root -- and every commit falls back to a full record. That
@@ -560,6 +577,28 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
     }
     return pruned;
 }
+void encode_torrent_requests(Writer& w, const MetadataSnapshot& s) {
+    if (s.torrent_requests.size() > max_torrent_requests)
+        throw std::runtime_error("too many torrent requests");
+    w.u32(static_cast<uint32_t>(s.torrent_requests.size()));
+    for (const auto& [id, request] : s.torrent_requests) {
+        if (id != request.id) throw std::runtime_error("torrent request keyed by another id");
+        encode_torrent_request(w, request);
+    }
+}
+
+void decode_torrent_requests(Reader& r, MetadataSnapshot& s) {
+    const auto count = r.u32();
+    if (count > max_torrent_requests)
+        throw DecodeError("too many torrent requests");
+    for (uint32_t i = 0; i < count; ++i) {
+        auto request = decode_torrent_request(r);
+        auto id = request.id;
+        if (id.empty() || !s.torrent_requests.emplace(std::move(id), std::move(request)).second)
+            throw DecodeError("bad torrent request key");
+    }
+}
+
 Bytes encode_snapshot(const MetadataSnapshot& s) {
     // SM13 and earlier have nowhere to put a namespace root, and a snapshot
     // that carries one has its entries in the tree rather than in the map.
@@ -574,14 +613,17 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     // branch-capable participant roster and causal GC/branch floor. Legacy
     // snapshots retain their exact historical encodings until the first
     // protocol-20 policy transition.
-    const bool branch_state = !s.merge_parents.empty() || !s.conflicts.empty();
-    const bool policy_state = s.metadata_write_replicas_required != 0;
-    const bool governance_state = !s.metadata_participants.empty() ||
+    const bool torrent_state = !s.torrent_requests.empty();
+    const bool branch_state = torrent_state || !s.merge_parents.empty() || !s.conflicts.empty();
+    const bool policy_state = torrent_state || s.metadata_write_replicas_required != 0;
+    const bool governance_state = torrent_state || !s.metadata_participants.empty() ||
                                   s.metadata_branch_floor != Hash256{} ||
                                   s.retention_baseline_complete;
     const bool include_node_status =
         policy_state || branch_state || !s.node_status.empty() || !s.identity_resets.empty();
-    if (governance_state)
+    if (torrent_state)
+        w.raw(SM15);
+    else if (governance_state)
         w.raw(SM13);
     else if (policy_state)
         w.raw(SM12);
@@ -654,6 +696,8 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
         w.fixed(s.metadata_branch_floor.bytes);
         w.u8(s.retention_baseline_complete ? 1 : 0);
     }
+    if (torrent_state)
+        encode_torrent_requests(w, s);
     return w.take();
 }
 Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
@@ -689,7 +733,7 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
         throw std::runtime_error("too many metadata participants");
 
     Writer w;
-    w.raw(SM14);
+    w.raw(s.torrent_requests.empty() ? SM14 : SM16);
     w.u32(s.metadata_voters.size());
     for (const auto& v : s.metadata_voters)
         w.fixed(v.bytes);
@@ -734,6 +778,8 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
         w.fixed(participant.bytes);
     w.fixed(s.metadata_branch_floor.bytes);
     w.u8(s.retention_baseline_complete ? 1 : 0);
+    if (!s.torrent_requests.empty())
+        encode_torrent_requests(w, s);
     return w.take();
 }
 
@@ -743,7 +789,7 @@ namespace {
 // namespace is what the plan exists to stop happening on every decode, so the
 // caller that genuinely needs a map asks `attach_namespace` for it and the
 // rest read one path at a time through `namespace_tree_lookup`.
-MetadataSnapshot decode_snapshot_v14(Reader& r) {
+MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests) {
     MetadataSnapshot s;
     const auto voters = r.u32();
     if (voters > 1024)
@@ -841,6 +887,8 @@ MetadataSnapshot decode_snapshot_v14(Reader& r) {
     if (baseline > 1)
         throw DecodeError("bad retention baseline state");
     s.retention_baseline_complete = baseline != 0;
+    if (torrent_requests)
+        decode_torrent_requests(r, s);
     r.finish();
     // No "missing root" check: SM13 proves the namespace is a filesystem by
     // finding "/" in the map, and there is no map here to look in. The
@@ -854,7 +902,11 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     Reader r(d);
     auto m = r.raw(8);
     if (std::equal(m.begin(), m.end(), SM14.begin()))
-        return decode_snapshot_v14(r);
+        return decode_snapshot_v14(r, false);
+    if (std::equal(m.begin(), m.end(), SM16.begin()))
+        return decode_snapshot_v14(r, true);
+    // SM15 is SM13 with every section present, then the torrent requests.
+    const bool v15 = std::equal(m.begin(), m.end(), SM15.begin());
     const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
     const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
     const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
@@ -863,7 +915,7 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     const bool v10 = std::equal(m.begin(), m.end(), SM10.begin());
     const bool v11 = std::equal(m.begin(), m.end(), SM11.begin());
     const bool v12 = std::equal(m.begin(), m.end(), SM12.begin());
-    const bool v13 = std::equal(m.begin(), m.end(), SM13.begin());
+    const bool v13 = v15 || std::equal(m.begin(), m.end(), SM13.begin());
     if (!v5 && !v6 && !v7 && !v8 && !v9 && !v10 && !v11 && !v12 && !v13)
         throw DecodeError("bad snapshot");
     auto nv = r.u32();
@@ -960,7 +1012,8 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     }
     if (v12 || v13) {
         s.metadata_write_replicas_required = r.u32();
-        if (!s.metadata_write_replicas_required)
+        // SM15 writes the floor whether or not one is set.
+        if (!s.metadata_write_replicas_required && !v15)
             throw DecodeError("bad metadata write replica floor");
     }
     if (v13) {
@@ -978,6 +1031,8 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
             throw DecodeError("bad retention baseline state");
         s.retention_baseline_complete = baseline != 0;
     }
+    if (v15)
+        decode_torrent_requests(r, s);
     r.finish();
     auto x = s.entries.find("/");
     if (x == s.entries.end() || x->second.type != EntryType::directory)
@@ -996,9 +1051,13 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
     static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
+    static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
     const bool topology =
         delta.replace_merge_parents.has_value() || delta.replace_conflicts.has_value();
-    const bool v8 = !delta.append_entries.empty();
+    // DLT9 is DLT8 plus a trailing torrent-requests section (0.64.0), written
+    // only when a mutation touches a torrent request.
+    const bool v9 = !delta.upsert_torrent_requests.empty() || !delta.erase_torrent_requests.empty();
+    const bool v8 = v9 || !delta.append_entries.empty();
     // DLT7 whenever DLT5/6 cannot say it: one topology set without the other,
     // or a canonical tombstone order. Both sets together still encode as DLT6
     // so a mixed-version cluster keeps its cheap merges during a rolling
@@ -1008,7 +1067,7 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
                     (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
     const bool v6 = !v7 && topology;
     Writer w;
-    w.raw(v8 ? magic_v8 : v7 ? magic_v7 : v6 ? magic_v6 : magic_v5);
+    w.raw(v9 ? magic_v9 : v8 ? magic_v8 : v7 ? magic_v7 : v6 ? magic_v6 : magic_v5);
     w.u32(delta.mutation_sequences.size());
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         w.fixed(node.bytes);
@@ -1098,6 +1157,15 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
             }
         }
     }
+    if (v9) {
+        w.u32(static_cast<uint32_t>(delta.upsert_torrent_requests.size()));
+        for (const auto& [id, request] : delta.upsert_torrent_requests) {
+            if (id != request.id) throw std::invalid_argument("torrent request keyed by another id");
+            encode_torrent_request(w, request);
+        }
+        w.u32(static_cast<uint32_t>(delta.erase_torrent_requests.size()));
+        for (const auto& id : delta.erase_torrent_requests) w.string(id);
+    }
     return w.take();
 }
 
@@ -1110,6 +1178,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
     static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
+    static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
     Reader r(data);
     auto got = r.raw(magic_v1.size());
     const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
@@ -1117,7 +1186,9 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     const bool v3 = std::equal(got.begin(), got.end(), magic_v3.begin());
     const bool v4 = std::equal(got.begin(), got.end(), magic_v4.begin());
     const bool v5 = std::equal(got.begin(), got.end(), magic_v5.begin());
-    const bool v8 = std::equal(got.begin(), got.end(), magic_v8.begin());
+    // DLT9 is DLT8 plus a trailing torrent-requests section.
+    const bool v9 = std::equal(got.begin(), got.end(), magic_v9.begin());
+    const bool v8 = v9 || std::equal(got.begin(), got.end(), magic_v8.begin());
     // DLT8 is DLT7 plus a trailing append-entries section.
     const bool v7 = v8 || std::equal(got.begin(), got.end(), magic_v7.begin());
     // DLT7 is DLT6 plus a flags byte; everything before the topology sets is
@@ -1287,6 +1358,26 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
                 throw DecodeError("duplicate metadata delta append path");
         }
     }
+    if (v9) {
+        const auto upserts = r.u32();
+        if (upserts > max_torrent_requests)
+            throw DecodeError("too many torrent requests in delta");
+        for (uint32_t i = 0; i < upserts; ++i) {
+            auto request = decode_torrent_request(r);
+            auto id = request.id;
+            if (!delta.upsert_torrent_requests.emplace(std::move(id), std::move(request)).second)
+                throw DecodeError("duplicate torrent request in delta");
+        }
+        const auto erasures = r.u32();
+        if (erasures > max_torrent_requests)
+            throw DecodeError("too many torrent request erasures in delta");
+        for (uint32_t i = 0; i < erasures; ++i) {
+            auto id = r.string(max_torrent_request_text);
+            if (delta.upsert_torrent_requests.contains(id))
+                throw DecodeError("torrent request both written and erased");
+            delta.erase_torrent_requests.push_back(std::move(id));
+        }
+    }
     r.finish();
     return delta;
 }
@@ -1447,6 +1538,19 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
     if (!after.identity_resets.empty() && delta.upsert_identity_resets.empty())
         delta.upsert_identity_resets.emplace(*after.identity_resets.begin());
 
+    // Torrent requests travel whole: a changed one is rewritten, a tombstone
+    // erased after its grace is named. The successor's encoding follows from
+    // its content (SM15/SM16 while any request exists), so no witness is
+    // needed here.
+    for (const auto& [id, request] : after.torrent_requests) {
+        auto it = before.torrent_requests.find(id);
+        if (it == before.torrent_requests.end() || it->second != request)
+            delta.upsert_torrent_requests.emplace(id, request);
+    }
+    for (const auto& [id, _] : before.torrent_requests)
+        if (!after.torrent_requests.contains(id))
+            delta.erase_torrent_requests.push_back(id);
+
     return delta;
 }
 
@@ -1549,6 +1653,10 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
         if (found == out.identity_resets.end() || found->second.epoch < reset.epoch)
             out.identity_resets[key] = reset;
     }
+    for (const auto& [id, request] : delta.upsert_torrent_requests)
+        out.torrent_requests[id] = request;
+    for (const auto& id : delta.erase_torrent_requests)
+        out.torrent_requests.erase(id);
     if (delta.replace_merge_parents)
         out.merge_parents = *delta.replace_merge_parents;
     if (delta.replace_conflicts)
@@ -2135,6 +2243,10 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
                 out.identity_resets[key] = reset;
         }
     }
+    // Torrent requests join per request (torrent_request.hpp): no merge of
+    // them ever becomes an operator conflict.
+    out.torrent_requests =
+        merge_torrent_requests(base.torrent_requests, left.torrent_requests, right.torrent_requests);
 
     // A conflict recorded by an earlier merge whose subject one branch has
     // since rewritten is decided; keeping it (and shipping it in every merge

@@ -715,7 +715,12 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
         });
         removed += before - origins.size();
         recompute_priority(it->second);
-        if (origins.empty() && terminal(it->second.state)) it = hints_.erase(it);
+        // A failed hint outlives the job that raised it (0.64.0): clearing
+        // Colony deleted S02E13's failed hint, the only record that the file
+        // was never catalogued. Only a settled outcome goes with its job.
+        const bool settled = it->second.state == CatalogueHintState::catalogued ||
+                             it->second.state == CatalogueHintState::no_match;
+        if (origins.empty() && settled) it = hints_.erase(it);
         else ++it;
     }
     if (removed) {

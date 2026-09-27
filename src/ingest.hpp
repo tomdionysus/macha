@@ -104,6 +104,9 @@ Json optional_u64(const std::optional<uint64_t>&);
 Json catalogue_summary_json(const IngestJob&, const CatalogueHintSummary* detail = nullptr);
 Json ingest_job_json(const IngestJob&, bool include_files,
                      const CatalogueHintSummary* catalogue_detail = nullptr);
+// The cluster RPC shape: persistence plus the transient rate and ETA.
+Json ingest_job_wire_json(const IngestJob&);
+IngestJob parse_ingest_job_wire(const Json&);
 
 struct ClusterIngestJob {
     NodeId node_id;
@@ -114,6 +117,8 @@ struct ClusterIngestJob {
 struct IngestActionResult {
     bool exists{};
     bool changed{};
+    // The job is known to be on a node that could not be reached.
+    bool unreachable{};
     std::optional<ClusterIngestJob> updated;
 };
 
@@ -124,6 +129,9 @@ struct StagingStatus {
     uint64_t reserved_bytes{};
     uint64_t accounted_bytes{};
 };
+// Staging capacity as the API and the torrent RPC report it: limit, bytes on
+// disk, bytes reserved by running downloads, their sum, and what is left.
+Json staging_capacity_json(const StagingStatus&);
 
 class StagingArea {
     IngestConfig config_;
@@ -142,6 +150,25 @@ class StagingArea {
     void release(std::string_view owner);
     uint64_t reservation(std::string_view owner) const;
     StagingStatus status() const;
+
+    // Deletes a payload inside staging without waiting for it (0.64.0): the
+    // directory is renamed into `.trash` beside it, which is instant on one
+    // filesystem, and empty_trash() deletes it later. Until then it still
+    // counts against the staging limit. A clear that deleted a 75 GB payload
+    // in the request took 34 s on a busy DATA disk (gbni-1, 2026-09-27).
+    // Returns false when the path is not inside staging or could not be moved.
+    bool discard(const std::filesystem::path&);
+    // Deletes everything in `.trash`; what cannot be deleted now stays for
+    // the next call. Returns the number of entries removed.
+    size_t empty_trash();
+    std::filesystem::path trash_path() const;
+    // Wakes the thread that calls empty_trash().
+    void wait_for_trash(std::stop_token, std::chrono::milliseconds);
+
+  private:
+    std::mutex trash_mutex_;
+    std::condition_variable_any trash_cv_;
+    bool trash_pending_{true};
 };
 
 class IngestManager {
@@ -172,6 +199,7 @@ class IngestManager {
     // by callback. That poll owns its own thread so it cannot be starved by
     // busy import workers -- which is exactly what a single shared worker did.
     std::jthread catalogue_worker_;
+    std::jthread trash_worker_;
 
     void load_state();
     void save_state_locked() const;
@@ -206,12 +234,11 @@ class IngestManager {
     void set_blocked(IngestJob&, std::string code, std::string message);
     void cleanup_partials(const IngestJob&);
 
-    // NodeRuntime::set_ingest_bridge() handler bodies. Local-only -- never
-    // call the *_cluster_wide() methods from here, or a peer's survey would
-    // itself re-survey its own peers.
+    // NodeRuntime::set_ingest_bridge() handler bodies: this node's own jobs
+    // only. Every node's view of the cluster (ClusterJobView) is built from
+    // these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
-    IngestActionResult dispatch_action_cluster_wide(std::string_view id, std::string_view action);
 
   public:
     IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig,
@@ -256,21 +283,6 @@ class IngestManager {
     size_t active_jobs() const;
     size_t peak_active_jobs() const;
 
-    // Cluster-wide visibility: local jobs (this node's own jobs()), plus one
-    // RPC survey per active peer. An unreachable/erroring peer is logged and
-    // skipped, never fails the whole call -- same partial-tolerance contract
-    // as MetadataManager::discover_accepted_heads().
-    std::vector<ClusterIngestJob> jobs_cluster_wide() const;
-    // Local job(id) first (zero added latency for the common owned-here
-    // case); only surveys peers when the job is locally absent.
-    std::optional<ClusterIngestJob> job_cluster_wide(std::string_view id) const;
-    // Each: local action first; only surveys peers when the job is locally
-    // absent. The first peer reporting the job exists is authoritative,
-    // preserving the local 404-vs-409 distinction cluster-wide.
-    IngestActionResult pause_cluster_wide(std::string_view id);
-    IngestActionResult resume_cluster_wide(std::string_view id);
-    IngestActionResult cancel_cluster_wide(std::string_view id);
-    IngestActionResult clear_cluster_wide(std::string_view id);
 };
 
 } // namespace macha

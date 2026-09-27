@@ -5,6 +5,7 @@
 #include "subsystem_abi.hpp"
 #include "subsystem_registry.hpp"
 #include "supervised.hpp"
+#include "torrent_coordinator.hpp"
 
 #ifdef MACHA_TEST_TORRENT_PLUGIN
 #include <dlfcn.h>
@@ -2276,7 +2277,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
 // A node with no torrent plugin loaded -- not built, not installed, or
 // faulted and between restarts -- must answer honestly rather than assuming
 // the engine is there. This needs no plugin at all, which is the point.
-MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_reports_it_absent) {
+MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_answers_from_the_cluster_view) {
     TestNode fixture("torrent-absent");
     fixture.prepare();
     fixture.start();
@@ -2291,7 +2292,10 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
     torrent_config.enabled = true; // configured on, but nothing provides it.
     TorrentSearchManager search(torrent_config);
     SubsystemRegistry registry;
-    AcquisitionApi acquisition(ingest, registry, search);
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   fixture.config().state_path);
+    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
 
     HttpRequest status_request;
     status_request.method = "GET";
@@ -2303,19 +2307,86 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
     CHECK(status_body.find("build_available")->asBool() == false);
     CHECK(status_body.find("enabled")->asBool() == false);
 
-    // Every endpoint that needs the engine says so, rather than crashing on a
-    // null capability or pretending the job list is empty.
-    for (const auto& [method, path] :
-         std::vector<std::pair<std::string, std::string>>{
-             {"GET", "/api/v1/torrents/jobs"},
-             {"POST", "/api/v1/torrents/jobs"},
-             {"GET", "/api/v1/torrents/jobs/whatever"},
-             {"POST", "/api/v1/torrents/jobs/whatever/pause"}}) {
+    // 0.64.0: the job routes answer on every node from the cluster view, so a
+    // node without the plugin lists the cluster's jobs (none here) instead of
+    // 503, and refuses only what it cannot do itself: run a torrent.
+    const auto call = [&](std::string method, std::string path, std::string body = {}) {
         HttpRequest request;
-        request.method = method;
-        request.path = path;
-        const auto response = acquisition.handle(request);
-        CHECK(response.status == 503);
+        request.method = std::move(method);
+        request.path = std::move(path);
+        request.body = Bytes(body.begin(), body.end());
+        return acquisition.handle(request);
+    };
+    const auto parse = [](const HttpResponse& response) {
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+    {
+        const auto listed = call("GET", "/api/v1/torrents/jobs");
+        REQUIRE(listed.status == 200);
+        const auto body = parse(listed);
+        CHECK(body.find("jobs")->asArray().empty());
+        CHECK(body.find("refresh_interval_ms")->asUInt64() == 5000);
+        CHECK(body.find("sources")->asArray().empty()); // no torrents here, no peers
+    }
+    {
+        const auto nodes = call("GET", "/api/v1/torrents/nodes");
+        REQUIRE(nodes.status == 200);
+        const auto body = parse(nodes);
+        CHECK(body.find("nodes")->asArray().empty()); // not torrent-capable
+        CHECK(body.find("default_remove_after_ms")->isNull());
+    }
+    {
+        // Torrents belong to the cluster: a node that cannot run one still
+        // takes the add, and it waits for a node that can.
+        const auto added = call("POST", "/api/v1/torrents/jobs",
+                                R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890&dn=Waiting"})");
+        REQUIRE(added.status == 202);
+        const auto body = parse(added);
+        CHECK(body.find("node_id")->isNull());
+        CHECK(body.find("info_hash")->asString() == "1234567890123456789012345678901234567890");
+        const auto& job = *body.find("job");
+        CHECK(job.find("phase")->asString() == "awaiting_node");
+        CHECK(job.find("state")->asString() == "awaiting_node");
+        CHECK(job.find("name")->asString() == "Waiting");
+        CHECK(job.find("node_id")->isNull());
+        CHECK(job.find("desired_blocked_reason")->asString() == "no_capable_node");
+        CHECK(job.find("bytes_total")->isNull()); // no live view of an unclaimed job
+        const auto id = body.find("id")->asString();
+
+        const auto again = call("POST", "/api/v1/torrents/jobs",
+                                R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890"})");
+        CHECK(again.status == 409);
+        CHECK(parse(again).find("id")->asString() == id);
+        CHECK(parse(again).find("node_id")->isNull());
+
+        CHECK(parse(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().size() == 1);
+        const auto paused = call("POST", "/api/v1/torrents/jobs/" + id + "/pause");
+        CHECK(paused.status == 202);
+        CHECK(parse(paused).find("desired")->asString() == "paused");
+        const auto patched = call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":3600000})");
+        CHECK(patched.status == 200);
+        CHECK(parse(patched).find("remove_after_ms")->asUInt64() == 3600000);
+        CHECK(call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":86400001})").status == 400);
+        CHECK(call("POST", "/api/v1/torrents/jobs/" + id + "/clear").status == 202);
+        CHECK(parse(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().empty());
+    }
+    {
+        // A pin to a node that cannot run torrents is refused.
+        const auto pinned = call("POST", "/api/v1/torrents/jobs",
+                                 R"({"magnet":"magnet:?xt=urn:btih:2234567890123456789012345678901234567890","node_id":")" +
+                                     to_string(fixture.node().node_id()) + R"("})");
+        CHECK(pinned.status == 409);
+        CHECK(parse(pinned).find("error")->find("reason")->asString() == "node_not_torrent_capable");
+    }
+    CHECK(call("GET", "/api/v1/torrents/jobs/whatever").status == 404);
+    CHECK(call("POST", "/api/v1/torrents/jobs/whatever/pause").status == 404);
+    {
+        const auto listed = call("GET", "/api/v1/ingest/jobs");
+        REQUIRE(listed.status == 200);
+        const auto sources = parse(listed).find("sources")->asArray();
+        REQUIRE(sources.size() == 1);
+        CHECK(sources.front().find("local")->asBool());
+        CHECK(sources.front().find("reachable")->asBool());
     }
 
     // Search is core's own Torznab client, so it stays available.
@@ -2393,10 +2464,10 @@ MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_se
 
     plugin.subsystem().start();
     const std::string url = "https://127.0.0.1:1/result.torrent";
-    auto as_magnet = torrents.add_on(NodeId{}, url, false);
+    auto as_magnet = torrents.place(url, false);
     CHECK(!as_magnet.placed);
     CHECK(as_magnet.error.find("requires a magnet") != std::string::npos);
-    auto as_result = torrents.add_on(NodeId{}, url, true);
+    auto as_result = torrents.place(url, true);
     CHECK(!as_result.placed);
     CHECK(as_result.error.find("requires a magnet") == std::string::npos);
     plugin.subsystem().stop();
@@ -2534,12 +2605,21 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     CHECK(failed_ingest->state == IngestJobState::failed);
 
     TorrentSearchManager search(torrent_config);
-    AcquisitionApi acquisition(ingest, registry, search);
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   fixture.config().state_path);
+    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
+    // The jobs restored from jobs.json become cluster requests this node has
+    // already claimed (0.64.0), on the coordinator's first pass.
+    coordinator.pass_now();
+    REQUIRE(coordinator.request("torrent-retry").has_value());
+    CHECK(coordinator.request("torrent-retry")->phase == TorrentPhase::failed);
+    CHECK(coordinator.request("torrent-retry")->claim->node_id == fixture.node().node_id());
     HttpRequest retry_request;
     retry_request.method = "POST";
     retry_request.path = "/api/v1/torrents/jobs/torrent-retry/retry";
     const auto retry_response = acquisition.handle(retry_request);
-    REQUIRE(retry_response.status == 200);
+    REQUIRE(retry_response.status == 202);
     const auto retry_body = Json::parse(
         std::string(retry_response.body.begin(), retry_response.body.end()));
     CHECK(retry_body.find("state")->asString() == "importing");
@@ -2619,7 +2699,10 @@ MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resum
     CHECK(torrents.job("torrent-retry")->state == TorrentJobState::failed);
 
     TorrentSearchManager search(torrent_config);
-    AcquisitionApi acquisition(ingest, registry, search);
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                   fixture.config().state_path);
+    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
     HttpRequest resume;
     resume.method = "POST";
     resume.path = "/api/v1/ingest/jobs/ingest-retry/resume";
@@ -2706,29 +2789,36 @@ MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second
     const auto faults_before = torrent_thread_faults();
 
     const std::string magnet = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Twice";
-    const auto first = torrents.add_on(NodeId{}, magnet, false);
+    const auto first = torrents.place(magnet, false);
     REQUIRE(first.placed);
-    const auto second = torrents.add_on(NodeId{}, magnet, false);
+    const auto second = torrents.place(magnet, false);
     CHECK(!second.placed);
     CHECK(second.reason == "torrent_already_added");
     CHECK(second.job_id == first.job_id);
     CHECK(second.node_id == f.fixture.node().node_id());
 
     TorrentSearchManager search(f.torrent_config);
-    AcquisitionApi acquisition(*f.ingest, f.registry, search);
+    ClusterJobView cluster_jobs(f.fixture.node(), *f.ingest, f.registry);
+    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, cluster_jobs, f.state_path);
+    AcquisitionApi acquisition(*f.ingest, f.registry, search, cluster_jobs, coordinator);
+    // Through the API the duplicate key is the cluster's requests (0.64.0).
+    const std::string api_magnet = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777&dn=Twice";
     HttpRequest add;
     add.method = "POST";
     add.path = "/api/v1/torrents/jobs";
-    const std::string body = "{\"magnet\":\"" + magnet + "\"}";
+    const std::string body = "{\"magnet\":\"" + api_magnet + "\"}";
     add.body = Bytes(body.begin(), body.end());
+    const auto accepted = acquisition.handle(add);
+    REQUIRE(accepted.status == 202);
+    const auto accepted_id =
+        Json::parse(std::string(accepted.body.begin(), accepted.body.end())).find("id")->asString();
     const auto refused = acquisition.handle(add);
     CHECK(refused.status == 409);
     const auto refusal = Json::parse(std::string(refused.body.begin(), refused.body.end()));
     CHECK(refusal.find("status")->asString() == "torrent_already_added");
     CHECK(refusal.find("error")->find("code")->asString() == "torrent_already_added");
     CHECK(!refusal.find("error")->find("message")->asString().empty());
-    CHECK(refusal.find("id")->asString() == first.job_id);
-    CHECK(refusal.find("node_id")->asString() == to_string(f.fixture.node().node_id()));
+    CHECK(refusal.find("id")->asString() == accepted_id);
 
     size_t holding = 0;
     for (const auto& job : torrents.jobs())
@@ -2739,9 +2829,9 @@ MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second
     // state; once cleared, nothing of it is left in the session, so the same
     // torrent can be added again.
     REQUIRE(torrents.cancel(first.job_id));
-    CHECK(torrents.add_on(NodeId{}, magnet, false).reason == "torrent_already_added");
+    CHECK(torrents.place(magnet, false).reason == "torrent_already_added");
     REQUIRE(torrents.clear(first.job_id));
-    const auto again = torrents.add_on(NodeId{}, magnet, false);
+    const auto again = torrents.place(magnet, false);
     CHECK(again.placed);
     CHECK(again.job_id != first.job_id);
     CHECK(torrent_thread_faults() == faults_before);
@@ -2799,13 +2889,151 @@ MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore
     std::this_thread::sleep_for(11s);
     CHECK(torrent_thread_faults() == faults_before);
     // The worker is still running: a new job is picked up and sampled.
-    const auto fresh = torrents.add_on(
-        NodeId{}, "magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
+    const auto fresh = torrents.place("magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
     REQUIRE(fresh.placed);
     REQUIRE(wait_until([&] {
         const auto job = torrents.job(fresh.job_id);
         return job && job->updated_unix_ms > job->created_unix_ms;
     }, 5s));
+}
+
+MACHA_TEST("hydration_catalogue", test_a_cluster_torrent_is_claimed_and_driven_by_its_owner) {
+    // 0.64.0. An add is a request in metadata; the one torrent-capable node
+    // claims it, runs it under the request's id, applies the operator's
+    // intent to it, and lets it go when it is cleared.
+    TorrentPluginFixture f("torrent-coordinator-owner");
+    auto& torrents = f.torrents();
+    f.plugin->subsystem().start();
+    ClusterJobView view(f.fixture.node(), *f.ingest, f.registry);
+    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path);
+    const auto self = f.fixture.node().node_id();
+
+    const auto added = coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
+                                       false, std::nullopt, std::nullopt);
+    REQUIRE(added.status == 202);
+    const auto id = added.request->id;
+    CHECK(added.request->phase == TorrentPhase::awaiting_node);
+    CHECK(!added.request->remove_after_ms); // the cluster default is off
+
+    coordinator.pass_now();
+    auto r = coordinator.request(id);
+    REQUIRE(r.has_value());
+    REQUIRE(r->claim.has_value());
+    CHECK(r->claim->node_id == self);
+    CHECK(r->claim->epoch == 1);
+    CHECK(r->phase == TorrentPhase::downloading);
+    REQUIRE(torrents.job(id).has_value()); // run under the request's id
+
+    CHECK(coordinator.act(id, "pause").status == 202);
+    coordinator.pass_now();
+    CHECK(torrents.job(id)->state == TorrentJobState::paused);
+    CHECK(coordinator.desired_applied(*coordinator.request(id), torrents.job(id)));
+    CHECK(coordinator.act(id, "resume").status == 202);
+    coordinator.pass_now();
+    CHECK(torrents.job(id)->state != TorrentJobState::paused);
+
+    CHECK(coordinator.act(id, "clear").status == 409); // still running
+    CHECK(coordinator.act(id, "cancel").status == 202);
+    coordinator.pass_now(); // stops it locally
+    coordinator.pass_now(); // and records it
+    CHECK(coordinator.request(id)->phase == TorrentPhase::cancelled);
+    CHECK(coordinator.act(id, "clear").status == 202);
+    coordinator.pass_now();
+    CHECK(!coordinator.request(id).has_value());
+    CHECK(!torrents.job(id).has_value());
+}
+
+MACHA_TEST("hydration_catalogue", test_a_completed_torrent_is_removed_after_its_delay) {
+    // Removal after completion (0.64.0): off unless asked; with a delay of 0
+    // the owner removes the torrent job and the request at its next pass.
+    const std::string hash(40, '9');
+    TorrentPluginFixture f("torrent-remove-after", [&](TorrentPluginFixture& seeded) {
+        std::filesystem::create_directories(seeded.state_path / "torrent");
+        const auto payload = seeded.staging_path / "torrents" / "done-job";
+        std::filesystem::create_directories(payload);
+        Json::Object job;
+        job["id"] = "done-job";
+        job["name"] = "Finished";
+        job["source_uri"] = "magnet:?xt=urn:btih:" + hash;
+        job["info_hash"] = hash;
+        job["save_path"] = payload.string();
+        job["state"] = "completed";
+        job["created_unix_ms"] = static_cast<uint64_t>(1);
+        job["updated_unix_ms"] = static_cast<uint64_t>(2);
+        job["error"] = "";
+        Json::Array jobs;
+        jobs.emplace_back(std::move(job));
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(1);
+        root["jobs"] = std::move(jobs);
+        std::ofstream out(seeded.state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
+        out << Json(std::move(root)).dump();
+    });
+    auto& torrents = f.torrents();
+    ClusterJobView view(f.fixture.node(), *f.ingest, f.registry);
+    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path);
+
+    coordinator.pass_now(); // migrated: a completed request this node holds
+    auto r = coordinator.request("done-job");
+    REQUIRE(r.has_value());
+    CHECK(r->phase == TorrentPhase::completed);
+    coordinator.pass_now();
+    CHECK(coordinator.request("done-job").has_value()); // no delay set: kept
+
+    REQUIRE(coordinator.patch("done-job", std::optional<uint64_t>{0}, std::nullopt).status == 200);
+    coordinator.pass_now();
+    CHECK(!coordinator.request("done-job").has_value());
+    CHECK(!torrents.job("done-job").has_value());
+}
+
+MACHA_TEST("hydration_catalogue", test_a_lapsed_claim_is_taken_over_and_a_superseded_one_let_go) {
+    // A claim holds while its node is a member; past the lease another node
+    // takes it at the next epoch. A node that finds its own claim superseded
+    // stops and deletes its copy.
+    TorrentPluginFixture f("torrent-lease");
+    auto& torrents = f.torrents();
+    f.plugin->subsystem().start();
+    ClusterJobView view(f.fixture.node(), *f.ingest, f.registry);
+    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path,
+                                   std::chrono::milliseconds(0));
+    const auto self = f.fixture.node().node_id();
+    const auto gone = random_node_id(); // never a member
+
+    TorrentRequest lapsed;
+    lapsed.id = std::string(32, 'e');
+    lapsed.info_hash = std::string(40, 'a');
+    lapsed.source = "magnet:?xt=urn:btih:" + lapsed.info_hash;
+    lapsed.created_unix_ms = 1;
+    lapsed.claim = TorrentClaim{gone, 1, 1};
+    lapsed.phase = TorrentPhase::downloading;
+    lapsed.phase_epoch = 1;
+    f.fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        snapshot.torrent_requests[lapsed.id] = lapsed;
+        delta.upsert_torrent_requests[lapsed.id] = lapsed;
+    });
+
+    coordinator.pass_now(); // notes the owner absent
+    coordinator.pass_now(); // lease (0 ms) elapsed: taken over
+    auto r = coordinator.request(lapsed.id);
+    REQUIRE(r.has_value());
+    CHECK(r->claim->node_id == self);
+    CHECK(r->claim->epoch == 2);
+    CHECK(r->phase_epoch == 2);
+    REQUIRE(torrents.job(lapsed.id).has_value());
+
+    // Now another node's newer claim wins; this node lets its copy go.
+    auto superseding = *r;
+    superseding.claim = TorrentClaim{gone, 3, unix_ms()};
+    superseding.phase_epoch = 3;
+    superseding.progress_unix_ms = unix_ms() + 1;
+    f.fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        snapshot.torrent_requests[lapsed.id] = superseding;
+        delta.upsert_torrent_requests[lapsed.id] = superseding;
+    });
+    TorrentCoordinator patient(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path);
+    patient.pass_now(); // lease is 10 min here: no takeover, only the let-go
+    CHECK(!torrents.job(lapsed.id).has_value());
+    CHECK(patient.request(lapsed.id)->claim->node_id == gone);
 }
 
 #endif // MACHA_TEST_TORRENT_PLUGIN
@@ -4798,3 +5026,95 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
 }
 
 } // namespace
+
+MACHA_FAST_TEST("hydration_catalogue", test_a_failed_hint_outlives_the_job_that_raised_it) {
+    // 0.64.0. Clearing Colony deleted S02E13's failed hint, the only record
+    // that the file was never catalogued. A settled outcome goes with its job;
+    // a failure stays.
+    TempDir dir;
+    CatalogueHintQueue hints(dir.path());
+    const auto failed_id = hints.submit("/TV/Show/S01E01.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
+    const auto matched_id = hints.submit("/TV/Show/S01E02.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
+    auto first = hints.claim_next();
+    auto second = hints.claim_next();
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    hints.fail(failed_id, "catalogue_error", "provider lookup failed");
+    hints.mark_no_match(matched_id, "tv", "macha:e02", "no match");
+    CHECK(hints.erase_origin("ingest", "job-1") == 2);
+    const auto kept = hints.get(failed_id);
+    REQUIRE(kept.has_value());
+    CHECK(kept->state == CatalogueHintState::failed);
+    CHECK(kept->origins.empty());
+    CHECK(!hints.get(matched_id).has_value());
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_and_is_deleted_later) {
+    // 0.64.0: a clear no longer deletes its payload in the request. The
+    // payload is renamed into staging's trash, still counted, and emptied by
+    // the trash worker.
+    TempDir dir;
+    IngestConfig config;
+    config.staging_path = dir.path() / "staging";
+    config.staging_limit = 1ull << 30;
+    StagingArea staging(config);
+    const auto payload = config.staging_path / "torrents" / "job";
+    std::filesystem::create_directories(payload / "Season 1");
+    {
+        std::ofstream out(payload / "Season 1" / "episode.mkv", std::ios::binary);
+        out << std::string(4096, 'x');
+    }
+    const auto before = staging.status().disk_bytes;
+    CHECK(staging.discard(payload));
+    CHECK(!std::filesystem::exists(payload));
+    CHECK(staging.status().disk_bytes == before); // counted until deleted
+    CHECK(staging.empty_trash() == 1);
+    CHECK(staging.status().disk_bytes < before);
+    CHECK(std::filesystem::is_empty(staging.trash_path()));
+    CHECK(!staging.discard(dir.path() / "outside")); // never outside staging
+}
+
+MACHA_TEST("hydration_catalogue", test_a_hint_newer_than_its_batch_snapshot_is_deferred_not_failed) {
+    // Colony S02E13, gbni-1, 2026-09-27: adopted a second after its batch took
+    // its namespace snapshot, claimed by that batch, judged "namespace path no
+    // longer exists" -- terminal -- and never catalogued. A hint newer than
+    // the snapshot now waits for the next batch.
+    TempDir t;
+    auto key = t.path() / "cluster.key";
+    write_key(key);
+    auto config = config_for(t.path() / "disk", key, free_port());
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    auto keys = load_cluster_keys(key);
+    Service service(config, keys);
+    service.start();
+    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid()); // metadata is up
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::make_unique<FakeHttpClient>());
+    auto& hints = service.catalogue_hints();
+    const auto snapshot = service.metadata_manager().snapshot(); // no such file in it
+    const auto taken = unix_ms();
+    DistributedStore::DurabilityBatch batch;
+
+    const auto late_id = hints.submit("/Movies/Late (2026)/Late.mkv", "ingest", "job", CatalogueHintPriority::ingest);
+    auto late = hints.claim_next();
+    REQUIRE(late.has_value());
+    REQUIRE(late->created_unix_ms >= taken);
+    CHECK(!scanner.prepare_hint(*late, {}, snapshot, taken, batch).has_value());
+    CHECK(hints.get(late_id)->state == CatalogueHintState::deferred);
+    CHECK(hints.get(late_id)->error_code == "path_not_yet_visible");
+
+    // Absent from a snapshot taken after the hint: genuinely gone.
+    const auto gone_id = hints.submit("/Movies/Gone (2026)/Gone.mkv", "ingest", "job", CatalogueHintPriority::ingest);
+    auto gone = hints.claim_next();
+    REQUIRE(gone.has_value());
+    const auto later = service.metadata_manager().snapshot();
+    CHECK(!scanner.prepare_hint(*gone, {}, later, unix_ms() + 1, batch).has_value());
+    CHECK(hints.get(gone_id)->state == CatalogueHintState::failed);
+    CHECK(hints.get(gone_id)->error_code == "path_missing");
+}

@@ -1,4 +1,4 @@
-# Macha 0.63.0
+# Macha 0.64.0
 #
 # Copy this file per node. Paths, advertise address and failure_domain are
 # node-local. The cluster key contents and dht policy must match every node.
@@ -603,6 +603,12 @@ torrent:
   # listen_interfaces: 10.44.1.51:6881
   listen_port: 6881
   max_active: 4
+  # false drains this node: it keeps its torrent jobs and takes no new ones.
+  accept_new_jobs: true
+  # How long after a torrent completes it is removed (torrent job, ingest
+  # job, staging payload). Absent or null is off; 0 is at once; at most
+  # 86400000 (24 h).
+  # remove_on_complete_after_ms: 3600000
   max_download_rate: 0B  # 0 = unlimited
   max_upload_rate: 0B    # 0 = unlimited
   # Threshold for libtorrent's alert stream, independent of the top-level

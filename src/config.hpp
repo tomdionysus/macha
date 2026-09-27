@@ -522,6 +522,14 @@ struct TorrentConfig {
     // own syntax (an address or a device name, e.g. "wlan0:6881").
     std::string listen_interfaces;
     uint16_t listen_port{6881};
+    // False drains this node (0.64.0): it keeps the jobs it has, takes no new
+    // one, and stays listed as torrent-capable with not_accepting_reason
+    // `draining`.
+    bool accept_new_jobs{true};
+    // How long after a torrent completes it is removed (its torrent job,
+    // ingest job and staging payload). Absent is off. 0..24 h; what an add
+    // that does not name remove_after_ms gets, copied into the job.
+    std::optional<std::chrono::milliseconds> remove_on_complete_after;
     std::vector<TorrentSearchProviderConfig> search_providers;
 };
 

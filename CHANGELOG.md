@@ -1,5 +1,66 @@
 # Current release
 
+## 0.64.0 — Torrents belong to the cluster (development)
+
+**Cluster protocol 22: every node upgrades together.** The metadata snapshot
+now carries torrent requests (SM15/SM16, DLT9), which a protocol-21 node
+rejects.
+
+**A torrent is added to the cluster, not to a node.** An add is recorded as a
+request in metadata. Any node that runs the torrent subsystem may claim it:
+the scheduler on each capable node claims waiting requests when it has a
+slot and staging room, runs the download under the request's id, applies the
+operator's intent to it, and writes its progress back (`awaiting_node`,
+`downloading`, `importing`, `completed`, `failed`, `cancelled`). A claim holds
+while its node is a member; a node absent for 10 minutes loses it and another
+capable node starts the job again. A node that finds its claim taken over
+deletes its copy. Concurrent writes merge by a fixed rule per field (cancel is
+final, a later claim epoch wins, nothing moves backwards within an epoch),
+never as operator conflicts. Jobs a node held before become requests it has
+already claimed, on its first pass.
+
+- `POST /api/v1/torrents/jobs` takes an optional pin (`node_id`, which must be
+  torrent-capable) and `remove_after_ms`; answers `202` with `info_hash` and
+  the whole `job` once the request is in metadata, so any node lists it at
+  once. `torrent_already_added` is cluster-wide. A node without torrents takes
+  adds. `503 metadata_unavailable` carries the new failure scope `cluster`.
+- Jobs gain `phase`, `desired`, `desired_changed_unix_ms`, `desired_applied`,
+  `desired_blocked_reason`, `pinned_node_id`, `live_as_of_unix_ms`,
+  `remove_after_ms`, `remove_at_unix_ms`, `completed_unix_ms`; `node_id` is
+  null while unclaimed; live figures are null when unknown.
+- Actions record intent and answer `202` with the job; the owner applies them.
+  With metadata unwritable, pause/resume/cancel on a claimed job still work:
+  the owner applies them and publishes them later (new RPC `torrent_intent`).
+- `PATCH /api/v1/torrents/jobs/{id}` changes `remove_after_ms`, or re-pins a
+  job still awaiting a node.
+- `GET /api/v1/torrents/nodes` lists the torrent-capable nodes for a
+  selector: reachability, `accepting` and `not_accepting_reason`
+  (`slots_full`, `staging_full`, `draining`, `unreachable`), slots and
+  staging, plus `default_remove_after_ms`.
+- **Removal after completion**, off unless set per job or with
+  `torrent.remove_on_complete_after_ms` (0 to 24 h). `torrent.accept_new_jobs:
+  false` drains a node.
+
+**Job lists answer from memory.** Every node polls its peers' live torrent
+state and ingest jobs in the background every 5 s; no list or lookup waits on
+another node (on 2026-09-27 a list waited 0.1-5 s on fi-1's congested link).
+Every torrent route works on every node, including ones without the plugin.
+The ingest list gains `sources`, so a node whose jobs are stale or missing is
+visible.
+
+Found watching the day's imports, fixed:
+
+- **A clear no longer deletes the payload in the request.** It is moved into
+  staging's `.trash` and deleted in the background (it counts against the
+  staging limit until then). A clear that deleted a 75 GB payload in the
+  request took 34 s on a busy disk; the client gave up.
+- **A catalogue hint newer than its batch's snapshot is deferred, not
+  failed.** Colony S02E13 was adopted a second after its batch read the
+  namespace, judged `path_missing` (terminal), and never catalogued. New hint
+  code `path_not_yet_visible`.
+- **Clearing a job keeps its failed catalogue hints**, the record that a file
+  was never catalogued.
+
 ## 0.63.0 — A faulted thread runs again or says why not; one job per torrent (development)
 
 **The torrent worker died on gbni-1 on 2026-09-26 and nothing noticed.** A

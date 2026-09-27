@@ -20,7 +20,10 @@
 
 namespace macha {
 namespace {
-constexpr uint16_t protocol_version = 21;
+// 22 (0.64.0): the metadata snapshot carries torrent requests (SM15/SM16,
+// DLT9). A protocol-21 node would reject those records, full-record
+// fallback included, so the two cannot share a cluster.
+constexpr uint16_t protocol_version = 22;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
@@ -683,6 +686,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_objects";
     case MessageType::have_control_objects:
         return "have_control_objects";
+    case MessageType::torrent_intent:
+        return "torrent_intent";
     case MessageType::dial_request:
         return "dial_request";
     case MessageType::dial_back_probe:
@@ -729,6 +734,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_objects_reply";
     case MessageType::have_control_objects_reply:
         return "have_control_objects_reply";
+    case MessageType::torrent_intent_reply:
+        return "torrent_intent_reply";
     case MessageType::user_sync:
         return "user_sync";
     case MessageType::user_sync_reply:

@@ -554,6 +554,13 @@ void parse_torrent(const YAML::Node& root, Config& c) {
     if (torrent["lsd"]) c.torrent.lsd = torrent["lsd"].as<bool>();
     if (torrent["upnp"]) c.torrent.upnp = torrent["upnp"].as<bool>();
     if (torrent["natpmp"]) c.torrent.natpmp = torrent["natpmp"].as<bool>();
+    if (torrent["accept_new_jobs"]) c.torrent.accept_new_jobs = torrent["accept_new_jobs"].as<bool>();
+    if (auto after = torrent["remove_on_complete_after_ms"]; after && !after.IsNull()) {
+        const auto value = milliseconds(after, "torrent.remove_on_complete_after_ms");
+        if (value > std::chrono::hours(24))
+            throw std::runtime_error("torrent.remove_on_complete_after_ms must be at most 86400000 (24 h)");
+        c.torrent.remove_on_complete_after = value;
+    }
     if (auto search = torrent["search"]) {
         if (auto providers = search["providers"]) {
             // YAML `providers:` with only commented examples is a null node.

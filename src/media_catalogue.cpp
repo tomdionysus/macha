@@ -2749,6 +2749,7 @@ CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path
 std::optional<CatalogueScanner::PreparedHintMatch>
 CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                                const MetadataSnapshot& namespace_snapshot,
+                               uint64_t snapshot_taken_unix_ms,
                                DistributedStore::DurabilityBatch& artwork_batch) {
     if (stop.stop_requested()) return {};
     CatalogueScannerConfig config;
@@ -2771,6 +2772,16 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
     auto scan_nodes = fs_.namespace_nodes();
     auto found_entry = namespace_entry(namespace_snapshot, &scan_nodes, path);
     if (!found_entry) {
+        // The batch's snapshot is older than this hint: the file may simply
+        // not be in it yet. Until 0.64.0 this was a terminal path_missing --
+        // Colony S02E13, gbni-1, 2026-09-27, adopted a second after its
+        // batch took the snapshot and never catalogued. Look again next batch.
+        if (hint.created_unix_ms >= snapshot_taken_unix_ms) {
+            hints_.defer(hint.id, "path_not_yet_visible",
+                         "the file is newer than the namespace snapshot this batch read",
+                         unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
+            return {};
+        }
         hints_.fail(hint.id, "path_missing", "namespace path no longer exists");
         return {};
     }
@@ -3022,6 +3033,7 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
     // batch. An empty queue therefore causes no metadata work at all. Normally
     // this is a pure cache read; a cold-start batch may populate it once.
     std::optional<MetadataSnapshotView> namespace_view;
+    uint64_t namespace_view_taken_unix_ms = 0;
 
     for (; out.claimed < max_hints && !stop.stop_requested() && !budget_http->exhausted();) {
         auto hint = hints_.claim_next();
@@ -3029,11 +3041,13 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
         ++out.claimed;
         try {
             if (!namespace_view) {
+                namespace_view_taken_unix_ms = unix_ms();
                 namespace_view = fs_.available_snapshot_view();
                 if (!namespace_view)
                     namespace_view = fs_.local_snapshot_view();
             }
-            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot, artwork_batch)) {
+            if (auto match = prepare_hint(*hint, stop, *namespace_view->snapshot,
+                                          namespace_view_taken_unix_ms, artwork_batch)) {
                 if (media_information_ && match->media_id.starts_with("macha:")) {
                     (void)media_information_->request(
                         {match->media_id}, MediaInformationPriority::background,

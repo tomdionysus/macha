@@ -360,7 +360,6 @@ Json ingest_job_json(const IngestJob& job, bool include_files,
     return Json(std::move(out));
 }
 
-namespace {
 // Wire shape for the cluster RPC survey: the persistence shape (job_json/
 // parse_job) plus the two transient fields it deliberately never persists
 // (rate_bytes_per_second, eta_seconds -- resetting those across a local
@@ -380,7 +379,16 @@ IngestJob parse_ingest_job_wire(const Json& value) {
         job.eta_seconds = eta->asUInt64();
     return job;
 }
-} // namespace
+
+Json staging_capacity_json(const StagingStatus& status) {
+    Json::Object out;
+    out["limit_bytes"] = status.limit;
+    out["disk_bytes"] = status.disk_bytes;
+    out["reserved_bytes"] = status.reserved_bytes;
+    out["accounted_bytes"] = status.accounted_bytes;
+    out["free_bytes"] = status.limit > status.accounted_bytes ? status.limit - status.accounted_bytes : 0;
+    return Json(std::move(out));
+}
 
 StagingArea::StagingArea(IngestConfig config) : config_(std::move(config)) {
     if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
@@ -422,6 +430,51 @@ uint64_t StagingArea::reservation(std::string_view owner) const {
     std::lock_guard lock(mutex_);
     auto it = reservations_.find(std::string(owner));
     return it == reservations_.end() ? 0 : it->second;
+}
+
+std::filesystem::path StagingArea::trash_path() const { return config_.staging_path / ".trash"; }
+
+bool StagingArea::discard(const std::filesystem::path& path) {
+    if (config_.staging_path.empty() || !contains(path)) return false;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return true;
+    const auto trash = trash_path();
+    std::filesystem::create_directories(trash, ec);
+    const auto target = trash / (to_string(random_node_id()) + "-" + path.filename().string());
+    std::filesystem::rename(path, target, ec);
+    if (ec) {
+        Log::warn("staging discard could not move " + path.string() + " to trash: " + ec.message());
+        return false;
+    }
+    {
+        std::lock_guard lock(trash_mutex_);
+        trash_pending_ = true;
+    }
+    trash_cv_.notify_all();
+    return true;
+}
+
+size_t StagingArea::empty_trash() {
+    const auto trash = trash_path();
+    std::error_code ec;
+    if (!std::filesystem::exists(trash, ec)) return 0;
+    size_t removed = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(trash, ec)) {
+        std::error_code remove_error;
+        std::filesystem::remove_all(entry.path(), remove_error);
+        if (remove_error)
+            Log::warn("staging trash entry not deleted yet " + entry.path().string() + ": " +
+                      remove_error.message());
+        else
+            ++removed;
+    }
+    return removed;
+}
+
+void StagingArea::wait_for_trash(std::stop_token stop, std::chrono::milliseconds interval) {
+    std::unique_lock lock(trash_mutex_);
+    trash_cv_.wait_for(lock, stop, interval, [this] { return trash_pending_; });
+    trash_pending_ = false;
 }
 
 StagingStatus StagingArea::status() const {
@@ -511,115 +564,6 @@ Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload)
     return Bytes(text.begin(), text.end());
 }
 
-std::vector<ClusterIngestJob> IngestManager::jobs_cluster_wide() const {
-    std::vector<ClusterIngestJob> out;
-    for (auto& job : jobs()) {
-        auto summary = catalogue_summary(job.id);
-        out.push_back({node_.node_id(), std::move(job), std::move(summary)});
-    }
-    for (const auto& peer : node_.membership().active()) {
-        if (peer.id == node_.node_id()) continue;
-        try {
-            auto reply = node_.call(peer, MessageType::get_ingest_jobs, {}, FrameType::control);
-            if (reply.message.type != MessageType::ingest_jobs_reply) continue;
-            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
-                                   reply.message.payload.size());
-            auto parsed = Json::parse(text);
-            const auto* peer_jobs = parsed.find("jobs");
-            if (!peer_jobs) continue;
-            for (const auto& value : peer_jobs->asArray())
-                out.push_back({peer.id, parse_ingest_job_wire(value), {}});
-        } catch (const std::exception& error) {
-            Log::debug("ingest job survey " + peer.host + ": " + error.what());
-        }
-    }
-    return out;
-}
-
-std::optional<ClusterIngestJob> IngestManager::job_cluster_wide(std::string_view id) const {
-    if (auto local = job(id))
-        return ClusterIngestJob{node_.node_id(), std::move(*local), catalogue_summary(id)};
-    Json::Object request;
-    request["job_id"] = std::string(id);
-    const auto request_text = Json(std::move(request)).dump();
-    const Bytes request_bytes(request_text.begin(), request_text.end());
-    for (const auto& peer : node_.membership().active()) {
-        if (peer.id == node_.node_id()) continue;
-        try {
-            auto reply = node_.call(peer, MessageType::get_ingest_jobs, request_bytes,
-                                    FrameType::control);
-            if (reply.message.type != MessageType::ingest_jobs_reply) continue;
-            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
-                                   reply.message.payload.size());
-            auto parsed = Json::parse(text);
-            const auto* peer_jobs = parsed.find("jobs");
-            if (!peer_jobs || peer_jobs->asArray().empty()) continue;
-            return ClusterIngestJob{peer.id, parse_ingest_job_wire(peer_jobs->asArray().front()), {}};
-        } catch (const std::exception& error) {
-            Log::debug("ingest job survey " + peer.host + ": " + error.what());
-        }
-    }
-    return std::nullopt;
-}
-
-IngestActionResult IngestManager::dispatch_action_cluster_wide(std::string_view id,
-                                                               std::string_view action) {
-    IngestActionResult result;
-    if (auto local = job(id)) {
-        result.exists = true;
-        if (action == "pause") result.changed = pause(id);
-        else if (action == "resume") result.changed = resume(id);
-        else if (action == "cancel") result.changed = cancel(id);
-        else if (action == "clear") result.changed = clear(id);
-        if (auto updated = job(id))
-            result.updated = ClusterIngestJob{node_.node_id(), std::move(*updated),
-                                              catalogue_summary(id)};
-        return result;
-    }
-    Json::Object request;
-    request["job_id"] = std::string(id);
-    request["action"] = std::string(action);
-    const auto request_text = Json(std::move(request)).dump();
-    const Bytes request_bytes(request_text.begin(), request_text.end());
-    for (const auto& peer : node_.membership().active()) {
-        if (peer.id == node_.node_id()) continue;
-        try {
-            auto reply = node_.call(peer, MessageType::ingest_job_action, request_bytes,
-                                    FrameType::control);
-            if (reply.message.type != MessageType::ingest_job_action_reply) continue;
-            const std::string text(reinterpret_cast<const char*>(reply.message.payload.data()),
-                                   reply.message.payload.size());
-            auto parsed = Json::parse(text);
-            const auto* exists = parsed.find("exists");
-            if (!exists || !exists->isBool() || !exists->asBool()) continue;
-            result.exists = true;
-            if (const auto* changed = parsed.find("changed"); changed && changed->isBool())
-                result.changed = changed->asBool();
-            if (const auto* updated = parsed.find("job"); updated && !updated->isNull())
-                result.updated = ClusterIngestJob{peer.id, parse_ingest_job_wire(*updated), {}};
-            return result;
-        } catch (const std::exception& error) {
-            Log::debug("ingest job action survey " + peer.host + ": " + error.what());
-        }
-    }
-    return result;
-}
-
-IngestActionResult IngestManager::pause_cluster_wide(std::string_view id) {
-    return dispatch_action_cluster_wide(id, "pause");
-}
-
-IngestActionResult IngestManager::resume_cluster_wide(std::string_view id) {
-    return dispatch_action_cluster_wide(id, "resume");
-}
-
-IngestActionResult IngestManager::cancel_cluster_wide(std::string_view id) {
-    return dispatch_action_cluster_wide(id, "cancel");
-}
-
-IngestActionResult IngestManager::clear_cluster_wide(std::string_view id) {
-    return dispatch_action_cluster_wide(id, "clear");
-}
 
 void IngestManager::load_state() {
     std::vector<std::pair<std::string, std::string>> migration_hints;
@@ -690,6 +634,17 @@ void IngestManager::start() {
     catalogue_worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("ingest-catalogue", stop, [this, stop] { catalogue_loop(stop); });
     });
+    // Deletes discarded payloads off every request path; also finishes what a
+    // previous run left in the trash.
+    trash_worker_ = std::jthread([this](std::stop_token stop) {
+        run_supervised_loop("staging-trash", stop, [this, stop] {
+            while (!stop.stop_requested()) {
+                if (const auto removed = staging_.empty_trash())
+                    Log::info("staging trash emptied entries=" + std::to_string(removed));
+                staging_.wait_for_trash(stop, std::chrono::seconds(30));
+            }
+        });
+    });
     Log::info("ingest started workers=" + std::to_string(count));
 }
 
@@ -697,6 +652,7 @@ void IngestManager::request_stop() {
     for (auto& worker : workers_)
         if (worker.joinable()) worker.request_stop();
     if (catalogue_worker_.joinable()) catalogue_worker_.request_stop();
+    if (trash_worker_.joinable()) trash_worker_.request_stop();
     cv_.notify_all();
 }
 
@@ -706,6 +662,7 @@ void IngestManager::stop() {
         if (worker.joinable()) worker.join();
     workers_.clear();
     if (catalogue_worker_.joinable()) catalogue_worker_.join();
+    if (trash_worker_.joinable()) trash_worker_.join();
 }
 
 void IngestManager::reconfigure(IngestConfig config) {
@@ -873,6 +830,8 @@ void IngestManager::cleanup_source(const IngestJob& job) {
         std::error_code ec;
         if (!std::filesystem::exists(job.source_path, ec)) return;
         ec.clear();
+        // Into the trash, not deleted here: this runs in the clear request.
+        if (staging_.discard(job.source_path)) return;
         if (std::filesystem::is_directory(job.source_path, ec) && !ec)
             std::filesystem::remove_all(job.source_path, ec);
         else {
