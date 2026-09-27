@@ -2,7 +2,7 @@
 
 ## Contract
 
-Every Macha node is a metadata replica. There are no permanent metadata voters, witnesses, leaders or designated authorities.
+Every Macha node is a metadata replica, and every replica has the same standing.
 
 `dht.metadata_min_write_replicas` is the minimum number of **distinct active nodes** which must durably store an immutable metadata commit before that commit may be accepted. It is a durability floor, not a target replica count and not a majority derived from cluster membership.
 
@@ -17,7 +17,7 @@ any mutually connected pair may continue publishing metadata while the other ten
 
 ## Commit, acceptance and heads are separate concepts
 
-Live metadata writes deliberately do not use a distributed CAS/PREPARE/COMMIT protocol.
+A live metadata write is two steps over immutable objects: store the commit on enough replicas, then record its acceptance.
 
 A `MetadataCommit` is an immutable DAG node: it contains a complete state or deterministic delta, its primary parent, and any additional merge parents. A replica may durably store a valid commit regardless of which accepted head it currently exposes. Storing a commit therefore never means "replace your current head".
 
@@ -40,17 +40,16 @@ Reconciliation itself is an ordinary immutable commit with multiple parents and 
 The commit-store/acceptance model is implemented directly:
 
 - every active node is eligible to store metadata commits and acceptance evidence;
-- live publication uses `put_metadata_commit` followed by `accept_metadata_commit`; there are no CAS/PREPARE/COMMIT RPCs on the wire;
+- live publication uses `put_metadata_commit` followed by `accept_metadata_commit`;
 - a receiver validates and stores an immutable commit without comparing it with its current head;
 - an accepted commit carries durable evidence of the distinct replicas which stored it at publication time;
 - each replica persists encrypted accepted-head certificates separately from its materialised checkpoint;
-- a serialized `metadata_voters` field is readable for state compatibility and is cleared by the first policy transition;
 - each replica retains encrypted compact ancestry/history across checkpoint compaction;
 - accepted heads exchange ancestry, collapse stale ancestor heads and locate common ancestors;
 - divergent maximal heads are folded deterministically through two-parent reconciliation commits; this permits an arbitrary number of heads to converge without choosing one branch as authoritative;
 - non-conflicting namespace changes merge automatically; incompatible namespace or catalogue-root changes become durable first-class conflicts while the common-ancestor value remains visible;
 - same-generation sibling discovery invalidates metadata caches through an observation epoch rather than relying solely on numeric generation advancement;
-- virgin founders construct the same deterministic generation-2 root and publish it through the ordinary immutable-commit path; no genesis leader or voter exists;
+- virgin founders construct the same deterministic generation-2 root and publish it through the ordinary immutable-commit path, so any founder may publish it;
 - non-destructive DATA repair can continue from an accepted local branch while reconciliation is pending;
 - accepted metadata references install durable causal retention claims on the physical DATA/CONTROL copies before publication; retention claims themselves drive bounded repair if a claimed copy is missing or corrupt;
 - GC remains active during partitions. Each node releases only locally-held claims for objects absent from its sole accepted head, and only claim dots dominated by that head's causal mutation clock. An unseen/concurrent branch which touched the object carries a newer/incomparable claim dot and therefore remains protected without any global branch survey.
@@ -126,20 +125,14 @@ form; a tree-backed node stays tree-backed.
 
 ## Torrent requests
 
-Since 0.64.0 a snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM15 is the SM13 layout with every section present followed by the requests; SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. Each is written only while the collection is non-empty, so a cluster that never queues a torrent keeps its encodings byte for byte.
+A snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM15 is the SM13 layout with every section present followed by the requests; SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. Each is written only while the collection is non-empty, so a cluster with no torrent requests writes SM13, SM14 and DLT8.
 
 Reconciliation joins the collection per request instead of recording conflicts: every field has a deterministic merge (cancel is final; a later claim epoch wins; within one epoch a request never moves backwards; removal wins), so the merge is commutative, associative and idempotent and never needs an operator. Removed requests stay as tombstones for seven days so a branch that has not seen the removal cannot bring one back.
 
-A protocol-21 node rejects SM15, SM16 and DLT9, full-record fallback included, so 0.64.0 is cluster protocol 22 and every node upgrades together.
+SM15, SM16 and DLT9 belong to cluster protocol 22, which every node in the cluster must run.
 
-## Compatibility
+## Configuration alias
 
-`dht.metadata_replicas` named a fixed voter count whose effective write
-requirement was its majority. It is still accepted as an alias and translated
-to that floor, so `metadata_replicas: 3` means
-`metadata_min_write_replicas: 2`. The two keys are mutually exclusive, and new
-configurations should use only `metadata_min_write_replicas`.
-
-A committed checkpoint written before acceptance certificates existed is
-imported once as a legacy accepted head; every commit after that carries an
-explicit certificate.
+`dht.metadata_replicas` is accepted as an alias and translated to the majority
+of the count it gives, so `metadata_replicas: 3` means
+`metadata_min_write_replicas: 2`. The two keys are mutually exclusive.

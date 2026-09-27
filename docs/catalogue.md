@@ -127,13 +127,13 @@ Failures are classified:
 
 This prevents a temporary cluster outage from permanently marking otherwise valid media as failed.
 
-A batch reads one namespace snapshot for all its hints. A hint created after that snapshot was taken may name a file the snapshot cannot contain; it is deferred with `path_not_yet_visible` and looked at again in the next batch, rather than failed with `path_missing` (0.64.0). Clearing the ingest job that raised a hint removes only that origin: a `failed` hint stays, as the record that its file was never catalogued.
+A batch reads one namespace snapshot for all its hints. A hint created after that snapshot was taken may name a file the snapshot cannot contain; it is deferred with `path_not_yet_visible` and looked at again in the next batch, rather than failed with `path_missing`. Clearing the ingest job that raised a hint removes only that origin: a `failed` hint stays, as the record that its file was never catalogued.
 
 `GET /api/v1/catalogue/hints` lists every hint with its `state` (`queued`,
 `processing`, `deferred`, `catalogued`, `no_match`, `failed`), attempt and
 failure counts, `candidate_cursor`, `provider`, `media_id`,
-`catalogue_item_ids` and `origins`. Since 0.56.0 `result` is a code rather than
-a sentence (`matched`, `outside_catalogue_roots`, `not_media_file`,
+`catalogue_item_ids` and `origins`. `result` is a code
+(`matched`, `outside_catalogue_roots`, `not_media_file`,
 `no_media_candidate`, `no_provider_match`, `already_stored`,
 `profile_prepared`, `media_not_live`, `manual_existing_item`,
 `manual_metadata`, or `null`), and `error_code` sits beside `error`

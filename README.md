@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.64.2*
+*v0.65.0*
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
@@ -12,9 +12,10 @@ content-addressed extents, placed across ordinary machines, exposed through
 FUSE, indexed in a distributed catalogue, and served directly or through
 in-process FFmpeg remux/transcode pipelines.
 
-There is no permanent master, cloud service or account system. Nodes share a
-cluster key, discover peers through bootstrap endpoints, and converge data
-placement and replicas in the background.
+Every node is an equal peer. Nodes share a cluster key, discover peers through
+bootstrap endpoints, and converge data placement and replicas in the
+background. Accounts and their roles live in a user table that every node
+holds in full.
 
 ## This repository, and what sits around it
 
@@ -36,8 +37,8 @@ worth understanding before changing either side:
 > does not choose.** A client reads the media facts, decides what to do with
 > them against its own decoder, and instructs.
 
-So the node has no notion of device capability, no `capabilities` negotiation,
-and refuses only what is impossible or misdescribed — never what a client said
+So the node works from media facts and the client's instruction alone, and
+refuses only what is impossible or misdescribed — never what a client said
 it could not play. Whether a device can decode what it asked for is the
 client's business. [Streaming](docs/streaming.md) is the normative statement of
 that contract, including the error codes and the reasoning behind them; treat
@@ -91,7 +92,8 @@ Three explicit storage classes, with separate durability rules:
 - **CACHE** — opportunistic, non-authoritative copies. Cache contents never
   satisfy DATA or metadata durability.
 
-Every known node is metadata-capable; there is no privileged voter subset.
+Every known node is metadata-capable and counts equally towards the metadata
+write floor.
 `dht.min_write_replicas` is the foreground DATA publication floor,
 `dht.replicas` the desired converged replica count, and
 `dht.metadata_min_write_replicas` the independent floor for publishing a

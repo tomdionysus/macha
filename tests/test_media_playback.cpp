@@ -10,6 +10,13 @@ using namespace macha::test_support;
 
 namespace {
 
+// The body's `idempotency` field on a keyed create, or empty when absent.
+std::string idempotency_of(const HttpResponse& response) {
+    auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+    const auto* field = body.find("idempotency");
+    return field ? field->asString() : std::string{};
+}
+
 // FakeMediaEngine with its store kept reachable, so a test can watch what a
 // refused request did (or did not) do to the producer, and can publish a
 // fragment while a request is held on it.
@@ -1280,9 +1287,6 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     // A probe failure is one title's problem; the node is fit for every other.
     REQUIRE(error->find("node_healthy") != nullptr);
     CHECK(error->find("node_healthy")->asBool());
-    REQUIRE(response.headers.contains("X-Macha-Playback-Trace"));
-    REQUIRE(response.headers.contains("X-Macha-Playback-Stage"));
-    CHECK(response.headers.at("X-Macha-Playback-Stage") == "probe");
 
     playback.stop();
     service.stop();
@@ -1339,7 +1343,7 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
         CHECK(observed->probes() == 1);
         first_body = Json::parse(std::string(created.body.begin(), created.body.end()));
         first_session_id = first_body.find("session_id")->asString();
-        CHECK(created.headers.at("X-Macha-Idempotency") == "created");
+        CHECK(idempotency_of(created) == "created");
         playback.stop();
     }
     REQUIRE(service.catalogue().media_profile(first_media_id).has_value());
@@ -1464,12 +1468,12 @@ MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) 
     auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
     CHECK(first_json.find("session_id")->dump() == second_json.find("session_id")->dump());
     CHECK(first_json.find("generation")->dump() == second_json.find("generation")->dump());
-    CHECK(first.headers.at("X-Macha-Idempotency") == "created");
-    CHECK(second.headers.at("X-Macha-Idempotency") == "replayed");
+    CHECK(idempotency_of(first) == "created");
+    CHECK(idempotency_of(second) == "replayed");
 
     auto replay = playback.handle(request);
     REQUIRE(replay.status == 201);
-    CHECK(replay.headers.at("X-Macha-Idempotency") == "replayed");
+    CHECK(idempotency_of(replay) == "replayed");
     auto replay_json = Json::parse(std::string(replay.body.begin(), replay.body.end()));
     CHECK(replay_json.find("session_id")->dump() == first_json.find("session_id")->dump());
     CHECK(observed->probes() == 1);
@@ -1493,7 +1497,7 @@ MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) 
     CHECK(playback.handle(remove).status == 204);
     auto reused_after_delete = playback.handle(conflicting);
     REQUIRE(reused_after_delete.status == 201);
-    CHECK(reused_after_delete.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(idempotency_of(reused_after_delete) == "created");
     CHECK(observed->probes() == 1);
     REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
 
@@ -1621,7 +1625,7 @@ MACHA_TEST("media_playback", test_profile_endpoint_pending_does_not_gate_session
     create.body.assign(text.begin(), text.end());
     auto admitted = playback.handle(create);
     REQUIRE(admitted.status == 201);
-    CHECK(admitted.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(idempotency_of(admitted) == "created");
     CHECK(engine->probes() == 1);
     CHECK(queue_requests.load() == 1);
 
@@ -1681,7 +1685,7 @@ MACHA_TEST("media_playback", test_unavailable_profile_queue_uses_media_engine_fa
 
     auto admitted = playback.handle(create);
     REQUIRE(admitted.status == 201);
-    CHECK(admitted.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(idempotency_of(admitted) == "created");
     CHECK(queue_attempts.load() == 0);
     CHECK(engine->probes() == 1);
     REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
@@ -1741,14 +1745,14 @@ MACHA_TEST("media_playback", test_failed_profile_job_retry_falls_back_and_replay
 
     auto admitted = playback.handle(create);
     REQUIRE(admitted.status == 201);
-    CHECK(admitted.headers.at("X-Macha-Idempotency") == "created");
+    CHECK(idempotency_of(admitted) == "created");
     CHECK(engine->probes() == 1);
     CHECK(requests.load() == 1);
     auto admitted_body = Json::parse(std::string(admitted.body.begin(), admitted.body.end()));
 
     auto replayed = playback.handle(create);
     REQUIRE(replayed.status == 201);
-    CHECK(replayed.headers.at("X-Macha-Idempotency") == "replayed");
+    CHECK(idempotency_of(replayed) == "replayed");
     CHECK(engine->probes() == 1);
     auto replayed_body = Json::parse(std::string(replayed.body.begin(), replayed.body.end()));
     CHECK(replayed_body.find("session_id")->dump() == admitted_body.find("session_id")->dump());
@@ -3634,10 +3638,6 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(options->find("subtitle_streams")->isArray());
     REQUIRE(options->find("subtitle_streams")->asArray().size() == 1);
     CHECK(options->find("subtitle_streams")->asArray().front().find("index")->asInt64() == 2);
-    // A title's other files are not the session's to offer: the client
-    // chooses among them from GET /api/v1/playback/media?item_id=.
-    CHECK(options->find("media_ids") == nullptr);
-    CHECK(options->find("can_switch_media") == nullptr);
     REQUIRE(options->find("quality_heights") != nullptr);
     CHECK(!options->find("quality_heights")->asArray().empty());
     auto session_id = created_json.find("session_id")->asString();

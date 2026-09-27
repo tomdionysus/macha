@@ -1,8 +1,8 @@
 # Streaming
 
-The playback API is instruction-based. **The server reports what a file is and performs what it is asked for; it does not choose.** A client reads the media facts, decides what to do with them against its own decoder, and instructs. Media probing, remuxing and transcoding run in-process through the FFmpeg libraries behind `MediaEngine`; no `ffmpeg` or `ffprobe` subprocess is launched.
+The playback API is instruction-based. **The server reports what a file is and performs what it is asked for; it does not choose.** A client reads the media facts, decides what to do with them against its own decoder, and instructs. Media probing, remuxing and transcoding run inside the node, through the FFmpeg libraries (libav) behind `MediaEngine`.
 
-There is no `auto` mode. `preferences.mode` is required on every session, and a missing or unrecognised mode is `400 bad_playback_request`.
+The client names the mode: `preferences.mode` is required on every session, and a missing or unrecognised mode is `400 bad_playback_request`.
 
 ## Modes
 
@@ -41,7 +41,7 @@ The per-stream instructions name what happens to each stream:
 }
 ```
 
-`code` is `choice_required` (several candidates, none named, or a language several share) or `choice_not_available` (the index or language names nothing this media has; `choices` lists what it does have). `choice` is `video_stream`, `audio_stream`, `subtitle_stream` or `container`; `choices` holds stream indexes, or the two container names. Both are `400`. A language the media lacks is never answered with a different track: until 0.58.0 it silently fell back to the default one. `direct` is the exception that proves the rule: the file is served untouched and the player picks its own tracks, so an unnamed stream is not refused there, and `output` then describes no selected stream.
+`code` is `choice_required` (several candidates, none named, or a language several share) or `choice_not_available` (the index or language names nothing this media has; `choices` lists what it does have). `choice` is `video_stream`, `audio_stream`, `subtitle_stream` or `container`; `choices` holds stream indexes, or the two container names. Both are `400`. A language the media lacks is refused, never answered with a different track. `direct` is the exception that proves the rule: the file is served untouched and the player picks its own tracks, so an unnamed stream is not refused there, and `output` then describes no selected stream.
 
 **The mode has to describe what is being done.** `direct` and `remux` copy every stream; `transcode` re-encodes at least one and may copy the other. `transcode` is the permissive mode, and it is how a mixture is asked for.
 
@@ -64,11 +64,11 @@ So "copy the video, re-encode the audio" is `{"mode": "transcode", "video": "cop
 - a copy into a container that cannot carry that codec (fragmented MP4 carries H.264, HEVC and AV1 video, and AAC, AC-3, E-AC-3 and Opus audio);
 - a transcode when the node has no encoder for the target.
 
-Every refusal in that list is `400 bad_playback_request` with `scope: request` and `alternative_may_succeed: false`, except the container one: that is `422 copy_not_supported` with `scope: node` and `alternative_may_succeed: true`, because the request is coherent, another build may carry the codec, and a transcode of that stream would succeed here. A refusal names the rule. The server does not quietly reinterpret a mode into the one that would have worked, because a session that reports a mode it is not performing misleads everything downstream of it.
+Every refusal in that list is `400 bad_playback_request` with `scope: request` and `alternative_may_succeed: false`, except the container one: that is `422 copy_not_supported` with `scope: node` and `alternative_may_succeed: true`, because the request is coherent, another build may carry the codec, and a transcode of that stream would succeed here. A refusal names the rule. The server performs exactly the mode it was given, because a session that reported a mode it was not performing would mislead everything downstream of it.
 
 The session reports the container it actually served in `output.container`: `fmp4` or `mpegts` for an HLS session, and the source's own container for a `direct` one. A request is not evidence of what was performed, so read it there. The `direct` vocabulary is the same one the facts endpoint uses for a source container, so the two are comparable.
 
-**What the server does not do.** It does not ask what the client can play, and there is no `capabilities` field. Whether a device can decode what it asked for is the client's business; the server reports the facts and carries out the instruction. A client that asks for `direct` on a file it cannot demux gets the file.
+**Decoding is the client's business.** The server works from the media facts and the client's instruction alone. Whether a device can decode what it asked for is for the client to decide; the server reports the facts and carries out the instruction. A client that asks for `direct` on a file it cannot demux gets the file.
 
 ## Media facts
 
@@ -89,7 +89,7 @@ GET /api/v1/playback/media?media_id=<macha: or path: identity>
 GET /api/v1/playback/media?item_id=<catalogue item>
 ```
 
-It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true) and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. Whether a stream can be copied into a container is a fact about that stream, so every video and audio stream carries its own `copy_into` object with `fmp4` and `mpegts` booleans. Until 0.58.0 `operations` carried `copy_into_fmp4` and `copy_into_mpegts` for the first video and audio stream only, which answered for whichever track happened to be first. No session is created and no pipeline starts. Each file gets the whole probe allowance; one slow file no longer pushes the rest into `unavailable`.
+It returns, per media, the identity, path, size, `container`, `format`, `duration_ms`, `bitrate`, the full stream list, and an `operations` object describing what this node can do with that file: `direct` (always true) and `transcode_video` / `transcode_audio` reflecting the encoders present in this build. Whether a stream can be copied into a container is a fact about that stream, so every video and audio stream carries its own `copy_into` object with `fmp4` and `mpegts` booleans. The call is read-only: no session is created and no pipeline starts. Each file gets the whole probe allowance to itself, so one slow file leaves the others' allowance intact.
 
 **This is how a title is played.** A catalogue item is a title; its `media_ids` are its files, and each file has its own facts. The client reads them with `?item_id=`, chooses the file, the mode, the streams and the container, and creates the session with that file's `media_id`.
 
@@ -121,7 +121,7 @@ FFmpeg streams marked `AV_DISPOSITION_ATTACHED_PIC` are metadata images, not pla
 
 `PlaybackManager` owns policy and `MediaEngine` owns media operations. The interface contains media concepts (`probe`, `PlaybackPlan`, `MediaEngineSession`, fragments and subtitle extraction), not FFmpeg options. The current implementation is `LibavMediaEngine`, but another implementation can replace it without changing the HTTP/session API.
 
-Each media source is an immutable seekable `MediaInput`. The libav input `AVIOContext` maps read/seek callbacks directly onto the pinned Macha `ReadHandle`. There is no loopback HTTP hop and no FUSE dependency. Replacing or renaming a pathname after playback starts does not silently change the extents underneath that session.
+Each media source is an immutable seekable `MediaInput`. The libav input `AVIOContext` maps read/seek callbacks directly onto the pinned Macha `ReadHandle`, so the engine reads the store itself, independently of the HTTP server and the FUSE mount. Replacing or renaming a pathname after playback starts does not silently change the extents underneath that session.
 
 Probe and subtitle readers are deliberately *not* registered with `PlaybackTracker`; only the actual direct/transformed playback reader drives read-ahead/current-file/catalogue hydration. Stable `macha:` media IDs are indexed by metadata generation, so selecting among catalogue representations does not rescan and re-hash the whole namespace on every session creation.
 
@@ -162,7 +162,7 @@ Production is sequential, so arriving beyond the look-ahead does not skip the in
 | `produced_age_ms` | How long ago the last fragment was published |
 | `producer_parked` | Whether the producer is blocked on the look-ahead gate |
 
-The rate is `produced_ms / producing_ms`, and the wait for a join at `P` is `(P - produced_ms) / (rate - 1)`. The pair is raw on purpose: a rate computed on the node is a rate with the node's smoothing and the node's window baked in, and a client deciding whether to hand over needs to choose those itself. One response answers it -- there is nothing to poll, and nothing added to a viewer's critical path.
+The rate is `produced_ms / producing_ms`, and the wait for a join at `P` is `(P - produced_ms) / (rate - 1)`. The pair is raw on purpose: a rate computed on the node is a rate with the node's smoothing and the node's window baked in, and a client deciding whether to hand over needs to choose those itself. One response answers it, without polling and without adding anything to a viewer's critical path.
 
 **`producing_ms` is not wall clock, and must not be replaced by it.** The producer runs to `max_ahead_segments` beyond demand and then blocks, so a viewer watching at normal speed keeps it parked for most of the generation's life. Wall clock would therefore report about 1.0x however fast the encoder is -- and 1.0x is read as "cannot outrun realtime", which defers a handover that would have worked. `producing_ms` accumulates only the intervals in which the encoder was actually running.
 
@@ -243,7 +243,7 @@ Connections are HTTP/1.1 keep-alive by default, reused for up to `keep_alive_max
 
 Session creation and control require the session bearer token from `POST /api/v1/session`. Returned stream URLs use a separate high-entropy capability in the path so native players can fetch direct files, playlists and fragments without the bearer token. Stream capabilities expire with the playback session.
 
-Every JSON object response carries a top-level snake_case `status` (0.56.0): `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the two playback errors built outside the common envelope — `account_session_limit` and the `playback_*_failed` stage errors — whose `status` is `"error"`. Branch on `error.code`, which is present on every error. Stream bodies, `204` and non-JSON responses carry no `status`.
+Every JSON object response carries a top-level snake_case `status`: `"ok"` on success, unless the handler states its own. An error's `status` is its `error.code`, except the two playback errors built outside the common envelope — `account_session_limit` and the `playback_*_failed` stage errors — whose `status` is `"error"`. Branch on `error.code`, which is present on every error. Stream bodies, `204` and non-JSON responses carry no `status`.
 
 ## Status
 
@@ -251,7 +251,7 @@ Every JSON object response carries a top-level snake_case `status` (0.56.0): `"o
 GET /api/v1/playback/status
 ```
 
-Reports enablement, current session/transcode counts, media-engine backend/version and encoder availability. Legacy executable-discovery status fields are reported as false/empty; the active backend/version and encoder capabilities are the authoritative status fields.
+Reports enablement, current session/transcode counts, the media engine (`media_engine_available`, `media_engine`, `media_engine_version`) and encoder availability (`h264_encoder`, `aac_encoder`).
 
 ### The budgets a node enforces, and where a client reads them
 
@@ -274,16 +274,14 @@ A client must bound its own attempt on a node against the budgets that node enfo
 - **`pipeline_idle_ms`** — how long a physical remux/transcode pipeline survives without valid current-generation traffic (`streaming.pipeline_idle_ms`).
 - **`session_idle_ms`** — how long a logical session survives without control or valid stream activity (`streaming.session_idle_ms`). This is also how long a session abandoned on an unreachable node keeps its slot.
 - **`max_sessions_per_account`** — the per-account cap, described under [what one account may hold](#what-one-account-may-hold-on-one-node). The limit only; the live count is never here.
-- **`max_sessions`** — the node-wide session cap, every account together. Its refusal is `resource_limit` and means something different from the one above: this node is full, rather than this account is. Added in 0.49.0.
-- **`transcode_entitlement_idle_ms`** — how long a session may hold a transcode entitlement with no stream activity before the node releases it. Added in 0.49.0; see [keeping a transcode slot across a pause](#keeping-a-transcode-slot-across-a-pause).
+- **`max_sessions`** — the node-wide session cap, every account together. Its refusal is `resource_limit` and means something different from the one above: this node is full, rather than this account is.
+- **`transcode_entitlement_idle_ms`** — how long a session may hold a transcode entitlement with no stream activity before the node releases it. See [keeping a transcode slot across a pause](#keeping-a-transcode-slot-across-a-pause).
 
-`pipeline_idle_ms`, `session_idle_ms` and `max_sessions_per_account` arrived in 0.48.0. Clients had been holding private copies of the first two, hardcoded against this node's defaults, which is exactly the failure `look_ahead_ms` was added to stop.
-
-These are each node's statement about **itself**, relayed like `load1` and `cpu_cores`. No node computes or reports a cluster-wide figure: it has no data to do so, since telemetry carries no peer's streaming configuration. A client that needs a worst case across the nodes it might use composes it from these, because only the client knows which nodes those are.
+These are each node's statement about **itself**, relayed like `load1` and `cpu_cores`. Each node reports only its own figures, because streaming configuration stays on the node it belongs to and telemetry does not relay it. A client that needs a worst case across the nodes it might use composes it from these, because only the client knows which nodes those are.
 
 They are **not** on the session payload, unlike `stream.look_ahead_ms`. That field is needed during playback, once a session exists; these bound the request that creates the session, so a client cannot learn them from the response it is timing out on — and a node it has never used would never report them at all.
 
-**Absence means the node cannot say**, never a default: an older node predating the field, or one with `streaming.enabled` false, omits them rather than reporting zero. A client must fall back to its own conservative bound and must never shorten a budget on the strength of a missing field, nor substitute another node's figure, which is a fact about that node.
+**Absence means the node cannot say**, never a default: a node with `streaming.enabled` false omits them rather than reporting zero. A client must fall back to its own conservative bound and must never shorten a budget on the strength of a missing field, nor substitute another node's figure, which is a fact about that node.
 
 The two directions of error are not symmetric. A client budget longer than the node's merely waits longer than necessary. A budget shorter than it abandons the node inside its own entitlement, discards a transcode that was about to succeed, and starts the identical encode elsewhere — manufacturing a viewer-visible failure out of a node that was working. Read the figure rather than guessing it, and err long.
 
@@ -297,7 +295,7 @@ Content-Type: application/json
 Authorization: Bearer <session token>
 ```
 
-`media_id` is required, and playback is by `media_id` only: a title is not playable as such, its files are, and choosing one is the client's decision. A request naming `item_id` is refused with `400 item_id_not_accepted`, and one naming no `media_id` with `400 media_id_required`; the same holds for `PATCH`, where a `media_id` switches the file being served. Until 0.58.0 an `item_id` alone made the server rank the item's files (direct over remux over transcode, then list order) and play the winner. `path:/logical/file` is also accepted as a media identity, and a file no title references is playable by its `media_id` like any other.
+`media_id` is required, and playback is by `media_id` only: a title is not playable as such, its files are, and choosing one is the client's decision. A request naming `item_id` is refused with `400 item_id_not_accepted`, and one naming no `media_id` with `400 media_id_required`; the same holds for `PATCH`, where a `media_id` switches the file being served. `path:/logical/file` is also accepted as a media identity, and a file no title references is playable by its `media_id` like any other.
 
 **A playback session is a resource, not a property of the bearer.** A `POST`
 to the collection creates a member, every time. Two `POST`s on one bearer
@@ -305,16 +303,10 @@ token yield two live sessions with different ids, both streaming, neither
 disturbing the other. The response is `201` with a `Location` header naming
 the new session.
 
-This changed in 0.48.0 and it breaks what came before. Until then the server
-keyed a playback session on the authenticated API session and a token had at
-most one, so a second `POST` silently superseded whatever that token was
-already playing. A client that needed two concurrent generations needed two
-API sessions. Both of those facts are gone: hold as many as you need, within
-the per-account cap below.
+Hold as many as you need, within the per-account cap below.
 
-**The server mints the id.** There is no request field that proposes one, no
-viewer-session header, and no `viewer_session_id` body field — `idempotency_key`
-is a request token, not an identifier. A client that loses an id recovers it
+**The server mints the id**, and the response is the only place it comes
+from; `idempotency_key` is a request token, not an identifier. A client that loses an id recovers it
 from the collection listing rather than reconstructing it.
 
 **Idempotency is a separate mechanism** and is a **query parameter**, not a
@@ -335,11 +327,11 @@ startup budgets; a key whose session has since ended answers
 visible ASCII characters; anything else is `400 bad_idempotency_key`. The
 fingerprint includes the bearer token, so a key cannot replay across API
 sessions. Keys are scoped per account, so one account cannot occupy another's
-key and turn its legitimate retry into a conflict. The response reports
-`X-Macha-Idempotency: created|replayed`.
+key and turn its legitimate retry into a conflict. A keyed response carries
+`idempotency`: `"created"` or `"replayed"`.
 
-Omitting the key makes each `POST` a distinct creation, which now means a
-distinct session. Idempotency prevents a *duplicate* session on a retry; it is
+Omitting the key makes each `POST` a distinct creation, and so a distinct
+session. Idempotency prevents a *duplicate* session on a retry; it is
 not what lets you hold two, and it is not needed for that.
 
 ### What one account may hold on one node
@@ -406,12 +398,13 @@ client that assumes a figure and meets a node configured differently gets the
 failure it was trying to avoid. Absent means the node does not say, so keep a
 conservative local bound and never lengthen one on a missing field.
 
-**Why this exists.** The entitlement used to be held until the session was
-erased, so it outlived its own pipeline by `session_idle_ms` — thirty minutes
+**Why this exists.** Holding the entitlement for the life of the session
+would let it outlive its own pipeline by `session_idle_ms` — thirty minutes
 against sixty seconds. On a node where `max_video_transcodes` is 1, one client
-that crashed, was force-stopped or was reaped in the background closed that
-node to transcoding for everybody for half an hour. A refusal after a long
-pause is visible, attributable and recoverable; that outage was none of those.
+that crashed, was force-stopped or was reaped in the background would close
+that node to transcoding for everybody for half an hour. A refusal after a long
+pause is visible, attributable and recoverable; that outage would be none of
+those.
 
 **If refused on resume**, the `429` carries `scope: request` on the update
 path — do not walk the cluster, the session is pinned to this node — with
@@ -422,7 +415,7 @@ usually start immediately.
 
 A **generation** is one produced stream for a session. A seek, a quality or
 track change, and a media switch each end the current generation and begin a
-new one. (A second `POST` no longer does: it makes a separate session.) The
+new one; a second `POST` makes a separate session instead. The
 generation number is in the stream path, so every URL a client holds belongs
 to exactly one:
 
@@ -433,8 +426,7 @@ to exactly one:
 **The stream is a subresource of the session it belongs to.** The capability
 sits immediately before the part it authorises, and it stays in the path
 rather than moving to a header because it is a capability, not a credential —
-media players fetch segments without application headers. The top-level
-`/api/v1/playback/stream/...` route was removed in 0.48.0.
+media players fetch segments without application headers.
 
 When a generation is superseded its producing pipeline is stopped and its
 segments stop resolving. **Every URL the client still holds for that
@@ -463,10 +455,9 @@ client must not collapse them:**
 - **`404 not_found`** — nothing here ever produced that: a generation above
   the current one, an unknown session, or a bad capability.
 
-`410` arrived in 0.48.0. Before it, a superseded generation and a segment that
-never existed shared one `404`, which made every regenerate — and a regenerate
-is routine — indistinguishable from a fault, and left a client reasonably
-retrying something that would never come back.
+Keeping `410` apart from `404` is what lets a client tell a routine
+regenerate from a fault, and stop retrying something that will never come
+back.
 
 Minimal request:
 
@@ -589,7 +580,7 @@ Per mode:
 
 - **Transcode.** `seek_ms` is exactly the requested position and `seek_offset_ms` is always `0`. The encoder can start on any frame, so it does. The decoder still seeks back to the preceding keyframe for pre-roll and discards decoded frames before the origin; on slow software decode that can add seconds to startup. That is the price of asking for a non-keyframe and it is the client's to pay.
 - **Remux.** `seek_ms` is the last indexed keyframe at or before the request; `seek_offset_ms` is the remainder. A stream copy has no decoder and an fMP4 fragment's first sample must be a sync sample, so this is the only split the container permits. The client attaches at `seek_offset_ms` within the first fragment, so the pre-roll is fetched but never presented.
-- **Direct.** `seek_ms` is the request and `seek_offset_ms` is `0`. There is no generation; the client byte-ranges the source.
+- **Direct.** `seek_ms` is the request and `seek_offset_ms` is `0`. Direct playback is generation-free; the client byte-ranges the source.
 
 The offset is therefore zero exactly when the mode can be frame-accurate. A client that wants a cheap, exactly-aligned seek asks for a position that is already a keyframe.
 
@@ -610,14 +601,14 @@ DELETE /api/v1/playback/sessions/{id}
 for**, and it is what makes handover between clients on one account possible:
 it answers under `items`, like every other collection here, plus the `account`
 block. It lists exactly the caller's own sessions on this node and nothing
-else. There is no cluster-wide listing — a session is a resource of the node
-producing it, and no node can enumerate another's.
+else. Listing is per node — a session is a resource of the node producing
+it, and each node enumerates only its own.
 
 **A session belongs to one account, and the control routes enforce it.** An
 id belonging to another account answers **`404`, not `403`**, on `GET`,
 `PATCH` and `DELETE`: whether an id exists on this node is not something one
-account gets to learn about another. This matters more than it used to, since
-the listing now hands ids out.
+account gets to learn about another, and the listing hands ids out only to
+their owner.
 
 `DELETE` tears down that one session and leaves the caller's others running.
 Delete sessions you have finished with: an undeleted one holds its slot
@@ -629,14 +620,14 @@ against the per-account cap until it idles out.
 POST /api/v1/playback/sessions/{id}/stream/{token}/close
 ```
 
-**New in 0.60.0.** The same teardown as `DELETE`, authorised by the session's
+The same teardown as `DELETE`, authorised by the session's
 signed stream URL instead of a bearer: `{id}/stream/{token}` is the prefix of
 the `stream.url` every session response carries. It takes no `Authorization`
 header, no other custom header and no body (or a `text/plain` one), so it is a
 CORS simple request and needs no preflight. That is the point of it: a browser
 unloading a page does not complete a preflighted request, and a cross-origin
-`DELETE` with a bearer is always preflighted, so a reload used to leave its
-session -- and any transcode slot -- held until the idle rule. Send it with
+`DELETE` with a bearer is always preflighted, so without this route a reload
+would leave its session -- and any transcode slot -- held until the idle rule. Send it with
 `navigator.sendBeacon` or `fetch(..., {keepalive: true})` on page exit, and keep
 using `DELETE` for every other close.
 
@@ -688,7 +679,7 @@ A direct MP4 can be assigned directly to a normal HTML `<video>` element. For tr
 
 ## Resource limits and cleanup
 
-`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements belong to a session: each session created is its own logical viewer, which a `PATCH` replacement inherits, so two sessions transcoding hold two entitlements even on one account. Transcode limits count those entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through changes that still transcode, and releases it on DELETE or the page-exit close, on session expiry, **after `transcode_entitlement_idle_ms` with no stream activity** (new in 0.49.0; it used to be held until the session was erased), or **when a `PATCH` leaves transcode** (new in 0.60.0): a session switched to direct or remux gives up its video entitlement, and one whose audio is no longer transcoded gives up its audio entitlement. Switching back to transcode reacquires it like any other `PATCH`, and may then be refused with `resource_limit`. The release is per session: it clears only what that logical viewer holds, and is skipped while another session record still shares the same logical viewer. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429, and **the two 429s are not interchangeable**. `account_session_limit` is identical on every node, so a client must not walk the cluster on it. `resource_limit` is this node's property, and its failure axes differ by path: on **create** it is `scope: node` — another node may have capacity, so walking is right — while on **update** it is `scope: request`, because the session already exists here and walking would mean abandoning a generation that is still serving. Both carry `node_healthy: true` and `alternative_may_succeed: true`: on the update path the alternative is a different instruction against this same node, such as remux instead of transcode or a lower `max_height`. In every case the viewer's current playback is untouched by the refusal. Malformed/incompatible playback requests return `400 bad_playback_request`, a copy the segment container cannot carry returns `422 copy_not_supported`, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503 (422 when the source is `source_unsupported`). Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` (and `reason` when the engine gave one) in the `error` object, and return the same values in `X-Macha-Playback-Trace` and `X-Macha-Playback-Stage` for correlation with `playback[trace]` server logs.
+`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements belong to a session: each session created is its own logical viewer, which a `PATCH` replacement inherits, so two sessions transcoding hold two entitlements even on one account. Transcode limits count those entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through changes that still transcode, and releases it on DELETE or the page-exit close, on session expiry, **after `transcode_entitlement_idle_ms` with no stream activity**, or **when a `PATCH` leaves transcode**: a session switched to direct or remux gives up its video entitlement, and one whose audio is no longer transcoded gives up its audio entitlement. Switching back to transcode reacquires it like any other `PATCH`, and may then be refused with `resource_limit`. The release is per session: it clears only what that logical viewer holds, and is skipped while another session record still shares the same logical viewer. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429, and **the two 429s are not interchangeable**. `account_session_limit` is identical on every node, so a client must not walk the cluster on it. `resource_limit` is this node's property, and its failure axes differ by path: on **create** it is `scope: node` — another node may have capacity, so walking is right — while on **update** it is `scope: request`, because the session already exists here and walking would mean abandoning a generation that is still serving. Both carry `node_healthy: true` and `alternative_may_succeed: true`: on the update path the alternative is a different instruction against this same node, such as remux instead of transcode or a lower `max_height`. In every case the viewer's current playback is untouched by the refusal. Malformed/incompatible playback requests return `400 bad_playback_request`, a copy the segment container cannot carry returns `422 copy_not_supported`, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503 (422 when the source is `source_unsupported`). Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` (and `reason` when the engine gave one) in the `error` object; `trace` correlates with the `playback[trace]` server logs.
 
 Logical sessions expire after `session_idle_ms` without control or valid
 current-generation stream activity. Expiry cancels the in-process pipeline and

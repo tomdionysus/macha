@@ -1056,7 +1056,7 @@ struct PlaybackManager::Impl {
     HttpResponse creation_response(const Session& session, std::string trace,
                                    std::string_view idempotency_status = {}) const {
         auto payload = session_json(session);
-        payload["trace_id"] = trace;
+        payload["trace_id"] = std::move(trace);
         // What this account may hold here and what it holds now, so a client
         // can plan against the cap instead of discovering it by refusal at the
         // worst moment. Counted live, under the lock, at the instant of the
@@ -1066,15 +1066,12 @@ struct PlaybackManager::Impl {
         // /api/v1/playback/status, which clients cache. A count that can only
         // arrive fresh cannot be read stale.
         payload["account"] = account_state_json(session.account);
+        // Whether a keyed request created this session or replayed an existing
+        // one: the one fact here the client cannot infer from what it sent.
+        if (!idempotency_status.empty())
+            payload["idempotency"] = std::string(idempotency_status);
         auto response = http_json(201, payload.dump());
         response.headers["Location"] = "/api/v1/playback/sessions/" + session.id;
-        response.headers["X-Macha-Playback-Trace"] = std::move(trace);
-        // Unlike the retired Idempotency-Key/Macha-Viewer-Session echoes (pure
-        // restatements of what the client already sent), this conveys new
-        // information the client cannot otherwise infer: whether its request
-        // created a session or joined/replayed an existing one.
-        if (!idempotency_status.empty())
-            response.headers["X-Macha-Idempotency"] = std::string(idempotency_status);
         return response;
     }
 
@@ -3574,10 +3571,7 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
             error["alternative_may_succeed"] = *axes.alternative_may_succeed;
         Json::Object body;
         body["error"] = std::move(error);
-        auto response = http_json(status, Json(std::move(body)).dump());
-        response.headers["X-Macha-Playback-Trace"] = e.trace();
-        response.headers["X-Macha-Playback-Stage"] = e.stage();
-        return response;
+        return http_json(status, Json(std::move(body)).dump());
     } catch (const std::exception& e) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
         Log::warn("playback request failed method=" + request.method + " path=" + request.path +
