@@ -52,6 +52,15 @@ bool safe_tracker_url(std::string_view value) {
     return value.starts_with("http://") || value.starts_with("https://") || value.starts_with("udp://");
 }
 
+// An add of a torrent some job already holds. Thrown and caught inside this
+// file only: add() callers see it as a Placement or an RPC reply carrying the
+// code and the holder's id.
+struct TorrentAlreadyAdded : std::runtime_error {
+    std::string job_id;
+    explicit TorrentAlreadyAdded(std::string holder)
+        : std::runtime_error("job " + holder + " already holds this torrent"), job_id(std::move(holder)) {}
+};
+
 // Until 0.58.2 a job's info_hash was declared, serialised and persisted, and
 // never set, so every job reported null.
 std::string info_hash_hex(const lt::info_hash_t& hashes) { return torrent_info_hash_hex(hashes); }
@@ -315,6 +324,11 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
             try {
                 added["job_id"] = search_result ? add_search_result(uri) : add(uri);
                 added["exists"] = true;
+            } catch (const TorrentAlreadyAdded& held) {
+                added["exists"] = false;
+                added["error_code"] = std::string("torrent_already_added");
+                added["error"] = std::string(held.what());
+                added["job_id"] = held.job_id;
             } catch (const std::exception& error) {
                 added["exists"] = false;
                 added["error_code"] = std::string("add_failed");
@@ -360,6 +374,10 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
             placement.job_id = search_result ? add_search_result(std::string(magnet_or_uri))
                                              : add(std::string(magnet_or_uri));
             placement.placed = true;
+        } catch (const TorrentAlreadyAdded& held) {
+            placement.reason = "torrent_already_added";
+            placement.error = held.what();
+            placement.job_id = held.job_id;
         } catch (const std::exception& error) {
             placement.reason = "add_failed";
             placement.error = error.what();
@@ -408,6 +426,8 @@ TorrentService::Placement TorrentManager::add_on(const NodeId& node,
         // The peer's own code, so a refusal there reads the same as one here.
         const auto* code = parsed.find("error_code");
         placement.reason = code && code->isString() ? code->asString() : "node_did_not_start";
+        // torrent_already_added names the job that holds the torrent there.
+        if (const auto* id = parsed.find("job_id"); id && id->isString()) placement.job_id = id->asString();
         if (const auto* error = parsed.find("error"); error && error->isString())
             placement.error = error->asString();
         else
@@ -571,11 +591,23 @@ void TorrentManager::save_state_locked() const {
     durable_replace_file(state_file_, Json(std::move(root)).dump());
 }
 
+void TorrentManager::set_fault_sink(std::function<void(std::string)> sink) {
+    std::lock_guard lock(mutex_);
+    fault_sink_ = std::move(sink);
+}
+
 void TorrentManager::start() {
     if (!config_.enabled || worker_.joinable()) return;
     restore_jobs();
     worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("torrent", [this, stop] { loop(stop); });
+        run_supervised_escalating("torrent", [this, stop] { loop(stop); }, [this](std::string reason) {
+            std::function<void(std::string)> sink;
+            {
+                std::lock_guard lock(mutex_);
+                sink = fault_sink_;
+            }
+            if (sink) sink(std::move(reason));
+        });
     });
 }
 
@@ -687,7 +719,28 @@ void TorrentManager::restore_jobs() {
             restore.push_back(job);
         }
     }
+    // Oldest first, so of two jobs recorded for one torrent before 0.63.0
+    // refused the second, the first keeps it.
+    std::stable_sort(restore.begin(), restore.end(), [](const TorrentJob& a, const TorrentJob& b) {
+        return a.created_unix_ms < b.created_unix_ms;
+    });
+    std::map<std::string, std::string, std::less<>> restored_by_hash;
     for (const auto& job : restore) {
+        if (!job.info_hash.empty()) {
+            const auto [holder, first] = restored_by_hash.try_emplace(job.info_hash, job.id);
+            if (!first) {
+                std::lock_guard lock(mutex_);
+                auto& mutable_job = jobs_[job.id];
+                mutable_job.state = TorrentJobState::failed;
+                mutable_job.error_code = "duplicate_torrent";
+                mutable_job.error = "job " + holder->second + " holds the same torrent";
+                mutable_job.updated_unix_ms = unix_ms();
+                save_state_locked();
+                Log::warn("torrent job not restored id=" + job.id + ": job " + holder->second +
+                          " holds the same torrent info_hash=" + job.info_hash);
+                continue;
+            }
+        }
         try {
             // Resume data first: it names the pieces already verified, so the
             // disk backend trusts them instead of re-hashing the payload.
@@ -712,8 +765,9 @@ void TorrentManager::restore_jobs() {
             // gbni-1, 2026-09-25, stuck after 0.61.0). Added normally, the
             // check holds it again as soon as its size is known.
             set_hold_at_add(atp, job.state == TorrentJobState::paused);
-            auto handle = impl_->session.add_torrent(std::move(atp));
-            impl_->handles[job.id] = std::move(handle);
+            atp.flags |= lt::torrent_flags::duplicate_is_error;
+            std::lock_guard lock(mutex_);
+            impl_->handles[job.id] = impl_->session.add_torrent(std::move(atp));
         } catch (const std::exception& e) {
             std::lock_guard lock(mutex_);
             auto& mutable_job = jobs_[job.id];
@@ -732,7 +786,6 @@ std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
     job.id = to_string(random_node_id());
     job.created_unix_ms = job.updated_unix_ms = unix_ms();
     job.save_path = ingest_.staging().path() / "torrents" / job.id;
-    std::filesystem::create_directories(job.save_path);
 
     lt::add_torrent_params atp;
     if (auto magnet = sanitize_magnet_uri(uri)) {
@@ -763,37 +816,58 @@ std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
     }
     atp.save_path = job.save_path.string();
     harden_add_params(atp, config_);
-    auto handle = impl_->session.add_torrent(std::move(atp));
+    // Macha's own check below is the rule; this is its backstop. Without it
+    // libtorrent answers a second add of a torrent with the first one's
+    // handle, and a hash Macha failed to match (a v2-only magnet for a
+    // hybrid torrent) would become two jobs sharing one torrent again.
+    atp.flags |= lt::torrent_flags::duplicate_is_error;
+    const auto wanted = atp.ti ? atp.ti->info_hashes() : atp.info_hashes;
+    const auto info_hash = info_hash_hex(wanted);
+
+    // Checked and added under one lock, so two concurrent adds of one torrent
+    // cannot both pass the check.
+    std::lock_guard lock(mutex_);
+    if (!info_hash.empty())
+        if (auto holder = job_holding_locked(info_hash)) {
+            Log::info("torrent add refused: job " + *holder + " already holds info_hash=" + info_hash);
+            throw TorrentAlreadyAdded(*holder);
+        }
+    std::filesystem::create_directories(job.save_path);
+    lt::torrent_handle handle;
+    try {
+        handle = impl_->session.add_torrent(std::move(atp));
+    } catch (const lt::system_error& e) {
+        std::error_code ec;
+        std::filesystem::remove_all(job.save_path, ec);
+        if (e.code() == lt::errors::duplicate_torrent) {
+            // libtorrent matched a hash Macha's comparison did not (a v2-only
+            // magnet for a hybrid torrent): name the job whose torrent it is.
+            for (const auto& [id, candidate] : impl_->handles) {
+                const auto held = candidate.info_hashes();
+                if ((wanted.has_v1() && held.has_v1() && wanted.v1 == held.v1) ||
+                    (wanted.has_v2() && held.has_v2() && wanted.v2 == held.v2))
+                    throw TorrentAlreadyAdded(id);
+            }
+        }
+        throw;
+    }
     auto status = handle.status(lt::torrent_handle::query_name);
     job.name = sanitize_text(status.name, 1024);
     job.info_hash = info_hash_hex(status.info_hashes);
     job.state = status.state == lt::torrent_status::downloading_metadata ? TorrentJobState::metadata : TorrentJobState::queued;
-    {
-        std::lock_guard lock(mutex_);
-        jobs_[job.id] = job;
-        impl_->handles[job.id] = std::move(handle);
-        try {
-            save_state_locked();
-        } catch (...) {
-            // The API must not report a failed admission while libtorrent keeps
-            // unacknowledged work running. Roll the live handle and in-memory
-            // record back before propagating the persistence failure.
-            if (auto h = impl_->handles.find(job.id); h != impl_->handles.end()) {
-                try {
-                    impl_->session.remove_torrent(
-                        h->second, lt::session::delete_files | lt::session::delete_partfile);
-                } catch (...) {
-                    // Preserve the original durable-state error. remove_torrent
-                    // is best-effort cleanup here; erase the manager handle so
-                    // this failed request cannot later be driven by our worker.
-                }
-                impl_->handles.erase(h);
-            }
-            jobs_.erase(job.id);
-            std::error_code ec;
-            std::filesystem::remove_all(job.save_path, ec);
-            throw;
-        }
+    jobs_[job.id] = job;
+    impl_->handles[job.id] = std::move(handle);
+    try {
+        save_state_locked();
+    } catch (...) {
+        // The API must not report a failed admission while libtorrent keeps
+        // unacknowledged work running. Roll the live handle and in-memory
+        // record back before propagating the persistence failure.
+        retire_torrent_locked(job.id, true);
+        jobs_.erase(job.id);
+        std::error_code ec;
+        std::filesystem::remove_all(job.save_path, ec);
+        throw;
     }
     cv_.notify_all();
     return job.id;
@@ -912,20 +986,8 @@ bool TorrentManager::cancel(std::string_view id) {
     if (it->second.state == TorrentJobState::completed || it->second.state == TorrentJobState::cancelled) return false;
     if (it->second.ingest_job_id) (void)ingest_.cancel(*it->second.ingest_job_id);
     const bool delete_payload = ingest_.delete_owned_source_on_cancel();
-    if (auto h = impl_->handles.find(it->first); h != impl_->handles.end()) {
-        if (delete_payload)
-            impl_->session.remove_torrent(h->second, lt::session::delete_files | lt::session::delete_partfile);
-        else
-            impl_->session.remove_torrent(h->second);
-        impl_->handles.erase(h);
-    }
+    retire_torrent_locked(it->first, delete_payload);
     ingest_.staging().release(it->first);
-    publication_waits_.erase(it->first);
-    check_samples_.erase(it->first);
-    {
-        std::error_code ec;
-        std::filesystem::remove(resume_path(it->first), ec);
-    }
     if (delete_payload) {
         std::error_code ec;
         std::filesystem::remove_all(it->second.save_path, ec);
@@ -936,6 +998,7 @@ bool TorrentManager::cancel(std::string_view id) {
     it->second.eta_seconds.reset();
     it->second.updated_unix_ms = unix_ms();
     save_state_locked();
+    Log::info("torrent cancelled id=" + it->first + " payload_deleted=" + (delete_payload ? "true" : "false"));
     cv_.notify_all();
     return true;
 }
@@ -951,6 +1014,10 @@ bool TorrentManager::clear(std::string_view id) {
             it->second.state != TorrentJobState::failed)
             return false;
         terminal_job = it->second;
+        // A terminal job needs no torrent, and one that failed in libtorrent
+        // still has one. Until 0.63.0 clear left it in the session and in
+        // impl_->handles while deleting its payload underneath it.
+        retire_torrent_locked(terminal_job.id, false);
     }
 
     bool linked_cleared = false;
@@ -966,10 +1033,6 @@ bool TorrentManager::clear(std::string_view id) {
         if (ec) throw std::runtime_error("cannot clear torrent staging payload: " + ec.message());
     }
     ingest_.staging().release(terminal_job.id);
-    {
-        std::error_code ec;
-        std::filesystem::remove(resume_path(terminal_job.id), ec);
-    }
 
     std::lock_guard lock(mutex_);
     auto it = jobs_.find(std::string(id));
@@ -980,6 +1043,58 @@ bool TorrentManager::clear(std::string_view id) {
     Log::info("torrent cleared id=" + terminal_job.id);
     cv_.notify_all();
     return true;
+}
+
+std::optional<std::string> TorrentManager::job_holding_locked(std::string_view info_hash) const {
+    for (const auto& [id, job] : jobs_)
+        if (job.info_hash == info_hash) return id;
+    return std::nullopt;
+}
+
+void TorrentManager::retire_torrent_locked(const std::string& id, bool delete_payload) {
+    publication_waits_.erase(id);
+    check_samples_.erase(id);
+    if (impl_) {
+        if (auto h = impl_->handles.find(id); h != impl_->handles.end()) {
+            try {
+                if (delete_payload)
+                    impl_->session.remove_torrent(h->second,
+                                                  lt::session::delete_files | lt::session::delete_partfile);
+                else
+                    impl_->session.remove_torrent(h->second);
+            } catch (const std::exception& e) {
+                // Already gone from the session: what matters is that no
+                // handle to it stays behind.
+                Log::warn("torrent remove failed id=" + id + ": " + e.what());
+            }
+            impl_->handles.erase(h);
+        }
+    }
+    std::error_code ec;
+    std::filesystem::remove(resume_path(id), ec);
+}
+
+void TorrentManager::isolate_fault_locked(const std::string& id, std::string_view what) {
+    Log::error("torrent job faulted id=" + id + ": " + std::string(what) +
+               "; the job is failed and every other job carries on");
+    retire_torrent_locked(id, false);
+    auto it = jobs_.find(id);
+    if (it == jobs_.end()) return;
+    auto& job = it->second;
+    // A job linked to an ingest keeps following it: update_jobs brings a
+    // failed job back while its ingest runs.
+    job.state = TorrentJobState::failed;
+    job.error_code = "torrent_fault";
+    job.error = std::string(what);
+    job.download_rate = job.upload_rate = 0;
+    job.eta_seconds.reset();
+    job.updated_unix_ms = unix_ms();
+    if (!job.ingest_job_id) ingest_.staging().release(id);
+    try {
+        save_state_locked();
+    } catch (const std::exception& e) {
+        Log::warn("torrent state not saved after fault id=" + id + ": " + e.what());
+    }
 }
 
 bool TorrentManager::linked_ingest_revived(const TorrentJob& job) const {
@@ -1021,23 +1136,36 @@ void TorrentManager::drain_alerts() {
             Log::info("torrent DHT bootstrapped");
             continue;
         }
+        // An alert can outlive its torrent: it may name one retired since it
+        // was queued. Only a handle still held by a job is acted on, and
+        // under the lock that keeps it held.
         if (const auto* finished = lt::alert_cast<lt::piece_finished_alert>(alert)) {
-            if (const auto path = save_path_of(finished->handle))
-                verifications_->piece_verified(*path, static_cast<int>(finished->piece_index));
+            std::lock_guard lock(mutex_);
+            if (const auto* job = job_of_locked(finished->handle))
+                verifications_->piece_verified(job->save_path.string(),
+                                               static_cast<int>(finished->piece_index));
             continue;
         }
         // A check (a resume, or a recheck) reports no per-piece alerts, and
         // piece alerts can be dropped (below), so at these two points every
         // piece the torrent holds is reported from its own bitfield.
-        if (const auto* checked = lt::alert_cast<lt::torrent_checked_alert>(alert)) {
-            report_held_pieces(checked->handle);
-            // A finished check is exactly what a restart must not repeat.
-            request_resume_save(checked->handle);
-            continue;
-        }
-        if (const auto* finished = lt::alert_cast<lt::torrent_finished_alert>(alert)) {
-            report_held_pieces(finished->handle);
-            request_resume_save(finished->handle);
+        const lt::torrent_handle* settled = nullptr;
+        if (const auto* checked = lt::alert_cast<lt::torrent_checked_alert>(alert))
+            settled = &checked->handle;
+        else if (const auto* finished = lt::alert_cast<lt::torrent_finished_alert>(alert))
+            settled = &finished->handle;
+        if (settled) {
+            std::lock_guard lock(mutex_);
+            if (auto* job = job_of_locked(*settled)) {
+                const auto id = job->id;
+                try {
+                    report_held_pieces_locked(*job, *settled);
+                    // A finished check is exactly what a restart must not repeat.
+                    request_resume_save(*settled);
+                } catch (const std::exception& e) {
+                    isolate_fault_locked(id, e.what());
+                }
+            }
             continue;
         }
         if (const auto* saved = lt::alert_cast<lt::save_resume_data_alert>(alert)) {
@@ -1115,24 +1243,21 @@ void TorrentManager::drain_alerts() {
     }
 }
 
-void TorrentManager::report_held_pieces(const lt::torrent_handle& handle) {
-    const auto path = save_path_of(handle);
-    if (!path) return;
+void TorrentManager::report_held_pieces_locked(const TorrentJob& job, const lt::torrent_handle& handle) {
+    const auto path = job.save_path.string();
     const auto held = handle.status(lt::torrent_handle::query_pieces).pieces;
     for (int piece = 0; piece < held.size(); ++piece)
-        if (held.get_bit(lt::piece_index_t(piece))) verifications_->piece_verified(*path, piece);
+        if (held.get_bit(lt::piece_index_t(piece))) verifications_->piece_verified(path, piece);
 }
 
-std::optional<std::string> TorrentManager::save_path_of(const lt::torrent_handle& handle) const {
-    if (!impl_) return std::nullopt;
+TorrentJob* TorrentManager::job_of_locked(const lt::torrent_handle& handle) {
+    if (!impl_) return nullptr;
     for (const auto& [id, candidate] : impl_->handles) {
         if (candidate != handle) continue;
-        std::lock_guard lock(mutex_);
         const auto job = jobs_.find(id);
-        if (job == jobs_.end()) return std::nullopt;
-        return job->second.save_path.string();
+        return job == jobs_.end() ? nullptr : &job->second;
     }
-    return std::nullopt;
+    return nullptr;
 }
 
 bool TorrentManager::publication_settled_locked(const std::string& id, const TorrentJob& job) {
@@ -1219,14 +1344,37 @@ void TorrentManager::loop(std::stop_token stop) {
         // Piece alerts are a hint; the bitfield is the record. Every few
         // seconds every torrent's held pieces are reported again, so a lost
         // alert delays an extent's publication by at most this interval.
+        // impl_->handles is only ever read or changed under mutex_, and a
+        // torrent leaves it only through retire_torrent_locked, so every
+        // handle walked here names a torrent still in the session. A walk
+        // that throws anyway fails that one job, never the worker.
         if (impl_ && Clock::now() - last_held_pieces_report_ >= held_pieces_report_interval) {
             last_held_pieces_report_ = Clock::now();
-            for (const auto& [_, handle] : impl_->handles) report_held_pieces(handle);
+            std::lock_guard lock(mutex_);
+            std::vector<std::pair<std::string, std::string>> faults;
+            for (const auto& [id, handle] : impl_->handles) {
+                const auto job = jobs_.find(id);
+                if (job == jobs_.end()) continue;
+                try {
+                    report_held_pieces_locked(job->second, handle);
+                } catch (const std::exception& e) {
+                    faults.emplace_back(id, e.what());
+                }
+            }
+            for (const auto& [id, what] : faults) isolate_fault_locked(id, what);
         }
         if (impl_ && Clock::now() - last_resume_save_ >= resume_save_interval) {
             last_resume_save_ = Clock::now();
             std::lock_guard lock(mutex_);
-            for (const auto& [_, handle] : impl_->handles) request_resume_save(handle);
+            std::vector<std::pair<std::string, std::string>> faults;
+            for (const auto& [id, handle] : impl_->handles) {
+                try {
+                    request_resume_save(handle);
+                } catch (const std::exception& e) {
+                    faults.emplace_back(id, e.what());
+                }
+            }
+            for (const auto& [id, what] : faults) isolate_fault_locked(id, what);
         }
         update_jobs();
         std::unique_lock lock(mutex_);
@@ -1248,194 +1396,198 @@ void TorrentManager::loop(std::stop_token stop) {
 void TorrentManager::update_jobs() {
     std::lock_guard lock(mutex_);
     bool changed = false;
+    std::vector<std::pair<std::string, std::string>> faults;
     for (auto& [id, job] : jobs_) {
-        if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed)
-            continue;
-        // Until 0.62.0 a failed job was never looked at again, so resuming
-        // its ingest directly left it failed for good, with its staging
-        // reservation held (Rome, gbni-1, 2026-09-25). One whose ingest is
-        // running again falls through to the linked-ingest sync below.
-        if (job.state == TorrentJobState::failed && !linked_ingest_revived(job))
-            continue;
+        // One job's fault is that job's, not the worker's (0.63.0).
+        try {
+            if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed)
+                continue;
+            // Until 0.62.0 a failed job was never looked at again, so resuming
+            // its ingest directly left it failed for good, with its staging
+            // reservation held (Rome, gbni-1, 2026-09-25). One whose ingest is
+            // running again falls through to the linked-ingest sync below.
+            if (job.state == TorrentJobState::failed && !linked_ingest_revived(job))
+                continue;
 
-        // Macha's explicit pause is operator intent. libtorrent applies
-        // pause asynchronously and status() may briefly report the pre-pause
-        // download state; never let that stale observation resume the job in
-        // Macha. Linked ingest jobs are still sampled because their own state
-        // is authoritative once the torrent payload has been handed over.
-        if (job.state == TorrentJobState::paused && !job.ingest_job_id)
-            continue;
+            // Macha's explicit pause is operator intent. libtorrent applies
+            // pause asynchronously and status() may briefly report the pre-pause
+            // download state; never let that stale observation resume the job in
+            // Macha. Linked ingest jobs are still sampled because their own state
+            // is authoritative once the torrent payload has been handed over.
+            if (job.state == TorrentJobState::paused && !job.ingest_job_id)
+                continue;
 
-        if (job.ingest_job_id) {
-            auto ingest_job = ingest_.job(*job.ingest_job_id);
-            if (!ingest_job) {
+            if (job.ingest_job_id) {
+                auto ingest_job = ingest_.job(*job.ingest_job_id);
+                if (!ingest_job) {
+                    job.state = TorrentJobState::failed;
+                    job.error_code = "ingest_missing";
+                    job.error = "associated ingest job disappeared";
+                } else {
+                    job.catalogue_total = ingest_job->catalogue_total;
+                    job.catalogue_pending = ingest_job->catalogue_pending;
+                    job.catalogue_catalogued = ingest_job->catalogue_catalogued;
+                    job.catalogue_no_match = ingest_job->catalogue_no_match;
+                    job.catalogue_failed = ingest_job->catalogue_failed;
+                    if (ingest_job->state == IngestJobState::completed) {
+                        job.state = TorrentJobState::completed;
+                        job.error.clear();
+                        job.error_code.clear();
+                        ingest_.staging().release(id);
+                    } else if (ingest_job->state == IngestJobState::failed ||
+                               ingest_job->state == IngestJobState::cancelled) {
+                        job.state = TorrentJobState::failed;
+                        job.error_code = ingest_job->state == IngestJobState::cancelled ? "ingest_cancelled"
+                                         : !ingest_job->error_code.empty()          ? ingest_job->error_code
+                                                                                    : "ingest_failed";
+                        job.error = "ingest " + ingest_job_state_name(ingest_job->state) +
+                                    (ingest_job->error.empty() ? std::string{} : ": " + ingest_job->error);
+                    } else {
+                        if (ingest_job->state == IngestJobState::paused)
+                            job.state = TorrentJobState::paused;
+                        else if (ingest_job->state == IngestJobState::blocked)
+                            job.state = TorrentJobState::blocked;
+                        else if (ingest_job->state == IngestJobState::cataloguing)
+                            job.state = TorrentJobState::cataloguing;
+                        else
+                            job.state = TorrentJobState::importing;
+                        job.bytes_total = ingest_job->bytes_total;
+                        job.bytes_completed = ingest_job->bytes_completed;
+                        job.download_rate = ingest_job->rate_bytes_per_second;
+                        job.eta_seconds = ingest_job->eta_seconds;
+                        job.error_code = ingest_job->error_code;
+                        job.error = ingest_job->error;
+                    }
+                }
+                job.updated_unix_ms = unix_ms();
+                changed = true;
+                continue;
+            }
+
+            auto hit = impl_->handles.find(id);
+            if (hit == impl_->handles.end()) continue;
+            auto status = hit->second.status(lt::torrent_handle::query_name | lt::torrent_handle::query_accurate_download_counters);
+            job.name = sanitize_text(status.name, 1024);
+            if (job.info_hash.empty()) job.info_hash = info_hash_hex(status.info_hashes);
+            job.bytes_total = status.total_wanted > 0 ? static_cast<uint64_t>(status.total_wanted) : 0;
+            job.bytes_completed = status.total_wanted_done > 0 ? static_cast<uint64_t>(status.total_wanted_done) : 0;
+            job.download_rate = status.download_rate > 0 ? static_cast<uint64_t>(status.download_rate) : 0;
+            job.upload_rate = status.upload_rate > 0 ? static_cast<uint64_t>(status.upload_rate) : 0;
+            job.uploaded_total = status.all_time_upload > 0 ? static_cast<uint64_t>(status.all_time_upload) : 0;
+            job.peers = status.num_peers > 0 ? static_cast<unsigned>(status.num_peers) : 0;
+            job.seeds = status.num_seeds > 0 ? static_cast<unsigned>(status.num_seeds) : 0;
+            if (job.download_rate && job.bytes_total >= job.bytes_completed)
+                job.eta_seconds = (job.bytes_total - job.bytes_completed + job.download_rate - 1) / job.download_rate;
+            else
+                job.eta_seconds.reset();
+
+            if (status.errc) {
                 job.state = TorrentJobState::failed;
-                job.error_code = "ingest_missing";
-                job.error = "associated ingest job disappeared";
-            } else {
-                job.catalogue_total = ingest_job->catalogue_total;
-                job.catalogue_pending = ingest_job->catalogue_pending;
-                job.catalogue_catalogued = ingest_job->catalogue_catalogued;
-                job.catalogue_no_match = ingest_job->catalogue_no_match;
-                job.catalogue_failed = ingest_job->catalogue_failed;
-                if (ingest_job->state == IngestJobState::completed) {
-                    job.state = TorrentJobState::completed;
+                job.error_code = "torrent_error";
+                job.error = status.errc.message();
+                ingest_.staging().release(id);
+                changed = true;
+                continue;
+            }
+
+            if (job.bytes_total) {
+                const auto remaining = job.bytes_total > job.bytes_completed ? job.bytes_total - job.bytes_completed : 0;
+                if (!ingest_.staging().reserve(id, remaining)) {
+                    hold_torrent(hit->second);
+                    job.state = TorrentJobState::blocked;
+                    job.error_code = "staging_full";
+                    job.error = "staging size limit reached";
+                    job.download_rate = 0;
+                    job.eta_seconds.reset();
+                    job.updated_unix_ms = unix_ms();
+                    changed = true;
+                    continue;
+                } else if (job.state == TorrentJobState::blocked && job.error_code == "staging_full") {
+                    release_torrent(hit->second);
                     job.error.clear();
                     job.error_code.clear();
-                    ingest_.staging().release(id);
-                } else if (ingest_job->state == IngestJobState::failed ||
-                           ingest_job->state == IngestJobState::cancelled) {
-                    job.state = TorrentJobState::failed;
-                    job.error_code = ingest_job->state == IngestJobState::cancelled ? "ingest_cancelled"
-                                     : !ingest_job->error_code.empty()          ? ingest_job->error_code
-                                                                                : "ingest_failed";
-                    job.error = "ingest " + ingest_job_state_name(ingest_job->state) +
-                                (ingest_job->error.empty() ? std::string{} : ": " + ingest_job->error);
+                }
+            }
+
+            // Do not switch exhaustively on libtorrent's state enum. 2.1 adds
+            // queued_for_checking/allocating in configurations where older builds
+            // do not expose those names, and -Wswitch then turns the otherwise
+            // harmless API difference into a build failure. Unknown/pre-download
+            // states remain queued until they enter one of the stable states below.
+            if (const auto phase = torrent_check_phase(status); phase == TorrentCheckPhase::queued) {
+                // Waiting for another torrent's check: libtorrent checks one at a
+                // time. Until 0.61.0 this read as `verifying` with no progress
+                // and no ETA, indistinguishable from a check that had stalled.
+                job.state = TorrentJobState::verify_queued;
+                job.eta_seconds.reset();
+                check_samples_.erase(id);
+            } else if (phase == TorrentCheckPhase::checking) {
+                job.state = TorrentJobState::verifying;
+                // The check's own rate: how far through the payload it has read,
+                // not the verified bytes (a check of a partial download finds
+                // most pieces absent and still has to read past them).
+                const auto total = status.total_wanted > 0 ? static_cast<uint64_t>(status.total_wanted) : 0;
+                const auto checked = static_cast<uint64_t>(static_cast<double>(total) *
+                                                           std::clamp(static_cast<double>(status.progress), 0.0, 1.0));
+                const auto now = Clock::now();
+                auto& sample = check_samples_[id];
+                if (sample.at != Clock::time_point{} && checked >= sample.checked) {
+                    const auto seconds = std::chrono::duration<double>(now - sample.at).count();
+                    if (seconds >= 1.0) {
+                        const double instant = static_cast<double>(checked - sample.checked) / seconds;
+                        sample.rate = sample.rate > 0 ? 0.7 * sample.rate + 0.3 * instant : instant;
+                        sample.checked = checked;
+                        sample.at = now;
+                    }
                 } else {
-                    if (ingest_job->state == IngestJobState::paused)
-                        job.state = TorrentJobState::paused;
-                    else if (ingest_job->state == IngestJobState::blocked)
-                        job.state = TorrentJobState::blocked;
-                    else if (ingest_job->state == IngestJobState::cataloguing)
-                        job.state = TorrentJobState::cataloguing;
-                    else
-                        job.state = TorrentJobState::importing;
-                    job.bytes_total = ingest_job->bytes_total;
-                    job.bytes_completed = ingest_job->bytes_completed;
-                    job.download_rate = ingest_job->rate_bytes_per_second;
-                    job.eta_seconds = ingest_job->eta_seconds;
-                    job.error_code = ingest_job->error_code;
-                    job.error = ingest_job->error;
+                    sample.checked = checked;
+                    sample.at = now;
+                }
+                if (sample.rate > 0 && total > checked)
+                    job.eta_seconds = static_cast<uint64_t>(static_cast<double>(total - checked) / sample.rate) + 1;
+                else
+                    job.eta_seconds.reset();
+            } else if (status.state == lt::torrent_status::downloading_metadata) {
+                job.state = TorrentJobState::metadata;
+            } else if (status.state == lt::torrent_status::downloading) {
+                job.state = TorrentJobState::downloading;
+            } else if (status.state == lt::torrent_status::finished ||
+                       status.state == lt::torrent_status::seeding) {
+                job.state = TorrentJobState::downloaded;
+            } else {
+                job.state = TorrentJobState::queued;
+            }
+
+            if (job.state == TorrentJobState::downloaded) {
+                hold_torrent(hit->second);
+                // Pretty Woman, 2026-09-24: submitted at download finish with
+                // publication still 30-odd extents behind, the ingest found an
+                // incomplete journal and copied the whole film. The torrent is
+                // kept, paused, until its extents are all published.
+                if (!publication_settled_locked(id, job)) {
+                    job.updated_unix_ms = unix_ms();
+                    changed = true;
+                    continue;
+                }
+                try {
+                    const auto ingest_id = ingest_.submit_path(job.save_path, "torrent", job.id,
+                                                               job.name, std::nullopt, true, true);
+                    job.ingest_job_id = ingest_id;
+                    job.state = TorrentJobState::importing;
+                    retire_torrent_locked(id, false);
+                } catch (const std::exception& e) {
+                    job.state = TorrentJobState::failed;
+                    job.error_code = "ingest_submit_failed";
+                    job.error = "cannot submit completed torrent to ingest: " + std::string(e.what());
                 }
             }
             job.updated_unix_ms = unix_ms();
             changed = true;
-            continue;
+        } catch (const std::exception& e) {
+            faults.emplace_back(id, e.what());
         }
-
-        auto hit = impl_->handles.find(id);
-        if (hit == impl_->handles.end()) continue;
-        auto status = hit->second.status(lt::torrent_handle::query_name | lt::torrent_handle::query_accurate_download_counters);
-        job.name = sanitize_text(status.name, 1024);
-        if (job.info_hash.empty()) job.info_hash = info_hash_hex(status.info_hashes);
-        job.bytes_total = status.total_wanted > 0 ? static_cast<uint64_t>(status.total_wanted) : 0;
-        job.bytes_completed = status.total_wanted_done > 0 ? static_cast<uint64_t>(status.total_wanted_done) : 0;
-        job.download_rate = status.download_rate > 0 ? static_cast<uint64_t>(status.download_rate) : 0;
-        job.upload_rate = status.upload_rate > 0 ? static_cast<uint64_t>(status.upload_rate) : 0;
-        job.uploaded_total = status.all_time_upload > 0 ? static_cast<uint64_t>(status.all_time_upload) : 0;
-        job.peers = status.num_peers > 0 ? static_cast<unsigned>(status.num_peers) : 0;
-        job.seeds = status.num_seeds > 0 ? static_cast<unsigned>(status.num_seeds) : 0;
-        if (job.download_rate && job.bytes_total >= job.bytes_completed)
-            job.eta_seconds = (job.bytes_total - job.bytes_completed + job.download_rate - 1) / job.download_rate;
-        else
-            job.eta_seconds.reset();
-
-        if (status.errc) {
-            job.state = TorrentJobState::failed;
-            job.error_code = "torrent_error";
-            job.error = status.errc.message();
-            ingest_.staging().release(id);
-            changed = true;
-            continue;
-        }
-
-        if (job.bytes_total) {
-            const auto remaining = job.bytes_total > job.bytes_completed ? job.bytes_total - job.bytes_completed : 0;
-            if (!ingest_.staging().reserve(id, remaining)) {
-                hold_torrent(hit->second);
-                job.state = TorrentJobState::blocked;
-                job.error_code = "staging_full";
-                job.error = "staging size limit reached";
-                job.download_rate = 0;
-                job.eta_seconds.reset();
-                job.updated_unix_ms = unix_ms();
-                changed = true;
-                continue;
-            } else if (job.state == TorrentJobState::blocked && job.error_code == "staging_full") {
-                release_torrent(hit->second);
-                job.error.clear();
-                job.error_code.clear();
-            }
-        }
-
-        // Do not switch exhaustively on libtorrent's state enum. 2.1 adds
-        // queued_for_checking/allocating in configurations where older builds
-        // do not expose those names, and -Wswitch then turns the otherwise
-        // harmless API difference into a build failure. Unknown/pre-download
-        // states remain queued until they enter one of the stable states below.
-        if (const auto phase = torrent_check_phase(status); phase == TorrentCheckPhase::queued) {
-            // Waiting for another torrent's check: libtorrent checks one at a
-            // time. Until 0.61.0 this read as `verifying` with no progress
-            // and no ETA, indistinguishable from a check that had stalled.
-            job.state = TorrentJobState::verify_queued;
-            job.eta_seconds.reset();
-            check_samples_.erase(id);
-        } else if (phase == TorrentCheckPhase::checking) {
-            job.state = TorrentJobState::verifying;
-            // The check's own rate: how far through the payload it has read,
-            // not the verified bytes (a check of a partial download finds
-            // most pieces absent and still has to read past them).
-            const auto total = status.total_wanted > 0 ? static_cast<uint64_t>(status.total_wanted) : 0;
-            const auto checked = static_cast<uint64_t>(static_cast<double>(total) *
-                                                       std::clamp(static_cast<double>(status.progress), 0.0, 1.0));
-            const auto now = Clock::now();
-            auto& sample = check_samples_[id];
-            if (sample.at != Clock::time_point{} && checked >= sample.checked) {
-                const auto seconds = std::chrono::duration<double>(now - sample.at).count();
-                if (seconds >= 1.0) {
-                    const double instant = static_cast<double>(checked - sample.checked) / seconds;
-                    sample.rate = sample.rate > 0 ? 0.7 * sample.rate + 0.3 * instant : instant;
-                    sample.checked = checked;
-                    sample.at = now;
-                }
-            } else {
-                sample.checked = checked;
-                sample.at = now;
-            }
-            if (sample.rate > 0 && total > checked)
-                job.eta_seconds = static_cast<uint64_t>(static_cast<double>(total - checked) / sample.rate) + 1;
-            else
-                job.eta_seconds.reset();
-        } else if (status.state == lt::torrent_status::downloading_metadata) {
-            job.state = TorrentJobState::metadata;
-        } else if (status.state == lt::torrent_status::downloading) {
-            job.state = TorrentJobState::downloading;
-        } else if (status.state == lt::torrent_status::finished ||
-                   status.state == lt::torrent_status::seeding) {
-            job.state = TorrentJobState::downloaded;
-        } else {
-            job.state = TorrentJobState::queued;
-        }
-
-        if (job.state == TorrentJobState::downloaded) {
-            hold_torrent(hit->second);
-            // Pretty Woman, 2026-09-24: submitted at download finish with
-            // publication still 30-odd extents behind, the ingest found an
-            // incomplete journal and copied the whole film. The torrent is
-            // kept, paused, until its extents are all published.
-            if (!publication_settled_locked(id, job)) {
-                job.updated_unix_ms = unix_ms();
-                changed = true;
-                continue;
-            }
-            try {
-                const auto ingest_id = ingest_.submit_path(job.save_path, "torrent", job.id,
-                                                           job.name, std::nullopt, true, true);
-                job.ingest_job_id = ingest_id;
-                job.state = TorrentJobState::importing;
-                impl_->session.remove_torrent(hit->second);
-                impl_->handles.erase(hit);
-                std::error_code ec;
-                std::filesystem::remove(resume_path(id), ec);
-            } catch (const std::exception& e) {
-                job.state = TorrentJobState::failed;
-                job.error_code = "ingest_submit_failed";
-                job.error = "cannot submit completed torrent to ingest: " + std::string(e.what());
-            }
-        }
-        job.updated_unix_ms = unix_ms();
-        changed = true;
     }
+    for (const auto& [id, what] : faults) isolate_fault_locked(id, what);
     if (changed) save_state_locked();
 }
 

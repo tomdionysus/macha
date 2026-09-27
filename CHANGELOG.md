@@ -1,5 +1,50 @@
 # Current release
 
+## 0.63.0 — A faulted thread runs again or says why not; one job per torrent (development)
+
+**The torrent worker died on gbni-1 on 2026-09-26 and nothing noticed.** A
+torrent had been added twice. libtorrent keys a torrent by its info hash and
+answered the second add with the first one's handle, so two jobs owned one
+torrent. Cancelling one removed the torrent (deleting the other's payload);
+the other job's handle then named nothing, and the worker's next held-pieces
+pass threw `invalid torrent handle used`. `run_supervised` logged it and let
+the thread end. For a day every job read what it last read -- two finished
+downloads were never handed to the ingest, and a torrent added afterwards
+downloaded 30 GB that Macha never tracked -- while `subsystems` said the
+torrent plugin was `running`.
+
+- **Every thread says what a fault means for it.** `run_supervised` is
+  replaced by three entry points, chosen at each of the 42 thread sites:
+  `run_supervised_loop` (a service loop; run again after a backoff of 1 s
+  doubling to 60 s), `run_supervised_once` (a connection, a transcode, a
+  start-up phase, a scan; ends, its owner decides), and
+  `run_supervised_escalating` (a plugin subsystem's thread; the supervisor
+  rebuilds the subsystem). Every fault is logged at ERROR and counted in a
+  new `threads` block in `GET /api/v1/status`.
+- **The torrent worker escalates** through the plugin's fault sink, which it
+  never had: a fault it cannot pin on one job rebuilds the subsystem from
+  `jobs.json`, visible in `subsystems` as `restarting` with `last_fault`.
+- **One job's fault is that job's.** A libtorrent or bookkeeping exception
+  while sampling, reporting pieces, saving resume data or handling an alert
+  for one job fails that job (`torrent_fault`) and removes its download; the
+  worker carries on with the rest.
+- **One job per torrent.** A second add of a torrent a job on that node
+  already holds (any state, until cleared) is refused: `409
+  torrent_already_added`, naming the holder in `id` and `node_id`.
+  libtorrent's `duplicate_is_error` is set as a backstop. Two jobs recorded
+  for one torrent before this restore as one: the older keeps it, the newer
+  is `failed` with `duplicate_torrent`.
+- **A torrent leaves the session one way.** Cancel, clear, the hand-off to
+  ingest and add-rollback all go through one removal that also drops the
+  handle; `clear` used to leave a failed job's torrent in the session. The
+  handle table is read and changed only under the manager's lock: the worker
+  walked it unlocked while API threads changed it.
+- `cancel` is logged (`torrent cancelled id=... payload_deleted=...`).
+
+API changes: new `409 torrent_already_added` on `POST /api/v1/torrents/jobs`;
+new job `error_code`s `duplicate_torrent` and `torrent_fault`; new `threads`
+array in `GET /api/v1/status`.
+
 ## 0.62.3 — Why repair did not run is visible (development)
 
 After 0.62.2 gbni-1's repair examined nothing at all, while the maintenance

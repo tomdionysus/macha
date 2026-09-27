@@ -4,6 +4,7 @@
 #include "acquisition_api.hpp"
 #include "subsystem_abi.hpp"
 #include "subsystem_registry.hpp"
+#include "supervised.hpp"
 
 #ifdef MACHA_TEST_TORRENT_PLUGIN
 #include <dlfcn.h>
@@ -2634,6 +2635,179 @@ MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resum
     CHECK(after->error_code.empty());
     plugin.subsystem().stop();
 }
+namespace {
+uint64_t torrent_thread_faults() {
+    for (const auto& status : supervised_thread_statuses())
+        if (status.name == "torrent") return status.faults;
+    return 0;
+}
+
+// The plugin loaded against a fixture node, as the tests above set it up.
+struct TorrentPluginFixture {
+    TestNode fixture;
+    std::filesystem::path state_path;
+    std::filesystem::path staging_path;
+    std::unique_ptr<CatalogueHintQueue> hints;
+    std::unique_ptr<IngestManager> ingest;
+    TorrentConfig torrent_config;
+    Config plugin_config;
+    SubsystemRegistry registry;
+    SubsystemContext context;
+    std::unique_ptr<LoadedTorrentPlugin> plugin;
+
+    explicit TorrentPluginFixture(const std::string& name, const std::function<void(TorrentPluginFixture&)>& seed = {})
+        : fixture(name) {
+        fixture.prepare();
+        state_path = fixture.config().state_path;
+        staging_path = fixture.path() / "staging";
+        if (seed) seed(*this);
+        fixture.start();
+        hints = std::make_unique<CatalogueHintQueue>(state_path / "catalogue-hints");
+        IngestConfig ingest_config;
+        ingest_config.enabled = true;
+        ingest_config.staging_path = staging_path;
+        ingest = std::make_unique<IngestManager>(fixture.node(), fixture.filesystem(), *hints, ingest_config);
+        torrent_config.enabled = true;
+        torrent_config.dht = false;
+        torrent_config.pex = false;
+        torrent_config.lsd = false;
+        plugin_config = fixture.node().config();
+        plugin_config.torrent = torrent_config;
+        plugin_config.state_path = state_path;
+        context.config = &plugin_config;
+        context.node = &fixture.node();
+        context.ingest = ingest.get();
+        context.registry = &registry;
+        plugin = std::make_unique<LoadedTorrentPlugin>(context);
+    }
+
+    ~TorrentPluginFixture() {
+        plugin->subsystem().stop();
+        plugin.reset();
+    }
+
+    TorrentService& torrents() {
+        auto owner = registry.torrent();
+        REQUIRE(owner);
+        return *owner;
+    }
+};
+} // namespace
+
+MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second_add_names_it) {
+    // 0.63.0. libtorrent keys a torrent by its info hash and answered a second
+    // add with the first one's handle, so two jobs owned one torrent; on
+    // gbni-1 on 2026-09-26 cancelling one removed the other's torrent and
+    // deleted its payload, and the worker died on the stale handle. A second
+    // add is now refused with the holder's id.
+    TorrentPluginFixture f("torrent-one-job-per-hash");
+    auto& torrents = f.torrents();
+    f.plugin->subsystem().start();
+    const auto faults_before = torrent_thread_faults();
+
+    const std::string magnet = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Twice";
+    const auto first = torrents.add_on(NodeId{}, magnet, false);
+    REQUIRE(first.placed);
+    const auto second = torrents.add_on(NodeId{}, magnet, false);
+    CHECK(!second.placed);
+    CHECK(second.reason == "torrent_already_added");
+    CHECK(second.job_id == first.job_id);
+    CHECK(second.node_id == f.fixture.node().node_id());
+
+    TorrentSearchManager search(f.torrent_config);
+    AcquisitionApi acquisition(*f.ingest, f.registry, search);
+    HttpRequest add;
+    add.method = "POST";
+    add.path = "/api/v1/torrents/jobs";
+    const std::string body = "{\"magnet\":\"" + magnet + "\"}";
+    add.body = Bytes(body.begin(), body.end());
+    const auto refused = acquisition.handle(add);
+    CHECK(refused.status == 409);
+    const auto refusal = Json::parse(std::string(refused.body.begin(), refused.body.end()));
+    CHECK(refusal.find("status")->asString() == "torrent_already_added");
+    CHECK(refusal.find("error")->find("code")->asString() == "torrent_already_added");
+    CHECK(!refusal.find("error")->find("message")->asString().empty());
+    CHECK(refusal.find("id")->asString() == first.job_id);
+    CHECK(refusal.find("node_id")->asString() == to_string(f.fixture.node().node_id()));
+
+    size_t holding = 0;
+    for (const auto& job : torrents.jobs())
+        if (job.info_hash == "4444444444444444444444444444444444444444") ++holding;
+    CHECK(holding == 1);
+
+    // A job on record holds its torrent until it is cleared, whatever its
+    // state; once cleared, nothing of it is left in the session, so the same
+    // torrent can be added again.
+    REQUIRE(torrents.cancel(first.job_id));
+    CHECK(torrents.add_on(NodeId{}, magnet, false).reason == "torrent_already_added");
+    REQUIRE(torrents.clear(first.job_id));
+    const auto again = torrents.add_on(NodeId{}, magnet, false);
+    CHECK(again.placed);
+    CHECK(again.job_id != first.job_id);
+    CHECK(torrent_thread_faults() == faults_before);
+}
+
+MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore_as_one) {
+    // The 2026-09-26 incident, from the state it left: two jobs recorded for
+    // one torrent. Restored, both were handed the same libtorrent torrent;
+    // cancelling the first removed it, the second's handle went stale, and
+    // the next held-pieces pass threw and ended the worker. The later job is
+    // now failed at restore with duplicate_torrent and holds nothing, and the
+    // worker outlives the cancel.
+    const std::string hash = "5555555555555555555555555555555555555555";
+    TorrentPluginFixture f("torrent-duplicate-restore", [&](TorrentPluginFixture& seeded) {
+        std::filesystem::create_directories(seeded.state_path / "torrent");
+        Json::Array jobs;
+        for (const auto& [id, created] : {std::pair<std::string, uint64_t>{"dup-second", 2},
+                                         std::pair<std::string, uint64_t>{"dup-first", 1}}) {
+            const auto payload = seeded.staging_path / "torrents" / id;
+            std::filesystem::create_directories(payload);
+            Json::Object job;
+            job["id"] = id;
+            job["name"] = "Twice Restored";
+            job["source_uri"] = "magnet:?xt=urn:btih:" + hash;
+            job["info_hash"] = hash;
+            job["save_path"] = payload.string();
+            job["state"] = "queued";
+            job["created_unix_ms"] = created;
+            job["updated_unix_ms"] = created;
+            job["error"] = "";
+            jobs.emplace_back(std::move(job));
+        }
+        Json::Object root;
+        root["version"] = static_cast<uint64_t>(1);
+        root["jobs"] = std::move(jobs);
+        std::ofstream out(seeded.state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
+        REQUIRE(out.good());
+        out << Json(std::move(root)).dump();
+    });
+    auto& torrents = f.torrents();
+    const auto faults_before = torrent_thread_faults();
+    f.plugin->subsystem().start();
+
+    const auto second = torrents.job("dup-second");
+    REQUIRE(second.has_value());
+    CHECK(second->state == TorrentJobState::failed);
+    CHECK(second->error_code == "duplicate_torrent");
+    CHECK(second->error.find("dup-first") != std::string::npos);
+    const auto first = torrents.job("dup-first");
+    REQUIRE(first.has_value());
+    CHECK(first->state != TorrentJobState::failed);
+
+    REQUIRE(torrents.cancel("dup-first"));
+    // Past the held-pieces interval (10 s), where the stale handle threw.
+    std::this_thread::sleep_for(11s);
+    CHECK(torrent_thread_faults() == faults_before);
+    // The worker is still running: a new job is picked up and sampled.
+    const auto fresh = torrents.add_on(
+        NodeId{}, "magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
+    REQUIRE(fresh.placed);
+    REQUIRE(wait_until([&] {
+        const auto job = torrents.job(fresh.job_id);
+        return job && job->updated_unix_ms > job->created_unix_ms;
+    }, 5s));
+}
+
 #endif // MACHA_TEST_TORRENT_PLUGIN
 
 MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_clear_cleanup) {

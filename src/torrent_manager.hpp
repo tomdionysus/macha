@@ -13,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -55,6 +56,10 @@ class TorrentManager final : public TorrentService {
     bool logged_portmap_{};
     bool warned_portmap_failed_{};
     std::jthread worker_;
+    // SubsystemSupervisor's fault sink, through TorrentSubsystem: a fault the
+    // worker cannot contain to one job rebuilds the manager from its durable
+    // state. Guarded by mutex_.
+    std::function<void(std::string)> fault_sink_;
 
     // Each job's libtorrent resume data (0.61.0): without it every restart
     // re-hashed every staged byte of every torrent before any could download.
@@ -87,8 +92,8 @@ class TorrentManager final : public TorrentService {
     // that can observe whether the session actually bound a usable interface.
     void drain_alerts();
     // Reports every piece a torrent holds to the disk backend, from the
-    // torrent's own bitfield. Repeats are harmless.
-    void report_held_pieces(const libtorrent::torrent_handle&);
+    // torrent's own bitfield. Repeats are harmless. Caller holds mutex_.
+    void report_held_pieces_locked(const TorrentJob&, const libtorrent::torrent_handle&);
     static constexpr auto held_pieces_report_interval = std::chrono::seconds(10);
     Clock::time_point last_held_pieces_report_{};
     // A downloaded torrent is handed to the ingest only once the disk backend
@@ -104,8 +109,21 @@ class TorrentManager final : public TorrentService {
     // ever on a put that will not succeed.
     static constexpr auto publication_stall_limit = std::chrono::minutes(10);
     bool publication_settled_locked(const std::string& id, const TorrentJob& job);
-    // The save path of the job a session handle belongs to, if any.
-    std::optional<std::string> save_path_of(const libtorrent::torrent_handle&) const;
+    // The job a session handle belongs to, if any. Caller holds mutex_.
+    TorrentJob* job_of_locked(const libtorrent::torrent_handle&);
+    // The job, in any state, that already holds this info hash (0.63.0). One
+    // job per torrent: libtorrent keys a torrent by its info hash and hands a
+    // second add the first one's handle, so two jobs for one hash were two
+    // owners of one torrent, and cancelling either removed the other's
+    // torrent and deleted its payload (gbni-1, 2026-09-26).
+    std::optional<std::string> job_holding_locked(std::string_view info_hash) const;
+    // The one way a torrent leaves the session and impl_->handles, so no
+    // handle is ever left naming a removed torrent. Caller holds mutex_.
+    void retire_torrent_locked(const std::string& id, bool delete_payload);
+    // A libtorrent or bookkeeping fault on one job fails that job and retires
+    // its torrent; the worker carries on with every other job. Until 0.63.0
+    // one such fault ended the worker for all of them. Caller holds mutex_.
+    void isolate_fault_locked(const std::string& id, std::string_view what);
     void update_jobs();
     bool has_active_jobs_locked() const;
     // A failed job whose ingest has been resumed (through the ingest's own
@@ -126,6 +144,8 @@ class TorrentManager final : public TorrentService {
                    const std::filesystem::path& state_path);
     ~TorrentManager() override;
 
+    // Installed before start().
+    void set_fault_sink(std::function<void(std::string)>);
     void start();
     void request_stop();
     void stop();

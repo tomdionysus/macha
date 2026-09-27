@@ -307,6 +307,24 @@ The practical consequences for an operator:
   (`/api/v1/manage/filesystem/blocked-namespace-operation`,
   `parked-publications`) answer "nothing to report" while the mount is
   faulted rather than erroring.
+- **A thread that faults is on record, and runs again when it is a service
+  loop (0.63.0).** Every thread Macha starts runs under one of three
+  supervisions, chosen per thread (`src/supervised.hpp`): a *service loop*
+  (ingest, hydration, the RPC workers, maintenance, ...) that throws is run
+  again after a backoff of 1 s doubling to 60 s; a *task* (a connection, a
+  transcode, a start-up phase, a storage scan) that throws ends, and its
+  owner decides what that means; a thread of a plugin subsystem (the torrent
+  worker) hands its fault to the subsystem's supervisor, which rebuilds the
+  subsystem from its durable state, so it shows in `subsystems` as
+  `restarting` with `last_fault`. Every fault is logged at ERROR as `thread
+  '<name>' faulted (<code>): ...` and counted in the always-present
+  `threads` block of `GET /api/v1/status`, one entry per thread name:
+  `running` and `restarting` (threads of that name in their body, and waiting
+  out a backoff), `faults`, `last_fault_code` (`exception`,
+  `unknown_exception`), `last_fault` and `last_fault_unix_ms`. Until 0.63.0 a
+  thread that threw logged `thread stopped on exception` once and ended; on
+  gbni-1 on 2026-09-26 that was the torrent worker, and every torrent sat
+  unchanged for a day while `subsystems` said `running`.
 - **A lost mount is a `faulted` subsystem, not a process exit.** A FUSE mount
   that disappears under a running node (`umount -l`, a kernel module reload)
   is remounted in place, with `restart_count` climbing and `last_fault` naming

@@ -412,6 +412,17 @@ A named node that cannot take the job is refused; the job is never started somew
 | 409 | `placement_failed` | `node_did_not_start` | the named node did not start the job and gave no code |
 | 409 | `placement_failed` | `missing_uri` | the named node received no URI |
 | 409 | `placement_failed` | `add_failed` | the target node could not add the torrent: torrent support is disabled there, the URI is not an acceptable magnet, or the job could not be recorded |
+| 409 | `torrent_already_added` | | a job on the target node already holds this torrent (the same info hash), in any state until it is cleared. The body names it in the fields a `202` uses (0.63.0) |
+
+A torrent is held by one job per node. A second add of it is refused, and the refusal names the job that holds it:
+
+```json
+{"status": "torrent_already_added",
+ "error": {"code": "torrent_already_added", "message": "job 7d0c2f5e9a1b4e38b6d4a0c1f2e3d4b5 already holds this torrent"},
+ "id": "7d0c2f5e9a1b4e38b6d4a0c1f2e3d4b5", "node_id": "a3c95e0f7d2b41e8b6c4d0f19e7a2b58"}
+```
+
+To download it again, clear that job first. Before 0.63.0 the second add made a second job on the same download: cancelling either removed the other's download and deleted its payload, and the node's torrent worker then stopped for every job.
 
 ### List and inspect
 
@@ -529,7 +540,7 @@ Operator actions:
 | `cancel` | anything but `completed`, `cancelled` | `cancelled`; a linked ingest is cancelled too |
 | `clear` | `completed`, `cancelled`, `failed` | the job is removed |
 
-A failure before handover (`torrent_error`, `ingest_submit_failed`, `restore_failed`) cannot be retried; cancel or clear it and add the torrent again.
+A failure before handover (`torrent_error`, `torrent_fault`, `ingest_submit_failed`, `restore_failed`, `duplicate_torrent`) cannot be retried; cancel or clear it and add the torrent again.
 
 ### Torrent error codes
 
@@ -539,6 +550,8 @@ A failure before handover (`torrent_error`, `ingest_submit_failed`, `restore_fai
 | `torrent_error` | `failed` | the download engine reported an error on the torrent | no |
 | `ingest_submit_failed` | `failed` | the finished payload could not be submitted to ingest | no |
 | `restore_failed` | `failed` | the job could not be re-added to the download engine when the node started | no |
+| `duplicate_torrent` | `failed` | another job on this node, recorded before 0.63.0 refused duplicates, holds the same torrent; the older job keeps it | no |
+| `torrent_fault` | `failed` | the download engine faulted on this job (0.63.0); the job's download is removed and every other job carries on. A linked job still follows its ingest | no; clear it and add the torrent again |
 | `ingest_failed` | `failed` | the linked ingest failed without a code | via `retry` |
 | `ingest_cancelled` | `failed` | the linked ingest was cancelled | no |
 | `ingest_missing` | `failed` | the linked ingest no longer exists | no |

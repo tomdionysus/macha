@@ -507,11 +507,11 @@ void CacheHydrator::start() {
     try {
         for (size_t i = 0; i < workers; ++i)
             fetch_workers_.emplace_back([this](std::stop_token stop) {
-                run_supervised("hydration-fetch", [this, stop] { fetch_loop(stop); });
+                run_supervised_loop("hydration-fetch", stop, [this, stop] { fetch_loop(stop); });
             });
         std::lock_guard lock(mutex_);
         worker_ = std::jthread([this](std::stop_token stop) {
-            run_supervised("hydration", [this, stop] { loop(stop); });
+            run_supervised_loop("hydration", stop, [this, stop] { loop(stop); });
         });
     } catch (...) {
         request_stop();

@@ -260,7 +260,7 @@ struct Lane {
         threads.reserve(workers);
         for (size_t i = 0; i < workers; ++i)
             threads.emplace_back([this](std::stop_token stop) {
-                run_supervised(name, [this, stop] { loop(stop); });
+                run_supervised_loop(name, stop, [this, stop] { loop(stop); });
             });
     }
 
@@ -1452,7 +1452,7 @@ void HttpServer::start() {
     impl_->control.start(std::max<size_t>(1, impl_->config.control_workers));
     impl_->data.start(std::max<size_t>(1, impl_->config.workers));
     impl_->reactor = std::jthread([this](std::stop_token stop) {
-        run_supervised("http-reactor", [this, stop] { impl_->reactor_loop(stop); });
+        run_supervised_once("http-reactor", [this, stop] { impl_->reactor_loop(stop); });
     });
     std::unique_lock lock(impl_->startup_mutex);
     impl_->startup_cv.wait(lock, [this] { return impl_->startup_complete; });

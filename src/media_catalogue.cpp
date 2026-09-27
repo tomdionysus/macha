@@ -2538,7 +2538,7 @@ void CatalogueScanner::start() {
     http_->reset_stop();
     hints_.requeue_processing();
     worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("catalogue-scanner", [this, stop] { loop(stop); });
+        run_supervised_loop("catalogue-scanner", stop, [this, stop] { loop(stop); });
     });
 }
 void CatalogueScanner::request_stop() {

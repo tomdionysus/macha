@@ -98,7 +98,7 @@ void MediaInformationService::queue_publication_locked(std::string media_id,
 void MediaInformationService::start() {
     if (started_ || !engine_ || !engine_->status().available) return;
     worker_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("media-information", [this, stop] { loop(stop); });
+        run_supervised_loop("media-information", stop, [this, stop] { loop(stop); });
     });
     started_ = true;
 }

@@ -2,6 +2,7 @@
 #include "json.hpp"
 #include "manage_api.hpp"
 #include "status_api.hpp"
+#include "supervised.hpp"
 #include "test_backend_support.hpp"
 #include "users_api.hpp"
 
@@ -788,8 +789,25 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     auto root = body_of(light);
     // Everything an operator or a client needs to render health and choose a
     // node stays on the polled route.
-    for (const auto* key : {"cluster", "nodes", "startup", "subsystems", "connectivity"})
+    for (const auto* key : {"cluster", "nodes", "startup", "subsystems", "threads", "connectivity"})
         CHECK(root.find(key) != nullptr);
+    // A supervised thread's fault is on the polled route (0.63.0); before it,
+    // a thread that ended said so once in the journal and nowhere else.
+    std::thread([] {
+        run_supervised_once("test-status-thread-fault", [] { throw std::runtime_error("boom"); });
+    }).join();
+    {
+        const auto again = body_of(get("/api/v1/status"));
+        const Json* listed = nullptr;
+        for (const auto& entry : again.find("threads")->asArray())
+            if (entry.find("name")->asString() == "test-status-thread-fault") listed = &entry;
+        REQUIRE(listed != nullptr);
+        CHECK(listed->find("faults")->asUInt64() == 1);
+        CHECK(listed->find("running")->asUInt64() == 0);
+        CHECK(listed->find("last_fault_code")->asString() == "exception");
+        CHECK(listed->find("last_fault")->asString() == "boom");
+        CHECK(!listed->find("last_fault_unix_ms")->isNull());
+    }
     // The response says which node produced it, and the value joins to an
     // entry in nodes[]. Without this a client configured with one address gets
     // a cluster snapshot in which nothing identifies the node that answered,

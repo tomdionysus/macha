@@ -1575,7 +1575,7 @@ class LibavSession final : public MediaEngineSession {
                                                      vod_plan_.segment_durations,
                                                      vod_plan_.playback.container)) {
         worker_ = std::jthread([this](std::stop_token stop) {
-            run_supervised("media-engine-session", [this, stop] { run(stop); });
+            run_supervised_once("media-engine-session", [this, stop] { run(stop); });
         });
     }
 

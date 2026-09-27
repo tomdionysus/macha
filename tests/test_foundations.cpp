@@ -4,6 +4,7 @@
 #include "miniupnpc_compat.hpp"
 #include "test_backend_support.hpp"
 #include "retained_memory.hpp"
+#include "supervised.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -1342,6 +1343,107 @@ MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
             std::cerr << "  " << site << "\n";
     }
     REQUIRE(unguarded.empty());
+}
+
+namespace {
+std::optional<SupervisedThreadStatus> supervised_status_of(std::string_view name) {
+    for (auto& status : supervised_thread_statuses())
+        if (status.name == name) return status;
+    return std::nullopt;
+}
+} // namespace
+
+MACHA_FAST_TEST("foundations", test_supervised_restart_delay_doubles_to_its_ceiling) {
+    CHECK(supervised_restart_delay(1) == 1s);
+    CHECK(supervised_restart_delay(2) == 2s);
+    CHECK(supervised_restart_delay(3) == 4s);
+    CHECK(supervised_restart_delay(6) == 32s);
+    CHECK(supervised_restart_delay(7) == 60s);
+    CHECK(supervised_restart_delay(1000) == 60s);
+}
+
+MACHA_TEST("foundations", test_a_supervised_loop_that_throws_runs_again) {
+    // gbni-1, 2026-09-26: the torrent worker threw once on a stale handle and
+    // ended, logged once, and nothing ran it again for a day. A service loop
+    // that faults is run again, and the fault is on record.
+    std::atomic<int> runs{0};
+    std::jthread thread([&](std::stop_token stop) {
+        run_supervised_loop("test-loop-restarts", stop, [&] {
+            if (++runs == 1) throw std::runtime_error("first run fails");
+        });
+    });
+    REQUIRE(wait_until([&] { return runs.load() == 2; }, 5s));
+    thread.join();
+    CHECK(runs.load() == 2); // a normal return ends it; it is not rerun.
+    const auto status = supervised_status_of("test-loop-restarts");
+    REQUIRE(status.has_value());
+    CHECK(status->faults == 1);
+    CHECK(status->last_fault_code == "exception");
+    CHECK(status->last_fault == "first run fails");
+    CHECK(status->last_fault_unix_ms > 0);
+    CHECK(status->running == 0);
+    CHECK(status->restarting == 0);
+}
+
+MACHA_TEST("foundations", test_a_supervised_loop_in_backoff_stops_when_asked) {
+    std::atomic<int> runs{0};
+    std::jthread thread([&](std::stop_token stop) {
+        run_supervised_loop("test-loop-backoff-stop", stop, [&] {
+            ++runs;
+            throw 7; // not a std::exception
+        });
+    });
+    REQUIRE(wait_until([&] {
+        const auto status = supervised_status_of("test-loop-backoff-stop");
+        return status && status->restarting == 1;
+    }, 5s));
+    const auto asked = std::chrono::steady_clock::now();
+    thread.request_stop();
+    thread.join();
+    // Well inside the 1 s backoff: the wait is woken by the stop, not waited out.
+    CHECK(std::chrono::steady_clock::now() - asked < 900ms);
+    CHECK(runs.load() == 1);
+    const auto status = supervised_status_of("test-loop-backoff-stop");
+    REQUIRE(status.has_value());
+    CHECK(status->last_fault_code == "unknown_exception");
+    CHECK(status->restarting == 0);
+}
+
+MACHA_TEST("foundations", test_a_supervised_task_that_throws_ends_on_record) {
+    std::atomic<int> runs{0};
+    std::thread thread([&] {
+        run_supervised_once("test-once-ends", [&] {
+            ++runs;
+            throw std::runtime_error("connection lost");
+        });
+    });
+    thread.join();
+    CHECK(runs.load() == 1);
+    const auto status = supervised_status_of("test-once-ends");
+    REQUIRE(status.has_value());
+    CHECK(status->faults == 1);
+    CHECK(status->last_fault == "connection lost");
+    CHECK(status->running == 0);
+}
+
+MACHA_TEST("foundations", test_an_escalating_thread_hands_its_fault_to_the_sink) {
+    std::atomic<int> runs{0};
+    std::string reason;
+    std::thread thread([&] {
+        run_supervised_escalating(
+            "test-escalates", [&] {
+                ++runs;
+                throw std::runtime_error("invalid torrent handle used");
+            },
+            [&](std::string why) { reason = std::move(why); });
+    });
+    thread.join();
+    CHECK(runs.load() == 1);
+    CHECK(reason.find("test-escalates") != std::string::npos);
+    CHECK(reason.find("invalid torrent handle used") != std::string::npos);
+    const auto status = supervised_status_of("test-escalates");
+    REQUIRE(status.has_value());
+    CHECK(status->faults == 1);
 }
 
 namespace {

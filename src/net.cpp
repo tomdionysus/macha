@@ -1655,10 +1655,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         channel_.set_io_timeout(std::chrono::milliseconds(0));
         peer_observer_(peer_);
         reader_ = std::jthread([this](std::stop_token stop) {
-            run_supervised("net-peer-reader", [this, stop] { reader_loop(stop); });
+            run_supervised_once("net-peer-reader", [this, stop] { reader_loop(stop); });
         });
         writer_ = std::jthread([this](std::stop_token stop) {
-            run_supervised("net-peer-writer", [this, stop] { writer_loop(stop); });
+            run_supervised_once("net-peer-writer", [this, stop] { writer_loop(stop); });
         });
     }
 
@@ -1853,7 +1853,7 @@ RpcClient::RpcClient(ClusterKeys keys, std::function<NodeInfo()> local,
       retained_memory_(retained_memory) {
     validate_frame_limit(max_frame_size_);
     health_thread_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("net-health", [this, stop] { health_loop(stop); });
+        run_supervised_loop("net-health", stop, [this, stop] { health_loop(stop); });
     });
 }
 
@@ -3450,7 +3450,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
     void start_writer() {
         writer = std::jthread([this](std::stop_token stop) {
-            run_supervised("net-rpc-writer", [this, stop] { writer_loop(stop); });
+            run_supervised_once("net-rpc-writer", [this, stop] { writer_loop(stop); });
         });
     }
 
@@ -3928,23 +3928,23 @@ void RpcServer::start() {
     data_workers_.reserve(data_worker_count);
     for (size_t i = 0; i < fast_control_worker_count; ++i)
         fast_control_workers_.emplace_back([this](std::stop_token stop) {
-            run_supervised("net-rpc-fast-control-worker", [this, stop] { fast_control_worker_loop(stop); });
+            run_supervised_loop("net-rpc-fast-control-worker", stop, [this, stop] { fast_control_worker_loop(stop); });
         });
     for (size_t i = 0; i < control_worker_count; ++i)
         control_workers_.emplace_back([this](std::stop_token stop) {
-            run_supervised("net-rpc-control-worker", [this, stop] { control_worker_loop(stop); });
+            run_supervised_loop("net-rpc-control-worker", stop, [this, stop] { control_worker_loop(stop); });
         });
     for (size_t i = 0; i < execution_limits_.metadata_workers; ++i)
         metadata_workers_.emplace_back([this](std::stop_token stop) {
-            run_supervised("net-rpc-metadata-worker", [this, stop] { metadata_worker_loop(stop); });
+            run_supervised_loop("net-rpc-metadata-worker", stop, [this, stop] { metadata_worker_loop(stop); });
         });
     for (size_t i = 0; i < data_worker_count; ++i)
         data_workers_.emplace_back([this](std::stop_token stop) {
-            run_supervised("net-rpc-data-worker", [this, stop] { data_worker_loop(stop); });
+            run_supervised_loop("net-rpc-data-worker", stop, [this, stop] { data_worker_loop(stop); });
         });
 
     accept_thread_ = std::jthread([this](std::stop_token stop) {
-        run_supervised("net-rpc-accept", [this, stop] { accept_loop(stop); });
+        run_supervised_loop("net-rpc-accept", stop, [this, stop] { accept_loop(stop); });
     });
 }
 
@@ -4091,7 +4091,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
                 registered = true;
             }
             session->reader = std::jthread([this, raw = session.get()](std::stop_token) {
-                run_supervised("net-rpc-session", [this, raw] { session_loop(raw); });
+                run_supervised_once("net-rpc-session", [this, raw] { session_loop(raw); });
             });
         } catch (...) {
             pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
