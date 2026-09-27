@@ -905,23 +905,27 @@ struct HttpServer::Impl {
                 auto found = connections.find(poll_ids[i]);
                 if (found == connections.end())
                     continue;
+                // on_readable() and flush() can close the connection, which
+                // destroys it: whether it survived is asked by id, never by
+                // reading the object that may be gone.
+                const auto id = poll_ids[i];
                 Connection& connection = *found->second;
                 if (revents & (POLLERR | POLLNVAL)) {
-                    close_connection(connection.id);
+                    close_connection(id);
                     continue;
                 }
                 if (revents & POLLIN) {
                     on_readable(connection);
-                    if (!connections.contains(connection.id))
+                    if (!connections.contains(id))
                         continue;
                 }
                 if (revents & POLLOUT) {
                     flush(connection);
-                    if (!connections.contains(connection.id))
+                    if (!connections.contains(id))
                         continue;
                 }
                 if ((revents & POLLHUP) && !(revents & POLLIN))
-                    close_connection(connection.id);
+                    close_connection(id);
             }
 
             expire(Clock::now());

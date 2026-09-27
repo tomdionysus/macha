@@ -1182,6 +1182,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     bool retire_notice_sent_{}; // guarded by outbound_mutex_
     std::atomic_uint64_t inbound_active_{};
     std::atomic_uint64_t writes_active_{};
+    std::mutex start_mutex_;
     std::jthread reader_;
     std::jthread writer_;
 
@@ -1661,10 +1662,21 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         peer_ = channel_.client_handshake(lane);
         channel_.set_io_timeout(std::chrono::milliseconds(0));
         peer_observer_(peer_);
+    }
+
+    // Starts the reader and writer. Called once, by the owner, after
+    // make_shared has returned: a thread started from the constructor could
+    // dispatch a request before the object had an owner, so shared_from_this()
+    // threw, and could reach close() while reader_ and writer_ were still being
+    // assigned. Each thread waits here until both are.
+    void start() {
+        std::lock_guard starting(start_mutex_);
         reader_ = std::jthread([this](std::stop_token stop) {
+            { std::lock_guard started(start_mutex_); }
             run_supervised_once("net-peer-reader", [this, stop] { reader_loop(stop); });
         });
         writer_ = std::jthread([this](std::stop_token stop) {
+            { std::lock_guard started(start_mutex_); }
             run_supervised_once("net-peer-writer", [this, stop] { writer_loop(stop); });
         });
     }
@@ -2033,6 +2045,10 @@ void RpcClient::register_inbound(InboundRoute route) {
     std::vector<std::function<void()>> retire;
     {
         std::lock_guard lock(mutex_);
+        if (held_inbound_peers_for_tests_.contains(peer)) {
+            held_inbound_routes_for_tests_.push_back(std::move(route));
+            return;
+        }
         note_peer_locked(route.peer);
         if (!route.peer.host.empty() && route.peer.port) {
             Endpoint advertised{route.peer.host, route.peer.port};
@@ -2167,6 +2183,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                                      to_string(*expected) + ", actual authenticated NodeId " +
                                      to_string(actual_id));
         }
+        fresh->start();
         if (actual)
             *actual = fresh->peer().id;
 
@@ -2223,6 +2240,13 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                       " lane=" + std::string(transport_lane_name(lane)) +
                       " endpoint=" + endpoint_key(endpoint));
         }
+        std::function<void()> after_dial;
+        {
+            std::lock_guard lock(mutex_);
+            after_dial = after_dial_for_tests_;
+        }
+        if (after_dial)
+            after_dial();
         finish_flight();
         return winner;
     } catch (...) {
@@ -2270,6 +2294,14 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
     }
     if (auto existing = call_existing(actual, lane, type, payload, frame_type, &route_error))
         return std::move(*existing);
+    // Two nodes that dial each other at once keep one session per lane: the
+    // lower id keeps the one it dialled and retires the other. The higher id's
+    // dial can therefore be retired before it is used, while the peer's own
+    // session has not yet registered here -- a gap of moments, in which a call
+    // used to fail with no route at all. Wait for that session instead.
+    if (route_error.empty() && actual != NodeId{} && await_route(actual, lane))
+        if (auto existing = call_existing(actual, lane, type, payload, frame_type, &route_error))
+            return std::move(*existing);
     throw std::runtime_error(route_error.empty()
                                  ? "no canonical RPC route to peer"
                                  : "no canonical RPC route to peer: " + route_error);
@@ -2695,6 +2727,41 @@ std::string RpcClient::probe_dial(const Endpoint& endpoint, const NodeId& expect
     } catch (const std::exception& error) {
         return error.what();
     }
+}
+
+bool RpcClient::await_route(const NodeId& peer, TransportLane lane) {
+    std::unique_lock lock(mutex_);
+    return connection_cv_.wait_for(lock, connect_timeout_,
+                                   [&] { return route_usable_locked(peer, lane); });
+}
+
+void RpcClient::hold_inbound_for_tests(const NodeId& peer) {
+    std::lock_guard lock(mutex_);
+    held_inbound_peers_for_tests_.insert(peer);
+}
+
+void RpcClient::release_inbound_for_tests(const NodeId& peer) {
+    std::vector<InboundRoute> held;
+    {
+        std::lock_guard lock(mutex_);
+        held_inbound_peers_for_tests_.erase(peer);
+        for (auto it = held_inbound_routes_for_tests_.begin();
+             it != held_inbound_routes_for_tests_.end();) {
+            if (it->peer.id == peer) {
+                held.push_back(std::move(*it));
+                it = held_inbound_routes_for_tests_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& route : held)
+        register_inbound(std::move(route));
+}
+
+void RpcClient::set_after_dial_for_tests(std::function<void()> hook) {
+    std::lock_guard lock(mutex_);
+    after_dial_for_tests_ = std::move(hook);
 }
 
 void RpcClient::close_lane_for_tests(const NodeId& peer, TransportLane lane) {

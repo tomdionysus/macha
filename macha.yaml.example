@@ -439,6 +439,9 @@ catalogue:
     max_provider_requests_per_scan: 32
     provider_batch_delay_ms: 30000
     max_artwork_bytes: 16M
+    # A file whose path below the scanner root has one of these as a word
+    # (ignoring case) is not catalogued: release samples, for instance.
+    ignore_terms: [sample]
     providers:
       movies:
         enabled: true

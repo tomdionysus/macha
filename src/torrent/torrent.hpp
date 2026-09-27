@@ -76,6 +76,11 @@ Json torrent_job_api_json(const TorrentJob&);
 // the transient rates, peers and ETA). Core decodes peers' replies with the
 // wire parser; the plugin writes both.
 Json torrent_job_json(const TorrentJob&);
+// What an update changed in a job's persisted form (torrent_job_json), apart
+// from updated_unix_ms: nothing; only the transfer counters, which move on
+// every tick while bytes move; or the record itself.
+enum class TorrentJobChange : uint8_t { none, progress, record };
+TorrentJobChange torrent_job_change(const TorrentJob& before, const TorrentJob& after);
 TorrentJob parse_torrent_job(const Json&);
 Json torrent_job_wire_json(const TorrentJob&);
 TorrentJob parse_torrent_job_wire(const Json&);

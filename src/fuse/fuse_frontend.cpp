@@ -715,6 +715,8 @@ struct FuseFrontend::State {
     std::array<BrokerQueue, 6> broker;
     std::atomic_size_t broker_pending{};
     std::atomic_bool stopping{};
+    // -1: the foreground clock decides; 0 or 1: a test has decided.
+    std::atomic_int viewer_active_override{-1};
     std::mutex write_request_mutex;
     std::condition_variable_any write_request_cv;
     uint64_t pending_write_request_bytes{};
@@ -3297,6 +3299,8 @@ struct FuseFrontend::State {
     }
 
     bool viewer_active() const {
+        if (const auto decided = viewer_active_override.load(std::memory_order_acquire); decided >= 0)
+            return decided == 1;
         return config.publication_quiet.count() > 0 &&
                fs.foreground_idle_for() < config.publication_quiet;
     }
@@ -6629,6 +6633,17 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->recovery_dropped_operations.load(std::memory_order_relaxed),
         state_->publications_abandoned.load(std::memory_order_relaxed),
     };
+}
+
+void FuseFrontend::set_viewer_active_for_tests(std::optional<bool> active) {
+    state_->viewer_active_override.store(active ? (*active ? 1 : 0) : -1,
+                                         std::memory_order_release);
+    // A loop held by a viewer can be asleep with no timed wake; it must see
+    // the change now, not at its next unrelated notification.
+    {
+        std::lock_guard lock(state_->data_queue_mutex);
+    }
+    state_->data_cv.notify_all();
 }
 
 bool FuseFrontend::wait_for_idle(std::chrono::milliseconds timeout) {

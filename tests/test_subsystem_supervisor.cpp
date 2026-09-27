@@ -405,3 +405,32 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_stops_while_a_facto
     CHECK(cancelled.load());
     CHECK(elapsed < 2s);
 }
+
+MACHA_TEST("subsystem_supervisor", test_service_stops_plugins_before_the_store) {
+    // A plugin writes into the store until the moment it is stopped: the
+    // torrent subsystem publishes each verified extent as it goes. The node
+    // must still take those writes while plugins stop, so Service::stop stops
+    // every plugin before it withdraws DATA admission and outbound RPC.
+    TempDir plugins;
+    copy_plugin(MACHA_TEST_PLUGIN_WRITES_ON_STOP, plugins.path());
+    const auto result = plugins.path() / "result";
+    REQUIRE(::setenv("MACHA_TEST_STOP_WRITE_RESULT", result.c_str(), 1) == 0);
+
+    TestService fixture("plugins-stop-before-the-store");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    config.plugin_path = plugins.path();
+    auto& service = fixture.start();
+
+    const auto outcome = [&] {
+        std::ifstream in(result);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    REQUIRE(wait_until([&] { return outcome() == "started"; }, 10s));
+
+    service.stop();
+    CHECK(outcome() == "ok");
+    if (outcome() != "ok") std::cerr << "write from stop(): " << outcome() << "\n";
+}

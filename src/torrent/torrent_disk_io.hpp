@@ -104,8 +104,10 @@ struct TorrentDiskHooks {
     // backend only writes payload files (stage 1 behaviour, and tests).
     uint64_t extent_size{};
     // Stores one extent's bytes durably and returns its object id, or nothing
-    // on failure (the backend retries).
-    std::function<std::optional<ObjectId>(std::span<const uint8_t>)> publish;
+    // on failure (the backend retries). `abort` is set when the backend shuts
+    // down; a store honouring it ends a write in flight promptly, and the
+    // extent, never journalled, is published again when the torrent resumes.
+    std::function<std::optional<ObjectId>(std::span<const uint8_t>, std::atomic_bool& abort)> publish;
     std::shared_ptr<TorrentPieceVerifications> verifications;
     // How long a failed publication waits before it is tried again.
     std::chrono::milliseconds publish_retry{std::chrono::seconds(30)};

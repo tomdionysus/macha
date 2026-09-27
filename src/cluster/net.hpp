@@ -402,6 +402,13 @@ class RpcClient {
     std::map<NodeId, std::optional<MessageType>> stalled_peers_for_tests_;
     std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_for_tests_;
     AsyncRpc stalled_call_for_tests_locked();
+    // Test-only: inbound routes from these peers are parked, not registered,
+    // until release_inbound_for_tests(); and a hook run after every dial.
+    std::set<NodeId> held_inbound_peers_for_tests_;
+    std::vector<InboundRoute> held_inbound_routes_for_tests_;
+    std::function<void()> after_dial_for_tests_;
+    // Waits, up to the connect timeout, for any usable route to `peer`.
+    bool await_route(const NodeId& peer, TransportLane lane);
     std::map<std::string, PeerHealth> health_;
     std::map<std::string, Endpoint> endpoints_;
     std::map<std::string, IdentityAssociationReset> identity_resets_;
@@ -531,6 +538,12 @@ class RpcClient {
     // Tear down one lane to a peer (both directions) without touching the
     // other. Tests use it to stand in for a NAT mapping silently expiring.
     void close_lane_for_tests(const NodeId& peer, TransportLane lane);
+    // Test-only. Park inbound routes from `peer` instead of registering them,
+    // as if its sessions had not reached this node yet; release registers
+    // them. The hook runs after each dial installs, before the call uses it.
+    void hold_inbound_for_tests(const NodeId& peer);
+    void release_inbound_for_tests(const NodeId& peer);
+    void set_after_dial_for_tests(std::function<void()> hook);
     uint64_t dial_requests_sent() const {
         return dial_requests_sent_.load(std::memory_order_relaxed);
     }

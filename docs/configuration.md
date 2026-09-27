@@ -629,6 +629,19 @@ catalogue:
           contact: https://example.invalid/macha
 ```
 
+`ignore_terms` (default `[sample]`) keeps files out of the catalogue: a file
+is not catalogued when a word of its path below the scanner root equals one of
+the terms, ignoring case. Words are the runs of letters and digits, so
+`sample` matches `Sample/film.mkv` and `film-sample.mkv` but not
+`Samples of Joy.mkv`. An empty list catalogues everything. An ingest hint for
+such a file ends `no_match` with result `ignored_term`.
+
+```yaml
+catalogue:
+  scanner:
+    ignore_terms: [sample, trailer]
+```
+
 Artwork fetched by providers is ordinary DATA. Catalogue manifest/shards are CONTROL.
 
 ### API server

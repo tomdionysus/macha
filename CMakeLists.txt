@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.65.0 LANGUAGES CXX)
+project(macha VERSION 0.66.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -519,7 +519,7 @@ if(MACHA_BUILD_TESTS)
     # Subsystem/SubsystemPluginEntry types and build-identity stamp.
     foreach(plugin_name IN ITEMS test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
                                 test_plugin_no_entry_symbol test_plugin_declining
-                                test_plugin_faulting_after_start)
+                                test_plugin_faulting_after_start test_plugin_writes_on_stop)
         add_library(${plugin_name} MODULE tests/plugins/${plugin_name}.cpp)
         target_link_libraries(${plugin_name} PRIVATE macha_core)
         set_target_properties(${plugin_name} PROPERTIES PREFIX "")
@@ -558,9 +558,11 @@ if(MACHA_BUILD_TESTS)
         MACHA_TEST_PLUGIN_MISMATCHED_ABI="$<TARGET_FILE:test_plugin_mismatched_abi>"
         MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL="$<TARGET_FILE:test_plugin_no_entry_symbol>"
         MACHA_TEST_PLUGIN_DECLINING="$<TARGET_FILE:test_plugin_declining>"
-        MACHA_TEST_PLUGIN_FAULTING_AFTER_START="$<TARGET_FILE:test_plugin_faulting_after_start>")
+        MACHA_TEST_PLUGIN_FAULTING_AFTER_START="$<TARGET_FILE:test_plugin_faulting_after_start>"
+        MACHA_TEST_PLUGIN_WRITES_ON_STOP="$<TARGET_FILE:test_plugin_writes_on_stop>")
     add_dependencies(macha-tests test_plugin_ok test_plugin_faulting test_plugin_mismatched_abi
-        test_plugin_no_entry_symbol test_plugin_declining test_plugin_faulting_after_start)
+        test_plugin_no_entry_symbol test_plugin_declining test_plugin_faulting_after_start
+        test_plugin_writes_on_stop)
     # Tests that need the real torrent subsystem dlopen it from the build
     # tree, exactly as production loads it from the install tree. Pointing a
     # Service's plugin_path here also keeps a test process from loading a
