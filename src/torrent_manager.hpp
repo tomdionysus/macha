@@ -131,13 +131,17 @@ class TorrentManager final : public TorrentService {
     // ingest back rather than stay failed with its staging held.
     bool linked_ingest_revived(const TorrentJob&) const;
     std::string add_impl(std::string uri, bool allow_fetch);
+    // A parsed add: libtorrent's params and the canonical magnet persisted
+    // for it. Defined in the .cpp, which alone sees libtorrent's types.
+    struct ParsedAdd;
+    void parse_add_uri(std::string uri, bool allow_fetch, ParsedAdd& out);
+    std::string add_parsed(std::string id, ParsedAdd& parsed, bool held);
 
-    // NodeRuntime::set_torrent_bridge() handler bodies. Local-only -- never
-    // call the *_cluster_wide() methods from here, or a peer's survey would
-    // itself re-survey its own peers.
+    // NodeRuntime::set_torrent_bridge() handler bodies: this node's own jobs
+    // only. Every node's view of the cluster (ClusterJobView) is built from
+    // these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
-    TorrentActionResult dispatch_action_cluster_wide(std::string_view id, std::string_view action);
 
   public:
     TorrentManager(NodeRuntime&, IngestManager&, TorrentConfig,
@@ -163,14 +167,10 @@ class TorrentManager final : public TorrentService {
     bool cancel(std::string_view id) override;
     bool clear(std::string_view id) override;
 
-    Placement add_on(const NodeId&, std::string_view, bool search_result) override;
-    std::vector<ClusterTorrentJob> jobs_cluster_wide() const override;
-    std::optional<ClusterTorrentJob> job_cluster_wide(std::string_view id) const override;
-    TorrentActionResult pause_cluster_wide(std::string_view id) override;
-    TorrentActionResult resume_cluster_wide(std::string_view id) override;
-    TorrentActionResult retry_cluster_wide(std::string_view id) override;
-    TorrentActionResult cancel_cluster_wide(std::string_view id) override;
-    TorrentActionResult clear_cluster_wide(std::string_view id) override;
+    Placement place(std::string_view magnet_or_uri, bool search_result) override;
+    Resolved resolve(std::string_view uri, bool search_result) override;
+    std::string adopt(std::string_view id, std::string_view magnet, bool held) override;
+    Offer offer() const override;
 };
 
 } // namespace macha

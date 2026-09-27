@@ -30,12 +30,131 @@ std::optional<std::pair<std::string, std::string>> job_action(std::string_view p
                                                std::string(path.substr(slash + 1))};
 }
 
+Json sources_json(const std::vector<ClusterJobView::Source>& sources) {
+    Json::Array out;
+    for (const auto& source : sources) {
+        Json::Object item;
+        item["node_id"] = to_string(source.node_id);
+        item["local"] = source.local;
+        item["reachable"] = source.reachable;
+        item["as_of_unix_ms"] = source.as_of_unix_ms ? Json(source.as_of_unix_ms) : Json(nullptr);
+        out.push_back(std::move(item));
+    }
+    return Json(std::move(out));
+}
+
+std::optional<NodeId> parse_node_id(const Json& value, std::string& error) {
+    if (value.isNull()) return NodeId{};
+    if (!value.isString()) {
+        error = "node_id must be a string";
+        return std::nullopt;
+    }
+    const auto bytes = unhex(value.asString());
+    NodeId node;
+    if (!bytes || bytes->size() != node.bytes.size()) {
+        error = "node_id is not a node identifier";
+        return std::nullopt;
+    }
+    std::copy(bytes->begin(), bytes->end(), node.bytes.begin());
+    return node;
+}
+
+// remove_after_ms: absent (nullopt), null (present, empty), or 0..24 h.
+bool parse_remove_after(const Json& body, std::optional<std::optional<uint64_t>>& out, std::string& error) {
+    const auto* value = body.find("remove_after_ms");
+    if (!value) return true;
+    if (value->isNull()) {
+        out = std::optional<uint64_t>{};
+        return true;
+    }
+    if (!value->isNumber()) {
+        error = "remove_after_ms must be null or a number of milliseconds";
+        return false;
+    }
+    const auto ms = value->asInt64();
+    if (ms < 0 || ms > 86400000) {
+        error = "remove_after_ms must be between 0 and 86400000";
+        return false;
+    }
+    out = std::optional<uint64_t>{static_cast<uint64_t>(ms)};
+    return true;
+}
+
+HttpResponse outcome_error(const TorrentCoordinator::Outcome& outcome) {
+    if (outcome.cluster_scope) {
+        FailureAxes axes;
+        axes.scope = FailureScope::cluster;
+        axes.alternative_may_succeed = false;
+        return http_error(outcome.status, outcome.code, outcome.message, outcome.reason, axes);
+    }
+    if (!outcome.reason.empty()) return http_error(outcome.status, outcome.code, outcome.message, outcome.reason);
+    return http_error(outcome.status, outcome.code, outcome.message);
+}
+
+HttpResponse unreachable_error() {
+    return http_error(503, "node_unreachable",
+                      "the node that owns this job cannot be reached from this node");
+}
+
 HttpResponse action_error(bool exists) {
     return exists ? http_error(409, "invalid_state", "job cannot perform that action in its current state")
                   : http_error(404, "not_found", "job not found");
 }
 
 } // namespace
+
+std::map<NodeId, uint64_t> AcquisitionApi::live_ages() const {
+    std::map<NodeId, uint64_t> out;
+    for (const auto& source : jobs_.torrent_jobs().sources) out[source.node_id] = source.as_of_unix_ms;
+    return out;
+}
+
+// One torrent job as the API shows it (0.64.0): the cluster request from
+// metadata, with the owner's live state laid over it.
+Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId, uint64_t>& as_of) const {
+    const auto live = torrents_.live_job(r);
+    Json::Object out;
+    if (live) {
+        auto base = torrent_job_api_json(live->job);
+        out = base.asObject();
+    } else {
+        for (const auto* key : {"bytes_total", "bytes_completed", "download_rate", "upload_rate", "uploaded_total",
+                                "peers", "seeds", "eta_seconds", "progress", "catalogue"})
+            out[key] = Json(nullptr);
+    }
+    out["id"] = r.id;
+    out["info_hash"] = r.info_hash;
+    out["name"] = live && !live->job.name.empty() ? live->job.name : r.name;
+    out["phase"] = std::string(torrent_phase_name(r.phase));
+    out["state"] = r.phase == TorrentPhase::awaiting_node ? std::string("awaiting_node")
+                   : live                                ? torrent_job_state_name(live->job.state)
+                                                         : std::string(torrent_phase_name(r.phase));
+    out["desired"] = std::string(torrent_desired_name(r.desired));
+    out["desired_changed_unix_ms"] = r.desired_changed_unix_ms;
+    out["desired_applied"] = torrents_.desired_applied(r, live ? std::optional<TorrentJob>(live->job) : std::nullopt);
+    const auto blocked = torrents_.desired_blocked_reason(r);
+    out["desired_blocked_reason"] = blocked.empty() ? Json(nullptr) : Json(blocked);
+    out["node_id"] = r.claim ? Json(to_string(r.claim->node_id)) : Json(nullptr);
+    out["pinned_node_id"] = r.pinned_node_id ? Json(to_string(*r.pinned_node_id)) : Json(nullptr);
+    uint64_t live_as_of = 0;
+    if (live) {
+        if (live->node_id == jobs_.local_node_id()) live_as_of = unix_ms();
+        else if (auto found = as_of.find(live->node_id); found != as_of.end()) live_as_of = found->second;
+    }
+    out["live_as_of_unix_ms"] = live_as_of ? Json(live_as_of) : Json(nullptr);
+    out["remove_after_ms"] = r.remove_after_ms ? Json(*r.remove_after_ms) : Json(nullptr);
+    out["remove_at_unix_ms"] = r.remove_after_ms && r.completed_unix_ms
+                                   ? Json(r.completed_unix_ms + *r.remove_after_ms)
+                                   : Json(nullptr);
+    if (!live) out["ingest_job_id"] = r.ingest_job_id.empty() ? Json(nullptr) : Json(r.ingest_job_id);
+    out["error_code"] = r.error_code.empty() ? (live ? out["error_code"] : Json(nullptr)) : Json(r.error_code);
+    out["error"] = r.error.empty() ? (live ? out["error"] : Json(nullptr)) : Json(r.error);
+    out["created_unix_ms"] = r.created_unix_ms;
+    out["completed_unix_ms"] = r.completed_unix_ms ? Json(r.completed_unix_ms) : Json(nullptr);
+    out["updated_unix_ms"] = std::max({r.progress_unix_ms, r.desired_changed_unix_ms, r.settings_changed_unix_ms,
+                                       live ? live->job.updated_unix_ms : uint64_t{0}});
+    return Json(std::move(out));
+}
 
 HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
     try {
@@ -67,14 +186,17 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
         }
 
         if (request.method == "GET" && request.path == "/api/v1/ingest/jobs") {
+            const auto listing = jobs_.ingest_jobs();
             Json::Array jobs;
-            for (const auto& entry : ingest_.jobs_cluster_wide()) {
+            for (const auto& entry : listing.jobs) {
                 auto item = ingest_job_json(entry.job, false);
                 item["node_id"] = to_string(entry.node_id);
                 jobs.push_back(std::move(item));
             }
             Json::Object out;
             out["jobs"] = std::move(jobs);
+            out["sources"] = sources_json(listing.sources);
+            out["refresh_interval_ms"] = static_cast<uint64_t>(jobs_.refresh_interval().count());
             return http_json(200, Json(std::move(out)).dump());
         }
 
@@ -100,7 +222,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (auto target = job_action(request.path, "/api/v1/ingest/jobs/")) {
             if (request.method == "GET" && target->second.empty()) {
-                auto existing = ingest_.job_cluster_wide(target->first);
+                auto existing = jobs_.ingest_job(target->first);
                 if (!existing) return http_error(404, "not_found", "ingest job not found");
                 auto item = ingest_job_json(existing->job, true, &existing->catalogue);
                 item["node_id"] = to_string(existing->node_id);
@@ -108,11 +230,11 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             }
             if (request.method == "POST") {
                 IngestActionResult result;
-                if (target->second == "pause") result = ingest_.pause_cluster_wide(target->first);
-                else if (target->second == "resume") result = ingest_.resume_cluster_wide(target->first);
-                else if (target->second == "cancel") result = ingest_.cancel_cluster_wide(target->first);
-                else if (target->second == "clear") result = ingest_.clear_cluster_wide(target->first);
+                if (target->second == "pause" || target->second == "resume" ||
+                    target->second == "cancel" || target->second == "clear")
+                    result = jobs_.ingest_action(target->first, target->second);
                 else return http_error(404, "not_found", "unknown ingest action");
+                if (result.unreachable) return unreachable_error();
                 if (!result.changed) return action_error(result.exists);
                 if (target->second == "clear") {
                     Json::Object out;
@@ -145,43 +267,62 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             return http_json(200, Json(std::move(out)).dump());
         }
 
-        // Search is served by core (a Torznab HTTP client, no libtorrent), so
-        // it keeps working on a node with no plugin installed; everything
-        // else under /torrents/ needs the engine itself.
-        if (!torrents && request.path.starts_with("/api/v1/torrents/") &&
-            request.path != "/api/v1/torrents/search")
-            return http_error(503, "unavailable",
-                              "torrent subsystem is not available on this node");
-
         if (request.method == "GET" && request.path == "/api/v1/torrents/jobs") {
+            // The requests from this node's metadata, with each owner's live
+            // state from the cluster view (0.64.0).
+            const auto listing = jobs_.torrent_jobs();
+            std::map<NodeId, uint64_t> as_of;
+            for (const auto& source : listing.sources) as_of[source.node_id] = source.as_of_unix_ms;
             Json::Array jobs;
-            for (const auto& entry : torrents->jobs_cluster_wide()) {
-                auto item = torrent_job_api_json(entry.job);
-                item["node_id"] = to_string(entry.node_id);
-                jobs.push_back(std::move(item));
-            }
+            for (const auto& r : torrents_.requests()) jobs.push_back(request_json(r, as_of));
             Json::Object out;
             out["jobs"] = std::move(jobs);
+            out["sources"] = sources_json(listing.sources);
+            out["refresh_interval_ms"] = static_cast<uint64_t>(jobs_.refresh_interval().count());
+            return http_json(200, Json(std::move(out)).dump());
+        }
+
+        if (request.method == "GET" && request.path == "/api/v1/torrents/nodes") {
+            Json::Array nodes;
+            for (const auto& node : jobs_.torrent_nodes()) {
+                Json::Object item;
+                item["node_id"] = to_string(node.node_id);
+                item["host"] = node.host;
+                item["local"] = node.local;
+                item["reachable"] = node.reachable;
+                item["as_of_unix_ms"] = node.as_of_unix_ms ? Json(node.as_of_unix_ms) : Json(nullptr);
+                item["accepting"] = node.offer.accepting && node.reachable;
+                item["not_accepting_reason"] =
+                    !node.reachable ? Json(std::string("unreachable"))
+                    : node.offer.not_accepting_reason.empty() ? Json(nullptr)
+                                                              : Json(node.offer.not_accepting_reason);
+                item["max_active"] = static_cast<uint64_t>(node.offer.max_active);
+                item["active_jobs"] = static_cast<uint64_t>(node.offer.active_jobs);
+                item["staging"] = node.staging ? staging_capacity_json(*node.staging) : Json(nullptr);
+                nodes.push_back(std::move(item));
+            }
+            Json::Object out;
+            out["nodes"] = std::move(nodes);
+            out["refresh_interval_ms"] = static_cast<uint64_t>(jobs_.refresh_interval().count());
+            const auto remove_after = jobs_.default_remove_after();
+            out["default_remove_after_ms"] =
+                remove_after ? Json(static_cast<uint64_t>(remove_after->count())) : Json(nullptr);
             return http_json(200, Json(std::move(out)).dump());
         }
 
         if (request.method == "POST" && request.path == "/api/v1/torrents/jobs") {
             const auto body = parse_body(request);
-
-            // Optional placement. Absent means "here", which is what this route
-            // always did; a node id means that node downloads it. Which node
-            // runs a download is not a detail -- they differ in disk, in memory
-            // and in what else they are serving -- and until now it was decided
-            // by which address the client happened to be configured with.
-            NodeId target{};
-            if (const auto* node = body.find("node_id"); node && !node->isNull()) {
-                if (!node->isString())
-                    return http_error(400, "bad_request", "node_id must be a string");
-                const auto bytes = unhex(node->asString());
-                if (!bytes || bytes->size() != NodeId{}.bytes.size())
-                    return http_error(400, "bad_request", "node_id is not a node identifier");
-                std::copy(bytes->begin(), bytes->end(), target.bytes.begin());
+            // Optional pin (0.64.0): absent or null lets the cluster choose.
+            std::optional<NodeId> pin;
+            if (const auto* node = body.find("node_id")) {
+                std::string error;
+                auto parsed = parse_node_id(*node, error);
+                if (!parsed) return http_error(400, "bad_request", error);
+                if (*parsed != NodeId{}) pin = *parsed;
             }
+            std::optional<std::optional<uint64_t>> remove_after;
+            if (std::string error; !parse_remove_after(body, remove_after, error))
+                return http_error(400, "bad_request", error);
 
             std::string uri;
             bool search_result = false;
@@ -198,33 +339,24 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 return http_error(400, "bad_request", "magnet or acquisition_ref is required");
             }
 
-            const auto placement = torrents->add_on(target, uri, search_result);
-            if (!placement.placed && placement.reason == "torrent_already_added") {
-                // One job per torrent per node (0.63.0). The holder is named
-                // in the same fields a 202 uses, so a client can go straight
-                // to it.
+            const auto outcome = torrents_.add(uri, search_result, pin, remove_after);
+            if (outcome.code == "torrent_already_added") {
+                // The holder is named in the same fields a 202 uses, so a
+                // client can go straight to it.
                 Json::Object root;
                 root["status"] = std::string("torrent_already_added");
                 root["error"] = Json::Object{{"code", std::string("torrent_already_added")},
-                                             {"message", placement.error}};
-                root["id"] = placement.job_id;
-                root["node_id"] = to_string(placement.node_id);
+                                             {"message", outcome.message}};
+                root["id"] = outcome.request ? Json(outcome.request->id) : Json(nullptr);
+                root["node_id"] = outcome.node ? Json(to_string(*outcome.node)) : Json(nullptr);
                 return http_json(409, Json(std::move(root)).dump());
             }
-            if (!placement.placed) {
-                // An unreachable or unknown target is refused rather than
-                // quietly downloaded here. A job that lands somewhere the
-                // operator did not ask for is worse than one that fails.
-                return http_error(409, "placement_failed",
-                                  placement.error.empty() ? "the job could not be placed"
-                                                          : placement.error,
-                                  placement.reason.empty() ? "add_failed" : placement.reason);
-            }
+            if (outcome.status != 202) return outcome_error(outcome);
             Json::Object out;
-            out["id"] = placement.job_id;
-            // Always reported, including for a local add, so a client never has
-            // to infer where its own job went.
-            out["node_id"] = to_string(placement.node_id);
+            out["id"] = outcome.request->id;
+            out["info_hash"] = outcome.request->info_hash;
+            out["node_id"] = pin ? Json(to_string(*pin)) : Json(nullptr);
+            out["job"] = request_json(*outcome.request, {});
             return http_json(202, Json(std::move(out)).dump());
         }
 
@@ -256,30 +388,44 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (auto target = job_action(request.path, "/api/v1/torrents/jobs/")) {
             if (request.method == "GET" && target->second.empty()) {
-                auto existing = torrents->job_cluster_wide(target->first);
+                auto existing = torrents_.request(target->first);
                 if (!existing) return http_error(404, "not_found", "torrent job not found");
-                auto item = torrent_job_api_json(existing->job);
-                item["node_id"] = to_string(existing->node_id);
-                return http_json(200, item.dump());
+                return http_json(200, request_json(*existing, live_ages()).dump());
+            }
+            if (request.method == "PATCH" && target->second.empty()) {
+                const auto body = parse_body(request);
+                std::optional<std::optional<uint64_t>> remove_after;
+                if (std::string error; !parse_remove_after(body, remove_after, error))
+                    return http_error(400, "bad_request", error);
+                std::optional<std::optional<NodeId>> pin;
+                if (const auto* node = body.find("node_id")) {
+                    std::string error;
+                    auto parsed = parse_node_id(*node, error);
+                    if (!parsed) return http_error(400, "bad_request", error);
+                    pin = *parsed == NodeId{} ? std::optional<NodeId>{} : std::optional<NodeId>{*parsed};
+                }
+                if (!remove_after && !pin)
+                    return http_error(400, "bad_request", "remove_after_ms or node_id is required");
+                const auto outcome = torrents_.patch(target->first, remove_after, pin);
+                if (outcome.status != 200) return outcome_error(outcome);
+                return http_json(200, request_json(*outcome.request, live_ages()).dump());
             }
             if (request.method == "POST") {
-                TorrentActionResult result;
-                if (target->second == "pause") result = torrents->pause_cluster_wide(target->first);
-                else if (target->second == "resume") result = torrents->resume_cluster_wide(target->first);
-                else if (target->second == "retry") result = torrents->retry_cluster_wide(target->first);
-                else if (target->second == "cancel") result = torrents->cancel_cluster_wide(target->first);
-                else if (target->second == "clear") result = torrents->clear_cluster_wide(target->first);
-                else return http_error(404, "not_found", "unknown torrent action");
-                if (!result.changed) return action_error(result.exists);
-                if (target->second == "clear") {
+                const auto& action = target->second;
+                if (action != "pause" && action != "resume" && action != "retry" && action != "cancel" &&
+                    action != "clear")
+                    return http_error(404, "not_found", "unknown torrent action");
+                const auto outcome = torrents_.act(target->first, action);
+                if (outcome.status != 202) return outcome_error(outcome);
+                if (action == "clear") {
                     Json::Object out;
                     out["cleared"] = true;
-                    return http_json(200, Json(std::move(out)).dump());
+                    return http_json(202, Json(std::move(out)).dump());
                 }
-                if (!result.updated) return action_error(result.exists);
-                auto item = torrent_job_api_json(result.updated->job);
-                item["node_id"] = to_string(result.updated->node_id);
-                return http_json(200, item.dump());
+                // Intent recorded; the owner applies it and `state` follows.
+                const auto shown = outcome.request ? outcome.request : torrents_.request(target->first);
+                if (!shown) return http_error(404, "not_found", "torrent job not found");
+                return http_json(202, request_json(*shown, live_ages()).dump());
             }
         }
 

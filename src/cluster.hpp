@@ -193,6 +193,7 @@ class NodeRuntime {
     JobActionHandler ingest_action_handler_;
     JobsQueryHandler torrent_jobs_handler_;
     JobActionHandler torrent_action_handler_;
+    JobActionHandler torrent_intent_handler_;
 
     void signal_service_event(ServiceEvent);
 
@@ -241,6 +242,8 @@ class NodeRuntime {
     // themselves -- or a single cluster-wide query fans out unboundedly.
     void set_ingest_bridge(JobsQueryHandler jobs, JobActionHandler action);
     void set_torrent_bridge(JobsQueryHandler jobs, JobActionHandler action);
+    // The torrent coordinator's handler for torrent_intent (0.64.0).
+    void set_torrent_intent_handler(JobActionHandler);
     void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;

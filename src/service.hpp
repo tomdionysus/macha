@@ -69,6 +69,8 @@ class Service {
     std::unique_ptr<HydrationManager> hydration_;
     std::unique_ptr<IngestManager> ingest_;
     std::unique_ptr<TorrentSearchManager> torrent_search_;
+    std::unique_ptr<ClusterJobView> cluster_jobs_;
+    std::unique_ptr<TorrentCoordinator> torrent_coordinator_;
     std::unique_ptr<AcquisitionApi> acquisition_api_;
     std::unique_ptr<CatalogueApi> catalogue_api_;
     std::unique_ptr<ManageApi> manage_api_;
@@ -174,6 +176,12 @@ class Service {
     std::shared_ptr<TorrentService> torrents() {
         wait_services_ready();
         return registry_.torrent();
+    }
+    ClusterJobView& cluster_jobs() {
+        return *cluster_jobs_;
+    }
+    TorrentCoordinator& torrent_coordinator() {
+        return *torrent_coordinator_;
     }
     AcquisitionApi& acquisition_api() {
         wait_services_ready();

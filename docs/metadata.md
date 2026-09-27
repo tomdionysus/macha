@@ -124,6 +124,14 @@ form; a tree-backed node stays tree-backed.
   path-wise as before, and re-roots the result, so a merge costs what it
   costs for an inline namespace.
 
+## Torrent requests
+
+Since 0.64.0 a snapshot also carries `torrent_requests`: the torrents the cluster has been asked to download, one record per request, with who has claimed it, what the operator wants and how far it has got (see the acquisition guide). SM15 is the SM13 layout with every section present followed by the requests; SM16 is SM14 followed by the requests; DLT9 is DLT8 followed by the requests a mutation rewrote and the tombstones it erased. Each is written only while the collection is non-empty, so a cluster that never queues a torrent keeps its encodings byte for byte.
+
+Reconciliation joins the collection per request instead of recording conflicts: every field has a deterministic merge (cancel is final; a later claim epoch wins; within one epoch a request never moves backwards; removal wins), so the merge is commutative, associative and idempotent and never needs an operator. Removed requests stay as tombstones for seven days so a branch that has not seen the removal cannot bring one back.
+
+A protocol-21 node rejects SM15, SM16 and DLT9, full-record fallback included, so 0.64.0 is cluster protocol 22 and every node upgrades together.
+
 ## Compatibility
 
 `dht.metadata_replicas` named a fixed voter count whose effective write

@@ -698,6 +698,13 @@ so a download yields to a viewer on a slow device. It replaced
 `torrent.pressure_download_rate`, which is no longer read. It takes effect at
 restart; `max_active`, the rate limits and `log_level` apply on live reload.
 
+`torrent.accept_new_jobs` (default true; 0.64.0) set false drains a node: it
+keeps the torrent jobs it has, takes no new one, and stays listed in
+`GET /api/v1/torrents/nodes` with `not_accepting_reason` `draining`.
+`torrent.remove_on_complete_after_ms` (absent or null = off; 0..86400000) is
+how long after a torrent completes it is removed; it is reported as
+`default_remove_after_ms`. Both apply on live reload.
+
 ## Web client
 
 `web.root` names a directory of built web-client assets to serve at the server's root. It is unset by default, and a node with no `web.root` answers non-API paths exactly as before: `404`.

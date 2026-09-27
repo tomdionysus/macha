@@ -4220,3 +4220,179 @@ MACHA_FAST_TEST("storage_metadata", test_decoded_extent_vectors_carry_no_allocat
 }
 
 } // namespace
+
+namespace {
+TorrentRequest sample_torrent_request(const std::string& id, const std::string& hash, uint64_t created) {
+    TorrentRequest r;
+    r.id = id;
+    r.info_hash = hash;
+    r.source = "magnet:?xt=urn:btih:" + hash;
+    r.created_unix_ms = created;
+    r.created_by = NodeId{};
+    r.name = "Sample";
+    return r;
+}
+} // namespace
+
+MACHA_FAST_TEST("storage_metadata", test_torrent_requests_join_without_conflicts) {
+    // 0.64.0. Metadata writes are not compare-and-swap and history branches, so
+    // two replicas can change one request at once. Every field has a rule and
+    // the merge is a join: the same answer from either side, and again.
+    const auto a_node = random_node_id();
+    const auto b_node = random_node_id();
+    auto base = sample_torrent_request(std::string(32, 'a'), std::string(40, '1'), 100);
+
+    {
+        Writer w;
+        auto full = base;
+        full.pinned_node_id = a_node;
+        full.remove_after_ms = 0;
+        full.claim = TorrentClaim{b_node, 2, 500};
+        full.phase = TorrentPhase::importing;
+        full.phase_epoch = 2;
+        full.ingest_job_id = "ingest";
+        full.error_code = "code";
+        full.removed_unix_ms = 9;
+        encode_torrent_request(w, full);
+        const auto bytes = w.take();
+        Reader r(bytes);
+        CHECK(decode_torrent_request(r) == full);
+        r.finish();
+    }
+
+    auto paused = base;
+    paused.desired = TorrentDesired::paused;
+    paused.desired_changed_unix_ms = 200;
+    paused.desired_changed_by = a_node;
+    auto cancelled = base;
+    cancelled.desired = TorrentDesired::cancelled;
+    cancelled.desired_changed_unix_ms = 150; // earlier, and still final
+    cancelled.desired_changed_by = b_node;
+    auto claimed = base;
+    claimed.claim = TorrentClaim{a_node, 1, 300};
+    claimed.phase = TorrentPhase::downloading;
+    claimed.phase_epoch = 1;
+    claimed.progress_unix_ms = 300;
+    auto rival = base;
+    rival.claim = TorrentClaim{b_node, 1, 290}; // same epoch, earlier: wins
+    auto takeover = base;
+    takeover.claim = TorrentClaim{b_node, 2, 900};
+    takeover.phase = TorrentPhase::downloading;
+    takeover.phase_epoch = 2;
+    takeover.progress_unix_ms = 900;
+    auto removed = base;
+    removed.removed_unix_ms = 1000;
+
+    const std::vector<TorrentRequest> variants{base, paused, cancelled, claimed, rival, takeover, removed};
+    for (const auto& x : variants) {
+        CHECK(merge_torrent_request(x, x) == x);
+        for (const auto& y : variants) {
+            CHECK(merge_torrent_request(x, y) == merge_torrent_request(y, x));
+            for (const auto& z : variants)
+                CHECK(merge_torrent_request(merge_torrent_request(x, y), z) ==
+                      merge_torrent_request(x, merge_torrent_request(y, z)));
+        }
+    }
+    CHECK(merge_torrent_request(paused, cancelled).desired == TorrentDesired::cancelled);
+    CHECK(merge_torrent_request(claimed, rival).claim->node_id == b_node);
+    CHECK(merge_torrent_request(claimed, takeover).claim->epoch == 2);
+    CHECK(merge_torrent_request(claimed, takeover).phase_epoch == 2);
+    CHECK(merge_torrent_request(claimed, removed).removed_unix_ms == 1000);
+
+    // Collections: a tombstone erased on one side stays erased unless the
+    // other changed it; two live requests for one torrent keep the earlier.
+    std::map<std::string, TorrentRequest, std::less<>> m_base{{base.id, removed}};
+    std::map<std::string, TorrentRequest, std::less<>> erased{};
+    std::map<std::string, TorrentRequest, std::less<>> untouched{{base.id, removed}};
+    CHECK(merge_torrent_requests(m_base, erased, untouched).empty());
+    auto touched = removed;
+    touched.desired = TorrentDesired::cancelled;
+    touched.desired_changed_unix_ms = 2000;
+    CHECK(merge_torrent_requests(m_base, erased, {{base.id, touched}}).size() == 1);
+
+    const auto first = sample_torrent_request(std::string(32, 'b'), std::string(40, '2'), 100);
+    const auto second = sample_torrent_request(std::string(32, 'c'), std::string(40, '2'), 101);
+    const auto both = merge_torrent_requests({}, {{first.id, first}}, {{second.id, second}});
+    REQUIRE(both.size() == 2);
+    CHECK(both.at(first.id).desired == TorrentDesired::active);
+    CHECK(both.at(second.id).desired == TorrentDesired::cancelled);
+    CHECK(both.at(second.id).error_code == "duplicate_torrent");
+    CHECK(merge_torrent_requests({}, {{second.id, second}}, {{first.id, first}}) == both);
+}
+
+MACHA_FAST_TEST("storage_metadata", test_torrent_requests_ride_the_snapshot_and_its_deltas) {
+    // SM15 (inline namespace), SM16 (tree-backed) and DLT9 carry the
+    // collection; a cluster with none keeps its exact encodings.
+    const auto magic = [](const Bytes& bytes) { return std::string(bytes.begin(), bytes.begin() + 8); };
+    MetadataSnapshot base = decode_snapshot(genesis_metadata().payload);
+    base.metadata_write_replicas_required = 1;
+    const auto base_bytes = encode_snapshot(base);
+    CHECK(magic(base_bytes) != "DHTMETB5");
+
+    auto with = base;
+    auto request = sample_torrent_request(std::string(32, 'd'), std::string(40, '3'), 100);
+    request.claim = TorrentClaim{random_node_id(), 1, 150};
+    with.torrent_requests[request.id] = request;
+    const auto with_bytes = encode_snapshot(with);
+    CHECK(magic(with_bytes) == "DHTMETB5");
+    CHECK(decode_snapshot(with_bytes).torrent_requests == with.torrent_requests);
+    CHECK(encode_snapshot(decode_snapshot(with_bytes)) == with_bytes);
+
+    const auto added = metadata_delta(base, with);
+    REQUIRE(added.has_value());
+    CHECK(added->upsert_torrent_requests.size() == 1);
+    const auto added_bytes = encode_metadata_delta(*added);
+    CHECK(magic(added_bytes) == "DHTMDLT9");
+    CHECK(encode_snapshot(apply_metadata_delta(base, decode_metadata_delta(added_bytes))) == with_bytes);
+
+    auto changed = with;
+    changed.torrent_requests[request.id].phase = TorrentPhase::downloading;
+    changed.torrent_requests[request.id].phase_epoch = 1;
+    const auto update = metadata_delta(with, changed);
+    REQUIRE(update.has_value());
+    CHECK(encode_snapshot(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*update)))) ==
+          encode_snapshot(changed));
+
+    // Erased again: the snapshot returns to its pre-request encoding.
+    const auto erased = metadata_delta(changed, base);
+    REQUIRE(erased.has_value());
+    CHECK(erased->erase_torrent_requests == std::vector<std::string>{request.id});
+    CHECK(encode_snapshot(apply_metadata_delta(changed, decode_metadata_delta(encode_metadata_delta(*erased)))) ==
+          base_bytes);
+
+    // A delta that does not touch the collection is still DLT5-8.
+    auto unrelated = with;
+    unrelated.mutation_sequences[random_node_id()] = 5;
+    const auto quiet = metadata_delta(with, unrelated);
+    REQUIRE(quiet.has_value());
+    CHECK(magic(encode_metadata_delta(*quiet)) != "DHTMDLT9");
+    CHECK(encode_snapshot(apply_metadata_delta(with, decode_metadata_delta(encode_metadata_delta(*quiet)))) ==
+          encode_snapshot(unrelated));
+
+    // Tree-backed: SM16, and SM14 while empty.
+    auto tree = with;
+    tree.entries.clear();
+    tree.namespace_root = object_id(pattern(64));
+    const auto tree_bytes = encode_snapshot_v14(tree);
+    CHECK(magic(tree_bytes) == "DHTMETB6");
+    CHECK(decode_snapshot(tree_bytes).torrent_requests == tree.torrent_requests);
+    tree.torrent_requests.clear();
+    CHECK(magic(encode_snapshot_v14(tree)) == "DHTMETB4");
+
+    // Reconciliation joins the collection instead of recording a conflict.
+    auto left = with;
+    left.torrent_requests[request.id].desired = TorrentDesired::paused;
+    left.torrent_requests[request.id].desired_changed_unix_ms = 300;
+    auto right = with;
+    right.torrent_requests[request.id].phase = TorrentPhase::downloading;
+    right.torrent_requests[request.id].phase_epoch = 1;
+    right.torrent_requests[request.id].progress_unix_ms = 400;
+    Hash256 left_head{}, right_head{};
+    left_head.bytes[0] = 1;
+    right_head.bytes[0] = 2;
+    const auto merged = merge_metadata_snapshots(with, left, right, left_head, right_head);
+    CHECK(merged.conflicts_created == 0);
+    const auto& joined = merged.snapshot.torrent_requests.at(request.id);
+    CHECK(joined.desired == TorrentDesired::paused);
+    CHECK(joined.phase == TorrentPhase::downloading);
+}

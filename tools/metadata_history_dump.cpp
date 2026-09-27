@@ -439,6 +439,7 @@ int main(int argc, char** argv) {
                       << " conflicts=" << snapshot.conflicts.size()
                       << " node_status=" << snapshot.node_status.size()
                       << " identity_resets=" << snapshot.identity_resets.size()
+                      << " torrent_requests=" << snapshot.torrent_requests.size()
                       << " mutation_sequences=" << snapshot.mutation_sequences.size() << '\n'
                       << '\n';
             if (objects.empty()) {
@@ -488,6 +489,7 @@ int main(int argc, char** argv) {
                   << " conflicts=" << snapshot.conflicts.size()
                   << " node_status=" << snapshot.node_status.size()
                   << " identity_resets=" << snapshot.identity_resets.size()
+                  << " torrent_requests=" << snapshot.torrent_requests.size()
                   << " mutation_sequences=" << snapshot.mutation_sequences.size()
                   << " merge_parents=" << snapshot.merge_parents.size() << '\n';
         std::cout << "  bytes: entries=" << entry_bytes << " (of which extents=" << extent_bytes
