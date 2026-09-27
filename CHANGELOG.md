@@ -1,5 +1,23 @@
 # Current release
 
+## 0.64.2 — Import destinations ignore case (development)
+
+**A lowercase release made a second folder for one film.** The 720p
+Martian was imported into `/Movies/the martian (2015)/` beside `/Movies/The
+Martian (2015)/`: the folder name comes from the release name, and the
+existing-folder check matched case exactly. Names that differ only by case
+are one name to anyone browsing, and to Windows, which Macha will run on.
+
+- An import reuses a folder that already exists under another spelling, as
+  spelt.
+- A file whose name differs from one already there only by case is a
+  collision and gets ` (2)`.
+- The existing duplicate was merged by a rename (metadata only; the file kept
+  its media id and catalogue binding) and the empty folder removed.
+
+Case folding here is ASCII; the namespace-wide case policy the Windows port
+needs is not yet designed.
+
 ## 0.64.1 — Prompt replication sends only where there is room (development)
 
 **gbni-1 was pushing about 2 MB/s of refused writes into fi-1.** Prompt

@@ -5118,3 +5118,52 @@ MACHA_TEST("hydration_catalogue", test_a_hint_newer_than_its_batch_snapshot_is_d
     CHECK(hints.get(gone_id)->state == CatalogueHintState::failed);
     CHECK(hints.get(gone_id)->error_code == "path_missing");
 }
+
+MACHA_TEST("hydration_catalogue", test_an_import_uses_an_existing_folder_whatever_its_case) {
+    // The Martian, gbni-1, 2026-09-27: a 720p release named in lowercase was
+    // imported into "/Movies/the martian (2015)" beside "/Movies/The Martian
+    // (2015)". Names that differ only by case are one name (and will be on
+    // Windows): the existing folder is reused as spelt, and a file whose name
+    // differs from one already there only by case is a collision.
+    TestService fixture("node");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.ingest.enabled = false;
+    auto& service = fixture.start();
+    auto& fs = service.filesystem();
+    fs.mkdir("/Movies", 0755, getuid(), getgid());
+    fs.mkdir("/Movies/The Martian (2015)", 0755, getuid(), getgid());
+    fs.create_file("/Movies/The Martian (2015)/The.Martian.2015.EXTENDED.1080p.mkv", 0644, getuid(), getgid());
+
+    const auto root = fixture.path() / "martian";
+    std::filesystem::create_directories(root);
+    for (const auto& [name, seed] : {std::pair{std::string("the.martian.2015.extended.720p.bluray.x264-nezu.mkv"), 5},
+                                     std::pair{std::string("the.martian.2015.extended.1080p.mkv"), 6}}) {
+        std::ofstream out(root / name, std::ios::binary);
+        const auto bytes = pattern(64 * 1024 + seed, static_cast<uint8_t>(seed));
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = fixture.path() / "staging";
+    ingest_config.source_roots = {root};
+    IngestManager ingest(service.node(), fs, service.catalogue_hints(), ingest_config);
+    const auto id = ingest.submit_path(root);
+    ingest.start();
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+    const auto job = ingest.job(id);
+    REQUIRE(job.has_value());
+    REQUIRE(job->files.size() == 2);
+    for (const auto& file : job->files) {
+        CHECK(file.destination_path.starts_with("/Movies/The Martian (2015)/"));
+        if (file.source_path.ends_with("1080p.mkv"))
+            CHECK(file.destination_path != "/Movies/The Martian (2015)/the.martian.2015.extended.1080p.mkv");
+    }
+    size_t martian_folders = 0;
+    for (const auto& [name, entry] : fs.readdir("/Movies"))
+        if (entry.type == EntryType::directory && name.find("artian") != std::string::npos) ++martian_folders;
+    CHECK(martian_folders == 1);
+    ingest.stop();
+}

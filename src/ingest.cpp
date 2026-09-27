@@ -24,6 +24,17 @@
 namespace macha {
 namespace {
 
+// ASCII case folding. Names that differ only by case are one name to a
+// Windows filesystem, and to any person browsing the library; full Unicode
+// folding belongs to the namespace-wide case policy, not to this.
+std::string fold_case(std::string_view value) {
+    std::string out(value);
+    for (auto& c : out)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return out;
+}
+
+
 uint64_t now_ms() { return unix_ms(); }
 
 std::filesystem::path absolute_normal(const std::filesystem::path& path) {
@@ -1329,16 +1340,12 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     // files of one torrent plan the same path -- the extras of Rome's two
     // seasons, each with a "Menu Art.mkv" -- and the second then failed with
     // destination_conflict once the first had been imported (2026-09-25).
+    // Compared ignoring case (0.64.2): two names that differ only by case
+    // are one name on Windows and to anyone browsing.
     std::set<std::string> planned_destinations;
     const auto taken = [&](const std::string& path) {
-        if (planned_destinations.contains(path)) return true;
-        try {
-            (void)fs_.getattr(path);
-            return true;
-        } catch (const FsError& e) {
-            if (e.code() == ENOENT) return false;
-            throw;
-        }
+        if (planned_destinations.contains(fold_case(path))) return true;
+        return exists_ignoring_case(path);
     };
 
     for (const auto& source : host_files) {
@@ -1347,13 +1354,14 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         if (size_error || !size) continue;
         auto destination = choose_destination(source, size);
         if (destination.empty()) continue;
+        destination = with_existing_case(destination);
 
         // Resolve collisions once and persist the selected path. Resume never
         // re-runs this choice for a planned job.
         std::string candidate = destination;
         for (unsigned suffix = 2; taken(candidate); ++suffix)
             candidate = append_collision_suffix(destination, suffix);
-        planned_destinations.insert(candidate);
+        planned_destinations.insert(fold_case(candidate));
 
         IngestFileProgress planned;
         planned.source_path = source.string();
@@ -1397,7 +1405,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         planned.destination_path = base_destination;
         for (unsigned suffix = 2; taken(planned.destination_path); ++suffix)
             planned.destination_path = append_collision_suffix(base_destination, suffix);
-        planned_destinations.insert(planned.destination_path);
+        planned_destinations.insert(fold_case(planned.destination_path));
         planned.temporary_path = planned.destination_path + ".macha-ingest-" + job.id.substr(0, 12) + ".part";
         planned.size = size;
         planned.source_mtime_ns = host_mtime(source);
@@ -1455,6 +1463,61 @@ std::string IngestManager::choose_destination(const std::filesystem::path& sourc
     }
     }
     return {};
+}
+
+// The destination with each folder that already exists spelt as it already
+// is (0.64.2). The 720p Martian landed in "/Movies/the martian (2015)" beside
+// "/Movies/The Martian (2015)" because its release name was lowercase and the
+// existing-folder check matched case exactly (gbni-1, 2026-09-27).
+std::string IngestManager::with_existing_case(const std::string& destination) {
+    const std::filesystem::path path(destination);
+    std::vector<std::string> parts;
+    for (const auto& part : path) {
+        const auto component = part.string();
+        if (!component.empty() && component != "/") parts.push_back(component);
+    }
+    if (parts.empty()) return destination;
+    std::string current;
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+        const auto parent = current.empty() ? std::string("/") : current;
+        std::string chosen = parts[i];
+        try {
+            (void)fs_.getattr(current + "/" + parts[i]);
+        } catch (const FsError& e) {
+            if (e.code() != ENOENT) throw;
+            try {
+                const auto wanted = fold_case(parts[i]);
+                for (const auto& [name, entry] : fs_.readdir(parent))
+                    if (entry.type == EntryType::directory && fold_case(name) == wanted) {
+                        chosen = name;
+                        break;
+                    }
+            } catch (const FsError& missing) {
+                if (missing.code() != ENOENT) throw;
+            }
+        }
+        current += "/" + chosen;
+    }
+    return current + "/" + parts.back();
+}
+
+// Something at this path already, ignoring case.
+bool IngestManager::exists_ignoring_case(const std::string& path) {
+    try {
+        (void)fs_.getattr(path);
+        return true;
+    } catch (const FsError& e) {
+        if (e.code() != ENOENT) throw;
+    }
+    const std::filesystem::path p(path);
+    const auto wanted = fold_case(p.filename().string());
+    try {
+        for (const auto& [name, _] : fs_.readdir(p.parent_path().string()))
+            if (fold_case(name) == wanted) return true;
+    } catch (const FsError& e) {
+        if (e.code() != ENOENT && e.code() != ENOTDIR) throw;
+    }
+    return false;
 }
 
 void IngestManager::ensure_namespace_parents(std::string_view path) {

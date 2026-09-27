@@ -239,6 +239,8 @@ Each `catalogue.items` entry:
 | `error_code`, `error` | string or null | why this file failed |
 | `catalogue_item_ids` | array of strings | catalogue items the file became |
 
+Destinations are compared ignoring case (0.64.2): a folder that already exists under another spelling is reused as spelt (a lowercase release goes into `/Movies/The Martian (2015)/`, not a new `/Movies/the martian (2015)/`), and a file whose name differs from one already there only by case gets a ` (2)` suffix like any other collision.
+
 Each `files` entry: `source_path`, `destination_path` (strings), `size`, `copied` (integers), `completed`, `skipped`, `catalogue_candidate` (bools). A file that is not a catalogue candidate (a sidecar) is imported but not sent to the catalogue.
 
 ### Ingest job states
