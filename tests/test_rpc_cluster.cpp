@@ -2410,6 +2410,57 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
     slow1_server.stop();
 }
 
+MACHA_TEST("rpc_cluster", test_prompt_replication_sends_nothing_to_a_full_owner) {
+    // 0.64.1. Every new object went to fi-1, whose backend had 81 bytes free;
+    // each 4 MB put was refused and resent every 30 s for ever, about 2 MB/s
+    // into Finland, counted nowhere. An owner that gossips no room is not a
+    // destination, and the object is left to repair.
+    TestNode fixture("full-owner", ConfigProfile::functional);
+    auto& config = fixture.config();
+    const auto& keys = fixture.keys();
+    config.replication = 2;
+    config.min_write_replicas = 1;
+    config.metadata_min_write_replicas = 1;
+    auto& node = fixture.start();
+
+    const auto full_port = free_port();
+    NodeInfo full;
+    full.id = random_node_id();
+    full.host = "127.0.0.1";
+    full.port = full_port;
+    full.failure_domain = "full-site";
+    full.capacity = 1024ULL * 1024 * 1024;
+    full.used = full.capacity - 81;
+    full.seen_unix_ms = unix_ms();
+    std::atomic<int> puts{0};
+    RpcServer full_server("127.0.0.1", full_port, keys, full,
+                          [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+                              if (request.type == MessageType::put_object) ++puts;
+                              if (request.type == MessageType::have_object) {
+                                  Writer w;
+                                  w.u8(0);
+                                  return RpcMessage{MessageType::bool_reply, w.take()};
+                              }
+                              return RpcMessage{MessageType::ok, {}};
+                          },
+                          [](const NodeInfo&) {});
+    full_server.start();
+    node.membership().observe(full, true);
+    REQUIRE(node.membership().active().size() == 2);
+
+    DistributedStore store(node);
+    auto data = pattern(128 * 1024, 7);
+    auto id = object_id(data);
+    CHECK(store.put(id, data));
+    REQUIRE(wait_until([&] { return store.repair_diagnostics().prompt_skipped_no_room >= 1; }, 10s));
+    const auto diagnostics = store.repair_diagnostics();
+    CHECK(diagnostics.prompt_dropped >= 1);
+    CHECK(diagnostics.prompt_copies == 0);
+    CHECK(diagnostics.prompt_failures == 0); // nothing was sent to be refused
+    CHECK(puts.load() == 0);
+    full_server.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
     TestService fixture("local");
     auto& config = fixture.config();

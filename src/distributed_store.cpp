@@ -1261,14 +1261,27 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
     // and loaders in the arbiter, and counted against the background effort
     // ceiling). Reaching `replication` beyond the second copy stays with the
     // repair pass; this loop exists to close the single-copy window quickly.
-    std::deque<std::pair<ObjectId, Clock::time_point>> retry;
+    //
+    // It is a shortcut, not the guarantee: repair is. So it only sends where
+    // there is room, and gives up on an object after a few refusals rather
+    // than resending it for ever (0.64.1: every new object went to fi-1,
+    // whose backend had 81 bytes free, and each refused 4 MB put was resent
+    // every 30 s -- about 2 MB/s into a congested link, counted nowhere).
+    struct Retry {
+        ObjectId id;
+        Clock::time_point due;
+        unsigned attempts{};
+    };
+    constexpr unsigned max_attempts = 5;
+    std::deque<Retry> retry;
     while (!stop.stop_requested()) {
         std::optional<ObjectId> id;
+        unsigned attempts = 0;
         {
             std::unique_lock lock(prompt_mutex_);
             prompt_cv_.wait(lock, stop, [&] {
                 return !prompt_queue_.empty() ||
-                       (!retry.empty() && retry.front().second <= Clock::now());
+                       (!retry.empty() && retry.front().due <= Clock::now());
             });
             if (stop.stop_requested()) return;
             if (!prompt_queue_.empty()) {
@@ -1278,20 +1291,35 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
             }
         }
         if (!id) {
-            if (!retry.empty() && retry.front().second <= Clock::now()) {
-                id = retry.front().first;
+            if (!retry.empty() && retry.front().due <= Clock::now()) {
+                id = retry.front().id;
+                attempts = retry.front().attempts;
                 retry.pop_front();
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
         }
+        const auto retry_later = [&] {
+            prompt_failures_.fetch_add(1, std::memory_order_relaxed);
+            if (attempts + 1 >= max_attempts) {
+                prompt_dropped_.fetch_add(1, std::memory_order_relaxed);
+                return; // repair's to finish
+            }
+            // 30 s, 60 s, 120 s, 240 s.
+            const auto delay = std::chrono::seconds(30) * (1u << attempts);
+            retry.push_back({*id, Clock::now() + delay, attempts + 1});
+            std::sort(retry.begin(), retry.end(),
+                      [](const Retry& a, const Retry& b) { return a.due < b.due; });
+        };
         try {
             if (!n_.local_store().has(*id)) continue; // gone (deleted, or never local)
             auto nodes = ranked(*id);
             const size_t target = std::min(n_.config().replication, nodes.size());
             if (target < 2) continue;
+            const uint64_t room_needed = std::max<uint64_t>(n_.config().extent_size, 1);
             size_t holders = 1; // the local copy
+            bool skipped_full = false;
             std::optional<NodeInfo> destination;
             for (const auto& node : nodes) {
                 if (node.id == n_.node_id()) continue;
@@ -1303,26 +1331,40 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                 }
                 if (present) {
                     if (++holders >= 2) break;
-                } else if (!destination) {
-                    destination = node;
+                    continue;
                 }
+                // Room as the node itself gossips it. Sending a full node the
+                // object only to have it refused wastes the link both ways.
+                if (node.capacity && node.used + room_needed > node.capacity) {
+                    skipped_full = true;
+                    continue;
+                }
+                if (!destination) destination = node;
             }
-            if (holders >= 2 || !destination) continue;
+            if (holders >= 2) continue;
+            if (!destination) {
+                if (skipped_full) {
+                    prompt_skipped_no_room_.fetch_add(1, std::memory_order_relaxed);
+                    prompt_dropped_.fetch_add(1, std::memory_order_relaxed);
+                }
+                continue;
+            }
             auto data = n_.local_store().get(*id);
             if (!data) continue;
             if (put_on(*destination, *id, *data, false)) {
                 prompt_copies_.fetch_add(1, std::memory_order_relaxed);
                 n_.notify_storage_mutation();
             } else {
-                prompt_failures_.fetch_add(1, std::memory_order_relaxed);
-                retry.emplace_back(*id, Clock::now() + std::chrono::seconds(30));
+                retry_later();
             }
         } catch (const std::exception& error) {
-            prompt_failures_.fetch_add(1, std::memory_order_relaxed);
             Log::debug("prompt replication id=" + to_string(*id) + " error=" + error.what());
-            retry.emplace_back(*id, Clock::now() + std::chrono::seconds(30));
+            retry_later();
         }
-        if (retry.size() > 4096) retry.pop_front();
+        if (retry.size() > 4096) {
+            retry.pop_front();
+            prompt_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -2227,6 +2269,12 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
     out.gate_quiescent = repair_gate_quiescent_.load(std::memory_order_relaxed);
     out.gate_credit = repair_gate_credit_.load(std::memory_order_relaxed);
     out.last_credit_bytes = repair_last_credit_.load(std::memory_order_relaxed);
+    const auto prompt = prompt_replication_stats();
+    out.prompt_queued = prompt.queued;
+    out.prompt_copies = prompt.copies;
+    out.prompt_failures = prompt.failures;
+    out.prompt_skipped_no_room = prompt_skipped_no_room_.load(std::memory_order_relaxed);
+    out.prompt_dropped = prompt_dropped_.load(std::memory_order_relaxed);
     std::lock_guard lock(repair_sample_mutex_);
     out.unsourceable_sample.assign(repair_unsourceable_sample_.begin(),
                                    repair_unsourceable_sample_.end());

@@ -57,6 +57,15 @@ class DistributedStore {
         uint64_t gate_quiescent{};
         uint64_t gate_credit{};
         uint64_t last_credit_bytes{};
+        // Prompt replication (0.64.1), cumulative since start: the loop that
+        // copies each new object to a second owner at once. Until 0.64.1 it
+        // was counted nowhere, and it pushed every new object into fi-1's
+        // full backend and retried the refusal every 30 s for ever.
+        uint64_t prompt_queued{};
+        uint64_t prompt_copies{};
+        uint64_t prompt_failures{};
+        uint64_t prompt_skipped_no_room{};
+        uint64_t prompt_dropped{};
     };
 
     struct DurableReplica {
@@ -121,6 +130,8 @@ class DistributedStore {
     std::jthread prompt_thread_;
     std::atomic_uint64_t prompt_copies_{};
     std::atomic_uint64_t prompt_failures_{};
+    std::atomic_uint64_t prompt_skipped_no_room_{};
+    std::atomic_uint64_t prompt_dropped_{};
     // Repair's two silent failures, made countable. The pull side is the one
     // that matters after a node leaves: an object the live namespace still
     // references, that this node should own, that is not here, not in the

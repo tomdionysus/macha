@@ -1410,6 +1410,14 @@ HttpResponse ClusterStatusService::diagnostics_response() {
             gates["credit"] = values.gate_credit;
             repair_diagnostics["pass_gates"] = std::move(gates);
             repair_diagnostics["last_credit_bytes"] = values.last_credit_bytes;
+            // The quick second copy of each new object (0.64.1).
+            Json::Object prompt;
+            prompt["queued"] = values.prompt_queued;
+            prompt["copies"] = values.prompt_copies;
+            prompt["failures"] = values.prompt_failures;
+            prompt["skipped_no_room"] = values.prompt_skipped_no_room;
+            prompt["dropped"] = values.prompt_dropped;
+            diagnostics["prompt_replication"] = std::move(prompt);
         } catch (const std::exception& error) {
             Log::debug("status repair diagnostics unavailable: " + std::string(error.what()));
         }

@@ -1,5 +1,22 @@
 # Current release
 
+## 0.64.1 — Prompt replication sends only where there is room (development)
+
+**gbni-1 was pushing about 2 MB/s of refused writes into fi-1.** Prompt
+replication -- the loop that copies each new object to a second owner at
+once, ahead of repair -- sent every new object to fi-1, whose 10G backend had
+81 bytes free, and requeued each refused 4 MB put every 30 s, indefinitely,
+up to 4096 objects. Nothing counted it. The traffic filled fi-1's site link:
+round trips to it rose from about 60 ms to 235-440 ms, and every request that
+touched fi-1 paid for it.
+
+- An owner whose gossiped storage has less than an extent free is not a
+  destination. With no owner that has room, the object is left to repair.
+- A refused send is retried at most five times (30 s doubling to 4 min),
+  then left to repair.
+- `diagnostics.prompt_replication` (`GET /api/v1/status/diagnostics`):
+  `queued`, `copies`, `failures`, `skipped_no_room`, `dropped`.
+
 ## 0.64.0 — Torrents belong to the cluster (development)
 
 **Cluster protocol 22: every node upgrades together.** The metadata snapshot
