@@ -83,7 +83,14 @@ GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/keyframes
 ```
 
 Each entry is `[time_ms, byte_offset]`, from the container's own index:
-video keyframes, and audio samples at most one per second of media. Each
+video keyframes, and audio samples at most one per second of media. A
+stream's `index` is its container stream index: the same number as
+`source.streams[].index` and `selected.video_stream` / `selected.audio_stream`
+on a playback session, so a client can keep only the streams it is playing.
+Times are the index's decode times (DTS), not presentation times: for video
+with B-frames a keyframe's time is early by its composition offset, typically
+tens to a few hundred milliseconds, so they place bytes but are not
+frame-exact. Each
 stream's entries are sorted by byte offset (times are not guaranteed to rise
 in that order across an interleave). `offsets` says what an offset points
 at: `sample` (MP4: the sample's exact position) or `cluster` (Matroska: the
