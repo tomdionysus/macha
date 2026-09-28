@@ -649,6 +649,14 @@ struct StreamingConfig {
     // engine went, and at or above session_idle the session outlives it.
     std::chrono::milliseconds transcode_entitlement_idle{std::chrono::minutes(5)};
     std::chrono::milliseconds startup_timeout{15000};
+    // `start=async` (opt-in per request): the start fails only when its
+    // progress has not moved for this long, never on elapsed time. Planning
+    // before the pipeline stays bounded by probe_timeout.
+    std::chrono::milliseconds startup_no_progress{15000};
+    // The longest a start long-poll (GET ?after=&wait_ms=) is held.
+    std::chrono::milliseconds start_wait_max{25000};
+    // How long a failed async start stays readable before it is gone.
+    std::chrono::milliseconds start_failed_retention{60000};
     std::chrono::milliseconds segment_duration{4000};
     size_t max_ahead_segments{8};
     uint64_t segment_memory_bytes{64ULL * 1024 * 1024};

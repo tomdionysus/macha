@@ -3201,6 +3201,280 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
 }
 
 namespace {
+// A pipeline whose first fragment and start progress the test controls, for
+// `start=async`.
+// What the engine and the test share about one pipeline, owned by both so a
+// stopped pipeline never leaves the test holding a dangling session.
+struct ProgressingState {
+    std::atomic_bool running{true};
+    std::shared_ptr<MediaSegmentStore> segments;
+    MediaStartProgress progress;
+};
+
+class ProgressingSession final : public MediaEngineSession {
+    std::shared_ptr<ProgressingState> state_;
+
+  public:
+    explicit ProgressingSession(std::shared_ptr<ProgressingState> state) : state_(std::move(state)) {}
+    bool running() const override { return state_->running.load(); }
+    std::optional<int> exit_code() const override {
+        return state_->running.load() ? std::optional<int>{} : std::optional<int>{0};
+    }
+    std::string diagnostics() const override { return {}; }
+    std::shared_ptr<MediaSegmentStore> segments() const override { return state_->segments; }
+    void note_segment_requested(uint64_t index) override { state_->segments->note_requested(index); }
+    void stop() override {
+        state_->running.store(false);
+        state_->segments->cancel();
+    }
+    const MediaStartProgress* start_progress() const override { return &state_->progress; }
+};
+
+class ProgressingMediaEngine final : public MediaEngine {
+    mutable std::mutex mutex_;
+    std::shared_ptr<ProgressingState> last_;
+    std::atomic_uint starts_{};
+
+  public:
+    MediaEngineStatus status() const override { return {true, "fake", "progressing", true, true}; }
+    MediaProbeResult probe(const MediaSource&, std::chrono::milliseconds = {}) override {
+        MediaProbeResult result;
+        result.format = "matroska,webm";
+        result.duration_seconds = 60.0;
+        result.bitrate = 4'000'000;
+        result.streams.push_back(MediaStreamInfo{0, MediaStreamType::video, "h264", "High", "", 1920, 1080, 0, 0, 8, true, false, 3'700'000});
+        result.streams.push_back(MediaStreamInfo{1, MediaStreamType::audio, "aac", "LC", "eng", 0, 0, 2, 48000, 0, true, false, 192'000});
+        return result;
+    }
+    HlsVodPlan prepare_hls_vod(const MediaSource&, const PlaybackPlan& plan, double duration_seconds,
+                               std::chrono::milliseconds segment_duration, bool,
+                               std::chrono::milliseconds = {}) override {
+        HlsVodPlan vod;
+        vod.playback = plan;
+        const double segment = segment_duration.count() / 1000.0;
+        vod.source_duration_seconds = duration_seconds;
+        vod.seek_segment_seconds = segment;
+        vod.segment_durations.push_back(2.0);
+        double left = duration_seconds - 2.0;
+        while (left > segment + 0.001) { vod.segment_durations.push_back(segment); left -= segment; }
+        vod.segment_durations.push_back(std::max(0.001, left));
+        return vod;
+    }
+    std::unique_ptr<MediaEngineSession> start_hls(const MediaSource&, const HlsVodPlan& vod_plan,
+                                                  std::chrono::milliseconds segment_duration,
+                                                  size_t max_ahead_segments, uint64_t memory_limit,
+                                                  const std::filesystem::path& spill_directory) override {
+        auto state = std::make_shared<ProgressingState>();
+        state->segments = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit, spill_directory,
+                                                              segment_duration, vod_plan.segment_durations);
+        {
+            std::lock_guard lock(mutex_);
+            last_ = state;
+        }
+        ++starts_;
+        return std::make_unique<ProgressingSession>(std::move(state));
+    }
+    std::string extract_webvtt_segment(const MediaSource&, int, std::chrono::milliseconds,
+                                       std::chrono::milliseconds, std::chrono::milliseconds) override { return {}; }
+    unsigned starts() const { return starts_.load(); }
+    std::shared_ptr<ProgressingState> last() const {
+        std::lock_guard lock(mutex_);
+        return last_;
+    }
+    void advance(int64_t output_ms) {
+        auto state = last();
+        REQUIRE(state != nullptr);
+        state->progress.source_bytes_read.fetch_add(4096);
+        state->progress.output_media_us.store(output_ms * 1000);
+        state->progress.moved();
+    }
+    void release() {
+        auto state = last();
+        REQUIRE(state != nullptr);
+        REQUIRE(state->segments->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        REQUIRE(state->segments->publish_segment(Bytes{'s', 'e', 'g'}, 2.0));
+    }
+};
+
+struct AsyncStartFixture {
+    TempDir t;
+    std::unique_ptr<Service> service;
+    std::unique_ptr<PlaybackManager> playback;
+    ProgressingMediaEngine* engine{};
+    std::string media_id;
+
+    explicit AsyncStartFixture(std::chrono::milliseconds no_progress = 1000ms) {
+        auto keyfile = t.path() / "key";
+        write_key(keyfile);
+        auto keys = load_cluster_keys(keyfile);
+        auto c = config_for(t.path() / "node", keyfile, free_port());
+        c.replication = 1;
+        c.metadata_min_write_replicas = 1;
+        c.catalogue.api.enabled = false;
+        service = std::make_unique<Service>(c, keys);
+        service->start();
+        service->filesystem().mkdir("/media", 0755, getuid(), getgid());
+        service->filesystem().create_file("/media/async.mkv", 0644, getuid(), getgid());
+        auto writer = service->filesystem().open_write("/media/async.mkv", true);
+        auto bytes = pattern(64 * 1024);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        media_id = file_media_id(service->filesystem().getattr("/media/async.mkv"));
+
+        CatalogueApiConfig api;
+        StreamingConfig streaming;
+        streaming.enabled = true;
+        streaming.temp_path = t.path() / "playback";
+        streaming.max_sessions = 4;
+        streaming.max_video_transcodes = 1;
+        streaming.max_audio_transcodes = 1;
+        streaming.startup_timeout = 1s;
+        streaming.startup_no_progress = no_progress;
+        streaming.start_wait_max = 5s;
+        streaming.start_failed_retention = 1s;
+        auto owned = std::make_unique<ProgressingMediaEngine>();
+        engine = owned.get();
+        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->catalogue(), api,
+                                                     streaming, std::move(owned));
+        playback->start();
+    }
+    ~AsyncStartFixture() {
+        playback->stop();
+        service->stop();
+    }
+    static Json body(const HttpResponse& response) {
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    }
+    HttpResponse create(const std::string& mode, bool async, const std::string& key = {}) {
+        Json::Object preferences{{"mode", mode}};
+        if (mode != "direct") preferences["container"] = std::string("fmp4");
+        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        if (async) request.query["start"] = "async";
+        if (!key.empty()) request.query["idempotency_key"] = key;
+        request.session = SessionIdentity{.id = "viewer", .roles = {"media_viewer"}};
+        request.body.assign(text.begin(), text.end());
+        return playback->handle(request);
+    }
+    HttpResponse call(const std::string& method, const std::string& id,
+                      std::map<std::string, std::string, std::less<>> query = {}, std::string text = {}) {
+        HttpRequest request;
+        request.method = method;
+        request.path = "/api/v1/playback/sessions/" + id;
+        for (auto& [name, value] : query) request.query[name] = value;
+        request.session = SessionIdentity{.id = "viewer", .roles = {"media_viewer"}};
+        request.body.assign(text.begin(), text.end());
+        return playback->handle(request);
+    }
+    std::string stage(const std::string& id) {
+        auto response = call("GET", id);
+        if (response.status != 200) return "status-" + std::to_string(response.status);
+        return body(response).find("start")->find("stage")->asString();
+    }
+};
+} // namespace
+
+MACHA_TEST("media_playback", test_an_async_start_reports_progress_and_outlives_the_elapsed_budget) {
+    AsyncStartFixture f;
+    auto created = f.create("transcode", true);
+    REQUIRE(created.status == 202);
+    auto json = AsyncStartFixture::body(created);
+    CHECK(json.find("status")->asString() == "playback_starting");
+    const auto id = json.find("session_id")->asString();
+    CHECK(json.find("stream")->find("url")->isNull());
+    CHECK(json.find("stream")->find("close_url")->asString().ends_with("/close"));
+    CHECK(json.find("mode")->asString() == "transcode");
+    REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
+
+    // Still going past startup_timeout (1 s), because it keeps progressing.
+    for (int ms = 250; ms <= 2500; ms += 250) {
+        f.engine->advance(ms / 2);
+        std::this_thread::sleep_for(250ms);
+    }
+    CHECK(f.stage(id) == "encoding");
+    auto polled = AsyncStartFixture::body(f.call("GET", id));
+    const auto start = polled.find("start");
+    REQUIRE(start != nullptr);
+    REQUIRE(start->find("output_media_ms") != nullptr);
+    CHECK(start->find("output_media_ms")->asInt64() == 1250);
+    REQUIRE(start->find("first_fragment_ms") != nullptr);
+    CHECK(start->find("first_fragment_ms")->asInt64() == 2000);
+    REQUIRE(start->find("source_bytes_read") != nullptr);
+    CHECK(start->find("source_bytes_read")->asUInt64() > 0);
+    CHECK(start->find("preroll_total_ms") == nullptr);
+
+    // A long-poll on the current sequence parks; a PATCH is refused while pending.
+    const auto seq = std::to_string(start->find("progress_seq")->asUInt64());
+    auto parked = f.call("GET", id, {{"after", seq}, {"wait_ms", "60000"}});
+    CHECK(parked.defer.has_value());
+    auto patch = f.call("PATCH", id, {}, R"({"seek_ms":1000})");
+    CHECK(patch.status == 409);
+    CHECK(AsyncStartFixture::body(patch).find("error")->find("code")->asString() == "playback_starting");
+
+    f.engine->release();
+    REQUIRE(wait_until([&] { return f.stage(id) == "ready"; }, 2s));
+    auto ready = AsyncStartFixture::body(f.call("GET", id));
+    CHECK(ready.find("stream")->find("url")->asString().ends_with("/master.m3u8"));
+    CHECK(f.call("DELETE", id).status == 204);
+}
+
+MACHA_TEST("media_playback", test_a_stalled_async_start_fails_and_frees_its_slot_at_once) {
+    AsyncStartFixture f(600ms);
+    auto created = f.create("transcode", true);
+    REQUIRE(created.status == 202);
+    const auto id = AsyncStartFixture::body(created).find("session_id")->asString();
+    REQUIRE(wait_until([&] { return f.stage(id) == "failed"; }, 3s));
+    auto failed = AsyncStartFixture::body(f.call("GET", id));
+    const auto* error = failed.find("start")->find("error");
+    REQUIRE(error != nullptr);
+    CHECK(error->find("code")->asString() == "playback_pipeline_start_failed");
+    CHECK(error->find("start_stage")->asString() == "encoding");
+    // The only transcode slot is free again at once.
+    auto next = f.create("transcode", true);
+    CHECK(next.status == 202);
+    const auto next_id = AsyncStartFixture::body(next).find("session_id")->asString();
+    CHECK(f.call("DELETE", next_id).status == 204);
+    // And the failure is gone after its retention.
+    REQUIRE(wait_until([&] { return f.call("GET", id).status == 404; }, 3s));
+}
+
+MACHA_TEST("media_playback", test_deleting_a_pending_async_start_stops_it_and_frees_the_slot) {
+    AsyncStartFixture f;
+    auto created = f.create("transcode", true);
+    REQUIRE(created.status == 202);
+    const auto id = AsyncStartFixture::body(created).find("session_id")->asString();
+    REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
+    CHECK(f.call("DELETE", id).status == 204);
+    REQUIRE(wait_until([&] { return !f.engine->last()->running.load(); }, 2s));
+    auto next = f.create("transcode", true);
+    CHECK(next.status == 202);
+    CHECK(f.call("DELETE", AsyncStartFixture::body(next).find("session_id")->asString()).status == 204);
+}
+
+MACHA_TEST("media_playback", test_async_direct_play_and_replays_answer_without_a_second_start) {
+    AsyncStartFixture f;
+    // Direct play has no pipeline: it answers as a blocking create would.
+    auto direct = f.create("direct", true);
+    REQUIRE(direct.status == 201);
+    CHECK(AsyncStartFixture::body(direct).find("start") == nullptr);
+    CHECK(f.call("DELETE", AsyncStartFixture::body(direct).find("session_id")->asString()).status == 204);
+
+    // A retried keyed create while pending answers the same pending session.
+    auto first = f.create("transcode", true, "retry-1");
+    REQUIRE(first.status == 202);
+    auto again = f.create("transcode", true, "retry-1");
+    REQUIRE(again.status == 202);
+    CHECK(AsyncStartFixture::body(again).find("idempotency")->asString() == "replayed");
+    CHECK(AsyncStartFixture::body(again).find("session_id")->asString() ==
+          AsyncStartFixture::body(first).find("session_id")->asString());
+    CHECK(f.engine->starts() <= 1);
+    CHECK(f.call("DELETE", AsyncStartFixture::body(first).find("session_id")->asString()).status == 204);
+}
+
+namespace {
 // One node, one tiny file and a PlaybackManager admitting a single video
 // transcode: the shape of fi-1 when a held slot refuses everybody else.
 struct SingleSlotPlayback {

@@ -691,6 +691,14 @@ void parse_streaming(const ConfigNode& root, Config& c) {
                          "streaming.transcode_entitlement_idle_ms");
     if (streaming["startup_timeout_ms"])
         c.streaming.startup_timeout = milliseconds(streaming["startup_timeout_ms"], "streaming.startup_timeout_ms");
+    if (streaming["startup_no_progress_ms"])
+        c.streaming.startup_no_progress =
+            milliseconds(streaming["startup_no_progress_ms"], "streaming.startup_no_progress_ms");
+    if (streaming["start_wait_max_ms"])
+        c.streaming.start_wait_max = milliseconds(streaming["start_wait_max_ms"], "streaming.start_wait_max_ms");
+    if (streaming["start_failed_retention_ms"])
+        c.streaming.start_failed_retention =
+            milliseconds(streaming["start_failed_retention_ms"], "streaming.start_failed_retention_ms");
     if (streaming["segment_duration_ms"])
         c.streaming.segment_duration = milliseconds(streaming["segment_duration_ms"], "streaming.segment_duration_ms");
     if (streaming["max_ahead_segments"])

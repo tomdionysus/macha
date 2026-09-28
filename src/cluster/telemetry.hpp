@@ -137,6 +137,14 @@ struct NodeTelemetry {
     // its keep-alive against the node it is actually on rather than a
     // hardcoded guess -- the same reason the two idle timers above are here.
     uint32_t playback_transcode_entitlement_idle_ms{};
+    // `start=async` (0.69.0): a start fails only when its progress has not
+    // moved for startup_no_progress_ms; a long-poll waits at most
+    // start_wait_max_ms; a failed start stays readable for
+    // start_failed_retention_ms. Zero means the node does not offer
+    // `start=async`.
+    uint32_t playback_startup_no_progress_ms{};
+    uint32_t playback_start_wait_max_ms{};
+    uint32_t playback_start_failed_retention_ms{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -152,6 +160,9 @@ struct PlaybackBudgets {
     uint32_t max_transcodes_per_account{};
     uint32_t max_sessions{};
     uint32_t transcode_entitlement_idle_ms{};
+    uint32_t startup_no_progress_ms{};
+    uint32_t start_wait_max_ms{};
+    uint32_t start_failed_retention_ms{};
 };
 
 // Grouped for the same reason as PlaybackBudgets below it: refresh_local's

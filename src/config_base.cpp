@@ -382,6 +382,15 @@ void validate(Config& config) {
     if (config.streaming.startup_timeout < std::chrono::milliseconds(1000) ||
         config.streaming.startup_timeout > std::chrono::minutes(2))
         throw std::runtime_error("streaming.startup_timeout_ms must be 1000..120000");
+    if (config.streaming.startup_no_progress < std::chrono::milliseconds(1000) ||
+        config.streaming.startup_no_progress > std::chrono::minutes(2))
+        throw std::runtime_error("streaming.startup_no_progress_ms must be 1000..120000");
+    if (config.streaming.start_wait_max < std::chrono::milliseconds(1000) ||
+        config.streaming.start_wait_max > std::chrono::minutes(5))
+        throw std::runtime_error("streaming.start_wait_max_ms must be 1000..300000");
+    if (config.streaming.start_failed_retention < std::chrono::seconds(1) ||
+        config.streaming.start_failed_retention > std::chrono::minutes(30))
+        throw std::runtime_error("streaming.start_failed_retention_ms must be 1000..1800000");
     if (config.streaming.segment_duration < std::chrono::milliseconds(1000) ||
         config.streaming.segment_duration > std::chrono::seconds(20))
         throw std::runtime_error("streaming.segment_duration_ms must be 1000..20000");

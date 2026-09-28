@@ -248,6 +248,9 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.playback_session_idle_ms = 1800000;
     telemetry.playback_max_sessions_per_account = 32;
     telemetry.playback_max_transcodes_per_account = 2;
+    telemetry.playback_startup_no_progress_ms = 15000;
+    telemetry.playback_start_wait_max_ms = 25000;
+    telemetry.playback_start_failed_retention_ms = 60000;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
