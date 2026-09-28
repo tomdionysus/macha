@@ -1,5 +1,19 @@
 # Current release
 
+## 0.71.0 — Torrents can be added paused (development)
+
+**A torrent can be added paused.** `POST /api/v1/torrents/jobs` takes
+`"paused": true`, which records the request with `desired: paused` in the
+same metadata write as the add. Adding and then pausing was a race: a node's
+scheduler could claim the waiting job and start it before the pause landed.
+A node may still claim a job added paused, but it adopts it held, so it is
+never checked or downloaded until it is resumed.
+
+API additions (announce to Core and every client):
+- `POST /api/v1/torrents/jobs` takes an optional `paused` (boolean; absent,
+  null or false as before; any other type is `400 bad_request`). The job
+  answers `desired: paused`, and resume works as for any paused job.
+
 ## 0.70.0 — Transcode rate facts; node names (development)
 
 **A node states how fast it has transcoded each kind of source.** Every

@@ -2438,6 +2438,21 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
         CHECK(parse(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().empty());
     }
     {
+        // Added already paused, in the same write: no pause to race.
+        const auto added = call("POST", "/api/v1/torrents/jobs",
+                                R"({"magnet":"magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd&dn=Held","paused":true})");
+        REQUIRE(added.status == 202);
+        const auto body = parse(added);
+        CHECK(body.find("job")->find("desired")->asString() == "paused");
+        const auto id = body.find("id")->asString();
+        const auto resumed = call("POST", "/api/v1/torrents/jobs/" + id + "/resume");
+        CHECK(resumed.status == 202);
+        CHECK(parse(resumed).find("desired")->asString() == "active");
+        CHECK(call("POST", "/api/v1/torrents/jobs",
+                   R"({"magnet":"magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","paused":"yes"})").status == 400);
+        CHECK(call("POST", "/api/v1/torrents/jobs/" + id + "/clear").status == 202);
+    }
+    {
         // A pin to a node that cannot run torrents is refused.
         const auto pinned = call("POST", "/api/v1/torrents/jobs",
                                  R"({"magnet":"magnet:?xt=urn:btih:2234567890123456789012345678901234567890","node_id":")" +

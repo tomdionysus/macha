@@ -61,9 +61,10 @@ class TorrentCoordinator {
     };
 
     // `remove_after`: absent means the cluster default; present-and-empty
-    // means never.
+    // means never. `paused` records the request already paused, in the same
+    // metadata write, so no node starts it before a separate pause lands.
     Outcome add(std::string_view uri, bool search_result, std::optional<NodeId> pin,
-                std::optional<std::optional<uint64_t>> remove_after);
+                std::optional<std::optional<uint64_t>> remove_after, bool paused = false);
     // Live (not removed) requests, by id.
     std::vector<TorrentRequest> requests() const;
     std::optional<TorrentRequest> request(std::string_view id) const;

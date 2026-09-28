@@ -416,6 +416,7 @@ A torrent is added to the **cluster**: the add is recorded as a request in clust
 | `acquisition_ref` | one of these two | a reference from a search **on this same node**. `magnet` wins if both are given. A search result's `.torrent` is read by a torrent-capable node (this one, or one it asks) and recorded as its canonical magnet |
 | `node_id` | no | **pins** the job to that node, which must run the torrent subsystem. Absent or null lets the cluster choose |
 | `remove_after_ms` | no | remove the job this long after it completes: 0 (at once) to 86400000 (24 h). Absent copies the cluster default (`default_remove_after_ms` on [`/torrents/nodes`](#torrent-capable-nodes)) into the job; null means never |
+| `paused` | no | `true` records the job already paused (`desired: paused`), in the same metadata write as the add, so it never starts before a pause could land: a node may claim it but adopts it held, so it is never checked and never downloads until resumed. Absent, null or `false` is as before. It sets nothing else: a pin still names the only node that may claim it, and `remove_after_ms` still counts from completion. An add of a torrent already present answers `409 torrent_already_added` and leaves that job as it is |
 
 The response is `202`, sent only once the request is accepted into metadata, so a list from any node includes it:
 
