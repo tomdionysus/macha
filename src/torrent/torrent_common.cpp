@@ -189,6 +189,14 @@ std::optional<TorrentJobState> parse_torrent_job_state(std::string_view state) {
     return {};
 }
 
+Json torrent_publication_json(const TorrentJob::Publication& p) {
+    return Json(Json::Object{{"published_extents", p.published_extents},
+                             {"extents", p.extents},
+                             {"published_bytes", p.published_bytes},
+                             {"bytes", p.bytes},
+                             {"progress_age_ms", p.progress_age_ms}});
+}
+
 Json torrent_job_api_json(const TorrentJob& job) {
     Json::Object out;
     out["id"] = job.id;
@@ -227,6 +235,8 @@ Json torrent_job_api_json(const TorrentJob& job) {
     out["updated_unix_ms"] = job.updated_unix_ms;
     out["error_code"] = job.error_code.empty() ? Json(nullptr) : Json(job.error_code);
     out["error"] = job.error.empty() ? Json(nullptr) : Json(job.error);
+    out["publication"] = job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
+    out["waiting_reason"] = job.waiting_reason.empty() ? Json(nullptr) : Json(job.waiting_reason);
     return Json(std::move(out));
 }
 
@@ -314,6 +324,8 @@ Json torrent_job_wire_json(const TorrentJob& job) {
     out["peers"] = static_cast<uint64_t>(job.peers);
     out["seeds"] = static_cast<uint64_t>(job.seeds);
     out["eta_seconds"] = optional_u64(job.eta_seconds);
+    out["publication"] = job.publication ? torrent_publication_json(*job.publication) : Json(nullptr);
+    out["waiting_reason"] = job.waiting_reason;
     return out;
 }
 
@@ -324,6 +336,20 @@ TorrentJob parse_torrent_job_wire(const Json& value) {
     if (const auto* v = value.find("peers")) job.peers = static_cast<unsigned>(v->asUInt64());
     if (const auto* v = value.find("seeds")) job.seeds = static_cast<unsigned>(v->asUInt64());
     if (const auto* v = value.find("eta_seconds"); v && !v->isNull()) job.eta_seconds = v->asUInt64();
+    if (const auto* v = value.find("publication"); v && v->isObject()) {
+        TorrentJob::Publication p;
+        const auto number = [&](const char* key) {
+            const auto* field = v->find(key);
+            return field ? field->asUInt64() : uint64_t{0};
+        };
+        p.published_extents = number("published_extents");
+        p.extents = number("extents");
+        p.published_bytes = number("published_bytes");
+        p.bytes = number("bytes");
+        p.progress_age_ms = number("progress_age_ms");
+        job.publication = p;
+    }
+    if (const auto* v = value.find("waiting_reason"); v && v->isString()) job.waiting_reason = v->asString();
     return job;
 }
 
