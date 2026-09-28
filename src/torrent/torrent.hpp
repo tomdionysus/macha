@@ -63,6 +63,23 @@ struct TorrentJob {
     // is the ingest's carries the ingest's own code.
     std::string error_code;
     std::string error;
+    // How far the owner has published the torrent's verified extents into the
+    // store, while its disk backend tracks the torrent (from the first
+    // verified piece until the ingest is submitted). Transient: carried on the
+    // wire, never persisted. `progress_age_ms` is how long ago the published
+    // count last advanced, on the owner's clock at its last sample.
+    struct Publication {
+        uint64_t published_extents{};
+        uint64_t extents{};
+        uint64_t published_bytes{};
+        uint64_t bytes{};
+        uint64_t progress_age_ms{};
+    };
+    std::optional<Publication> publication;
+    // Why a job that has stopped is waiting, as a code: "extent_publication"
+    // (downloaded, handed to the ingest once every extent is published), or
+    // empty. Transient, like `publication`.
+    std::string waiting_reason;
 };
 
 // HTTP/RPC-facing JSON shape for a torrent job -- shared by the local HTTP
@@ -72,6 +89,7 @@ struct TorrentJob {
 // parse_torrent_job() in torrent.cpp (the on-disk jobs.json persistence
 // shape, file-local) since both live in that translation unit.
 Json torrent_job_api_json(const TorrentJob&);
+Json torrent_publication_json(const TorrentJob::Publication&);
 // jobs.json persistence shape, and the cluster RPC shape (persistence plus
 // the transient rates, peers and ETA). Core decodes peers' replies with the
 // wire parser; the plugin writes both.

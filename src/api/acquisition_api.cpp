@@ -119,7 +119,8 @@ Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId
         out = base.asObject();
     } else {
         for (const auto* key : {"bytes_total", "bytes_completed", "download_rate", "upload_rate", "uploaded_total",
-                                "peers", "seeds", "eta_seconds", "progress", "catalogue"})
+                                "peers", "seeds", "eta_seconds", "progress", "catalogue", "publication",
+                                "waiting_reason"})
             out[key] = Json(nullptr);
     }
     out["id"] = r.id;

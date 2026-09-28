@@ -108,6 +108,10 @@ class TorrentManager final : public TorrentService {
         Clock::time_point advanced{};
     };
     std::map<std::string, PublicationWait, std::less<>> publication_waits_;
+    // Per job, the published count last seen and when it last moved, for the
+    // job's `publication` (reported whenever the backend tracks the torrent).
+    std::map<std::string, PublicationWait, std::less<>> publication_seen_;
+    void refresh_publication_locked(const std::string& id, TorrentJob& job);
     // Publication that stops advancing for this long is given up on: the
     // ingest runs and copies what is missing, rather than the job waiting for
     // ever on a put that will not succeed.

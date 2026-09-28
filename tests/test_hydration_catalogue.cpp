@@ -2344,6 +2344,39 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
 // A node with no torrent plugin loaded -- not built, not installed, or
 // faulted and between restarts -- must answer honestly rather than assuming
 // the engine is there. This needs no plugin at all, which is the point.
+MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_the_wire_and_reaches_the_api) {
+    // A downloaded torrent waits while its extents are published into the
+    // store; the job says how far that has got, and why it is waiting.
+    TorrentJob job;
+    job.id = "t1";
+    job.state = TorrentJobState::downloaded;
+    job.bytes_total = 2'607'096'508;
+    job.bytes_completed = job.bytes_total;
+    job.publication = TorrentJob::Publication{246, 624, 1'031'798'784, 2'607'096'508, 4200};
+    job.waiting_reason = "extent_publication";
+    const auto wire = parse_torrent_job_wire(torrent_job_wire_json(job));
+    REQUIRE(wire.publication.has_value());
+    CHECK(wire.publication->published_extents == 246);
+    CHECK(wire.publication->extents == 624);
+    CHECK(wire.publication->published_bytes == 1'031'798'784);
+    CHECK(wire.publication->bytes == 2'607'096'508);
+    CHECK(wire.publication->progress_age_ms == 4200);
+    CHECK(wire.waiting_reason == "extent_publication");
+    const auto api = torrent_job_api_json(wire);
+    CHECK(api.find("publication")->find("published_extents")->asUInt64() == 246);
+    CHECK(api.find("waiting_reason")->asString() == "extent_publication");
+    // Never persisted: a restart reports it afresh from the backend.
+    const auto stored = parse_torrent_job(torrent_job_json(job));
+    CHECK(!stored.publication.has_value());
+    CHECK(stored.waiting_reason.empty());
+    // None reported: null, never zero.
+    TorrentJob quiet;
+    quiet.id = "t2";
+    const auto none = torrent_job_api_json(parse_torrent_job_wire(torrent_job_wire_json(quiet)));
+    CHECK(none.find("publication")->isNull());
+    CHECK(none.find("waiting_reason")->isNull());
+}
+
 MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_answers_from_the_cluster_view) {
     TestNode fixture("torrent-absent");
     fixture.prepare();
