@@ -3975,6 +3975,85 @@ MACHA_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_resolut
     CHECK(track.artwork.empty());
 }
 
+MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_shards_still_read) {
+    CatalogueSnapshot snapshot;
+    CatalogueItem item;
+    item.id = "codec:index";
+    item.kind = CatalogueKind::movie;
+    item.title = "Index";
+    item.revision = 1;
+    snapshot.items.emplace(item.id, item);
+    const std::string media_id = "macha:" + std::string(64, 'b');
+    const ObjectId index = object_id(Bytes{1, 2, 3});
+    snapshot.media_indexes.emplace(media_id, index);
+    const auto roundtrip = decode_catalogue(encode_catalogue(snapshot));
+    REQUIRE(roundtrip.media_indexes.contains(media_id));
+    CHECK(roundtrip.media_indexes.at(media_id) == index);
+
+    // A shard written before media indexes existed (MCAT0021: no index
+    // section) is data already on disk and must still read.
+    snapshot.media_indexes.clear();
+    auto older = encode_catalogue(snapshot);
+    REQUIRE(older.size() > 12);
+    older[7] = '1';                            // MCAT0022 -> MCAT0021
+    older.resize(older.size() - 4);            // no index count
+    const auto read_back = decode_catalogue(older);
+    CHECK(read_back.items.contains(item.id));
+    CHECK(read_back.media_indexes.empty());
+}
+
+MACHA_TEST("hydration_catalogue", test_a_media_index_is_stored_live_and_served_immutably) {
+    TestService fixture("catalogue-media-index");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+    auto& catalogue = service.catalogue();
+
+    const std::string media_id = "macha:" + std::string(64, 'c');
+    const std::string body = R"({"status":"ok","schema_version":1,"streams":[]})";
+    catalogue.put_media_index(media_id, Bytes(body.begin(), body.end()));
+    auto stored = catalogue.media_index(media_id);
+    REQUIRE(stored.has_value());
+    CHECK(std::string(stored->begin(), stored->end()) == body);
+
+    // Referenced DATA, so GC must see it as live.
+    const auto live = catalogue.maintenance_objects().live;
+    CHECK(live.contains(object_id(Bytes(body.begin(), body.end()))));
+
+    int calls = 0;
+    CatalogueApi api(catalogue, service.catalogue_hints(), {}, {}, {},
+                     std::chrono::hours(24 * 30), {},
+                     [&](const std::string& id) -> std::optional<Bytes> {
+                         ++calls;
+                         if (id == media_id) return catalogue.media_index(id);
+                         if (id == "macha:mpegts") throw KeyframeIndexUnsupported("no byte index");
+                         return std::nullopt;
+                     });
+    auto get = [&](const std::string& id) {
+        return api.handle({.method = "GET",
+                           .path = "/api/v1/catalogue/media/" + id + "/keyframes",
+                           .query = {}, .headers = {}, .body = {}, .session = {}});
+    };
+    auto served = get(media_id);
+    REQUIRE(served.status == 200);
+    CHECK(std::string(served.body.begin(), served.body.end()) == body);
+    CHECK(served.headers.at("Cache-Control").find("immutable") != std::string::npos);
+    CHECK(served.headers.at("ETag") == "\"" + media_id + "\"");
+    CHECK(get("path:/Movies/x.mkv").status == 400);
+    CHECK(get("macha:gone").status == 404);
+    auto unsupported = get("macha:mpegts");
+    CHECK(unsupported.status == 422);
+    CHECK(std::string(unsupported.body.begin(), unsupported.body.end()).find("keyframes_not_supported") !=
+          std::string::npos);
+    CHECK(calls == 3);
+
+    // An index goes with its media's profile when the file is gone.
+    (void)catalogue.prune_media_profiles({});
+    CHECK(!catalogue.media_index(media_id).has_value());
+}
+
 MACHA_TEST("hydration_catalogue", test_item_edits_validate_parents_and_keep_files_unless_named) {
     // The metadata editor's edits (proposal G): a whole PUT that leaves out
     // media_ids must not unbind the item's files; PATCH changes only what it

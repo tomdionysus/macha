@@ -674,6 +674,11 @@ void Service::initialise_services(std::stop_token stop) {
                 auto found = fs_ptr->find_media(media_id);
                 if (!found) return std::nullopt;
                 return found->second.size;
+            },
+            [information = media_information.get()](const std::string& media_id)
+                -> std::optional<Bytes> {
+                if (!information) return std::nullopt;
+                return information->keyframe_index(media_id, Clock::now() + std::chrono::seconds(30));
             });
         auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
                                                       *catalogue_hints, *scanner);

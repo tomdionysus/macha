@@ -66,6 +66,42 @@ and that answer is served `no-cache`. `format` is libav's name for what the
 file is; the playback `container`, which can depend on the file's name, is on
 session facts only.
 
+A client playing a file directly (Direct Play) can turn the byte ranges it
+holds into times with the file's keyframe byte index:
+
+```text
+GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/keyframes
+```
+
+```json
+{"status": "ok", "schema_version": 1, "media_id": "macha:...",
+ "container": "mp4", "offsets": "sample",
+ "size_bytes": 1425529460, "duration_ms": 6443500,
+ "streams": [
+   {"index": 0, "type": "video", "codec": "hevc", "entries": [[0, 48], [2002, 1043377]]},
+   {"index": 1, "type": "audio", "codec": "aac", "entries": [[0, 1040]]}]}
+```
+
+Each entry is `[time_ms, byte_offset]`, from the container's own index:
+video keyframes, and audio samples at most one per second of media. Each
+stream's entries are sorted by byte offset (times are not guaranteed to rise
+in that order across an interleave). `offsets` says what an offset points
+at: `sample` (MP4: the sample's exact position) or `cluster` (Matroska: the
+Cluster holding the entry, at or just before it). Between entries the mapping
+is the client's to interpolate; past the last entry the file ends at
+(`duration_ms`, `size_bytes`). A Matroska file often cues only its video, so
+its audio list may hold one entry or none.
+
+The index is built once per media id: after the media's background profile,
+or on the first request for a file profiled before it existed. It is stored
+as an immutable DATA object referenced from the catalogue, like artwork, and
+is never built on the playback path. The response is `immutable` with the
+media id as its `ETag`. Codes: `400 bad_media_id`, `404 not_found` (this node
+cannot find the file), `422 keyframes_not_supported` (a container that keeps
+no byte index: only MP4 and Matroska do), `422 keyframes_failed` (the file
+could not be read, with the failure axes of a profile failure). One index is
+built at a time on a node.
+
 Pre-session availability is guaranteed for a `macha:` identity, so a miss is
 not normally a deferral. The order is:
 

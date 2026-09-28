@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media/media_engine.hpp"
+#include "media/media_containers.hpp"
 #include "media/subtitle_text.hpp"
 
 #include "log.hpp"
@@ -1736,6 +1737,67 @@ class LibavMediaEngine final : public MediaEngine {
         Log::debug("playback probe end media=" + source.media_id + " elapsed_ms=" + std::to_string(elapsed) +
                    " streams=" + std::to_string(result.streams.size()));
         return result;
+    }
+
+    std::optional<MediaKeyframeIndex> keyframe_index(const MediaSource& source,
+                                                     std::chrono::milliseconds timeout) override {
+        if (timeout.count() <= 0) timeout = config_.probe_timeout;
+        InputContext input(source, MediaReadPurpose::probe, source.cancelled.get(), config_.probe_bytes,
+                           config_.probe_analyze_duration, timeout);
+        auto* format = input.get();
+        const auto rc = avformat_find_stream_info(format, nullptr);
+        if (rc < 0) {
+            if (input.timed_out())
+                throw MediaError(MediaFailure::timed_out, "keyframe index timed out reading stream information");
+            if (!input.read_error().empty())
+                throw MediaError(MediaFailure::unreadable, "read media: " + input.read_error());
+            throw MediaError(MediaFailure::unsupported, "read stream information: " + av_error(rc));
+        }
+        const std::string format_name = format->iformat && format->iformat->name ? format->iformat->name : "";
+        MediaKeyframeIndex out;
+        out.container = container_for_format(format_name, source.logical_path);
+        if (out.container == "mp4")
+            out.exact_offsets = true;
+        else if (out.container != "matroska" && out.container != "webm")
+            return std::nullopt;
+        const int video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (!out.exact_offsets && video >= 0) {
+            materialise_deferred_seek_index(format, video, 0.0);
+            if (input.timed_out())
+                throw MediaError(MediaFailure::timed_out, "keyframe index timed out loading the Cues");
+        }
+        out.size_bytes = source.size;
+        if (format->duration != AV_NOPTS_VALUE && format->duration > 0)
+            out.duration_ms = format->duration / 1000;
+        const int64_t start_us = format->start_time == AV_NOPTS_VALUE ? 0 : format->start_time;
+        for (unsigned i = 0; i < format->nb_streams; ++i) {
+            auto* stream = format->streams[i];
+            const auto type = stream->codecpar->codec_type;
+            const bool picture = (stream->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0;
+            if (picture || (type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO)) continue;
+            MediaKeyframeIndex::Stream indexed;
+            indexed.index = static_cast<int>(i);
+            indexed.type = stream_type(type);
+            indexed.codec = avcodec_get_name(stream->codecpar->codec_id);
+            std::optional<int64_t> last_kept_ms;
+            const int entries = avformat_index_get_entries_count(stream);
+            for (int e = 0; e < entries; ++e) {
+                const auto* entry = avformat_index_get_entry(stream, e);
+                if (!entry || entry->timestamp == AV_NOPTS_VALUE || entry->pos < 0) continue;
+                if (type == AVMEDIA_TYPE_VIDEO && !(entry->flags & AVINDEX_KEYFRAME)) continue;
+                const int64_t us = av_rescale_q(entry->timestamp, stream->time_base, AV_TIME_BASE_Q);
+                const int64_t ms = std::max<int64_t>(0, (us - start_us) / 1000);
+                // Every audio sample is a sync point; one a second is enough
+                // to place a byte range and keeps a film's list small.
+                if (type == AVMEDIA_TYPE_AUDIO && last_kept_ms && ms < *last_kept_ms + 1000) continue;
+                indexed.entries.emplace_back(ms, static_cast<uint64_t>(entry->pos));
+                last_kept_ms = ms;
+            }
+            std::stable_sort(indexed.entries.begin(), indexed.entries.end(),
+                             [](const auto& a, const auto& b) { return a.second < b.second; });
+            out.streams.push_back(std::move(indexed));
+        }
+        return out;
     }
 
     HlsVodPlan prepare_hls_vod(const MediaSource& source, const PlaybackPlan& requested,

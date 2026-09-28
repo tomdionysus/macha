@@ -74,6 +74,9 @@ struct CatalogueSnapshot {
         auto operator<=>(const MediaProfile&) const = default;
     };
     std::map<std::string, MediaProfile, std::less<>> media_profiles;
+    // A media's keyframe byte index: an immutable DATA object, like artwork,
+    // referenced beside the profile rather than inside it.
+    std::map<std::string, ObjectId, std::less<>> media_indexes;
 };
 
 bool valid_catalogue_media_profile(std::string_view media_id,
@@ -191,7 +194,8 @@ class CatalogueManager {
     std::vector<NodeId> control_converged_nodes_;
     Clock::time_point control_convergence_retry_{};
 
-    static std::set<ObjectId> artwork_ids(const CatalogueSnapshot&);
+    // Every DATA object the catalogue references: artwork and media indexes.
+    static std::set<ObjectId> data_object_ids(const CatalogueSnapshot&);
     size_t durability_required() const;
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
     bool converge_control_replicas(const MetadataSnapshot&);
@@ -221,6 +225,11 @@ class CatalogueManager {
     void put_media_profile(std::string media_id, MediaProbeResult profile);
     void put_media_profiles(std::map<std::string, MediaProbeResult, std::less<>> profiles);
     size_t prune_media_profiles(const std::set<std::string>& live_media_ids);
+    // The stored keyframe byte index of a media, as its bytes; empty when none
+    // is stored or its object cannot be read.
+    std::optional<Bytes> media_index(std::string_view media_id);
+    // Store `bytes` as a DATA object and reference it as the media's index.
+    void put_media_index(std::string media_id, std::span<const uint8_t> bytes);
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
                                     std::optional<std::string_view> parent = {});
     // `keep`, when given, filters before ranking, so `limit` counts only the

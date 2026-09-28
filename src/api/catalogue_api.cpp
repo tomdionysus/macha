@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/catalogue_api.hpp"
+#include "catalogue/media_information.hpp"
 #include "macha_version.hpp"
 
 #include "crypto.hpp"
@@ -518,6 +519,29 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
         }
 
         constexpr std::string_view media_prefix = "/api/v1/catalogue/media/";
+        constexpr std::string_view keyframes_suffix = "/keyframes";
+        if (request.method == "GET" && request.path.starts_with(media_prefix) &&
+            request.path.ends_with(keyframes_suffix)) {
+            auto encoded = std::string_view(request.path).substr(media_prefix.size());
+            encoded.remove_suffix(keyframes_suffix.size());
+            auto media_id = url_decode(encoded);
+            if (!media_id.starts_with("macha:"))
+                return error(400, "bad_media_id", "immutable macha media ID required");
+            std::optional<Bytes> index;
+            try {
+                if (keyframe_index_) index = keyframe_index_(media_id);
+            } catch (const KeyframeIndexUnsupported& e) {
+                return error(422, "keyframes_not_supported", e.what());
+            } catch (const MediaError& e) {
+                return media_error(422, "keyframes_failed", e.what(), e.failure());
+            }
+            if (!index) return error(404, "not_found", "media is not available on this node");
+            HttpResponse response{200, "application/json; charset=utf-8", {}, std::move(*index)};
+            // A media id names its bytes, so its index never changes.
+            response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+            response.headers["ETag"] = json_escape(media_id);
+            return response;
+        }
         constexpr std::string_view profile_suffix = "/profile";
         if (request.method == "GET" && request.path.starts_with(media_prefix) &&
             request.path.ends_with(profile_suffix)) {

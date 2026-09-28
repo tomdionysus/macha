@@ -23,6 +23,9 @@ class CatalogueApi {
     std::chrono::milliseconds artwork_capability_ttl_;
     // The size of a media id's file, when this node can find it.
     std::function<std::optional<uint64_t>(const std::string&)> media_size_;
+    // A media id's keyframe byte index, stored or built now; empty when this
+    // node cannot find the file.
+    std::function<std::optional<Bytes>(const std::string&)> keyframe_index_;
   public:
     CatalogueApi(
         CatalogueManager& catalogue, CatalogueHintQueue& hints,
@@ -30,12 +33,14 @@ class CatalogueApi {
         std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
         std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile = {},
         std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
-        std::function<std::optional<uint64_t>(const std::string&)> media_size = {})
+        std::function<std::optional<uint64_t>(const std::string&)> media_size = {},
+        std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {})
         : catalogue_(catalogue), hints_(hints),
           request_media_rescan_(std::move(request_media_rescan)),
           request_media_profiles_(std::move(request_media_profiles)),
           resolve_media_profile_(std::move(resolve_media_profile)),
-          artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)) {}
+          artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)),
+          keyframe_index_(std::move(keyframe_index)) {}
     HttpResponse handle(const HttpRequest&);
     // Recognizes a request as a self-authorizing capability URL (currently:
     // an artwork GET carrying a valid, unexpired signature) so HttpServer can
