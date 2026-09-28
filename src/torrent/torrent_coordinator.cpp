@@ -211,7 +211,8 @@ std::optional<std::chrono::milliseconds> TorrentCoordinator::default_remove_afte
 // ---- API ----------------------------------------------------------------------
 
 TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool search_result, std::optional<NodeId> pin,
-                                                   std::optional<std::optional<uint64_t>> remove_after) {
+                                                   std::optional<std::optional<uint64_t>> remove_after,
+                                        bool paused) {
     Outcome out;
     const auto self = node_.node_id();
     if (pin && *pin == NodeId{}) pin.reset();
@@ -306,6 +307,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
         request.remove_after_ms = static_cast<uint64_t>(fallback->count());
     request.settings_changed_unix_ms = request.desired_changed_unix_ms = request.created_unix_ms;
     request.settings_changed_by = request.desired_changed_by = self;
+    if (paused) request.desired = TorrentDesired::paused;
 
     std::optional<TorrentRequest> holder;
     try {
@@ -335,7 +337,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
         return out;
     }
     Log::info("torrent requested id=" + request.id + " info_hash=" + info_hash +
-              (pin ? " pinned=" + to_string(*pin) : std::string{}));
+              (pin ? " pinned=" + to_string(*pin) : std::string{}) + (paused ? " paused" : ""));
     wake_.notify_all();
     out.status = 202;
     out.code = "ok";
