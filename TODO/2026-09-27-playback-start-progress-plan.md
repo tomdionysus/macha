@@ -60,6 +60,49 @@ it. Caveat from the client: all three creates returned the same session id
 (`cd941acb...`) although it deleted in between, so the PATCHes may have hit
 one reused session. Unexplained; see "Also to check".
 
+### Measured 2026-09-28 (fi-1, 0.67.0 with the start counters)
+
+The pre-roll hypothesis is **disproved**. A create (not a PATCH) of
+`1e763547` at `seek_ms` 2008000, transcode to 1440p H.264, audio stream 1 to
+AAC, `container` fmp4, trace `d52a0365`, answered 201 in 8.8 s. Per second:
+
+| elapsed | source bytes | pre-roll decoded / total | output media |
+| --- | --- | --- | --- |
+| 1 s | 13.8 MB | 167 / 457 ms | 0 |
+| 2 s | 17.1 MB | 417 / 457 ms | 0 |
+| 4 s | 23.2 MB | done | 291 ms |
+| 6 s | 28.0 MB | done | 1001 ms |
+| 8.6 s | 33.3 MB | done | 1960 ms (first fragment) |
+
+The keyframe sat 457 ms before the origin and the pre-roll was over by 2 s
+(417 ms is the last frame before it). Source reads were steady, not stalled.
+
+The TV client's PATCH shape, same node, same hour (create on the 1280x534
+H.264 file at 1990000, then PATCH to `1e763547` at 2008000):
+
+| PATCH | output | first fragment | output rate |
+| --- | --- | --- | --- |
+| `max_height` 1440 | 2560x1440 | 10.4 s, 200 | ~0.35x |
+| `max_height` null | 3840x2160 | 11.9 s, 200 | ~0.33x |
+
+2.25x the output pixels barely moved the rate, so **the cost is the software
+decode of 4K HEVC 10-bit, not the encode**. After pre-roll there is a further
+~2 s before any output (encoder start-up: `zero_latency=0`). Neither run
+reproduced the 503: the 15-16.5 s of 2026-09-27 is ~3-5 s more than measured
+here, which any other load on the node covers. Two consequences:
+
+- The start budget is the smaller problem. At ~0.33x this node cannot
+  transcode this file in real time at all; a start that fits the budget
+  still drains the buffer within seconds of playing. The client has to
+  learn that before choosing the file (a fact about the node's decode rate
+  for a source, which nothing states today), not after a stall.
+- The progress design below is still right for starts that are slow but
+  sustainable, and the counters above are what it reports.
+
+The design below stands, and the measurement is its argument: the output
+counter moved every second for the whole start, so a client watching it
+would have known the start was progressing.
+
 ## Design
 
 ### 1. Opt-in, so the lockdown is safe
