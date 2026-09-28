@@ -223,7 +223,10 @@ class CatalogueManager {
     size_t prune_media_profiles(const std::set<std::string>& live_media_ids);
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
                                     std::optional<std::string_view> parent = {});
-    std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50);
+    // `keep`, when given, filters before ranking, so `limit` counts only the
+    // items it keeps.
+    std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50,
+                                      const std::function<bool(const CatalogueItem&)>& keep = {});
     CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {});
     std::vector<CatalogueItem> upsert_many(std::vector<CatalogueItem>);
     bool erase(std::string_view id, std::optional<uint64_t> expected_revision = {});
@@ -240,11 +243,15 @@ class CatalogueManager {
                                             std::span<const uint8_t> bytes,
                                             DistributedStore::DurabilityBatch& batch);
     bool artwork_durability_barrier(DistributedStore::DurabilityBatch& batch);
+    // `vanished_media`: media a complete scan found nowhere in the namespace.
+    // With `prune_missing`, every leaf drops them, manual items included; a
+    // manual item stays when its last file goes.
     void reconcile_scanner(const std::vector<CatalogueItem>& discovered,
                            const std::set<std::string>& active_media_ids,
                            bool prune_missing = true,
                            std::optional<Hash256> expected_namespace = std::nullopt,
-                           const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {});
+                           const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
+                           const std::set<std::string>& vanished_media = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
     CatalogueMaintenance maintenance_objects();
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,

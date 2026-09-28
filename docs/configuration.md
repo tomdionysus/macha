@@ -443,6 +443,7 @@ streaming:
   enabled: true
   max_sessions: 64
   max_sessions_per_account: 32
+  max_transcodes_per_account: 2
   max_video_transcodes: 1
   max_audio_transcodes: 4
   video_decoder_threads: 2
@@ -469,6 +470,9 @@ streaming:
 1..1024 and must stay above `max_sessions_per_account` (`0` disables the
 per-account bound), or the node-wide limit refuses first and the account cap
 is never reached. Neither transcode limit may exceed `max_sessions`.
+`max_transcodes_per_account` (2) bounds how many of one account's sessions on
+this node may hold a transcode entitlement at once, so one account cannot take
+every transcode slot; `0` disables it.
 
 `max_ahead_segments` (8) is how far beyond the highest fragment index a client
 has actually requested the producer is allowed to run before it parks on a

@@ -119,8 +119,6 @@ class Service {
     void wait_services_ready();
     std::string describe_readiness_stall() const;
     HttpResponse handle_http(const HttpRequest&);
-    // The role a request needs, or empty when a valid session is enough.
-    static std::string_view required_role(const HttpRequest&);
     // Unauthenticated liveness: whether this node is serving, and nothing more.
     HttpResponse health_response() const;
     bool capability_request(const HttpRequest&);
@@ -132,6 +130,8 @@ class Service {
     void retain_metadata_publication(const MetadataPublicationContext&);
 
   public:
+    // The role a request needs, or empty when a valid session is enough.
+    static std::string_view required_role(const HttpRequest&);
     Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {},
             MaintenanceStageHook maintenance_stage_hook = {},
             StartupStallHandler startup_stall_handler = {});

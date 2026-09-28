@@ -1348,7 +1348,13 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
     }
     REQUIRE(service.catalogue().media_profile(first_media_id).has_value());
     {
-        CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints());
+        auto media_size = [&](const std::string& media_id) -> std::optional<uint64_t> {
+            auto found = service.filesystem().find_media(media_id);
+            if (!found) return std::nullopt;
+            return found->second.size;
+        };
+        CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints(), {}, {}, {},
+                                   std::chrono::hours(24 * 30), media_size);
         HttpRequest profile_request;
         profile_request.method = "GET";
         profile_request.path = "/api/v1/catalogue/media/" + first_media_id + "/profile";
@@ -1357,6 +1363,16 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
         CHECK(response.headers.at("Cache-Control").find("immutable") != std::string::npos);
         auto profile = Json::parse(std::string(response.body.begin(), response.body.end()));
         CHECK(profile.find("media_id")->asString() == first_media_id);
+        CHECK(profile.find("size")->asUInt64() ==
+              service.filesystem().find_media(first_media_id)->second.size);
+
+        // A size this node cannot find is null, and the answer is not cached.
+        CatalogueApi sizeless_api(service.catalogue(), service.catalogue_hints());
+        auto sizeless = sizeless_api.handle(profile_request);
+        REQUIRE(sizeless.status == 200);
+        CHECK(sizeless.headers.at("Cache-Control") == "private, no-cache");
+        CHECK(Json::parse(std::string(sizeless.body.begin(), sizeless.body.end()))
+                  .find("size")->isNull());
         CHECK(profile.find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
         CHECK(profile.find("duration_ms")->asUInt64() == 60'000);
         REQUIRE(profile.find("streams")->asArray().size() == 4);
@@ -4016,10 +4032,16 @@ MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catal
     CHECK(container_for_format("nut", "film.nut") == "nut");
     CHECK(container_for_format("", "film.qqq").empty());
 
-    CHECK(direct_mime("film.avi") == "video/x-msvideo");
-    CHECK(direct_mime("film.mkv") == "video/x-matroska");
-    CHECK(direct_mime("song.mka") == "audio/x-matroska");
-    CHECK(direct_mime("film.qqq") == "application/octet-stream");
+    // A source's Content-Type is what the probe found in it: the container,
+    // and whether there is a picture. A Matroska file named .mp4 is served as
+    // Matroska; sound alone in Matroska or MP4 is served as audio.
+    CHECK(direct_mime(container_for_format("matroska,webm", "film.mp4"), true) == "video/x-matroska");
+    CHECK(direct_mime("matroska", false) == "audio/x-matroska");
+    CHECK(direct_mime(container_for_format("mov,mp4,m4a,3gp,3g2,mj2", "song.mp4"), false) == "audio/mp4");
+    CHECK(direct_mime("avi", true) == "video/x-msvideo");
+    CHECK(direct_mime("avi", false) == "video/x-msvideo");
+    CHECK(direct_mime("mp3", false) == "audio/mpeg");
+    CHECK(direct_mime("nut", true) == "application/octet-stream");
     CHECK(segment_mime("index.m3u8") == "application/vnd.apple.mpegurl");
     CHECK(segment_mime("seg7.m4s") == "video/mp4");
     CHECK(segment_mime("seg7.ts") == "video/mp2t");
@@ -4096,6 +4118,18 @@ struct PlaybackFixture {
         return SessionIdentity{.id = std::string(user) + "-auth",
                                .roles = {"media_viewer"},
                                .user_id = std::string(user)};
+    }
+
+    HttpResponse create_transcode(const SessionIdentity& who) {
+        Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
+        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
+        auto text = Json(std::move(root)).dump();
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/playback/sessions";
+        request.session = who;
+        request.body.assign(text.begin(), text.end());
+        return playback->handle(request);
     }
 
     HttpResponse create(const SessionIdentity& who, std::string_view key = {}) {
@@ -4269,6 +4303,46 @@ MACHA_TEST("media_playback", test_the_account_cap_refuses_with_its_own_code_and_
     const auto id = listed.find("items")->asArray().front().find("session_id")->asString();
     REQUIRE(fixture.control("DELETE", id, alice).status == 204);
     CHECK(fixture.create(alice).status == 201);
+}
+
+MACHA_TEST("media_playback", test_one_account_cannot_take_every_transcode_on_a_node) {
+    // Transcode entitlements are per session, so without a per-account bound
+    // one account could open sessions until it held every transcode slot on
+    // the node. The node here allows four; one account may hold two.
+    PlaybackFixture fixture(32, 16);
+    const auto alice = PlaybackFixture::viewer("alice");
+    const auto bob = PlaybackFixture::viewer("bob");
+
+    const auto first = fixture.create_transcode(alice);
+    REQUIRE(first.status == 201);
+    REQUIRE(fixture.create_transcode(alice).status == 201);
+
+    auto refused = fixture.create_transcode(alice);
+    REQUIRE(refused.status == 429);
+    const auto refusal = PlaybackFixture::body_of(refused);
+    const auto* error = refusal.find("error");
+    CHECK(error->find("code")->asString() == "account_transcode_limit");
+    // The same on every node, so not worth walking; but the same request
+    // without a transcode needs no entitlement and may succeed here.
+    CHECK(error->find("scope")->asString() == "request");
+    CHECK(error->find("node_healthy")->asBool() == true);
+    CHECK(error->find("alternative_may_succeed")->asBool() == true);
+    CHECK(error->find("transcodes")->asUInt64() == 2);
+    CHECK(error->find("max_transcodes")->asUInt64() == 2);
+
+    // The account can still remux, and another account can still transcode.
+    CHECK(fixture.create(alice).status == 201);
+    CHECK(fixture.create_transcode(bob).status == 201);
+
+    // Stated beside the session count, so a client can plan against it.
+    const auto listed = PlaybackFixture::body_of(fixture.list(alice));
+    CHECK(listed.find("account")->find("transcodes")->asUInt64() == 2);
+    CHECK(listed.find("account")->find("max_transcodes")->asUInt64() == 2);
+
+    // Releasing one transcoding session frees one.
+    const auto first_id = PlaybackFixture::body_of(first).find("session_id")->asString();
+    REQUIRE(fixture.control("DELETE", first_id, alice).status == 204);
+    CHECK(fixture.create_transcode(alice).status == 201);
 }
 
 MACHA_TEST("media_playback", test_an_idempotency_key_is_scoped_to_its_account) {

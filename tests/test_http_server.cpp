@@ -156,6 +156,25 @@ MACHA_FAST_TEST("http_server", test_top_level_key_scan_ignores_strings_and_nesti
     CHECK(!http_json_object_has_key("", "status"));
 }
 
+MACHA_TEST("http_server", test_a_repeated_query_parameter_keeps_every_value) {
+    // `kind=movie&kind=show` asks for both kinds. `query` keeps one value per
+    // key; `query_all` keeps them all, in order.
+    auto config = loopback_config();
+    HttpServer server(config, [&](const HttpRequest& request) {
+        std::string joined;
+        if (auto all = request.query_all.find("kind"); all != request.query_all.end())
+            for (const auto& value : all->second) joined += value + ";";
+        return http_json(200, "{\"kinds\":\"" + joined + "\",\"last\":\"" +
+                                  request.query.at("kind") + "\"}");
+    });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+    const auto response = raw_http_get(server.bound_port(), "/q?kind=movie&kind=show%20x&q=1");
+    CHECK(response.find("\"kinds\":\"movie;show x;\"") != std::string::npos);
+    CHECK(response.find("\"last\":\"show x\"") != std::string::npos);
+    server.stop();
+}
+
 MACHA_TEST("http_server", test_a_blocking_body_read_on_one_connection_does_not_delay_another) {
     auto config = loopback_config();
     std::atomic_bool entered{};

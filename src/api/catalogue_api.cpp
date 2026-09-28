@@ -209,7 +209,8 @@ std::string items_json(const std::vector<CatalogueItem>& items, const CatalogueS
     return out;
 }
 
-Json media_profile_json(std::string_view media_id, const MediaProbeResult& profile) {
+Json media_profile_json(std::string_view media_id, const MediaProbeResult& profile,
+                        std::optional<uint64_t> size) {
     Json::Array streams;
     for (const auto& stream : profile.streams) {
         Json::Object value{{"index", stream.index},
@@ -235,6 +236,7 @@ Json media_profile_json(std::string_view media_id, const MediaProbeResult& profi
     Json::Object out{{"schema_version", 3},
                      {"media_id", std::string(media_id)},
                      {"format", profile.format},
+                     {"size", size ? Json(*size) : Json(nullptr)},
                      {"duration_ms", static_cast<uint64_t>(
                          std::max(0.0, profile.duration_seconds) * 1000.0)},
                      {"bitrate", profile.bitrate},
@@ -251,63 +253,128 @@ std::optional<int32_t> json_i32(const Json& root, std::string_view key) {
     return static_cast<int32_t>(number);
 }
 
-CatalogueItem parse_item(std::string id, std::span<const uint8_t> bytes) {
-    std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    auto root = Json::parse(text);
-    if (!root.isObject())
-        throw std::runtime_error("catalogue item body must be a JSON object");
-    CatalogueItem item;
-    item.id = std::move(id);
-    const auto* kind_value = root.find("kind");
-    const auto* title_value = root.find("title");
-    if (!kind_value || !title_value)
-        throw std::runtime_error("catalogue item requires kind and title");
-    auto kind = parse_catalogue_kind(kind_value->asString());
-    if (!kind)
-        throw std::runtime_error("unknown catalogue kind");
-    item.kind = *kind;
-    item.title = title_value->asString();
-    if (const auto* value = root.find("sort_title")) item.sort_title = value->asString();
-    if (const auto* value = root.find("synopsis")) item.synopsis = value->asString();
-    if (const auto* value = root.find("parent_id"); value && !value->isNull())
-        item.parent_id = value->asString();
-    item.year = json_i32(root, "year");
-    item.season_number = json_i32(root, "season_number");
-    item.episode_number = json_i32(root, "episode_number");
-    item.disc_number = json_i32(root, "disc_number");
-    item.track_number = json_i32(root, "track_number");
-    if (const auto* aliases = root.find("aliases")) {
-        if (!aliases->isArray()) throw std::runtime_error("aliases must be an array");
-        for (const auto& alias : aliases->asArray()) item.aliases.push_back(alias.asString());
+// A request body or item the API cannot accept: a 400 with its own code, not a
+// catalogue failure. `fields` are stated beside the code.
+struct BadItem : std::runtime_error {
+    std::string code;
+    std::vector<std::pair<std::string, std::string>> fields;
+    BadItem(std::string error_code, const std::string& message,
+            std::vector<std::pair<std::string, std::string>> extra = {})
+        : std::runtime_error(message), code(std::move(error_code)), fields(std::move(extra)) {}
+};
+
+Json parse_item_body(std::span<const uint8_t> bytes) {
+    try {
+        std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        auto root = Json::parse(text);
+        if (!root.isObject()) throw BadItem("bad_item", "catalogue item body must be a JSON object");
+        return root;
+    } catch (const BadItem&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw BadItem("bad_item", e.what());
     }
-    if (const auto* external = root.find("external_ids")) {
-        if (!external->isObject()) throw std::runtime_error("external_ids must be an object");
-        for (const auto& [provider, value] : external->asObject())
-            item.external_ids[provider] = value.asString();
-    }
-    if (const auto* media = root.find("media_ids")) {
-        if (!media->isArray()) throw std::runtime_error("media_ids must be an array");
-        for (const auto& value : media->asArray()) item.media_ids.push_back(value.asString());
-    }
-    if (const auto* artwork = root.find("artwork")) {
-        if (!artwork->isArray()) throw std::runtime_error("artwork must be an array");
-        for (const auto& value : artwork->asArray()) {
-            const auto* id_value = value.find("id");
-            const auto* role = value.find("role");
-            const auto* mime = value.find("mime_type");
-            if (!id_value || !role || !mime)
-                throw std::runtime_error("artwork requires role, id and mime_type");
-            auto decoded = unhex(id_value->asString());
-            if (!decoded || decoded->size() != 32)
-                throw std::runtime_error("bad artwork object id");
-            CatalogueArtwork art;
-            art.role = role->asString();
-            std::copy(decoded->begin(), decoded->end(), art.id.bytes.begin());
-            art.mime_type = mime->asString();
-            item.artwork.push_back(std::move(art));
+}
+
+// Sets every field `root` states. For a whole item (PUT) kind and title are
+// required; a partial update (PATCH) changes only what is present, and a null
+// clears an optional field.
+void apply_item_fields(CatalogueItem& item, const Json& root, bool whole) {
+    try {
+        const auto* kind_value = root.find("kind");
+        const auto* title_value = root.find("title");
+        if (whole && (!kind_value || !title_value))
+            throw BadItem("bad_item", "catalogue item requires kind and title");
+        if (kind_value) {
+            auto kind = parse_catalogue_kind(kind_value->asString());
+            if (!kind) throw BadItem("bad_item", "unknown catalogue kind");
+            item.kind = *kind;
         }
+        if (title_value) item.title = title_value->asString();
+        if (const auto* value = root.find("sort_title")) item.sort_title = value->asString();
+        if (const auto* value = root.find("synopsis")) item.synopsis = value->asString();
+        if (const auto* value = root.find("parent_id"))
+            item.parent_id = value->isNull() ? std::nullopt
+                                             : std::optional<std::string>(value->asString());
+        const auto number = [&](std::string_view key, std::optional<int32_t>& field) {
+            if (root.find(key)) field = json_i32(root, key);
+        };
+        number("year", item.year);
+        number("season_number", item.season_number);
+        number("episode_number", item.episode_number);
+        number("disc_number", item.disc_number);
+        number("track_number", item.track_number);
+        if (const auto* aliases = root.find("aliases")) {
+            if (!aliases->isArray()) throw BadItem("bad_item", "aliases must be an array");
+            item.aliases.clear();
+            for (const auto& alias : aliases->asArray()) item.aliases.push_back(alias.asString());
+        }
+        if (const auto* external = root.find("external_ids")) {
+            if (!external->isObject()) throw BadItem("bad_item", "external_ids must be an object");
+            item.external_ids.clear();
+            for (const auto& [provider, value] : external->asObject())
+                item.external_ids[provider] = value.asString();
+        }
+        if (const auto* media = root.find("media_ids")) {
+            if (!media->isArray()) throw BadItem("bad_item", "media_ids must be an array");
+            item.media_ids.clear();
+            for (const auto& value : media->asArray()) item.media_ids.push_back(value.asString());
+        }
+        if (const auto* artwork = root.find("artwork")) {
+            if (!artwork->isArray()) throw BadItem("bad_item", "artwork must be an array");
+            item.artwork.clear();
+            for (const auto& value : artwork->asArray()) {
+                const auto* id_value = value.find("id");
+                const auto* role = value.find("role");
+                const auto* mime = value.find("mime_type");
+                if (!id_value || !role || !mime)
+                    throw BadItem("bad_item", "artwork requires role, id and mime_type");
+                auto decoded = unhex(id_value->asString());
+                if (!decoded || decoded->size() != 32)
+                    throw BadItem("bad_item", "bad artwork object id");
+                CatalogueArtwork art;
+                art.role = role->asString();
+                std::copy(decoded->begin(), decoded->end(), art.id.bytes.begin());
+                art.mime_type = mime->asString();
+                item.artwork.push_back(std::move(art));
+            }
+        }
+        // A hand edit is locked against the scanner unless it says otherwise.
+        bool lock = true;
+        if (const auto* value = root.find("lock")) lock = value->asBool();
+        if (lock)
+            item.external_ids["macha_metadata_locked"] = "1";
+        else
+            item.external_ids.erase("macha_metadata_locked");
+    } catch (const BadItem&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw BadItem("bad_item", e.what());
     }
-    return item;
+}
+
+// The kind an item's parent must be, or none for a top-level kind.
+std::optional<CatalogueKind> required_parent_kind(CatalogueKind kind) {
+    switch (kind) {
+    case CatalogueKind::season: return CatalogueKind::show;
+    case CatalogueKind::episode: return CatalogueKind::season;
+    case CatalogueKind::album: return CatalogueKind::artist;
+    case CatalogueKind::track: return CatalogueKind::album;
+    default: return std::nullopt;
+    }
+}
+
+void validate_parent(CatalogueManager& catalogue, const CatalogueItem& item) {
+    if (!item.parent_id) return;
+    const auto parent = catalogue.get(*item.parent_id);
+    if (!parent)
+        throw BadItem("parent_not_found", "parent item not found",
+                      {{"parent_id", *item.parent_id}});
+    const auto wanted = required_parent_kind(item.kind);
+    if (!wanted || parent->kind != *wanted)
+        throw BadItem("bad_parent_kind", "parent is the wrong kind for this item",
+                      {{"kind", std::string(catalogue_kind_name(item.kind))},
+                       {"parent_kind", std::string(catalogue_kind_name(parent->kind))}});
 }
 
 std::optional<uint64_t> expected_revision(const HttpRequest& request) {
@@ -425,8 +492,28 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 if (ec != std::errc{} || end != it->second.data() + it->second.size() || limit > 1000)
                     return error(400, "bad_limit", "limit must be 0..1000");
             }
+            // `kind` may repeat; absent means every kind. `parent` keeps only
+            // that item's children. Both filter before `limit`.
+            std::vector<std::string> kind_names;
+            if (auto all = request.query_all.find("kind"); all != request.query_all.end())
+                kind_names = all->second;
+            else if (auto one = request.query.find("kind"); one != request.query.end())
+                kind_names = {one->second};
+            std::set<CatalogueKind> kinds;
+            for (const auto& name : kind_names) {
+                auto kind = parse_catalogue_kind(name);
+                if (!kind) return error(400, "bad_kind", "unknown catalogue kind: " + name);
+                kinds.insert(*kind);
+            }
+            std::optional<std::string> parent;
+            if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
+            auto keep = [&](const CatalogueItem& item) {
+                if (!kinds.empty() && !kinds.contains(item.kind)) return false;
+                if (parent && item.parent_id != parent) return false;
+                return true;
+            };
             auto snapshot = catalogue_.snapshot_view();
-            return json(200, items_json(catalogue_.search(q->second, limit), *snapshot,
+            return json(200, items_json(catalogue_.search(q->second, limit, keep), *snapshot,
                                         {catalogue_.cluster_keys(), artwork_capability_ttl_}));
         }
 
@@ -470,8 +557,12 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 response.headers["Location"] = request.path;
                 return response;
             }
-            auto response = json(200, media_profile_json(media_id, *profile).dump());
-            response.headers["Cache-Control"] = "private, max-age=31536000, immutable";
+            // A media id names its bytes, so its size never changes; a size
+            // this node cannot find yet is not cached as an answer.
+            const auto size = media_size_ ? media_size_(media_id) : std::nullopt;
+            auto response = json(200, media_profile_json(media_id, *profile, size).dump());
+            response.headers["Cache-Control"] = size ? "private, max-age=31536000, immutable"
+                                                     : "private, no-cache";
             response.headers["ETag"] = json_escape(media_id);
             return response;
         }
@@ -537,9 +628,26 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 response.headers["ETag"] = "\"rev-" + std::to_string(item->revision) + "\"";
                 return response;
             }
-            if (request.method == "PUT") {
+            if (request.method == "PUT" || request.method == "PATCH") {
                 auto existing = catalogue_.get(id);
-                auto item = parse_item(id, request.body);
+                if (request.method == "PATCH" && !existing)
+                    return error(404, "not_found", "catalogue item not found");
+                const auto root = parse_item_body(request.body);
+                // A whole PUT replaces the descriptive fields, but files and
+                // artwork are only ever changed by naming them: an edit that
+                // leaves media_ids out must not unbind every file.
+                CatalogueItem item;
+                if (request.method == "PATCH") {
+                    item = *existing;
+                } else {
+                    item.id = id;
+                    if (existing) {
+                        item.media_ids = existing->media_ids;
+                        item.artwork = existing->artwork;
+                    }
+                }
+                apply_item_fields(item, root, request.method == "PUT");
+                validate_parent(catalogue_, item);
                 auto saved = catalogue_.upsert(std::move(item), expected_revision(request));
                 auto snapshot = catalogue_.snapshot_view();
                 auto response = json(existing ? 200 : 201, item_json(saved, *snapshot,
@@ -587,6 +695,11 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
         return error(404, "not_found", "endpoint not found");
     } catch (const CatalogueConflict& e) {
         return error(409, "conflict", e.what());
+    } catch (const BadItem& e) {
+        std::string body = "{\"error\":" + json_escape(e.code) + ",\"message\":" + json_escape(e.what());
+        for (const auto& [name, value] : e.fields)
+            body += "," + json_escape(name) + ":" + json_escape(value);
+        return json(400, body + "}");
     } catch (const std::exception& e) {
         return error(503, "catalogue_unavailable", e.what());
     }

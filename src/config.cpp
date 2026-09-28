@@ -667,6 +667,9 @@ void parse_streaming(const ConfigNode& root, Config& c) {
     if (streaming["max_sessions_per_account"])
         c.streaming.max_sessions_per_account =
             streaming["max_sessions_per_account"].as<size_t>();
+    if (streaming["max_transcodes_per_account"])
+        c.streaming.max_transcodes_per_account =
+            streaming["max_transcodes_per_account"].as<size_t>();
     if (streaming["max_video_transcodes"])
         c.streaming.max_video_transcodes = streaming["max_video_transcodes"].as<size_t>();
     if (streaming["max_audio_transcodes"])
