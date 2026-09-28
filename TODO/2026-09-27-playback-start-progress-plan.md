@@ -224,6 +224,9 @@ does not support `start=async`.
 - **Replacement URLs on the same poll.** When a pending PATCH reaches
   `ready`, the long-poll that sees it carries the replacement's stream URLs,
   so a client can buffer it beside the playing generation.
+- **Deleting the session takes its pending replacement with it.** Stop or
+  Back during a pending PATCH needs one `DELETE` of the session, not
+  `.../pending` first.
 - **Abandoning is cheap.** `DELETE` of a pending create or of `pending`
   stops the start and frees its transcode slot at once, so a client may race
   or abandon a slow start on its own budget.
