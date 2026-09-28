@@ -787,6 +787,7 @@ struct PlaybackManager::Impl {
     };
 
     struct StartState;
+    struct PendingReplacement;
 
     struct SourceLease {
         std::string media_id;
@@ -838,6 +839,9 @@ struct PlaybackManager::Impl {
         // reached. On the placeholder while pending, and on the session that
         // replaces it once ready.
         std::shared_ptr<StartState> start;
+        // A replacement generation an async PATCH is starting while this one
+        // keeps serving. Guarded by the Impl mutex.
+        std::shared_ptr<PendingReplacement> pending;
     };
 
     // An async start. The session map holds the admitted placeholder --
@@ -867,6 +871,19 @@ struct PlaybackManager::Impl {
             last_change = Clock::now();
             return std::exchange(waiters, {});
         }
+    };
+    struct ResourceReservation;
+    // An async PATCH's replacement: its start, the resources reserved for it
+    // (committed at the swap, rolled back by its worker otherwise), and when
+    // its worker is done.
+    struct PendingReplacement {
+        std::shared_ptr<StartState> start;
+        std::shared_ptr<ResourceReservation> reservation;
+        bool needs_plan{};
+        Clock::time_point failed_until{};
+        std::mutex done_mutex;
+        std::condition_variable done_cv;
+        bool done{};
     };
     struct FailedStart {
         std::string account;
@@ -1123,6 +1140,30 @@ struct PlaybackManager::Impl {
         return to_string(sha256({reinterpret_cast<const uint8_t*>(text.data()), text.size()}));
     }
 
+    // The live pending replacement of a session, dropping one whose failure
+    // has been readable for long enough. Precondition: mutex held.
+    std::shared_ptr<PendingReplacement> pending_locked(Session& session) {
+        if (session.pending && session.pending->failed_until != Clock::time_point{} &&
+            Clock::now() >= session.pending->failed_until)
+            session.pending.reset();
+        return session.pending;
+    }
+
+    // Stop a session's pending replacement and wait for its worker, which
+    // rolls its reservation back, so the next admission sees the slot free.
+    void cancel_pending(Session& session) {
+        std::shared_ptr<PendingReplacement> taken;
+        {
+            std::lock_guard lock(mutex);
+            taken = std::exchange(session.pending, {});
+        }
+        if (!taken) return;
+        taken->start->cancelled.store(true);
+        stop_pipeline(*taken->start->candidate);
+        std::unique_lock done(taken->done_mutex);
+        taken->done_cv.wait(done, [&] { return taken->done; });
+    }
+
     static void wake(const std::vector<std::shared_ptr<HttpWaker>>& waiters) {
         for (const auto& waiter : waiters) waiter->fire();
     }
@@ -1346,6 +1387,103 @@ struct PlaybackManager::Impl {
                           " stage=" + stalled + " error=" + message);
             }
         }
+        std::lock_guard lock(mutex);
+        --start_workers;
+        start_workers_cv.notify_all();
+    }
+
+    // An async PATCH's worker: build the replacement beside the playing
+    // generation and swap it in only when its first fragment exists.
+    void run_replacement(std::shared_ptr<Session> old, std::shared_ptr<PendingReplacement> pending,
+                         std::string trace) {
+        auto start = pending->start;
+        auto replacement = start->candidate;
+        std::string stalled = "planning";
+        bool swapped = false;
+        try {
+            if (pending->needs_plan) prepare_transformed_vod(*replacement, trace);
+            if (start->cancelled.load()) throw std::runtime_error("start cancelled");
+            std::vector<std::shared_ptr<HttpWaker>> waiters;
+            {
+                std::lock_guard lock(start->mutex);
+                if (replacement->vod_plan && !replacement->vod_plan->segment_durations.empty())
+                    start->first_fragment_ms =
+                        std::llround(replacement->vod_plan->segment_durations.front() * 1000.0);
+                start->stage = "encoding";
+                stalled = "encoding";
+                waiters = start->changed_locked();
+            }
+            wake(waiters);
+            start_pipeline(*replacement, trace, false);
+            wait_for_first_fragment_async(*replacement, *start, trace);
+            auto old_active = active_engine(*old);
+            {
+                std::lock_guard lock(mutex);
+                auto it = sessions.find(old->id);
+                if (start->cancelled.load() || it == sessions.end() || it->second != old ||
+                    old->pending != pending)
+                    throw std::runtime_error("start cancelled");
+                it->second = replacement;
+                old->pending.reset();
+                commit_resources_locked(*pending->reservation);
+                *pending->reservation = {};
+                release_unused_transcode_entitlements_locked(*replacement);
+                signal_cleanup_locked();
+            }
+            swapped = true;
+            if (old_active) old_active->segments()->mark_superseded(true);
+            stop_pipeline(*old);
+            std::error_code ec;
+            if (!old->generation_dir.empty() && old->generation_dir != replacement->generation_dir)
+                std::filesystem::remove_all(old->generation_dir, ec);
+            {
+                std::lock_guard lock(start->mutex);
+                start->stage = "ready";
+                waiters = start->changed_locked();
+            }
+            wake(waiters);
+            Log::info("playback[" + trace + "] async update ready id=" + replacement->id +
+                      " generation=" + std::to_string(replacement->generation));
+        } catch (...) {
+            const auto error = std::current_exception();
+            if (!swapped) {
+                stop_pipeline(*replacement);
+                std::error_code ec;
+                if (!replacement->generation_dir.empty() && replacement->generation_dir != old->generation_dir)
+                    std::filesystem::remove_all(replacement->generation_dir, ec);
+                if (pending->reservation->video || pending->reservation->audio) {
+                    rollback_resources(*replacement, *pending->reservation);
+                    *pending->reservation = {};
+                }
+            }
+            std::vector<std::shared_ptr<HttpWaker>> waiters;
+            if (start->cancelled.load()) {
+                std::lock_guard lock(start->mutex);
+                waiters = std::exchange(start->waiters, {});
+            } else {
+                {
+                    std::lock_guard lock(start->mutex);
+                    start->error = start_error_json(error, stalled);
+                    start->stage = "failed";
+                    waiters = start->changed_locked();
+                }
+                {
+                    std::lock_guard lock(mutex);
+                    if (old->pending == pending)
+                        pending->failed_until = Clock::now() + config.start_failed_retention;
+                }
+                std::string message = "unknown";
+                try { std::rethrow_exception(error); } catch (const std::exception& e) { message = e.what(); } catch (...) {}
+                Log::warn("playback[" + trace + "] async update failed id=" + old->id + " stage=" + stalled +
+                          " error=" + message + "; the current generation keeps serving");
+            }
+            wake(waiters);
+        }
+        {
+            std::lock_guard done(pending->done_mutex);
+            pending->done = true;
+        }
+        pending->done_cv.notify_all();
         std::lock_guard lock(mutex);
         --start_workers;
         start_workers_cv.notify_all();
@@ -3161,7 +3299,15 @@ struct PlaybackManager::Impl {
             session->touched = Clock::now();
             signal_cleanup_locked();
         }
-        if (session->start) {
+        std::shared_ptr<PendingReplacement> pending;
+        {
+            std::lock_guard lock(mutex);
+            pending = pending_locked(*session);
+        }
+        const auto watched = session->start && start_pending(*session) ? session->start
+                             : pending                                  ? pending->start
+                                                                        : session->start;
+        if (watched) {
             // Long-poll: answer when progress_seq passes `after`, or at the
             // wait, whichever comes first.
             auto number = [&](std::string_view name) -> std::optional<uint64_t> {
@@ -3179,13 +3325,13 @@ struct PlaybackManager::Impl {
             const auto deadline = request.resumed ? request.resume_deadline
                                                   : Clock::now() + std::chrono::milliseconds(wait_ms);
             std::shared_ptr<HttpWaker> waker;
-            bool pending = false;
+            bool unfinished = false;
             {
-                std::lock_guard lock(session->start->mutex);
-                pending = !session->start->finished();
-                if (after && pending && session->start->seq <= *after && Clock::now() < deadline) {
+                std::lock_guard lock(watched->mutex);
+                unfinished = !watched->finished();
+                if (after && unfinished && watched->seq <= *after && Clock::now() < deadline) {
                     waker = std::make_shared<HttpWaker>();
-                    session->start->waiters.push_back(waker);
+                    watched->waiters.push_back(waker);
                 }
             }
             if (waker) {
@@ -3193,12 +3339,17 @@ struct PlaybackManager::Impl {
                 deferred.defer = HttpDeferral{std::move(waker), deadline, {}};
                 return deferred;
             }
-            if (pending) return http_json(200, pending_json(*session, *session->start).dump());
+            if (unfinished && watched == session->start)
+                return http_json(200, pending_json(*session, *session->start).dump());
         }
         auto result = session_json(*session);
         if (session->start) {
             std::lock_guard lock(session->start->mutex);
             result["start"] = start_json_locked(*session->start);
+        }
+        if (pending) {
+            std::lock_guard lock(pending->start->mutex);
+            result["pending"] = Json(Json::Object{{"start", start_json_locked(*pending->start)}});
         }
         if (auto active = active_engine(*session)) {
             result["engine_running"] = active->running();
@@ -3233,6 +3384,13 @@ struct PlaybackManager::Impl {
         if (start_pending(*old))
             return http_error(409, "playback_starting",
                               "this session's start is not ready: wait for it, or DELETE it");
+        bool async_start = false;
+        if (auto it = request.query.find("start"); it != request.query.end()) {
+            if (it->second != "async") return http_error(400, "bad_start", "start must be async");
+            async_start = true;
+        }
+        // A second PATCH replaces a pending one.
+        cancel_pending(*old);
         auto trace = hex_token(4);
         Json root = Json::parse(std::string_view(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
         if (!root.isObject()) return http_error(400, "bad_request", "JSON object required");
@@ -3306,7 +3464,45 @@ struct PlaybackManager::Impl {
             replacement->account = old->account;
             replacement->generation = old->generation;
             if (seek_ms) replacement->plan.request_seek(std::chrono::milliseconds(*seek_ms));
-            prepare_transformed_vod(*replacement, trace);
+            if (!async_start || !transformed(replacement->plan)) prepare_transformed_vod(*replacement, trace);
+        }
+        if (async_start && transformed(replacement->plan)) {
+            // Admitted now; built beside the playing generation, which keeps
+            // serving -- not superseded -- until the replacement is ready.
+            auto pending = std::make_shared<PendingReplacement>();
+            pending->needs_plan = !replacement->vod_plan;
+            pending->reservation = std::make_shared<ResourceReservation>(reserve_resources(*replacement, old->id));
+            pending->start = std::make_shared<StartState>();
+            pending->start->candidate = replacement;
+            {
+                std::lock_guard lock(mutex);
+                auto it = sessions.find(std::string(id));
+                if (it == sessions.end() || it->second != old) {
+                    rollback_resources(*replacement, *pending->reservation);
+                    throw std::runtime_error("playback session changed during update");
+                }
+                old->pending = pending;
+                ++start_workers;
+            }
+            try {
+                std::thread([this, old, pending, trace] { run_replacement(old, pending, trace); }).detach();
+            } catch (...) {
+                {
+                    std::lock_guard lock(mutex);
+                    old->pending.reset();
+                    --start_workers;
+                    start_workers_cv.notify_all();
+                }
+                rollback_resources(*replacement, *pending->reservation);
+                throw;
+            }
+            auto payload = session_json(*old);
+            payload["status"] = std::string("playback_starting");
+            {
+                std::lock_guard lock(pending->start->mutex);
+                payload["pending"] = Json(Json::Object{{"start", start_json_locked(*pending->start)}});
+            }
+            return http_json(202, payload.dump());
         }
         ResourceReservation resource_reservation;
         // start_pipeline() below can block for several seconds (up to
@@ -3352,6 +3548,20 @@ struct PlaybackManager::Impl {
         if (!old->generation_dir.empty() && old->generation_dir != replacement->generation_dir)
             std::filesystem::remove_all(old->generation_dir, ec);
         return http_json(200, session_json(*replacement).dump());
+    }
+
+    // Abandon a pending replacement; the playing generation is untouched.
+    HttpResponse erase_pending(std::string_view id, const HttpRequest& request) {
+        std::shared_ptr<Session> session;
+        {
+            std::lock_guard lock(mutex);
+            auto it = sessions.find(id);
+            if (it == sessions.end() || !caller_owns(*it->second, request))
+                return http_error(404, "not_found", "playback session not found");
+            session = it->second;
+        }
+        cancel_pending(*session);
+        return {204, "application/json; charset=utf-8", {}, {}, {}};
     }
 
     HttpResponse erase_session(std::string_view id, const HttpRequest& request) {
@@ -3417,6 +3627,7 @@ struct PlaybackManager::Impl {
             if (removed->start->candidate && removed->start->candidate != removed)
                 stop_pipeline(*removed->start->candidate);
         }
+        cancel_pending(*removed);
         stop_pipeline(*removed);
         std::error_code ec;
         std::filesystem::remove_all(*config.temp_path / removed->id, ec);
@@ -3661,6 +3872,10 @@ struct PlaybackManager::Impl {
             const auto slash = rest.find('/');
             const auto id = rest.substr(0, slash);
             if (id.empty()) return http_error(404, "not_found", "endpoint not found");
+            if (rest.substr(slash == std::string_view::npos ? rest.size() : slash) == "/pending") {
+                if (request.method != "DELETE") return http_error(405, "method", "DELETE required");
+                return erase_pending(id, request);
+            }
             if (slash == std::string_view::npos) {
                 if (request.method == "GET") return get_session(id, request);
                 if (request.method == "PATCH") return update_session(id, request);
@@ -3890,8 +4105,10 @@ void PlaybackManager::stop() {
     std::vector<std::shared_ptr<Impl::StartState>> starts;
     {
         std::lock_guard lock(impl_->mutex);
-        for (auto& [_, session] : impl_->sessions)
+        for (auto& [_, session] : impl_->sessions) {
             if (session->start) starts.push_back(session->start);
+            if (session->pending) starts.push_back(session->pending->start);
+        }
     }
     for (auto& start : starts) {
         start->cancelled.store(true);
