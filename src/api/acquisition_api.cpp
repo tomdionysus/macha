@@ -323,6 +323,12 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             std::optional<std::optional<uint64_t>> remove_after;
             if (std::string error; !parse_remove_after(body, remove_after, error))
                 return http_error(400, "bad_request", error);
+            // Optional (0.71.0): created already paused, in the same write.
+            bool paused = false;
+            if (const auto* value = body.find("paused"); value && !value->isNull()) {
+                if (!value->isBool()) return http_error(400, "bad_request", "paused must be a boolean");
+                paused = value->asBool();
+            }
 
             std::string uri;
             bool search_result = false;
@@ -339,7 +345,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
                 return http_error(400, "bad_request", "magnet or acquisition_ref is required");
             }
 
-            const auto outcome = torrents_.add(uri, search_result, pin, remove_after);
+            const auto outcome = torrents_.add(uri, search_result, pin, remove_after, paused);
             if (outcome.code == "torrent_already_added") {
                 // The holder is named in the same fields a 202 uses, so a
                 // client can go straight to it.
