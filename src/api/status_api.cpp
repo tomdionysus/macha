@@ -423,6 +423,15 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_transcode_entitlement_idle_ms)
             playback["transcode_entitlement_idle_ms"] =
                 static_cast<uint64_t>(live->playback_transcode_entitlement_idle_ms);
+        // start=async: present only on a node that offers it.
+        if (live->playback_startup_no_progress_ms)
+            playback["startup_no_progress_ms"] =
+                static_cast<uint64_t>(live->playback_startup_no_progress_ms);
+        if (live->playback_start_wait_max_ms)
+            playback["start_wait_max_ms"] = static_cast<uint64_t>(live->playback_start_wait_max_ms);
+        if (live->playback_start_failed_retention_ms)
+            playback["start_failed_retention_ms"] =
+                static_cast<uint64_t>(live->playback_start_failed_retention_ms);
     }
     node["playback"] = std::move(playback);
     node["identity_association_reset"] =
