@@ -266,7 +266,10 @@ A client must bound its own attempt on a node against the budgets that node enfo
   "max_sessions_per_account": 32,
   "max_transcodes_per_account": 2,
   "max_sessions": 64,
-  "transcode_entitlement_idle_ms": 300000
+  "transcode_entitlement_idle_ms": 300000,
+  "startup_no_progress_ms": 15000,
+  "start_wait_max_ms": 25000,
+  "start_failed_retention_ms": 60000
 }
 ```
 
@@ -278,6 +281,7 @@ A client must bound its own attempt on a node against the budgets that node enfo
 - **`max_transcodes_per_account`** — how many of one account's sessions may hold a transcode entitlement on this node, described in the same section. The limit only.
 - **`max_sessions`** — the node-wide session cap, every account together. Its refusal is `resource_limit` and means something different from the one above: this node is full, rather than this account is.
 - **`transcode_entitlement_idle_ms`** — how long a session may hold a transcode entitlement with no stream activity before the node releases it. See [keeping a transcode slot across a pause](#keeping-a-transcode-slot-across-a-pause).
+- **`startup_no_progress_ms`**, **`start_wait_max_ms`**, **`start_failed_retention_ms`** — the `start=async` budgets, described under [starting without blocking](#starting-without-blocking-startasync). Their absence means the node does not offer `start=async`.
 
 These are each node's statement about **itself**, relayed like `load1` and `cpu_cores`. Each node reports only its own figures, because streaming configuration stays on the node it belongs to and telemetry does not relay it. A client that needs a worst case across the nodes it might use composes it from these, because only the client knows which nodes those are.
 
@@ -599,6 +603,46 @@ The offset is therefore zero exactly when the mode can be frame-accurate. A clie
 The mode is never substituted. A remux request stays remux, including when its keyframe situation is awkward: where the index names no keyframe at or before the request, the baseline is `0` and the offset carries the whole request. A decodable stream's first sample is necessarily a sync sample, so a copy can always begin at the beginning; the index simply did not name it. (Separately, a remux whose keyframe index is unusable *as a segment plan* still fails; it never falls back to transcode. That is remux being unplannable, not a seek being moved.)
 
 The baseline is never a keyframe *after* the request. Aligning forward would leave the content between the request and that keyframe in no generation at all, unrecoverable by any client: a skipped scene on a viewer seek, and deleted content on the reaped-session recovery path, which rebuilds a generation at a position a viewer has actually reached.
+
+### Starting without blocking (`start=async`)
+
+By default a create or `PATCH` that needs a pipeline blocks until the first fragment exists, bounded by `startup_timeout_ms`. With `?start=async` it answers as soon as the request is admitted, and the node reports the start's progress; the client decides how long to wait, and the node fails the start only when its progress stops, never on elapsed time. Opt-in: without the parameter nothing changes.
+
+**Admission is synchronous.** Every refusal decidable at admission (`account_session_limit`, `account_transcode_limit`, `resource_limit`, `choice_required`, `media_id_required`, ...) answers at once with its usual code. Direct play has no pipeline to wait for and answers exactly as a blocking create: `201` with its URLs and no `start` object.
+
+**Create.** `POST /api/v1/playback/sessions?start=async` answers `202` with `status: playback_starting` and the session payload: `session_id` and every stable field a blocking create returns, `stream.url` `null` until the start is ready, `stream.close_url` (the signed close, which works before any stream exists), and a `start` object:
+
+```json
+"start": {
+  "stage": "encoding",
+  "progress_seq": 41,
+  "progress_age_ms": 180,
+  "elapsed_ms": 6350,
+  "source_bytes_read": 23231867,
+  "preroll_decoded_ms": 417,
+  "preroll_total_ms": 457,
+  "output_media_ms": 667,
+  "first_fragment_ms": 2000
+}
+```
+
+- `stage`, in order: `planning`, `preroll` (a transcode seek decoding from the keyframe before the origin up to it), `encoding` (producing the first fragment; for a remux, packaging), `ready`, `failed`.
+- The counters are facts, never estimates; the client computes rates and fractions. A counter a stage cannot measure is absent, not zero: `source_bytes_read` is absent in `planning`, and `preroll_*` appear only for a transcode seek between keyframes.
+- `output_media_ms` is media past the origin that has reached the output; the first fragment is ready when it reaches `first_fragment_ms`.
+- `progress_seq` rises on every change; `progress_age_ms` is its age on the node's clock, comparable only with itself.
+- On `failed`, `error` carries the failure's code (`playback_pipeline_start_failed`, ...) and `start_stage`, the stage that stalled.
+
+Once `ready`, the session is a normal session: its stream URLs appear, and `start` stays with `stage: ready`. A retried `POST ?start=async` with the same `idempotency_key` answers the same pending session (`202`, `idempotency: replayed`). A `PATCH` on a session whose create is still pending answers `409 playback_starting`.
+
+**Update.** `PATCH /api/v1/playback/sessions/{id}?start=async` answers `202` with `status: playback_starting` and the session as it is: the current generation keeps serving and is not superseded. The replacement is under `pending.start`. When it is ready, the session becomes the replacement (a new `generation`, its own stream URLs), the old generation stops, and `pending` disappears. If it fails, `pending.start` shows `failed` with its error for `start_failed_retention_ms` while the current generation plays on. A second `PATCH` while one is pending replaces the pending one. Subtitle-only and direct-play changes have no pipeline and answer as a blocking `PATCH` does.
+
+**Long-poll.** `GET /api/v1/playback/sessions/{id}?after=<progress_seq>&wait_ms=<n>` answers as soon as the pending start's `progress_seq` exceeds `after` or its stage changes, or at `wait_ms` with the state unchanged. `wait_ms` above `start_wait_max_ms` is clamped, not refused. A parked request costs the node a connection, not a thread. The `GET` that sees `ready` carries the new stream URLs.
+
+**Cancel.** `DELETE` of the session (or its signed close) cancels a pending create; `DELETE /api/v1/playback/sessions/{id}/pending` abandons a pending update and leaves the current generation playing. Deleting the session also drops a pending replacement. Either frees the start's transcode slot at once, so a client may race or abandon a slow start on its own budget.
+
+**Failure frees at once.** A failed create releases its transcode entitlement and session slot immediately; `GET` keeps answering its `failed` state for `start_failed_retention_ms`, then `404`.
+
+**The node's budgets** (Status, per node): `startup_no_progress_ms` (a start with no progress for this long fails; planning before the pipeline stays bounded by `probe_timeout_ms`), `start_wait_max_ms` (the long-poll cap) and `start_failed_retention_ms`.
 
 ## List, inspect, change and stop a session
 

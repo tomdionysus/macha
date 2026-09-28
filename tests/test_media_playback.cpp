@@ -3454,6 +3454,86 @@ MACHA_TEST("media_playback", test_deleting_a_pending_async_start_stops_it_and_fr
     CHECK(f.call("DELETE", AsyncStartFixture::body(next).find("session_id")->asString()).status == 204);
 }
 
+namespace {
+// A ready async session on the fixture: created, released, swapped in.
+std::string ready_session(AsyncStartFixture& f) {
+    auto created = f.create("transcode", true);
+    REQUIRE(created.status == 202);
+    const auto id = AsyncStartFixture::body(created).find("session_id")->asString();
+    REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
+    f.engine->release();
+    REQUIRE(wait_until([&] { return f.stage(id) == "ready"; }, 2s));
+    return id;
+}
+std::string pending_stage(AsyncStartFixture& f, const std::string& id) {
+    auto json = AsyncStartFixture::body(f.call("GET", id));
+    const auto* pending = json.find("pending");
+    return pending ? pending->find("start")->find("stage")->asString() : std::string("none");
+}
+} // namespace
+
+MACHA_TEST("media_playback", test_an_async_update_keeps_the_playing_generation_until_its_replacement_is_ready) {
+    AsyncStartFixture f;
+    const auto id = ready_session(f);
+    const auto first = f.engine->last();
+    auto patched = f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":30000})");
+    REQUIRE(patched.status == 202);
+    auto json = AsyncStartFixture::body(patched);
+    CHECK(json.find("status")->asString() == "playback_starting");
+    CHECK(json.find("generation")->asUInt64() == 1);
+    CHECK(json.find("stream")->find("url")->asString().ends_with("/1/master.m3u8"));
+    REQUIRE(json.find("pending") != nullptr);
+    REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
+    // The playing generation is not superseded while the replacement starts.
+    CHECK(first->running.load());
+    f.engine->advance(500);
+    REQUIRE(wait_until([&] { return pending_stage(f, id) == "encoding"; }, 2s));
+    f.engine->release();
+    REQUIRE(wait_until([&] { return pending_stage(f, id) == "none"; }, 2s));
+    auto swapped = AsyncStartFixture::body(f.call("GET", id));
+    CHECK(swapped.find("generation")->asUInt64() == 2);
+    CHECK(swapped.find("seek_ms")->asUInt64() == 30000);
+    CHECK(!first->running.load());
+    CHECK(f.call("DELETE", id).status == 204);
+}
+
+MACHA_TEST("media_playback", test_abandoning_a_pending_update_leaves_the_playing_generation_and_frees_the_slot) {
+    AsyncStartFixture f;
+    const auto id = ready_session(f);
+    const auto first = f.engine->last();
+    REQUIRE(f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":20000})").status == 202);
+    REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
+    const auto second = f.engine->last();
+    CHECK(f.call("DELETE", id + "/pending").status == 204);
+    CHECK(!second->running.load());
+    CHECK(first->running.load());
+    auto json = AsyncStartFixture::body(f.call("GET", id));
+    CHECK(json.find("pending") == nullptr);
+    CHECK(json.find("generation")->asUInt64() == 1);
+    // The replacement's reservation is released: another update is admitted.
+    CHECK(f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":40000})").status == 202);
+    // Deleting the session takes its pending replacement with it.
+    REQUIRE(wait_until([&] { return f.engine->starts() == 3; }, 2s));
+    const auto third = f.engine->last();
+    CHECK(f.call("DELETE", id).status == 204);
+    CHECK(!third->running.load());
+    CHECK(!first->running.load());
+}
+
+MACHA_TEST("media_playback", test_a_stalled_update_fails_under_pending_and_the_generation_plays_on) {
+    AsyncStartFixture f(600ms);
+    const auto id = ready_session(f);
+    const auto first = f.engine->last();
+    REQUIRE(f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":20000})").status == 202);
+    REQUIRE(wait_until([&] { return pending_stage(f, id) == "failed"; }, 3s));
+    auto json = AsyncStartFixture::body(f.call("GET", id));
+    CHECK(json.find("pending")->find("start")->find("error")->find("code")->asString() ==
+          "playback_pipeline_start_failed");
+    CHECK(json.find("generation")->asUInt64() == 1);
+    CHECK(first->running.load());
+    CHECK(f.call("DELETE", id).status == 204);
+}
+
 MACHA_TEST("media_playback", test_async_direct_play_and_replays_answer_without_a_second_start) {
     AsyncStartFixture f;
     // Direct play has no pipeline: it answers as a blocking create would.
