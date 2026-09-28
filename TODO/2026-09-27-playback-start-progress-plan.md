@@ -2,6 +2,9 @@
 
 Status: plan, operator-approved direction (2026-09-27: "Guessing the time is
 asinine. We need a better system to inform the client." / "We'll do this").
+Counters built and measured on fi-1 in 0.67.0 (no wire change). Wire shape
+sent to Core and every client on 2026-09-28 for their checks, as planned
+for 0.69.0.
 Wire shape below must be announced to Core and every client before any code
 ships. Clients enter release lockdown after this.
 
@@ -142,10 +145,17 @@ On `GET /api/v1/playback/sessions/{id}` (and in `pending` during a PATCH):
   "source_bytes_read": 188743680,
   "preroll_decoded_ms": 3120,
   "preroll_total_ms": 5005,
-  "first_fragment_media_ms": 0,
-  "first_fragment_target_ms": 6000
+  "output_media_ms": 0,
+  "first_fragment_ms": 2000
 }
 ```
+
+`output_media_ms` is media past the origin that has reached the output;
+the first fragment is ready when it reaches `first_fragment_ms` (the first
+planned fragment's length, 2000 today). `source_bytes_read` covers the
+pipeline's reads; planning reads through its own input and reports none, so
+in `planning` it is absent. `preroll_*` appear only for a transcode seek that
+lands between keyframes.
 
 Stages, snake_case codes, in order: `planning`, `preroll` (transcode only:
 decoding from the keyframe to the origin), `encoding` (producing the first
