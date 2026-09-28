@@ -17,6 +17,12 @@
 
 namespace macha {
 
+// The container keeps no byte index (only MP4 and Matroska do).
+class KeyframeIndexUnsupported : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 namespace MediaInformationPriority {
 inline constexpr int background = 10;
 inline constexpr int requested = 50;
@@ -47,6 +53,10 @@ class MediaInformationService {
     bool prune_requested_{true};
     bool started_{};
     std::function<void(std::string, MediaProbeResult)> profile_publisher_;
+    // One keyframe index is built at a time on a node: each is one demux
+    // context reading from DATA, and a second request for the same file
+    // waits here and then finds it stored.
+    std::mutex keyframe_index_mutex_;
 
     std::optional<std::pair<std::string, FsEntry>> source_for(std::string_view media_id) const;
     bool media_is_live(std::string_view media_id) const;
@@ -79,6 +89,11 @@ class MediaInformationService {
     MediaProbeResult resolve_playback(std::string media_id, std::string path, FsEntry entry,
                                       Clock::time_point deadline);
     void request_prune();
+    // The keyframe byte index of a media, as the route serves it: the stored
+    // object, or built from the file, stored, then returned. Empty when the
+    // media is not in the namespace. Throws MediaError when the file cannot be
+    // read, and KeyframeIndexUnsupported for a container without one.
+    std::optional<Bytes> keyframe_index(const std::string& media_id, Clock::time_point deadline);
 
     CatalogueHintQueue& hints() noexcept { return hints_; }
 };

@@ -68,6 +68,14 @@ the decisions waiting on the operator.
      as a failure; the retention test waited for membership, not for the
      nodes to take DATA.
 
+0c. **Deleting unmatched files fails and logs nothing (operator, 2026-09-28).**
+   A delete of unmatched files reported "3 of 4 files could not be
+   deleted." (the client's wording) and the node logged no error. Every
+   failed `DELETE /api/v1/manage/unmatched/{id}` must log its cause (code,
+   path, media id, the filesystem error) so the next one is diagnosable from
+   the journal. Then find why three of four failed: not yet reproduced or
+   investigated.
+
 0b. **Open from 2026-09-27, not yet fixed:**
    - **The web client gates its torrent page on the answering node's
      `/torrents/status`** and shows "This server was built without

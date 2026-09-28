@@ -1,5 +1,28 @@
 # Current release
 
+## 0.68.0 — Keyframe byte index for Direct Play (development)
+
+**A Direct Play file's keyframe byte index.** A browser playing a file
+directly reports what it has buffered by mapping bytes to time linearly,
+which drifts on any file whose bitrate is uneven. The server now publishes,
+per media id, the container's own index as (time, byte offset) pairs per
+stream -- video keyframes, audio at most one a second -- sorted by offset,
+with the file's size and duration as the end anchor. It is built once, after
+the media's background profile or on the first request, stored as an
+immutable DATA object referenced from the catalogue, and never built on the
+playback path.
+
+**The catalogue shard format is MCAT0022**: a media index section after the
+profiles. MCAT0021 shards are still read.
+
+API additions (announce to Core and every client):
+- `GET /api/v1/catalogue/media/{id}/keyframes` answers `{status: ok,
+  schema_version: 1, media_id, container, offsets: sample|cluster,
+  size_bytes, duration_ms, streams: [{index, type, codec, entries:
+  [[time_ms, byte_offset], ...]}]}`, `immutable`, `ETag` the media id; codes
+  `400 bad_media_id`, `404 not_found`, `422 keyframes_not_supported`,
+  `422 keyframes_failed`.
+
 ## 0.67.0 — Per-account transcode bound; metadata editor API (development)
 
 **One account can no longer take every transcode slot on a node.**

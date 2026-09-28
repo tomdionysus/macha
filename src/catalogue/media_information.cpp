@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "catalogue/media_information.hpp"
+#include "json.hpp"
+#include "log.hpp"
 #include "metadata/namespace_tree.hpp"
 
 #include "diagnostics.hpp"
@@ -335,6 +337,16 @@ void MediaInformationService::process_hint(const CatalogueHint& hint,
         auto deadline = Clock::now() + std::chrono::seconds(30);
         (void)resolve(media_id, source->first, source->second, false, deadline);
         hints_.mark_catalogued(hint.id, "media-information", media_id, {}, "profile_prepared");
+        // The keyframe index rides the same background pass, so a client
+        // asking for it later finds it stored. Its failure is not the
+        // profile's: the route builds it on demand instead.
+        try {
+            (void)keyframe_index(media_id, Clock::now() + std::chrono::seconds(30));
+        } catch (const KeyframeIndexUnsupported&) {
+        } catch (const std::exception& e) {
+            if (!stop.stop_requested())
+                Log::debug("media keyframe index deferred media=" + media_id + " error=" + e.what());
+        }
     } catch (const InformationPreempted&) {
         hints_.defer(hint.id, "yielded_to_playback", "yielded to playback", 0);
     } catch (const std::exception& e) {
@@ -356,6 +368,59 @@ void MediaInformationService::publish_one(std::string media_id, MediaProbeResult
         catalogue_.put_media_profile(media_id, std::move(probe));
     std::lock_guard lock(mutex_);
     flights_.erase(media_id);
+}
+
+namespace {
+
+Bytes encode_keyframe_index(std::string_view media_id, const MediaKeyframeIndex& index) {
+    Json::Array streams;
+    for (const auto& stream : index.streams) {
+        Json::Array entries;
+        entries.reserve(stream.entries.size());
+        for (const auto& [ms, pos] : stream.entries)
+            entries.emplace_back(Json::Array{Json(static_cast<int64_t>(ms)), Json(static_cast<uint64_t>(pos))});
+        streams.emplace_back(Json::Object{{"index", static_cast<int64_t>(stream.index)},
+                                          {"type", media_stream_type_name(stream.type)},
+                                          {"codec", stream.codec},
+                                          {"entries", Json(std::move(entries))}});
+    }
+    Json::Object out{{"status", "ok"},
+                     {"schema_version", 1},
+                     {"media_id", std::string(media_id)},
+                     {"container", index.container},
+                     {"offsets", index.exact_offsets ? "sample" : "cluster"},
+                     {"size_bytes", index.size_bytes},
+                     {"duration_ms", static_cast<int64_t>(index.duration_ms)},
+                     {"streams", Json(std::move(streams))}};
+    const auto text = Json(std::move(out)).dump();
+    return Bytes(text.begin(), text.end());
+}
+
+} // namespace
+
+std::optional<Bytes> MediaInformationService::keyframe_index(const std::string& media_id,
+                                                             Clock::time_point deadline) {
+    if (auto stored = catalogue_.media_index(media_id)) return stored;
+    if (!engine_ || !engine_->status().available) return {};
+    std::lock_guard build(keyframe_index_mutex_);
+    if (auto stored = catalogue_.media_index(media_id)) return stored;
+    auto found = fs_.find_media(media_id);
+    if (!found) return {};
+    const auto& [path, entry] = *found;
+    MediaSource source{
+        media_id, path, entry.size,
+        [this, entry, path](MediaReadPurpose) -> std::shared_ptr<MediaInput> {
+            return std::make_shared<InformationInput>(
+                fs_.open_read(entry, path, false, FrameType::speculative), entry.size);
+        },
+        {}};
+    auto remaining = std::max(std::chrono::milliseconds(1),
+                              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()));
+    auto index = engine_->keyframe_index(source, remaining);
+    if (!index) throw KeyframeIndexUnsupported("this container keeps no byte index");
+    auto bytes = encode_keyframe_index(media_id, *index);
+    catalogue_.put_media_index(media_id, bytes);
+    return bytes;
 }
 
 void MediaInformationService::request_prune() {

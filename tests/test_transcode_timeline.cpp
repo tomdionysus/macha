@@ -140,7 +140,7 @@ void drain_encoder(AVFormatContext* out, AVCodecContext* enc, AVStream* stream, 
     av_packet_free(&packet);
 }
 
-Synthesized synthesize_source(const std::filesystem::path& path) {
+Synthesized synthesize_source(const std::filesystem::path& path, const char* muxer = "matroska") {
     // mpeg4 for the source video: it is present in every ordinary build and
     // encodes a hundred seconds of this frame size in about a second. The
     // source codec is not what is under test -- the transcode of it is.
@@ -149,7 +149,7 @@ Synthesized synthesize_source(const std::filesystem::path& path) {
     if (!video_codec || !audio_codec) throw std::runtime_error("source encoders unavailable");
 
     AVFormatContext* out = nullptr;
-    require_av(avformat_alloc_output_context2(&out, nullptr, "matroska", path.c_str()),
+    require_av(avformat_alloc_output_context2(&out, nullptr, muxer, path.c_str()),
                "allocate source container");
     const std::unique_ptr<AVFormatContext, void (*)(AVFormatContext*)> out_guard(
         out, [](AVFormatContext* c) {
@@ -757,4 +757,57 @@ MACHA_HEAVY_TEST("transcode_timeline", test_a_transcode_start_reports_its_prerol
     // before the first fragment could exist.
     CHECK(run.start_preroll_decoded_us >= run.start_preroll_total_us - frame_us);
     CHECK(run.start_output_media_us > 0);
+}
+
+MACHA_HEAVY_TEST("transcode_timeline", test_a_keyframe_index_places_every_keyframe_by_byte) {
+    // A Direct Play client maps the byte ranges it holds to times with this
+    // index. The source has a keyframe every second; the index must name them
+    // in byte order, inside the file, with the file's end as its anchor.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    TempDir temp;
+    for (const auto* muxer : {"matroska", "mp4"}) {
+        const bool mp4 = std::string_view(muxer) == "mp4";
+        const auto path = temp.path() / (mp4 ? "source.mp4" : "source.mkv");
+        const auto synthesized = synthesize_source(path, muxer);
+        MediaSource source;
+        source.media_id = std::string("macha:keyframes-") + muxer;
+        source.logical_path = path.filename().string();
+        source.size = synthesized.bytes.size();
+        source.open = [&synthesized](MediaReadPurpose) {
+            return std::make_shared<MemoryInput>(synthesized.bytes);
+        };
+        const auto index = engine->keyframe_index(source, std::chrono::milliseconds{30000});
+        REQUIRE(index.has_value());
+        std::cout << muxer << ": container=" << index->container << " streams=" << index->streams.size();
+        for (const auto& stream : index->streams)
+            std::cout << " [" << stream.index << " " << stream.codec << " " << stream.entries.size() << "]";
+        std::cout << " duration_ms=" << index->duration_ms << "\n";
+        CHECK(index->container == (mp4 ? "mp4" : "matroska"));
+        CHECK(index->exact_offsets == mp4);
+        CHECK(index->size_bytes == synthesized.bytes.size());
+        CHECK(std::llabs(index->duration_ms - static_cast<int64_t>(kSourceSeconds * 1000)) < 1000);
+        const auto video = std::find_if(index->streams.begin(), index->streams.end(),
+                                        [](const auto& s) { return s.type == MediaStreamType::video; });
+        REQUIRE(video != index->streams.end());
+        // One keyframe a second, give or take the ends.
+        CHECK(video->entries.size() >= static_cast<size_t>(kSourceSeconds) - 2);
+        CHECK(video->entries.size() <= static_cast<size_t>(kSourceSeconds) + 2);
+        for (const auto& stream : index->streams) {
+            for (size_t i = 0; i < stream.entries.size(); ++i) {
+                CHECK(stream.entries[i].second < synthesized.bytes.size());
+                CHECK(stream.entries[i].first <= index->duration_ms);
+                if (i) CHECK(stream.entries[i].second >= stream.entries[i - 1].second);
+            }
+        }
+        if (mp4) {
+            // Every AAC frame is a sync sample; the index keeps one a second.
+            const auto audio = std::find_if(index->streams.begin(), index->streams.end(),
+                                            [](const auto& s) { return s.type == MediaStreamType::audio; });
+            REQUIRE(audio != index->streams.end());
+            CHECK(audio->entries.size() >= static_cast<size_t>(kSourceSeconds) - 2);
+            CHECK(audio->entries.size() <= static_cast<size_t>(kSourceSeconds) + 2);
+        }
+    }
 }

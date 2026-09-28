@@ -316,9 +316,37 @@ class MediaEngineSession {
     virtual void stop() = 0;
 };
 
+// Where a file's keyframes (video) and samples (audio) sit, as bytes, so a
+// client can turn the byte ranges it holds into times. Facts from the
+// container's own index: in MP4 each offset is the sample's exact position;
+// in Matroska it is the Cluster holding the entry, which starts at or just
+// before it. Each stream's entries are (time_ms, byte offset), sorted by
+// offset; audio keeps at most one entry per second of media. Past the last
+// entry the file ends at (duration_ms, size_bytes).
+struct MediaKeyframeIndex {
+    std::string container;
+    bool exact_offsets{};
+    uint64_t size_bytes{};
+    int64_t duration_ms{};
+    struct Stream {
+        int index{-1};
+        MediaStreamType type{MediaStreamType::other};
+        std::string codec;
+        std::vector<std::pair<int64_t, uint64_t>> entries;
+    };
+    std::vector<Stream> streams;
+};
+
 class MediaEngine {
   public:
     virtual ~MediaEngine() = default;
+    // Empty when the container keeps no usable byte index (only MP4 and
+    // Matroska do). Throws MediaError when the source cannot be read.
+    virtual std::optional<MediaKeyframeIndex> keyframe_index(const MediaSource&,
+                                                             std::chrono::milliseconds timeout = {}) {
+        (void)timeout;
+        return std::nullopt;
+    }
     virtual MediaEngineStatus status() const = 0;
     virtual MediaProbeResult probe(const MediaSource&,
                                    std::chrono::milliseconds timeout = {}) = 0;
