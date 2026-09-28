@@ -197,6 +197,37 @@ for that long. Published beside the others in each node's Status `playback`
 block, with `start_wait_max_ms` (the long-poll cap). Absent means the node
 does not support `start=async`.
 
+### 7. Settled with Core and the web client (2026-09-28)
+
+- **Close before ready.** The 202 payload carries the session's signed close
+  URL (`POST .../stream/{token}/close`, as since 0.60.0), and the node accepts
+  it for a pending create; a pending PATCH's `pending` carries its own. A page
+  unloading mid-start can then close without the bearer DELETE.
+- **Idempotency covers the pending state.** A retried `POST ?start=async`
+  with the same `idempotency_key` answers the same pending session (`202`,
+  `idempotency: replayed`), never a second admission.
+- **A failed start releases at once.** On `failed` the transcode entitlement
+  and the session's slot are released immediately; `GET` keeps answering the
+  `failed` state with its error for 60 s (`start_failed_retention_ms`,
+  published in Status), then `404`.
+- **Direct play never goes pending.** Under `start=async` a direct create
+  answers exactly as a blocking one: `201` with its URLs and no `start`
+  object. Nothing to poll.
+- **The body is complete.** The `202` body carries `session_id` and every
+  stable field a blocking create returns (mode, preferences, selected,
+  source, endpoint); no reader needs a header, `Location` included.
+- **Long-poll cap.** `start_wait_max_ms` (proposed 25000) is in Status; a
+  `wait_ms` above it is clamped, not refused.
+- **Stages by mode.** A remux has no pre-roll (it starts at a keyframe);
+  its `encoding` stage is packaging. `progress_age_ms` is on the node's
+  clock and comparable only with itself.
+- **Replacement URLs on the same poll.** When a pending PATCH reaches
+  `ready`, the long-poll that sees it carries the replacement's stream URLs,
+  so a client can buffer it beside the playing generation.
+- **Abandoning is cheap.** `DELETE` of a pending create or of `pending`
+  stops the start and frees its transcode slot at once, so a client may race
+  or abandon a slow start on its own budget.
+
 ## What has to be measured before the shape is final
 
 The counters above are what the code can see, but none is exported today:
