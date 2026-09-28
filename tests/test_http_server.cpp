@@ -164,6 +164,8 @@ MACHA_TEST("http_server", test_a_repeated_query_parameter_keeps_every_value) {
         std::string joined;
         if (auto all = request.query_all.find("kind"); all != request.query_all.end())
             for (const auto& value : all->second) joined += value + ";";
+        if (request.query_all.empty())
+            return http_json(200, "{\"parameters\":0}");
         return http_json(200, "{\"kinds\":\"" + joined + "\",\"last\":\"" +
                                   request.query.at("kind") + "\"}");
     });
@@ -172,6 +174,8 @@ MACHA_TEST("http_server", test_a_repeated_query_parameter_keeps_every_value) {
     const auto response = raw_http_get(server.bound_port(), "/q?kind=movie&kind=show%20x&q=1");
     CHECK(response.find("\"kinds\":\"movie;show x;\"") != std::string::npos);
     CHECK(response.find("\"last\":\"show x\"") != std::string::npos);
+    // A target with no query string has no parameters at all.
+    CHECK(raw_http_get(server.bound_port(), "/q").find("\"parameters\":0") != std::string::npos);
     server.stop();
 }
 
