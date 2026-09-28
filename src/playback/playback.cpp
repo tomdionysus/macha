@@ -26,7 +26,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <utility>
 
 #if defined(__linux__)
 #include <malloc.h>
