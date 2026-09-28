@@ -238,6 +238,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                        cfg_.runtime.viewer_memory_reserve_bytes,
                        cfg_.runtime.loader_memory_reserve_bytes,
                        cfg_.runtime.reassembly_memory_reserve_bytes),
+      transcode_rates_(cfg_.state_path / "playback" / "transcode-rates.json"),
       inbound_(initial_inbound_resolution(cfg_)),
       members_(self_info(cfg_, id_, 0, 0, 0,
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
@@ -1783,7 +1784,9 @@ void NodeRuntime::refresh_telemetry() {
             static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.start_wait_max.count()));
         playback.start_failed_retention_ms = static_cast<uint32_t>(
             std::max<int64_t>(0, cfg_.streaming.start_failed_retention.count()));
+        playback.transcode_rates = transcode_rates_.summary();
     }
+    telemetry_.set_node_name(cfg_.node_name);
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
                              peers_active > 0 ? peers_active - 1 : 0, phase,

@@ -949,6 +949,9 @@ struct PlaybackManager::Impl {
     size_t reserved_audio_transcodes{};
     // Transcode entitlements reserved per account and not yet committed.
     std::map<std::string, size_t, std::less<>> reserved_account_transcodes;
+    // Transcoding pipelines running now, as the concurrency a rate
+    // observation was taken at.
+    std::atomic<uint32_t> running_transcodes{};
     uint64_t idle_pipelines_reclaimed{};
     uint64_t unused_sessions_reclaimed{};
     bool heap_reclaim_pending{};
@@ -2108,6 +2111,29 @@ struct PlaybackManager::Impl {
         signal_cleanup_locked();
     }
 
+    static bool transcoding(const PlaybackPlan& plan) {
+        return plan.video == MediaTransform::transcode || plan.audio == MediaTransform::transcode;
+    }
+
+    // A transcode generation that produced at least a minute of media says
+    // what this node sustained for its kind of source; record it as the
+    // generation ends.
+    void record_transcode_rate(const Session& session, MediaEngineSession& active) {
+        if (!transcoding(session.plan)) return;
+        const auto state = active.segments()->snapshot();
+        if (state.produced_media_ms < 60000 || state.producing_ms == 0) return;
+        const double rate = static_cast<double>(state.produced_media_ms) / static_cast<double>(state.producing_ms);
+        const auto concurrent = running_transcodes.load();
+        auto& book = fs.node().transcode_rates();
+        if (session.plan.video == MediaTransform::transcode) {
+            if (const auto* video = stream_at(session.probe, session.plan.video_stream))
+                book.record("video", video->codec, static_cast<uint32_t>(std::max(0, video->bit_depth)),
+                            TranscodeRateBook::height_class(video->height), rate, concurrent);
+        } else if (const auto* audio = stream_at(session.probe, session.plan.audio_stream)) {
+            book.record("audio", audio->codec, 0, 0, rate, concurrent);
+        }
+    }
+
     void stop_pipeline(Session& session) {
         std::shared_ptr<MediaEngineSession> active;
         {
@@ -2115,6 +2141,8 @@ struct PlaybackManager::Impl {
             active.swap(session.engine_session);
         }
         if (active) {
+            record_transcode_rate(session, *active);
+            if (transcoding(session.plan) && running_transcodes.load() > 0) --running_transcodes;
             active->stop();
             // Destroy codec and segment owners before waking the asynchronous
             // reclaimer. stop_pipeline() is also used by viewer-facing seek
@@ -2297,6 +2325,7 @@ struct PlaybackManager::Impl {
                 std::lock_guard lock(session.pipeline_mutex);
                 session.engine_session = std::shared_ptr<MediaEngineSession>(std::move(launched));
             }
+            if (transcoding(session.plan)) ++running_transcodes;
             if (wait_for_first_fragment) {
                 try {
                     wait_for_initial_fragment(session, trace);

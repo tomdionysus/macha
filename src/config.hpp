@@ -855,6 +855,9 @@ struct Config {
     std::string listen_host{"0.0.0.0"};
     std::string advertise_host;
     std::string failure_domain;
+    // A display name for this node (`node_name`), shown as-is in Status;
+    // nothing routes or ranks on it. Empty means none.
+    std::string node_name;
     uint16_t port{7437};
     // network.inbound_capable: can peers connect *to* this node? `no` is the
     // node behind CGNAT or a corporate NAT: it dials its peers, they answer

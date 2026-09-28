@@ -26,6 +26,20 @@ enum class NodePhase : uint8_t { starting, recovering, ready };
 
 std::string_view node_phase_name(NodePhase);
 
+// What a node has sustained transcoding one kind of source: the median of its
+// recent finished generations' produced / producing media time, parked time
+// excluded. A measurement, never an estimate; an unseen class is absent.
+struct TranscodeRate {
+    std::string kind;        // "video" or "audio"
+    std::string codec;       // the source stream's codec
+    uint32_t bit_depth{};    // video only
+    uint32_t height_class{}; // video only: 576, 720, 1080, 1440, 2160, 4320
+    uint32_t rate_milli{};   // median rate x1000
+    uint32_t observations{};
+    uint32_t concurrent{};   // median transcodes running on the node when observed
+    auto operator<=>(const TranscodeRate&) const = default;
+};
+
 struct NodeTelemetry {
     NodeId node_id{};
     NodeId boot_id{};
@@ -145,6 +159,9 @@ struct NodeTelemetry {
     uint32_t playback_startup_no_progress_ms{};
     uint32_t playback_start_wait_max_ms{};
     uint32_t playback_start_failed_retention_ms{};
+    std::vector<TranscodeRate> playback_transcode_rates;
+    // The operator's display name for the node (`node_name`), or empty.
+    std::string node_name;
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -163,6 +180,7 @@ struct PlaybackBudgets {
     uint32_t startup_no_progress_ms{};
     uint32_t start_wait_max_ms{};
     uint32_t start_failed_retention_ms{};
+    std::vector<TranscodeRate> transcode_rates;
 };
 
 // Grouped for the same reason as PlaybackBudgets below it: refresh_local's
@@ -202,8 +220,14 @@ class TelemetryStore {
     std::clock_t previous_cpu_{std::clock()};
     uint64_t sequence_{};
     std::filesystem::path persisted_path_;
+    std::string node_name_;
 
   public:
+    // The display name this node reports for itself from its next sample on.
+    void set_node_name(std::string name) {
+        std::lock_guard lock(mutex_);
+        node_name_ = std::move(name);
+    }
     TelemetryStore(NodeId self, std::filesystem::path persisted_path = {});
     NodeId boot_id() const { return boot_id_; }
     NodeTelemetry refresh_local(const NodeInfo&, std::string version, uint64_t cache_capacity,
