@@ -1004,10 +1004,12 @@ std::vector<CatalogueItem> CatalogueManager::list(std::optional<CatalogueKind> k
     return out;
 }
 
-std::vector<CatalogueItem> CatalogueManager::search(std::string_view query, size_t limit) {
+std::vector<CatalogueItem> CatalogueManager::search(
+    std::string_view query, size_t limit, const std::function<bool(const CatalogueItem&)>& keep) {
     auto snapshot = current_snapshot();
     std::vector<std::pair<double, CatalogueItem>> ranked;
     for (const auto& [_, item] : snapshot->items) {
+        if (keep && !keep(item)) continue;
         auto s = score(query, item);
         if (s > 0.0)
             ranked.emplace_back(s, item);
@@ -1349,7 +1351,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          const std::set<std::string>& active_media_ids,
                                          bool prune_missing,
                                          std::optional<Hash256> expected_namespace,
-                                         const std::map<std::string, MediaProbeResult, std::less<>>& profiles) {
+                                         const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
+                                         const std::set<std::string>& vanished_media) {
     DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
@@ -1457,6 +1460,24 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                 ++item.revision;
                 item.updated_ns = wall_time_ns();
                 changed = true;
+            }
+        }
+
+        // A manual item may bind a file outside the catalogue roots, so it
+        // loses only files gone from the namespace altogether.
+        if (!vanished_media.empty()) {
+            for (auto& [_, item] : current.items) {
+                auto marker = item.external_ids.find("macha_scanner");
+                if (marker != item.external_ids.end() && marker->second == "1") continue;
+                const auto before = item.media_ids.size();
+                std::erase_if(item.media_ids, [&](const std::string& media) {
+                    return vanished_media.contains(media);
+                });
+                if (item.media_ids.size() != before) {
+                    ++item.revision;
+                    item.updated_ns = wall_time_ns();
+                    changed = true;
+                }
             }
         }
 

@@ -21,18 +21,21 @@ class CatalogueApi {
     // (operator, 2026-09-07). Absent only in fixtures without an engine.
     std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile_;
     std::chrono::milliseconds artwork_capability_ttl_;
+    // The size of a media id's file, when this node can find it.
+    std::function<std::optional<uint64_t>(const std::string&)> media_size_;
   public:
     CatalogueApi(
         CatalogueManager& catalogue, CatalogueHintQueue& hints,
         std::function<void(const std::vector<std::string>&)> request_media_rescan = {},
         std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
         std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile = {},
-        std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30))
+        std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
+        std::function<std::optional<uint64_t>(const std::string&)> media_size = {})
         : catalogue_(catalogue), hints_(hints),
           request_media_rescan_(std::move(request_media_rescan)),
           request_media_profiles_(std::move(request_media_profiles)),
           resolve_media_profile_(std::move(resolve_media_profile)),
-          artwork_capability_ttl_(artwork_capability_ttl) {}
+          artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)) {}
     HttpResponse handle(const HttpRequest&);
     // Recognizes a request as a self-authorizing capability URL (currently:
     // an artwork GET carrying a valid, unexpired signature) so HttpServer can

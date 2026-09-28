@@ -35,6 +35,9 @@ struct HttpRequest {
     bool resumed{};
     std::shared_ptr<void> resumed_state{};
     Clock::time_point resume_deadline{};
+    // Every value of each query parameter, in order, for parameters that may
+    // repeat (`kind=movie&kind=show`); `query` keeps the last of each.
+    std::map<std::string, std::vector<std::string>, std::less<>> query_all;
 };
 
 class HttpBodySource {

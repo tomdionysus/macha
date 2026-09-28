@@ -408,6 +408,9 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_max_sessions_per_account)
             playback["max_sessions_per_account"] =
                 static_cast<uint64_t>(live->playback_max_sessions_per_account);
+        if (live->playback_max_transcodes_per_account)
+            playback["max_transcodes_per_account"] =
+                static_cast<uint64_t>(live->playback_max_transcodes_per_account);
         // The node-wide cap beside the per-account one. 0.48.0 shipped the
         // second without the first, which left the two 429s asymmetric where
         // it mattered: a client could say "another screen on this account is

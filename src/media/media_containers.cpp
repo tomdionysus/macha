@@ -19,44 +19,41 @@ bool same_token(std::string_view left, std::string_view right) {
                       });
 }
 
-// One row per file name we recognise: the container the name claims, what to
-// say in Content-Type when those bytes are served unchanged, and whether the
-// catalogue should treat the file as video or as audio. An empty container or
-// mime means the name does not say and something else must decide -- the
-// probe for the container, application/octet-stream for the type.
+// One row per file name we recognise: the container the name claims, and
+// whether the catalogue should treat the file as video or as audio. An empty
+// container means the name does not say and the probe decides.
 struct ExtensionFact {
     std::string_view extension;
     std::string_view container;
-    std::string_view mime;
     Kind kind;
 };
 
 constexpr std::array<ExtensionFact, 23> extension_facts{{
-    {".mkv", "matroska", "video/x-matroska", Kind::video},
-    {".mka", "matroska", "audio/x-matroska", Kind::audio},
-    {".webm", "webm", "video/webm", Kind::video},
+    {".mkv", "matroska", Kind::video},
+    {".mka", "matroska", Kind::audio},
+    {".webm", "webm", Kind::video},
     // The mov/mp4/m4a family shares one demuxer and one container token.
-    {".mp4", "mp4", "video/mp4", Kind::video},
-    {".m4v", "mp4", "video/mp4", Kind::video},
-    {".mov", "mp4", "video/mp4", Kind::video},
-    {".m4a", "mp4", "audio/mp4", Kind::audio},
-    {".avi", "avi", "video/x-msvideo", Kind::video},
-    {".wmv", "asf", "video/x-ms-wmv", Kind::video},
-    {".wma", "asf", "audio/x-ms-wma", Kind::audio},
-    {".mpg", "mpeg", "video/mpeg", Kind::video},
-    {".mpeg", "mpeg", "video/mpeg", Kind::video},
-    {".ts", "mpegts", "video/mp2t", Kind::video},
-    {".m2ts", "mpegts", "video/mp2t", Kind::video},
-    {".mp3", "mp3", "audio/mpeg", Kind::audio},
-    {".flac", "flac", "audio/flac", Kind::audio},
-    {".ogg", "ogg", "audio/ogg", Kind::audio},
-    {".oga", "ogg", "audio/ogg", Kind::audio},
-    {".opus", "ogg", "audio/ogg", Kind::audio},
-    {".aac", "adts", "audio/aac", Kind::audio},
-    {".wav", "wav", "audio/wav", Kind::audio},
-    {".aiff", "aiff", "audio/aiff", Kind::audio},
+    {".mp4", "mp4", Kind::video},
+    {".m4v", "mp4", Kind::video},
+    {".mov", "mp4", Kind::video},
+    {".m4a", "mp4", Kind::audio},
+    {".avi", "avi", Kind::video},
+    {".wmv", "asf", Kind::video},
+    {".wma", "asf", Kind::audio},
+    {".mpg", "mpeg", Kind::video},
+    {".mpeg", "mpeg", Kind::video},
+    {".ts", "mpegts", Kind::video},
+    {".m2ts", "mpegts", Kind::video},
+    {".mp3", "mp3", Kind::audio},
+    {".flac", "flac", Kind::audio},
+    {".ogg", "ogg", Kind::audio},
+    {".oga", "ogg", Kind::audio},
+    {".opus", "ogg", Kind::audio},
+    {".aac", "adts", Kind::audio},
+    {".wav", "wav", Kind::audio},
+    {".aiff", "aiff", Kind::audio},
     // A name that states a codec and not a container. The probe decides.
-    {".alac", "", "", Kind::audio},
+    {".alac", "", Kind::audio},
 }};
 
 // libavformat lists every name a demuxer answers to ("matroska,webm",
@@ -123,13 +120,43 @@ constexpr std::array<CarriageFact, 10> carriage_facts{{
 constexpr std::array<std::string_view, 6> webvtt_source_codecs{
     "ass", "mov_text", "ssa", "subrip", "text", "webvtt"};
 
+// Content-Type for a source served unchanged, by its probed container: one
+// type when the media has a picture, one when it is sound alone. An empty
+// audio type means the container is not used for sound alone.
+struct ContainerMime {
+    std::string_view container;
+    std::string_view video;
+    std::string_view audio;
+};
+
+constexpr std::array<ContainerMime, 13> container_mimes{{
+    {"matroska", "video/x-matroska", "audio/x-matroska"},
+    {"webm", "video/webm", "audio/webm"},
+    {"mp4", "video/mp4", "audio/mp4"},
+    {"avi", "video/x-msvideo", ""},
+    {"asf", "video/x-ms-wmv", "audio/x-ms-wma"},
+    {"mpeg", "video/mpeg", "audio/mpeg"},
+    {"mpegts", "video/mp2t", "audio/mp2t"},
+    {"mp3", "", "audio/mpeg"},
+    {"flac", "", "audio/flac"},
+    {"ogg", "video/ogg", "audio/ogg"},
+    {"adts", "", "audio/aac"},
+    {"wav", "", "audio/wav"},
+    {"aiff", "", "audio/aiff"},
+}};
+
 // Content-Type for the files a session generates rather than serves.
-constexpr std::array<ExtensionFact, 5> generated_facts{{
-    {".m3u8", "", "application/vnd.apple.mpegurl", Kind::video},
-    {".m4s", "", "video/mp4", Kind::video},
-    {".mp4", "", "video/mp4", Kind::video},
-    {".ts", "", "video/mp2t", Kind::video},
-    {".vtt", "", "text/vtt; charset=utf-8", Kind::video},
+struct GeneratedFact {
+    std::string_view extension;
+    std::string_view mime;
+};
+
+constexpr std::array<GeneratedFact, 5> generated_facts{{
+    {".m3u8", "application/vnd.apple.mpegurl"},
+    {".m4s", "video/mp4"},
+    {".mp4", "video/mp4"},
+    {".ts", "video/mp2t"},
+    {".vtt", "text/vtt; charset=utf-8"},
 }};
 
 const ExtensionFact* extension_fact(std::string_view ext) {
@@ -207,10 +234,14 @@ std::string container_for_format(std::string_view format, std::string_view path)
     return std::string(first_token);
 }
 
-std::string direct_mime(std::string_view path) {
-    const auto* fact = extension_fact(path_extension(path));
-    if (!fact || fact->mime.empty()) return "application/octet-stream";
-    return std::string(fact->mime);
+std::string direct_mime(std::string_view container, bool picture) {
+    for (const auto& fact : container_mimes) {
+        if (fact.container != container) continue;
+        const auto preferred = picture ? fact.video : fact.audio;
+        const auto other = picture ? fact.audio : fact.video;
+        return std::string(preferred.empty() ? other : preferred);
+    }
+    return "application/octet-stream";
 }
 
 std::string segment_mime(std::string_view name) {

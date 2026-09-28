@@ -1772,6 +1772,8 @@ void NodeRuntime::refresh_telemetry() {
             static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.session_idle.count()));
         playback.max_sessions_per_account =
             static_cast<uint32_t>(cfg_.streaming.max_sessions_per_account);
+        playback.max_transcodes_per_account =
+            static_cast<uint32_t>(cfg_.streaming.max_transcodes_per_account);
         playback.max_sessions = static_cast<uint32_t>(cfg_.streaming.max_sessions);
         playback.transcode_entitlement_idle_ms = static_cast<uint32_t>(
             std::max<int64_t>(0, cfg_.streaming.transcode_entitlement_idle.count()));

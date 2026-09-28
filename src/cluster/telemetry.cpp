@@ -132,6 +132,7 @@ enum TelemetryFieldId : uint16_t {
     field_cache_hits = 35,
     field_cache_misses = 36,
     field_cache_evictions = 37,
+    field_playback_max_transcodes_per_account = 38,
 };
 
 void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
@@ -209,6 +210,8 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     put_uint(body, field_playback_session_idle_ms, value.playback_session_idle_ms);
     put_uint(body, field_playback_max_sessions_per_account,
              value.playback_max_sessions_per_account);
+    put_uint(body, field_playback_max_transcodes_per_account,
+             value.playback_max_transcodes_per_account);
     put_uint(body, field_playback_max_sessions, value.playback_max_sessions);
     put_uint(body, field_playback_transcode_entitlement_idle_ms,
              value.playback_transcode_entitlement_idle_ms);
@@ -346,6 +349,10 @@ NodeTelemetry decode(Reader& reader) {
         case field_playback_max_sessions_per_account:
             value.playback_max_sessions_per_account = static_cast<uint32_t>(
                 field_uint(payload, 4, "playback_max_sessions_per_account"));
+            break;
+        case field_playback_max_transcodes_per_account:
+            value.playback_max_transcodes_per_account = static_cast<uint32_t>(
+                field_uint(payload, 4, "playback_max_transcodes_per_account"));
             break;
         case field_playback_max_sessions:
             value.playback_max_sessions =
@@ -510,6 +517,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.playback_pipeline_idle_ms = playback.pipeline_idle_ms;
     telemetry.playback_session_idle_ms = playback.session_idle_ms;
     telemetry.playback_max_sessions_per_account = playback.max_sessions_per_account;
+    telemetry.playback_max_transcodes_per_account = playback.max_transcodes_per_account;
     telemetry.playback_max_sessions = playback.max_sessions;
     telemetry.cache_hits = cache.hits;
     telemetry.cache_misses = cache.misses;

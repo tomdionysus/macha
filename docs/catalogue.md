@@ -54,13 +54,17 @@ GET /api/v1/catalogue/media/{url-encoded-macha-media-id}/profile
 ```
 
 The response contains `schema_version` (currently 3), `media_id`, `format`,
-`duration_ms`, aggregate `bitrate`, and per stream `index`, `type`, `codec`,
-`profile`, `language`, `width`, `height`, `channels`, `sample_rate`,
-`bit_depth`, `level`, `color_transfer`, `dolby_vision_profile`,
-`dolby_vision_compatibility`, `default`, `forced`, `bitrate` and
-`attached_picture`. Every field is present, with `0` or `""` for a fact the
-stream does not have. It is served with private immutable cache headers and the
-media ID as its `ETag`.
+`size` (the file's bytes), `duration_ms`, aggregate `bitrate`, and per stream
+`index`, `type`, `codec`, `profile`, `language`, `width`, `height`,
+`channels`, `sample_rate`, `bit_depth`, `level`, `color_transfer`,
+`dolby_vision_profile`, `dolby_vision_compatibility`, `default`, `forced`,
+`bitrate` and `attached_picture`. Every stream field is present, with `0` or
+`""` for a fact the stream does not have. It is served with private immutable
+cache headers and the media ID as its `ETag`: a media ID names its bytes, so
+none of this changes. `size` is `null` when this node cannot find the file,
+and that answer is served `no-cache`. `format` is libav's name for what the
+file is; the playback `container`, which can depend on the file's name, is on
+session facts only.
 
 Pre-session availability is guaranteed for a `macha:` identity, so a miss is
 not normally a deferral. The order is:
@@ -148,8 +152,11 @@ The `error` text is for people; act on the codes.
 Reads need `media_viewer`; every mutation needs `manager`.
 
 - `GET /api/v1/catalogue/status` — `ready`, `metadata_generation`, `known_metadata_generation`, `root`, `items`, `artwork_objects`, `local_artwork_objects`, `last_sync_unix_ms`, and `error_code` (`converging`, `unavailable`) beside `error`.
-- `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...&limit=...` (limit up to 1000, default 50) — `{"items": [...]}`.
-- `GET|PUT|DELETE /api/v1/catalogue/items/{id}` — the item carries its revision as `ETag: "rev-N"`; `PUT` and `DELETE` honour `If-Match` with that value and answer a stale one with `409 conflict`.
+- `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...&limit=...` (limit up to 1000, default 50) — `{"items": [...]}`. Search also takes `kind`, which may repeat (`kind=movie&kind=show`; `movie`, `show`, `season`, `episode`, `artist`, `album`, `track`), and `parent`, which keeps only that item's children; both filter before `limit`, and an unknown kind is `400 bad_kind`.
+- `GET|PUT|PATCH|DELETE /api/v1/catalogue/items/{id}` — the item carries its revision as `ETag: "rev-N"`; `PUT`, `PATCH` and `DELETE` honour `If-Match` with that value and answer a stale one with `409 conflict`.
+  - `PUT` replaces the item's descriptive fields; `media_ids` and `artwork` change only when the body names them, so an edit that leaves them out keeps the item's files and artwork. `PATCH` changes only the fields present, and `null` clears an optional one; an unknown item is `404 not_found`.
+  - A `parent_id` must name an existing item of the right kind (season under show, episode under season, album under artist, track under album; movie, show and artist take none): otherwise `400 parent_not_found` with `parent_id`, or `400 bad_parent_kind` with `kind` and `parent_kind`. A body that is not a usable item is `400 bad_item`.
+  - An edit locks the item against the scanner (`external_ids.macha_metadata_locked`) unless the body says `"lock": false`, which removes the lock.
 - `DELETE /api/v1/catalogue/items/{id}/metadata` — clears the item's metadata and queues its media for rematching.
 - `POST /api/v1/catalogue/items/{id}/artwork?role=...&mime=...` — stores the body as artwork (DATA, below) and answers `201` with `role`, `id`, `mime_type`.
 - `GET /api/v1/catalogue/artwork/{object id}` — artwork bytes. Items carry signed artwork URLs (`?exp=...&sig=...`) that need no bearer token and stay byte-identical inside a TTL bucket, so a browser cache keeps them; the response is `immutable` with the object id as its `ETag`.

@@ -215,6 +215,11 @@ std::string_view Service::required_role(const HttpRequest& request) {
         // peer on the caller's say-so.
         return mutating ? role_manager : role_view_status;
 
+    // Provider search and artwork listings are not reads either: they make
+    // this node call TMDB or MusicBrainz on the caller's say-so.
+    if (request.path.starts_with("/api/v1/manage/providers"))
+        return role_manager;
+
     // Managing accounts. "me" is the exception: everyone may change their own
     // password, and UsersApi refuses a role change made that way.
     if (UsersApi::routes(request.path))
@@ -664,7 +669,12 @@ void Service::initialise_services(std::stop_token stop) {
                 return information->resolve_playback(media_id, found->first, found->second,
                                                      Clock::now() + std::chrono::seconds(30));
             },
-            node_.config().catalogue.api.artwork_capability_ttl);
+            node_.config().catalogue.api.artwork_capability_ttl,
+            [fs_ptr = fs.get()](const std::string& media_id) -> std::optional<uint64_t> {
+                auto found = fs_ptr->find_media(media_id);
+                if (!found) return std::nullopt;
+                return found->second.size;
+            });
         auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
                                                       *catalogue_hints, *scanner);
         auto streaming = std::make_unique<PlaybackManager>(

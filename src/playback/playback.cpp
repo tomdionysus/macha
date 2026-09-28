@@ -68,6 +68,14 @@ std::string source_container(const MediaProbeResult& probe, std::string_view pat
     return container_for_format(probe.format, path);
 }
 
+// Content-Type for serving the source unchanged, from the media info.
+std::string source_mime(const MediaProbeResult& probe, std::string_view path) {
+    const bool picture = std::any_of(probe.streams.begin(), probe.streams.end(), [](const auto& stream) {
+        return stream.type == MediaStreamType::video && !stream.attached_picture;
+    });
+    return direct_mime(source_container(probe, path), picture);
+}
+
 bool webvtt_subtitle_supported(const MediaStreamInfo& stream) {
     return stream.type == MediaStreamType::subtitle &&
            webvtt_subtitle_codec_supported(stream.codec);
@@ -128,6 +136,20 @@ public:
         : std::runtime_error("account playback session limit reached: holding " +
                              std::to_string(held) + " of " + std::to_string(limit) +
                              " on this node"),
+          held_(held), limit_(limit) {}
+    size_t held() const noexcept { return held_; }
+    size_t limit() const noexcept { return limit_; }
+
+private:
+    size_t held_;
+    size_t limit_;
+};
+
+class AccountTranscodeLimitError final : public std::runtime_error {
+public:
+    AccountTranscodeLimitError(size_t held, size_t limit)
+        : std::runtime_error("account transcode limit reached: holding " + std::to_string(held) +
+                             " of " + std::to_string(limit) + " on this node"),
           held_(held), limit_(limit) {}
     size_t held() const noexcept { return held_; }
     size_t limit() const noexcept { return limit_; }
@@ -866,6 +888,8 @@ struct PlaybackManager::Impl {
     size_t pending_sessions{};
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
+    // Transcode entitlements reserved per account and not yet committed.
+    std::map<std::string, size_t, std::less<>> reserved_account_transcodes;
     uint64_t idle_pipelines_reclaimed{};
     uint64_t unused_sessions_reclaimed{};
     bool heap_reclaim_pending{};
@@ -1464,7 +1488,31 @@ struct PlaybackManager::Impl {
     struct ResourceReservation {
         bool video{};
         bool audio{};
+        // The account's first entitlement for this logical viewer: counted
+        // against max_transcodes_per_account until committed or rolled back.
+        std::string account;
+        bool account_slot{};
     };
+
+    // Logical viewers of `account` holding a transcode entitlement, plus the
+    // account's entitlements reserved and not yet committed.
+    size_t account_transcodes_locked(std::string_view account,
+                                     std::string_view excluding = {}) const {
+        size_t count = 0;
+        std::set<const LogicalViewerSession*> counted;
+        for (const auto& [id, session] : sessions) {
+            if (id == excluding || session->account != account || !session->logical_session)
+                continue;
+            if ((session->logical_session->video_transcode_entitled ||
+                 session->logical_session->audio_transcode_entitled) &&
+                counted.insert(session->logical_session.get()).second)
+                ++count;
+        }
+        if (auto reserved = reserved_account_transcodes.find(account);
+            reserved != reserved_account_transcodes.end())
+            count += reserved->second;
+        return count;
+    }
 
     void reserve_session_slot(std::string_view account) {
         std::lock_guard lock(mutex);
@@ -1521,11 +1569,22 @@ struct PlaybackManager::Impl {
         if (audio && audio_transcodes_locked(excluding) + reserved_audio_transcodes >=
                          config.max_audio_transcodes)
             throw ResourceLimitError("audio transcode limit reached");
+        // A logical viewer that holds no entitlement yet is a new transcoding
+        // viewer for its account; one already holding video or audio is not.
+        const bool account_slot =
+            (video || audio) && !session.logical_session->video_transcode_entitled &&
+            !session.logical_session->audio_transcode_entitled;
+        if (account_slot && config.max_transcodes_per_account) {
+            const auto held = account_transcodes_locked(session.account, excluding);
+            if (held >= config.max_transcodes_per_account)
+                throw AccountTranscodeLimitError(held, config.max_transcodes_per_account);
+        }
         if (video) ++reserved_video_transcodes;
         if (audio) ++reserved_audio_transcodes;
+        if (account_slot) ++reserved_account_transcodes[session.account];
         if (video) session.logical_session->video_transcode_entitled = true;
         if (audio) session.logical_session->audio_transcode_entitled = true;
-        return {video, audio};
+        return {video, audio, account_slot ? session.account : std::string{}, account_slot};
     }
 
     // True when no session other than this one shares its logical viewer.
@@ -1601,6 +1660,12 @@ struct PlaybackManager::Impl {
     void commit_resources_locked(const ResourceReservation& reservation) {
         if (reservation.video && reserved_video_transcodes) --reserved_video_transcodes;
         if (reservation.audio && reserved_audio_transcodes) --reserved_audio_transcodes;
+        if (reservation.account_slot) {
+            auto reserved = reserved_account_transcodes.find(reservation.account);
+            if (reserved != reserved_account_transcodes.end() && reserved->second &&
+                --reserved->second == 0)
+                reserved_account_transcodes.erase(reserved);
+        }
     }
 
     void rollback_resources(Session& session, const ResourceReservation& reservation) {
@@ -2025,7 +2090,7 @@ struct PlaybackManager::Impl {
                              {"can_seek", true},
                              {"can_change_quality", can_change_quality}};
         const auto mime_type = session.plan.mode == PlaybackMode::direct
-                                   ? direct_mime(session.source.logical_path)
+                                   ? source_mime(session.probe, session.source.logical_path)
                                    : "application/vnd.apple.mpegurl";
         Json::Object source{{"path", session.source.logical_path},
                             {"format", session.probe.format},
@@ -2210,7 +2275,8 @@ struct PlaybackManager::Impl {
                 session->stream_served = true;
                 signal_cleanup_locked();
             }
-            return ranged_response(request, session->source_entry.size, direct_mime(session->source.logical_path),
+            return ranged_response(request, session->source_entry.size,
+                                   source_mime(session->probe, session->source.logical_path),
                                    [this, path = session->source.logical_path, entry = session->source_entry](uint64_t offset, uint64_t length) {
                                        return std::make_shared<LogicalBody>(fs.open_read(entry, path, false, FrameType::foreground), offset, length);
                                    });
@@ -2676,8 +2742,10 @@ struct PlaybackManager::Impl {
         {
             std::lock_guard lock(mutex);
             out["sessions"] = static_cast<uint64_t>(sessions_held_by_locked(account));
+            out["transcodes"] = static_cast<uint64_t>(account_transcodes_locked(account));
         }
         out["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
+        out["max_transcodes"] = static_cast<uint64_t>(config.max_transcodes_per_account);
         return Json(std::move(out));
     }
 
@@ -2693,12 +2761,14 @@ struct PlaybackManager::Impl {
         // per-node listing hands it over for free.
         const auto account = account_key(*request.session);
         Json::Array out;
+        size_t transcodes = 0;
         {
             std::lock_guard lock(mutex);
             for (const auto& [_, session] : sessions) {
                 if (session->account != account) continue;
                 out.push_back(session_json(*session));
             }
+            transcodes = account_transcodes_locked(account);
         }
         Json::Object body;
         const auto held = out.size();
@@ -2711,6 +2781,8 @@ struct PlaybackManager::Impl {
         Json::Object account_info;
         account_info["sessions"] = static_cast<uint64_t>(held);
         account_info["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
+        account_info["transcodes"] = static_cast<uint64_t>(transcodes);
+        account_info["max_transcodes"] = static_cast<uint64_t>(config.max_transcodes_per_account);
         body["account"] = std::move(account_info);
         return http_json(200, Json(std::move(body)).dump());
     }
@@ -3012,6 +3084,8 @@ struct PlaybackManager::Impl {
                          {"max_sessions", static_cast<uint64_t>(config.max_sessions)},
                          {"max_sessions_per_account",
                           static_cast<uint64_t>(config.max_sessions_per_account)},
+                         {"max_transcodes_per_account",
+                          static_cast<uint64_t>(config.max_transcodes_per_account)},
                          {"video_transcodes", static_cast<uint64_t>(video_transcodes)},
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
@@ -3429,6 +3503,7 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     // Policy limits and playback timing apply to subsequent sessions immediately.
     impl_->config.max_sessions = config.max_sessions;
     impl_->config.max_sessions_per_account = config.max_sessions_per_account;
+    impl_->config.max_transcodes_per_account = config.max_transcodes_per_account;
     impl_->config.max_video_transcodes = config.max_video_transcodes;
     impl_->config.max_audio_transcodes = config.max_audio_transcodes;
     impl_->config.session_idle = config.session_idle;
@@ -3506,6 +3581,21 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
                            {"alternative_may_succeed", false},
                            {"sessions", static_cast<uint64_t>(e.held())},
                            {"max_sessions", static_cast<uint64_t>(e.limit())}};
+        Json::Object root;
+        root["error"] = std::move(error);
+        return http_json(429, Json(std::move(root)).dump());
+    } catch (const AccountTranscodeLimitError& e) {
+        // Like account_session_limit, the same on every node, so a client
+        // must not walk: scope=request. Unlike it, the same request without a
+        // transcode (remux or direct) needs no entitlement and may succeed
+        // here, so alternative_may_succeed is true.
+        Json::Object error{{"code", std::string("account_transcode_limit")},
+                           {"message", std::string(e.what())},
+                           {"scope", std::string("request")},
+                           {"node_healthy", true},
+                           {"alternative_may_succeed", true},
+                           {"transcodes", static_cast<uint64_t>(e.held())},
+                           {"max_transcodes", static_cast<uint64_t>(e.limit())}};
         Json::Object root;
         root["error"] = std::move(error);
         return http_json(429, Json(std::move(root)).dump());

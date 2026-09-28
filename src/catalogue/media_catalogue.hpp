@@ -9,6 +9,7 @@
 #include "json.hpp"
 
 #include <chrono>
+#include <functional>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -45,6 +46,9 @@ struct MediaProbe {
     std::optional<std::string> musicbrainz_recording_id;
     std::optional<std::string> musicbrainz_release_id;
     std::optional<std::string> musicbrainz_artist_id;
+    // A TMDB movie or TV id: the lookup fetches that record instead of
+    // searching by title.
+    std::optional<std::string> tmdb_id;
     std::string track_artist;
     std::string album_artist;
     MediaProbeLookupStrategy lookup_strategy{MediaProbeLookupStrategy::automatic};
@@ -134,12 +138,81 @@ class CurlHttpClient final : public HttpClient {
     RemoteHttpResponse get(std::string_view, const std::vector<std::string>&, size_t) override;
 };
 
+// A metadata editor request the providers could not satisfy; `status` and
+// `code` are the API's answer.
+struct ProviderRequestError : std::runtime_error {
+    int status;
+    std::string code;
+    ProviderRequestError(int http_status, std::string error_code, const std::string& message)
+        : std::runtime_error(message), status(http_status), code(std::move(error_code)) {}
+};
+
+// MusicBrainz asks each client for at most one request a second. Every
+// MusicBrainzProvider on a node shares one gate, so the scanner's requests and
+// the metadata editor's together keep to it; the circuit is shared the same way.
+struct MusicBrainzGate {
+    std::mutex mutex;
+    std::chrono::steady_clock::time_point last_request{};
+    std::chrono::steady_clock::time_point unavailable_until{};
+};
+
+// The numbers a provider reference needs to name one playable item: a TV
+// show's season and episode, a release's disc and track.
+struct ProviderRefNumbers {
+    std::optional<int32_t> season;
+    std::optional<int32_t> episode;
+    std::optional<int32_t> disc;
+    std::optional<int32_t> track;
+};
+
+// One image a provider offers for an artwork role.
+struct ArtworkOption {
+    std::string option_id;
+    std::string role;
+    std::optional<int32_t> width;
+    std::optional<int32_t> height;
+    std::string language;
+    std::string preview_url; // the provider's own small image, for the client
+    std::string url;         // full size; the server fetches it, never the client
+};
+
+// A metadata editor's search of one provider.
+struct ProviderSearchQuery {
+    std::string kind; // movie, show, album
+    std::string text;
+    std::optional<int32_t> year;
+    std::string artist; // albums: narrows to releases credited to this artist
+    size_t limit{10};
+};
+
+// One record a provider search found.
+struct ProviderSearchResult {
+    std::string ref; // what a match by reference takes
+    std::string provider;
+    std::string kind;
+    std::string title;
+    std::optional<int32_t> year;
+    std::string overview;
+    std::string artist;       // albums
+    std::string catalogue_id; // the id a match gives the item
+};
+
 class MetadataProvider {
   public:
     virtual ~MetadataProvider() = default;
     virtual std::string_view name() const noexcept = 0;
     virtual bool supports(MediaProbeKind) const = 0;
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
+    virtual std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) { return {}; }
+    // The images the provider has for a role of the record `kind`:`id` names
+    // (a TMDB `movie` or `tv`, a MusicBrainz `release`); `numbers` narrow a
+    // show to a season or an episode.
+    virtual std::vector<ArtworkOption> artwork_options(std::string_view /*kind*/,
+                                                       std::string_view /*id*/,
+                                                       std::string_view /*role*/,
+                                                       const ProviderRefNumbers& /*numbers*/) {
+        return {};
+    }
 };
 
 class TmdbProvider final : public MetadataProvider {
@@ -162,6 +235,10 @@ class TmdbProvider final : public MetadataProvider {
     std::string_view name() const noexcept override { return "tmdb"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+    std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) override;
+    std::vector<ArtworkOption> artwork_options(std::string_view kind, std::string_view id,
+                                               std::string_view role,
+                                               const ProviderRefNumbers& numbers) override;
     size_t cache_entries() const noexcept {
         return movie_cache_.size() + show_cache_.size() + season_cache_.size();
     }
@@ -176,8 +253,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::map<std::string, std::optional<Json>> recording_cache_;
     std::map<std::string, std::optional<std::string>> cover_cache_;
     size_t cache_bytes_{};
-    std::chrono::steady_clock::time_point last_request_{};
-    std::chrono::steady_clock::time_point unavailable_until_{};
+    std::shared_ptr<MusicBrainzGate> gate_;
 
     Json api(std::string_view path, const std::vector<std::pair<std::string, std::string>>& query = {});
     std::optional<Json> release_by_id(std::string_view);
@@ -186,10 +262,15 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::optional<std::string> cover_url(std::string_view release_id);
 
   public:
-    MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig);
+    MusicBrainzProvider(HttpClient&, CatalogueMusicBrainzConfig,
+                        std::shared_ptr<MusicBrainzGate> gate = {});
     std::string_view name() const noexcept override { return "musicbrainz"; }
     bool supports(MediaProbeKind) const override;
     std::optional<ProviderMatch> lookup(const MediaProbe&) override;
+    std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) override;
+    std::vector<ArtworkOption> artwork_options(std::string_view kind, std::string_view id,
+                                               std::string_view role,
+                                               const ProviderRefNumbers& numbers) override;
     size_t cache_entries() const noexcept {
         return release_cache_.size() + release_id_cache_.size() + recording_cache_.size() +
                cover_cache_.size();
@@ -242,6 +323,8 @@ class CatalogueScanProvider {
         return std::move(candidates.front().probe);
     }
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
+    // The named metadata provider ("tmdb", "musicbrainz") when it is configured.
+    virtual MetadataProvider* metadata(std::string_view) noexcept { return nullptr; }
 };
 
 class MovieScanProvider final : public CatalogueScanProvider {
@@ -257,6 +340,9 @@ class MovieScanProvider final : public CatalogueScanProvider {
                               const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
+    }
+    MetadataProvider* metadata(std::string_view provider) noexcept override {
+        return metadata_ && provider == metadata_->name() ? metadata_.get() : nullptr;
     }
 };
 
@@ -274,6 +360,9 @@ class TvScanProvider final : public CatalogueScanProvider {
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override {
         return metadata_ ? metadata_->lookup(probe) : std::nullopt;
     }
+    MetadataProvider* metadata(std::string_view provider) noexcept override {
+        return metadata_ && provider == metadata_->name() ? metadata_.get() : nullptr;
+    }
 };
 
 class MusicScanProvider final : public CatalogueScanProvider {
@@ -283,13 +372,20 @@ class MusicScanProvider final : public CatalogueScanProvider {
 
   public:
     MusicScanProvider(HttpClient&, CatalogueMusicProviderConfig,
-                      size_t max_artwork_bytes = 16 * 1024 * 1024);
+                      size_t max_artwork_bytes = 16 * 1024 * 1024,
+                      std::shared_ptr<MusicBrainzGate> musicbrainz_gate = {});
     std::string_view name() const noexcept override { return "music"; }
     const std::vector<std::string>& roots() const noexcept override { return roots_; }
     bool accepts_path(std::string_view path) const noexcept override;
     MediaProbeFile probe_file(FileSystem&, std::string_view, std::string_view,
                               const FsEntry&) override;
     std::optional<ProviderMatch> lookup(const MediaProbe& probe) override;
+    MetadataProvider* metadata(std::string_view provider) noexcept override;
+};
+
+struct ProviderRefMatch {
+    std::string leaf_id;
+    std::vector<std::string> item_ids;
 };
 
 // Enumerate the file members of one catalogue root from a single immutable
@@ -311,6 +407,12 @@ class CatalogueScanner {
     std::shared_ptr<MediaEngine> profile_engine_;
     MediaInformationService* media_information_{};
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
+    // The metadata editor's own providers: the same configuration over the
+    // unbudgeted client, so an operator's request neither spends nor waits on
+    // a scan batch's provider budget. One editor request at a time.
+    std::vector<std::unique_ptr<CatalogueScanProvider>> editor_providers_;
+    std::mutex editor_mutex_;
+    std::shared_ptr<MusicBrainzGate> musicbrainz_gate_{std::make_shared<MusicBrainzGate>()};
     std::atomic_bool rescan_requested_{};
     std::jthread worker_;
     mutable std::mutex config_mutex_;
@@ -338,6 +440,16 @@ class CatalogueScanner {
 
     HintBatchResult process_hint_batch(std::stop_token, size_t max_hints);
     CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const;
+    // Fetch and stage the provider artwork `match` names onto its items. An
+    // item `locked` names keeps its artwork. False when `stop` interrupted it.
+    bool stage_remote_artwork(ProviderMatch& match,
+                              const std::function<bool(std::string_view)>& locked,
+                              std::stop_token stop, size_t max_artwork_bytes,
+                              DistributedStore::DurabilityBatch& artwork_batch);
+    // Under editor_mutex_: the editor's metadata provider for a scan provider
+    // ("movies", "tv", "music") and a metadata provider name.
+    MetadataProvider* editor_metadata(std::string_view scan_provider,
+                                      std::string_view metadata_provider);
 
   public:
     // One hint against one namespace snapshot, as a batch prepares it. Public
@@ -362,6 +474,28 @@ class CatalogueScanner {
     size_t request_media_rescan(const std::vector<std::string>& media_ids);
     size_t request_media_profiles(const std::vector<std::string>& media_ids);
     std::vector<MediaProbeCandidate> probe_unmatched(std::string_view hint_id);
+    // Match an unmatched file to a provider reference (`tmdb:movie:<id>`,
+    // `tmdb:tv:<id>`, `musicbrainz:release:<mbid>`): fetch the record, build
+    // the hierarchy, stage its artwork and bind the file, as a scan match
+    // would. Throws ProviderRequestError with the API's answer.
+    ProviderRefMatch match_unmatched_ref(std::string_view hint_id, std::string_view ref,
+                                         const ProviderRefNumbers& numbers);
+    // Search the provider for a kind (movie, show: TMDB; album: MusicBrainz).
+    // A result's catalogue_id is kept only when the catalogue holds that item.
+    // Throws ProviderRequestError with the API's answer.
+    std::vector<ProviderSearchResult> search_providers(const ProviderSearchQuery&);
+    // The images a provider offers for one role of a reference: `poster` or
+    // `backdrop` for a movie or show, `poster` for a season (`numbers.season`),
+    // `still` for an episode (season and episode), `cover` for a release.
+    // Throws ProviderRequestError with the API's answer.
+    std::vector<ArtworkOption> artwork_options(std::string_view ref, std::string_view role,
+                                               const ProviderRefNumbers& numbers);
+    // Fetch one listed option and make it the item's artwork for the role.
+    // The reference is the item's own unless `ref` names one. Locks the item
+    // unless `lock` is false. Throws ProviderRequestError.
+    CatalogueItem choose_artwork(std::string_view item_id, std::string_view role,
+                                 std::string_view option_id, std::optional<std::string> ref,
+                                 ProviderRefNumbers numbers, bool lock);
     size_t scan_once();
 };
 
