@@ -460,6 +460,9 @@ streaming:
   segment_timeout_ms: 6000
   transcode_entitlement_idle_ms: 300000
   startup_timeout_ms: 15000
+  startup_no_progress_ms: 15000
+  start_wait_max_ms: 25000
+  start_failed_retention_ms: 60000
   probe_bytes: 8M
   probe_analyze_duration_ms: 5000
   probe_timeout_ms: 20000
@@ -473,6 +476,13 @@ is never reached. Neither transcode limit may exceed `max_sessions`.
 `max_transcodes_per_account` (2) bounds how many of one account's sessions on
 this node may hold a transcode entitlement at once, so one account cannot take
 every transcode slot; `0` disables it.
+
+`startup_no_progress_ms` (15000, 1000..120000), `start_wait_max_ms` (25000,
+1000..300000) and `start_failed_retention_ms` (60000, 1000..1800000) govern a
+`start=async` request: it fails only when its progress has not moved for
+`startup_no_progress_ms`; a start long-poll waits at most `start_wait_max_ms`;
+a failed async start stays readable for `start_failed_retention_ms`. All three
+are published per node in `GET /api/v1/status` (see docs/streaming.md).
 
 `max_ahead_segments` (8) is how far beyond the highest fragment index a client
 has actually requested the producer is allowed to run before it parks on a

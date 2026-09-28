@@ -1,5 +1,43 @@
 # Current release
 
+## 0.69.0 — Playback start reports progress (`start=async`) (development)
+
+**A start reports its progress and fails only when progress stops.** Opt-in
+per request: `?start=async` on a create or a `PATCH` answers `202` once the
+request is admitted, and the node reports what the start has done -- its
+stage, source bytes read, a transcode seek's pre-roll, media produced toward
+the first fragment. The client decides how long to wait; the node fails the
+start only when nothing has moved for `streaming.startup_no_progress_ms`. An
+async `PATCH` keeps the playing generation serving until its replacement is
+ready. Without the parameter nothing changes. Checked with Core and every
+client before it was built (TODO/2026-09-27-playback-start-progress-plan.md).
+
+Measured on fi-1 (2026-09-28) with the start counters: a 4K HEVC 10-bit
+transcode start took 8.6-11.9 s, decoding at ~0.33x real time, with output
+advancing every second throughout.
+
+New settings: `streaming.startup_no_progress_ms` (15000),
+`streaming.start_wait_max_ms` (25000), `streaming.start_failed_retention_ms`
+(60000).
+
+API additions (announce to Core and every client):
+- `POST /api/v1/playback/sessions?start=async`: `202`, `status:
+  playback_starting`, the session with `stream.url: null`,
+  `stream.close_url`, and `start` {stage, progress_seq, progress_age_ms,
+  elapsed_ms, source_bytes_read, preroll_decoded_ms, preroll_total_ms,
+  output_media_ms, first_fragment_ms, error}. Direct play answers `201` as
+  before. `409 playback_starting` for a `PATCH` on a pending create.
+- `PATCH /api/v1/playback/sessions/{id}?start=async`: `202`, the current
+  session, and `pending.start`.
+- `GET /api/v1/playback/sessions/{id}?after=&wait_ms=`: a long-poll on the
+  pending start; `start` stays on a session once ready; a failed create is
+  readable for `start_failed_retention_ms`.
+- `DELETE /api/v1/playback/sessions/{id}/pending` abandons a pending update.
+- `400 bad_start` for any `start` value other than `async`.
+- Each node's `playback` block in `GET /api/v1/status` gains
+  `startup_no_progress_ms`, `start_wait_max_ms`, `start_failed_retention_ms`
+  (telemetry fields 39-41); `GET /api/v1/playback/status` carries the same.
+
 ## 0.68.0 — Keyframe byte index for Direct Play (development)
 
 **A Direct Play file's keyframe byte index.** A browser playing a file

@@ -3,8 +3,8 @@
 Status: plan, operator-approved direction (2026-09-27: "Guessing the time is
 asinine. We need a better system to inform the client." / "We'll do this").
 Counters built and measured on fi-1 in 0.67.0 (no wire change). Wire shape
-sent to Core and every client on 2026-09-28 for their checks, as planned
-for 0.69.0.
+checked by Core and every client on 2026-09-28; built in 0.69.0 (async
+create and async PATCH).
 Wire shape below must be announced to Core and every client before any code
 ships. Clients enter release lockdown after this.
 
