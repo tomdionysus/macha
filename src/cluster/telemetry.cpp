@@ -136,6 +136,8 @@ enum TelemetryFieldId : uint16_t {
     field_playback_startup_no_progress_ms = 39,
     field_playback_start_wait_max_ms = 40,
     field_playback_start_failed_retention_ms = 41,
+    field_playback_transcode_rates = 42,
+    field_node_name = 43,
 };
 
 void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
@@ -222,6 +224,23 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     put_uint(body, field_playback_start_wait_max_ms, value.playback_start_wait_max_ms);
     put_uint(body, field_playback_start_failed_retention_ms,
              value.playback_start_failed_retention_ms);
+    if (!value.playback_transcode_rates.empty()) {
+        Writer rates;
+        rates.u16(static_cast<uint16_t>(std::min<size_t>(value.playback_transcode_rates.size(), 256)));
+        size_t written = 0;
+        for (const auto& rate : value.playback_transcode_rates) {
+            if (written++ == 256) break;
+            rates.string(rate.kind);
+            rates.string(rate.codec);
+            rates.u32(rate.bit_depth);
+            rates.u32(rate.height_class);
+            rates.u32(rate.rate_milli);
+            rates.u32(rate.observations);
+            rates.u32(rate.concurrent);
+        }
+        put_field(body, field_playback_transcode_rates, rates.data());
+    }
+    put_string(body, field_node_name, value.node_name);
     put_uint(body, field_cache_hits, value.cache_hits);
     put_uint(body, field_cache_misses, value.cache_misses);
     put_uint(body, field_cache_evictions, value.cache_evictions);
@@ -381,6 +400,25 @@ NodeTelemetry decode(Reader& reader) {
             value.playback_start_failed_retention_ms = static_cast<uint32_t>(
                 field_uint(payload, 4, "playback_start_failed_retention_ms"));
             break;
+        case field_node_name: value.node_name.assign(payload.begin(), payload.end()); break;
+        case field_playback_transcode_rates: {
+            Reader rates(payload);
+            const auto count = rates.u16();
+            if (count > 256) throw DecodeError("too many transcode rates");
+            for (uint16_t i = 0; i < count; ++i) {
+                TranscodeRate rate;
+                rate.kind = rates.string(16);
+                rate.codec = rates.string(64);
+                rate.bit_depth = rates.u32();
+                rate.height_class = rates.u32();
+                rate.rate_milli = rates.u32();
+                rate.observations = rates.u32();
+                rate.concurrent = rates.u32();
+                value.playback_transcode_rates.push_back(std::move(rate));
+            }
+            rates.finish();
+            break;
+        }
         case field_cache_hits:
             value.cache_hits = field_uint(payload, 8, "cache_hits");
             break;
@@ -545,6 +583,11 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.playback_startup_no_progress_ms = playback.startup_no_progress_ms;
     telemetry.playback_start_wait_max_ms = playback.start_wait_max_ms;
     telemetry.playback_start_failed_retention_ms = playback.start_failed_retention_ms;
+    telemetry.playback_transcode_rates = std::move(playback.transcode_rates);
+    {
+        std::lock_guard lock(mutex_);
+        telemetry.node_name = node_name_;
+    }
     observe(telemetry, true);
     return telemetry;
 }

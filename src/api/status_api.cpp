@@ -50,6 +50,7 @@ PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
     out.metadata_generation = telemetry.metadata_generation;
     out.storage_backends_online = telemetry.storage_backends_online;
     out.api_endpoint = telemetry.api_endpoint;
+    out.node_name = telemetry.node_name;
     return out;
 }
 
@@ -261,6 +262,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
                                 : (member ? member->seen_unix_ms : durable.observed_unix_ms));
     node["live_age_ms"] = live ? Json(live_age_ms) : Json(nullptr);
     node["version"] = live ? live->version : durable.version;
+    // The operator's display name for the node; null when it has none.
+    {
+        const auto& name = live ? live->node_name : durable.node_name;
+        node["node_name"] = name.empty() ? Json(nullptr) : Json(name);
+    }
     node["host"] = member ? member->host : (live ? live->host : durable.host);
     node["port"] =
         static_cast<uint64_t>(member ? member->port : (live ? live->port : durable.port));
@@ -432,6 +438,24 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_start_failed_retention_ms)
             playback["start_failed_retention_ms"] =
                 static_cast<uint64_t>(live->playback_start_failed_retention_ms);
+        // What this node has sustained transcoding each kind of source it has
+        // actually transcoded; a kind it has never seen is absent, not guessed.
+        if (!live->playback_transcode_rates.empty()) {
+            Json::Array rates;
+            for (const auto& rate : live->playback_transcode_rates) {
+                Json::Object entry{{"kind", rate.kind},
+                                   {"codec", rate.codec},
+                                   {"rate", static_cast<double>(rate.rate_milli) / 1000.0},
+                                   {"observations", static_cast<uint64_t>(rate.observations)},
+                                   {"concurrent", static_cast<uint64_t>(rate.concurrent)}};
+                if (rate.kind == "video") {
+                    entry["bit_depth"] = static_cast<uint64_t>(rate.bit_depth);
+                    entry["height_class"] = static_cast<uint64_t>(rate.height_class);
+                }
+                rates.push_back(Json(std::move(entry)));
+            }
+            playback["transcode_rates"] = std::move(rates);
+        }
     }
     node["playback"] = std::move(playback);
     node["identity_association_reset"] =
