@@ -459,6 +459,11 @@ struct TranscodeRun {
     std::vector<double> fragment_media_seconds;
     std::vector<double> fragment_declared_seconds;
     std::string playlist;
+    // The engine's start progress when the first fragment was ready.
+    uint64_t start_bytes_read{};
+    int64_t start_preroll_total_us{-1};
+    int64_t start_preroll_decoded_us{};
+    int64_t start_output_media_us{};
 };
 
 TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
@@ -498,6 +503,8 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     auto store = session->segments();
     REQUIRE(store != nullptr);
     REQUIRE(store->wait_ready(std::chrono::milliseconds{60000}));
+    const auto* progress = session->start_progress();
+    REQUIRE(progress != nullptr);
 
     // Consume in order, exactly as a client does. The store bounds production
     // ahead of the consumer, so a harness that never asks for a fragment gets
@@ -509,6 +516,10 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     std::vector<Bytes> fragments;
 
     TranscodeRun run;
+    run.start_bytes_read = progress->source_bytes_read.load();
+    run.start_preroll_total_us = progress->preroll_total_us.load();
+    run.start_preroll_decoded_us = progress->preroll_decoded_us.load();
+    run.start_output_media_us = progress->output_media_us.load();
     run.probed_seconds = probe.duration_seconds;
     run.planned_segments = vod.segment_durations.size();
     run.planned_seconds = 0.0;
@@ -713,4 +724,37 @@ MACHA_HEAVY_TEST("transcode_timeline", test_transcoded_seek_starts_both_streams_
     // silently ignored (a full-length generation) fails here.
     const double remaining = kSourceSeconds - static_cast<double>(kSeek.count()) / 1000.0;
     CHECK(run.timeline.video.span_seconds() < remaining + 5.0);
+}
+
+MACHA_HEAVY_TEST("transcode_timeline", test_a_transcode_start_reports_its_preroll) {
+    // A transcode seek decodes from the keyframe before the origin and throws
+    // those frames away. On a 4K HEVC source that pre-roll is the suspected
+    // cost of a slow start, so the engine reports it: here the keyframes are a
+    // second apart and the seek is half a second past one.
+    StreamingConfig streaming;
+    auto engine = make_libav_media_engine(streaming);
+    REQUIRE(engine != nullptr);
+    if (!transcode_available(*engine)) {
+        std::cout << "skipped: this build has no H.264/AAC encoder\n";
+        return;
+    }
+
+    TempDir temp;
+    const auto source_path = temp.path() / "source.mkv";
+    const auto synthesized = synthesize_source(source_path);
+
+    const auto run = transcode(*engine, synthesized, temp.path() / "spill",
+                               std::chrono::milliseconds{60500});
+    std::cout << "start progress: bytes=" << run.start_bytes_read
+              << " preroll_total_us=" << run.start_preroll_total_us
+              << " preroll_decoded_us=" << run.start_preroll_decoded_us
+              << " output_media_us=" << run.start_output_media_us << "\n";
+    constexpr int64_t frame_us = 1'000'000 / kFrameRate;
+    CHECK(run.start_bytes_read > 0);
+    CHECK(run.start_preroll_total_us >= 500'000 - frame_us);
+    CHECK(run.start_preroll_total_us <= 500'000 + frame_us);
+    // Pre-roll ends one frame before the origin, and all of it was decoded
+    // before the first fragment could exist.
+    CHECK(run.start_preroll_decoded_us >= run.start_preroll_total_us - frame_us);
+    CHECK(run.start_output_media_us > 0);
 }

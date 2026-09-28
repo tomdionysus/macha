@@ -162,6 +162,7 @@ struct InputIoState {
     // "this node cannot reach the extents" from "these bytes are not media".
     // Keep the first underlying failure so the caller can report which it was.
     std::string read_error;
+    MediaStartProgress* progress{};
 };
 
 bool input_aborted(const InputIoState& state) {
@@ -194,6 +195,10 @@ int input_read(void* opaque, uint8_t* buffer, int buffer_size) {
         }
         if (!n) return AVERROR_EOF;
         state.offset += n;
+        if (state.progress) {
+            state.progress->source_bytes_read.fetch_add(n, std::memory_order_relaxed);
+            state.progress->moved();
+        }
         return static_cast<int>(n);
     } catch (const std::exception& error) {
         if (state.cancelled && state.cancelled->load()) return AVERROR_EXIT;
@@ -259,7 +264,8 @@ class InputContext {
   public:
     InputContext(const MediaSource& source, MediaReadPurpose purpose, std::atomic_bool* cancelled,
                  uint64_t probe_bytes = 0, std::chrono::milliseconds analyze = {},
-                 std::chrono::milliseconds wall_timeout = {}) {
+                 std::chrono::milliseconds wall_timeout = {},
+                 MediaStartProgress* progress = nullptr) {
         try {
             if (!source.open)
                 throw MediaError(MediaFailure::unreadable, "media source has no reader factory");
@@ -277,6 +283,7 @@ class InputContext {
             state_.media_id = source.media_id;
             state_.purpose = purpose;
             state_.cancelled = cancelled;
+            state_.progress = progress;
             if (wall_timeout.count() > 0) state_.deadline = Clock::now() + wall_timeout;
 
             constexpr int io_buffer_size = 256 * 1024;
@@ -723,6 +730,7 @@ struct StreamPipeline {
     // it here. Both are needed to know when the delayed moov can be written
     // (see the early flush in run_pipeline).
     bool output_started{};
+    MediaStartProgress* progress{};
 
     ~StreamPipeline() {
         if (fifo) av_audio_fifo_free(fifo);
@@ -999,6 +1007,13 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
         const auto flags = encoded->flags;
         const int mux_rc = av_interleaved_write_frame(output, encoded);
         if (mux_rc >= 0) pipe.output_started = true;
+        if (mux_rc >= 0 && pipe.progress && pts != AV_NOPTS_VALUE) {
+            const auto us = av_rescale_q(pts, pipe.output_stream->time_base, AV_TIME_BASE_Q);
+            if (us > pipe.progress->output_media_us.load(std::memory_order_relaxed)) {
+                pipe.progress->output_media_us.store(us, std::memory_order_relaxed);
+                pipe.progress->moved();
+            }
+        }
         if (mux_rc < 0) {
             Log::warn("libav mux rejected encoded video packet stream=" +
                       std::to_string(pipe.input_index) +
@@ -1237,7 +1252,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                   std::shared_ptr<MediaSegmentStore> store, std::atomic_bool& cancelled,
                   uint64_t probe_bytes, std::chrono::milliseconds analyze_duration,
                   std::chrono::milliseconds startup_timeout, size_t video_decoder_threads,
-                  size_t video_encoder_threads) {
+                  size_t video_encoder_threads, MediaStartProgress& progress) {
     const auto& plan = vod_plan.playback;
     if (vod_plan.segment_durations.empty())
         throw std::runtime_error("VOD plan contains no media segments");
@@ -1248,7 +1263,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
     // finite startup timeout, so stopping a failed generation must not join a
     // worker that is still blocked in stream discovery.
     InputContext input(source, MediaReadPurpose::playback, &cancelled,
-                       probe_bytes, analyze_duration, startup_timeout);
+                       probe_bytes, analyze_duration, startup_timeout, &progress);
     auto* in = input.get();
     const auto stream_info_started = Clock::now();
     auto stream_info_rc = avformat_find_stream_info(in, nullptr);
@@ -1325,6 +1340,7 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         pipe->output_stream = avformat_new_stream(out, nullptr);
         if (!pipe->output_stream) throw std::bad_alloc();
         pipe->output_index = pipe->output_stream->index;
+        pipe->progress = &progress;
         if (transform == MediaTransform::copy) {
             av_require(avcodec_parameters_copy(pipe->output_stream->codecpar, input_stream->codecpar), "copy stream parameters");
             pipe->output_stream->codecpar->codec_tag = 0;
@@ -1442,6 +1458,14 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                     }
                     write_mux_packet(out, packet.get());
                     pipe.output_started = true;
+                    if (presentation != AV_NOPTS_VALUE) {
+                        const auto us = av_rescale_q(presentation - origin, pipe.input_stream->time_base,
+                                                     AV_TIME_BASE_Q);
+                        if (us > progress.output_media_us.load(std::memory_order_relaxed)) {
+                            progress.output_media_us.store(us, std::memory_order_relaxed);
+                            progress.moved();
+                        }
+                    }
                 } else {
                     if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
                     if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
@@ -1450,8 +1474,26 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                         rc = avcodec_receive_frame(pipe.decoder, decoded.get());
                         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
                         av_require(rc, "receive decoded frame");
-                        if (pipe.type == MediaStreamType::video)
+                        if (pipe.type == MediaStreamType::video) {
+                            // Timestamps here are relative to the origin, so a
+                            // frame before zero is pre-roll: the first says how
+                            // far back the keyframe was, each later one how far
+                            // through that the decoder is.
+                            const auto frame_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE
+                                                       ? decoded->best_effort_timestamp
+                                                       : decoded->pts;
+                            if (frame_pts != AV_NOPTS_VALUE && frame_pts < 0) {
+                                const auto behind = av_rescale_q(-frame_pts, pipe.input_stream->time_base,
+                                                                 AV_TIME_BASE_Q);
+                                if (progress.preroll_total_us.load(std::memory_order_relaxed) < 0)
+                                    progress.preroll_total_us.store(behind, std::memory_order_relaxed);
+                                progress.preroll_decoded_us.store(
+                                    progress.preroll_total_us.load(std::memory_order_relaxed) - behind,
+                                    std::memory_order_relaxed);
+                                progress.moved();
+                            }
                             encode_video_frame(pipe, out, decoded.get(), encoded.get(), cuts);
+                        }
                         else
                             process_audio_frame(pipe, out, decoded.get(), encoded.get());
                         av_frame_unref(decoded.get());
@@ -1523,13 +1565,14 @@ class LibavSession final : public MediaEngineSession {
     std::atomic_int exit_code_{-1};
     mutable std::mutex diagnostics_mutex_;
     std::string diagnostics_;
+    MediaStartProgress progress_;
 
     void run(std::stop_token stop) {
         try {
             if (stop.stop_requested()) cancelled_.store(true);
             run_pipeline(source_, vod_plan_, segment_duration_, store_, cancelled_,
                          probe_bytes_, analyze_duration_, startup_timeout_,
-                         video_decoder_threads_, video_encoder_threads_);
+                         video_decoder_threads_, video_encoder_threads_, progress_);
             if (cancelled_.load()) {
                 exit_code_.store(0);
             } else {
@@ -1590,6 +1633,7 @@ class LibavSession final : public MediaEngineSession {
         return diagnostics_;
     }
     std::shared_ptr<MediaSegmentStore> segments() const override { return store_; }
+    const MediaStartProgress* start_progress() const override { return &progress_; }
     void note_segment_requested(uint64_t index) override { store_->note_requested(index); }
     void stop() override {
         cancelled_.store(true);
