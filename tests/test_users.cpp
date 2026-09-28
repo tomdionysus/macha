@@ -86,6 +86,19 @@ MACHA_FAST_TEST("users", test_roles_are_capabilities_not_a_ladder) {
     CHECK(expand_roles(expand_roles(all_roles())).size() == 5);
 }
 
+MACHA_FAST_TEST("users", test_provider_requests_need_the_manager_role_even_to_read) {
+    // A read of the management API is a viewer's, but a provider search makes
+    // the node call out on the caller's say-so.
+    HttpRequest request;
+    request.method = "GET";
+    request.path = "/api/v1/manage/unmatched";
+    CHECK(Service::required_role(request) == role_media_viewer);
+    request.path = "/api/v1/manage/providers/search";
+    CHECK(Service::required_role(request) == role_manager);
+    request.path = "/api/v1/manage/providers/artwork";
+    CHECK(Service::required_role(request) == role_manager);
+}
+
 MACHA_FAST_TEST("users", test_user_merge_is_deterministic_and_commutative) {
     // Two replicas that saw the same writes in a different order must land on
     // the same record, or a partition heals into a flap rather than a value.

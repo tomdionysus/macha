@@ -595,6 +595,10 @@ struct StreamingConfig {
     // hard towards permissive and leaves the node protected by the resource
     // that is actually scarce.
     size_t max_sessions_per_account{32};
+    // How many of one account's sessions on this node may hold a transcode
+    // entitlement (video or audio) at once. Without it one account could open
+    // sessions until it held every transcode slot on the node. 0 = no bound.
+    size_t max_transcodes_per_account{2};
     size_t max_video_transcodes{1};
     size_t max_audio_transcodes{4};
     // Per transformed video. Combined with max_video_transcodes this is a

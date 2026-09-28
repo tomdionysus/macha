@@ -1,6 +1,7 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-27 ~15:00Z, after 0.64.1 was deployed on both nodes.
+Last updated: 2026-09-28, after 0.66.0 was deployed on both nodes and 0.67.0
+was committed on `develop`.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
@@ -10,17 +11,20 @@ not repeated here. Work top-to-bottom unless new evidence changes the order.
 It says what is in flight, how to build and deploy, what is owed to whom, and
 the decisions waiting on the operator.
 
-## Cluster state (2026-09-27 ~15:00Z)
+## Cluster state (2026-09-28)
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1** (10.35.1.10,
-  also .50) both run **0.64.1** (`3c3e11a`, tagged; `main` there), **cluster
+  also .50) both run **0.66.0** (`768a3b3`, tagged; `main` there), **cluster
   protocol 22**: a protocol-21 node cannot join, so a protocol change means
   both nodes installed back to back. Metadata writable 2/2 against
   `metadata_min_write_replicas: 2`: restarting either node makes metadata
   read-only until it is back.
-- **0.64.2 is committed on `develop` (unpushed), built and tested (561/11/20
-  on fi-1), NOT deployed**: import destinations ignore case. Push, rolling
-  deploy (still protocol 22), tag -- on the operator's go.
+- **gbni-1 runs with glibc heap checking** (drop-in
+  `/etc/systemd/system/macha.service.d/heap-check.conf`, cores to
+  `/mnt/diskB/crash`) until the heap corruption's writer is found.
+- **0.67.0 is committed on `develop`, not pushed, not deployed**: per-account
+  transcode bound, the metadata editor API, direct-play Content-Type from the
+  media info.
 - **Torrents belong to the cluster** since 0.64.0: requests in metadata,
   claimed by any torrent-capable node (gbni-1 is the only one; fi-1 has
   `torrent.enabled: false`). Three jobs: two Martian copies completed, Wake Up
@@ -42,10 +46,6 @@ the decisions waiting on the operator.
   on-box in `/root/.macha-claude-credentials` on both nodes.
 
 ## The queue
-
-0. **Deploy 0.66.0** (uncommitted, operator's call): gbni-1 runs 0.65.0,
-   fi-1 0.64.1. 0.64.2 and 0.65.0 are pushed and tagged. Rebuild on fi-1
-   (niced, after a viewer check) and run its suites before installing.
 
 0b-. **Degraded operation is the normal case (operator, 2026-09-28).** With
    es-1 away and fi-1 full, new objects have one copy; that is accepted until
@@ -145,16 +145,11 @@ the decisions waiting on the operator.
    `Menu Art (2).mkv` and `Previews for all episodes (2).mkv`). Planner:
    `choose_destination` in `src/acquisition/ingest.cpp`.
 5. **Decisions waiting on the operator** (do not act without them):
-   - The web client's metadata-editor proposal (A-G in the 2026-09-24
-     session: provider search, match by provider ref with parent chain,
-     manual parents by id, artwork options, search kind/parent filter,
-     partial update and validation) and the multi-file fixes (media_id
-     belongs to item on PATCH, manual items pruning dead files, flag a
-     media_id bound to two items). Core owns the client side and wants the
-     version and wire shape of each as it ships.
-   - Transcode entitlements are per session (`src/playback/playback.cpp` create
-     path): one account can open up to 32 sessions and take every transcode
-     slot on a node. A law 2 second-clause gap; needs a per-account bound.
+   - Metadata editor API: approved 2026-09-28 and built in 0.67.0 (G, F, D,
+     C, A, E and the multi-file fixes); see
+     `TODO/2026-09-28-metadata-editor-api-plan.md`. B (richer probe
+     candidates) waits on the operator's choice of fields. The operator
+     carries it to the clients himself; do not message client sessions.
    - 317 directories under `/Movies` and `/Music` on gbni-1 list empty
      (list in `/root/empty-dirs.txt` there). Some are leftovers beside the
      film (Airplane); others (Pitch Black, Police Academy, Predator 2) have
@@ -162,14 +157,12 @@ the decisions waiting on the operator.
      directories, then "there's files"; confirm which should hold a film.
    - Torrent staging option A vs B (stage 2 of the disk backend plan); stages
      3-4 of that plan.
-6. **Torrent job state rewritten twice a second: fixed in 0.66.0 (uncommitted).**
 7. **Known defects found 2026-09-24/25, not yet fixed:**
-   - `catalogue_api` maps every exception to `503 catalogue_unavailable`
-     (`src/api/catalogue_api.cpp` ~590): bad JSON, bad `If-Match`, artwork for a
-     missing item all answer 503 instead of 400/404.
-   - `PUT /api/v1/catalogue/items/{id}` is a full replacement with no
-     validation: parent may not exist or form a cycle, and omitting
-     `media_ids` unbinds every file.
+   - `catalogue_api` answering `503 catalogue_unavailable` for client
+     errors: fixed for item edits in 0.67.0 (`400 bad_item`, `404` for a
+     missing item, parents validated, omitted `media_ids` kept); the other
+     routes (artwork upload, `If-Match` parsing) not re-checked. A parent
+     cycle through `PUT`/`PATCH` is not checked.
    - Three more transient conditions still raise a bare `runtime_error`
      that an ingest would fail on rather than block: `object replication
      quorum unavailable` (`src/cluster/distributed_store.cpp` 163, 195), `metadata
@@ -193,10 +186,6 @@ the decisions waiting on the operator.
    generate the document from the route table so it cannot drift, so the
    first step is a declarative route table that dispatch actually runs from.
    Document the status and error codes from 0.56.0 with it.
-9. **Search `kind` filter** (approved; Core asked). Repeated `kind`
-   parameter (`movie`, `show`, `season`, `episode`, `artist`, `album`,
-   `track`), filtered before `limit`; absent means all; unknown is a 400.
-   `src/api/catalogue_api.cpp` around line 417. Tell Core the version.
 10. **People on catalogue items -- directors, cast** (approved), with a
    **required backfill**: TMDB `append_to_response=credits` on the requests
    the scanner already makes (`src/catalogue/media_catalogue.cpp` ~1544); store on

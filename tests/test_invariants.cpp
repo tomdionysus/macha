@@ -168,6 +168,592 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
     CHECK(hints.list().empty());
 }
 
+MACHA_TEST("invariants", test_manual_entry_attaches_to_existing_parents_by_id) {
+    TestService fixture("manage-manual-parents");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    auto& catalogue = service.catalogue();
+    auto& hints = service.catalogue_hints();
+    fs.mkdir("/TV", 0755, getuid(), getgid());
+
+    auto parent = [](CatalogueKind kind, std::string id, std::string title,
+                     std::optional<std::string> parent_id = {}) {
+        CatalogueItem item;
+        item.kind = kind;
+        item.id = std::move(id);
+        item.title = std::move(title);
+        if (parent_id) item.parent_id = *parent_id;
+        return item;
+    };
+    auto season_two = parent(CatalogueKind::season, "tmdb:tv:1:season:2", "Season 2", "tmdb:tv:1");
+    season_two.season_number = 2;
+    catalogue.upsert_many({parent(CatalogueKind::show, "tmdb:tv:1", "Scanner Show"), season_two,
+                           parent(CatalogueKind::artist, "musicbrainz:artist:a", "Scanner Artist")});
+
+    CatalogueScanner scanner(service.node(), fs, catalogue, hints, config.catalogue.scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), fs, catalogue, hints, scanner);
+
+    int file = 0;
+    auto unmatched = [&] {
+        const auto path = "/TV/file-" + std::to_string(++file) + ".mkv";
+        write_file(fs, path, pattern(4096, static_cast<uint8_t>(file)));
+        const auto hint_id = hints.submit(path, "scanner", file_media_id(fs.getattr(path)),
+                                          CatalogueHintPriority::periodic_scan);
+        REQUIRE(hints.claim_next().has_value());
+        hints.mark_no_match(hint_id, "tv", file_media_id(fs.getattr(path)), "no match");
+        return hint_id;
+    };
+    auto post = [&](const std::string& hint_id, const std::string& body) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/manage/unmatched/" + hint_id + "/manual";
+        request.body.assign(body.begin(), body.end());
+        auto response = manage.handle(request);
+        return std::pair{response.status,
+                         Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                                 response.body.size()))};
+    };
+    auto leaf = [&](const Json& body) { return catalogue.get(body.find("leaf_item_id")->asString()); };
+
+    // season_id: the episode joins the scanner's season, locked.
+    auto [status, body] = post(unmatched(), R"({"kind":"episode","season_id":"tmdb:tv:1:season:2","season_number":7,"episode_number":3})");
+    REQUIRE(status == 201);
+    auto episode = leaf(body);
+    REQUIRE(episode.has_value());
+    CHECK(episode->parent_id == "tmdb:tv:1:season:2");
+    CHECK(episode->season_number == 2);
+    CHECK(episode->external_ids.at("macha_metadata_locked") == "1");
+    CHECK(catalogue.get("tmdb:tv:1:season:2")->title == "Season 2");
+
+    // series_id plus an existing season number reuses that season.
+    std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":2,"episode_number":4,"lock":false})");
+    REQUIRE(status == 201);
+    episode = leaf(body);
+    CHECK(episode->parent_id == "tmdb:tv:1:season:2");
+    CHECK(!episode->external_ids.contains("macha_metadata_locked"));
+    CHECK(catalogue.list(CatalogueKind::season, std::string_view("tmdb:tv:1")).size() == 1);
+
+    // A new season number creates one season under the existing show.
+    std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":5,"episode_number":1})");
+    REQUIRE(status == 201);
+    const auto new_season = catalogue.get(*leaf(body)->parent_id);
+    REQUIRE(new_season.has_value());
+    CHECK(new_season->parent_id == "tmdb:tv:1");
+    CHECK(new_season->season_number == 5);
+    CHECK(catalogue.list(CatalogueKind::show).size() == 1);
+
+    // artist_id plus an album title: one album, reused by the second track.
+    std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"One","track_number":1})");
+    REQUIRE(status == 201);
+    const auto album_id = leaf(body)->parent_id;
+    CHECK(catalogue.get(*album_id)->parent_id == "musicbrainz:artist:a");
+    std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"Two","track_number":2})");
+    REQUIRE(status == 201);
+    CHECK(leaf(body)->parent_id == album_id);
+    CHECK(catalogue.list(CatalogueKind::artist).size() == 1);
+
+    // A missing parent is 404 and a wrong kind is 400, both naming the parent.
+    const auto refused = unmatched();
+    std::tie(status, body) = post(refused, R"({"kind":"episode","season_id":"tmdb:tv:missing","episode_number":1})");
+    CHECK(status == 404);
+    CHECK(body.find("error")->find("code")->asString() == "parent_not_found");
+    CHECK(body.find("error")->find("parent_id")->asString() == "tmdb:tv:missing");
+    std::tie(status, body) = post(refused, R"({"kind":"track","album_id":"musicbrainz:artist:a","title":"Three"})");
+    CHECK(status == 400);
+    CHECK(body.find("error")->find("code")->asString() == "bad_parent_kind");
+    CHECK(body.find("error")->find("expected_kind")->asString() == "album");
+    CHECK(body.find("error")->find("parent_kind")->asString() == "artist");
+    CHECK(hints.get(refused).has_value());
+}
+
+MACHA_TEST("invariants", test_unmatched_files_match_to_a_provider_reference) {
+    TestService fixture("manage-provider-ref");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    auto& catalogue = service.catalogue();
+    auto& hints = service.catalogue_hints();
+    for (const auto* root : {"/Movies", "/TV", "/Music"}) fs.mkdir(root, 0755, getuid(), getgid());
+
+    const auto token = fixture.path() / "tmdb.token";
+    std::ofstream(token) << "test-token\n";
+    const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
+    auto http = std::make_unique<FakeHttpClient>();
+    http->add("/movie/335984", 200, "application/json",
+              R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","poster_path":"/p.jpg"})");
+    http->add("/movie/77", 500, "text/plain", "down");
+    http->add("/tv/1399/season/1", 200, "application/json",
+              R"({"id":3624,"name":"Season 1","episodes":[{"id":63057,"episode_number":2,"name":"The Kingsroad"}]})");
+    http->add("/tv/1399", 200, "application/json",
+              R"({"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17"})");
+    http->add("/release/" + release, 200, "application/json",
+              R"({"id":")" + release + R"(","title":"Hand Album","date":"1999",
+                  "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
+                  "media":[{"position":1,"tracks":[{"position":1,"title":"One","recording":{"id":"r1","title":"One"}},
+                                                   {"position":2,"title":"Two","recording":{"id":"r2","title":"Two"}}]}]})");
+    http->add("image.tmdb.org", 200, "image/jpeg", "poster-bytes");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.roots = {"/TV"};
+    scanner_config.tv.tmdb.token_file = token;
+    scanner_config.music.roots = {"/Music"};
+    CatalogueScanner scanner(service.node(), fs, catalogue, hints, scanner_config, std::move(http));
+    ManageApi manage(service.node(), service.metadata_manager(), fs, catalogue, hints, scanner);
+
+    int file = 0;
+    auto unmatched = [&](const std::string& root, const std::string& extension) {
+        const auto path = root + "/file-" + std::to_string(++file) + extension;
+        write_file(fs, path, pattern(4096, static_cast<uint8_t>(file)));
+        const auto media_id = file_media_id(fs.getattr(path));
+        const auto hint_id = hints.submit(path, "scanner", media_id,
+                                          CatalogueHintPriority::periodic_scan);
+        REQUIRE(hints.claim_next().has_value());
+        hints.mark_no_match(hint_id, "scanner", media_id, "no_provider_match");
+        return std::pair{hint_id, media_id};
+    };
+    auto match = [&](const std::string& hint_id, const std::string& body) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/manage/unmatched/" + hint_id + "/match";
+        request.body.assign(body.begin(), body.end());
+        auto response = manage.handle(request);
+        return std::pair{response.status,
+                         Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                                 response.body.size()))};
+    };
+    auto code = [](const Json& body) { return body.find("error")->find("code")->asString(); };
+
+    // A movie by TMDB id: the record, its poster and the binding, as a scan would.
+    auto [movie_hint, movie_media] = unmatched("/Movies", ".mkv");
+    auto [status, body] = match(movie_hint, R"({"ref":"tmdb:movie:335984"})");
+    REQUIRE(status == 200);
+    CHECK(body.find("status")->asString() == "matched");
+    CHECK(body.find("leaf_item_id")->asString() == "tmdb:movie:335984");
+    auto movie = catalogue.get("tmdb:movie:335984");
+    REQUIRE(movie.has_value());
+    CHECK(movie->title == "Blade Runner 2049");
+    CHECK(movie->media_ids == std::vector<std::string>{movie_media});
+    REQUIRE(movie->artwork.size() == 1);
+    CHECK(movie->artwork.front().role == "poster");
+    CHECK(!hints.get(movie_hint).has_value());
+
+    // A show by id with season and episode numbers builds show, season, episode.
+    auto [episode_hint, episode_media] = unmatched("/TV", ".mkv");
+    std::tie(status, body) = match(episode_hint, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":2})");
+    REQUIRE(status == 200);
+    auto episode = catalogue.get(body.find("leaf_item_id")->asString());
+    REQUIRE(episode.has_value());
+    CHECK(episode->title == "The Kingsroad");
+    CHECK(episode->media_ids == std::vector<std::string>{episode_media});
+    CHECK(catalogue.get(*episode->parent_id)->parent_id == "tmdb:tv:1399");
+
+    // A release by MusicBrainz id with a track number.
+    auto [track_hint, track_media] = unmatched("/Music", ".flac");
+    std::tie(status, body) = match(track_hint, R"({"ref":"musicbrainz:release:)" + release + R"(","track_number":2})");
+    REQUIRE(status == 200);
+    auto track = catalogue.get(body.find("leaf_item_id")->asString());
+    REQUIRE(track.has_value());
+    CHECK(track->title == "Two");
+    CHECK(track->media_ids == std::vector<std::string>{track_media});
+
+    // Refusals leave the file unmatched.
+    auto [refused, refused_media] = unmatched("/Movies", ".mkv");
+    std::tie(status, body) = match(refused, R"({"ref":"imdb:tt0083658"})");
+    CHECK(status == 400);
+    CHECK(code(body) == "bad_ref");
+    std::tie(status, body) = match(refused, R"({"ref":"tmdb:tv:1399","season_number":1})");
+    CHECK(status == 400);
+    CHECK(code(body) == "not_playable_ref");
+    std::tie(status, body) = match(refused, R"({"ref":"tmdb:movie:404404"})");
+    CHECK(status == 404);
+    CHECK(code(body) == "provider_not_found");
+    std::tie(status, body) = match(refused, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":9})");
+    CHECK(status == 404);
+    CHECK(code(body) == "provider_not_found");
+    std::tie(status, body) = match(refused, R"({"ref":"tmdb:movie:77"})");
+    CHECK(status == 503);
+    CHECK(code(body) == "provider_unavailable");
+    CHECK(hints.get(refused).has_value());
+}
+
+MACHA_TEST("invariants", test_a_provider_reference_needs_its_provider_configured) {
+    TestService fixture("manage-provider-ref-unconfigured");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    auto& hints = service.catalogue_hints();
+    fs.mkdir("/Movies", 0755, getuid(), getgid());
+    write_file(fs, "/Movies/film.mkv", pattern(4096, 7));
+    const auto media_id = file_media_id(fs.getattr("/Movies/film.mkv"));
+    const auto hint_id = hints.submit("/Movies/film.mkv", "scanner", media_id,
+                                      CatalogueHintPriority::periodic_scan);
+    REQUIRE(hints.claim_next().has_value());
+    hints.mark_no_match(hint_id, "movies", media_id, "no_provider_match");
+
+    // No TMDB token: the movie provider has no metadata source.
+    CatalogueScannerConfig scanner_config;
+    scanner_config.movies.roots = {"/Movies"};
+    auto http = std::make_unique<FakeHttpClient>();
+    auto* http_ptr = http.get();
+    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints, scanner_config,
+                             std::move(http));
+    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
+                     scanner);
+    HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/v1/manage/unmatched/" + hint_id + "/match";
+    const std::string body = R"({"ref":"tmdb:movie:335984"})";
+    request.body.assign(body.begin(), body.end());
+    auto response = manage.handle(request);
+    CHECK(response.status == 400);
+    auto json = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                        response.body.size()));
+    CHECK(json.find("error")->find("code")->asString() == "provider_not_configured");
+    CHECK(http_ptr->requests() == 0);
+}
+
+MACHA_TEST("invariants", test_provider_search_finds_records_and_says_which_are_catalogued) {
+    TestService fixture("manage-provider-search");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    CatalogueItem held;
+    held.kind = CatalogueKind::movie;
+    held.id = "tmdb:movie:335984";
+    held.title = "Blade Runner 2049";
+    service.catalogue().upsert_many({held});
+
+    const auto token = fixture.path() / "tmdb.token";
+    std::ofstream(token) << "test-token\n";
+    auto http = std::make_unique<FakeHttpClient>();
+    auto* http_ptr = http.get();
+    http->add("/search/movie", 200, "application/json",
+              R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","overview":"K."},
+                             {"id":78,"title":"Blade Runner","release_date":"1982-06-25"},
+                             {"id":79,"title":"Blade Runner Black Out"}]})");
+    http->add("/search/tv", 500, "text/plain", "down");
+    http->add("/release", 200, "application/json",
+              R"({"releases":[{"id":"0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41","title":"Hand Album","date":"1999-02-01",
+                               "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
+                               "release-group":{"id":"g1"}}]})");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.roots = {"/TV"};
+    scanner_config.tv.tmdb.token_file = token;
+    scanner_config.music.roots = {"/Music"};
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+                             service.catalogue_hints(), scanner_config, std::move(http));
+    ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(),
+                     service.catalogue(), service.catalogue_hints(), scanner);
+
+    auto search = [&](std::map<std::string, std::string, std::less<>> query) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/manage/providers/search";
+        for (auto& [name, value] : query) request.query[name] = value;
+        auto response = manage.handle(request);
+        return std::pair{response.status,
+                         Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                                 response.body.size()))};
+    };
+
+    auto [status, body] = search({{"q", "Blade Runner"}, {"kind", "movie"}, {"year", "2017"}, {"limit", "2"}});
+    REQUIRE(status == 200);
+    CHECK(body.find("status")->asString() == "ok");
+    const auto& results = body.find("results")->asArray();
+    REQUIRE(results.size() == 2);
+    CHECK(results[0].find("ref")->asString() == "tmdb:movie:335984");
+    CHECK(results[0].find("provider")->asString() == "tmdb");
+    CHECK(results[0].find("year")->asInt64() == 2017);
+    CHECK(results[0].find("overview")->asString() == "K.");
+    CHECK(results[0].find("catalogue_item_id")->asString() == "tmdb:movie:335984");
+    CHECK(results[1].find("catalogue_item_id") == nullptr);
+    CHECK(http_ptr->requests_containing("primary_release_year=2017") == 1);
+
+    std::tie(status, body) = search({{"q", "Hand Album"}, {"kind", "album"}, {"artist", "Band"}});
+    REQUIRE(status == 200);
+    const auto& albums = body.find("results")->asArray();
+    REQUIRE(albums.size() == 1);
+    CHECK(albums[0].find("ref")->asString() == "musicbrainz:release:0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41");
+    CHECK(albums[0].find("artist")->asString() == "Band");
+    CHECK(albums[0].find("year")->asInt64() == 1999);
+
+    auto code = [](const Json& json) { return json.find("error")->find("code")->asString(); };
+    std::tie(status, body) = search({{"q", "Thrones"}, {"kind", "show"}});
+    CHECK(status == 503);
+    CHECK(code(body) == "provider_unavailable");
+    std::tie(status, body) = search({{"q", "x"}, {"kind", "episode"}});
+    CHECK(status == 400);
+    CHECK(code(body) == "bad_kind");
+    std::tie(status, body) = search({{"kind", "movie"}});
+    CHECK(status == 400);
+    CHECK(code(body) == "bad_query");
+    std::tie(status, body) = search({{"q", "x"}, {"kind", "movie"}, {"limit", "0"}});
+    CHECK(status == 400);
+    CHECK(code(body) == "bad_limit");
+}
+
+MACHA_TEST("invariants", test_artwork_options_list_and_a_choice_becomes_the_items_artwork) {
+    TestService fixture("manage-artwork-choice");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+    auto& catalogue = service.catalogue();
+
+    const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
+    auto item = [](CatalogueKind kind, std::string id, std::optional<std::string> parent = {}) {
+        CatalogueItem out;
+        out.kind = kind;
+        out.id = std::move(id);
+        out.title = out.id;
+        if (parent) out.parent_id = *parent;
+        return out;
+    };
+    auto season = item(CatalogueKind::season, "tmdb:season:1399:1", "tmdb:tv:1399");
+    season.season_number = 1;
+    auto episode = item(CatalogueKind::episode, "tmdb:episode:63057", season.id);
+    episode.season_number = 1;
+    episode.episode_number = 2;
+    auto album = item(CatalogueKind::album, "musicbrainz:album:g1");
+    album.external_ids["musicbrainz_release"] = release;
+    catalogue.upsert_many({item(CatalogueKind::movie, "tmdb:movie:335984"),
+                           item(CatalogueKind::show, "tmdb:tv:1399"), season, episode, album,
+                           item(CatalogueKind::movie, "manual:movie:x")});
+
+    const auto token = fixture.path() / "tmdb.token";
+    std::ofstream(token) << "test-token\n";
+    auto http = std::make_unique<FakeHttpClient>();
+    auto* http_ptr = http.get();
+    http->add("/movie/335984/images", 200, "application/json",
+              R"({"posters":[{"file_path":"/a.jpg","width":1000,"height":1500,"iso_639_1":"en"},
+                             {"file_path":"/b.jpg","width":2000,"height":3000,"iso_639_1":null}],
+                  "backdrops":[{"file_path":"/c.jpg","width":1920,"height":1080}]})");
+    http->add("/tv/1399/season/1/episode/2/images", 200, "application/json",
+              R"({"stills":[{"file_path":"/s.jpg","width":1280,"height":720}]})");
+    http->add("/movie/404404/images", 404, "application/json", "{}");
+    http->add("image.tmdb.org", 200, "image/jpeg", "tmdb-image");
+    http->add("-500.jpg", 200, "image/jpeg", "cover-image");
+    http->add("coverartarchive.org/release/" + release, 200, "application/json",
+              R"({"images":[{"id":36041390393,"front":true,"types":["Front"],
+                             "image":"https://coverartarchive.org/release/)" + release + R"(/36041390393.jpg",
+                             "thumbnails":{"250":"https://coverartarchive.org/release/)" + release + R"(/36041390393-250.jpg",
+                                           "500":"https://coverartarchive.org/release/)" + release + R"(/36041390393-500.jpg"}},
+                            {"id":2,"front":false,"types":["Back"],"image":"https://coverartarchive.org/x/2.jpg"}]})");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.movies.tmdb.token_file = token;
+    scanner_config.tv.roots = {"/TV"};
+    scanner_config.tv.tmdb.token_file = token;
+    scanner_config.music.roots = {"/Music"};
+    CatalogueScanner scanner(service.node(), service.filesystem(), catalogue,
+                             service.catalogue_hints(), scanner_config, std::move(http));
+    ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(), catalogue,
+                     service.catalogue_hints(), scanner);
+
+    auto parse = [](const HttpResponse& response) {
+        return Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                       response.body.size()));
+    };
+    auto options = [&](std::map<std::string, std::string, std::less<>> query) {
+        HttpRequest request;
+        request.method = "GET";
+        request.path = "/api/v1/manage/providers/artwork";
+        for (auto& [name, value] : query) request.query[name] = value;
+        auto response = manage.handle(request);
+        return std::pair{response.status, parse(response)};
+    };
+    auto choose = [&](const std::string& body) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = "/api/v1/manage/providers/artwork/choose";
+        request.body.assign(body.begin(), body.end());
+        auto response = manage.handle(request);
+        return std::pair{response.status, parse(response)};
+    };
+    auto code = [](const Json& json) { return json.find("error")->find("code")->asString(); };
+
+    auto [status, body] = options({{"ref", "tmdb:movie:335984"}, {"role", "poster"}});
+    REQUIRE(status == 200);
+    const auto& posters = body.find("options")->asArray();
+    REQUIRE(posters.size() == 2);
+    CHECK(posters[0].find("option_id")->asString() == "/a.jpg");
+    CHECK(posters[0].find("width")->asInt64() == 1000);
+    CHECK(posters[0].find("language")->asString() == "en");
+    CHECK(posters[1].find("language")->isNull());
+    CHECK(posters[0].find("preview_url")->asString() == "https://image.tmdb.org/t/p/w185/a.jpg");
+    CHECK(posters[0].find("url") == nullptr);
+
+    auto [cover_status, covers] = options({{"ref", "musicbrainz:release:" + release}, {"role", "cover"}});
+    REQUIRE(cover_status == 200);
+    REQUIRE(covers.find("options")->asArray().size() == 1);
+    CHECK(covers.find("options")->asArray()[0].find("option_id")->asString() == "36041390393");
+
+    // Choosing fetches the full image, replaces the role and locks the item.
+    std::tie(status, body) = choose(R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/b.jpg"})");
+    REQUIRE(status == 200);
+    CHECK(body.find("status")->asString() == "chosen");
+    auto movie = catalogue.get("tmdb:movie:335984");
+    REQUIRE(movie->artwork.size() == 1);
+    CHECK(movie->artwork.front().role == "poster");
+    CHECK(movie->external_ids.at("macha_metadata_locked") == "1");
+    CHECK(http_ptr->requests_containing("/b.jpg") == 1);
+
+    // An episode's reference is its show's, with its own numbers.
+    std::tie(status, body) = choose(R"({"item_id":"tmdb:episode:63057","role":"still","option_id":"/s.jpg","lock":false})");
+    REQUIRE(status == 200);
+    auto chosen_episode = catalogue.get("tmdb:episode:63057");
+    REQUIRE(chosen_episode->artwork.size() == 1);
+    CHECK(!chosen_episode->external_ids.contains("macha_metadata_locked"));
+
+    // An album's reference is its release.
+    std::tie(status, body) = choose(R"({"item_id":"musicbrainz:album:g1","role":"cover","option_id":"36041390393"})");
+    REQUIRE(status == 200);
+    CHECK(catalogue.get("musicbrainz:album:g1")->artwork.size() == 1);
+    CHECK(http_ptr->requests_containing("36041390393-500.jpg") == 1);
+
+    std::tie(status, body) = options({{"ref", "tmdb:movie:335984"}, {"role", "still"}});
+    CHECK(status == 400);
+    CHECK(code(body) == "bad_role");
+    std::tie(status, body) = options({{"ref", "tmdb:movie:404404"}, {"role", "poster"}});
+    CHECK(status == 404);
+    CHECK(code(body) == "provider_not_found");
+    std::tie(status, body) = choose(R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/elsewhere.jpg"})");
+    CHECK(status == 404);
+    CHECK(code(body) == "option_not_found");
+    std::tie(status, body) = choose(R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg"})");
+    CHECK(status == 400);
+    CHECK(code(body) == "no_provider_ref");
+    std::tie(status, body) = choose(R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg","ref":"tmdb:movie:335984"})");
+    CHECK(status == 200);
+}
+
+MACHA_TEST("invariants", test_manual_items_lose_only_files_gone_from_the_namespace) {
+    TestService fixture("manual-prune");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto& fs = service.filesystem();
+    auto& catalogue = service.catalogue();
+    fs.mkdir("/Movies", 0755, getuid(), getgid());
+    fs.mkdir("/Other", 0755, getuid(), getgid());
+    auto file = [&](const std::string& path, uint8_t seed) {
+        write_file(fs, path, pattern(4096, seed));
+        return file_media_id(fs.getattr(path));
+    };
+    const auto in_root = file("/Movies/a.mkv", 1);
+    const auto outside_roots = file("/Other/b.mkv", 2);
+    const auto deleted = file("/Movies/c.mkv", 3);
+
+    CatalogueItem manual;
+    manual.kind = CatalogueKind::movie;
+    manual.id = "manual:movie:kept";
+    manual.title = "Kept";
+    manual.media_ids = {in_root, outside_roots, deleted};
+    CatalogueItem only_deleted = manual;
+    only_deleted.id = "manual:movie:emptied";
+    only_deleted.media_ids = {deleted};
+    catalogue.upsert_many({manual, only_deleted});
+    fs.unlink("/Movies/c.mkv");
+
+    CatalogueScannerConfig scanner_config;
+    scanner_config.enabled = true;
+    scanner_config.movies.roots = {"/Movies"};
+    scanner_config.tv.enabled = false;
+    scanner_config.music.enabled = false;
+    CatalogueScanner scanner(service.node(), fs, catalogue, service.catalogue_hints(),
+                             scanner_config, std::make_unique<FakeHttpClient>());
+    (void)scanner.scan_once();
+
+    auto kept = catalogue.get("manual:movie:kept");
+    REQUIRE(kept.has_value());
+    auto expected = std::vector<std::string>{in_root, outside_roots};
+    std::sort(expected.begin(), expected.end());
+    auto actual = kept->media_ids;
+    std::sort(actual.begin(), actual.end());
+    CHECK(actual == expected);
+    auto emptied = catalogue.get("manual:movie:emptied");
+    REQUIRE(emptied.has_value());
+    CHECK(emptied->media_ids.empty());
+}
+
+MACHA_TEST("invariants", test_a_file_bound_to_two_items_is_listed_as_a_conflict) {
+    TestService fixture("manage-conflicts");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    config.catalogue.scanner.enabled = false;
+    auto& service = fixture.start();
+
+    auto item = [](CatalogueKind kind, std::string id, std::vector<std::string> media,
+                   std::optional<std::string> parent = {}) {
+        CatalogueItem out;
+        out.kind = kind;
+        out.id = std::move(id);
+        out.title = out.id;
+        out.media_ids = std::move(media);
+        if (parent) out.parent_id = *parent;
+        return out;
+    };
+    service.catalogue().upsert_many({
+        item(CatalogueKind::movie, "tmdb:movie:1", {"macha:twice"}),
+        item(CatalogueKind::movie, "manual:movie:1", {"macha:twice"}),
+        // A multi-episode file: one season, several episodes.
+        item(CatalogueKind::episode, "tmdb:episode:1", {"macha:double"}, "tmdb:season:9:1"),
+        item(CatalogueKind::episode, "tmdb:episode:2", {"macha:double"}, "tmdb:season:9:1"),
+        item(CatalogueKind::movie, "tmdb:movie:2", {"macha:once"}),
+    });
+
+    auto& hints = service.catalogue_hints();
+    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(), hints,
+                             config.catalogue.scanner);
+    ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(),
+                     service.catalogue(), hints, scanner);
+    HttpRequest list;
+    list.method = "GET";
+    list.path = "/api/v1/manage/unmatched";
+    auto response = manage.handle(list);
+    REQUIRE(response.status == 200);
+    auto json = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
+                                        response.body.size()));
+    const auto& conflicts = json.find("conflicts")->asArray();
+    REQUIRE(conflicts.size() == 1);
+    CHECK(conflicts[0].find("media_id")->asString() == "macha:twice");
+    CHECK(conflicts[0].find("item_ids")->asArray().size() == 2);
+}
+
 MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     TestService fixture("manage-identity-reset");
     auto& config = fixture.config();

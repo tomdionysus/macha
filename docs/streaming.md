@@ -264,6 +264,7 @@ A client must bound its own attempt on a node against the budgets that node enfo
   "pipeline_idle_ms": 60000,
   "session_idle_ms": 1800000,
   "max_sessions_per_account": 32,
+  "max_transcodes_per_account": 2,
   "max_sessions": 64,
   "transcode_entitlement_idle_ms": 300000
 }
@@ -274,6 +275,7 @@ A client must bound its own attempt on a node against the budgets that node enfo
 - **`pipeline_idle_ms`** — how long a physical remux/transcode pipeline survives without valid current-generation traffic (`streaming.pipeline_idle_ms`).
 - **`session_idle_ms`** — how long a logical session survives without control or valid stream activity (`streaming.session_idle_ms`). This is also how long a session abandoned on an unreachable node keeps its slot.
 - **`max_sessions_per_account`** — the per-account cap, described under [what one account may hold](#what-one-account-may-hold-on-one-node). The limit only; the live count is never here.
+- **`max_transcodes_per_account`** — how many of one account's sessions may hold a transcode entitlement on this node, described in the same section. The limit only.
 - **`max_sessions`** — the node-wide session cap, every account together. Its refusal is `resource_limit` and means something different from the one above: this node is full, rather than this account is.
 - **`transcode_entitlement_idle_ms`** — how long a session may hold a transcode entitlement with no stream activity before the node releases it. See [keeping a transcode slot across a pause](#keeping-a-transcode-slot-across-a-pause).
 
@@ -337,7 +339,7 @@ not what lets you hold two, and it is not needed for that.
 ### What one account may hold on one node
 
 ```json
-"account": { "sessions": 3, "max_sessions": 32 }
+"account": { "sessions": 3, "max_sessions": 32, "transcodes": 1, "max_transcodes": 2 }
 ```
 
 Creation and the collection listing both carry this block: what this account
@@ -345,6 +347,16 @@ holds on this node right now, and what it may hold. Over the cap, creation is
 refused with `429` and code **`account_session_limit`**, stating both numbers
 as `error.sessions` and `error.max_sessions`, with `scope: request`,
 `node_healthy: true` and `alternative_may_succeed: false`.
+
+`transcodes` is how many of the account's sessions on this node hold a
+transcode entitlement (video or audio, counted once per session), and
+`max_transcodes` how many may (`streaming.max_transcodes_per_account`; `0`
+means no per-account bound). A create or `PATCH` that would give the account
+one more transcoding session is refused with `429` and code
+**`account_transcode_limit`**, stating `error.transcodes` and
+`error.max_transcodes`, with `scope: request`, `node_healthy: true` and
+`alternative_may_succeed: true`: the same request as remux or direct needs no
+entitlement and may succeed on this node.
 
 **Those two fields matter as much as the status.** An account-scoped refusal
 is identical on every node, so a client must not walk the cluster looking for
@@ -556,7 +568,7 @@ The response separates requested preferences, resolved playback, original source
 }
 ```
 
-`preferences` echoes the instruction as given; the top-level `mode` is the mode being performed, which is always the mode asked for, since a mode that misdescribes itself is refused rather than reinterpreted. `trace_id` and `account` are on the creation response only; `GET` and `PATCH` return the session without them, and the listing carries `account` once beside `items`. `source.streams` describes the original elementary streams. `output.video`/`output.audio` describe the selected source stream, whether it is copied or transcoded, and the actual output codec/geometry/audio format. A CRF H.264 transcode has no fixed video bitrate and therefore omits `output.video.bitrate` unless an explicit target bitrate is in force. Returned stream URLs are relative to the API origin.
+`preferences` echoes the instruction as given; the top-level `mode` is the mode being performed, which is always the mode asked for, since a mode that misdescribes itself is refused rather than reinterpreted. `trace_id` and `account` are on the creation response only; `GET` and `PATCH` return the session without them, and the listing carries `account` once beside `items`. `source.streams` describes the original elementary streams. `output.video`/`output.audio` describe the selected source stream, whether it is copied or transcoded, and the actual output codec/geometry/audio format. A CRF H.264 transcode has no fixed video bitrate and therefore omits `output.video.bitrate` unless an explicit target bitrate is in force. For direct play, `stream.mime_type` (and the `Content-Type` of the direct response) comes from the media info: the probed container, and whether the source has a picture (a video stream that is not attached cover art), so a Matroska file named `.mp4` is served as `video/x-matroska` and sound alone in MP4 as `audio/mp4`. Returned stream URLs are relative to the API origin.
 
 ### Where a seek actually starts
 
@@ -679,7 +691,7 @@ A direct MP4 can be assigned directly to a normal HTML `<video>` element. For tr
 
 ## Resource limits and cleanup
 
-`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements belong to a session: each session created is its own logical viewer, which a `PATCH` replacement inherits, so two sessions transcoding hold two entitlements even on one account. Transcode limits count those entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through changes that still transcode, and releases it on DELETE or the page-exit close, on session expiry, **after `transcode_entitlement_idle_ms` with no stream activity**, or **when a `PATCH` leaves transcode**: a session switched to direct or remux gives up its video entitlement, and one whose audio is no longer transcoded gives up its audio entitlement. Switching back to transcode reacquires it like any other `PATCH`, and may then be refused with `resource_limit`. The release is per session: it clears only what that logical viewer holds, and is skipped while another session record still shares the same logical viewer. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429, and **the two 429s are not interchangeable**. `account_session_limit` is identical on every node, so a client must not walk the cluster on it. `resource_limit` is this node's property, and its failure axes differ by path: on **create** it is `scope: node` — another node may have capacity, so walking is right — while on **update** it is `scope: request`, because the session already exists here and walking would mean abandoning a generation that is still serving. Both carry `node_healthy: true` and `alternative_may_succeed: true`: on the update path the alternative is a different instruction against this same node, such as remux instead of transcode or a lower `max_height`. In every case the viewer's current playback is untouched by the refusal. Malformed/incompatible playback requests return `400 bad_playback_request`, a copy the segment container cannot carry returns `422 copy_not_supported`, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503 (422 when the source is `source_unsupported`). Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` (and `reason` when the engine gave one) in the `error` object; `trace` correlates with the `playback[trace]` server logs.
+`max_sessions`, `max_sessions_per_account`, `max_video_transcodes` and `max_audio_transcodes` are enforced independently. `max_sessions` bounds the node; `max_sessions_per_account` bounds one account on it, and its refusal is the distinct `account_session_limit` described above, because a client must treat the two differently. Transcode entitlements belong to a session: each session created is its own logical viewer, which a `PATCH` replacement inherits, so two sessions transcoding hold two entitlements even on one account. Transcode limits count those entitlements, not seeks, replacement generations or physical encoder processes. Once acquired, a logical session retains its entitlement through changes that still transcode, and releases it on DELETE or the page-exit close, on session expiry, **after `transcode_entitlement_idle_ms` with no stream activity**, or **when a `PATCH` leaves transcode**: a session switched to direct or remux gives up its video entitlement, and one whose audio is no longer transcoded gives up its audio entitlement. Switching back to transcode reacquires it like any other `PATCH`, and may then be refused with `resource_limit`. The release is per session: it clears only what that logical viewer holds, and is skipped while another session record still shares the same logical viewer. Admission reserves pending session/transcode capacity before pipeline startup, so simultaneous POST/PATCH requests cannot race through a limit before either session becomes visible. `video_transcodes` and `audio_transcodes` in status report those admission entitlements; `running_video_transcode_pipelines` and `running_audio_transcode_pipelines` separately report live physical encoders. Hitting a limit returns HTTP 429, and **the two 429s are not interchangeable**. `account_session_limit` and `account_transcode_limit` are identical on every node, so a client must not walk the cluster on them. `resource_limit` is this node's property, and its failure axes differ by path: on **create** it is `scope: node` — another node may have capacity, so walking is right — while on **update** it is `scope: request`, because the session already exists here and walking would mean abandoning a generation that is still serving. Both carry `node_healthy: true` and `alternative_may_succeed: true`: on the update path the alternative is a different instruction against this same node, such as remux instead of transcode or a lower `max_height`. In every case the viewer's current playback is untouched by the refusal. Malformed/incompatible playback requests return `400 bad_playback_request`, a copy the segment container cannot carry returns `422 copy_not_supported`, missing media/session state returns 404, a superseded generation returns 410, and media-engine failures return 503 (422 when the source is `source_unsupported`). Probe and pipeline-start failures use stage-specific error codes (`playback_probe_failed` or `playback_pipeline_start_failed`), include `trace`/`stage` (and `reason` when the engine gave one) in the `error` object; `trace` correlates with the `playback[trace]` server logs.
 
 Logical sessions expire after `session_idle_ms` without control or valid
 current-generation stream activity. Expiry cancels the in-process pipeline and

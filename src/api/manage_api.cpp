@@ -248,6 +248,32 @@ CatalogueItem manual_base(CatalogueKind kind, std::string id, std::string title,
     return item;
 }
 
+// A parent named by id that cannot take the manual item: 404 when it does not
+// exist, 400 when it is the wrong kind. `fields` are stated in the error.
+struct ManualParentError : std::runtime_error {
+    int status;
+    std::string code;
+    std::vector<std::pair<std::string, std::string>> fields;
+    ManualParentError(int http_status, std::string error_code, const std::string& message,
+                      std::vector<std::pair<std::string, std::string>> extra)
+        : std::runtime_error(message), status(http_status), code(std::move(error_code)),
+          fields(std::move(extra)) {}
+};
+
+CatalogueItem require_parent(CatalogueManager& catalogue, const std::string& id,
+                             CatalogueKind kind) {
+    auto parent = catalogue.get(id);
+    if (!parent)
+        throw ManualParentError(404, "parent_not_found", "parent item not found",
+                                {{"parent_id", id}});
+    if (parent->kind != kind)
+        throw ManualParentError(400, "bad_parent_kind", "parent is the wrong kind",
+                                {{"parent_id", id},
+                                 {"expected_kind", std::string(catalogue_kind_name(kind))},
+                                 {"parent_kind", std::string(catalogue_kind_name(parent->kind))}});
+    return *parent;
+}
+
 struct ManualItems {
     std::vector<CatalogueItem> items;
     std::string leaf_id;
@@ -273,14 +299,60 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
     }
 
     if (kind == "episode") {
-        const auto series_title = required_string(root, "series");
-        const auto series_year = optional_i32(root, "series_year");
-        const auto season_number = optional_i32(root, "season_number");
+        auto season_number = optional_i32(root, "season_number");
         const auto episode_number = optional_i32(root, "episode_number");
+        const auto season_id = string_value(root, "season_id");
+        const auto series_id = string_value(root, "series_id");
+        std::optional<CatalogueItem> existing_season;
+        if (!season_id.empty()) {
+            existing_season = require_parent(catalogue, season_id, CatalogueKind::season);
+            if (existing_season->season_number) season_number = existing_season->season_number;
+        }
         if (!season_number || !episode_number)
             throw std::runtime_error("season_number and episode_number are required");
         const auto episode_title = string_value(root, "title",
             "Episode " + std::to_string(*episode_number));
+
+        // An existing season or show named by id: the episode joins the
+        // scanner's (or anyone's) hierarchy instead of a duplicate by name.
+        if (existing_season || !series_id.empty()) {
+            std::vector<CatalogueItem> written;
+            CatalogueItem season;
+            if (existing_season) {
+                season = *existing_season;
+            } else {
+                const auto show = require_parent(catalogue, series_id, CatalogueKind::show);
+                std::optional<CatalogueItem> found;
+                for (const auto& candidate : catalogue.list(CatalogueKind::season, show.id))
+                    if (candidate.season_number == season_number) { found = candidate; break; }
+                if (found) {
+                    season = *found;
+                } else {
+                    season = manual_base(CatalogueKind::season,
+                        manual_id("season", show.id + "|" + std::to_string(*season_number)),
+                        "Season " + std::to_string(*season_number));
+                    season.parent_id = show.id;
+                    season.season_number = season_number;
+                    preserve_existing(catalogue, season);
+                    written.push_back(season);
+                }
+            }
+            auto episode = manual_base(CatalogueKind::episode,
+                manual_id("episode", season.id + "|" + std::to_string(*episode_number)),
+                episode_title, synopsis);
+            episode.parent_id = season.id;
+            episode.season_number = season_number;
+            episode.episode_number = episode_number;
+            episode.media_ids.emplace_back(media_id);
+            preserve_existing(catalogue, episode);
+            out.leaf_id = episode.id;
+            written.push_back(std::move(episode));
+            out.items = std::move(written);
+            return out;
+        }
+
+        const auto series_title = required_string(root, "series");
+        const auto series_year = optional_i32(root, "series_year");
 
         const auto show_identity = series_title + "|" +
             (series_year ? std::to_string(*series_year) : "");
@@ -311,12 +383,58 @@ ManualItems build_manual_items(CatalogueManager& catalogue, const Json& root,
     }
 
     if (kind == "track") {
-        const auto artist_title = required_string(root, "artist");
-        const auto album_title = required_string(root, "album");
         const auto track_title = required_string(root, "title");
         const auto year = optional_i32(root, "year");
         const auto disc = optional_i32(root, "disc_number");
         const auto track_number = optional_i32(root, "track_number");
+        const auto album_id = string_value(root, "album_id");
+        const auto artist_id = string_value(root, "artist_id");
+
+        // An existing album, or an existing artist with the album by title.
+        if (!album_id.empty() || !artist_id.empty()) {
+            std::vector<CatalogueItem> written;
+            CatalogueItem album;
+            if (!album_id.empty()) {
+                album = require_parent(catalogue, album_id, CatalogueKind::album);
+            } else {
+                const auto artist = require_parent(catalogue, artist_id, CatalogueKind::artist);
+                const auto album_title = required_string(root, "album");
+                std::optional<CatalogueItem> found;
+                for (const auto& candidate : catalogue.list(CatalogueKind::album, artist.id))
+                    if (candidate.title == album_title && (!year || candidate.year == year)) {
+                        found = candidate;
+                        break;
+                    }
+                if (found) {
+                    album = *found;
+                } else {
+                    album = manual_base(CatalogueKind::album,
+                        manual_id("album", artist.id + "|" + album_title + "|" +
+                                               (year ? std::to_string(*year) : "")),
+                        album_title);
+                    album.parent_id = artist.id;
+                    album.year = year;
+                    preserve_existing(catalogue, album);
+                    written.push_back(album);
+                }
+            }
+            const auto track_identity = album.id + "|" + (disc ? std::to_string(*disc) : "") + "|" +
+                (track_number ? std::to_string(*track_number) : "") + "|" + track_title;
+            auto track = manual_base(CatalogueKind::track, manual_id("track", track_identity),
+                                     track_title, synopsis);
+            track.parent_id = album.id;
+            track.disc_number = disc;
+            track.track_number = track_number;
+            track.media_ids.emplace_back(media_id);
+            preserve_existing(catalogue, track);
+            out.leaf_id = track.id;
+            written.push_back(std::move(track));
+            out.items = std::move(written);
+            return out;
+        }
+
+        const auto artist_title = required_string(root, "artist");
+        const auto album_title = required_string(root, "album");
 
         auto artist = manual_base(CatalogueKind::artist,
             manual_id("artist", artist_title), artist_title);
@@ -633,9 +751,122 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 if (!current_hint_file(fs_, hint)) continue;
                 items.push_back(hint_json(fs_, hint));
             }
+            // A file bound to more than one playable item, except the one
+            // legitimate case: a multi-episode file, bound to several episodes
+            // of one season.
+            std::map<std::string, std::vector<const CatalogueItem*>> bound;
+            const auto snapshot = catalogue_.snapshot_view();
+            for (const auto& [_, item] : snapshot->items) {
+                if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
+                    item.kind != CatalogueKind::track)
+                    continue;
+                for (const auto& media : item.media_ids) bound[media].push_back(&item);
+            }
+            Json::Array conflicts;
+            for (const auto& [media, holders] : bound) {
+                if (holders.size() < 2) continue;
+                const bool one_season = std::all_of(holders.begin(), holders.end(), [&](const auto* item) {
+                    return item->kind == CatalogueKind::episode && item->parent_id &&
+                           item->parent_id == holders.front()->parent_id;
+                });
+                if (one_season) continue;
+                Json::Array ids;
+                for (const auto* item : holders) ids.emplace_back(item->id);
+                conflicts.push_back(Json(Json::Object{{"media_id", media}, {"item_ids", Json(std::move(ids))}}));
+            }
             Json::Object out;
             out["count"] = static_cast<uint64_t>(items.size());
             out["items"] = std::move(items);
+            out["conflicts"] = std::move(conflicts);
+            return http_json(200, Json(std::move(out)).dump());
+        }
+
+        if (request.method == "GET" && request.path == "/api/v1/manage/providers/search") {
+            ProviderSearchQuery query;
+            if (auto it = request.query.find("q"); it != request.query.end()) query.text = it->second;
+            if (query.text.empty()) return http_error(400, "bad_query", "q is required");
+            if (auto it = request.query.find("kind"); it != request.query.end()) query.kind = it->second;
+            if (auto it = request.query.find("artist"); it != request.query.end()) query.artist = it->second;
+            if (auto it = request.query.find("year"); it != request.query.end() && !it->second.empty()) {
+                int32_t year = 0;
+                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), year);
+                if (ec != std::errc{} || end != it->second.data() + it->second.size())
+                    return http_error(400, "bad_year", "year must be a number");
+                query.year = year;
+            }
+            if (auto it = request.query.find("limit"); it != request.query.end() && !it->second.empty()) {
+                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), query.limit);
+                if (ec != std::errc{} || end != it->second.data() + it->second.size() ||
+                    query.limit == 0 || query.limit > 50)
+                    return http_error(400, "bad_limit", "limit must be 1..50");
+            }
+            Json::Array results;
+            for (const auto& result : scanner_.search_providers(query)) {
+                Json::Object item;
+                item["ref"] = result.ref;
+                item["provider"] = result.provider;
+                item["kind"] = result.kind;
+                item["title"] = result.title;
+                item["year"] = result.year ? Json(static_cast<int64_t>(*result.year)) : Json(nullptr);
+                item["overview"] = result.overview;
+                if (result.kind == "album") item["artist"] = result.artist;
+                if (!result.catalogue_id.empty()) item["catalogue_item_id"] = result.catalogue_id;
+                results.push_back(Json(std::move(item)));
+            }
+            Json::Object out;
+            out["status"] = "ok";
+            out["results"] = std::move(results);
+            return http_json(200, Json(std::move(out)).dump());
+        }
+
+        if (request.method == "GET" && request.path == "/api/v1/manage/providers/artwork") {
+            auto query_i32 = [&](std::string_view name) -> std::optional<int32_t> {
+                auto it = request.query.find(name);
+                if (it == request.query.end() || it->second.empty()) return {};
+                int32_t value = 0;
+                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), value);
+                if (ec != std::errc{} || end != it->second.data() + it->second.size())
+                    throw ProviderRequestError(400, "bad_number", std::string(name) + " must be a number");
+                return value;
+            };
+            const auto ref = request.query.contains("ref") ? request.query.at("ref") : std::string{};
+            const auto role = request.query.contains("role") ? request.query.at("role") : std::string{};
+            ProviderRefNumbers numbers;
+            numbers.season = query_i32("season_number");
+            numbers.episode = query_i32("episode_number");
+            Json::Array options;
+            for (const auto& option : scanner_.artwork_options(ref, role, numbers)) {
+                Json::Object item;
+                item["option_id"] = option.option_id;
+                item["role"] = option.role;
+                item["width"] = option.width ? Json(static_cast<int64_t>(*option.width)) : Json(nullptr);
+                item["height"] = option.height ? Json(static_cast<int64_t>(*option.height)) : Json(nullptr);
+                item["language"] = option.language.empty() ? Json(nullptr) : Json(option.language);
+                item["preview_url"] = option.preview_url;
+                options.push_back(Json(std::move(item)));
+            }
+            Json::Object out;
+            out["status"] = "ok";
+            out["options"] = std::move(options);
+            return http_json(200, Json(std::move(out)).dump());
+        }
+
+        if (request.method == "POST" && request.path == "/api/v1/manage/providers/artwork/choose") {
+            const auto body = parse_body(request);
+            std::optional<std::string> ref;
+            if (auto value = string_value(body, "ref"); !value.empty()) ref = std::move(value);
+            ProviderRefNumbers numbers;
+            numbers.season = optional_i32(body, "season_number");
+            numbers.episode = optional_i32(body, "episode_number");
+            bool lock = true;
+            if (const auto* value = body.find("lock")) lock = value->asBool();
+            auto item = scanner_.choose_artwork(required_string(body, "item_id"),
+                                                required_string(body, "role"),
+                                                required_string(body, "option_id"), std::move(ref),
+                                                numbers, lock);
+            Json::Object out;
+            out["status"] = "chosen";
+            out["item"] = catalogue_item_json(item);
             return http_json(200, Json(std::move(out)).dump());
         }
 
@@ -685,6 +916,22 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 auto current = current_hint_file(fs_, *hint);
                 if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
                 const auto root = parse_body(request);
+                if (const auto ref = string_value(root, "ref"); !ref.empty()) {
+                    ProviderRefNumbers numbers;
+                    numbers.season = optional_i32(root, "season_number");
+                    numbers.episode = optional_i32(root, "episode_number");
+                    numbers.disc = optional_i32(root, "disc_number");
+                    numbers.track = optional_i32(root, "track_number");
+                    const auto matched = scanner_.match_unmatched_ref(id, ref, numbers);
+                    Json::Array items;
+                    for (const auto& item_id : matched.item_ids)
+                        if (auto item = catalogue_.get(item_id)) items.push_back(catalogue_item_json(*item));
+                    Json::Object out;
+                    out["status"] = "matched";
+                    out["leaf_item_id"] = matched.leaf_id;
+                    out["items"] = std::move(items);
+                    return http_json(200, Json(std::move(out)).dump());
+                }
                 const auto item_id = required_string(root, "catalogue_item_id");
                 auto item = catalogue_.get(item_id);
                 if (!item) return http_error(404, "catalogue_item_not_found", "catalogue item not found");
@@ -707,7 +954,18 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 if (!hint) return http_error(404, "not_found", "unmatched file not found");
                 auto current = current_hint_file(fs_, *hint);
                 if (!current) return http_error(409, "stale_unmatched", "file changed or moved since matching failed");
-                auto manual = build_manual_items(catalogue_, parse_body(request), current->second);
+                const auto body = parse_body(request);
+                auto manual = build_manual_items(catalogue_, body, current->second);
+                // Hand-entered metadata is locked against the scanner unless
+                // the request says otherwise.
+                bool lock = true;
+                if (const auto* value = body.find("lock")) lock = value->asBool();
+                for (auto& item : manual.items) {
+                    if (lock)
+                        item.external_ids["macha_metadata_locked"] = "1";
+                    else
+                        item.external_ids.erase("macha_metadata_locked");
+                }
                 auto saved = catalogue_.upsert_many(std::move(manual.items));
                 hints_.mark_catalogued(hint->id, "manual", current->second, {manual.leaf_id},
                                        "manual_metadata");
@@ -816,6 +1074,15 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
         return http_error(409, "catalogue_conflict", e.what());
     } catch (const CatalogueUnavailable& e) {
         return http_error(503, "catalogue_unavailable", e.what());
+    } catch (const ProviderRequestError& e) {
+        return http_error(e.status, e.code, e.what());
+    } catch (const ManualParentError& e) {
+        Json::Object error{{"code", e.code}, {"message", std::string(e.what())}};
+        for (const auto& [name, value] : e.fields) error[name] = value;
+        Json::Object root;
+        root["status"] = e.code;
+        root["error"] = std::move(error);
+        return http_json(e.status, Json(std::move(root)).dump());
     } catch (const JsonError& e) {
         return http_error(400, "bad_json", e.what());
     } catch (const std::runtime_error& e) {

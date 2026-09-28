@@ -247,6 +247,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.playback_pipeline_idle_ms = 60000;
     telemetry.playback_session_idle_ms = 1800000;
     telemetry.playback_max_sessions_per_account = 32;
+    telemetry.playback_max_transcodes_per_account = 2;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
@@ -333,7 +334,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
             const auto id = scan.u16();
             const auto size = scan.u16();
             auto payload = scan.raw(size);
-            if (id >= 28 && id <= 32) continue; // the playback fields
+            if ((id >= 28 && id <= 32) || id == 38) continue; // the playback fields
             put_u16(trimmed, id);
             put_u16(trimmed, size);
             trimmed.insert(trimmed.end(), payload.begin(), payload.end());
@@ -349,6 +350,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(silent.playback_pipeline_idle_ms == 0);
     CHECK(silent.playback_session_idle_ms == 0);
     CHECK(silent.playback_max_sessions_per_account == 0);
+    CHECK(silent.playback_max_transcodes_per_account == 0);
     // ... and everything it did say is intact.
     CHECK(silent.api_endpoint == telemetry.api_endpoint);
     CHECK(silent.cpu_cores == telemetry.cpu_cores);

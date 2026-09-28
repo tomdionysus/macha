@@ -4,18 +4,70 @@
 
 ## Unmatched media
 
-`GET /api/v1/manage/unmatched` returns only terminal semantic `no_match` records that still resolve to the same immutable `macha:` media identity. Deferred provider outages, queued work, active matching, files outside configured catalogue roots, and stale paths are not presented as files requiring manual matching. The response is `{count, items}`; each item's `result` is the code the scanner recorded (for example `no_provider_match`, `no_media_candidate` or `media_not_live`), not a sentence.
+`GET /api/v1/manage/unmatched` returns only terminal semantic `no_match` records that still resolve to the same immutable `macha:` media identity. Deferred provider outages, queued work, active matching, files outside configured catalogue roots, and stale paths are not presented as files requiring manual matching. The response is `{count, items, conflicts}`; each item's `result` is the code the scanner recorded (for example `no_provider_match`, `no_media_candidate` or `media_not_live`), not a sentence. `conflicts` lists every file bound to more than one movie, episode or track, as `{media_id, item_ids}`, except a multi-episode file bound to several episodes of one season.
 
 For one unmatched record:
 
 - `GET /api/v1/manage/unmatched/{id}` returns the failure plus local filename/tag probe hypotheses;
 - `GET /api/v1/manage/unmatched/{id}/matches?q=...` searches existing catalogue leaf items as prospective manual bindings;
-- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode or track (`400 not_playable_item` for any other kind);
-- `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy as required) and binds the file;
+- `POST /api/v1/manage/unmatched/{id}/match` with `{catalogue_item_id}` binds the immutable media identity to an existing movie, episode or track (`400 not_playable_item` for any other kind); with `{ref}` it matches to a provider record instead (see below);
+- `POST /api/v1/manage/unmatched/{id}/manual` creates normal manual catalogue metadata (including show/season or artist/album hierarchy as required) and binds the file (see below);
 - `POST /api/v1/manage/unmatched/{id}/retry` reopens normal scanner work at manual-rescan priority (`202`);
 - `DELETE /api/v1/manage/unmatched/{id}` deletes the media file through MachaDFS and clears the exception record.
 
 Every destructive/resolution operation verifies that the current path still has the media identity recorded when matching failed. A replaced or moved path therefore returns `409 stale_unmatched` instead of acting on different bytes.
+
+A match by provider reference fetches the record, builds its hierarchy (reusing items already catalogued under the same ids), stages the provider's default artwork and binds the file, exactly as a scan match does. `ref` is one of:
+
+- `tmdb:movie:<id>`;
+- `tmdb:tv:<id>` with `season_number` and `episode_number`;
+- `musicbrainz:release:<mbid>` with `track_number` and optionally `disc_number`.
+
+It answers `200` with `status: matched`, `leaf_item_id` and the `items` written. Refusals leave the file unmatched: `400 bad_ref` (not one of the forms above), `400 not_playable_ref` (a show or release without its numbers), `400 provider_not_configured` (no TMDB token, or MusicBrainz disabled), `404 provider_not_found` (no such record, or no episode or track with those numbers), `503 provider_unavailable` (the provider could not be reached or failed). Editor requests use their own provider connections, outside the scanner's per-batch request budget; MusicBrainz requests from the editor and the scanner share one pacing of one a second.
+
+## Provider search
+
+`GET /api/v1/manage/providers/search?q=...&kind=movie|show|album&year=&artist=&limit=` searches the metadata provider for a kind: TMDB for `movie` and `show`, MusicBrainz releases for `album` (`artist` narrows to releases credited to that artist). `limit` is 1..50, default 10. It answers:
+
+```json
+{"status": "ok", "results": [
+  {"ref": "tmdb:movie:335984", "provider": "tmdb", "kind": "movie",
+   "title": "Blade Runner 2049", "year": 2017, "overview": "...",
+   "catalogue_item_id": "tmdb:movie:335984"}
+]}
+```
+
+`ref` is what a match by provider reference takes. `year` is `null` when the provider gives none; an album result adds `artist`. `catalogue_item_id` is present when the catalogue already holds the item a match would write. Codes: `400 bad_query` (no `q`), `400 bad_kind`, `400 bad_year`, `400 bad_limit`, `400 provider_not_configured`, `503 provider_unavailable`.
+
+## Provider artwork
+
+`GET /api/v1/manage/providers/artwork?ref=...&role=...` lists the images a provider has for one role of a reference:
+
+- `tmdb:movie:<id>` and `tmdb:tv:<id>`: `poster`, `backdrop`;
+- `tmdb:tv:<id>` with `season_number`: `poster` (the season's);
+- `tmdb:tv:<id>` with `season_number` and `episode_number`: `still`;
+- `musicbrainz:release:<mbid>`: `cover` (the Cover Art Archive's front images).
+
+It answers `{"status": "ok", "options": [{option_id, role, width, height, language, preview_url}]}`. `width`, `height` and `language` are `null` when the provider does not say; `preview_url` is the provider's own small image, for the client to show directly.
+
+`POST /api/v1/manage/providers/artwork/choose` with `{item_id, role, option_id}` fetches that option at full size, stores it as catalogue artwork and makes it the item's only artwork for the role. The reference is the item's own: a TMDB movie or show is its own record, a season or episode is its show's with its own numbers, an album is its MusicBrainz release. An item with none (a manual item) names one with `ref` (and `season_number`, `episode_number`). The choice locks the item against the scanner unless the body says `"lock": false`. It answers `{"status": "chosen", "item": ...}`.
+
+Codes, for both: `400 bad_ref`, `400 bad_role` (not a role that reference offers), `400 bad_number`, `400 provider_not_configured`, `404 provider_not_found`, `503 provider_unavailable`; for a choice also `404 not_found` (no such item), `400 no_provider_ref`, `404 option_not_found` (not an option the provider lists for that role now).
+
+Provider search and artwork need the manager role even to read, since they make the node call the provider on the caller's say-so.
+
+## Manual entry
+
+Manual entry names its parents either by title or by id. By id, the item joins an existing hierarchy, such as a show the scanner matched, instead of creating a `manual:` one beside it:
+
+- an episode takes `season_id` (the episode takes that season's number), or `series_id` plus `season_number`, which reuses that show's season with the number or creates one under the show; otherwise `series`, `series_year`, `season_number` as titles;
+- a track takes `album_id`, or `artist_id` plus `album`, which reuses that artist's album with the title (and `year`, when given) or creates one under the artist; otherwise `artist`, `album` as titles.
+
+Existing parents are referenced, never rewritten. A named id that does not exist is `404 parent_not_found`; one of the wrong kind is `400 bad_parent_kind`. Both state `error.parent_id`; `bad_parent_kind` adds `error.expected_kind` and `error.parent_kind`. The unmatched record is left in place when a request is refused.
+
+Every item manual entry writes carries the metadata lock (`external_ids.macha_metadata_locked = "1"`), so a later scan does not overwrite it, unless the body says `"lock": false`.
+
+A manual item may bind a file anywhere in MachaDFS. A complete catalogue scan unbinds from manual items only files gone from the namespace altogether; the item itself stays, with no files if its last one went.
 
 Artwork for manually created metadata uses the ordinary catalogue artwork endpoint. It remains DATA and follows normal placement, replication, repair and GC.
 

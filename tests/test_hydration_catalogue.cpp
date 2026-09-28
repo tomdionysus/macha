@@ -3975,6 +3975,142 @@ MACHA_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_resolut
     CHECK(track.artwork.empty());
 }
 
+MACHA_TEST("hydration_catalogue", test_item_edits_validate_parents_and_keep_files_unless_named) {
+    // The metadata editor's edits (proposal G): a whole PUT that leaves out
+    // media_ids must not unbind the item's files; PATCH changes only what it
+    // names; parents are checked; a bad body is a 400, not a 503; and a hand
+    // edit is locked against the scanner unless it says otherwise.
+    TestService fixture("catalogue-item-edits");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+
+    CatalogueItem show;
+    show.id = "show:edit-test";
+    show.kind = CatalogueKind::show;
+    show.title = "Edit Show";
+    show = service.catalogue().upsert(show);
+    CatalogueItem movie;
+    movie.id = "movie:edit-test";
+    movie.kind = CatalogueKind::movie;
+    movie.title = "Edit Movie";
+    movie.media_ids = {"macha:file-a", "macha:file-b"};
+    movie = service.catalogue().upsert(movie);
+
+    CatalogueApi api(service.catalogue(), service.catalogue_hints());
+    auto call = [&](std::string method, std::string id, std::string body) {
+        return api.handle({.method = std::move(method),
+                           .path = "/api/v1/catalogue/items/" + id,
+                           .query = {},
+                           .headers = {},
+                           .body = Bytes(body.begin(), body.end()),
+                           .session = {}});
+    };
+    auto error_of = [](const HttpResponse& response) {
+        return Json::parse(std::string(response.body.begin(), response.body.end()));
+    };
+
+    // A whole PUT without media_ids keeps both files, and locks the edit.
+    auto put = call("PUT", "movie%3Aedit-test", R"({"kind":"movie","title":"Renamed"})");
+    REQUIRE(put.status == 200);
+    auto stored = service.catalogue().get(movie.id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->title == "Renamed");
+    CHECK((stored->media_ids == std::vector<std::string>{"macha:file-a", "macha:file-b"}));
+    CHECK(stored->external_ids.at("macha_metadata_locked") == "1");
+
+    // PATCH changes only what it names; lock false unlocks.
+    auto patch = call("PATCH", "movie%3Aedit-test", R"({"year":1999,"lock":false})");
+    REQUIRE(patch.status == 200);
+    stored = service.catalogue().get(movie.id);
+    CHECK(stored->title == "Renamed");
+    CHECK(stored->year == std::optional<int32_t>{1999});
+    CHECK(stored->media_ids.size() == 2);
+    CHECK(!stored->external_ids.contains("macha_metadata_locked"));
+
+    // PATCH of an item that does not exist, and a body that is not an object.
+    CHECK(call("PATCH", "movie%3Anope", R"({"year":2000})").status == 404);
+    auto malformed = call("PATCH", "movie%3Aedit-test", "[1,2]");
+    CHECK(malformed.status == 400);
+    CHECK(error_of(malformed).find("error")->asString() == "bad_item");
+
+    // Parents: one that does not exist, and one of the wrong kind.
+    auto missing = call("PUT", "season%3Aedit-test",
+                        R"({"kind":"season","title":"S1","parent_id":"show:absent"})");
+    CHECK(missing.status == 400);
+    CHECK(error_of(missing).find("error")->asString() == "parent_not_found");
+    CHECK(error_of(missing).find("parent_id")->asString() == "show:absent");
+    auto wrong = call("PUT", "episode%3Aedit-test",
+                      R"({"kind":"episode","title":"E1","parent_id":"show:edit-test"})");
+    CHECK(wrong.status == 400);
+    CHECK(error_of(wrong).find("error")->asString() == "bad_parent_kind");
+    CHECK(error_of(wrong).find("kind")->asString() == "episode");
+    CHECK(error_of(wrong).find("parent_kind")->asString() == "show");
+    CHECK(!service.catalogue().get("episode:edit-test").has_value());
+
+    // The right parent is accepted.
+    CHECK(call("PUT", "season%3Aedit-test",
+               R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})").status == 201);
+}
+
+MACHA_TEST("hydration_catalogue", test_search_filters_by_kind_and_parent_before_its_limit) {
+    // The metadata editor's search (proposal F, backlog item 9): `kind` may
+    // repeat, `parent` keeps one item's children, both filter before `limit`,
+    // and an unknown kind is a 400.
+    TestService fixture("catalogue-search-filters");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.hydration.enabled = false;
+    auto& service = fixture.start();
+    auto add = [&](std::string id, CatalogueKind kind, std::string title,
+                   std::optional<std::string> parent = {}) {
+        CatalogueItem item;
+        item.id = std::move(id);
+        item.kind = kind;
+        item.title = std::move(title);
+        item.parent_id = std::move(parent);
+        return service.catalogue().upsert(item);
+    };
+    for (int i = 0; i < 5; ++i)
+        add("episode:ember-" + std::to_string(i), CatalogueKind::episode, "Ember Episode " + std::to_string(i));
+    add("movie:ember", CatalogueKind::movie, "Ember");
+    add("show:ember", CatalogueKind::show, "Ember Show");
+    add("season:ember-1", CatalogueKind::season, "Ember Season", "show:ember");
+    add("season:other-1", CatalogueKind::season, "Ember Season Elsewhere", "show:other");
+
+    CatalogueApi api(service.catalogue(), service.catalogue_hints());
+    auto search = [&](std::map<std::string, std::vector<std::string>, std::less<>> all) {
+        HttpRequest request{.method = "GET", .path = "/api/v1/catalogue/search", .query = {},
+                            .headers = {}, .body = {}, .session = {}};
+        for (const auto& [key, values] : all) request.query[key] = values.back();
+        request.query_all = std::move(all);
+        return api.handle(request);
+    };
+    auto ids = [](const HttpResponse& response) {
+        std::set<std::string> out;
+        auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+        for (const auto& item : body.find("items")->asArray()) out.insert(item.find("id")->asString());
+        return out;
+    };
+
+    // Five episodes rank alongside; with limit 2 and kind=movie&kind=show the
+    // two asked-for kinds still both come back.
+    auto kinds = search({{"q", {"ember"}}, {"kind", {"movie", "show"}}, {"limit", {"2"}}});
+    REQUIRE(kinds.status == 200);
+    CHECK((ids(kinds) == std::set<std::string>{"movie:ember", "show:ember"}));
+
+    auto children = search({{"q", {"ember"}}, {"parent", {"show:ember"}}});
+    REQUIRE(children.status == 200);
+    CHECK((ids(children) == std::set<std::string>{"season:ember-1"}));
+
+    auto unknown = search({{"q", {"ember"}}, {"kind", {"film"}}});
+    CHECK(unknown.status == 400);
+    CHECK(std::string(unknown.body.begin(), unknown.body.end()).find("bad_kind") != std::string::npos);
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_display_only) {
     TestService fixture("catalogue-effective-artwork-api");
     auto& config = fixture.config();

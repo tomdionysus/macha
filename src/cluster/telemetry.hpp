@@ -123,6 +123,8 @@ struct NodeTelemetry {
     // about the node it happens to be talking to, which is why it rides here
     // rather than only on that node's own playback status.
     uint32_t playback_max_sessions_per_account{};
+    // How many of one account's sessions may hold a transcode here at once.
+    uint32_t playback_max_transcodes_per_account{};
     // Node-wide, every account together. 0.48.0 published the per-account cap
     // and not this one, which left a client able to state "another screen on
     // this account is playing" and unable to state "this node is full" -- the
@@ -147,6 +149,7 @@ struct PlaybackBudgets {
     uint32_t pipeline_idle_ms{};
     uint32_t session_idle_ms{};
     uint32_t max_sessions_per_account{};
+    uint32_t max_transcodes_per_account{};
     uint32_t max_sessions{};
     uint32_t transcode_entitlement_idle_ms{};
 };

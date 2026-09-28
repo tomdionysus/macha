@@ -1,5 +1,104 @@
 # Current release
 
+## 0.67.0 — Per-account transcode bound; metadata editor API (development)
+
+**One account can no longer take every transcode slot on a node.**
+Transcode entitlements are per session, so an account could open sessions
+until it held them all. `streaming.max_transcodes_per_account` (default 2,
+`0` disables) bounds how many of one account's sessions on a node hold an
+entitlement at once; reservations count, so simultaneous creates cannot race
+past it.
+
+**Search by kind and parent (proposal F, backlog item 9).** `kind` may repeat
+and `parent` keeps one item's children, both before `limit`. The HTTP layer
+now keeps every value of a repeated query parameter (`HttpRequest::query_all`).
+
+**Item edits for the metadata editor (proposal G).** `PATCH
+/api/v1/catalogue/items/{id}` changes only the fields present; `PUT` no longer
+unbinds files or artwork a body leaves out; parents are validated
+(`400 parent_not_found`, `400 bad_parent_kind`); a malformed body is
+`400 bad_item` where it was `503 catalogue_unavailable`; a hand edit locks the
+item against the scanner unless it says `"lock": false`.
+
+**Manual entry joins existing parents (proposal D).** A hand-entered episode
+or track can name its season, show, album or artist by id, so it lands in the
+scanner's `tmdb:` or `musicbrainz:` hierarchy instead of a duplicate `manual:`
+one. Items it writes carry the metadata lock unless `"lock": false`.
+
+**Match to a provider reference (proposal C).** An unmatched file can be
+matched to a TMDB movie or show, or a MusicBrainz release, by id: the server
+fetches the record, builds the hierarchy, stages the default artwork and binds
+the file as a scan match would. The metadata editor has its own provider
+connections, outside the scan batch's request budget; both share MusicBrainz's
+one-request-a-second pacing.
+
+**Provider search (proposal A).** The metadata editor can search TMDB for
+movies and shows and MusicBrainz for releases, and is told which results the
+catalogue already holds.
+
+**Artwork options and choice (proposal E).** The metadata editor can list a
+provider's posters, backdrops, stills or covers for an item and choose one;
+the server fetches it and makes it the item's artwork for that role. Provider
+routes need the manager role even to read.
+
+**Multi-file fixes.** A complete scan unbinds deleted files from manual items
+(it already did from scanner items), looking for them across the whole
+namespace so a manual binding outside the catalogue roots is kept. Files bound
+to two playable items are listed. The media profile states the file's size.
+
+**Direct play's Content-Type comes from the media info.** It was taken from
+the file's extension alone; it is now the probed container's type, audio or
+video by whether the source has a picture.
+
+API additions (announce to Core and every client):
+- Direct play `stream.mime_type` and the direct response's `Content-Type`
+  follow the probed container and streams, not the file name.
+- `GET /api/v1/manage/unmatched` gains `conflicts`: `[{media_id, item_ids}]`
+  for a file bound to more than one movie, episode or track (a multi-episode
+  file within one season is not one).
+- `GET /api/v1/catalogue/media/{id}/profile` gains `size` (bytes, `null` when
+  this node cannot find the file; that answer is served `no-cache`).
+- `GET /api/v1/manage/providers/artwork?ref=&role=&season_number=&episode_number=`
+  answers `{status: ok, options: [{option_id, role, width, height, language,
+  preview_url}]}`.
+- `POST /api/v1/manage/providers/artwork/choose` with `{item_id, role,
+  option_id}` (optional `ref`, `season_number`, `episode_number`, `lock`)
+  answers `{status: chosen, item}`; codes `bad_ref`, `bad_role`, `bad_number`,
+  `no_provider_ref`, `option_not_found`, `provider_not_configured`,
+  `provider_not_found`, `provider_unavailable`, `not_found`.
+- Every method on `/api/v1/manage/providers` needs the manager role.
+- `GET /api/v1/manage/providers/search?q=&kind=movie|show|album&year=&artist=&limit=`
+  answers `{status: ok, results: [{ref, provider, kind, title, year, overview,
+  artist (albums), catalogue_item_id (when held)}]}`; codes `bad_query`,
+  `bad_kind`, `bad_year`, `bad_limit`, `provider_not_configured`,
+  `provider_unavailable`.
+- `POST /api/v1/manage/unmatched/{id}/match` accepts `{"ref": ...}`
+  (`tmdb:movie:<id>`, `tmdb:tv:<id>` with `season_number` and
+  `episode_number`, `musicbrainz:release:<mbid>` with `track_number`, optional
+  `disc_number`) in place of `catalogue_item_id`; answers `200` with
+  `status: matched`, `leaf_item_id`, `items`; codes `400 bad_ref`,
+  `400 not_playable_ref`, `400 provider_not_configured`,
+  `404 provider_not_found`, `503 provider_unavailable`.
+- `POST /api/v1/manage/unmatched/{id}/manual` takes `season_id`, or
+  `series_id` plus `season_number`, for an episode, and `album_id`, or
+  `artist_id` plus `album`, for a track; codes `404 parent_not_found` (with
+  `error.parent_id`) and `400 bad_parent_kind` (with `error.parent_id`,
+  `error.expected_kind`, `error.parent_kind`); written items carry
+  `external_ids.macha_metadata_locked = "1"` unless `"lock": false`.
+- `GET /api/v1/catalogue/search` takes a repeatable `kind` and `parent`,
+  filtered before `limit`; `400 bad_kind` for an unknown kind.
+- `PATCH /api/v1/catalogue/items/{id}`; `PUT` keeps omitted `media_ids` and
+  `artwork`; codes `bad_item`, `parent_not_found` (with `parent_id`),
+  `bad_parent_kind` (with `kind`, `parent_kind`); edits set the metadata lock
+  unless `"lock": false`.
+- A create or `PATCH` over the bound is refused `429` with code
+  `account_transcode_limit`, `error.transcodes`, `error.max_transcodes`,
+  `scope: request`, `node_healthy: true`, `alternative_may_succeed: true`.
+- The `account` block on create and on the listing gains `transcodes` and
+  `max_transcodes`.
+- Each node's `playback` budgets in `GET /api/v1/status` gain
+  `max_transcodes_per_account` (telemetry field 38; older peers skip it).
+
 ## 0.66.0 — Catalogue ignore terms; torrent jobs saved on change; shutdown order, simultaneous connects, ingest clear, empty objects (development)
 
 **The cataloguer skips release samples.** `catalogue.scanner.ignore_terms`

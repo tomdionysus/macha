@@ -63,6 +63,23 @@ std::map<std::string, std::string, std::less<>> parse_query(std::string_view que
     return out;
 }
 
+std::map<std::string, std::vector<std::string>, std::less<>> parse_query_all(std::string_view query) {
+    std::map<std::string, std::vector<std::string>, std::less<>> out;
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        auto amp = query.find('&', pos);
+        auto part =
+            query.substr(pos, amp == std::string_view::npos ? query.size() - pos : amp - pos);
+        auto eq = part.find('=');
+        out[http_url_decode(part.substr(0, eq))].push_back(
+            eq == std::string_view::npos ? "" : http_url_decode(part.substr(eq + 1)));
+        if (amp == std::string_view::npos)
+            break;
+        pos = amp + 1;
+    }
+    return out;
+}
+
 std::string reason(int status) {
     switch (status) {
     case 200:
@@ -1088,6 +1105,7 @@ struct HttpServer::Impl {
         request.path = http_url_decode(target.substr(0, question));
         if (question != std::string::npos)
             request.query = parse_query(target.substr(question + 1));
+            request.query_all = parse_query_all(target.substr(question + 1));
 
         std::string line;
         size_t content_length = 0;

@@ -1291,6 +1291,12 @@ class ProviderTemporarilyUnavailable final : public std::runtime_error {
     std::chrono::milliseconds retry_after() const noexcept { return retry_after_; }
 };
 
+// The provider has no record under the id asked for.
+class ProviderRecordNotFound final : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
 bool transient_provider_status(long status) {
     return status == 429 || status >= 500;
 }
@@ -1498,6 +1504,13 @@ std::string TmdbProvider::image_url(std::string_view path) const {
 }
 
 std::optional<Json> TmdbProvider::find_show(const MediaProbe& probe) {
+    if (probe.tmdb_id) {
+        const auto key = "id:" + *probe.tmdb_id;
+        if (auto it = show_cache_.find(key); it != show_cache_.end()) return it->second;
+        auto show = api_optional("/tv/" + *probe.tmdb_id, {{"language", config_.language}});
+        provider_cache_store(show_cache_, cache_bytes_, key, show);
+        return show;
+    }
     const auto key = normalized(probe.series) + "|" + (probe.year ? std::to_string(*probe.year) : "");
     if (auto it = show_cache_.find(key); it != show_cache_.end()) return it->second;
     std::vector<std::pair<std::string, std::string>> q{{"query", probe.series}, {"language", config_.language}};
@@ -1520,11 +1533,15 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     if (!supports(probe.kind)) return {};
     ProviderMatch match;
     if (probe.kind == MediaProbeKind::movie) {
-        const auto key = normalized(probe.title) + "|" +
-                         (probe.year ? std::to_string(*probe.year) : "");
+        const auto key = probe.tmdb_id
+            ? "id:" + *probe.tmdb_id
+            : normalized(probe.title) + "|" + (probe.year ? std::to_string(*probe.year) : "");
         std::optional<Json> cached_detail;
         if (auto it = movie_cache_.find(key); it != movie_cache_.end()) {
             cached_detail = it->second;
+        } else if (probe.tmdb_id) {
+            cached_detail = api_optional("/movie/" + *probe.tmdb_id, {{"language", config_.language}});
+            provider_cache_store(movie_cache_, cache_bytes_, key, cached_detail);
         } else {
             std::vector<std::pair<std::string, std::string>> q{
                 {"query", probe.title}, {"language", config_.language}};
@@ -1762,8 +1779,69 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     return match;
 }
 
-MusicBrainzProvider::MusicBrainzProvider(HttpClient& http, CatalogueMusicBrainzConfig config)
-    : http_(http), config_(std::move(config)) {}
+std::vector<ProviderSearchResult> TmdbProvider::search(const ProviderSearchQuery& query) {
+    const bool movie = query.kind == "movie";
+    std::vector<std::pair<std::string, std::string>> q{{"query", query.text},
+                                                       {"language", config_.language}};
+    if (query.year)
+        q.emplace_back(movie ? "primary_release_year" : "first_air_date_year",
+                       std::to_string(*query.year));
+    auto root = api(movie ? "/search/movie" : "/search/tv", q);
+    std::vector<ProviderSearchResult> out;
+    const auto* results = root.find("results");
+    if (!results || !results->isArray()) return out;
+    for (const auto& result : results->asArray()) {
+        if (out.size() >= query.limit) break;
+        const auto id = json_i32(result.find("id"));
+        if (!id) continue;
+        ProviderSearchResult found;
+        found.ref = item_id("tmdb", movie ? "movie" : "tv", std::to_string(*id));
+        found.provider = "tmdb";
+        found.kind = query.kind;
+        found.title = json_string(result.find(movie ? "title" : "name"));
+        found.year = json_year(result.find(movie ? "release_date" : "first_air_date"));
+        found.overview = json_string(result.find("overview"));
+        found.catalogue_id = found.ref;
+        out.push_back(std::move(found));
+    }
+    return out;
+}
+
+std::vector<ArtworkOption> TmdbProvider::artwork_options(std::string_view kind,
+                                                         std::string_view id,
+                                                         std::string_view role,
+                                                         const ProviderRefNumbers& numbers) {
+    auto path = "/" + std::string(kind) + "/" + std::string(id);
+    if (kind == "tv" && numbers.season) {
+        path += "/season/" + std::to_string(*numbers.season);
+        if (numbers.episode) path += "/episode/" + std::to_string(*numbers.episode);
+    }
+    auto root = api_optional(path + "/images");
+    if (!root) throw ProviderRecordNotFound("TMDB has no record at " + path);
+    const auto* images = root->find(role == "poster" ? "posters"
+                                    : role == "backdrop" ? "backdrops" : "stills");
+    std::vector<ArtworkOption> out;
+    if (!images || !images->isArray()) return out;
+    for (const auto& image : images->asArray()) {
+        const auto file = json_string(image.find("file_path"));
+        if (file.empty()) continue;
+        ArtworkOption option;
+        option.option_id = file;
+        option.role = std::string(role);
+        option.width = json_i32(image.find("width"));
+        option.height = json_i32(image.find("height"));
+        option.language = json_string(image.find("iso_639_1"));
+        option.preview_url = "https://image.tmdb.org/t/p/w185" + file;
+        option.url = image_url(file);
+        out.push_back(std::move(option));
+    }
+    return out;
+}
+
+MusicBrainzProvider::MusicBrainzProvider(HttpClient& http, CatalogueMusicBrainzConfig config,
+                                         std::shared_ptr<MusicBrainzGate> gate)
+    : http_(http), config_(std::move(config)),
+      gate_(gate ? std::move(gate) : std::make_shared<MusicBrainzGate>()) {}
 
 bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
     return config_.enabled && kind == MediaProbeKind::track;
@@ -1771,12 +1849,13 @@ bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
 
 Json MusicBrainzProvider::api(std::string_view path,
                               const std::vector<std::pair<std::string, std::string>>& query) {
+    std::unique_lock gate(gate_->mutex);
     const auto now = std::chrono::steady_clock::now();
-    if (unavailable_until_ > now)
+    if (gate_->unavailable_until > now)
         throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz circuit open");
 
-    if (last_request_ != std::chrono::steady_clock::time_point{}) {
-        const auto due = last_request_ + std::chrono::seconds(1);
+    if (gate_->last_request != std::chrono::steady_clock::time_point{}) {
+        const auto due = gate_->last_request + std::chrono::seconds(1);
         while (std::chrono::steady_clock::now() < due) {
             if (http_.stop_requested())
                 throw std::runtime_error("MusicBrainz request cancelled");
@@ -1796,16 +1875,18 @@ Json MusicBrainzProvider::api(std::string_view path,
     } catch (const ProviderBudgetExhausted&) {
         throw;
     } catch (const std::exception& e) {
-        unavailable_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        gate_->unavailable_until = std::chrono::steady_clock::now() + std::chrono::seconds(60);
         throw ProviderTemporarilyUnavailable(
             "musicbrainz", "MusicBrainz transport unavailable: " + std::string(e.what()));
     }
-    last_request_ = std::chrono::steady_clock::now();
+    gate_->last_request = std::chrono::steady_clock::now();
     if (transient_provider_status(response.status)) {
-        unavailable_until_ = last_request_ + std::chrono::seconds(60);
+        gate_->unavailable_until = gate_->last_request + std::chrono::seconds(60);
         throw ProviderTemporarilyUnavailable(
             "musicbrainz", "MusicBrainz returned HTTP " + std::to_string(response.status));
     }
+    if (response.status == 404)
+        throw ProviderRecordNotFound("MusicBrainz has no record at " + std::string(path));
     if (response.status != 200)
         throw std::runtime_error("MusicBrainz returned HTTP " + std::to_string(response.status));
     return Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1982,6 +2063,76 @@ std::optional<std::string> MusicBrainzProvider::cover_url(std::string_view relea
     }
     provider_cache_store(cover_cache_, cache_bytes_, key, result);
     return result;
+}
+
+std::vector<ProviderSearchResult> MusicBrainzProvider::search(const ProviderSearchQuery& query) {
+    auto lucene = "release:\"" + lucene_quote(query.text) + "\"";
+    if (!query.artist.empty()) lucene += " AND artist:\"" + lucene_quote(query.artist) + "\"";
+    if (query.year) lucene += " AND date:" + std::to_string(*query.year);
+    auto root = api("/release", {{"query", lucene}, {"limit", std::to_string(query.limit)}});
+    std::vector<ProviderSearchResult> out;
+    const auto* releases = root.find("releases");
+    if (!releases || !releases->isArray()) return out;
+    for (const auto& release : releases->asArray()) {
+        if (out.size() >= query.limit) break;
+        const auto id = json_string(release.find("id"));
+        if (id.empty()) continue;
+        std::string group;
+        if (auto found_group = release.find("release-group"); found_group && found_group->isObject())
+            group = json_string(found_group->find("id"));
+        ProviderSearchResult found;
+        found.ref = item_id("musicbrainz", "release", id);
+        found.provider = "musicbrainz";
+        found.kind = "album";
+        found.title = json_string(release.find("title"));
+        found.year = json_year(release.find("date"));
+        found.artist = artist_credit_name(release.find("artist-credit"));
+        found.catalogue_id = item_id("musicbrainz", "album", group.empty() ? id : group);
+        out.push_back(std::move(found));
+    }
+    return out;
+}
+
+std::vector<ArtworkOption> MusicBrainzProvider::artwork_options(std::string_view,
+                                                                std::string_view id,
+                                                                std::string_view role,
+                                                                const ProviderRefNumbers&) {
+    auto response = http_.get("https://coverartarchive.org/release/" + std::string(id),
+                              {"Accept: application/json"}, 2 * 1024 * 1024);
+    // The Cover Art Archive answers 404 for a release with no art.
+    if (response.status == 404) return {};
+    if (response.status != 200)
+        throw std::runtime_error("Cover Art Archive returned HTTP " + std::to_string(response.status));
+    auto root = Json::parse(std::string_view(reinterpret_cast<const char*>(response.body.data()),
+                                             response.body.size()));
+    std::vector<ArtworkOption> out;
+    const auto* images = root.find("images");
+    if (!images || !images->isArray()) return out;
+    for (const auto& image : images->asArray()) {
+        bool front = false;
+        if (auto flag = image.find("front"); flag && flag->isBool()) front = flag->asBool();
+        if (auto types = image.find("types"); types && types->isArray())
+            for (const auto& type : types->asArray())
+                if (type.isString() && type.asString() == "Front") front = true;
+        if (!front) continue;
+        const auto* image_id = image.find("id");
+        if (!image_id || image_id->isNull()) continue;
+        ArtworkOption option;
+        option.option_id = image_id->isString() ? image_id->asString() : image_id->dump();
+        option.role = std::string(role);
+        const auto* thumbs = image.find("thumbnails");
+        auto thumb = [&](std::string_view size) {
+            return thumbs && thumbs->isObject() ? json_string(thumbs->find(std::string(size)))
+                                                : std::string{};
+        };
+        option.preview_url = thumb("250");
+        if (option.preview_url.empty()) option.preview_url = thumb("small");
+        option.url = thumb(config_.cover_size);
+        if (option.url.empty()) option.url = json_string(image.find("image"));
+        if (option.url.empty()) continue;
+        out.push_back(std::move(option));
+    }
+    return out;
 }
 
 std::optional<ProviderMatch> MusicBrainzProvider::lookup(const MediaProbe& probe) {
@@ -2432,10 +2583,12 @@ MediaProbeFile TvScanProvider::probe_file(
 }
 
 MusicScanProvider::MusicScanProvider(HttpClient& http, CatalogueMusicProviderConfig config,
-                                     size_t max_artwork_bytes)
+                                     size_t max_artwork_bytes,
+                                     std::shared_ptr<MusicBrainzGate> musicbrainz_gate)
     : roots_(std::move(config.roots)), max_artwork_bytes_(max_artwork_bytes) {
     if (config.musicbrainz.enabled)
-        metadata_.push_back(std::make_unique<MusicBrainzProvider>(http, std::move(config.musicbrainz)));
+        metadata_.push_back(std::make_unique<MusicBrainzProvider>(
+            http, std::move(config.musicbrainz), std::move(musicbrainz_gate)));
     if (config.discogs.enabled) {
         try {
             metadata_.push_back(std::make_unique<DiscogsProvider>(http, std::move(config.discogs)));
@@ -2462,6 +2615,12 @@ MediaProbeFile MusicScanProvider::probe_file(
     return {std::move(candidates), std::move(embedded->artwork)};
 }
 
+
+MetadataProvider* MusicScanProvider::metadata(std::string_view provider) noexcept {
+    for (const auto& candidate : metadata_)
+        if (candidate->name() == provider) return candidate.get();
+    return nullptr;
+}
 
 std::optional<ProviderMatch> MusicScanProvider::lookup(const MediaProbe& probe) {
     if (metadata_.empty()) return {};
@@ -2515,14 +2674,27 @@ CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs,
 CatalogueScanner::~CatalogueScanner() { stop(); }
 
 void CatalogueScanner::configure_providers() {
-    providers_.clear();
-    if (config_.movies.enabled)
-        providers_.push_back(std::make_unique<MovieScanProvider>(*provider_http_, config_.movies));
-    if (config_.tv.enabled)
-        providers_.push_back(std::make_unique<TvScanProvider>(*provider_http_, config_.tv));
-    if (config_.music.enabled)
-        providers_.push_back(std::make_unique<MusicScanProvider>(*provider_http_, config_.music,
-                                                               config_.max_artwork_bytes));
+    auto build = [&](HttpClient& http) {
+        std::vector<std::unique_ptr<CatalogueScanProvider>> out;
+        if (config_.movies.enabled)
+            out.push_back(std::make_unique<MovieScanProvider>(http, config_.movies));
+        if (config_.tv.enabled)
+            out.push_back(std::make_unique<TvScanProvider>(http, config_.tv));
+        if (config_.music.enabled)
+            out.push_back(std::make_unique<MusicScanProvider>(
+                http, config_.music, config_.max_artwork_bytes, musicbrainz_gate_));
+        return out;
+    };
+    providers_ = build(*provider_http_);
+    std::lock_guard editor(editor_mutex_);
+    editor_providers_ = build(*http_);
+}
+
+MetadataProvider* CatalogueScanner::editor_metadata(std::string_view scan_provider,
+                                                    std::string_view metadata_provider) {
+    for (const auto& provider : editor_providers_)
+        if (provider->name() == scan_provider) return provider->metadata(metadata_provider);
+    return nullptr;
 }
 
 bool CatalogueScanner::coordinator() const {
@@ -2776,6 +2948,356 @@ CatalogueScanProvider* CatalogueScanner::provider_for_path(std::string_view path
     return selected;
 }
 
+bool CatalogueScanner::stage_remote_artwork(
+    ProviderMatch& match, const std::function<bool(std::string_view)>& locked,
+    std::stop_token stop, size_t max_artwork_bytes,
+    DistributedStore::DurabilityBatch& artwork_batch) {
+    std::set<std::tuple<std::string, std::string, std::string>> fetched_remote_artwork;
+    for (const auto& art : match.artwork) {
+        if (stop.stop_requested()) return false;
+        if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
+        auto target = std::find_if(match.items.begin(), match.items.end(), [&](const auto& item) {
+            return item.id == art.item_id;
+        });
+        if (target == match.items.end()) continue;
+        if (locked(art.item_id)) continue;
+        try {
+            auto response = http_->get(art.url, {}, max_artwork_bytes);
+            if (response.status != 200 || response.body.empty()) continue;
+            auto mime = response.content_type;
+            if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
+            if (!mime.starts_with("image/")) continue;
+            auto staged = catalogue_.stage_artwork_deferred(
+                art.role, mime, response.body, artwork_batch);
+            const bool duplicate = std::any_of(
+                target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
+                    return current.role == staged.role && current.id == staged.id;
+                });
+            if (!duplicate) target->artwork.push_back(std::move(staged));
+        } catch (const std::exception& e) {
+            if (stop.stop_requested()) return false;
+            Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
+        }
+    }
+    return true;
+}
+
+namespace {
+
+struct ProviderRef {
+    std::string provider;
+    std::string kind;
+    std::string id;
+};
+
+std::optional<ProviderRef> parse_provider_ref(std::string_view ref) {
+    const auto first = ref.find(':');
+    if (first == std::string_view::npos) return {};
+    const auto second = ref.find(':', first + 1);
+    if (second == std::string_view::npos) return {};
+    ProviderRef out{std::string(ref.substr(0, first)),
+                    std::string(ref.substr(first + 1, second - first - 1)),
+                    std::string(ref.substr(second + 1))};
+    const auto digits = [](std::string_view value) {
+        return !value.empty() && value.size() <= 12 &&
+               std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); });
+    };
+    const auto mbid = [](std::string_view value) {
+        if (value.size() != 36) return false;
+        for (size_t i = 0; i < value.size(); ++i) {
+            const bool dash = i == 8 || i == 13 || i == 18 || i == 23;
+            if (dash ? value[i] != '-' : !std::isxdigit(static_cast<unsigned char>(value[i])))
+                return false;
+        }
+        return true;
+    };
+    if (out.provider == "tmdb" && (out.kind == "movie" || out.kind == "tv") && digits(out.id))
+        return out;
+    if (out.provider == "musicbrainz" && out.kind == "release" && mbid(out.id)) return out;
+    return {};
+}
+
+} // namespace
+
+std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
+    const ProviderSearchQuery& query) {
+    struct Source {
+        std::string_view kind;
+        std::string_view scan_provider;
+        std::string_view metadata_provider;
+        MediaProbeKind probe_kind;
+    };
+    static constexpr Source sources[] = {
+        {"movie", "movies", "tmdb", MediaProbeKind::movie},
+        {"show", "tv", "tmdb", MediaProbeKind::episode},
+        {"album", "music", "musicbrainz", MediaProbeKind::track},
+    };
+    const auto source = std::find_if(std::begin(sources), std::end(sources),
+                                     [&](const Source& candidate) { return candidate.kind == query.kind; });
+    if (source == std::end(sources))
+        throw ProviderRequestError(400, "bad_kind", "kind must be movie, show or album");
+    const auto scan_provider = source->scan_provider;
+    const auto metadata_provider = source->metadata_provider;
+    const auto kind = source->probe_kind;
+    std::vector<ProviderSearchResult> results;
+    {
+        std::lock_guard editor(editor_mutex_);
+        auto* metadata = editor_metadata(scan_provider, metadata_provider);
+        if (!metadata || !metadata->supports(kind))
+            throw ProviderRequestError(400, "provider_not_configured",
+                                       std::string(metadata_provider) + " is not configured for " +
+                                           std::string(scan_provider));
+        try {
+            results = metadata->search(query);
+        } catch (const std::exception& e) {
+            throw ProviderRequestError(503, "provider_unavailable", e.what());
+        }
+    }
+    for (auto& result : results)
+        if (!catalogue_.get(result.catalogue_id)) result.catalogue_id.clear();
+    return results;
+}
+
+ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
+                                                       std::string_view ref,
+                                                       const ProviderRefNumbers& numbers) {
+    auto hint = hints_.get(hint_id);
+    if (!hint || hint->media_id.empty())
+        throw ProviderRequestError(404, "not_found", "unmatched file not found");
+    const auto parsed = parse_provider_ref(ref);
+    if (!parsed)
+        throw ProviderRequestError(400, "bad_ref",
+                                   "ref must be tmdb:movie:<id>, tmdb:tv:<id> or "
+                                   "musicbrainz:release:<mbid>");
+
+    MediaProbe probe;
+    probe.path = hint->path;
+    probe.media_id = hint->media_id;
+    std::string_view scan_provider;
+    if (parsed->kind == "movie") {
+        probe.kind = MediaProbeKind::movie;
+        probe.tmdb_id = parsed->id;
+        scan_provider = "movies";
+    } else if (parsed->kind == "tv") {
+        if (!numbers.season || !numbers.episode)
+            throw ProviderRequestError(400, "not_playable_ref",
+                                       "a show needs season_number and episode_number");
+        probe.kind = MediaProbeKind::episode;
+        probe.tmdb_id = parsed->id;
+        probe.season = numbers.season;
+        probe.episode = numbers.episode;
+        scan_provider = "tv";
+    } else {
+        if (!numbers.track)
+            throw ProviderRequestError(400, "not_playable_ref", "a release needs track_number");
+        probe.kind = MediaProbeKind::track;
+        probe.musicbrainz_release_id = parsed->id;
+        probe.track = numbers.track;
+        probe.disc = numbers.disc;
+        probe.lookup_strategy = MediaProbeLookupStrategy::music_release_first;
+        scan_provider = "music";
+    }
+
+    size_t max_artwork_bytes = 0;
+    {
+        std::lock_guard lock(config_mutex_);
+        max_artwork_bytes = config_.max_artwork_bytes;
+    }
+    std::optional<ProviderMatch> match;
+    {
+        std::lock_guard editor(editor_mutex_);
+        auto* metadata = editor_metadata(scan_provider, parsed->provider);
+        if (!metadata || !metadata->supports(probe.kind))
+            throw ProviderRequestError(400, "provider_not_configured",
+                                       parsed->provider + " is not configured for " +
+                                           std::string(scan_provider));
+        try {
+            match = metadata->lookup(probe);
+        } catch (const ProviderRecordNotFound&) {
+            // No match: answered below as provider_not_found.
+        } catch (const std::exception& e) {
+            throw ProviderRequestError(503, "provider_unavailable", e.what());
+        }
+    }
+    if (!match)
+        throw ProviderRequestError(404, "provider_not_found",
+                                   "the provider has no such record, or no episode or track "
+                                   "with those numbers");
+
+    const auto leaf = std::find_if(match->items.begin(), match->items.end(), [&](const auto& item) {
+        return std::find(item.media_ids.begin(), item.media_ids.end(), probe.media_id) !=
+               item.media_ids.end();
+    });
+    if (leaf == match->items.end())
+        throw ProviderRequestError(404, "provider_not_found", "the record names no playable item");
+    const auto leaf_id = leaf->id;
+
+    DistributedStore::DurabilityBatch artwork_batch;
+    const auto locked = [&](std::string_view item_id) {
+        auto item = catalogue_.get(item_id);
+        if (!item) return false;
+        const auto lock = item->external_ids.find("macha_metadata_locked");
+        return lock != item->external_ids.end() && lock->second == "1";
+    };
+    (void)stage_remote_artwork(*match, locked, {}, max_artwork_bytes, artwork_batch);
+    if (!catalogue_.artwork_durability_barrier(artwork_batch))
+        throw CatalogueUnavailable("catalogue artwork durability floor unavailable");
+    catalogue_.reconcile_scanner(match->items, {probe.media_id}, false, {}, {});
+
+    ProviderRefMatch out;
+    out.leaf_id = leaf_id;
+    for (const auto& item : match->items) out.item_ids.push_back(item.id);
+    hints_.mark_catalogued(hint->id, parsed->provider, probe.media_id, out.item_ids,
+                           "matched_provider_ref");
+    if (media_information_ && probe.media_id.starts_with("macha:"))
+        (void)media_information_->request({probe.media_id}, MediaInformationPriority::background,
+                                          "media-information-catalogue");
+    return out;
+}
+
+namespace {
+
+std::string_view scan_provider_for(const ProviderRef& ref) {
+    if (ref.kind == "movie") return "movies";
+    if (ref.kind == "tv") return "tv";
+    return "music";
+}
+
+// The artwork roles a reference offers: a movie or show has posters and
+// backdrops, a season posters, an episode stills, a release covers.
+std::vector<std::string_view> artwork_roles_for(const ProviderRef& ref,
+                                                const ProviderRefNumbers& numbers) {
+    if (ref.kind == "movie") return {"poster", "backdrop"};
+    if (ref.kind == "tv") {
+        if (numbers.season && numbers.episode) return {"still"};
+        if (numbers.season) return {"poster"};
+        return {"poster", "backdrop"};
+    }
+    return {"cover"};
+}
+
+} // namespace
+
+std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view ref,
+                                                             std::string_view role,
+                                                             const ProviderRefNumbers& numbers) {
+    const auto parsed = parse_provider_ref(ref);
+    if (!parsed)
+        throw ProviderRequestError(400, "bad_ref",
+                                   "ref must be tmdb:movie:<id>, tmdb:tv:<id> or "
+                                   "musicbrainz:release:<mbid>");
+    const auto roles = artwork_roles_for(*parsed, numbers);
+    if (std::find(roles.begin(), roles.end(), role) == roles.end()) {
+        std::string allowed;
+        for (const auto candidate : roles)
+            allowed += (allowed.empty() ? "" : ", ") + std::string(candidate);
+        throw ProviderRequestError(400, "bad_role", "role must be " + allowed + " for this reference");
+    }
+    const auto scan_provider = scan_provider_for(*parsed);
+    std::lock_guard editor(editor_mutex_);
+    auto* metadata = editor_metadata(scan_provider, parsed->provider);
+    if (!metadata)
+        throw ProviderRequestError(400, "provider_not_configured",
+                                   parsed->provider + " is not configured for " +
+                                       std::string(scan_provider));
+    try {
+        return metadata->artwork_options(parsed->kind, parsed->id, role, numbers);
+    } catch (const ProviderRecordNotFound& e) {
+        throw ProviderRequestError(404, "provider_not_found", e.what());
+    } catch (const std::exception& e) {
+        throw ProviderRequestError(503, "provider_unavailable", e.what());
+    }
+}
+
+CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::string_view role,
+                                               std::string_view option_id,
+                                               std::optional<std::string> ref,
+                                               ProviderRefNumbers numbers, bool lock) {
+    auto item = catalogue_.get(item_id);
+    if (!item) throw ProviderRequestError(404, "not_found", "catalogue item not found");
+
+    // An episode or season names its show's record with its own numbers.
+    if (item->kind == CatalogueKind::season || item->kind == CatalogueKind::episode) {
+        if (!numbers.season) numbers.season = item->season_number;
+        if (item->kind == CatalogueKind::episode && !numbers.episode)
+            numbers.episode = item->episode_number;
+    }
+    if (!ref) {
+        const auto is_tmdb_show = [](const std::optional<CatalogueItem>& candidate) {
+            return candidate && candidate->id.starts_with("tmdb:tv:");
+        };
+        switch (item->kind) {
+            case CatalogueKind::movie:
+                if (item->id.starts_with("tmdb:movie:")) ref = item->id;
+                break;
+            case CatalogueKind::show:
+                if (item->id.starts_with("tmdb:tv:")) ref = item->id;
+                break;
+            case CatalogueKind::season:
+                if (item->parent_id) {
+                    auto show = catalogue_.get(*item->parent_id);
+                    if (is_tmdb_show(show)) ref = show->id;
+                }
+                break;
+            case CatalogueKind::episode:
+                if (item->parent_id) {
+                    auto season = catalogue_.get(*item->parent_id);
+                    if (season && season->parent_id) {
+                        auto show = catalogue_.get(*season->parent_id);
+                        if (is_tmdb_show(show)) ref = show->id;
+                    }
+                }
+                break;
+            case CatalogueKind::album:
+                if (auto release = item->external_ids.find("musicbrainz_release");
+                    release != item->external_ids.end())
+                    ref = "musicbrainz:release:" + release->second;
+                break;
+            default:
+                break;
+        }
+    }
+    if (!ref)
+        throw ProviderRequestError(400, "no_provider_ref",
+                                   "the item has no provider record; name one with ref");
+
+    const auto options = artwork_options(*ref, role, numbers);
+    const auto option = std::find_if(options.begin(), options.end(), [&](const auto& candidate) {
+        return candidate.option_id == option_id;
+    });
+    if (option == options.end())
+        throw ProviderRequestError(404, "option_not_found",
+                                   "the provider does not list that option for this role");
+
+    size_t max_artwork_bytes = 0;
+    {
+        std::lock_guard config_lock(config_mutex_);
+        max_artwork_bytes = config_.max_artwork_bytes;
+    }
+    RemoteHttpResponse response;
+    try {
+        response = http_->get(option->url, {}, max_artwork_bytes);
+    } catch (const std::exception& e) {
+        throw ProviderRequestError(503, "provider_unavailable", e.what());
+    }
+    auto mime = response.content_type;
+    if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
+    if (response.status != 200 || response.body.empty() || !mime.starts_with("image/"))
+        throw ProviderRequestError(503, "provider_unavailable",
+                                   "the image fetch answered HTTP " + std::to_string(response.status));
+
+    auto art = catalogue_.stage_artwork(std::string(role), mime, response.body);
+    std::erase_if(item->artwork, [&](const CatalogueArtwork& existing) {
+        return existing.role == art.role;
+    });
+    item->artwork.push_back(std::move(art));
+    if (lock)
+        item->external_ids["macha_metadata_locked"] = "1";
+    else
+        item->external_ids.erase("macha_metadata_locked");
+    return catalogue_.upsert(*item, item->revision);
+}
+
 std::optional<CatalogueScanner::PreparedHintMatch>
 CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                                const MetadataSnapshot& namespace_snapshot,
@@ -3008,36 +3530,14 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         }
     }
 
-    std::set<std::tuple<std::string, std::string, std::string>> fetched_remote_artwork;
-    for (const auto& art : match.artwork) {
-        if (stop.stop_requested()) return {};
-        if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
-        auto target = std::find_if(match.items.begin(), match.items.end(), [&](const auto& item) {
-            return item.id == art.item_id;
-        });
-        if (target == match.items.end()) continue;
-        if (auto old = existing->items.find(art.item_id); old != existing->items.end()) {
-            const auto locked = old->second.external_ids.find("macha_metadata_locked");
-            if (locked != old->second.external_ids.end() && locked->second == "1") continue;
-        }
-        try {
-            auto response = http_->get(art.url, {}, config.max_artwork_bytes);
-            if (response.status != 200 || response.body.empty()) continue;
-            auto mime = response.content_type;
-            if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
-            if (!mime.starts_with("image/")) continue;
-            auto staged = catalogue_.stage_artwork_deferred(
-                art.role, mime, response.body, artwork_batch);
-            const bool duplicate = std::any_of(
-                target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
-                    return current.role == staged.role && current.id == staged.id;
-                });
-            if (!duplicate) target->artwork.push_back(std::move(staged));
-        } catch (const std::exception& e) {
-            if (stop.stop_requested()) return {};
-            Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
-        }
-    }
+    const auto locked = [&](std::string_view item_id) {
+        auto old = existing->items.find(std::string(item_id));
+        if (old == existing->items.end()) return false;
+        const auto lock = old->second.external_ids.find("macha_metadata_locked");
+        return lock != old->second.external_ids.end() && lock->second == "1";
+    };
+    if (!stage_remote_artwork(match, locked, stop, config.max_artwork_bytes, artwork_batch))
+        return {};
 
     std::vector<std::string> item_ids;
     item_ids.reserve(match.items.size());
@@ -3295,6 +3795,25 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
                                    hint_priority});
     }
 
+    // Manual bindings outside the roots are looked for in the whole namespace,
+    // in the same snapshot, and only those found nowhere are dropped.
+    std::set<std::string> vanished_media;
+    if (complete_scan) {
+        for (const auto& [_, item] : existing->items) {
+            auto marker = item.external_ids.find("macha_scanner");
+            if (marker != item.external_ids.end() && marker->second == "1") continue;
+            for (const auto& media : item.media_ids)
+                if (media.starts_with("macha:") && !active_media_ids.contains(media))
+                    vanished_media.insert(media);
+        }
+        if (!vanished_media.empty()) {
+            auto nodes = fs_.namespace_nodes();
+            for (const auto& [path, entry] : catalogue_snapshot_files("/", namespace_snapshot, &nodes, stop))
+                if (entry.size) vanished_media.erase(file_media_id(entry));
+            if (stop.stop_requested()) return 0;
+        }
+    }
+
     const auto ids = hints_.submit_many(std::move(submissions));
     if (stop.stop_requested()) return 0;
     // Discovery is the only destructive catalogue source. Hint processing is
@@ -3302,7 +3821,8 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     catalogue_.reconcile_scanner(
         {}, active_media_ids, complete_scan,
         complete_scan ? std::optional<Hash256>(metadata_namespace_signature(namespace_snapshot))
-                      : std::nullopt);
+                      : std::nullopt,
+        {}, vanished_media);
     if (!ids.empty())
         Log::info("catalogue scan queued " + std::to_string(ids.size()) + " media hints");
     return ids.size();

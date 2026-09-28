@@ -7,8 +7,8 @@
 namespace macha {
 
 // The container vocabulary: the one place that states what a file's name and
-// its probed format mean, what to say in Content-Type when bytes are served
-// as they are, and which codecs each streaming container can carry as a copy.
+// its probed format mean, what to say in Content-Type when a probed source is
+// served as it is, and which codecs each streaming container can carry as a copy.
 //
 // These are facts about file formats. They are not facts about a node, a
 // session or a client, so nothing here takes an engine type, opens a file or
@@ -38,9 +38,11 @@ std::string container_for_extension(std::string_view path);
 // know is reported under libav's own name for it rather than as nothing.
 std::string container_for_format(std::string_view format, std::string_view path);
 
-// Content-Type for serving a source file unchanged, and for the playlists,
+// Content-Type for serving a source file unchanged, from what the probe found
+// in it: its container (container_for_format) and whether it has a picture --
+// a video stream that is not attached cover art. Then for the playlists,
 // segments and cue files a session generates.
-std::string direct_mime(std::string_view path);
+std::string direct_mime(std::string_view container, bool picture);
 std::string segment_mime(std::string_view name);
 
 // Which codecs each streaming container carries as a copy. Asked of a media's
