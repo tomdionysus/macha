@@ -786,6 +786,8 @@ struct PlaybackManager::Impl {
         bool audio_transcode_entitled{};
     };
 
+    struct StartState;
+
     struct SourceLease {
         std::string media_id;
         std::string path;
@@ -832,6 +834,44 @@ struct PlaybackManager::Impl {
         // stopped belonging to a bearer, so the owner has to be recorded
         // rather than re-derived from whoever is asking.
         std::string account;
+        // Set on a session created with `start=async`: what its start has
+        // reached. On the placeholder while pending, and on the session that
+        // replaces it once ready.
+        std::shared_ptr<StartState> start;
+    };
+
+    // An async start. The session map holds the admitted placeholder --
+    // counted against every cap, owned, deletable -- while a start worker
+    // builds the real session beside it and swaps it in when its first
+    // fragment exists. GET and long-polls read this, never the half-built
+    // session.
+    struct StartState {
+        std::mutex mutex;
+        std::string stage{"planning"};
+        Clock::time_point started{Clock::now()};
+        Clock::time_point last_change{Clock::now()};
+        uint64_t seq{};
+        std::optional<uint64_t> source_bytes_read;
+        std::optional<int64_t> preroll_decoded_ms;
+        std::optional<int64_t> preroll_total_ms;
+        std::optional<int64_t> output_media_ms;
+        std::optional<int64_t> first_fragment_ms;
+        std::optional<Json> error;
+        std::vector<std::shared_ptr<HttpWaker>> waiters;
+        std::atomic_bool cancelled{};
+        std::shared_ptr<Session> candidate;
+        bool finished() const { return stage == "ready" || stage == "failed"; }
+        // Precondition: mutex held.
+        std::vector<std::shared_ptr<HttpWaker>> changed_locked() {
+            ++seq;
+            last_change = Clock::now();
+            return std::exchange(waiters, {});
+        }
+    };
+    struct FailedStart {
+        std::string account;
+        Json payload;
+        Clock::time_point expires;
     };
 
     FileSystem& fs;
@@ -969,6 +1009,12 @@ struct PlaybackManager::Impl {
         std::exception_ptr error;
     };
     std::map<std::string, std::shared_ptr<IdempotentCreation>, std::less<>> idempotent_creations;
+    // Failed async starts, readable until they expire. Guarded by `mutex`.
+    std::map<std::string, FailedStart, std::less<>> failed_starts;
+    // Start workers still running, so stop() can wait for them. Guarded by
+    // `mutex`.
+    size_t start_workers{};
+    std::condition_variable_any start_workers_cv;
 
     Impl(FileSystem& filesystem, CatalogueManager& cat, CatalogueApiConfig api,
          StreamingConfig streaming, std::shared_ptr<MediaEngine> media_engine,
@@ -1077,9 +1123,238 @@ struct PlaybackManager::Impl {
         return to_string(sha256({reinterpret_cast<const uint8_t*>(text.data()), text.size()}));
     }
 
+    static void wake(const std::vector<std::shared_ptr<HttpWaker>>& waiters) {
+        for (const auto& waiter : waiters) waiter->fire();
+    }
+
+    // Precondition: start.mutex held.
+    static Json start_json_locked(const StartState& start) {
+        const auto now = Clock::now();
+        Json::Object out{{"stage", start.stage},
+                         {"progress_seq", start.seq},
+                         {"progress_age_ms", static_cast<uint64_t>(std::max<int64_t>(
+                              0, std::chrono::duration_cast<std::chrono::milliseconds>(now - start.last_change).count()))},
+                         {"elapsed_ms", static_cast<uint64_t>(std::max<int64_t>(
+                              0, std::chrono::duration_cast<std::chrono::milliseconds>(now - start.started).count()))}};
+        if (start.source_bytes_read) out["source_bytes_read"] = *start.source_bytes_read;
+        if (start.preroll_total_ms) {
+            out["preroll_decoded_ms"] = static_cast<int64_t>(start.preroll_decoded_ms.value_or(0));
+            out["preroll_total_ms"] = static_cast<int64_t>(*start.preroll_total_ms);
+        }
+        if (start.output_media_ms) out["output_media_ms"] = static_cast<int64_t>(*start.output_media_ms);
+        if (start.first_fragment_ms) out["first_fragment_ms"] = static_cast<int64_t>(*start.first_fragment_ms);
+        if (start.error) out["error"] = *start.error;
+        return Json(std::move(out));
+    }
+
+    // A session whose async start is not ready: its admitted facts, its start,
+    // and the signed close that works before any stream exists. No stream URL
+    // until it is ready.
+    Json pending_json(const Session& placeholder, StartState& start) const {
+        auto payload = session_json(placeholder);
+        payload["stream"]["url"] = Json(nullptr);
+        payload["stream"]["close_url"] = public_stream_prefix(placeholder) + "/close";
+        std::lock_guard lock(start.mutex);
+        payload["start"] = start_json_locked(start);
+        return payload;
+    }
+
+    static bool start_pending(const Session& session) {
+        if (!session.start) return false;
+        std::lock_guard lock(session.start->mutex);
+        return !session.start->finished();
+    }
+
+    // Precondition: mutex held.
+    void prune_failed_starts_locked() {
+        const auto now = Clock::now();
+        std::erase_if(failed_starts, [&](const auto& entry) { return entry.second.expires <= now; });
+    }
+
+    std::shared_ptr<Session> copy_for_start(const Session& admitted) const {
+        auto copy = std::make_shared<Session>();
+        copy->id = admitted.id;
+        copy->token = admitted.token;
+        copy->preferences = admitted.preferences;
+        copy->source = admitted.source;
+        copy->source_entry = admitted.source_entry;
+        copy->probe = admitted.probe;
+        copy->plan = admitted.plan;
+        copy->touched = admitted.touched;
+        copy->logical_session = admitted.logical_session;
+        copy->account = admitted.account;
+        return copy;
+    }
+
+    static Json start_error_json(std::exception_ptr error, const std::string& stalled) {
+        try {
+            std::rethrow_exception(error);
+        } catch (const PlaybackStageError& e) {
+            Json::Object out{{"code", "playback_" + e.stage() + "_failed"},
+                             {"message", std::string(e.what())},
+                             {"trace", e.trace()},
+                             {"stage", e.stage()},
+                             {"start_stage", stalled}};
+            if (e.failure()) {
+                out["reason"] = std::string(media_failure_name(*e.failure()));
+                const auto axes = media_failure_axes(*e.failure());
+                if (axes.scope) out["scope"] = std::string(failure_scope_name(*axes.scope));
+                if (axes.node_healthy) out["node_healthy"] = *axes.node_healthy;
+                if (axes.alternative_may_succeed)
+                    out["alternative_may_succeed"] = *axes.alternative_may_succeed;
+            }
+            return Json(std::move(out));
+        } catch (const std::exception& e) {
+            return Json(Json::Object{{"code", std::string("playback_unavailable")},
+                                     {"message", std::string(e.what())},
+                                     {"start_stage", stalled}});
+        }
+    }
+
+    // Wait for the candidate's first fragment, publishing the engine's
+    // counters as they move and failing only when nothing has moved for
+    // startup_no_progress.
+    void wait_for_first_fragment_async(Session& session, StartState& start, std::string_view trace) {
+        auto active = active_engine(session);
+        if (!active) throw std::runtime_error("media pipeline did not start");
+        auto store = active->segments();
+        const auto* progress = active->start_progress();
+        std::optional<uint64_t> seen;
+        while (true) {
+            if (start.cancelled.load()) throw std::runtime_error("start cancelled");
+            const bool ready = store->wait_ready(std::chrono::milliseconds(250));
+            std::vector<std::shared_ptr<HttpWaker>> waiters;
+            bool stalled = false;
+            {
+                std::lock_guard lock(start.mutex);
+                if (progress) {
+                    const auto seq = progress->seq.load(std::memory_order_relaxed);
+                    if (seq != seen) {
+                        seen = seq;
+                        start.source_bytes_read = progress->source_bytes_read.load(std::memory_order_relaxed);
+                        const auto total = progress->preroll_total_us.load(std::memory_order_relaxed);
+                        const auto output = progress->output_media_us.load(std::memory_order_relaxed);
+                        if (total >= 0) {
+                            start.preroll_total_ms = total / 1000;
+                            start.preroll_decoded_ms =
+                                progress->preroll_decoded_us.load(std::memory_order_relaxed) / 1000;
+                        }
+                        start.output_media_ms = output / 1000;
+                        start.stage = total >= 0 && output == 0 ? "preroll" : "encoding";
+                        waiters = start.changed_locked();
+                    }
+                }
+                stalled = !ready && Clock::now() - start.last_change > config.startup_no_progress;
+            }
+            wake(waiters);
+            if (ready) return;
+            const auto state = store->snapshot();
+            if (!state.error.empty())
+                throw stage_error(std::string(trace), "pipeline_start",
+                                  std::runtime_error("libav pipeline failed before first fragment: " + state.error));
+            if (!active->running())
+                throw stage_error(std::string(trace), "pipeline_start",
+                                  std::runtime_error("libav pipeline ended before first fragment"));
+            if (stalled)
+                throw stage_error(std::string(trace), "pipeline_start",
+                                  std::runtime_error("no start progress for " +
+                                                     std::to_string(config.startup_no_progress.count()) + " ms"));
+        }
+    }
+
+    // The start worker: plan, start the pipeline, wait on progress, then swap
+    // the built session in for the placeholder -- or record the failure and
+    // release everything at once.
+    void run_start(std::shared_ptr<Session> placeholder, std::shared_ptr<StartState> start,
+                   std::string trace) {
+        auto candidate = start->candidate;
+        std::string stalled = "planning";
+        try {
+            prepare_transformed_vod(*candidate, trace);
+            if (start->cancelled.load()) throw std::runtime_error("start cancelled");
+            std::vector<std::shared_ptr<HttpWaker>> waiters;
+            {
+                std::lock_guard lock(start->mutex);
+                if (candidate->vod_plan && !candidate->vod_plan->segment_durations.empty())
+                    start->first_fragment_ms =
+                        std::llround(candidate->vod_plan->segment_durations.front() * 1000.0);
+                start->stage = "encoding";
+                stalled = "encoding";
+                waiters = start->changed_locked();
+            }
+            wake(waiters);
+            start_pipeline(*candidate, trace, false);
+            wait_for_first_fragment_async(*candidate, *start, trace);
+            {
+                std::lock_guard lock(mutex);
+                auto it = sessions.find(candidate->id);
+                if (start->cancelled.load() || it == sessions.end() || it->second != placeholder)
+                    throw std::runtime_error("start cancelled");
+                it->second = candidate;
+                signal_cleanup_locked();
+            }
+            {
+                std::lock_guard lock(start->mutex);
+                start->stage = "ready";
+                waiters = start->changed_locked();
+            }
+            wake(waiters);
+            Log::info("playback[" + trace + "] async start ready id=" + candidate->id + " elapsed_ms=" +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         Clock::now() - start->started).count()));
+        } catch (...) {
+            const auto error = std::current_exception();
+            stop_pipeline(*candidate);
+            std::error_code ec;
+            if (!candidate->generation_dir.empty()) std::filesystem::remove_all(candidate->generation_dir, ec);
+            if (start->cancelled.load()) {
+                std::vector<std::shared_ptr<HttpWaker>> waiters;
+                {
+                    std::lock_guard lock(start->mutex);
+                    waiters = std::exchange(start->waiters, {});
+                }
+                wake(waiters);
+            } else {
+                std::vector<std::shared_ptr<HttpWaker>> waiters;
+                Json payload;
+                {
+                    std::lock_guard lock(start->mutex);
+                    start->error = start_error_json(error, stalled);
+                    start->stage = "failed";
+                    waiters = start->changed_locked();
+                }
+                payload = pending_json(*placeholder, *start);
+                {
+                    std::lock_guard lock(mutex);
+                    auto it = sessions.find(placeholder->id);
+                    if (it != sessions.end() && it->second == placeholder) {
+                        sessions.erase(it);
+                        erase_idempotency_for_session_locked(placeholder->id);
+                        if (!placeholder->logical_session->client_key.empty())
+                            logical_sessions.erase(placeholder->logical_session->client_key);
+                        prune_failed_starts_locked();
+                        failed_starts[placeholder->id] =
+                            FailedStart{placeholder->account, std::move(payload),
+                                        Clock::now() + config.start_failed_retention};
+                        signal_cleanup_locked();
+                    }
+                }
+                wake(waiters);
+                std::string message = "unknown";
+                try { std::rethrow_exception(error); } catch (const std::exception& e) { message = e.what(); } catch (...) {}
+                Log::warn("playback[" + trace + "] async start failed id=" + placeholder->id +
+                          " stage=" + stalled + " error=" + message);
+            }
+        }
+        std::lock_guard lock(mutex);
+        --start_workers;
+        start_workers_cv.notify_all();
+    }
+
     HttpResponse creation_response(const Session& session, std::string trace,
                                    std::string_view idempotency_status = {}) const {
-        auto payload = session_json(session);
+        const bool pending = start_pending(session);
+        auto payload = pending ? pending_json(session, *session.start) : session_json(session);
         payload["trace_id"] = std::move(trace);
         // What this account may hold here and what it holds now, so a client
         // can plan against the cap instead of discovering it by refusal at the
@@ -1094,7 +1369,8 @@ struct PlaybackManager::Impl {
         // one: the one fact here the client cannot infer from what it sent.
         if (!idempotency_status.empty())
             payload["idempotency"] = std::string(idempotency_status);
-        auto response = http_json(201, payload.dump());
+        if (pending) payload["status"] = std::string("playback_starting");
+        auto response = http_json(pending ? 202 : 201, payload.dump());
         response.headers["Location"] = "/api/v1/playback/sessions/" + session.id;
         return response;
     }
@@ -1851,7 +2127,7 @@ struct PlaybackManager::Impl {
         session.vod_plan = std::move(prepared);
     }
 
-    void start_pipeline(Session& session, std::string_view trace) {
+    void start_pipeline(Session& session, std::string_view trace, bool wait_for_first_fragment = true) {
         stop_pipeline(session);
         session.stream_touched = Clock::now();
         ++session.generation;
@@ -1881,23 +2157,27 @@ struct PlaybackManager::Impl {
                 std::lock_guard lock(session.pipeline_mutex);
                 session.engine_session = std::shared_ptr<MediaEngineSession>(std::move(launched));
             }
-            try {
-                wait_for_initial_fragment(session, trace);
-            } catch (const PlaybackStageError&) {
-                stop_pipeline(session);
-                std::error_code cleanup_ec;
-                std::filesystem::remove_all(session.generation_dir, cleanup_ec);
-                throw;
-            } catch (const std::exception& e) {
-                stop_pipeline(session);
-                std::error_code cleanup_ec;
-                std::filesystem::remove_all(session.generation_dir, cleanup_ec);
-                throw stage_error(std::string(trace), "pipeline_start", e);
+            if (wait_for_first_fragment) {
+                try {
+                    wait_for_initial_fragment(session, trace);
+                } catch (const PlaybackStageError&) {
+                    stop_pipeline(session);
+                    std::error_code cleanup_ec;
+                    std::filesystem::remove_all(session.generation_dir, cleanup_ec);
+                    throw;
+                } catch (const std::exception& e) {
+                    stop_pipeline(session);
+                    std::error_code cleanup_ec;
+                    std::filesystem::remove_all(session.generation_dir, cleanup_ec);
+                    throw stage_error(std::string(trace), "pipeline_start", e);
+                }
             }
             session.stream_url = prefix + "/" + std::to_string(session.generation) + "/master.m3u8";
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
-            Log::info("playback[" + std::string(trace) + "] pipeline startup complete elapsed_ms=" +
-                      std::to_string(elapsed));
+            if (wait_for_first_fragment) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
+                Log::info("playback[" + std::string(trace) + "] pipeline startup complete elapsed_ms=" +
+                          std::to_string(elapsed));
+            }
         }
         if (session.plan.subtitle_stream >= 0)
             session.subtitle_url = prefix + "/" + std::to_string(session.generation) +
@@ -2616,6 +2896,13 @@ struct PlaybackManager::Impl {
             }))
             return http_error(400, "bad_idempotency_key",
                               "idempotency_key must be 1..256 visible ASCII characters");
+        // Opt-in: answer once admitted and report the start's progress,
+        // rather than blocking until the first fragment exists.
+        bool async_start = false;
+        if (auto it = request.query.find("start"); it != request.query.end()) {
+            if (it->second != "async") return http_error(400, "bad_start", "start must be async");
+            async_start = true;
+        }
 
         std::string fingerprint;
         // Declared out here because the error path below erases by it.
@@ -2702,17 +2989,48 @@ struct PlaybackManager::Impl {
             session->logical_session = logical_session;
             session->account = account;
             if (seek_ms) session->plan.request_seek(std::chrono::milliseconds(*seek_ms));
-            prepare_transformed_vod(*session, trace);
-            resource_reservation = reserve_resources(*session);
-            start_pipeline(*session, trace);
-            {
-                std::lock_guard lock(mutex);
-                sessions[session->id] = session;
-                signal_cleanup_locked();
-                if (pending_sessions) --pending_sessions;
-                release_pending_account_locked(account);
-                commit_resources_locked(resource_reservation);
-                resource_reservation = {};
+            if (async_start && transformed(session->plan)) {
+                // Admitted: every refusal decidable now has been made. The
+                // placeholder takes the session's place and slot; the start
+                // runs beside it. Direct play never gets here -- it has no
+                // pipeline to wait for.
+                resource_reservation = reserve_resources(*session);
+                auto start = std::make_shared<StartState>();
+                start->candidate = copy_for_start(*session);
+                start->candidate->start = start;
+                session->start = start;
+                {
+                    std::lock_guard lock(mutex);
+                    sessions[session->id] = session;
+                    signal_cleanup_locked();
+                    if (pending_sessions) --pending_sessions;
+                    release_pending_account_locked(account);
+                    commit_resources_locked(resource_reservation);
+                    resource_reservation = {};
+                    ++start_workers;
+                }
+                try {
+                    std::thread([this, session, start, trace] { run_start(session, start, trace); }).detach();
+                } catch (...) {
+                    std::lock_guard lock(mutex);
+                    sessions.erase(session->id);
+                    --start_workers;
+                    start_workers_cv.notify_all();
+                    throw;
+                }
+            } else {
+                prepare_transformed_vod(*session, trace);
+                resource_reservation = reserve_resources(*session);
+                start_pipeline(*session, trace);
+                {
+                    std::lock_guard lock(mutex);
+                    sessions[session->id] = session;
+                    signal_cleanup_locked();
+                    if (pending_sessions) --pending_sessions;
+                    release_pending_account_locked(account);
+                    commit_resources_locked(resource_reservation);
+                    resource_reservation = {};
+                }
             }
         } catch (...) {
             auto error = std::current_exception();
@@ -2827,14 +3145,61 @@ struct PlaybackManager::Impl {
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
-            if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
+            if (it == sessions.end()) {
+                // A failed async start stays readable for a while, so a
+                // client polling it learns why rather than finding nothing.
+                prune_failed_starts_locked();
+                auto failed = failed_starts.find(id);
+                if (failed != failed_starts.end() && request.session &&
+                    failed->second.account == account_key(*request.session))
+                    return http_json(200, failed->second.payload.dump());
+                return http_error(404, "not_found", "playback session not found");
+            }
             if (!caller_owns(*it->second, request))
                 return http_error(404, "not_found", "playback session not found");
             session = it->second;
             session->touched = Clock::now();
             signal_cleanup_locked();
         }
+        if (session->start) {
+            // Long-poll: answer when progress_seq passes `after`, or at the
+            // wait, whichever comes first.
+            auto number = [&](std::string_view name) -> std::optional<uint64_t> {
+                auto it = request.query.find(name);
+                if (it == request.query.end() || it->second.empty()) return std::nullopt;
+                uint64_t value = 0;
+                auto [end, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), value);
+                if (ec != std::errc{} || end != it->second.data() + it->second.size())
+                    throw std::invalid_argument(std::string(name) + " must be a non-negative integer");
+                return value;
+            };
+            const auto after = number("after");
+            const auto wait_ms = std::min<uint64_t>(number("wait_ms").value_or(0),
+                                                    static_cast<uint64_t>(config.start_wait_max.count()));
+            const auto deadline = request.resumed ? request.resume_deadline
+                                                  : Clock::now() + std::chrono::milliseconds(wait_ms);
+            std::shared_ptr<HttpWaker> waker;
+            bool pending = false;
+            {
+                std::lock_guard lock(session->start->mutex);
+                pending = !session->start->finished();
+                if (after && pending && session->start->seq <= *after && Clock::now() < deadline) {
+                    waker = std::make_shared<HttpWaker>();
+                    session->start->waiters.push_back(waker);
+                }
+            }
+            if (waker) {
+                HttpResponse deferred;
+                deferred.defer = HttpDeferral{std::move(waker), deadline, {}};
+                return deferred;
+            }
+            if (pending) return http_json(200, pending_json(*session, *session->start).dump());
+        }
         auto result = session_json(*session);
+        if (session->start) {
+            std::lock_guard lock(session->start->mutex);
+            result["start"] = start_json_locked(*session->start);
+        }
         if (auto active = active_engine(*session)) {
             result["engine_running"] = active->running();
             if (auto code = active->exit_code()) result["engine_exit_code"] = *code;
@@ -2865,6 +3230,9 @@ struct PlaybackManager::Impl {
                 return http_error(404, "not_found", "playback session not found");
             old = it->second;
         }
+        if (start_pending(*old))
+            return http_error(409, "playback_starting",
+                              "this session's start is not ready: wait for it, or DELETE it");
         auto trace = hex_token(4);
         Json root = Json::parse(std::string_view(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
         if (!root.isObject()) return http_error(400, "bad_request", "JSON object required");
@@ -3042,6 +3410,13 @@ struct PlaybackManager::Impl {
                 logical_sessions.erase(removed->logical_session->client_key);
             signal_cleanup_locked();
         }
+        // A start still running beside a placeholder stops now, freeing its
+        // slot at once rather than when the start would have ended.
+        if (removed->start) {
+            removed->start->cancelled.store(true);
+            if (removed->start->candidate && removed->start->candidate != removed)
+                stop_pipeline(*removed->start->candidate);
+        }
         stop_pipeline(*removed);
         std::error_code ec;
         std::filesystem::remove_all(*config.temp_path / removed->id, ec);
@@ -3121,6 +3496,10 @@ struct PlaybackManager::Impl {
                           static_cast<uint64_t>(config.max_sessions_per_account)},
                          {"max_transcodes_per_account",
                           static_cast<uint64_t>(config.max_transcodes_per_account)},
+                         {"startup_no_progress_ms", static_cast<uint64_t>(config.startup_no_progress.count())},
+                         {"start_wait_max_ms", static_cast<uint64_t>(config.start_wait_max.count())},
+                         {"start_failed_retention_ms",
+                          static_cast<uint64_t>(config.start_failed_retention.count())},
                          {"video_transcodes", static_cast<uint64_t>(video_transcodes)},
                          {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
@@ -3508,6 +3887,20 @@ void PlaybackManager::stop() {
     if (impl_->profile_publish_thread.joinable()) {
         impl_->profile_publish_thread.join();
     }
+    std::vector<std::shared_ptr<Impl::StartState>> starts;
+    {
+        std::lock_guard lock(impl_->mutex);
+        for (auto& [_, session] : impl_->sessions)
+            if (session->start) starts.push_back(session->start);
+    }
+    for (auto& start : starts) {
+        start->cancelled.store(true);
+        if (start->candidate) impl_->stop_pipeline(*start->candidate);
+    }
+    {
+        std::unique_lock lock(impl_->mutex);
+        impl_->start_workers_cv.wait(lock, [&] { return impl_->start_workers == 0; });
+    }
     std::vector<std::shared_ptr<Impl::Session>> sessions;
     {
         std::lock_guard lock(impl_->mutex);
@@ -3545,6 +3938,9 @@ void PlaybackManager::reconfigure(StreamingConfig config) {
     impl_->config.session_unused_idle = config.session_unused_idle;
     impl_->config.pipeline_idle = config.pipeline_idle;
     impl_->config.startup_timeout = config.startup_timeout;
+    impl_->config.startup_no_progress = config.startup_no_progress;
+    impl_->config.start_wait_max = config.start_wait_max;
+    impl_->config.start_failed_retention = config.start_failed_retention;
     impl_->config.segment_duration = config.segment_duration;
     impl_->config.max_ahead_segments = config.max_ahead_segments;
     impl_->config.segment_hold_window = config.segment_hold_window;

@@ -133,6 +133,9 @@ enum TelemetryFieldId : uint16_t {
     field_cache_misses = 36,
     field_cache_evictions = 37,
     field_playback_max_transcodes_per_account = 38,
+    field_playback_startup_no_progress_ms = 39,
+    field_playback_start_wait_max_ms = 40,
+    field_playback_start_failed_retention_ms = 41,
 };
 
 void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
@@ -215,6 +218,10 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     put_uint(body, field_playback_max_sessions, value.playback_max_sessions);
     put_uint(body, field_playback_transcode_entitlement_idle_ms,
              value.playback_transcode_entitlement_idle_ms);
+    put_uint(body, field_playback_startup_no_progress_ms, value.playback_startup_no_progress_ms);
+    put_uint(body, field_playback_start_wait_max_ms, value.playback_start_wait_max_ms);
+    put_uint(body, field_playback_start_failed_retention_ms,
+             value.playback_start_failed_retention_ms);
     put_uint(body, field_cache_hits, value.cache_hits);
     put_uint(body, field_cache_misses, value.cache_misses);
     put_uint(body, field_cache_evictions, value.cache_evictions);
@@ -361,6 +368,18 @@ NodeTelemetry decode(Reader& reader) {
         case field_playback_transcode_entitlement_idle_ms:
             value.playback_transcode_entitlement_idle_ms = static_cast<uint32_t>(
                 field_uint(payload, 4, "playback_transcode_entitlement_idle_ms"));
+            break;
+        case field_playback_startup_no_progress_ms:
+            value.playback_startup_no_progress_ms = static_cast<uint32_t>(
+                field_uint(payload, 4, "playback_startup_no_progress_ms"));
+            break;
+        case field_playback_start_wait_max_ms:
+            value.playback_start_wait_max_ms =
+                static_cast<uint32_t>(field_uint(payload, 4, "playback_start_wait_max_ms"));
+            break;
+        case field_playback_start_failed_retention_ms:
+            value.playback_start_failed_retention_ms = static_cast<uint32_t>(
+                field_uint(payload, 4, "playback_start_failed_retention_ms"));
             break;
         case field_cache_hits:
             value.cache_hits = field_uint(payload, 8, "cache_hits");
@@ -523,6 +542,9 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.cache_misses = cache.misses;
     telemetry.cache_evictions = cache.evictions;
     telemetry.playback_transcode_entitlement_idle_ms = playback.transcode_entitlement_idle_ms;
+    telemetry.playback_startup_no_progress_ms = playback.startup_no_progress_ms;
+    telemetry.playback_start_wait_max_ms = playback.start_wait_max_ms;
+    telemetry.playback_start_failed_retention_ms = playback.start_failed_retention_ms;
     observe(telemetry, true);
     return telemetry;
 }
