@@ -1,5 +1,30 @@
 # Current release
 
+## 0.70.0 — Transcode rate facts; node names (development)
+
+**A node states how fast it has transcoded each kind of source.** Every
+transcode generation that produced at least a minute of media records its
+produced over producing media time, parked time excluded, keyed by the
+source's class (video codec, bit depth and height class; or the audio codec
+for an audio-only transcode). Each node publishes the median of its last 16
+per class, with how many transcodes were running when they were taken, in
+its Status `playback` block. Measured, never estimated; persisted across
+restarts (`<state_path>/playback/transcode-rates.json`); a class never seen
+is absent. No node test-decodes to fill one in. The case that forced it:
+fi-1 decodes 4K HEVC 10-bit at ~0.33x real time, so a transcode of it cannot
+be sustained there, and nothing told a client that before it chose the file.
+
+**Node names.** An optional `node_name` in a node's configuration is shown
+for that node on every node's Status as `nodes[].node_name`, beside `host`.
+
+API additions (announce to Core and every client):
+- Each node's `playback` block in `GET /api/v1/status` gains
+  `transcode_rates: [{kind, codec, bit_depth, height_class, rate,
+  observations, concurrent}]` (telemetry field 42), absent until the node has
+  a finished transcode of at least a minute.
+- Each `nodes[]` entry gains `node_name` (string, or `null` when the node has
+  none; telemetry field 43).
+
 ## 0.69.0 — Playback start reports progress (`start=async`) (development)
 
 **A start reports its progress and fails only when progress stops.** Opt-in

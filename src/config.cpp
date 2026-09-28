@@ -835,6 +835,13 @@ Config load_yaml_config(const std::filesystem::path& path) {
         c.plugin_path = root["plugin_path"].as<std::string>();
     if (root["log_level"])
         c.log_level = parse_log_level(root["log_level"].as<std::string>());
+    if (root["node_name"]) {
+        c.node_name = root["node_name"].as<std::string>();
+        if (c.node_name.size() > 64 ||
+            std::any_of(c.node_name.begin(), c.node_name.end(),
+                        [](unsigned char ch) { return ch < 0x20 || ch == 0x7f; }))
+            throw std::runtime_error("node_name must be at most 64 printable characters");
+    }
     if (root["ffmpeg_log_level"])
         c.ffmpeg_log_level = parse_ffmpeg_log_level(root["ffmpeg_log_level"].as<std::string>());
     if (root["service_startup_timeout_ms"])

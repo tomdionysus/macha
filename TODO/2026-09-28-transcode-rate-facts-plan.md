@@ -1,8 +1,8 @@
 # A node states how fast it transcodes a kind of source
 
-Status: design, operator-approved direction (2026-09-28: "yes" to "should
-the server state how fast a node can decode a given source"). Wire shape to
-be sent to Core and every client before any code ships.
+Status: built in 0.70.0 (operator, 2026-09-28: "yes"; persist across
+restarts: yes; on-demand measurement: not now). Announced to Core and every
+client with the release.
 
 ## Why
 

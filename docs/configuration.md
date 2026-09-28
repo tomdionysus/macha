@@ -32,6 +32,18 @@ counter as they work; the process is terminated for its supervisor (systemd
 absolute ceiling on top and is off by default, so a five-minute replay on a
 small node never turns into a crash loop.
 
+## Node name
+
+```yaml
+node_name: Corvus FI-1
+```
+
+An optional display name for the node, at most 64 printable characters. It
+travels in telemetry, so every node's `GET /api/v1/status` shows it for every
+node as `nodes[].node_name` (`null` when unset), beside `host` and never in
+place of it: `host` stays the address peers and tools connect to. Nothing
+routes, ranks or authenticates on the name.
+
 ## Runtime memory bound
 
 ```yaml

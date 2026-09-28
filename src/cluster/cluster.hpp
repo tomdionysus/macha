@@ -15,6 +15,7 @@
 #include "auth/users.hpp"
 #include "storage/storage_pool.hpp"
 #include "cluster/telemetry.hpp"
+#include "cluster/transcode_rates.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -98,6 +99,9 @@ class NodeRuntime {
     NodeId durability_epoch_;
     DataResourceArbiter data_resources_;
     RetainedMemoryLedger retained_memory_;
+    // What this node has sustained transcoding each kind of source; playback
+    // records, telemetry publishes.
+    TranscodeRateBook transcode_rates_;
     // Declared before members_ so the roster is built with the right flags.
     mutable std::mutex inbound_mutex_;
     InboundResolution inbound_;
@@ -262,6 +266,7 @@ class NodeRuntime {
     DataResourceArbiter& data_resources() noexcept { return data_resources_; }
     const DataResourceArbiter& data_resources() const noexcept { return data_resources_; }
     RetainedMemoryLedger& retained_memory() noexcept { return retained_memory_; }
+    TranscodeRateBook& transcode_rates() noexcept { return transcode_rates_; }
     const RetainedMemoryLedger& retained_memory() const noexcept { return retained_memory_; }
     StoragePool& local_store();
     const StoragePool& local_store() const;

@@ -251,6 +251,10 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     telemetry.playback_startup_no_progress_ms = 15000;
     telemetry.playback_start_wait_max_ms = 25000;
     telemetry.playback_start_failed_retention_ms = 60000;
+    telemetry.playback_transcode_rates = {
+        TranscodeRate{"video", "hevc", 10, 2160, 330, 3, 1},
+        TranscodeRate{"audio", "truehd", 0, 0, 12500, 2, 2}};
+    telemetry.node_name = "Corvus FI-1";
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
@@ -1844,4 +1848,37 @@ MACHA_FAST_TEST("foundations", test_configuration_tristates_and_hosting_rules) {
     REQUIRE(warnings.size() == 2);
     CHECK(warnings[0].find("inbound-capable peers only") != std::string::npos);
     CHECK(warnings[1].find("network.advertise, network.upnp") != std::string::npos);
+}
+
+MACHA_FAST_TEST("foundations", test_transcode_rates_keep_a_median_per_class_and_survive_a_restart) {
+    TempDir t;
+    const auto path = t.path() / "playback" / "transcode-rates.json";
+    CHECK(TranscodeRateBook::height_class(534) == 576);
+    CHECK(TranscodeRateBook::height_class(1080) == 1080);
+    CHECK(TranscodeRateBook::height_class(1600) == 2160);
+    CHECK(TranscodeRateBook::height_class(4320) == 4320);
+    {
+        TranscodeRateBook book(path);
+        CHECK(book.summary().empty());
+        for (const double rate : {0.30, 0.35, 0.33})
+            book.record("video", "hevc", 10, 2160, rate, 1);
+        book.record("audio", "truehd", 0, 0, 12.5, 3);
+        // Only the last kept_observations count.
+        for (size_t i = 0; i < TranscodeRateBook::kept_observations + 4; ++i)
+            book.record("video", "h264", 8, 1080, 4.0, 2);
+    }
+    // A restart keeps what the hardware has shown.
+    TranscodeRateBook reloaded(path);
+    const auto rates = reloaded.summary();
+    REQUIRE(rates.size() == 3);
+    const auto find = [&](const std::string& codec) {
+        return *std::find_if(rates.begin(), rates.end(), [&](const auto& rate) { return rate.codec == codec; });
+    };
+    CHECK(find("hevc").rate_milli == 330);
+    CHECK(find("hevc").observations == 3);
+    CHECK(find("hevc").height_class == 2160);
+    CHECK(find("truehd").kind == "audio");
+    CHECK(find("truehd").rate_milli == 12500);
+    CHECK(find("truehd").concurrent == 3);
+    CHECK(find("h264").observations == TranscodeRateBook::kept_observations);
 }

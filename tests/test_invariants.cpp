@@ -1562,6 +1562,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer_telemetry.metadata_generation = peer.metadata_generation;
     peer_telemetry.storage_backends_online = 1;
     peer_telemetry.api_endpoint = "http://10.44.1.51:7438";
+    peer_telemetry.node_name = "Corvus Test Peer";
     node.telemetry().observe(peer_telemetry, true);
 
     response = status.handle(request);
@@ -1579,6 +1580,9 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         // Now that this peer has gossiped telemetry, its advertised API
         // address (distinct from host/port, its RPC bind address) is known.
         CHECK(value.find("api_endpoint")->asString() == "http://10.44.1.51:7438");
+        // The operator's display name travels beside host, never in place of it.
+        CHECK(value.find("node_name")->asString() == "Corvus Test Peer");
+        CHECK(value.find("host")->asString() == peer.host);
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
         CHECK(storage->find("available")->asBool());

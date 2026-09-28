@@ -71,6 +71,9 @@ struct PersistedNodeStatus {
     // wire codec (encode_node_status/decode_node_status in metadata.cpp), so
     // it never enters the replicated snapshot/checkpoint format.
     std::string api_endpoint;
+    // The operator's display name (`node_name`), mirrored the same local-only
+    // way for the same fallback.
+    std::string node_name;
     auto operator<=>(const PersistedNodeStatus&) const = default;
 };
 
