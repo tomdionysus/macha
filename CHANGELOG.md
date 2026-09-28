@@ -1,6 +1,16 @@
 # Current release
 
-## 0.71.0 — Torrents can be added paused (development)
+## 0.71.0 — Torrents can be added paused; a finished download shows its publication progress (development)
+
+**A finished download says what it is waiting for.** A torrent that has
+finished downloading is handed to the ingest only once all its verified
+extents are published into the store, so the import adopts them and completes
+in seconds. That publication can take minutes to tens of minutes (Avengers
+Endgame on gbni-1, 2026-09-28: 378 of 624 extents behind at finish, 5.5 min),
+and until now the job sat at `downloaded`, 100%, with nothing moving. Each
+torrent job now carries `publication` -- extents and bytes published, and how
+long ago the count last advanced -- and `waiting_reason:
+"extent_publication"` while it waits.
 
 **A torrent can be added paused.** `POST /api/v1/torrents/jobs` takes
 `"paused": true`, which records the request with `desired: paused` in the
@@ -13,6 +23,9 @@ API additions (announce to Core and every client):
 - `POST /api/v1/torrents/jobs` takes an optional `paused` (boolean; absent,
   null or false as before; any other type is `400 bad_request`). The job
   answers `desired: paused`, and resume works as for any paused job.
+- Torrent jobs gain `publication` ({published_extents, extents,
+  published_bytes, bytes, progress_age_ms} or null; a live field under
+  `live_as_of_unix_ms`) and `waiting_reason` (`extent_publication` or null).
 
 ## 0.70.0 — Transcode rate facts; node names (development)
 

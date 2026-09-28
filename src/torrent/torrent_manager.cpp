@@ -920,6 +920,7 @@ std::optional<std::string> TorrentManager::job_holding_locked(std::string_view i
 
 void TorrentManager::retire_torrent_locked(const std::string& id, bool delete_payload) {
     publication_waits_.erase(id);
+    publication_seen_.erase(id);
     check_samples_.erase(id);
     if (impl_) {
         if (auto h = impl_->handles.find(id); h != impl_->handles.end()) {
@@ -1125,6 +1126,31 @@ TorrentJob* TorrentManager::job_of_locked(const lt::torrent_handle& handle) {
         return job == jobs_.end() ? nullptr : &job->second;
     }
     return nullptr;
+}
+
+void TorrentManager::refresh_publication_locked(const std::string& id, TorrentJob& job) {
+    const auto progress = verifications_->publication(job.save_path.string());
+    if (!progress) {
+        job.publication.reset();
+        job.waiting_reason.clear();
+        publication_seen_.erase(id);
+        return;
+    }
+    const auto now = Clock::now();
+    auto [seen, first] = publication_seen_.try_emplace(id, PublicationWait{progress->published, now});
+    if (!first && seen->second.published != progress->published) seen->second = {progress->published, now};
+    const uint64_t extent = node_.config().extent_size;
+    TorrentJob::Publication publication;
+    publication.published_extents = progress->published;
+    publication.extents = progress->extents;
+    publication.bytes = job.bytes_total ? job.bytes_total : progress->extents * extent;
+    publication.published_bytes = std::min<uint64_t>(progress->published * extent, publication.bytes);
+    publication.progress_age_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - seen->second.advanced).count());
+    job.publication = publication;
+    job.waiting_reason = job.state == TorrentJobState::downloaded && !progress->complete()
+                             ? "extent_publication"
+                             : "";
 }
 
 bool TorrentManager::publication_settled_locked(const std::string& id, const TorrentJob& job) {
@@ -1449,6 +1475,7 @@ void TorrentManager::update_jobs() {
                     }
                 }
             }();
+            refresh_publication_locked(id, job);
             // Saved only when the record changed, not on every tick: a tick
             // that changes nothing is not a write (40 rewrites of jobs.json in
             // 20 s with nothing downloading, gbni-1, 2026-09-25). Transfer
