@@ -50,6 +50,13 @@ to two playable items are listed. The media profile states the file's size.
 the file's extension alone; it is now the probed container's type, audio or
 video by whether the source has a picture.
 
+**A slow playback start says where its time went.** The media engine counts
+what a starting pipeline has done -- source bytes read, a transcode seek's
+pre-roll (decoded against total) and media past the origin at the muxer --
+and the wait for the first fragment logs them: every second at DEBUG, and
+once at INFO when the fragment arrives or the wait times out. Nothing new is
+sent; this is the measurement step of the start-progress plan.
+
 API additions (announce to Core and every client):
 - Direct play `stream.mime_type` and the direct response's `Content-Type`
   follow the probed container and streams, not the file name.

@@ -287,9 +287,27 @@ class MediaSegmentStore {
     std::unique_ptr<Impl> impl_;
 };
 
+// What a starting pipeline has done so far: facts, never estimates. The
+// engine's worker writes them; playback reads them while it waits for the
+// first fragment. `seq` moves whenever any counter does.
+struct MediaStartProgress {
+    std::atomic_uint64_t seq{};
+    std::atomic_uint64_t source_bytes_read{};
+    // A transcode seek decodes from the keyframe before the origin up to it
+    // and discards those frames: the pre-roll. Total is -1 until the first
+    // pre-roll frame says how far back the keyframe was.
+    std::atomic_int64_t preroll_total_us{-1};
+    std::atomic_int64_t preroll_decoded_us{};
+    // Media time past the origin that has reached the muxer.
+    std::atomic_int64_t output_media_us{};
+    void moved() noexcept { seq.fetch_add(1, std::memory_order_relaxed); }
+};
+
 class MediaEngineSession {
   public:
     virtual ~MediaEngineSession() = default;
+    // Null when the engine does not report start progress.
+    virtual const MediaStartProgress* start_progress() const { return nullptr; }
     virtual bool running() const = 0;
     virtual std::optional<int> exit_code() const = 0;
     virtual std::string diagnostics() const = 0;

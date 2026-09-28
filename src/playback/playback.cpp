@@ -1714,13 +1714,48 @@ struct PlaybackManager::Impl {
         if (!active) throw std::runtime_error("media pipeline did not start");
         auto store = active->segments();
         auto started_at = Clock::now();
-        if (store->wait_ready(config.startup_timeout)) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
+        const auto deadline = started_at + config.startup_timeout;
+        const auto* progress = active->start_progress();
+        // What the pipeline has done so far, so a slow start shows where its
+        // time went: source bytes, transcode pre-roll, media past the origin.
+        const auto progress_text = [&] {
+            if (!progress) return std::string{};
+            const auto total = progress->preroll_total_us.load(std::memory_order_relaxed);
+            return " progress_seq=" + std::to_string(progress->seq.load(std::memory_order_relaxed)) +
+                   " source_bytes_read=" +
+                   std::to_string(progress->source_bytes_read.load(std::memory_order_relaxed)) +
+                   (total < 0 ? std::string{}
+                              : " preroll_decoded_ms=" +
+                                    std::to_string(progress->preroll_decoded_us.load(std::memory_order_relaxed) / 1000) +
+                                    " preroll_total_ms=" + std::to_string(total / 1000)) +
+                   " output_media_ms=" +
+                   std::to_string(progress->output_media_us.load(std::memory_order_relaxed) / 1000);
+        };
+        bool ready = false;
+        while (true) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+            if (remaining.count() <= 0) break;
+            if (store->wait_ready(std::min(remaining, std::chrono::milliseconds(1000)))) {
+                ready = true;
+                break;
+            }
+            if (!store->snapshot().error.empty() || !active->running()) break;
+            if (progress)
+                Log::debug("playback[" + std::string(trace) + "] waiting for first fragment elapsed_ms=" +
+                           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              Clock::now() - started_at).count()) +
+                           progress_text());
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
+        if (ready) {
             auto state = store->snapshot();
             Log::info("playback[" + std::string(trace) + "] first fragment ready elapsed_ms=" +
-                      std::to_string(elapsed) + " segments=" + std::to_string(state.segment_count));
+                      std::to_string(elapsed) + " segments=" + std::to_string(state.segment_count) +
+                      progress_text());
             return;
         }
+        Log::info("playback[" + std::string(trace) + "] no first fragment elapsed_ms=" +
+                  std::to_string(elapsed) + progress_text());
         auto state = store->snapshot();
         if (!state.error.empty()) throw std::runtime_error("libav pipeline failed before first fragment: " + state.error);
         auto diagnostic = active->diagnostics();
