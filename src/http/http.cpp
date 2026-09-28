@@ -1103,9 +1103,10 @@ struct HttpServer::Impl {
         }
         auto question = target.find('?');
         request.path = http_url_decode(target.substr(0, question));
-        if (question != std::string::npos)
+        if (question != std::string::npos) {
             request.query = parse_query(target.substr(question + 1));
             request.query_all = parse_query_all(target.substr(question + 1));
+        }
 
         std::string line;
         size_t content_length = 0;
