@@ -5,8 +5,33 @@ recent version of
 [the object ledger and the component model](2026-09-29-object-ledger-and-components-spec.md),
 which is canonical; where this plan and the spec disagree, the spec wins and
 this plan is corrected. Written 2026-09-29 against the tree at `51ed982`
-(0.73.2 code), ordered by critical path analysis: build the instrument
-first, prove the design on one thin slice through every layer, then widen.
+(0.73.2 code), ordered by critical path analysis: measure the existing
+system, build the instrument, prove the design on one thin slice through
+every layer, then widen.
+
+## What the structure is for
+
+Macha is to be Dijkstra-provable and Knuth-legible before mass peer review,
+and one reason for this experiment is to make independent testing easy.
+That sets the standard of evidence for every step:
+
+- **Proof is structure plus coverage.** Components small and composed
+  fractally, each with contracts stated as preconditions, postconditions
+  and invariants beside what it may wait on and whether it is thread-safe;
+  100% line and branch coverage of every component a step creates or
+  converts, each covered path's test mutation-proven. Where complexity
+  outruns what can be enumerated, the functional and behavioural suite
+  covers the rest.
+- **Legibility is a requirement, not polish.** A component reads top-down
+  as one idea; names say what things are; comments say why, never what the
+  code already says; a reviewer who did not write it can follow each
+  contract to its implementation and its tests.
+- **Sanitizers are used, not canonical.** The ASan and TSan builds
+  (`build-asan`, `build-tsan`) run, and anything they find is fixed, but
+  their silence is not evidence of correctness.
+- **No CI.** Every accepted stage and substage is committed and pushed to
+  GitHub on `experiment/object-ledger` or a branch cut from it. The pushed
+  history is the record.
 
 ## How every step is judged
 
@@ -20,11 +45,18 @@ step, without exception:
   at 0.73.2). Warnings are errors on both.
 - **Every new test is mutation-proven**: break the code it guards, see it
   fail, restore, remove the `.o`.
+- **Covers what it builds**: 100% line and branch coverage
+  (`./run-coverage.sh`) of every component the step creates or converts,
+  with each contract's preconditions, postconditions and invariants
+  written down and tested.
 - **Keeps operational and functional fidelity**, and meets none of the kill
-  criteria, judged holistically: no loss of fidelity to the user, nothing
-  more brittle, no breach of the Laws and Guidelines, nothing less
-  performant or less resilient than before. A step that fails this is
-  withdrawn, not patched forward.
+  criteria, judged holistically against T0's thresholds: no loss of
+  fidelity to the user, nothing more brittle, no breach of the Laws and
+  Guidelines, nothing less performant or less resilient than before. A step
+  that fails this is withdrawn, not patched forward.
+- **Records its decisions** in the spec's decision log, dated, with the
+  reasoning.
+- **Is pushed when accepted**, stage and substage alike.
 - **States the laws it touches** and how each holds.
 - **Changes nothing the API sends**, or announces the change to Core and
   every client before it ships.
@@ -50,13 +82,17 @@ are how each is evaluated, not preconditions for starting it.
   from `develop` as it stands (`75e6f98`).
 - **Versions are plain semver, no extensions**, bumped in `CMakeLists.txt`
   and the README's version line together (configure enforces the match),
-  as on `develop`. A version is taken when a build is deployed, from T5.
+  as on `develop`. A version is taken when a build is deployed: first by
+  T0's instrumented build, then from T5.
+  On failure the experiment's version line ceases to exist, as if it never
+  happened, and `develop` continues its own numbering.
 - **The cluster**: gbni-1 and fi-1 are the only Macha cluster in the world,
   and it is a disposable test cluster. Dropping the library costs a great
   deal of time and is avoided where possible, but not at the expense of the
   experiment.
-- **Nothing deploys before T5.** Until then the standard is in-process
-  testing (next section). From T5, deploys are built on fi-1 (never on
+- **Nothing deploys between T0 and T5.** T0 deploys instrumentation only,
+  because the baseline has to come from the real cluster; T1 to T4 are
+  judged in-process (next section). Every deploy is built on fi-1 (never on
   gbni-1), installed with `install-guarded.sh`, viewers checked first,
   nodes restarted 5-10 minutes apart.
 
@@ -85,10 +121,11 @@ suite runs put the code on real hardware under GCC as well.
 
 ## Why this order
 
-The layer-by-layer order this replaces had six costs, each removed here:
+The layer-by-layer order this replaces had seven costs, each removed here:
 
 | cost | cause | removed by |
 |---|---|---|
+| kill criteria not decidable | criteria stated qualitatively | T0 measures the existing system and sets thresholds |
 | fidelity checked by cluster soak (days) until late | the decision-trace harness came in the ledger stage | T1 builds it first; from then on fidelity is a suite comparison (minutes) |
 | design flaws found at ~80% of the effort | every foundation built in full before any contract used it | T2 proves every layer on one path at ~15% |
 | every file opened twice; merge conflicts everywhere | annotating 173 mutexes in 59 files as a separate stage | L: annotate as each step touches a file |
@@ -101,18 +138,19 @@ The layer-by-layer order this replaces had six costs, each removed here:
 Sizes are relative estimates for comparing steps, not a schedule.
 
 ```text
-T1 harness+clock [3] ─► T2 slice [5] ─► T3 ledger [5] ─► T4 metadata [6] ─► T5b conversions [~5]
-        │                    │
-        ├─► P presence [3] ──┘ (own deploy and soak)
-        │
-        └── T5a conversions needing no new contract [~5]: any time after T2
-            L annotate-as-touched, M map-just-in-time, Q test consolidation: inside every step
-            S final sweep [~4]: after T5
+T0 measure [3] ─► T1 harness+clock [3] ─► T2 slice [5] ─► T3 ledger [5] ─► T4 metadata [6] ─► T5b conversions [~5]
+                          │                    │
+                          ├─► P presence [3] ──┘ (cluster measurement at T5)
+                          │
+                          └── T5a conversions needing no new contract [~5]: any time after T2
+                              L annotate-as-touched, M map-just-in-time, Q test consolidation: inside every step
+                              S final sweep [~4]: after T5
 ```
 
-Critical path T1 → T2 → T3 → T4 → T5b, about 24 units of about 40. Only P
-and T5a run beside it; T1 to T4 all edit `src/service/service.cpp`, so
-parallel work there only produces conflicts.
+Critical path T0 → T1 → T2 → T3 → T4 → T5b, about 27 units of about 43.
+Only P and T5a run beside it; T1 to T4 all edit `src/service/service.cpp`,
+so parallel work there only produces conflicts. T0's cluster soak runs
+while T1 is built, so it adds little wall time.
 
 ## Tracks that run inside every step
 
@@ -177,6 +215,47 @@ Rules:
   sites against the step before; none may rise without a stated reason.
   Consolidation targets are set once T1 has measured how much of the
   summed time is waiting.
+
+## T0. Measure the existing system
+
+**Goal.** Turn the kill criteria from qualitative to quantitative: every
+"less performant, less resilient, more brittle" becomes a named metric with
+a baseline measured on 0.73.2 behaviour and a threshold recorded in the
+spec.
+
+**Work.**
+- Instrument the existing code, adding observation only. Measurements go
+  to the node's logs and local files, not to Status or any API response,
+  so nothing the clients receive changes. Where a figure already exists
+  (`nodes[].traffic`, `status/diagnostics` `repair`, the stage timings of
+  `log_slow_stage`), it is used as it is.
+- The metrics, each with how it is measured, over what window, and on
+  which node:
+  - claim walk and GC sweep cost per object; quantum-commit claim latency,
+    idle and under import load;
+  - repair bytes per minute and objects examined, idle and loaded;
+  - GC and retention release rates;
+  - API latency percentiles on the busy endpoints (`GET /api/v1/torrents/jobs`,
+    the catalogue, Status);
+  - playback start and seek latency; FUSE publication throughput;
+  - resident memory; startup time to `wait_services_ready`; shutdown time;
+    recovery time after a restart and after a backend drops and returns.
+- In-suite baselines on the laptop and fi-1: the Q figures above, the
+  microbenchmarks, and line and branch coverage per component
+  (`./run-coverage.sh`).
+- Deploy the instrumented build (plain semver, the experiment's first
+  version) to both nodes and soak it under normal load: viewers, torrents,
+  imports, repair.
+
+**Acceptance.**
+- The instrumented build is behaviourally identical to 0.73.2: all suites
+  green, the only diff is observation, and each probe's cost is measured
+  and negligible.
+- Every kill criterion has a metric, a baseline with its variance over the
+  soak, and a threshold (what difference counts as worse), written into the
+  spec's kill criteria.
+- The coverage baseline per component recorded, as the starting point for
+  the 100% bar on each component a later step converts.
 
 ## T1. The instrument: trace harness, clock seam, lifecycle recorder
 
@@ -411,7 +490,9 @@ shape.
 
 **Acceptance.**
 - The Clang build clean under `-Wthread-safety -Werror`; GCC and all three
-  suites green; the TSan build (`build-tsan`) clean.
+  suites green; the ASan and TSan builds run and anything they find is
+  fixed (used, not canonical).
+- 100% line and branch coverage of every component in the root.
 - No measurable change in lock-heavy paths (FUSE publication throughput,
   playback start and seek, API latency) against the same load.
 - Q: summed case time, wall time and wait sites below the baseline, with
@@ -422,13 +503,7 @@ shape.
 
 ## Open questions for the operator
 
-1. **Version numbers on failure.** Experiment deploys take plain semver
-   from 0.74.0 upward. If the experiment fails and development resumes from
-   `develop`, its next release could reuse a number an experiment build
-   already carried, so two different builds would share a version. Should
-   `develop` then continue above the highest experiment version, and are
-   experiment builds tagged at all?
-2. The spec's open questions are decided before the step that needs them:
+1. The spec's open questions are decided before the step that needs them:
    context in `Budget` before T2; core supervision and where the component
    model lives before T2; the control gate and `universal` before T3;
    release over pinned roots and map-backed snapshots before any later

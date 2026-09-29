@@ -672,12 +672,54 @@ Repair stays paced by `repair_share`, never gated.
   memory and latency the same or better; no law breached.
 - None of the kill criteria met.
 
+## Decision log
+
+Operator decisions, dated, with the reasoning given. Later entries
+supersede earlier ones where they conflict.
+
+- **2026-09-29. Fidelity is operational and functional**, to the user and
+  the operator, not fidelity to the current code.
+- **2026-09-29. Kill criteria**: any part that, taken holistically as an
+  operational system, loses fidelity to the user, becomes brittle, breaches
+  the Laws and Guidelines, or is less performant, less resilient or more
+  brittle than its predecessor. Qualitative until T0 instruments the
+  existing code, then quantitative.
+- **2026-09-29. This is an experiment**: built to find out; evidence is
+  what it produces, not a precondition.
+- **2026-09-29. The service-wide restructure is the point**, not scope
+  creep: every component moves onto declared dependencies.
+- **2026-09-29. Doing work twice is acceptable** where it buys fidelity and
+  a more efficient, performant and testable system.
+- **2026-09-29. One locking mechanism everywhere**: if it works it works
+  everywhere, if it fails it fails everywhere, and it is far easier to
+  test.
+- **2026-09-29. No writer may bypass the store**; after stage 0 it is
+  impossible, not merely unused.
+- **2026-09-29. `develop` is never modified** by the experiment and is the
+  only development stream. Work lands on branches cut from
+  `experiment/object-ledger` when accepted. On success the whole commit
+  tree merges into `develop`; on failure development continues from
+  `develop` as it stands and the experiment's plain-semver version line
+  ceases to exist.
+- **2026-09-29. The cluster** (gbni-1, fi-1) is the only Macha cluster and a
+  disposable test cluster; dropping the library is avoided where possible
+  but not at the expense of the experiment. It is first used for
+  measurement (T0), then from the component conversions (T5).
+- **2026-09-30. No CI.** Every accepted stage and substage is pushed; the
+  history is the record.
+- **2026-09-30. The standard of proof.** Macha is to be Dijkstra-provable
+  and Knuth-legible before mass peer review, and easing independent testing
+  is a reason for the experiment. Properly structured components with
+  stated contracts and 100% coverage, mutation-proven, are the proof where
+  complexity allows; the functional and behavioural suite covers the rest.
+- **2026-09-30. Sanitizers are used but not canonical.**
+
 ## Open questions for the operator
 
 1. **The control gate and `rebuilt_inventory`.** Control GC can run against
    an inventory built in the same pass, contrary to the comment at
    `src/service/service.cpp:1477`. Stage 0 preserves the code. Intended, or
-   a defect to fix on `develop` with its own test?
+   a defect to fix as a step of the experiment, with its own test?
 2. **`universal`.** Keep `everywhere` for a future placement rule, or remove
    the plumbing from repair, since nothing sets it?
 3. **Supervision of core components.** Once core components share the
@@ -685,9 +727,10 @@ Repair stays paced by `repair_share`, never gated.
    process?
 4. **Where the component model lives.** Generalise `src/subsystem/` in
    place, or a new home with `subsystem/` as the plugin loader over it?
-5. **Order against the queue.** The 2026-09-29 handover puts the ledger
-   fifth. 0a makes ACTIVE item 2 mechanical and the `has()` change helps
-   law 1; should they move up on their own?
+5. **The backlog while `develop` is frozen.** ACTIVE's queue, including
+   open P0s (the FUSE recovery test segfault, gbni-1's unexplained heap
+   corruption), has nowhere to land while the experiment runs. Do such
+   fixes become steps on the experiment branch, or wait until it ends?
 6. **Release over pinned roots.** Prove that retention release over "reachable
    from any pinned head" is equivalent to today's release against one head
    before the later store relies on it.
