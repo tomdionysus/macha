@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <thread>
 #include <map>
@@ -33,6 +34,9 @@ class DistributedStore {
         size_t pull_unsourceable{};
         bool complete{true};
         bool yielded{};
+        // The step stopped at an object that needs a transfer the byte
+        // budget could not cover; that object is the first of the next step.
+        bool credit_limited{};
     };
 
     // Bounded, snapshot-shaped: a cumulative count plus a small sample of the
@@ -51,7 +55,8 @@ class DistributedStore {
         bool push_phase_complete{};
         // Why the maintenance loop did or did not run a repair step, per
         // pass. With progress stuck at zero there was no way to tell a gate
-        // from a loop that never got here.
+        // from a loop that never got here. gate_credit counts steps that ran
+        // and stopped at a transfer the credit could not yet cover.
         uint64_t gate_ran{};
         uint64_t gate_share{};
         uint64_t gate_quiescent{};
@@ -110,7 +115,25 @@ class DistributedStore {
 
     NodeRuntime& n_;
     StoragePool::Cursor repair_push_cursor_;
-    std::optional<ObjectId> repair_push_pending_;
+    // Objects taken from the push cursor and not yet settled, in cursor order,
+    // with what one batched presence round found for each on its candidate
+    // peers. A step that stops (credit, a viewer, a failed operation) leaves
+    // both in place and the next step resumes at the same object.
+    std::deque<ObjectId> repair_push_window_;
+    std::map<std::pair<NodeId, ObjectId>, bool> repair_push_presence_;
+    std::set<ObjectId> repair_push_probed_;
+    bool repair_push_cursor_exhausted_{};
+    // At most this many repair pushes in flight at once (0.73.1).
+    static constexpr size_t repair_sends_in_flight = 8;
+    // Objects the current push pass has settled, saved so a restart resumes
+    // there (persist_repair_position), and the value to resume from.
+    uint64_t repair_push_settled_{};
+    std::optional<uint64_t> repair_push_resume_;
+    bool repair_pass_spans_change_{};
+    std::filesystem::path repair_position_path_;
+    Clock::time_point repair_position_saved_at_{};
+    uint64_t repair_position_saved_{};
+    void save_repair_position(bool force);
     std::optional<ObjectId> repair_pull_after_;
     const std::vector<ObjectId>* repair_live_identity_{};
     uint64_t repair_live_generation_{};
@@ -213,7 +236,16 @@ class DistributedStore {
     // peer combined.
     std::map<NodeId, std::map<ObjectId, bool>>
     batched_have_objects(const std::map<NodeId, NodeInfo>& node_info,
-                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node);
+                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node,
+                        FrameType frame_type = FrameType::loader);
+    // Repair's presence round: whether each peer holds a copy that reads back
+    // intact, have_valid_objects_max ids a request, all requests in flight at
+    // once. A peer that does not know have_valid_objects is asked one
+    // have_object at a time. A failed request answers false for its ids, as a
+    // failed have_object always has.
+    std::map<NodeId, std::map<ObjectId, bool>>
+    validated_presence(const std::map<NodeId, NodeInfo>& node_info,
+                       const std::map<NodeId, std::vector<ObjectId>>& ids_by_node);
     ObjectData get_from(const NodeInfo&, const ObjectId&, FrameType,
                         const std::shared_ptr<SharedFetch>&,
                         Clock::time_point deadline, std::atomic_bool* cancelled,
@@ -292,10 +324,19 @@ class DistributedStore {
     // Converges remote placement and proactively pulls live objects for which
     // this node has become an owner. Bounded repair_step() calls retain push/pull
     // cursors across scheduler slices; they never rebuild complete object vectors.
-    // The byte limit is network transfer, not block count; zero means unlimited.
+    // The byte limit is network transfer, not block count (repair_once: zero
+    // means unlimited). It gates transfers only: presence probes and index
+    // lookups run without it, bounded by operation_budget, and a step stops at
+    // the first transfer the budget cannot cover (RepairResult::credit_limited).
     // should_yield is consulted between operations only: an extent already in
     // flight completes and is kept, so a pacer can shorten repair's turns
     // without ever making them fruitless.
+    // Keep where the push pass has reached in `path`, saved at most every
+    // 30 s and at the end of each pass, and resume from it: a restart then
+    // does not re-check (a full read each on the peer) everything it had
+    // already copied. The node's own repair store enables this; a store
+    // without it starts each pass at the beginning.
+    void persist_repair_position(std::filesystem::path path);
     uint64_t repair_once(uint64_t byte_budget = 0, const std::vector<ObjectId>* live = nullptr,
                          const std::vector<ObjectId>* universal = nullptr);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,

@@ -1563,6 +1563,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer_telemetry.storage_backends_online = 1;
     peer_telemetry.api_endpoint = "http://10.44.1.51:7438";
     peer_telemetry.node_name = "Corvus Test Peer";
+    peer_telemetry.traffic = {TrafficClass{2, 5000, 100, 2500, 50}};
+    peer_telemetry.traffic_window_ms = 10000;
     node.telemetry().observe(peer_telemetry, true);
 
     response = status.handle(request);
@@ -1583,6 +1585,21 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         // The operator's display name travels beside host, never in place of it.
         CHECK(value.find("node_name")->asString() == "Corvus Test Peer");
         CHECK(value.find("host")->asString() == peer.host);
+        // Per-class cluster traffic, named by class code.
+        const auto* traffic = value.find("traffic");
+        REQUIRE(traffic != nullptr);
+        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == peer_telemetry.observed_unix_ms);
+        CHECK(traffic->find("window_ms")->asUInt64() == 10000);
+        const auto* classes = traffic->find("classes");
+        REQUIRE(classes != nullptr);
+        REQUIRE(classes->isArray());
+        REQUIRE(classes->asArray().size() == 1);
+        const auto& foreground = classes->asArray().front();
+        CHECK(foreground.find("class")->asString() == "foreground");
+        CHECK(foreground.find("in_bytes")->asUInt64() == 5000);
+        CHECK(foreground.find("out_bytes")->asUInt64() == 100);
+        CHECK(foreground.find("in_bytes_per_s")->asUInt64() == 2500);
+        CHECK(foreground.find("out_bytes_per_s")->asUInt64() == 50);
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
         CHECK(storage->find("available")->asBool());

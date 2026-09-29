@@ -184,10 +184,25 @@ void TorrentCoordinator::loop(std::stop_token stop) {
     }
 }
 
-// The current snapshot, including this node's own latest commit: an add's
-// 202 promises the job is listed at once (read-your-writes). snapshot_view()
-// refreshes a stale cache; the cached view is the fallback when metadata
-// cannot be read right now.
+// What the API lists from: the snapshot this node already holds, in memory.
+// An HTTP read never waits on a peer (law 1). Until 0.73.1 the listing went
+// through current_view(), whose refresh surveys the peers' accepted heads
+// whenever any peer has announced a generation; with torrents committing
+// progress on both nodes that was nearly every request, and
+// GET /api/v1/torrents/jobs took 0.6-1.7 s on fi-1 (2026-09-29).
+// This node's own commit is installed in memory before the commit returns,
+// so an add is listed at once. The exception is a commit that lands while
+// another node's concurrent commit leaves more than one accepted head: it
+// appears after the next background convergence. A node that has no
+// snapshot yet establishes one first.
+std::optional<MetadataSnapshotView> TorrentCoordinator::served_view() const {
+    if (auto view = metadata_.available_snapshot_view())
+        return view;
+    return current_view();
+}
+
+// The current snapshot for the coordinator's own passes, refreshed if stale;
+// the cached view is the fallback when metadata cannot be read right now.
 std::optional<MetadataSnapshotView> TorrentCoordinator::current_view() const {
     try {
         return metadata_.snapshot_view();
@@ -347,7 +362,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
 
 std::vector<TorrentRequest> TorrentCoordinator::requests() const {
     std::vector<TorrentRequest> out;
-    const auto view = current_view();
+    const auto view = served_view();
     if (!view) return out;
     for (const auto& [_, request] : view->snapshot->torrent_requests)
         if (!request.removed_unix_ms) out.push_back(request);
@@ -355,7 +370,7 @@ std::vector<TorrentRequest> TorrentCoordinator::requests() const {
 }
 
 std::optional<TorrentRequest> TorrentCoordinator::request(std::string_view id) const {
-    const auto view = current_view();
+    const auto view = served_view();
     if (!view) return std::nullopt;
     const auto found = view->snapshot->torrent_requests.find(id);
     if (found == view->snapshot->torrent_requests.end() || found->second.removed_unix_ms) return std::nullopt;

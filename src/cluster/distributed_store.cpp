@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/distributed_store.hpp"
 #include "codec.hpp"
+#include "durable_file.hpp"
 #include "log.hpp"
 #include "cluster/placement.hpp"
 #include "supervised.hpp"
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <set>
@@ -108,7 +110,12 @@ void DistributedStore::note_foreground(uint64_t bytes) {
 
 void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
     auto seconds = std::chrono::duration<double>(duration).count();
-    if (!bytes || seconds <= 0.0)
+    // Background credit is spent an extent at a time, so the estimate has to
+    // say what an extent costs. A transfer under half an extent is mostly one
+    // round trip and the far end's write, not bandwidth: on 2026-09-29
+    // gbni-1's repair pushed 16-100 KB objects to fi-1 and estimated ~20 KB/s
+    // on a path that moves 1.3 MB/s, so its credit, and repair, crawled.
+    if (!bytes || seconds <= 0.0 || bytes < n_.config().extent_size / 2)
         return;
     double sample = static_cast<double>(bytes) / seconds;
     double old = network_bps_.load(std::memory_order_relaxed);
@@ -1226,7 +1233,33 @@ DistributedStore::DistributedStore(NodeRuntime& n) : n_(n) {
     });
 }
 
+void DistributedStore::persist_repair_position(std::filesystem::path path) {
+    repair_position_path_ = std::move(path);
+    std::ifstream in(repair_position_path_);
+    uint64_t settled = 0;
+    if (in >> settled && settled)
+        repair_push_resume_ = settled;
+}
+
+void DistributedStore::save_repair_position(bool force) {
+    if (repair_position_path_.empty() || repair_push_settled_ == repair_position_saved_)
+        return;
+    const auto now = Clock::now();
+    if (!force && now - repair_position_saved_at_ < std::chrono::seconds(30))
+        return;
+    try {
+        std::filesystem::create_directories(repair_position_path_.parent_path());
+        durable_replace_file(repair_position_path_, std::to_string(repair_push_settled_));
+        repair_position_saved_ = repair_push_settled_;
+        repair_position_saved_at_ = now;
+    } catch (const std::exception& error) {
+        // A lost position costs a restart one pass of re-checking, nothing more.
+        Log::debug("repair position not saved: " + std::string(error.what()));
+    }
+}
+
 DistributedStore::~DistributedStore() {
+    save_repair_position(true);
     if (prompt_thread_.joinable()) {
         prompt_thread_.request_stop();
         prompt_cv_.notify_all();
@@ -1823,7 +1856,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
 
 std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_objects(
     const std::map<NodeId, NodeInfo>& node_info,
-    const std::map<NodeId, std::vector<ObjectId>>& ids_by_node) {
+    const std::map<NodeId, std::vector<ObjectId>>& ids_by_node, FrameType frame_type) {
     std::map<NodeId, std::map<ObjectId, bool>> results;
 
     // Local node: cheap presence check, no RPC, no chunking/concurrency needed.
@@ -1880,7 +1913,7 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
             writer.fixed(id.bytes);
         try {
             auto rpc = n_.call_async(found->second, MessageType::have_objects, writer.data(),
-                                     FrameType::loader);
+                                     frame_type);
             in_flight.push_back({chunk.node, std::move(chunk.ids), std::move(rpc)});
         } catch (const std::exception& error) {
             Log::debug("retention presence batch peer=" + found->second.host +
@@ -1924,6 +1957,95 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
         for (size_t i = 0; i < item.ids.size(); ++i)
             out[item.ids[i]] = ok && present[i];
         in_flight.erase(in_flight.begin());
+    }
+    return results;
+}
+
+std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::validated_presence(
+    const std::map<NodeId, NodeInfo>& node_info,
+    const std::map<NodeId, std::vector<ObjectId>>& ids_by_node) {
+    std::map<NodeId, std::map<ObjectId, bool>> results;
+    struct InFlight {
+        const NodeInfo* node;
+        std::vector<ObjectId> ids;
+        std::optional<AsyncRpc> rpc;
+    };
+    std::vector<InFlight> requests;
+    for (const auto& [node_id, ids] : ids_by_node) {
+        const auto found = node_info.find(node_id);
+        if (found == node_info.end())
+            continue;
+        for (size_t offset = 0; offset < ids.size(); offset += have_valid_objects_max) {
+            const auto end = std::min(ids.size(), offset + have_valid_objects_max);
+            InFlight request{&found->second,
+                             {ids.begin() + static_cast<long>(offset),
+                              ids.begin() + static_cast<long>(end)},
+                             {}};
+            Writer writer;
+            writer.u32(static_cast<uint32_t>(request.ids.size()));
+            for (const auto& id : request.ids)
+                writer.fixed(id.bytes);
+            try {
+                request.rpc = n_.call_async(found->second, MessageType::have_valid_objects,
+                                            writer.data(), FrameType::speculative);
+            } catch (const std::exception& error) {
+                Log::debug("repair presence batch peer=" + found->second.host +
+                           " error=" + error.what());
+            }
+            requests.push_back(std::move(request));
+        }
+    }
+
+    const auto one_at_a_time = [&](const NodeInfo& node, const ObjectId& id) {
+        Writer writer;
+        writer.fixed(id.bytes);
+        try {
+            auto reply =
+                n_.call_async(node, MessageType::have_object, writer.data(), FrameType::speculative)
+                    .get();
+            if (reply.message.type != MessageType::bool_reply)
+                return false;
+            Reader reader(reply.message.payload);
+            const bool present = reader.u8() != 0;
+            reader.finish();
+            return present;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    const auto deadline = std::max(n_.config().dead_after, n_.config().connect_timeout);
+    for (auto& request : requests) {
+        auto& out = results[request.node->id];
+        bool answered = false;
+        bool unknown_message = false;
+        if (request.rpc) {
+            try {
+                if (request.rpc->wait_for(deadline) != std::future_status::ready) {
+                    request.rpc->abort();
+                } else {
+                    auto reply = request.rpc->get();
+                    if (reply.message.type == MessageType::have_valid_objects_reply) {
+                        Reader reader(reply.message.payload);
+                        if (reader.u32() == request.ids.size()) {
+                            for (const auto& id : request.ids)
+                                out[id] = reader.u8() != 0;
+                            reader.finish();
+                            answered = true;
+                        }
+                    } else if (reply.message.type == MessageType::error) {
+                        unknown_message = true;
+                    }
+                }
+            } catch (const std::exception& error) {
+                Log::debug("repair presence batch peer=" + request.node->host +
+                           " error=" + error.what());
+            }
+        }
+        if (answered)
+            continue;
+        for (const auto& id : request.ids)
+            out[id] = unknown_message ? one_at_a_time(*request.node, id) : false;
     }
     return results;
 }
@@ -2201,7 +2323,9 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
 
 uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::vector<ObjectId>* live,
                                        const std::vector<ObjectId>* universal) {
-    return repair_step(byte_budget, 0, live, universal).bytes_transferred;
+    return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0, live,
+                       universal)
+        .bytes_transferred;
 }
 
 namespace {
@@ -2300,13 +2424,22 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     const bool generation_changed =
         live_generation ? repair_live_generation_ != live_generation
                         : repair_live_identity_ != live;
-    if (generation_changed) {
-        repair_push_cursor_ = {};
-        repair_push_pending_.reset();
-        repair_pull_after_.reset();
-        repair_push_complete_ = false;
-        repair_pull_complete_ = false;
-    }
+    const auto reset_push_window = [&] {
+        repair_push_window_.clear();
+        repair_push_presence_.clear();
+        repair_push_probed_.clear();
+        repair_push_cursor_exhausted_ = false;
+    };
+    // A new live set does not restart the pass. Until 0.73.1 every metadata
+    // commit sent both cursors back to the beginning, so on a cluster that
+    // commits all the time a pass kept re-checking the same leading objects
+    // -- under have_valid_objects, a full read each on the peer -- and seldom
+    // reached the rest. Positions are kept; a pass the live set changed under
+    // is followed by another at once, which covers anything that became live
+    // behind a cursor.
+    if (generation_changed &&
+        (repair_push_settled_ || repair_pull_after_ || !repair_push_window_.empty()))
+        repair_pass_spans_change_ = true;
     repair_live_identity_ = live;
     repair_live_generation_ = live_generation;
     if (!live || live->empty())
@@ -2314,7 +2447,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
     auto reset_completed_pass = [&] {
         repair_push_cursor_ = {};
-        repair_push_pending_.reset();
+        reset_push_window();
+        repair_push_settled_ = 0;
         repair_pull_after_.reset();
         repair_push_complete_ = false;
         repair_pull_complete_ = !live || live->empty();
@@ -2338,70 +2472,6 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         return true;
     };
 
-    auto maintenance_has_on = [&](const NodeInfo& target,
-                                  const ObjectId& id) -> std::optional<bool> {
-        if (target.id == n_.node_id()) {
-            // Presence, from the index. Until 0.62.0 this read, decrypted and
-            // hashed the whole extent to decide "already here", once per
-            // object per pass: on gbni-1 a pass over its 1.5 TB store was a
-            // full read of it, and under a busy node's share about one extent
-            // every thirty seconds. A corrupt local copy is found by scrub
-            // and by reads, which verify every object they consume, and is
-            // removed there; repair then sees it absent and restores it.
-            return n_.local_store().has(id);
-        }
-        if (!reserve_operation() || yielded())
-            return std::nullopt;
-
-        Writer writer;
-        writer.fixed(id.bytes);
-        try {
-            // Yield is taken between operations, never inside one: a probe
-            // already sent completes (one bounded control round trip).
-            auto rpc = n_.call_async(target, MessageType::have_object, writer.data(), FrameType::speculative);
-            auto reply = rpc.get();
-            if (reply.message.type != MessageType::bool_reply)
-                return false;
-            Reader reader(reply.message.payload);
-            bool present = reader.u8() != 0;
-            reader.finish();
-            return present;
-        } catch (...) {
-            return false;
-        }
-    };
-
-    auto maintenance_put_on = [&](const NodeInfo& target, const ObjectId& id,
-                                  std::span<const uint8_t> data) -> std::optional<bool> {
-        if (target.id == n_.node_id()) {
-            auto resource = n_.data_resources().acquire(
-                DataWorkContext(FrameType::speculative, data.size()), data.size());
-            if (!resource)
-                return std::nullopt;
-            return n_.local_store().put(id, data);
-        }
-        if (!reserve_operation() || yielded())
-            return std::nullopt;
-
-        Writer writer;
-        writer.fixed(id.bytes);
-        writer.bytes(data);
-        auto started = Clock::now();
-        try {
-            // One extent in flight is the bounded non-pre-emptible work the
-            // laws allow a lower class. Cancelling it on every yield meant a
-            // WAN transfer longer than the slice never completed at all.
-            auto rpc = n_.call_async(target, MessageType::put_object, writer.data(),
-                                     FrameType::speculative);
-            bool ok = rpc.get().message.type == MessageType::ok;
-            if (ok)
-                note_network(data.size(), Clock::now() - started);
-            return ok;
-        } catch (...) {
-            return false;
-        }
-    };
-
     // Limit cheap local/live-set examinations independently of remote RPCs. A
     // settled object may require no network operation at all; without a scan
     // budget a single maintenance tick could still walk millions of objects.
@@ -2410,138 +2480,314 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                                    : std::numeric_limits<size_t>::max();
     size_t scanned_total = 0;
 
+    // A peer whose advertised free space cannot take an extent is not probed
+    // or sent one. Until 0.62.1 every live object cost a WAN probe and a
+    // refused 4 MB put to fi-1, whose 10G store was full: that spent repair's
+    // whole operation budget, so the pull never reached the extents this node
+    // lacked. The copy stays under-replicated, which placement already reports.
+    const auto has_room = [&](const NodeInfo& peer) {
+        return peer.id == n_.node_id() || !peer.capacity ||
+               peer.used + n_.config().extent_size <= peer.capacity;
+    };
+
     // Push existing local replicas toward the current deterministic owner set.
     if (!repair_push_complete_) {
-        while (scanned_total < scan_budget && !repair_push_complete_) {
+        // After a restart, resume where the saved pass had reached: skip that
+        // many objects by index, which costs no reads. The order is the
+        // store's own and can shift, so the pass counts as spanning a change
+        // and another follows it.
+        if (repair_push_resume_) {
+            uint64_t skipped = 0;
+            while (skipped < *repair_push_resume_) {
+                bool pass_complete = false;
+                if (!n_.local_store().next_object(repair_push_cursor_, pass_complete)) {
+                    if (pass_complete)
+                        repair_push_cursor_exhausted_ = true;
+                    break;
+                }
+                ++skipped;
+            }
+            repair_push_settled_ = skipped;
+            repair_position_saved_ = skipped;
+            repair_pass_spans_change_ = true;
+            repair_push_resume_.reset();
+        }
+        // Take the next objects off the cursor into the window.
+        while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_) {
+            bool pass_complete = false;
+            auto next = n_.local_store().next_object(repair_push_cursor_, pass_complete);
+            if (!next) {
+                if (pass_complete)
+                    repair_push_cursor_exhausted_ = true;
+                break;
+            }
+            repair_push_window_.push_back(*next);
+        }
+        if (repair_push_window_.empty() && repair_push_cursor_exhausted_)
+            repair_push_complete_ = true;
+
+        // One presence round for everything in the window not yet probed,
+        // up to have_valid_objects_max objects a request and every request
+        // in flight at once. Until 0.73.0 each probe was its own ~90 ms WAN
+        // round trip and a step checked at most 16.
+        std::map<NodeId, NodeInfo> probe_nodes;
+        std::map<NodeId, std::vector<ObjectId>> probe_ids;
+        for (const auto& id : repair_push_window_) {
+            if (repair_push_probed_.contains(id))
+                continue;
+            if (live && !std::binary_search(live->begin(), live->end(), id))
+                continue;
+            const bool everywhere =
+                universal && std::binary_search(universal->begin(), universal->end(), id);
+            for (const auto& peer : everywhere ? hosting_nodes() : ranked(id)) {
+                if (peer.id == n_.node_id() || !has_room(peer))
+                    continue;
+                probe_nodes[peer.id] = peer;
+                probe_ids[peer.id].push_back(id);
+            }
+        }
+        bool probed = true;
+        if (!probe_ids.empty()) {
+            for (const auto& [_, ids] : probe_ids) {
+                const auto requests =
+                    (ids.size() + have_valid_objects_max - 1) / have_valid_objects_max;
+                for (size_t request = 0; request < requests && probed; ++request)
+                    probed = reserve_operation();
+                if (!probed)
+                    break;
+            }
+            if (probed && !yielded()) {
+                for (const auto& [node, ids] : validated_presence(probe_nodes, probe_ids))
+                    for (const auto& [id, present] : ids)
+                        repair_push_presence_[{node, id}] = present;
+            } else {
+                probed = false;
+            }
+        }
+        if (probed) {
+            for (const auto& id : repair_push_window_)
+                repair_push_probed_.insert(id);
+        }
+
+        // Sends go out in batches, all of a batch in flight at once, and
+        // each object settles when its own sends answer. Until 0.73.1 one
+        // push was in flight at a time: each waited for the far end's
+        // durable write and a WAN round trip, about 0.35 s an object, so
+        // gbni-1 moved ~500 KB/s of mostly small objects to fi-1 with full
+        // credit and an idle link (2026-09-29). A batch holds at most
+        // repair_sends_in_flight objects and two extents of payload (one
+        // larger object alone), so what a viewer arriving mid-batch waits
+        // behind stays bounded.
+        struct Send {
+            ObjectId id;
+            NodeInfo peer;
+            std::shared_ptr<const Bytes> data;
+            std::optional<AsyncRpc> rpc;
+        };
+        struct Plan {
+            ObjectId id;
+            bool live{true};
+            bool everywhere{};
+            size_t target{};
+            std::set<NodeId> keepers;
+        };
+        const auto settle = [&](const ObjectId& id) {
+            if (auto at = std::find(repair_push_window_.begin(), repair_push_window_.end(), id);
+                at != repair_push_window_.end())
+                repair_push_window_.erase(at);
+            repair_push_probed_.erase(id);
+            std::erase_if(repair_push_presence_,
+                          [&](const auto& entry) { return entry.first.second == id; });
+            ++repair_push_settled_;
+            ++scanned_total;
+            ++result.push_examined;
+        };
+        const uint64_t batch_bytes_cap = 2 * std::max<uint64_t>(1, n_.config().extent_size);
+
+        bool push_stopped = !probed;
+        while (!push_stopped && !repair_push_window_.empty()) {
             if (yielded())
                 break;
-            if (byte_budget && transferred >= byte_budget)
-                break;
-            if (operation_budget && operations >= operation_budget)
-                break;
-
-            ObjectId id;
-            if (repair_push_pending_) {
-                id = *repair_push_pending_;
-            } else {
-                bool pass_complete = false;
-                auto next = n_.local_store().next_object(repair_push_cursor_, pass_complete);
-                if (!next) {
-                    if (pass_complete)
-                        repair_push_complete_ = true;
+            std::vector<Plan> plans;
+            std::vector<Send> sends;
+            uint64_t batch_bytes = 0;
+            const std::vector<ObjectId> window(repair_push_window_.begin(),
+                                               repair_push_window_.end());
+            for (const auto& id : window) {
+                if (sends.size() >= repair_sends_in_flight ||
+                    (!sends.empty() && batch_bytes >= batch_bytes_cap))
                     break;
-                }
-                id = *next;
-                repair_push_pending_ = id;
-            }
-
-            // Physical cursors can see stale/non-live local objects. Garbage is
-            // handled separately; replica repair simply skips them.
-            if (live && !std::binary_search(live->begin(), live->end(), id)) {
-                repair_push_pending_.reset();
-                ++scanned_total;
-                ++result.push_examined;
-                continue;
-            }
-
-            const bool everywhere = universal &&
-                                    std::binary_search(universal->begin(), universal->end(), id);
-            // "Everywhere" means every node that hosts extents; a non-hosting
-            // node fetches a universal object on demand into its cache like
-            // anything else.
-            auto nodes = everywhere ? hosting_nodes() : ranked(id);
-            if (nodes.empty()) {
-                repair_push_pending_.reset();
-                ++scanned_total;
-                ++result.push_examined;
-                continue;
-            }
-            const size_t target = everywhere ? nodes.size()
-                                             : std::min(n_.config().replication, nodes.size());
-            std::set<NodeId> keepers;
-            std::optional<Bytes> source;
-            bool retry = false;
-
-            for (const auto& peer : nodes) {
-                if (keepers.size() >= target)
-                    break;
-                // A peer whose advertised free space cannot take an extent is
-                // not probed or sent one. Until 0.62.1 every live object cost a
-                // WAN probe and a refused 4 MB put to fi-1, whose 10G store was
-                // full: that spent repair's whole operation budget, so the pull
-                // never reached the extents this node lacked. The copy stays
-                // under-replicated, which placement already reports.
-                if (peer.id != n_.node_id() && peer.capacity &&
-                    peer.used + n_.config().extent_size > peer.capacity)
+                Plan plan;
+                plan.id = id;
+                // Physical cursors can see stale/non-live local objects.
+                // Garbage is handled separately; replica repair skips them.
+                if (live && !std::binary_search(live->begin(), live->end(), id)) {
+                    plan.live = false;
+                    plans.push_back(std::move(plan));
                     continue;
-                auto present_result = maintenance_has_on(peer, id);
-                if (!present_result) {
-                    retry = true;
-                    break;
                 }
-                bool present = *present_result;
-                if (!present) {
+                plan.everywhere =
+                    universal && std::binary_search(universal->begin(), universal->end(), id);
+                // "Everywhere" means every node that hosts extents; a
+                // non-hosting node fetches a universal object on demand into
+                // its cache like anything else.
+                const auto nodes = plan.everywhere ? hosting_nodes() : ranked(id);
+                plan.target = plan.everywhere ? nodes.size()
+                                              : std::min(n_.config().replication, nodes.size());
+                std::shared_ptr<const Bytes> source;
+                std::vector<Send> object_sends;
+                uint64_t object_bytes = 0;
+                bool stop = false;
+                bool unreadable = false;
+                for (const auto& peer : nodes) {
+                    if (plan.keepers.size() + object_sends.size() >= plan.target)
+                        break;
+                    if (!has_room(peer))
+                        continue;
+                    bool present = false;
+                    if (peer.id == n_.node_id()) {
+                        // Presence, from the index. Until 0.62.0 this read,
+                        // decrypted and hashed the whole extent; a corrupt
+                        // local copy is found by scrub and by reads, and is
+                        // removed there, and repair then sees it absent.
+                        present = n_.local_store().has(id);
+                    } else if (auto found = repair_push_presence_.find({peer.id, id});
+                               found != repair_push_presence_.end()) {
+                        present = found->second;
+                    }
+                    if (present) {
+                        plan.keepers.insert(peer.id);
+                        continue;
+                    }
                     if (!source) {
                         auto resource = n_.data_resources().acquire(
                             DataWorkContext(FrameType::speculative, n_.config().extent_size),
                             n_.config().extent_size);
                         if (!resource) {
-                            retry = true;
+                            stop = true;
                             break;
                         }
-                        source = n_.local_store().get(id);
-                        if (!source) {
+                        auto read = n_.local_store().get(id);
+                        if (!read) {
                             note_repair_local_unreadable(id);
+                            unreadable = true;
                             break;
                         }
+                        source = std::make_shared<const Bytes>(std::move(*read));
                     }
-                    if (byte_budget && transferred && transferred + source->size() > byte_budget) {
-                        retry = true;
+                    if (peer.id == n_.node_id()) {
+                        auto resource = n_.data_resources().acquire(
+                            DataWorkContext(FrameType::speculative, source->size()),
+                            source->size());
+                        if (!resource) {
+                            stop = true;
+                            break;
+                        }
+                        if (n_.local_store().put(id, *source))
+                            plan.keepers.insert(peer.id);
+                        continue;
+                    }
+                    // Credit pays for the bytes this transfer puts on the
+                    // wire, never for finding out which bytes are needed.
+                    if (transferred + batch_bytes + object_bytes + source->size() > byte_budget) {
+                        result.credit_limited = true;
+                        stop = true;
                         break;
                     }
-                    auto put_result = maintenance_put_on(peer, id, *source);
-                    if (!put_result) {
-                        retry = true;
+                    if (!reserve_operation()) {
+                        stop = true;
                         break;
                     }
-                    present = *put_result;
-                    if (present && peer.id != n_.node_id())
-                        transferred += source->size();
+                    object_sends.push_back(Send{id, peer, source, {}});
+                    object_bytes += source->size();
                 }
-                if (present)
-                    keepers.insert(peer.id);
+                if (stop) {
+                    push_stopped = true;
+                    break;
+                }
+                if (unreadable) {
+                    plans.push_back(std::move(plan));
+                    continue;
+                }
+                batch_bytes += object_bytes;
+                for (auto& send : object_sends)
+                    sends.push_back(std::move(send));
+                plans.push_back(std::move(plan));
             }
 
-            if (retry)
+            // Every send of the batch goes out before any answer is awaited.
+            // Each completes and is kept even if repair's turn ends meanwhile.
+            const auto dispatched = Clock::now();
+            for (auto& send : sends) {
+                Writer writer;
+                writer.fixed(send.id.bytes);
+                writer.bytes(*send.data);
+                try {
+                    send.rpc = n_.call_async(send.peer, MessageType::put_object, writer.data(),
+                                             FrameType::speculative);
+                } catch (const std::exception& error) {
+                    Log::debug("repair push peer=" + send.peer.host + " error=" + error.what());
+                }
+            }
+            std::set<ObjectId> failed;
+            uint64_t delivered = 0;
+            for (auto& send : sends) {
+                bool ok = false;
+                if (send.rpc) {
+                    try {
+                        ok = send.rpc->get().message.type == MessageType::ok;
+                    } catch (...) {
+                    }
+                }
+                if (!ok) {
+                    failed.insert(send.id);
+                    continue;
+                }
+                delivered += send.data->size();
+                repair_push_presence_[{send.peer.id, send.id}] = true;
+                for (auto& plan : plans)
+                    if (plan.id == send.id)
+                        plan.keepers.insert(send.peer.id);
+            }
+            if (delivered) {
+                transferred += delivered;
+                // One sample for the batch: its sends shared the link.
+                note_network(delivered, Clock::now() - dispatched);
+            }
+
+            size_t settled = 0;
+            for (const auto& plan : plans) {
+                if (failed.contains(plan.id))
+                    continue; // retried from the same place next step
+                if (plan.live && !plan.everywhere && plan.keepers.size() >= plan.target &&
+                    !plan.keepers.contains(n_.node_id()) &&
+                    !n_.retention_store().retained(RetentionClass::data, plan.id)) {
+                    auto resource = n_.data_resources().acquire(
+                        DataWorkContext(FrameType::speculative, n_.config().extent_size),
+                        n_.config().extent_size);
+                    if (resource)
+                        n_.local_store().remove(plan.id);
+                }
+                settle(plan.id);
+                ++settled;
+            }
+            if (!failed.empty() || !settled)
                 break;
-
-            if (!everywhere && keepers.size() >= target && !keepers.contains(n_.node_id()) &&
-                !n_.retention_store().retained(RetentionClass::data, id)) {
-                auto resource = n_.data_resources().acquire(
-                    DataWorkContext(FrameType::speculative, n_.config().extent_size),
-                    n_.config().extent_size);
-                if (resource)
-                    n_.local_store().remove(id);
-            }
-
-            repair_push_pending_.reset();
-            ++scanned_total;
-            ++result.push_examined;
         }
+        save_repair_position(false);
+        if (repair_push_window_.empty() && repair_push_cursor_exhausted_)
+            repair_push_complete_ = true;
     }
 
     // Pull objects this node should own. Iterate the immutable ordered live set
     // directly using upper_bound() rather than copying N object IDs into a new
     // vector on every bounded repair slice.
-    if (!repair_pull_complete_ && live && !live->empty() &&
-        (!byte_budget || transferred < byte_budget)) {
+    if (!repair_pull_complete_ && live && !live->empty() && !result.credit_limited) {
         auto it = repair_pull_after_
                       ? std::upper_bound(live->begin(), live->end(), *repair_pull_after_)
                       : live->begin();
         while (it != live->end() && scanned_total < scan_budget) {
             if (yielded())
-                break;
-            if (byte_budget && transferred >= byte_budget)
                 break;
 
             const ObjectId id = *it;
@@ -2578,6 +2824,11 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 ++scanned_total;
                 ++result.pull_examined;
                 continue;
+            }
+
+            if (transferred + n_.config().extent_size > byte_budget) {
+                result.credit_limited = true;
+                break;
             }
 
             if (!reserve_operation())
@@ -2622,9 +2873,14 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     repair_bytes_total_.fetch_add(result.bytes_transferred, std::memory_order_relaxed);
     repair_push_phase_complete_.store(repair_push_complete_, std::memory_order_relaxed);
     if (repair_push_complete_ && repair_pull_complete_) {
-        result.complete = true;
+        // A pass the live set changed under may have gone past objects before
+        // they became live: another starts at once rather than repair being
+        // called settled.
+        result.complete = !repair_pass_spans_change_;
+        repair_pass_spans_change_ = false;
         repair_passes_completed_.fetch_add(1, std::memory_order_relaxed);
         reset_completed_pass();
+        save_repair_position(true);
     }
     return result;
 }

@@ -98,6 +98,7 @@ class TorrentCoordinator {
                                                                       std::string& error);
     bool write_available() const;
     std::optional<MetadataSnapshotView> current_view() const;
+    std::optional<MetadataSnapshotView> served_view() const;
     std::optional<std::chrono::milliseconds> default_remove_after() const;
 
     NodeRuntime& node_;

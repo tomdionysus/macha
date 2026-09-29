@@ -626,6 +626,14 @@ Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control conver
 
 `busy_bandwidth_fraction` governs rebalance and scrub only; repair always earns credit at `idle_bandwidth_fraction` and shares time by the weights.
 
+**Credit pays for transfers, not for finding them.** A repair step runs whenever its share allows. It takes up to 64 of its own objects at a time and asks each peer about them together (`have_valid_objects`, 16 objects a request, every request in flight at once), and the peer checks each copy by reading, decrypting and hashing it, so a corrupt copy counts as missing and is replaced. A push is charged the object's own size and a pull a full extent (its size is not known until it arrives); a step stops at the first transfer its credit cannot yet cover and resumes there when the credit is due. Pushes go out in batches of up to 8 objects and two extents of payload, all in flight at once. A pass keeps its place when the live set changes (another pass follows one that spanned a change) and across a restart (`<state_path>/repair/push-position`).
+
+The credit rate is `idle_bandwidth_fraction` of the node's measured throughput to its peers. Only transfers of at least half an extent are measured: a smaller one is mostly a round trip and the far end's write, and counting it put the estimate at a few percent of the real link.
+
+**A peer's viewers pace repair too.** When another node reports foreground or read-ahead cluster traffic (`nodes[].traffic` in Status) in its latest telemetry, repair takes its weighted turns exactly as it does for this node's own viewers: its transfers share those viewers' links. It is paced, never stopped. A node is usually serving someone, and a copy not restored now makes a later viewer wait.
+
+`diagnostics.repair.pass_gates` counts steps that `ran`, passes turned away by `share` or a `quiescent` wait, and steps that stopped for `credit`.
+
 ## Catalogue
 
 Catalogue scanner/API configuration is optional. Scanner roots are provider-specific:

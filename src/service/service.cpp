@@ -626,6 +626,7 @@ void Service::initialise_services(std::stop_token stop) {
             return;
 
         auto store = std::make_unique<DistributedStore>(node_);
+        store->persist_repair_position(node_.config().state_path / "repair" / "push-position");
         auto metadata = std::make_unique<MetadataManager>(node_);
         auto catalogue = std::make_unique<CatalogueManager>(node_, *store, *metadata);
         auto fs = std::make_unique<FileSystem>(node_, *store, *metadata, &playback_);
@@ -1246,6 +1247,13 @@ void Service::loop(std::stop_token stop) {
         // suppress background work, while the transport queues themselves keep
         // playback above mount I/O.
         bool busy = playback_busy || interactive_busy || loader_busy;
+        // A peer's viewers pace repair exactly as this node's own do: repair's
+        // transfers share their links, so it takes its weighted turns while
+        // they play. Paced, never stopped -- a copy not restored now makes a
+        // later viewer wait, and a node is usually serving someone.
+        const bool peer_viewers = node_.peer_viewers_active(
+            std::max(node_.config().telemetry_interval * 3, std::chrono::milliseconds(3000)));
+        const bool repair_busy = busy || peer_viewers;
         double fraction = busy ? policy.busy_bandwidth_fraction : policy.idle_bandwidth_fraction;
 
         double bandwidth = store_->estimated_network_bps();
@@ -1281,6 +1289,7 @@ void Service::loop(std::stop_token stop) {
         }
 
         bool gc_due_this_pass = false;
+        bool repair_continue = false;
         try {
             // Remote generation notices wake no kernel/FUSE path and perform no
             // metadata-replica I/O themselves. The maintenance owner advances the coherent
@@ -1393,15 +1402,14 @@ void Service::loop(std::stop_token stop) {
                 log_slow_stage("catalogue-repair", stage);
             }
 
-            const bool allow_network_repair = repair_share.can_start(now, busy);
-            const bool network_due = allow_network_repair && now >= network_quiescent_until &&
-                                     network_credit >= node_.config().extent_size;
-            store_->note_repair_gate(
-                network_due                        ? DistributedStore::RepairGate::ran
-                : !allow_network_repair            ? DistributedStore::RepairGate::share
-                : now < network_quiescent_until    ? DistributedStore::RepairGate::quiescent
-                                                   : DistributedStore::RepairGate::credit,
-                network_credit);
+            // Credit gates repair's transfers inside the step, not the step:
+            // probing which objects need a copy costs no bulk bandwidth.
+            const bool allow_network_repair = repair_share.can_start(now, repair_busy);
+            const bool network_due = allow_network_repair && now >= network_quiescent_until;
+            store_->note_repair_gate(network_due             ? DistributedStore::RepairGate::ran
+                                     : !allow_network_repair ? DistributedStore::RepairGate::share
+                                                             : DistributedStore::RepairGate::quiescent,
+                                     network_credit);
             const bool garbage_due = !busy && !metadata_dirty;
             const bool gc_due = !busy && now >= gc_quiescent_until;
             gc_due_this_pass = gc_due;
@@ -1419,8 +1427,16 @@ void Service::loop(std::stop_token stop) {
                 const auto inventory_stage = Clock::now();
                 auto objects = fs_->maintenance_objects_cached();
                 bool rebuilt_inventory = false;
-                if (!maintenance_live_ || !maintenance_catalogue_complete_ ||
-                    maintenance_inventory_generation_ != objects->metadata_generation) {
+                // Rebuilding runs the catalogue's repair (maintenance_objects),
+                // which this pass holds back until metadata is ready. A repair
+                // step alone does not force it early: it works from the last
+                // inventory until then. Repair runs every pass since 0.72.0,
+                // and without this it refreshed the catalogue ahead of the
+                // metadata convergence it depends on.
+                const bool repair_only = network_due && !garbage_due && !gc_due;
+                if ((!maintenance_live_ || !maintenance_catalogue_complete_ ||
+                     maintenance_inventory_generation_ != objects->metadata_generation) &&
+                    (!maintenance_live_ || !repair_only || metadata_ready_for_dependants)) {
                     auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
                     auto universal = std::make_shared<std::vector<ObjectId>>();
                     auto control_live = std::make_shared<std::vector<ObjectId>>();
@@ -1486,14 +1502,39 @@ void Service::loop(std::stop_token stop) {
                     // cannot discover it. Walk a tiny bounded claim slice first and
                     // actively restore missing claimed DATA/CONTROL objects.
                     size_t retained_repairs = 0;
+                    bool retained_waiting_for_credit = false;
+                    // The walk stopped at its per-step bound with claims left;
+                    // repair is not quiescent until a walk reaches the end.
+                    bool retained_walk_unfinished = false;
+                    // Presence is an index lookup and costs no credit; only a
+                    // missing claimed object, which may be fetched, needs an
+                    // extent of it. Until 0.72.1 every claim examined was
+                    // charged an extent (ensure_local() answers true for
+                    // "already here" as well as "restored") and read back in
+                    // full: on 2026-09-29 that spent all of both nodes' credit
+                    // on objects they held, and repair moved no bytes at all.
                     auto repair_retained = [&](RetentionClass type,
                                                std::optional<ObjectId>& cursor) {
-                        for (size_t examined = 0; examined < 2 && network_credit >= extent;
-                             ++examined) {
+                        for (size_t examined = 0;; ++examined) {
+                            if (examined == 16) {
+                                retained_walk_unfinished = true;
+                                break;
+                            }
+                            const auto resume = cursor;
                             bool complete = false;
                             auto id = node_.retention_store().next_retained(type, cursor, complete);
                             if (!id)
                                 break;
+                            const bool present = type == RetentionClass::data
+                                                     ? node_.local_store().has(*id)
+                                                     : node_.control_store().has(*id);
+                            if (present)
+                                continue;
+                            if (network_credit < extent) {
+                                cursor = resume;
+                                retained_waiting_for_credit = true;
+                                break;
+                            }
                             const bool restored = type == RetentionClass::data
                                                       ? store_->ensure_local(*id, false)
                                                       : store_->ensure_control_local(*id);
@@ -1504,13 +1545,13 @@ void Service::loop(std::stop_token stop) {
                             }
                         }
                     };
-                    const auto higher_class_active = [this, &policy] {
+                    const auto higher_class_active = [this, &policy, peer_viewers] {
                         const auto quiet = policy.foreground_quiet;
-                        return store_->foreground_idle_for() < quiet ||
+                        return peer_viewers || store_->foreground_idle_for() < quiet ||
                                store_->interactive_idle_for() < quiet ||
                                store_->loader_idle_for() < quiet;
                     };
-                    repair_share.started(Clock::now(), busy);
+                    repair_share.started(Clock::now(), repair_busy);
                     // A throw from either repair stage must still close the
                     // turn, or the pacer counts it active forever and never
                     // computes another cooldown.
@@ -1524,12 +1565,11 @@ void Service::loop(std::stop_token stop) {
                     repair_retained(RetentionClass::control, retained_control_repair_after);
 
                     const auto byte_budget = static_cast<uint64_t>(network_credit);
-                    // The byte budget alone does not constrain have-object
-                    // probes: a settled or mostly-settled namespace could issue
-                    // thousands of synchronous control RPCs while consuming no
-                    // network credit. Bound each repair slice independently.
-                    const size_t operation_budget =
-                        static_cast<size_t>(std::clamp<uint64_t>((byte_budget / extent), 4, 16));
+                    // The byte budget does not constrain have-object probes: a
+                    // settled or mostly-settled namespace could issue thousands
+                    // of synchronous control RPCs while consuming no network
+                    // credit. Bound each repair slice independently.
+                    constexpr size_t operation_budget = 16;
                     enter_stage("network-repair");
                     const auto repair_stage = Clock::now();
                     auto repair = store_->repair_step(
@@ -1554,13 +1594,26 @@ void Service::loop(std::stop_token stop) {
                         network_credit = std::max(
                             0.0, network_credit - static_cast<double>(repair.bytes_transferred));
                     }
-                    if (repair.yielded) {
+                    if (repair.credit_limited) {
+                        // The credit deadline below wakes the loop when the
+                        // next extent is affordable.
+                        store_->note_repair_gate(DistributedStore::RepairGate::credit,
+                                                 network_credit);
+                    } else if (repair.yielded) {
                         Log::trace("maintenance: repair yielded to foreground I/O");
-                    } else if (!retained_repairs && !repair.bytes_transferred && repair.complete) {
+                    } else if (!repair.complete || retained_repairs || repair.bytes_transferred ||
+                               retained_walk_unfinished) {
+                        // Work left (a probe or scan budget ran out) or work
+                        // done: the next step is due after one interval, not
+                        // when credit or an unrelated event next wakes the loop.
+                        repair_continue = true;
+                    } else if (!retained_waiting_for_credit) {
                         network_credit = 0.0;
                         network_quiescent_until = Clock::time_point::max();
                         Log::trace("maintenance: repair quiescent; waiting for an event");
                     }
+                    // Otherwise the claim walk still waits for credit, and the
+                    // credit deadline wakes the loop for it.
                 }
 
                 const bool cluster_gc_healthy = node_.membership().all_known_reachable();
@@ -2076,10 +2129,12 @@ void Service::loop(std::stop_token stop) {
                                                              std::chrono::duration<double>(seconds)));
             }
             if (network_quiescent_until != Clock::time_point::max()) {
-                const auto turn = repair_share.wait_for(now_after_work, busy);
+                const auto turn = repair_share.wait_for(now_after_work, repair_busy);
                 if (turn > Clock::duration{})
                     deadline = std::min(deadline, now_after_work + turn);
             }
+            if (repair_continue)
+                deadline = std::min(deadline, now_after_work + policy.interval);
         }
         credit_deadline(local_credit, local_quiescent_until);
 

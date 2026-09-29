@@ -400,6 +400,8 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::have_object:
     case MessageType::have_objects:
     case MessageType::have_objects_reply:
+    case MessageType::have_valid_objects:
+    case MessageType::have_valid_objects_reply:
     case MessageType::retain_objects:
     case MessageType::delete_object:
     case MessageType::get_metadata:
@@ -686,6 +688,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_objects";
     case MessageType::have_control_objects:
         return "have_control_objects";
+    case MessageType::have_valid_objects:
+        return "have_valid_objects";
     case MessageType::torrent_intent:
         return "torrent_intent";
     case MessageType::dial_request:
@@ -734,6 +738,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_objects_reply";
     case MessageType::have_control_objects_reply:
         return "have_control_objects_reply";
+    case MessageType::have_valid_objects_reply:
+        return "have_valid_objects_reply";
     case MessageType::torrent_intent_reply:
         return "torrent_intent_reply";
     case MessageType::user_sync:
@@ -766,7 +772,8 @@ FrameType default_frame_type(MessageType type) noexcept {
         return FrameType::foreground;
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
         type == MessageType::telemetry || type == MessageType::have_object ||
-        type == MessageType::have_objects || type == MessageType::retain_objects ||
+        type == MessageType::have_objects || type == MessageType::have_valid_objects ||
+        type == MessageType::retain_objects ||
         type == MessageType::delete_object)
         return FrameType::speculative;
     return FrameType::control;
@@ -992,6 +999,10 @@ void SecureChannel::send_fragment(uint64_t request_id, FrameType frame_type,
     send_all(fd_, sealed.nonce, progress);
     send_all(fd_, sealed.tag, progress);
     send_all(fd_, sealed.ciphertext, progress);
+    if (traffic_)
+        traffic_->note(true, frame_type,
+                       header.data().size() + sealed.nonce.size() + sealed.tag.size() +
+                           sealed.ciphertext.size());
 }
 
 WireFragment
@@ -1035,6 +1046,9 @@ SecureChannel::receive_fragment(const std::function<void(uint64_t, size_t)>& pro
     recv_all(fd_, ciphertext, body_progress);
     auto payload = aes_gcm_open(rx_, nonce, tag, ciphertext, header_bytes);
     rx_counter_ = counter;
+    if (traffic_)
+        traffic_->note(false, frame_type,
+                       header_bytes.size() + nonce.size() + tag.size() + ciphertext.size());
     return {request_id,
             frame_type,
             message_type,
@@ -1695,6 +1709,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     bool finished() const {
         return broken_.load();
     }
+    // Before start(): the reader and writer are the channel's only users.
+    void set_traffic(std::shared_ptr<TransportTraffic> traffic) {
+        channel_.set_traffic(std::move(traffic));
+    }
     const NodeInfo& peer() const {
         return peer_;
     }
@@ -2183,6 +2201,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                                      to_string(*expected) + ", actual authenticated NodeId " +
                                      to_string(actual_id));
         }
+        fresh->set_traffic(traffic_);
         fresh->start();
         if (actual)
             *actual = fresh->peer().id;
@@ -3867,6 +3886,8 @@ RpcServer::RequestClass RpcServer::next_data_class() const {
 
 void RpcServer::attach_client(RpcClient& client) {
     shared_client_ = &client;
+    // One count for the node: inbound sessions and the client's own dials.
+    traffic_ = client.traffic();
     client.set_inbound_handler(
         [this](const NodeInfo& peer, RpcFrame frame, RpcClient::InboundReply reply) {
             enqueue_shared(peer, std::move(frame), std::move(reply));
@@ -4157,6 +4178,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
             }
             session->channel =
                 std::make_unique<SecureChannel>(client, keys_, std::move(local), max_frame_size_);
+            session->channel->set_traffic(traffic_);
             channel_owns_client = true;
             session->channel->set_io_timeout(rpc_handshake_timeout);
             {

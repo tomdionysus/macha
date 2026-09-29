@@ -3,6 +3,7 @@
 
 #include "types.hpp"
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <ctime>
@@ -38,6 +39,25 @@ struct TranscodeRate {
     uint32_t observations{};
     uint32_t concurrent{};   // median transcodes running on the node when observed
     auto operator<=>(const TranscodeRate&) const = default;
+};
+
+// This node's cluster traffic for one frame class (the wire value of
+// FrameType): bytes on and off the wire since start, and the rate over the
+// last telemetry interval. Only Macha's own traffic.
+struct TrafficClass {
+    uint8_t frame_class{};
+    uint64_t in_bytes{};
+    uint64_t out_bytes{};
+    uint32_t in_bytes_per_s{};
+    uint32_t out_bytes_per_s{};
+    auto operator<=>(const TrafficClass&) const = default;
+};
+
+// Cumulative per-class totals as the transport counts them, indexed by the
+// FrameType wire value.
+struct TrafficTotals {
+    std::array<uint64_t, 6> in_bytes{};
+    std::array<uint64_t, 6> out_bytes{};
 };
 
 struct NodeTelemetry {
@@ -162,6 +182,11 @@ struct NodeTelemetry {
     std::vector<TranscodeRate> playback_transcode_rates;
     // The operator's display name for the node (`node_name`), or empty.
     std::string node_name;
+    // Per-class cluster traffic (0.73.0). Empty means the sender did not say.
+    // The rates are over traffic_window_ms, the interval since the sender's
+    // previous sample; zero on its first sample after start, when it has none.
+    std::vector<TrafficClass> traffic;
+    uint32_t traffic_window_ms{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
@@ -221,6 +246,8 @@ class TelemetryStore {
     uint64_t sequence_{};
     std::filesystem::path persisted_path_;
     std::string node_name_;
+    std::optional<TrafficTotals> previous_traffic_;
+    Clock::time_point previous_traffic_at_{};
 
   public:
     // The display name this node reports for itself from its next sample on.
@@ -236,7 +263,8 @@ class TelemetryStore {
                                 uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
                                 uint64_t rpc_connections_canonical, NodePhase phase,
                                 std::string api_endpoint, PlaybackBudgets playback = {},
-                                CacheActivity cache = {});
+                                CacheActivity cache = {},
+                                std::optional<TrafficTotals> traffic = {});
     void observe(NodeTelemetry, bool direct = false);
     void apply_identity_reset(const IdentityAssociationReset&);
     std::optional<NodeTelemetry> local() const;

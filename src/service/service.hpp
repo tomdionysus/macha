@@ -203,6 +203,9 @@ class Service {
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
         return metadata_convergence_.diagnostics();
     }
+    DistributedStore::RepairDiagnostics repair_diagnostics() const {
+        return store_->repair_diagnostics();
+    }
     // Null when this node has no mount: not configured for one, or its FUSE
     // subsystem is faulted between restarts. See SubsystemRegistry.
     std::shared_ptr<FuseFrontend> fuse() {

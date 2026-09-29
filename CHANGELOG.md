@@ -1,5 +1,146 @@
 # Current release
 
+## 0.73.2 — The torrent listing no longer waits on a peer (development)
+
+`GET /api/v1/torrents/jobs` took 0.6-1.7 s on fi-1 while `/torrents/status`
+and `/torrents/nodes` answered in under a millisecond. Stack traces taken
+during the request showed the HTTP thread in a metadata read surveying the
+peers' accepted heads over the WAN: the torrent coordinator listed requests
+from a snapshot refresh, and that refresh is taken whenever any peer has
+announced a newer generation -- nearly always, with torrents committing
+progress on both nodes.
+
+The listing and single-request lookups now read the snapshot this node
+already holds in memory, as catalogue reads do; bringing it up to date is
+background convergence's job. A node's own commit is installed in memory
+before the commit returns, so an add is still listed at once. The exception,
+accepted deliberately: a commit that lands while another node's concurrent
+commit leaves more than one accepted head appears after the next background
+convergence rather than immediately. The coordinator's own passes still
+refresh.
+
+## 0.73.1 — Repair sends several objects at once and keeps its place (development)
+
+On 0.73.0 with `idle_bandwidth_fraction: 0.9`, gbni-1 moved ~500 KB/s to
+fi-1 with full credit, no credit stops and a link that carried at least
+2.8 MB/s. Two causes:
+
+**One push was in flight at a time.** Each waited for a WAN round trip and
+fi-1's durable write, about 0.35 s an object, and most objects are small
+(the 3 minutes measured averaged ~177 KB). A step now plans its sends --
+reading each source and charging its credit as before -- and puts them all
+in flight at once, up to 8 objects and two extents of payload a batch (one
+larger object alone), settling each object from its own answers. A failed
+send leaves its object to the next step. The bandwidth estimate takes one
+sample per batch, since its sends shared the link.
+
+**The pass kept starting again.** Every new live-set generation, which is
+every metadata commit, sent both repair cursors back to the start, and so
+did every restart. With `have_valid_objects` each object passed again is a
+full read on the peer: after the restart for `idle_bandwidth_fraction`,
+gbni-1 re-read the ~2,900 objects already on fi-1 (fi-1's disk reading
+~10 MB/s) for four minutes before sending anything new. Positions now
+survive a new generation, and a pass the live set changed under is followed
+by another at once, so nothing that became live behind a cursor is missed.
+The push pass's position is saved to
+`<state_path>/repair/push-position` (at most every 30 s, at the end of each
+pass, and at stop) and resumed after a restart by skipping that many objects
+by index.
+
+## 0.73.0 — Repair uses the link it has; nodes report their traffic by class (development)
+
+On 0.72.1 with `idle_bandwidth_fraction: 0.5`, gbni-1's repair moved about
+10 KB/s to fi-1 over a path measured at 1.3 MB/s. In 185 s it ran 24 steps,
+pushed 24 objects (mostly 16-100 KB), and stopped for credit after every one.
+Two causes fed each other, and a third cost was in the probes:
+
+**A push is charged what it sends.** 0.72.0 checked each push against a full
+extent before reading the object. With credit capped at one extent, any push
+left too little for the next, so a step moved one object and waited for a
+refill. A push now reads the object and checks its real size. A pull is
+still charged an extent, since its size is not known until it arrives.
+
+**The bandwidth estimate measures bandwidth.** It averaged bytes over elapsed
+time for every repair and fetch transfer, so a 30 KB push -- a WAN round trip
+and fi-1's disk write -- counted as a 20 KB/s link, and repair's credit, a
+fraction of the estimate, followed it down. Only transfers of at least half
+an extent are now measured.
+
+**Presence is probed a window at a time.** The push phase asked a peer about
+one object per round trip (~90 ms on the WAN) and at most 16 a step. It now
+takes up to 64 objects at a time and asks each peer about them in
+`have_valid_objects` requests of up to 16, all in flight at once. The peer
+answers each the way `have_object` answers one -- read, decrypt, hash -- so a
+corrupt copy still counts as missing and is replaced. A peer that does not
+know the message is probed one object at a time as before. (New wire message
+47, reply 123; no protocol bump.)
+
+**A peer's viewers pace repair.** When another node reports foreground or
+read-ahead cluster traffic, repair takes its weighted turns (`repair_weight`
+against `foreground_weight`) as it does for this node's own viewers. On
+2026-09-29 a viewer on fi-1 transcoding from extents pulled over its 1.3 MB/s
+link shared that link with repair's pushes from gbni-1, and gbni-1's pacer
+could not see it. Paced, never stopped: a copy not restored now makes a later
+viewer wait.
+
+**Nodes report their cluster traffic by class.** Each channel counts every
+sealed frame it sends and receives, overhead included, by frame class. Each
+node publishes the totals and the rate over its last telemetry interval
+(telemetry field 44).
+
+API addition (announce to Core and every client):
+- `GET /api/v1/status`: `nodes[].traffic` is `{as_of_unix_ms, window_ms,
+  classes: [{class, in_bytes, out_bytes, in_bytes_per_s, out_bytes_per_s}]}`
+  or `null` when the node did not report it. `class` is one of `control`,
+  `foreground`, `read_ahead`, `speculative`, `loader` (the set may grow).
+  `window_ms` and the rates are `null` on a node's first sample after start.
+  Only Macha's traffic between nodes; HTTP to clients is not in it.
+
+## 0.72.1 — Held retention claims no longer spend repair's credit (development)
+
+Deployed with `idle_bandwidth_fraction: 0.5`, 0.72.0 still moved no bytes on
+either node, with the credit at 0. The retention-claim walk, which runs ahead
+of each repair step, charged an extent of credit for every claim it examined,
+because `ensure_local()` answers true for "already here" as well as
+"restored". It also read each claimed object back in full to decide that. So
+claims already on disk spent all the credit before any transfer could use it.
+Presence is now an index lookup and costs nothing. Only a missing claimed
+object, which may be fetched, needs an extent of credit; without it the walk
+stops at that claim and resumes there. The walk examines up to 16 claims per
+class per step, up from 2, and repair is not called quiescent while the walk
+has claims left in its cycle. Before, a step that found nothing to move could
+put repair to sleep until the next event while a missing claimed object still
+lay ahead of the walk's cursor.
+
+A repair step no longer rebuilds the maintenance inventory while metadata
+convergence is unfinished; it works from the previous inventory until then.
+The rebuild runs the catalogue's own repair, which the maintenance pass holds
+back until metadata is ready. Since 0.72.0 ran a step on every pass, that
+refreshed the catalogue ahead of the convergence it depends on.
+
+## 0.72.0 — Repair credit pays for transfers, not for finding them (development)
+
+**Repair no longer waits for credit before looking.** Repair earns transfer
+credit at `idle_bandwidth_fraction` of the measured link, and until now a
+repair step could not start at all below one extent (4 MiB) of it. On fi-1,
+with its new 8T backend, that credit came to about 50 KB/s -- a tenth of a WAN
+link measured at 450-560 KB/s -- so a step ran about every 80 s and probed 4
+to 16 objects. Its push phase alone, one presence probe per object it held,
+was about 14 hours before it pulled anything, and 2026-09-29 measured zero
+bytes pulled. A step now runs whenever repair's weighted share allows. Presence
+probes and index lookups are bounded by a fixed per-step operation budget (16);
+each push or pull transfer needs credit that covers it, and a step stops at
+the first one that does not and resumes there when the credit is due. A step
+cut short by its probe budget is followed one maintenance interval later
+rather than at the next credit or event.
+
+Repair's transfer rate is unchanged: still `idle_bandwidth_fraction` of the
+estimated link.
+
+Diagnostics: `diagnostics.repair.pass_gates.credit` now counts steps that ran
+and stopped at a transfer the credit did not yet cover; `ran` counts every
+step. `share` and `quiescent` are as before.
+
 ## 0.71.0 — Torrents can be added paused; a finished download shows its publication progress (development)
 
 **A finished download says what it is waiting for.** A torrent that has

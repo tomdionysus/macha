@@ -93,18 +93,29 @@ the decisions waiting on the operator.
      re-fetches lost artwork. Written up, parked:
      [`2026-09-27-missing-artwork-and-single-copy-writes.md`](2026-09-27-missing-artwork-and-single-copy-writes.md).
 
-1. **Repair's credit gates stock-taking, not just transfer (measured, fix
-   proposed, awaiting the operator's go).** 0.62.3's `diagnostics.repair
-   .pass_gates` on gbni-1: every pass turned away by `credit` (46 of 46 in
-   3 min), credit growing ~6 KB/s, a step needing 4 MB, so one step per ~11
-   min of at most 64 objects over ~570k live extents. Nothing is examined and
-   no lost extent is ever counted. Proposed 0.63.0: a step runs whenever the
-   weighted share allows; index lookups and presence probes (`have_object`, no
-   data) always proceed; a 4 MB fetch or push only when credit covers it; an
-   extent no peer holds is counted unsourceable without spending credit. Also
-   verify why the bandwidth estimate is so low (fi-1's site link measured
-   congested on 2026-09-27, independently of Macha: the likely cause). Code: `src/service/service.cpp` network_due / byte_budget,
-   `DistributedStore::repair_step`.
+0d. **The object ledger (EXPERIMENTAL spec, 2026-09-29).** One record per
+   object (referenced, claimed, held, owner) on disk behind a bounded cache,
+   indexed per consumer, canonical shape so nodes can diff. Replaces the flat
+   live vector (32 B per extent, whole library on every node, rebuilt by a
+   tree walk on every commit: 12.8 GB at 100k titles), moves the retention
+   claim map out of memory, gives O(1) cohesion counts and diff-driven repair.
+   Contract first; no code until the operator has chosen the stages. The spec
+   is `TODO/2026-09-29-object-ledger-spec.md` on branch
+   `experiment/object-ledger`, not on develop.
+
+1. **Repair's credit gated stock-taking: fixed in 0.72.0; its rate is the
+   operator's call.** A step now runs whenever the share allows, probes are
+   bounded per step (16), and credit gates only transfers. Measured on fi-1
+   2026-09-29: the bandwidth estimate (~450-560 KB/s) matches the link (TCP
+   delivery_rate 3-5 Mbit/s at ~90 ms RTT), so it is not the fault; repair
+   transfers at `idle_bandwidth_fraction` (0.10) of it, ~50 KB/s, about
+   4 GB a day. Filling fi-1's 8T at that rate takes years. Open:
+   - [ ] Whether repair should take more of an idle link (the fraction is
+     config; it also sets rebalance/scrub credit). Operator to decide.
+   - [ ] An extent no peer holds is still only counted when a fetch is tried,
+     so it waits for credit like any pull.
+   - [ ] Push probes are one `have_object` round trip each (~90 ms on the
+     WAN); a batched `have_objects` per peer would cut a pass by 16x.
 2. **Per-file readability (designed, operator to choose where it goes).**
    Every extent of a file present on some reachable node: local
    `LocalStore::has()` (index), then one batched `have_objects` per peer (the

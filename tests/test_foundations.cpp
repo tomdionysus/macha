@@ -255,6 +255,9 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
         TranscodeRate{"video", "hevc", 10, 2160, 330, 3, 1},
         TranscodeRate{"audio", "truehd", 0, 0, 12500, 2, 2}};
     telemetry.node_name = "Corvus FI-1";
+    telemetry.traffic = {TrafficClass{2, 9'000'000'000ULL, 1'000, 1'300'000, 40},
+                         TrafficClass{4, 12, 7'000'000'000ULL, 0, 25'000}};
+    telemetry.traffic_window_ms = 10'004;
     CHECK(decode_node_telemetry(encode_node_telemetry(telemetry)) == telemetry);
     auto telemetry_set = decode_telemetry_set(encode_telemetry_set({telemetry}));
     REQUIRE(telemetry_set.size() == 1);
