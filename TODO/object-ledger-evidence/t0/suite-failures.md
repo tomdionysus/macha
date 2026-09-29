@@ -23,8 +23,9 @@ the spec's open question 5.
 The other two passed every isolated repetition at the same load; each
 failed once in a full-suite run at load 366, and each is timing-dependent
 by construction (a 1 s publication quiet window; peer batch-request
-counts). Neither is closed: both are to be measured with `--repeat` on
-node-f, where the suite is the baseline.
+counts). On node-f all three passed 100/100 (`--repeat 100`, load 1-2):
+their laptop failures are host overload meeting real-time waits, the class
+T1's injected clock removes, not defects T0 introduced.
 
 ## node-f, final run: the HTTP pipelining case
 
