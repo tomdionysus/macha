@@ -26,9 +26,25 @@ That sets the standard of evidence for every step:
   as one idea; names say what things are; comments say why, never what the
   code already says; a reviewer who did not write it can follow each
   contract to its implementation and its tests.
-- **Sanitizers are used, not canonical.** The ASan and TSan builds
-  (`build-asan`, `build-tsan`) run, and anything they find is fixed, but
-  their silence is not evidence of correctness.
+- **Two classes of component, two classes of test.** Primitives (mutexes,
+  bounds, spans, cursors, budgets, work classes, timeouts, limits, indexes)
+  have a phase space small enough to test deterministically and
+  exhaustively. Once a component's, class's or subsystem's phase space
+  grows beyond usable deterministic testing, its tests are by definition
+  functional or behavioural. The system is broken into as few fully
+  deterministically testable units as necessary; they are tested
+  exhaustively, their dependencies and their composers with fakes, and
+  that low-level deterministic layer is kept separate from the functional
+  and behavioural layer above it. This is what inversion of control is for.
+- **Sanitizers are debuggers.** The ASan and TSan builds (`build-asan`,
+  `build-tsan`) are pointed at a suspected fault, not run indiscriminately:
+  used that way they waste time and produce false positives. Their silence
+  is not evidence.
+- **Evidence is committed.** Each accepted step commits its proof beside
+  its code, under `TODO/object-ledger-evidence/<step>/`: the coverage report
+  for what it built, the mutation record (each mutation and the test that
+  failed), the trace comparison, and the suite timings. The history then
+  carries the evidence, not only the claim.
 - **No CI.** Every accepted stage and substage is committed and pushed to
   GitHub on `experiment/object-ledger` or a branch cut from it. The pushed
   history is the record.
@@ -56,6 +72,8 @@ step, without exception:
   that fails this is withdrawn, not patched forward.
 - **Records its decisions** in the spec's decision log, dated, with the
   reasoning.
+- **Commits its evidence** (coverage, mutation record, trace comparison,
+  timings) under `TODO/object-ledger-evidence/<step>/`.
 - **Is pushed when accepted**, stage and substage alike.
 - **States the laws it touches** and how each holds.
 - **Changes nothing the API sends**, or announces the change to Core and
@@ -490,8 +508,7 @@ shape.
 
 **Acceptance.**
 - The Clang build clean under `-Wthread-safety -Werror`; GCC and all three
-  suites green; the ASan and TSan builds run and anything they find is
-  fixed (used, not canonical).
+  suites green.
 - 100% line and branch coverage of every component in the root.
 - No measurable change in lock-heavy paths (FUSE publication throughput,
   playback start and seek, API latency) against the same load.
