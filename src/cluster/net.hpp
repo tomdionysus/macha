@@ -77,6 +77,13 @@ enum class MessageType : uint16_t {
     // written. The owner applies it at once and journals the intent until it
     // can be published. Reply: torrent_intent_reply.
     torrent_intent = 46,
+    // 0.73.0: repair's batched presence probe. Unlike have_objects, which
+    // answers from the index, each id is answered the way have_object answers
+    // one: read, decrypt and hash, so a corrupt copy is reported absent and
+    // repair replaces it. At most have_valid_objects_max ids a request. Reply:
+    // have_valid_objects_reply. An older peer answers with an error and the
+    // caller probes it one object at a time as before.
+    have_valid_objects = 47,
     // 0.27.0: the immutable record for a history hash as a self-contained
     // full-body entry, materialized by the serving peer (get_metadata_history_entry
     // returns the peer's *stored* frame, which may be exactly the delta the
@@ -113,8 +120,13 @@ enum class MessageType : uint16_t {
     user_sync_reply = 119,
     dial_back_probe_reply = 120,
     have_control_objects_reply = 121,
-    torrent_intent_reply = 122
+    torrent_intent_reply = 122,
+    have_valid_objects_reply = 123
 };
+
+// Each id in a have_valid_objects request is a full read on the peer, so a
+// request is bounded to what one data worker should do in one handler.
+inline constexpr size_t have_valid_objects_max = 16;
 
 // Transport priority is a property of the frame type itself. There is no
 // independent priority field on the wire which can contradict it.
@@ -154,6 +166,24 @@ enum class FrameType : uint8_t {
     // User-requested bulk work. Keep the existing speculative wire value
     // stable; priority is defined by frame_type_priority(), not enum order.
     loader = 5,
+};
+
+// Bytes this node has put on and taken off the wire, by frame class, since
+// start: every sealed fragment, header and AEAD overhead included. One is
+// shared by a node's RPC client and server and every channel they open, so it
+// is the node's whole cluster traffic. Only Macha's own traffic is counted;
+// anything else using the same link is invisible here.
+struct TransportTraffic {
+    static constexpr size_t classes = 6; // indexed by FrameType's wire value
+    std::array<std::atomic_uint64_t, classes> in_bytes{};
+    std::array<std::atomic_uint64_t, classes> out_bytes{};
+
+    void note(bool outbound, FrameType type, uint64_t bytes) noexcept {
+        const auto index = static_cast<size_t>(type);
+        if (index >= classes)
+            return;
+        (outbound ? out_bytes : in_bytes)[index].fetch_add(bytes, std::memory_order_relaxed);
+    }
 };
 
 const char* frame_type_name(FrameType) noexcept;
@@ -284,10 +314,13 @@ class SecureChannel {
     bool ready_{};
     std::mutex close_mutex_;
     bool shutdown_{};
+    std::shared_ptr<TransportTraffic> traffic_;
     void close_fd();
 
   public:
     SecureChannel(int, ClusterKeys, NodeInfo, size_t max_frame_size);
+    // Set before the channel carries frames; handshake bytes are not counted.
+    void set_traffic(std::shared_ptr<TransportTraffic> traffic) { traffic_ = std::move(traffic); }
     ~SecureChannel();
     SecureChannel(const SecureChannel&) = delete;
     SecureChannel& operator=(const SecureChannel&) = delete;
@@ -382,6 +415,7 @@ class RpcClient {
     std::chrono::milliseconds dead_after_;
     size_t max_frame_size_{};
     RetainedMemoryLedger* retained_memory_{};
+    std::shared_ptr<TransportTraffic> traffic_{std::make_shared<TransportTraffic>()};
     mutable std::mutex mutex_;
     std::condition_variable connection_cv_;
     // Creating a transport is expensive: authentication starts two persistent
@@ -510,6 +544,9 @@ class RpcClient {
                   std::chrono::milliseconds stall_notice,
                   std::chrono::milliseconds no_progress_deadline = {});
     RpcStats stats() const;
+    // Every channel this client opens counts into it; the node's server is
+    // given the same one, so it is the node's whole cluster traffic.
+    const std::shared_ptr<TransportTraffic>& traffic() const noexcept { return traffic_; }
     // Smoothed CONTROL-lane round trip to a peer, if any call has completed.
     std::optional<std::chrono::milliseconds> peer_latency(const NodeId&) const;
     std::map<NodeId, std::chrono::milliseconds> peer_latencies() const;
@@ -624,6 +661,7 @@ class RpcServer {
     std::vector<std::shared_ptr<Session>> sessions_;
     std::atomic_size_t pre_auth_sessions_{};
     RpcClient* shared_client_{};
+    std::shared_ptr<TransportTraffic> traffic_{std::make_shared<TransportTraffic>()};
 
     static RequestClass request_class(FrameType);
     static bool fast_control_request(const RpcFrame&);

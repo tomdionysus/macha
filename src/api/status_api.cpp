@@ -380,6 +380,44 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     }
     node["runtime"] = std::move(runtime);
 
+    // The node's own cluster traffic by frame class: totals since its start and
+    // the rate over its last telemetry interval (window_ms, as of the sample's
+    // own time). Only Macha's traffic between nodes; HTTP to clients and
+    // anything else on the link are not in it. Null when the node did not
+    // report it (an older node, or a stale sample); a rate is null on a
+    // node's first sample after start, when it has no interval yet.
+    if (live && online && !live->traffic.empty()) {
+        const bool rated = live->traffic_window_ms > 0;
+        Json::Array classes;
+        for (const auto& entry : live->traffic) {
+            const char* name = nullptr;
+            switch (static_cast<FrameType>(entry.frame_class)) {
+            case FrameType::control: name = "control"; break;
+            case FrameType::foreground: name = "foreground"; break;
+            case FrameType::read_ahead: name = "read_ahead"; break;
+            case FrameType::speculative: name = "speculative"; break;
+            case FrameType::loader: name = "loader"; break;
+            }
+            if (!name)
+                continue;
+            classes.push_back(Json(Json::Object{
+                {"class", name},
+                {"in_bytes", entry.in_bytes},
+                {"out_bytes", entry.out_bytes},
+                {"in_bytes_per_s",
+                 rated ? Json(static_cast<uint64_t>(entry.in_bytes_per_s)) : Json(nullptr)},
+                {"out_bytes_per_s",
+                 rated ? Json(static_cast<uint64_t>(entry.out_bytes_per_s)) : Json(nullptr)}}));
+        }
+        node["traffic"] = Json(Json::Object{
+            {"as_of_unix_ms", live->observed_unix_ms},
+            {"window_ms", rated ? Json(static_cast<uint64_t>(live->traffic_window_ms))
+                                : Json(nullptr)},
+            {"classes", Json(std::move(classes))}});
+    } else {
+        node["traffic"] = nullptr;
+    }
+
     // Configuration this node enforces, not a measurement of it -- separate
     // from `runtime` above for that reason. A client needs these about every
     // node it might fail over to, not only the one it is playing from, which

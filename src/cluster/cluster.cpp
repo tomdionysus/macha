@@ -993,6 +993,31 @@ void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
     }
 }
 
+TrafficTotals NodeRuntime::traffic_totals() const {
+    TrafficTotals totals;
+    const auto& traffic = client_.traffic();
+    for (size_t index = 0; index < totals.in_bytes.size() && index < TransportTraffic::classes;
+         ++index) {
+        totals.in_bytes[index] = traffic->in_bytes[index].load(std::memory_order_relaxed);
+        totals.out_bytes[index] = traffic->out_bytes[index].load(std::memory_order_relaxed);
+    }
+    return totals;
+}
+
+bool NodeRuntime::peer_viewers_active(std::chrono::milliseconds fresh_for) const {
+    for (const auto& view : telemetry_.views(fresh_for)) {
+        if (view.telemetry.node_id == node_id() || !view.fresh)
+            continue;
+        for (const auto& entry : view.telemetry.traffic) {
+            const auto type = static_cast<FrameType>(entry.frame_class);
+            if ((type == FrameType::foreground || type == FrameType::read_ahead) &&
+                (entry.in_bytes_per_s || entry.out_bytes_per_s))
+                return true;
+        }
+    }
+    return false;
+}
+
 bool NodeRuntime::viewer_recently_active(std::chrono::milliseconds window) const {
     return activity_idle_for(FrameType::foreground) < window ||
            activity_idle_for(FrameType::read_ahead) < window;
@@ -1269,6 +1294,33 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             for (const auto& id : ids)
                 writer.u8(local_store().has(id));
             return {MessageType::have_objects_reply, writer.take()};
+        }
+        case MessageType::have_valid_objects: {
+            Reader reader(request.payload);
+            const auto count = reader.u32();
+            if (!count || count > have_valid_objects_max)
+                return error_reply("invalid validated presence batch count");
+            std::vector<ObjectId> ids;
+            ids.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                ObjectId id;
+                id.bytes = reader.fixed<32>();
+                ids.push_back(id);
+            }
+            reader.finish();
+            // Repair trusts a "present" answer as a healthy copy, so each id
+            // is checked as have_object checks one: read, decrypt, hash. One
+            // DATA admission per id, since each is an extent read.
+            Writer writer;
+            writer.u32(count);
+            for (const auto& id : ids) {
+                auto resource = data_resources_.try_acquire(
+                    DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+                if (!resource)
+                    return error_reply("DATA resource admission busy or stopping");
+                writer.u8(local_store().valid(id));
+            }
+            return {MessageType::have_valid_objects_reply, writer.take()};
         }
         case MessageType::have_control_objects: {
             // The CONTROL counterpart, and deliberately not a variant of the
@@ -1790,7 +1842,8 @@ void NodeRuntime::refresh_telemetry() {
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
                              peers_active > 0 ? peers_active - 1 : 0, phase,
-                             std::move(api_endpoint), playback, cache_activity);
+                             std::move(api_endpoint), playback, cache_activity,
+                             traffic_totals());
 }
 
 void NodeRuntime::signal_telemetry_refresh() {
