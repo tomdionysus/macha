@@ -59,7 +59,6 @@ The other Macha repositories:
 | [macha-client](https://github.com/tomdionysus/macha-client) | The React/TypeScript web and TV client, also built for Samsung Tizen. Browses the catalogue and plays, and carries catalogue editing, ingest and cluster administration. |
 | [macha-client-rn](https://github.com/tomdionysus/macha-client-rn) | The React Native phone client for iOS and Android: a viewer, playing through AVPlayer and ExoPlayer. |
 | [macha-client-rn-android-tv](https://github.com/tomdionysus/macha-client-rn-android-tv) | The React Native Android TV client: leanback, D-pad only. |
-| [macha-site](https://github.com/tomdionysus/macha-site) | The project's landing and documentation site. |
 
 ## Governing laws
 
