@@ -3,6 +3,7 @@
 #include "codec.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
+#include "observation.hpp"
 #include "cluster/placement.hpp"
 #include "supervised.hpp"
 #include <algorithm>
@@ -906,6 +907,13 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     // 2026-09-07): the presence scan, re-replication of short objects, the
     // per-node claims, per-object fallbacks.
     const auto report = [&](bool ok) {
+        static auto& barrier = observations().histogram("claim.data_barrier_us");
+        static auto& barrier_ids = observations().counter("claim.data_barrier.ids");
+        static auto& barrier_failed = observations().counter("claim.data_barrier.failed");
+        barrier.record(elapsed_us(started));
+        barrier_ids.fetch_add(ids.size(), std::memory_order_relaxed);
+        if (!ok)
+            barrier_failed.fetch_add(1, std::memory_order_relaxed);
         const auto total = elapsed_ms(started);
         if (total >= 250 && Log::enabled(LogLevel::debug))
             Log::debug("DATA retention barrier ids=" + std::to_string(ids.size()) +

@@ -5,6 +5,7 @@
 
 #include "json.hpp"
 #include "log.hpp"
+#include "observation.hpp"
 #include "supervised.hpp"
 
 #include <algorithm>
@@ -677,6 +678,11 @@ struct HttpServer::Impl {
             response = http_error(500, "internal", "the request could not be completed");
         }
         const auto elapsed = ms_between(started, Clock::now());
+        // A deferred response has not been answered yet; its time is the
+        // wait it asked for, not the handler's cost.
+        if (!response.defer)
+            observations().record(observation_route_label(request.method, request.path),
+                                  elapsed_us(started));
         if (!response.defer && elapsed >= config.slow_request_threshold.count()) {
             slow.fetch_add(1, std::memory_order_relaxed);
             Log::info("HTTP slow request method=" + request.method + " path=" + request.path +

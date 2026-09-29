@@ -11,8 +11,10 @@
 #include <mach/thread_info.h>
 #include <pthread.h>
 #elif defined(__linux__)
+#include <fstream>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 #endif
 
 namespace macha {
@@ -68,6 +70,27 @@ uint64_t thread_cpu_time_ns() noexcept {
         return 0;
     return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL +
            static_cast<uint64_t>(ts.tv_nsec);
+#else
+    return 0;
+#endif
+}
+
+uint64_t process_resident_bytes() {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+        return 0;
+    return static_cast<uint64_t>(info.resident_size);
+#elif defined(__linux__)
+    std::ifstream stream("/proc/self/statm");
+    uint64_t virtual_pages = 0;
+    uint64_t resident_pages = 0;
+    if (!(stream >> virtual_pages >> resident_pages))
+        return 0;
+    const auto page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? resident_pages * static_cast<uint64_t>(page_size) : 0;
 #else
     return 0;
 #endif

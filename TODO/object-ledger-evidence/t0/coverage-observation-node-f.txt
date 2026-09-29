@@ -1,0 +1,9 @@
+All 18 tests passed; wall=599ms case-sum=2077ms effective_parallelism=3.46745
+unrun lines:
+236: {"p50", histogram.quantile(0.5)},
+237: {"p90", histogram.quantile(0.9)},
+238: {"p99", histogram.quantile(0.99)},
+untaken non-exception branches:
+93 branch  3 taken 0 (fallthrough) | while (seen < value && !max_.compare_exchange_weak(seen, value, std::m
+183 branch  4 taken 0 | static auto* registry = new Observations();
+183 branch 12 taken 0 (fallthrough) | static auto* registry = new Observations();
