@@ -26,10 +26,11 @@ That sets the standard of evidence for every step:
   as one idea; names say what things are; comments say why, never what the
   code already says; a reviewer who did not write it can follow each
   contract to its implementation and its tests.
-- **Two classes of component, two classes of test.** Primitives (mutexes,
-  bounds, spans, cursors, budgets, work classes, timeouts, limits, indexes)
-  have a phase space small enough to test deterministically and
-  exhaustively. Once a component's, class's or subsystem's phase space
+- **Two classes of component, two classes of test.** A primitive is any
+  unit whose phase space is small enough to test deterministically and
+  exhaustively; mutexes, bounds, spans, cursors, budgets, work classes,
+  timeouts, limits and indexes are examples, not the canonical set, and the
+  property defines the class. Once a component's, class's or subsystem's phase space
   grows beyond usable deterministic testing, its tests are by definition
   functional or behavioural. The system is broken into as few fully
   deterministically testable units as necessary; they are tested
