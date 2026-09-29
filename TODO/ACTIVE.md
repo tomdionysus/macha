@@ -1,15 +1,56 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-29, after 0.73.2 was deployed on both nodes and
-committed on `develop` (`efa9c21`, not pushed, not tagged).
+Last updated: 2026-09-30, on `experiment/object-ledger`, after the object
+ledger experiment's specification and implementation plan were agreed with
+the operator. The code is still 0.73.2 (`efa9c21`) on both nodes.
 
 This is the authoritative, ordered backlog. Detailed plans and UAT records in
 this directory remain evidence; completed work belongs in `COMPLETED.md` and is
 not repeated here. Work top-to-bottom unless new evidence changes the order.
 
-**Start here after a clear: read [the 2026-09-29 handover](HANDOVER-2026-09-29.md).**
-It says what is in flight, how to build and deploy, what is owed to whom, and
-the decisions waiting on the operator.
+**Start here after a clear: read [the 2026-09-30 handover](HANDOVER-2026-09-30.md),**
+then the experiment section below. The 2026-09-29 handover still holds for
+how to build and deploy.
+
+## First: the object ledger experiment
+
+**This is the active work, and the only development stream.** Branch
+`experiment/object-ledger`; `develop` is frozen at `75e6f98` and is never
+modified by the experiment. On success the whole experiment commit tree
+merges into `develop`; on failure development resumes from `develop` and the
+experiment's version line ceases to exist.
+
+- **Canonical spec** (the most recent version is canonical; the three
+  earlier specs are historical only):
+  [the object ledger and the component model](2026-09-29-object-ledger-and-components-spec.md).
+  Its decision log records every operator decision so far.
+- **Plan**: [stage 0 implementation plan](2026-09-29-object-ledger-implementation-plan.md),
+  ordered by critical path: T0 measure the existing system, T1 the
+  instrument (clock seam, decision traces, lifecycle recorder), P
+  authoritative presence, T2 a thin vertical slice (the claim walk through
+  every layer), T3 the ledger, T4 the metadata contract, T5 component
+  conversions into the composition root, S the final sweep; lock
+  annotation, just-in-time mapping and test consolidation inside every
+  step.
+- **Next: T0.** Instrument the existing code (observation only, to logs and
+  local files, not the API), deploy it as the experiment's first plain-semver
+  version, soak it, and write each kill criterion's metric, baseline,
+  variance and threshold into the spec.
+- **Rules for every step**: work on a branch cut from the experiment, merge
+  back only when accepted, then push (standing authorisation, experiment
+  branches only); 100% line and branch coverage of what the step builds or
+  converts, mutation-proven; contracts as preconditions, postconditions and
+  invariants; evidence committed under `TODO/object-ledger-evidence/<step>/`;
+  decisions in the spec's decision log. In-process testing until T5 (T0's
+  instrumentation deploy is the one exception). Sanitizers are debuggers,
+  not evidence. No CI. basemind for every code query.
+- **The cluster** (gbni-1, fi-1) is the only Macha cluster and a disposable
+  test cluster: avoid dropping the library, but not at the experiment's
+  expense.
+- **Waiting on the operator before the step that needs it** (spec open
+  questions): the backlog while `develop` is frozen (question 5, below);
+  context in `Budget`, core supervision and where the component model lives
+  (before T2); the control gate and `universal` (before T3).
 
 ## Cluster state (2026-09-29)
 
@@ -17,11 +58,13 @@ the decisions waiting on the operator.
   also .50 and .148) both run **0.73.2** (`efa9c21`), **cluster protocol 22**.
   Metadata writable 2/2 against `metadata_min_write_replicas: 2`: restarting
   either node makes metadata read-only until it is back.
-- **Git:** `develop` is one commit ahead of `origin/develop` (`efa9c21`, the
-  0.72.0-0.73.2 work). `main` and `origin/main` are at `0e54e7e`. Tags stop at
+- **Git:** `develop` is at `75e6f98`, two commits ahead of `origin/develop`
+  (`efa9c21`, the 0.72.0-0.73.2 work, and `75e6f98`, TODO), and is frozen
+  for the experiment. `main` and `origin/main` are at `0e54e7e`. Tags stop at
   `0.71.0` (`b454c53`): 0.72.0 to 0.73.2 are untagged. Branch
-  `experiment/object-ledger` (`9626935`, local only) holds the object ledger
-  spec. Push and tag only on the operator's word.
+  `experiment/object-ledger` is pushed to origin with tracking and holds the
+  specs, the plan and a merge of `75e6f98`. Push to `develop` or `main`, and
+  tag, only on the operator's word.
 - **gbni-1 runs with glibc heap checking** (drop-in
   `/etc/systemd/system/macha.service.d/heap-check.conf`, cores to
   `/mnt/diskB/crash`) until the 2026-09-28 heap corruption's writer is found.
@@ -55,6 +98,13 @@ the decisions waiting on the operator.
 
 ## The queue
 
+**While the experiment runs, nothing below lands on `develop`.** Whether an
+item becomes a step on the experiment branch or waits until the experiment
+ends is the operator's call (spec open question 5); the open P0s (the FUSE
+recovery segfault in item 12, gbni-1's unexplained heap corruption, which
+keeps glibc heap checking on) are the pressing cases. Items the experiment
+absorbs say so.
+
 0. **Degraded operation is the normal case (operator, 2026-09-28).** "Macha
    needs to work properly degraded like this, as best it can, indefinitely."
    Review what still waits on absent replicas against that.
@@ -83,21 +133,13 @@ the decisions waiting on the operator.
      are: probably extents lost with es-1.
    - [ ] **Validated probes read every copy on the peer each pass**
      (`have_valid_objects`, the operator's choice over index-only). The cost
-     scales with what the peer holds; the object ledger (0d) is the answer.
+     scales with what the peer holds; the object ledger's diff-driven repair
+     (a stage after stage 0) is the answer.
    - [ ] **A step's validation can run long on a busy HDD**, and the pacer's
      cooldown is 19x the turn, so steps become rare. Measure step length under
      load before changing anything.
 
-0d. **The object ledger (EXPERIMENTAL spec, 2026-09-29).** One record per
-   object (referenced, claimed, held, owner) on disk behind a bounded cache,
-   indexed per consumer, canonical shape so nodes can diff. Replaces the flat
-   live vector (32 B per extent, whole library on every node, rebuilt by a
-   tree walk on every commit: 12.8 GB at 100k titles), moves the retention
-   claim map out of memory, gives O(1) cohesion counts and diff-driven repair.
-   Contract first; no code until the operator has read it and chosen the
-   stages (five open questions in it). The spec is
-   `TODO/2026-09-29-object-ledger-spec.md` on branch `experiment/object-ledger`,
-   not on develop.
+0d. **The object ledger** moved to the top of this file as the active work.
 
 2. **HTTP reads that may wait on a peer.** 0.73.2 moved the torrent listing
    onto the in-memory snapshot after stack traces showed `GET
@@ -106,7 +148,10 @@ the decisions waiting on the operator.
    which refreshes a stale cache the same way: `catalogue_api.cpp` (482, 516,
    649, 676), `manage_api.cpp` (730, 758, 1012). Audit each; a read serves
    from `available_snapshot_view()` unless it needs read-your-writes it
-   cannot get from there (law 1).
+   cannot get from there (law 1). **The experiment makes the audit
+   mechanical**: T2's waiting guard lists every control-class path into
+   `snapshot_view()` from the suites, and T4 splits it into `current()` and
+   `converged()`. The fixes themselves stay this item's.
 
 3. **Unexplained on fi-1, 2026-09-29 ~12:00Z** (a viewer reported skips and
    pauses): a playback `PATCH` answered 503 after 19.9 s, a `DELETE` took
@@ -202,7 +247,9 @@ the decisions waiting on the operator.
     - `media_playback/test_abandoned_transcode_pipeline_is_reclaimed_before_session`,
       9/20 on the laptop at `--jobs 12` at `eea4795`.
     - `storage_v18/test_has_is_a_cheap_presence_check_not_a_decrypt`
-      (a truncated object reported present), full suite only.
+      (a truncated object reported present), full suite only. Directly in
+      the path of the experiment's step P (authoritative presence), which
+      must explain it or make it impossible.
     - `filesystem_fuse/test_coalesced_delete_burst_wakes_at_exact_garbage_grace`,
       twice in full macOS runs, 0/58 isolated.
     - `rpc_cluster/test_metadata_history_checkpoint_concurrent_proposers_converge`
@@ -225,6 +272,15 @@ P-1/P0/P1/P2 sections that follow date from 2026-09-05 to 2026-09-22 and have
 not been re-verified against 0.73.2 item by item.
 
 ## Standing rules (learned the hard way; do not relearn)
+
+- **basemind for every code query**, counts and surveys included (`code mode
+  grep` reports exact `total_matches`). On 2026-09-29 shell counts were
+  used and one was misread; the operator's rule is absolute. Rescan after
+  edits.
+- **A primitive is defined by its phase space** (small enough to test
+  deterministically and exhaustively), not by a list; 100% coverage proves
+  the implementation, and design fitness is a separate question
+  (operator, 2026-09-30).
 
 - **Pace, never gate.** No process or subsystem waits for a higher class to
   go idle; a new signal feeds the existing pacer (`repair_share`). A node is
