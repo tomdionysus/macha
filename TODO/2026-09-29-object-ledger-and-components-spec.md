@@ -716,9 +716,11 @@ supersede earlier ones where they conflict.
   with stated contracts and 100% coverage, mutation-proven, are the proof
   where complexity allows; the functional and behavioural suite covers the
   rest.
-- **2026-09-30. Two classes of component and test.** Primitives (mutexes,
-  bounds, spans, work classes, timeouts, limits, indexes) are tested
-  deterministically and exhaustively. A component whose phase space grows
+- **2026-09-30. Two classes of component and test.** A primitive is any
+  unit whose phase space is small enough to test deterministically and
+  exhaustively, and is tested that way; mutexes, bounds, spans, work
+  classes, timeouts, limits and indexes are examples, not the canonical
+  set. A component whose phase space grows
   beyond usable deterministic testing is, by definition, tested
   functionally or behaviourally. The system is broken into as few fully
   deterministically testable units as necessary, tested exhaustively with
