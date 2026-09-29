@@ -716,7 +716,20 @@ supersede earlier ones where they conflict.
   with stated contracts and 100% coverage, mutation-proven, are the proof
   where complexity allows; the functional and behavioural suite covers the
   rest.
-- **2026-09-30. Sanitizers are used but not canonical.**
+- **2026-09-30. Two classes of component and test.** Primitives (mutexes,
+  bounds, spans, work classes, timeouts, limits, indexes) are tested
+  deterministically and exhaustively. A component whose phase space grows
+  beyond usable deterministic testing is, by definition, tested
+  functionally or behaviourally. The system is broken into as few fully
+  deterministically testable units as necessary, tested exhaustively with
+  their dependencies and composers against fakes, and that layer is kept
+  separate from the functional and behavioural layer. This is inversion of
+  control.
+- **2026-09-30. Sanitizers are debuggers**, pointed at a suspected fault;
+  indiscriminate use wastes time and produces false positives. Not
+  canonical.
+- **2026-09-30. Evidence is committed** with each accepted step, so the
+  history carries the proof.
 
 ## Open questions for the operator
 
