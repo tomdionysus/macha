@@ -25,3 +25,22 @@ failed once in a full-suite run at load 366, and each is timing-dependent
 by construction (a 1 s publication quiet window; peer batch-request
 counts). Neither is closed: both are to be measured with `--repeat` on
 fi-1, where the suite is the baseline.
+
+## fi-1, final run: the HTTP pipelining case
+
+`http_server/test_head_and_pipelined_requests_on_one_connection` failed once
+in fi-1's final `macha-tests` run (614/615) and about 1 in 200 in isolation
+there (1/100, 0/100, 0/100, 1/100); the laptop passed 400/400 on 0.73.2 and
+0.74.0 alike.
+
+The mechanism is the test's reader, `raw_http_read_response`
+(`tests/test_backend_support.hpp:529`): it reads headers with `recv` into
+an 8 KiB buffer and keeps everything after the first header block as the
+body. When both pipelined responses are already in the socket, one `recv`
+takes both, the second response's bytes become the tail of the first body
+(`CHECK failed: first.body == ...`), and the next read finds nothing
+(`http test response truncated before headers`). Proven on 0.73.2
+(`14634ba`): a 300 ms sleep before the first read, so both responses are
+queued, fails 20/20 with that exact signature (sleep reverted after). The
+server's pipelining is not implicated; T0 did not introduce it. P0 test
+defect, reported, not fixed: where it lands waits on open question 5.

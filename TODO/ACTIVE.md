@@ -32,10 +32,13 @@ experiment's version line ceases to exist.
   conversions into the composition root, S the final sweep; lock
   annotation, just-in-time mapping and test consolidation inside every
   step.
-- **Next: T0.** Instrument the existing code (observation only, to logs and
-  local files, not the API), deploy it as the experiment's first plain-semver
-  version, soak it, and write each kill criterion's metric, baseline,
-  variance and threshold into the spec.
+- **Now: T0, built, not yet deployed.** 0.74.0 (`680047e` on
+  `experiment/object-ledger-t0`) instruments the existing code to a local
+  file; the spec carries the threshold rule and the K1-K11 table. Next:
+  announce the Status `threads` entry `observation` to Core and the
+  clients, deploy to both nodes, soak, fill the table's baselines from
+  `observation_report.py`, merge when accepted. See the update at the top
+  of the 2026-09-30 handover.
 - **Rules for every step**: work on a branch cut from the experiment, merge
   back only when accepted, then push (standing authorisation, experiment
   branches only); 100% line and branch coverage of what the step builds or
