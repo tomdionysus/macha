@@ -709,9 +709,13 @@ supersede earlier ones where they conflict.
   history is the record.
 - **2026-09-30. The standard of proof.** Macha is to be Dijkstra-provable
   and Knuth-legible before mass peer review, and easing independent testing
-  is a reason for the experiment. Properly structured components with
-  stated contracts and 100% coverage, mutation-proven, are the proof where
-  complexity allows; the functional and behavioural suite covers the rest.
+  is a reason for the experiment. 100% coverage demonstrates that the code
+  operates deterministically in all its paths; whether the design is fit
+  for its purpose is a separate, higher-order question, which the contracts,
+  the laws and the kill criteria answer. Properly structured components
+  with stated contracts and 100% coverage, mutation-proven, are the proof
+  where complexity allows; the functional and behavioural suite covers the
+  rest.
 - **2026-09-30. Sanitizers are used but not canonical.**
 
 ## Open questions for the operator
