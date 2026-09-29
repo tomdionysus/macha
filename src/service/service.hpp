@@ -18,6 +18,7 @@
 #include "api/web_api.hpp"
 #include "api/status_api.hpp"
 #include "torrent/torrent.hpp"
+#include "observation.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
@@ -42,6 +43,8 @@ class Service {
     using StartupStallHandler = std::function<void(std::string_view diagnostic)>;
 
   private:
+    // First, so startup time is measured from the start of construction.
+    Clock::time_point constructed_{Clock::now()};
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin (Phase 1 of
@@ -114,6 +117,12 @@ class Service {
     std::vector<GarbageRef> maintenance_stale_garbage_;
     std::optional<ObjectId> retention_data_repair_cursor_;
     std::optional<ObjectId> retention_control_repair_cursor_;
+    // Observation for the object ledger experiment's T0: written to a local
+    // file under the state path, never to Status or any API response.
+    std::unique_ptr<ObservationRecorder> observation_recorder_;
+    bool cluster_stable_observed_{};
+    std::atomic_bool observation_stopping_{};
+    std::map<std::string, uint64_t> observation_gauges();
 
     void initialise_services(std::stop_token);
     void wait_services_ready();

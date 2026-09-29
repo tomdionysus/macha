@@ -1,5 +1,28 @@
 # Current release
 
+## 0.74.0 — The node measures itself to a local file (experiment)
+
+The object ledger experiment's first version (T0 in
+`TODO/2026-09-29-object-ledger-implementation-plan.md`): the code of 0.73.2
+with observation added and nothing else changed. Every node appends one
+JSON line a minute to `<state_path>/observation/observations.jsonl`
+(rotated to `.1` at 64 MiB): latency histograms and counters for what moved
+in that minute, and gauges sampled at its end. One-off events -- process
+start, services ready, the first moment every known node is reachable with
+metadata stable, backends going offline and coming back, shutdown -- are
+written as they are drained, each with its own time.
+
+What is measured: the claim walk's cost per object, the GC sweep's cost per
+object and its release rates, inventory and release-horizon builds, repair
+steps and bytes split by whether a higher class was active, the DATA
+retention barrier (the claim a quantum commit waits on), every HTTP
+handler's latency by route, playback session creation, start, update and
+first fragment, fast-path seeks, resident memory, FUSE publication
+progress, and startup, recovery and shutdown times.
+
+Nothing here reaches a response body. The one visible difference is that
+Status `threads` lists the recorder's supervised thread, `observation`.
+
 ## 0.73.2 — The torrent listing no longer waits on a peer (development)
 
 `GET /api/v1/torrents/jobs` took 0.6-1.7 s on fi-1 while `/torrents/status`

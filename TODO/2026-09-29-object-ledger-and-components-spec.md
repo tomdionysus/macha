@@ -59,6 +59,54 @@ of the new structure, taken as an operational system holistically:
 Doing work twice is acceptable where it buys fidelity and a more efficient,
 performant and testable system.
 
+### The kill criteria, quantified (T0)
+
+Measured on 0.74.0, which is 0.73.2 plus observation
+(`src/observation.hpp`): each node appends a window a minute to
+`<state_path>/observation/observations.jsonl`, and
+`TODO/object-ledger-evidence/t0/observation_report.py` merges the windows'
+histogram buckets exactly and splits them into idle and loaded windows
+(loaded: FUSE publication bytes committed, a DATA retention barrier run, or
+a repair step with a higher class active). Histograms are in microseconds
+unless named `_ns`; a quantile is its bucket's upper bound, within 12.5%.
+
+**Threshold rule.** A step's figure is worse when it lies outside the
+baseline's own spread by more than a margin, compared like for like (same
+node, same load class):
+
+- latency (p50 and p99): worse above the larger of the baseline's highest
+  hourly value and 110% of its median hourly value;
+- throughput and rates of work done: worse below the smaller of the
+  baseline's lowest hourly value and 90% of its median;
+- resident memory: worse when the median is above 110% of the baseline
+  median, or the maximum above the baseline maximum by more than 10%;
+- startup, recovery, shutdown: worse above 120% of the slowest of at least
+  three baseline restarts;
+- microbenchmarks: worse above 110% of the median of five runs on the same
+  machine and toolchain;
+- suites: no case removed without its replacement being mutation-proven,
+  and summed case time and wall time not above the step before (Q track)
+  without a stated reason.
+
+Decisions (what is kept, repaired, released, deleted) are not thresholded:
+from T1 they are compared as traces and must be identical.
+
+Baseline and variance columns are filled from the 0.74.0 soak.
+
+| # | criterion | metric (series) | node | baseline | variance |
+|---|---|---|---|---|---|
+| K1 | claim walk cost | `maintenance.claim_walk.examine_us` p50/p99; in-suite `claim_walk.per_object` | both | soak | soak |
+| K2 | GC sweep cost | `maintenance.gc.per_object_ns` p50/p99, `maintenance.gc.step_us` | both | soak | soak |
+| K3 | quantum-commit claim latency | `claim.data_barrier_us` p50/p99, idle and loaded | both | soak | soak |
+| K4 | repair throughput | `maintenance.repair.bytes.{idle,loaded}`, `push_examined`, `pull_examined` per minute; `repair_*` gauges | both | soak | soak |
+| K5 | release and GC rates | `retention.released.*`, `retention.pruned.*`, `maintenance.gc.reclaimed_bytes`, `maintenance.tombstones.collected`, `catalogue.control_gc.removed` per minute | both | soak | soak |
+| K6 | API latency | `api GET /api/v1/torrents/jobs`, `api GET /api/v1/catalogue/*`, `api GET /api/v1/status` p50/p99 | both | soak | soak |
+| K7 | playback | `playback.create_us`, `playback.start_ready_us`, `playback.first_fragment_us`, `playback.update_ready_us` (seek) p50/p99 | both | soak | soak |
+| K8 | FUSE publication | `fuse_publication_bytes_committed` rate in loaded windows | gbni-1 | soak | soak |
+| K9 | resident memory | `rss_bytes` median and max | both | soak | soak |
+| K10 | startup, recovery, shutdown | events `services_ready`, `cluster_stable`, `shutdown`; backend `backend_online` minus `backend_offline` | both | soak | soak |
+| K11 | in-suite | case count, summed and wall time; microbenchmarks (`BENCH` lines); coverage per component | laptop, fi-1 | `object-ledger-evidence/t0/` | 5 runs |
+
 ## This is an experiment
 
 An experiment is built to find out whether it works. Its evidence is what
@@ -732,6 +780,16 @@ supersede earlier ones where they conflict.
   canonical.
 - **2026-09-30. Evidence is committed** with each accepted step, so the
   history carries the proof.
+- **2026-09-30 (T0). Observation goes to a local file**, one JSON line a
+  minute per node, never a response body. The recorder is a supervised
+  thread, so Status `threads` gains an `observation` entry: the only
+  difference a client can see, announced to Core and the clients before
+  0.74.0 ships.
+- **2026-09-30 (T0). The threshold rule** above, proposed by T0: a figure
+  is worse only outside the baseline's own hourly spread plus a margin,
+  compared within a node and a load class. Laptop suite timings are not a
+  baseline while other projects build on the same machine (load average
+  366 on 2026-09-30); fi-1's are.
 
 ## Open questions for the operator
 

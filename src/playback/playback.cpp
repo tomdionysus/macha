@@ -6,6 +6,7 @@
 #include "playback/segment_holds.hpp"
 #include "json.hpp"
 #include "log.hpp"
+#include "observation.hpp"
 #include "supervised.hpp"
 #include "macha_version.hpp"
 #include "media/media_containers.hpp"
@@ -1345,6 +1346,7 @@ struct PlaybackManager::Impl {
                 waiters = start->changed_locked();
             }
             wake(waiters);
+            observations().record("playback.start_ready_us", elapsed_us(start->started));
             Log::info("playback[" + trace + "] async start ready id=" + candidate->id + " elapsed_ms=" +
                       std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                                          Clock::now() - start->started).count()));
@@ -1447,6 +1449,7 @@ struct PlaybackManager::Impl {
                 waiters = start->changed_locked();
             }
             wake(waiters);
+            observations().record("playback.update_ready_us", elapsed_us(start->started));
             Log::info("playback[" + trace + "] async update ready id=" + replacement->id +
                       " generation=" + std::to_string(replacement->generation));
         } catch (...) {
@@ -2192,6 +2195,7 @@ struct PlaybackManager::Impl {
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started_at).count();
         if (ready) {
+            observations().record("playback.first_fragment_us", elapsed_us(started_at));
             auto state = store->snapshot();
             Log::info("playback[" + std::string(trace) + "] first fragment ready elapsed_ms=" +
                       std::to_string(elapsed) + " segments=" + std::to_string(state.segment_count) +
@@ -2393,6 +2397,7 @@ struct PlaybackManager::Impl {
         // was failing, so the slow path could not be told from a path that was
         // never attempted.
         const auto declined = [&](const std::string& reason) {
+            observations().add("playback.seek_fastpath.declined");
             Log::info("playback[" + std::string(trace) + "] seek fast-path declined media=" +
                       old.source.media_id + " requested_ms=" +
                       std::to_string(requested_seek.count()) + " reason=" + reason);
@@ -2417,6 +2422,7 @@ struct PlaybackManager::Impl {
         session->touched = Clock::now();
         session->logical_session = old.logical_session;
         session->account = old.account;
+        observations().add("playback.seek_fastpath.taken");
         Log::info("playback[" + std::string(trace) + "] seek fast-path media=" +
                   session->source.media_id + " requested_ms=" +
                   std::to_string(requested_seek.count()) + " seek_ms=" +
@@ -3230,6 +3236,7 @@ struct PlaybackManager::Impl {
             idempotent->cv.notify_all();
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_started).count();
+        observations().record("playback.create_us", elapsed_us(request_started));
         // What was negotiated and from what: the transforms and codecs the
         // viewer will get, and the capabilities it advertised. A TV that
         // claimed hevc and got a silent transcode could not be diagnosed

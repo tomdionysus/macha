@@ -5,6 +5,7 @@
 #include "diagnostics.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
+#include "observation.hpp"
 #include "cluster/placement.hpp"
 
 #include <algorithm>
@@ -113,12 +114,14 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
     std::shared_ptr<LocalStore> retired;
     std::filesystem::path path;
     bool log = false;
+    bool was_online = false;
     {
         std::lock_guard lock(backend->mutex);
         if ((expected_generation && backend->generation != expected_generation) ||
             (expected && backend->store != expected))
             return;
         path = backend->cfg.path;
+        was_online = backend->online;
         log = backend->online || backend->last_error != reason;
         backend->online = false;
         retired = std::move(backend->store);
@@ -131,6 +134,9 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
     retired.reset();
     if (log)
         Log::warn("storage backend offline " + path.string() + ": " + reason);
+    if (was_online)
+        observations().event({unix_ms(), "backend_offline", {},
+                              {{"path", path.string()}, {"reason", reason}}});
 }
 
 bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
@@ -265,6 +271,10 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             Log::info("storage backend online " + cfg.path.string() +
                       " elapsed_ms=" + std::to_string(elapsed.count()) +
                       " accounting=" + std::string(store->scan_complete() ? "ready" : "reconciling"));
+            observations().event({unix_ms(),
+                                  "backend_online",
+                                  {{"elapsed_ms", static_cast<uint64_t>(elapsed.count())}},
+                                  {{"path", cfg.path.string()}}});
         }
         return true;
     } catch (const std::exception& error) {

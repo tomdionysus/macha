@@ -4,6 +4,7 @@
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "durable_file.hpp"
+#include "diagnostics.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -28,27 +29,6 @@ namespace {
 // once, and a half-understood record is worse than a refused one.
 constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'T', 'E', 'L', '3'};
 constexpr size_t max_persisted_records = 1024;
-
-uint64_t resident_bytes() {
-#if defined(__APPLE__)
-    mach_task_basic_info_data_t info{};
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
-        return 0;
-    return static_cast<uint64_t>(info.resident_size);
-#elif defined(__linux__)
-    std::ifstream stream("/proc/self/statm");
-    uint64_t virtual_pages = 0;
-    uint64_t resident_pages = 0;
-    if (!(stream >> virtual_pages >> resident_pages))
-        return 0;
-    const auto page_size = sysconf(_SC_PAGESIZE);
-    return page_size > 0 ? resident_pages * static_cast<uint64_t>(page_size) : 0;
-#else
-    return 0;
-#endif
-}
 
 uint64_t physical_memory_bytes() {
 #if defined(__APPLE__)
@@ -587,7 +567,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.metadata_generation = info.metadata_generation;
     telemetry.uptime_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now - started_).count());
-    telemetry.rss_bytes = resident_bytes();
+    telemetry.rss_bytes = process_resident_bytes();
     const auto cpu_percent = wall_seconds > 0.0 ? std::max(0.0, cpu_seconds / wall_seconds * 100.0) : 0.0;
     telemetry.process_cpu_milli_percent =
         static_cast<uint32_t>(std::min<double>(cpu_percent * 1000.0, UINT32_MAX));

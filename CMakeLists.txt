@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.73.2 LANGUAGES CXX)
+project(macha VERSION 0.74.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -268,6 +268,7 @@ set(MACHA_CORE_SOURCES
     src/log.cpp
     src/supervised.cpp
     src/diagnostics.cpp
+    src/observation.cpp
     src/durable_file.cpp
     src/json.cpp
     src/subsystem/subsystem.cpp
@@ -550,7 +551,9 @@ if(MACHA_BUILD_TESTS)
         tests/test_http_server.cpp
         tests/test_http_compression.cpp
         tests/test_invariants.cpp
-        tests/test_models.cpp)
+        tests/test_models.cpp
+        tests/test_observation.cpp
+        tests/test_baselines.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
