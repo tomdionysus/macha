@@ -1,0 +1,16 @@
+[PASS] runtime_dependencies/test_aac_encodes_a_standard_channel_configuration 11ms
+[PASS] runtime_dependencies/test_advertised_api_endpoint_is_validated 10ms
+[PASS] runtime_dependencies/test_ffmpeg_log_bridge 5ms
+[PASS] runtime_dependencies/test_example_configuration_loads 11ms
+[PASS] runtime_dependencies/test_glibc_allocator_arena_limit_is_hard 86ms
+[PASS] runtime_dependencies/test_probe_failure_reports_why_it_failed 87ms
+[PASS] runtime_dependencies/test_yaml_config 15ms
+[PASS] runtime_dependencies/test_yaml_edge_node_needs_no_data_backends 2ms
+[PASS] runtime_dependencies/test_yaml_refuses_a_repair_weight_of_zero 2ms
+[PASS] runtime_dependencies/test_yaml_refuses_unknown_keys 2ms
+[PASS] runtime_dependencies/test_embedded_music_metadata_and_artwork 667ms
+[PASS] transcode_timeline/test_a_keyframe_index_places_every_keyframe_by_byte 9556ms
+[PASS] transcode_timeline/test_a_transcode_start_reports_its_preroll 6458ms
+[PASS] transcode_timeline/test_transcoded_audio_and_video_carry_the_same_timeline 9446ms
+[PASS] transcode_timeline/test_transcoded_seek_starts_both_streams_at_the_origin 6545ms
+All 15 tests passed; wall=32687ms case-sum=32903ms effective_parallelism=1.00661

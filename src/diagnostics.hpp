@@ -15,6 +15,8 @@ namespace macha {
 // platform failures simply disable the associated measurement.
 void set_thread_name(std::string_view) noexcept;
 uint64_t thread_cpu_time_ns() noexcept;
+// This process's resident set in bytes; 0 where the platform cannot say.
+uint64_t process_resident_bytes();
 
 class ThreadCpuReporter {
     std::string name_;

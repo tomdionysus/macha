@@ -758,6 +758,8 @@ void Service::initialise_services(std::stop_token stop) {
         services_ready_.store(true, std::memory_order_release);
         startup_cv_.notify_all();
         Log::info("server local services ready");
+        observations().event(
+            {unix_ms(), "services_ready", {{"elapsed_ms", elapsed_us(constructed_) / 1000}}, {}});
     } catch (const std::exception& error) {
         {
             std::lock_guard lock(startup_mutex_);
@@ -770,6 +772,17 @@ void Service::initialise_services(std::stop_token stop) {
 }
 
 void Service::start() {
+    // Before everything else, so a startup that never finishes still leaves
+    // its windows behind.
+    observation_recorder_ = std::make_unique<ObservationRecorder>(
+        observations(),
+        std::make_shared<ObservationLog>(
+            node_.config().state_path / "observation" / "observations.jsonl", 64ULL << 20),
+        std::string(kBuildIdentity), std::chrono::minutes(1),
+        [this] { return observation_gauges(); });
+    observations().event({unix_ms(), "start", {}, {{"version", std::string(kBuildIdentity)}}});
+    observation_recorder_->start();
+
     // Status is the first externally visible service. It depends only on the
     // lightweight node identity/membership state constructed from config, so
     // operators can observe startup even before the cluster listener or any
@@ -820,6 +833,10 @@ void Service::request_stop() {
 
 void Service::stop() {
     Log::debug("shutdown: Service::stop begin");
+    const auto stop_started = Clock::now();
+    // Gauges read services this stop tears down; the final window goes
+    // without them.
+    observation_stopping_.store(true, std::memory_order_release);
     // Before ingest: a subsystem plugin holds references to the services
     // below it (the torrent plugin submits completed downloads to ingest), so
     // every plugin instance must be destroyed while they are all still alive.
@@ -882,6 +899,47 @@ void Service::stop() {
     Log::debug("shutdown: NodeRuntime::stop calling");
     node_.stop();
     Log::debug("shutdown: Service::stop complete");
+    if (observation_recorder_) {
+        observations().event(
+            {unix_ms(), "shutdown", {{"elapsed_ms", elapsed_us(stop_started) / 1000}}, {}});
+        observation_recorder_->stop();
+        observation_recorder_.reset();
+    }
+}
+
+std::map<std::string, uint64_t> Service::observation_gauges() {
+    std::map<std::string, uint64_t> gauges{{"rss_bytes", process_resident_bytes()},
+                                           {"maintenance_wakeups", maintenance_wakeups()}};
+    if (!services_ready_.load(std::memory_order_acquire) ||
+        observation_stopping_.load(std::memory_order_acquire))
+        return gauges;
+    const auto idle_ms = [](std::chrono::milliseconds idle) {
+        return static_cast<uint64_t>(std::max<int64_t>(0, idle.count()));
+    };
+    gauges["foreground_idle_ms"] = idle_ms(store_->foreground_idle_for());
+    gauges["interactive_idle_ms"] = idle_ms(store_->interactive_idle_for());
+    gauges["loader_idle_ms"] = idle_ms(store_->loader_idle_for());
+    // Cumulative since start, as Status reports them; a window's rate is the
+    // difference between consecutive windows.
+    const auto repair = store_->repair_diagnostics();
+    gauges["repair_push_examined"] = repair.push_examined;
+    gauges["repair_pull_examined"] = repair.pull_examined;
+    gauges["repair_bytes_transferred"] = repair.bytes_transferred;
+    gauges["repair_passes_completed"] = repair.passes_completed;
+    gauges["repair_pull_unsourceable"] = repair.pull_unsourceable;
+    gauges["repair_gate_ran"] = repair.gate_ran;
+    gauges["repair_gate_share"] = repair.gate_share;
+    gauges["repair_gate_credit"] = repair.gate_credit;
+    gauges["repair_prompt_copies"] = repair.prompt_copies;
+    if (auto frontend = registry_.fuse()) {
+        const auto fuse = frontend->diagnostics();
+        gauges["fuse_publications_completed"] = fuse.data_publications_completed;
+        gauges["fuse_publication_bytes_committed"] = fuse.data_publication_bytes_committed;
+        gauges["fuse_publication_bytes_confirmed"] = fuse.data_publication_bytes_confirmed;
+        gauges["fuse_spool_bytes"] = fuse.spool_bytes;
+        gauges["fuse_parked_publications"] = fuse.parked_publications;
+    }
+    return gauges;
 }
 
 void Service::signal_maintenance(ServiceEvent event) {
@@ -1474,6 +1532,10 @@ void Service::loop(std::stop_token stop) {
                     maintenance_universal_ = std::move(universal);
                     maintenance_control_live_ = std::move(control_live);
                     rebuilt_inventory = true;
+                    observations().record("maintenance.inventory.build_us",
+                                          elapsed_us(inventory_stage));
+                    observations().add("maintenance.inventory.live_objects",
+                                       maintenance_live_->size());
                     // A newly-derived reachability set is never consumed by a
                     // destructive sweep in the same pass. Schedule exactly one
                     // follow-up after the foreground quiet boundary; without
@@ -1513,6 +1575,12 @@ void Service::loop(std::stop_token stop) {
                     // "already here" as well as "restored") and read back in
                     // full: on 2026-09-29 that spent all of both nodes' credit
                     // on objects they held, and repair moved no bytes at all.
+                    static auto& claim_walk_examine =
+                        observations().histogram("maintenance.claim_walk.examine_us");
+                    static auto& claim_walk_examined =
+                        observations().counter("maintenance.claim_walk.examined");
+                    static auto& claim_walk_missing =
+                        observations().counter("maintenance.claim_walk.missing");
                     auto repair_retained = [&](RetentionClass type,
                                                std::optional<ObjectId>& cursor) {
                         for (size_t examined = 0;; ++examined) {
@@ -1522,14 +1590,18 @@ void Service::loop(std::stop_token stop) {
                             }
                             const auto resume = cursor;
                             bool complete = false;
+                            const auto examine_started = Clock::now();
                             auto id = node_.retention_store().next_retained(type, cursor, complete);
                             if (!id)
                                 break;
                             const bool present = type == RetentionClass::data
                                                      ? node_.local_store().has(*id)
                                                      : node_.control_store().has(*id);
+                            claim_walk_examine.record(elapsed_us(examine_started));
+                            claim_walk_examined.fetch_add(1, std::memory_order_relaxed);
                             if (present)
                                 continue;
+                            claim_walk_missing.fetch_add(1, std::memory_order_relaxed);
                             if (network_credit < extent) {
                                 cursor = resume;
                                 retained_waiting_for_credit = true;
@@ -1582,6 +1654,21 @@ void Service::loop(std::stop_token stop) {
                             return repair_share.should_yield(Clock::now(), higher_class_active());
                         },
                         maintenance_inventory_generation_);
+                    {
+                        // Split by whether a higher class was active as the
+                        // step ended: repair idle against repair on its share.
+                        const std::string load = higher_class_active() ? "loaded" : "idle";
+                        observations().record("maintenance.repair.step_us." + load,
+                                              elapsed_us(repair_stage));
+                        observations().add("maintenance.repair.bytes." + load,
+                                           repair.bytes_transferred);
+                        observations().add("maintenance.repair.push_examined." + load,
+                                           repair.push_examined);
+                        observations().add("maintenance.repair.pull_examined." + load,
+                                           repair.pull_examined);
+                        observations().add("maintenance.repair.retained_repairs",
+                                           retained_repairs);
+                    }
                     log_slow_stage("network-repair", repair_stage,
                                    "bytes=" + std::to_string(repair.bytes_transferred) +
                                        " retained_repairs=" + std::to_string(retained_repairs) +
@@ -1619,6 +1706,15 @@ void Service::loop(std::stop_token stop) {
                 const bool cluster_gc_healthy = node_.membership().all_known_reachable();
                 const bool cluster_gc_stable =
                     cluster_gc_healthy && metadata_->cluster_status().stable;
+                if (cluster_gc_stable && !cluster_stable_observed_) {
+                    // Recovery after a restart: every known node reached and
+                    // metadata stable, for the first time in this process.
+                    cluster_stable_observed_ = true;
+                    observations().event({unix_ms(),
+                                          "cluster_stable",
+                                          {{"elapsed_ms", elapsed_us(constructed_) / 1000}},
+                                          {}});
+                }
 
                 if (garbage_due && !rebuilt_inventory && cluster_gc_stable &&
                     maintenance_catalogue_complete_) {
@@ -1631,6 +1727,7 @@ void Service::loop(std::stop_token stop) {
 
                     auto erase = maintenance_stale_garbage_;
                     erase.insert(erase.end(), matured.begin(), matured.end());
+                    observations().add("maintenance.tombstones.collected", matured.size());
                     if (!erase.empty() || !legacy.empty()) {
                         maintain_garbage_metadata(erase, legacy);
                     }
@@ -1654,6 +1751,8 @@ void Service::loop(std::stop_token stop) {
                 // branches are not dominated by that clock and therefore survive.
                 if (auto floor = metadata_->retention_release_view();
                     floor && floor->hash != retention_release_floor_hash_) {
+                    ObservedDuration horizon_build(
+                        observations().histogram("maintenance.release_horizon.build_us"));
                     auto data_live = std::make_shared<std::vector<ObjectId>>();
                     auto control_live = std::make_shared<std::vector<ObjectId>>();
                     bool complete = true;
@@ -1726,16 +1825,22 @@ void Service::loop(std::stop_token stop) {
                     // every durably-known node. A partition may continue to accumulate
                     // causal tombstones/claims, but it cannot reclaim authoritative bytes.
                     if (retention_release_complete_ && retention_release_control_live_) {
-                        (void)node_.retention_store().release_unreferenced(
-                            RetentionClass::control, *retention_release_control_live_,
-                            retention_release_clock_, 64);
+                        observations().add("retention.released.control",
+                                           node_.retention_store().release_unreferenced(
+                                               RetentionClass::control,
+                                               *retention_release_control_live_,
+                                               retention_release_clock_, 64));
                     }
                     enter_stage("control-gc");
                     const auto removed = catalogue_->control_gc_step(*maintenance_control_live_,
                                                                      policy.garbage_grace, 32);
-                    (void)node_.retention_store().prune_unclaimed(
-                        RetentionClass::control,
-                        [this](const ObjectId& id) { return node_.control_store().has(id); }, 64);
+                    observations().add("catalogue.control_gc.removed", removed);
+                    observations().add(
+                        "retention.pruned.control",
+                        node_.retention_store().prune_unclaimed(
+                            RetentionClass::control,
+                            [this](const ObjectId& id) { return node_.control_store().has(id); },
+                            64));
                     if (removed)
                         Log::debug("catalogue control GC removed=" + std::to_string(removed));
                 }
@@ -1787,6 +1892,7 @@ void Service::loop(std::stop_token stop) {
                         const auto released = node_.retention_store().release_unreferenced(
                             RetentionClass::data, *retention_release_data_live_,
                             retention_release_clock_, 64);
+                        observations().add("retention.released.data", released);
                         if (released && Log::enabled(LogLevel::debug))
                             Log::debug("retention released DATA claims node=" +
                                        to_string(node_.node_id()).substr(0, 6) + " count=" +
@@ -1833,6 +1939,16 @@ void Service::loop(std::stop_token stop) {
                         [this](const ObjectId& id) {
                             return node_.retention_store().retained(RetentionClass::data, id);
                         });
+                    {
+                        // gc.objects counts objects examined, reclaimed or not.
+                        const auto step_us = elapsed_us(gc_stage);
+                        observations().record("maintenance.gc.step_us", step_us);
+                        observations().add("maintenance.gc.examined", gc.objects);
+                        observations().add("maintenance.gc.reclaimed_bytes", gc.bytes);
+                        if (gc.objects)
+                            observations().record("maintenance.gc.per_object_ns",
+                                                  step_us * 1000 / gc.objects);
+                    }
                     log_slow_stage("garbage-collect", gc_stage,
                                    "reclaimed_bytes=" + std::to_string(gc.bytes) +
                                        " objects=" + std::to_string(gc.objects));
@@ -1846,9 +1962,12 @@ void Service::loop(std::stop_token stop) {
                                    std::to_string(gc.complete ? 1 : 0) + " live=" +
                                    std::to_string(maintenance_live_->size()) + " protected=" +
                                    std::to_string(protected_ids.size()));
-                    (void)node_.retention_store().prune_unclaimed(
-                        RetentionClass::data,
-                        [this](const ObjectId& id) { return node_.local_store().has(id); }, 64);
+                    observations().add(
+                        "retention.pruned.data",
+                        node_.retention_store().prune_unclaimed(
+                            RetentionClass::data,
+                            [this](const ObjectId& id) { return node_.local_store().has(id); },
+                            64));
                     if (gc.bytes && Log::enabled(LogLevel::debug))
                         Log::debug("garbage collection reclaimed " + std::to_string(gc.bytes) +
                                    " local bytes");
