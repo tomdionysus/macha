@@ -340,6 +340,15 @@ class NodeRuntime {
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
     void reconfigure_local(const Config&);
     void note_activity(FrameType, uint64_t bytes = 0);
+    // Cluster bytes on and off the wire by frame class since start, as the
+    // transport counted them (client dials and served sessions together).
+    TrafficTotals traffic_totals() const;
+    // Whether any other node reports viewer-class cluster traffic (foreground
+    // or read-ahead, either direction) over its last telemetry interval, from
+    // a sample no older than `fresh_for`. Repair counts it as busy for its
+    // weighted share, as it counts this node's own viewers: its transfers
+    // share those viewers' links, so it runs paced, never stopped.
+    bool peer_viewers_active(std::chrono::milliseconds fresh_for) const;
     uint64_t take_activity_bytes(FrameType);
     std::chrono::milliseconds activity_idle_for(FrameType) const;
     // Is somebody watching right now, within `window`? The arbiter and the

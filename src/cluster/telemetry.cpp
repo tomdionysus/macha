@@ -138,6 +138,7 @@ enum TelemetryFieldId : uint16_t {
     field_playback_start_failed_retention_ms = 41,
     field_playback_transcode_rates = 42,
     field_node_name = 43,
+    field_traffic = 44,
 };
 
 void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
@@ -241,6 +242,21 @@ void encode(Writer& writer, const NodeTelemetry& value) {
         put_field(body, field_playback_transcode_rates, rates.data());
     }
     put_string(body, field_node_name, value.node_name);
+    if (!value.traffic.empty()) {
+        Writer traffic;
+        traffic.u32(value.traffic_window_ms);
+        traffic.u8(static_cast<uint8_t>(std::min<size_t>(value.traffic.size(), 16)));
+        size_t written = 0;
+        for (const auto& entry : value.traffic) {
+            if (written++ == 16) break;
+            traffic.u8(entry.frame_class);
+            traffic.u64(entry.in_bytes);
+            traffic.u64(entry.out_bytes);
+            traffic.u32(entry.in_bytes_per_s);
+            traffic.u32(entry.out_bytes_per_s);
+        }
+        put_field(body, field_traffic, traffic.data());
+    }
     put_uint(body, field_cache_hits, value.cache_hits);
     put_uint(body, field_cache_misses, value.cache_misses);
     put_uint(body, field_cache_evictions, value.cache_evictions);
@@ -419,6 +435,23 @@ NodeTelemetry decode(Reader& reader) {
             rates.finish();
             break;
         }
+        case field_traffic: {
+            Reader traffic(payload);
+            value.traffic_window_ms = traffic.u32();
+            const auto count = traffic.u8();
+            if (count > 16) throw DecodeError("too many traffic classes");
+            for (uint8_t i = 0; i < count; ++i) {
+                TrafficClass entry;
+                entry.frame_class = traffic.u8();
+                entry.in_bytes = traffic.u64();
+                entry.out_bytes = traffic.u64();
+                entry.in_bytes_per_s = traffic.u32();
+                entry.out_bytes_per_s = traffic.u32();
+                value.traffic.push_back(entry);
+            }
+            traffic.finish();
+            break;
+        }
         case field_cache_hits:
             value.cache_hits = field_uint(payload, 8, "cache_hits");
             break;
@@ -530,7 +563,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     uint32_t storage_backends_online, uint32_t peers_known, uint32_t peers_active,
     uint64_t rpc_connections_created, uint64_t rpc_connections_reused,
     uint64_t rpc_connections_canonical, NodePhase phase, std::string api_endpoint,
-    PlaybackBudgets playback, CacheActivity cache) {
+    PlaybackBudgets playback, CacheActivity cache, std::optional<TrafficTotals> traffic) {
     const auto now = Clock::now();
     const auto cpu_now = std::clock();
     const auto wall_seconds = std::chrono::duration<double>(now - previous_cpu_wall_).count();
@@ -587,6 +620,37 @@ NodeTelemetry TelemetryStore::refresh_local(
     {
         std::lock_guard lock(mutex_);
         telemetry.node_name = node_name_;
+        if (traffic) {
+            // Rates over the interval since the previous sample; the first
+            // sample after start states totals with no rate yet.
+            const auto seconds =
+                previous_traffic_
+                    ? std::chrono::duration<double>(now - previous_traffic_at_).count()
+                    : 0.0;
+            telemetry.traffic_window_ms =
+                static_cast<uint32_t>(std::min<double>(seconds * 1000.0, UINT32_MAX));
+            const auto rate = [&](uint64_t current, uint64_t previous) -> uint32_t {
+                if (seconds <= 0.0 || current < previous)
+                    return 0;
+                return static_cast<uint32_t>(std::min<double>(
+                    static_cast<double>(current - previous) / seconds, UINT32_MAX));
+            };
+            for (size_t index = 1; index < traffic->in_bytes.size(); ++index) {
+                TrafficClass entry;
+                entry.frame_class = static_cast<uint8_t>(index);
+                entry.in_bytes = traffic->in_bytes[index];
+                entry.out_bytes = traffic->out_bytes[index];
+                if (previous_traffic_) {
+                    entry.in_bytes_per_s =
+                        rate(entry.in_bytes, previous_traffic_->in_bytes[index]);
+                    entry.out_bytes_per_s =
+                        rate(entry.out_bytes, previous_traffic_->out_bytes[index]);
+                }
+                telemetry.traffic.push_back(entry);
+            }
+            previous_traffic_ = *traffic;
+            previous_traffic_at_ = now;
+        }
     }
     observe(telemetry, true);
     return telemetry;

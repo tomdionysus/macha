@@ -435,6 +435,22 @@ The wire format is `TEL3`: every field tagged and length-delimited, and a
 default-valued field omitted, so a newer node can add a field an older one
 skips.
 
+`nodes[].traffic` is each node's own cluster traffic by frame class:
+`{as_of_unix_ms, window_ms, classes}`, where `classes` has one entry per class
+with `class` (`control`, `foreground`, `read_ahead`, `speculative`, `loader`;
+the set may grow), `in_bytes` and `out_bytes` since that node started, and
+`in_bytes_per_s` and `out_bytes_per_s` over `window_ms`, the interval between
+that node's last two samples (`network.telemetry_interval_ms`, 10 s by
+default). `as_of_unix_ms` is when the sample was taken. On a node's first
+sample after start `window_ms` and the rates are `null`: there is no interval
+yet.
+`foreground` is playback, `read_ahead` mounted reads and prefetch, `loader`
+imports, torrents and publication, `speculative` repair, prompt replication
+and other background work, `control` everything else. Every sealed frame is
+counted, overhead included. It is Macha's traffic between nodes only: HTTP to
+clients and anything else using the link are not in it. `null` when the node
+did not report it.
+
 Storage and cache byte objects include an `available` boolean. When coherent
 telemetry is unavailable, Status may still report membership-known storage
 capacity, but `used_bytes` and `free_bytes` are `null`; cache byte fields and
