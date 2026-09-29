@@ -64,8 +64,13 @@ performant and testable system.
 An experiment is built to find out whether it works. Its evidence is what
 it produces, not a precondition for starting: no step waits on an up-front
 proof, baseline or harness. The kill criteria above are the evaluation,
-applied to the structure as an operational system at every step, on the
-test cluster and the live cluster.
+applied to the structure as an operational system at every step: in-process
+until the component conversions, then on the cluster. gbni-1 and fi-1 are
+the only Macha cluster and a disposable test cluster; dropping the library
+costs a great deal of time and is avoided where possible, but not at the
+expense of the experiment. `develop` is never modified by the experiment:
+on success the whole experiment commit tree merges into it, on failure
+development continues from it as it stands.
 
 Judged as a staged design, the argued result is that stage 0 moves the
 structure toward the goals while keeping operational and functional
@@ -402,8 +407,8 @@ Stage 0:
   the bounded shutdown are preserved.
 - **The graph varies by node.** Components are enabled by configuration
   (torrent, scanner and ingest on fi-1; a different set on gbni-1), so each
-  node's graph and order differ. Each real node configuration is exercised
-  on the test cluster before it reaches the live cluster.
+  node's graph and order differ. Each real node configuration is tested
+  in-process as a fixture, then deployed one node at a time.
 - **Cycles are resolved, not hidden.** Each setter above is removed by
   layering (part B puts the object store below metadata, which removes the
   reason for `set_namespace_store`) or becomes a declared port: a contract
@@ -424,8 +429,11 @@ narrowest contract they need.
 
 ### B1. Object store: bytes by id
 
-Implemented by `LocalStore` (DATA) and the control store. Knows nothing of
-references or claims. Domain: local.
+Implemented by `StoragePool` for DATA (`NodeRuntime::local_store()`, over
+one `LocalStore` per backend) and by a `LocalStore` for control
+(`NodeRuntime::control_store()`); the rows below name `LocalStore` where the
+behaviour is per backend. Knows nothing of references or claims. Domain:
+local.
 
 | operation | today | thread | waits on |
 |---|---|---|---|
@@ -640,7 +648,7 @@ Repair stays paced by `repair_share`, never gated.
 - A3: each adapted walk visits the same ids in the same order across budget
   boundaries; a persisted cursor resumes after serialise and restore.
 - A5: derived start and stop order equals today's for each real node
-  configuration, on the test cluster; bounded shutdown holds.
+  configuration, as in-process fixtures; bounded shutdown holds.
 - B1: `has()` never reports a partially written object and never touches
   the device after warm-up; a backend going offline and being re-adopted
   leaves presence correct.
