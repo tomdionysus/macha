@@ -2029,7 +2029,10 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     streaming.temp_path = t.path() / "playback";
     streaming.max_video_transcodes = 1;
     streaming.video_decoder_threads = 3;
-    streaming.pipeline_idle = 50ms;
+    // Renewals below come 20 ms apart; the lease must outlast a loaded
+    // host's sleep overrun between two of them. At 50 ms it did not (the
+    // case failed 53/120 on an overloaded laptop, at the same rate on 0.73.2).
+    streaming.pipeline_idle = 500ms;
     streaming.session_idle = 5min;
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
                              std::make_unique<FakeMediaEngine>());
@@ -2101,7 +2104,7 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
                status.find("heap_reclaim_requests")->asUInt64() >= 1 &&
                status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
                status.find("heap_reclaim_runs")->asUInt64() >= 1;
-    }, 2s));
+    }, 5s));
 
     // Physical reclamation alone does not surrender the logical entitlement:
     // otherwise an ordinary resume or seek could be rejected the moment a
