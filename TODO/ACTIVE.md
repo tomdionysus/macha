@@ -32,7 +32,7 @@ experiment's version line ceases to exist.
   conversions into the composition root, S the final sweep; lock
   annotation, just-in-time mapping and test consolidation inside every
   step.
-- **Now: T0, built, not yet deployed.** 0.74.0 (`680047e` on
+- **Now: T0, deployed 2026-09-30 07:05Z/07:13Z, soaking.** 0.74.0 (`680047e` on
   `experiment/object-ledger-t0`) instruments the existing code to a local
   file; the spec carries the threshold rule and the K1-K11 table. Next:
   announce the Status `threads` entry `observation` to Core and the
