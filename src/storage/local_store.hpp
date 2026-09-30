@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include "storage/presence_index.hpp"
+#include "contract/object_store.hpp"
 #include "contract/thread_safety.hpp"
 #include <map>
 #include <set>
@@ -60,7 +61,7 @@ struct LocalStoreDiagnostics {
     uint64_t pack_recovery_skipped_bytes{};
 };
 
-class LocalStore {
+class LocalStore final : public ObjectStore {
   public:
     struct Cursor {
         std::optional<ObjectId> packed_after;
@@ -238,7 +239,7 @@ class LocalStore {
     // a miss is checked on disk under the object's lock, and a zero-byte file
     // found there is pruned. Never decrypts or verifies content: callers that
     // need the payload intact use get()/valid().
-    bool has(const ObjectId&) const noexcept;
+    bool has(const ObjectId&) const noexcept override;
     // Whether warm-up has finished and has() answers from the index alone.
     bool presence_authoritative() const {
         std::lock_guard lock(m_);

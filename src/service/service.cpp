@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/service.hpp"
+#include "service/claim_walk.hpp"
+#include "storage/retention_ledger.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
@@ -1284,8 +1286,8 @@ void Service::loop(std::stop_token stop) {
     WeightedLoaderService repair_share(policy.foreground_weight, policy.repair_weight,
                                        std::chrono::milliseconds(25));
     double scrub_credit = 0.0;
-    std::optional<ObjectId> retained_data_repair_after;
-    std::optional<ObjectId> retained_control_repair_after;
+    ClaimWalk data_claim_walk(RetentionClass::data);
+    ClaimWalk control_claim_walk(RetentionClass::control);
     // Why the destructive DATA sweep did not run, logged at DEBUG only when
     // the answer changes. Without it "GC is not reclaiming" has no line to
     // read; the 2026-09-15 artwork leak was diagnosed blind.
@@ -1644,12 +1646,6 @@ void Service::loop(std::stop_token stop) {
                 if (network_due) {
                     const auto extent = std::max<uint64_t>(1, node_.config().extent_size);
 
-                    // A durable retention claim is a promise about this physical
-                    // node, not merely an annotation on the node's current
-                    // namespace view. If scrub/corruption removes a claimed copy
-                    // belonging only to an unseen branch, ordinary live-set repair
-                    // cannot discover it. Walk a tiny bounded claim slice first and
-                    // actively restore missing claimed DATA/CONTROL objects.
                     size_t retained_repairs = 0;
                     bool retained_waiting_for_credit = false;
                     // The walk stopped at its per-step bound with claims left;
@@ -1662,54 +1658,32 @@ void Service::loop(std::stop_token stop) {
                     // "already here" as well as "restored") and read back in
                     // full: on 2026-09-29 that spent all of both nodes' credit
                     // on objects they held, and repair moved no bytes at all.
-                    static auto& claim_walk_examine =
-                        observations().histogram("maintenance.claim_walk.examine_us");
-                    static auto& claim_walk_examined =
-                        observations().counter("maintenance.claim_walk.examined");
-                    static auto& claim_walk_missing =
-                        observations().counter("maintenance.claim_walk.missing");
-                    auto repair_retained = [&](RetentionClass type,
-                                               std::optional<ObjectId>& cursor) {
-                        for (size_t examined = 0;; ++examined) {
-                            if (examined == 16) {
-                                retained_walk_unfinished = true;
-                                break;
-                            }
-                            const auto resume = cursor;
-                            bool complete = false;
-                            const auto examine_started = Clock::now();
-                            auto id = node_.retention_store().next_retained(type, cursor, complete);
-                            if (!id)
-                                break;
-                            const bool present = type == RetentionClass::data
-                                                     ? node_.local_store().has(*id)
-                                                     : node_.control_store().has(*id);
-                            claim_walk_examine.record(elapsed_us(examine_started));
-                            claim_walk_examined.fetch_add(1, std::memory_order_relaxed);
-                            if (present)
-                                continue;
-                            claim_walk_missing.fetch_add(1, std::memory_order_relaxed);
+                    struct CreditedRestorer final : ClaimRestorer {
+                        DistributedStore& store;
+                        double& credit;
+                        uint64_t extent;
+                        const decltype(trace_action)& trace;
+                        CreditedRestorer(DistributedStore& s, double& c, uint64_t e,
+                                         const decltype(trace_action)& t)
+                            : store(s), credit(c), extent(e), trace(t) {}
+                        Outcome restore(RetentionClass type, const ObjectId& id) override {
                             const std::string walked =
                                 std::string(type == RetentionClass::data ? "data " : "control ") +
-                                to_string(*id);
-                            if (network_credit < extent) {
-                                cursor = resume;
-                                retained_waiting_for_credit = true;
-                                trace_action("claim-walk", walked + " waiting-for-credit");
-                                break;
+                                to_string(id);
+                            if (credit < static_cast<double>(extent)) {
+                                trace("claim-walk", walked + " waiting-for-credit");
+                                return Outcome::waiting_for_credit;
                             }
                             const bool restored = type == RetentionClass::data
-                                                      ? store_->ensure_local(*id, false)
-                                                      : store_->ensure_control_local(*id);
-                            trace_action("claim-walk",
-                                         walked + (restored ? " restored" : " not-restored"));
-                            if (restored) {
-                                ++retained_repairs;
-                                network_credit =
-                                    std::max(0.0, network_credit - static_cast<double>(extent));
-                            }
+                                                      ? store.ensure_local(id, false)
+                                                      : store.ensure_control_local(id);
+                            trace("claim-walk", walked + (restored ? " restored" : " not-restored"));
+                            if (!restored)
+                                return Outcome::not_restored;
+                            credit = std::max(0.0, credit - static_cast<double>(extent));
+                            return Outcome::restored;
                         }
-                    };
+                    } restorer{*store_, network_credit, extent, trace_action};
                     const auto higher_class_active = [this, &policy, peer_viewers] {
                         const auto quiet = policy.foreground_quiet;
                         return peer_viewers || store_->foreground_idle_for() < quiet ||
@@ -1727,8 +1701,16 @@ void Service::loop(std::stop_token stop) {
                         ~RepairTurn() { share.finished(clock.now(), active()); }
                     } repair_turn{repair_share, higher_class_active, *clock_};
                     enter_stage("retention-repair");
-                    repair_retained(RetentionClass::data, retained_data_repair_after);
-                    repair_retained(RetentionClass::control, retained_control_repair_after);
+                    {
+                        const RetentionLedger ledger(node_.retention_store(), node_.local_store(),
+                                                     node_.control_store());
+                        for (auto* walk : {&data_claim_walk, &control_claim_walk}) {
+                            const auto step = walk->step(ledger, restorer);
+                            retained_repairs += step.restored;
+                            retained_waiting_for_credit |= step.waiting_for_credit;
+                            retained_walk_unfinished |= step.unfinished;
+                        }
+                    }
 
                     const auto byte_budget = static_cast<uint64_t>(network_credit);
                     // The byte budget does not constrain have-object probes: a
