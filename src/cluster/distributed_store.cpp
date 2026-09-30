@@ -2329,10 +2329,8 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
     return checked;
 }
 
-uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::vector<ObjectId>* live,
-                                       const std::vector<ObjectId>* universal) {
-    return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0, live,
-                       universal)
+uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::vector<ObjectId>* live) {
+    return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0, live)
         .bytes_transferred;
 }
 
@@ -2416,7 +2414,6 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
 DistributedStore::RepairResult
 DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               const std::vector<ObjectId>* live,
-                              const std::vector<ObjectId>* universal,
                               const std::function<bool()>& should_yield,
                               uint64_t live_generation) {
     RepairResult result;
@@ -2545,9 +2542,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 continue;
             if (live && !std::binary_search(live->begin(), live->end(), id))
                 continue;
-            const bool everywhere =
-                universal && std::binary_search(universal->begin(), universal->end(), id);
-            for (const auto& peer : everywhere ? hosting_nodes() : ranked(id)) {
+            for (const auto& peer : ranked(id)) {
                 if (peer.id == n_.node_id() || !has_room(peer))
                     continue;
                 probe_nodes[peer.id] = peer;
@@ -2595,7 +2590,6 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         struct Plan {
             ObjectId id;
             bool live{true};
-            bool everywhere{};
             size_t target{};
             std::set<NodeId> keepers;
         };
@@ -2634,14 +2628,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     plans.push_back(std::move(plan));
                     continue;
                 }
-                plan.everywhere =
-                    universal && std::binary_search(universal->begin(), universal->end(), id);
-                // "Everywhere" means every node that hosts extents; a
-                // non-hosting node fetches a universal object on demand into
-                // its cache like anything else.
-                const auto nodes = plan.everywhere ? hosting_nodes() : ranked(id);
-                plan.target = plan.everywhere ? nodes.size()
-                                              : std::min(n_.config().replication, nodes.size());
+                const auto nodes = ranked(id);
+                plan.target = std::min(n_.config().replication, nodes.size());
                 std::shared_ptr<const Bytes> source;
                 std::vector<Send> object_sends;
                 uint64_t object_bytes = 0;
@@ -2769,7 +2757,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             for (const auto& plan : plans) {
                 if (failed.contains(plan.id))
                     continue; // retried from the same place next step
-                if (plan.live && !plan.everywhere && plan.keepers.size() >= plan.target &&
+                if (plan.live && plan.keepers.size() >= plan.target &&
                     !plan.keepers.contains(n_.node_id()) &&
                     !n_.retention_store().retained(RetentionClass::data, plan.id)) {
                     auto resource = n_.data_resources().acquire(
@@ -2803,17 +2791,15 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 break;
 
             const ObjectId id = *it;
-            const bool everywhere = universal && n_.hosts_extents() &&
-                                    std::binary_search(universal->begin(), universal->end(), id);
             bool local_valid = false;
-            if (everywhere || should_own(id)) {
+            if (should_own(id)) {
                 // An index lookup, as in the push above: a pass that read
                 // every extent it already held could never reach the ones it
                 // lacks (gbni-1, 2026-09-25: years to cover its store). Scrub
                 // and the read path own corruption.
                 local_valid = n_.local_store().has(id);
             }
-            if ((!everywhere && !should_own(id)) || local_valid) {
+            if (!should_own(id) || local_valid) {
                 repair_pull_after_ = id;
                 ++it;
                 ++scanned_total;

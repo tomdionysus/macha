@@ -2411,9 +2411,8 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
     corrupt_object(c2.storage_backends.front().path, id);
 
     std::vector<ObjectId> live{id};
-    std::vector<ObjectId> universal{id};
     for (int i = 0; i < 4; ++i)
-        distributed.repair_once(8ULL * 1024 * 1024, &live, &universal);
+        distributed.repair_once(8ULL * 1024 * 1024, &live);
 
     bool repaired = false;
     try {

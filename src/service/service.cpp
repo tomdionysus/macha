@@ -1581,22 +1581,16 @@ void Service::loop(std::stop_token stop) {
                      maintenance_inventory_generation_ != objects->metadata_generation) &&
                     (!maintenance_live_ || !repair_only || metadata_ready_for_dependants)) {
                     auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
-                    auto universal = std::make_shared<std::vector<ObjectId>>();
                     auto control_live = std::make_shared<std::vector<ObjectId>>();
                     auto catalogue_objects = catalogue_->maintenance_objects();
                     maintenance_catalogue_complete_ = catalogue_objects.complete;
                     live->insert(live->end(), catalogue_objects.live.begin(),
                                  catalogue_objects.live.end());
-                    universal->insert(universal->end(), catalogue_objects.universal.begin(),
-                                      catalogue_objects.universal.end());
                     control_live->insert(control_live->end(),
                                          catalogue_objects.control_live.begin(),
                                          catalogue_objects.control_live.end());
                     std::sort(live->begin(), live->end());
                     live->erase(std::unique(live->begin(), live->end()), live->end());
-                    std::sort(universal->begin(), universal->end());
-                    universal->erase(std::unique(universal->begin(), universal->end()),
-                                     universal->end());
                     std::sort(control_live->begin(), control_live->end());
                     control_live->erase(std::unique(control_live->begin(), control_live->end()),
                                         control_live->end());
@@ -1614,7 +1608,6 @@ void Service::loop(std::stop_token stop) {
 
                     maintenance_inventory_generation_ = objects->metadata_generation;
                     maintenance_live_ = std::move(live);
-                    maintenance_universal_ = std::move(universal);
                     maintenance_control_live_ = std::move(control_live);
                     rebuilt_inventory = true;
                     observations().record("maintenance.inventory.build_us",
@@ -1747,7 +1740,6 @@ void Service::loop(std::stop_token stop) {
                     const auto repair_stage = Clock::now();
                     auto repair = store_->repair_step(
                         byte_budget, operation_budget, maintenance_live_.get(),
-                        maintenance_universal_.get(),
                         [&] {
                             // Repair's turn ends at the next operation boundary
                             // once its weighted slice is spent; it is paced,

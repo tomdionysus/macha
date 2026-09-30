@@ -131,7 +131,6 @@ class Service {
     MaintenanceStageHook maintenance_stage_hook_;
     uint64_t maintenance_inventory_generation_{};
     std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
-    std::shared_ptr<const std::vector<ObjectId>> maintenance_universal_;
     std::shared_ptr<const std::vector<ObjectId>> maintenance_control_live_;
     Hash256 retention_release_floor_hash_{};
     std::shared_ptr<const std::vector<ObjectId>> retention_release_data_live_;
