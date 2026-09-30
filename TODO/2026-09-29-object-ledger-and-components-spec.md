@@ -800,6 +800,24 @@ supersede earlier ones where they conflict.
   non-deterministic, and every variation traced to timing, not to a
   decision. Repair across two nodes is not compared (which node restores a
   copy first is a race by design); repair's order is compared on one node.
+- **2026-09-30. Backlog fixes land on the experiment branch** (open
+  question 5): each as its own step with its test, committed into the
+  experiment's line, pushed when accepted. `develop` stays frozen.
+- **2026-09-30. The work context travels in `Budget`** (question 8,
+  confirmed): point operations that may block take it explicitly; no
+  thread-local context.
+- **2026-09-30. The component model lives in `src/component/`** (question
+  4), with `src/subsystem/` the plugin loader over it. A two-way door: it can
+  be revisited.
+- **2026-09-30. Supervision** (question 3): stage 0 restarts no core
+  component beyond what is supervised today. Eventually, under inversion of
+  control, everything is a component and nothing is exempt from supervision.
+- **2026-09-30. The control gate gains `!rebuilt_inventory`** (question 1),
+  as its own step, pinned by a decision-trace fixture before and after.
+- **2026-09-30. `universal` is removed** (question 2): nothing sets it.
+- **2026-09-30. The T0 soak** runs 24 hours including loaded windows:
+  browser playback driven by Macha Client, FUSE write load, torrents queued
+  by the operator, restarts as needed.
 - **2026-09-30 (T1). The clock seam covers the pass's decisions only.** The
   store's activity clock (`idle_for`) and object ages in the store
   (`older_than`, the orphan grace) are still real time; fixtures reach
