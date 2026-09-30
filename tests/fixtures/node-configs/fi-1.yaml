@@ -1,0 +1,229 @@
+# Test fixture: fi-1's /etc/macha/macha.yaml as deployed on 2026-09-30 (0.74.0),
+# templated for an in-process run by the lifecycle recorder: paths under
+# ${ROOT}, ports ${PORT}/${API_PORT}, no advertise name, bootstrap peers
+# replaced (fi-1: one loopback port nothing listens on, since it may not
+# found a cluster alone; gbni-1: none),
+# no FUSE mount_path (no kernel mount in-process), torrent port ${TORRENT_PORT}.
+# Nothing secret was in it: the key and the TMDB token are file paths.
+# Macha 0.42.0 -- corvus-fi-1
+# Edge node behind CGNAT: 8T DATA on ${ROOT}/diskB, ingest and torrent enabled.
+# It dials its peers; nothing ever dials it (network.inbound_capable: false).
+
+state_path: ${ROOT}/etc/state
+key_file: ${ROOT}/etc/cluster.key
+
+log_level: DEBUG
+ffmpeg_log_level: ERROR
+
+storage:
+  # DATA on the 10 TB HDD at ${ROOT}/diskB (operator, 2026-09-29), moved there
+  # with its extents from the 10G NVMe backend. A subdirectory on purpose: if
+  # the disk is not mounted the path is absent and the backend stays offline
+  # instead of filling the root filesystem.
+  hosts_extents: true
+  data:
+    backends:
+      - path: ${ROOT}/diskB/data
+        limit: 8T
+        reserve_free: 64G
+
+  metadata:
+    path: ${ROOT}/etc/metadata-objects
+    limit: 4G
+    packing:
+      threshold: 1M
+      target_size: 64M
+
+cache:
+  # 10 GiB at the cluster's 4M extent size.
+  path: ${ROOT}/etc/cache
+  max_blocks: 2560
+  prefer_metadata: true
+
+filesystem:
+  root_uid: 0
+  root_gid: 0
+  root_mode: "0755"
+
+fuse:
+  allow_other: false
+
+  spool_path: ${ROOT}/etc/spool
+  operation_journal_path: ${ROOT}/etc/fuse-operations.log
+  max_spool_bytes: 10G
+  spool_reserve_free: 2G
+
+  entry_timeout_ms: 1000
+  attr_timeout_ms: 1000
+  negative_timeout_ms: 500
+  absolute_request_timeout_ms: 15000
+  timeouts:
+    lookup_ms: 1000
+    namespace_ms: 3000
+    read_ms: 10000
+    write_ms: 5000
+    sync_ms: 5000
+    lifecycle_ms: 2000
+
+  request_workers: 24
+  max_pending_requests: 4096
+  commit_workers: 8
+  recovery_commit_workers: 2
+  foreground_commit_workers: 1
+  publication_quiet_ms: 5000
+  max_pending_operations: 4096
+
+  hydration_priority: 2000
+  read_ahead_extents: 2
+  hint_lifetime_ms: 5000
+  write_through_cache: true
+
+  unmount_if_mounted: true
+  fail_closed_mountpoint: true
+  watchdog_interval_ms: 1000
+
+network:
+  listen: 127.0.0.1
+  port: ${PORT}
+  # Behind CGNAT: peers can never connect here. No advertise, upnp,
+  # external_ip or connectivity_check -- none of them can apply.
+  inbound_capable: false
+  failure_domain: finland
+  heartbeat_ms: 5000
+  dead_after_ms: 30000
+  connect_timeout_ms: 2500
+  max_frame_size: 256K
+  control_stall_notice_ms: 5000
+  data_stall_notice_ms: 120000
+
+dht:
+  # 2026-09-20, operator-authorised. The 128M default is smaller than TWO
+  # materialisations of this namespace (~51MB each) and cur_/committed_ are
+  # pinned, so a replica catching up has zero usable cache: every
+  # materialized() misses, replays ~228 deltas from a snapshot and is evicted
+  # before the next call. Measured on gbni-1: 0 cache hits in 30s, ~15s per
+  # reconstruction, 810 generations behind going nowhere at 28 B/s. With 512M
+  # the same catch-up ran ~577x faster and completed in about two minutes.
+  metadata_materialization_cache_bytes: 512M
+  # Cluster policy: identical to es-1.
+  replicas: 2
+  min_write_replicas: 1
+  metadata_min_write_replicas: 2
+  write_stall_ms: 2500
+  extent_size: 4M
+  read_ahead: 3
+  metadata_cache_ms: 250
+
+hydration:
+  enabled: true
+  interval_ms: 100
+  active_timeout_ms: 30000
+  max_inflight: 4
+  catalogue_lookahead: 1
+  engines:
+    read_ahead:
+      enabled: true
+      priority: 1000
+    current_file:
+      enabled: true
+      priority: 700
+    catalogue:
+      enabled: true
+      priority: 300
+
+# Join es-1's cluster; never self-form.
+bootstrap:
+  - 127.0.0.1:${DEAD_PORT}
+
+maintenance:
+  interval_ms: 1000
+  foreground_quiet_ms: 2000
+  busy_bandwidth_fraction: 0.0
+  idle_bandwidth_fraction: 0.9
+  cpu_target: 0.10
+  initial_bandwidth: 32M
+  max_bandwidth: 0B
+  scrub_fraction: 0.02
+  scrub_interval_ms: 2592000000
+  no_progress_backoff_ms: 300000
+  garbage_grace_ms: 2592000000
+
+catalogue:
+  # Ingest (and so torrent) requires the scanner. gbni-1 has the lower node
+  # id and stays the scan coordinator; this node scans what it imports.
+  scanner:
+    enabled: true
+    providers:
+      movies:
+        tmdb:
+          token_file: ${ROOT}/etc/tmdb.key
+      tv:
+        tmdb:
+          token_file: ${ROOT}/etc/tmdb.key
+
+  api:
+    enabled: true
+    listen: 127.0.0.1
+    advertised_endpoint: http://127.0.0.1:${API_PORT}
+    port: ${API_PORT}
+    max_request_bytes: 8M
+    workers: 16
+    max_queued_connections: 128
+    client_io_timeout_ms: 30000
+    stream_chunk_bytes: 256K
+    # Response compression (0.44.0). This node answers browsers directly over
+    # a CGNAT uplink, where the bytes saved are worth more than the CPU spent,
+    # and it hosts no extents so its cores are otherwise idle. Media is never
+    # compressed regardless of this setting.
+    compression: true
+    compression_min_bytes: 1K
+    compression_level: 6
+    compression_max_asset_bytes: 4M
+
+# Acquisition stages on the 10 TB disk, beside the DATA backend.
+ingest:
+  enabled: true
+  staging_path: ${ROOT}/diskB/ingest
+  staging_limit: 500G
+
+# Behind CGNAT: outbound connections only, so fewer peers than gbni-1 sees.
+torrent:
+  enabled: true
+  listen_interfaces: 127.0.0.1:${TORRENT_PORT}
+  listen_port: ${TORRENT_PORT}
+  max_active: 4
+  max_download_rate: 0B
+  max_upload_rate: 0B
+  # libtorrent alert stream threshold, independent of the top-level log_level.
+  log_level: INFO
+  dht: true
+  pex: true
+  lsd: true
+
+streaming:
+  enabled: true
+  temp_path: ${ROOT}/etc/playback
+  max_sessions: 64
+  max_sessions_per_account: 32
+  max_video_transcodes: 1
+  max_audio_transcodes: 4
+  session_idle_ms: 1800000
+  startup_timeout_ms: 15000
+  segment_duration_ms: 4000
+  max_ahead_segments: 8
+  segment_memory_bytes: 64M
+  probe_bytes: 8M
+  probe_analyze_duration_ms: 5000
+  probe_timeout_ms: 20000
+
+# Static web client (macha-client 0.16.0), served at the root of the API port.
+# Only this directory is served; everything under /api stays the server's.
+# No endpoint is baked into the bundle: it probes its own origin and adopts
+# this node when /api/v1/health identifies as Macha.
+web:
+  enabled: true
+  root: ${ROOT}/etc/web
+  index: index.html
+
+# Display name shown in Status (0.70.0).
+node_name: Corvus FI-1

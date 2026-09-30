@@ -790,6 +790,20 @@ supersede earlier ones where they conflict.
   compared within a node and a load class. Laptop suite timings are not a
   baseline while other projects build on the same machine (load average
   366 on 2026-09-30); fi-1's are.
+- **2026-09-30 (T1). What a decision trace compares.** Per fixture step:
+  the outcome (store and claim counts, named objects held and claimed), the
+  actions since the previous step (grouped by kind, each distinct action
+  once, in the order first taken), and each gate's current node conditions
+  with its verdict from the last pass where it was due and its inventory
+  not rebuilt. Scheduling (which passes ran, `due`, `rebuilt`, repair's
+  share) is not compared: the first design that compared it was 3-41%
+  non-deterministic, and every variation traced to timing, not to a
+  decision. Repair across two nodes is not compared (which node restores a
+  copy first is a race by design); repair's order is compared on one node.
+- **2026-09-30 (T1). The clock seam covers the pass's decisions only.** The
+  store's activity clock (`idle_for`) and object ages in the store
+  (`older_than`, the orphan grace) are still real time; fixtures reach
+  those states in real time. Injecting them is later work (T2 on).
 
 ## Open questions for the operator
 

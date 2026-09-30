@@ -1,0 +1,261 @@
+# Test fixture: gbni-1's /etc/macha/macha.yaml as deployed on 2026-09-30 (0.74.0),
+# templated for an in-process run by the lifecycle recorder: paths under
+# ${ROOT}, ports ${PORT}/${API_PORT}, no advertise name, bootstrap peers
+# replaced (fi-1: one loopback port nothing listens on, since it may not
+# found a cluster alone; gbni-1: none),
+# no FUSE mount_path (no kernel mount in-process), torrent port ${TORRENT_PORT}.
+# Nothing secret was in it: the key and the TMDB token are file paths.
+# Macha 0.18.0 two-node clean test cluster
+# Raspberry Pi: joiner, bulk DATA storage and acquisition node.
+
+state_path: ${ROOT}/etc/state
+key_file: ${ROOT}/etc/cluster.key
+
+log_level: DEBUG
+ffmpeg_log_level: ERROR
+
+storage:
+  data:
+    backends:
+      - path: ${ROOT}/diskB
+        limit: 8T
+        # Keep substantial physical headroom on the bulk disk for FUSE spool,
+        # ingest staging, pack compaction and recovery work.
+        reserve_free: 64G
+    packing:
+      threshold: 1M
+      target_size: 64M
+
+  metadata:
+    # Priority CONTROL/METADATA remains on the root/state filesystem and is
+    # independent of the 8T DATA quota on diskB.
+    path: ${ROOT}/etc/metadata-objects
+    limit: 4G
+    packing:
+      threshold: 1M
+      target_size: 64M
+
+cache:
+  # Keep the best-effort cache bounded on the root filesystem. At a 4M extent
+  # size, 1024 blocks is roughly a 4 GiB worst-case extent cache.
+  path: ${ROOT}/etc/cache
+  max_blocks: 1024
+  prefer_metadata: true
+
+filesystem:
+  root_uid: 0
+  root_gid: 0
+  root_mode: "0755"
+
+fuse:
+  allow_other: false
+
+  # The spool may contain the full accepted-but-unpublished write backlog, so it
+  # belongs on bulk storage. The small ordered operation journal remains in state.
+  spool_path: ${ROOT}/diskB/spool
+  operation_journal_path: ${ROOT}/etc/fuse-operations.log
+
+  entry_timeout_ms: 1000
+  attr_timeout_ms: 1000
+  negative_timeout_ms: 500
+  absolute_request_timeout_ms: 15000
+  timeouts:
+    lookup_ms: 1000
+    namespace_ms: 3000
+    read_ms: 10000
+    write_ms: 5000
+    sync_ms: 5000
+    lifecycle_ms: 2000
+
+  request_workers: 24
+  max_pending_requests: 4096
+  commit_workers: 8
+  # Recovery publication is deliberately bounded independently of live commits.
+  recovery_commit_workers: 2
+  foreground_commit_workers: 1
+  publication_quiet_ms: 5000
+  max_pending_operations: 4096
+
+  hydration_priority: 2000
+  read_ahead_extents: 2
+  hint_lifetime_ms: 5000
+  write_through_cache: true
+
+  unmount_if_mounted: true
+  fail_closed_mountpoint: true
+  watchdog_interval_ms: 1000
+
+network:
+  listen: 127.0.0.1
+  port: ${PORT}
+  failure_domain: test-lab
+  heartbeat_ms: 5000
+  dead_after_ms: 30000
+  connect_timeout_ms: 2500
+  max_frame_size: 256K
+  control_stall_notice_ms: 5000
+  data_stall_notice_ms: 120000
+
+dht:
+  replicas: 2
+  min_write_replicas: 1
+  metadata_replicas: 2
+  write_stall_ms: 2500
+  extent_size: 4M
+  # 16 extents was unnecessarily aggressive for a stability-first baseline.
+  # Three extents is the 0.18 default and keeps speculative work bounded.
+  read_ahead: 3
+  metadata_cache_ms: 250
+  # 2026-09-20, operator-authorised manual recovery step.
+  # The 128M default is smaller than TWO materialisations of this namespace
+  # (~51MB each), and cur_/committed_ are pinned, so the import walk had zero
+  # usable cache: every materialized() missed, replayed ~228 deltas from a
+  # snapshot, and was evicted immediately. Measured 0 cache hits in 30s and
+  # ~15s per reconstruction, which put a 810-generation rejoin at 3.4h+ of
+  # one core pegged at 100%.
+  metadata_materialization_cache_bytes: 512M
+
+hydration:
+  enabled: true
+  interval_ms: 100
+  active_timeout_ms: 30000
+  max_inflight: 4
+  catalogue_lookahead: 1
+  engines:
+    read_ahead:
+      enabled: true
+      priority: 1000
+    current_file:
+      enabled: true
+      priority: 700
+    catalogue:
+      enabled: true
+      priority: 300
+
+# Join only the Mac-created namespace; do not self-form while isolated.
+bootstrap: []
+
+maintenance:
+  interval_ms: 1000
+  foreground_quiet_ms: 2000
+  busy_bandwidth_fraction: 0.0
+  idle_bandwidth_fraction: 0.9
+  cpu_target: 0.10
+  initial_bandwidth: 32M
+  max_bandwidth: 0B
+  scrub_fraction: 0.02
+  scrub_interval_ms: 2592000000
+  no_progress_backoff_ms: 300000
+  garbage_grace_ms: 2592000000
+
+catalogue:
+  scanner:
+    enabled: true
+    interval_ms: 21600000
+    rescan_debounce_ms: 10000
+    rescan_max_delay_ms: 600000
+    max_provider_requests_per_scan: 32
+    provider_batch_delay_ms: 30000
+    max_artwork_bytes: 16M
+    providers:
+      movies:
+        enabled: true
+        roots:
+          - /Movies
+        tmdb:
+          enabled: true
+          token_file: ${ROOT}/etc/tmdb.key
+          language: en-GB
+          image_size: w500
+      tv:
+        enabled: true
+        roots:
+          - /TV
+        tmdb:
+          enabled: true
+          token_file: ${ROOT}/etc/tmdb.key
+          language: en-GB
+          image_size: w500
+      music:
+        enabled: true
+        roots:
+          - /Music
+        musicbrainz:
+          enabled: true
+          contact: https://github.com/tomdionysus/macha
+          cover_size: "500"
+        discogs:
+          enabled: false
+
+  api:
+    enabled: true
+    listen: 127.0.0.1
+    advertised_endpoint: http://127.0.0.1:${API_PORT}
+    port: ${API_PORT}
+    max_request_bytes: 8M
+    workers: 16
+    max_queued_connections: 128
+    client_io_timeout_ms: 30000
+    stream_chunk_bytes: 256K
+
+# Bulk acquisition lives here, not on the Mac seed node.
+ingest:
+  enabled: true
+  staging_path: ${ROOT}/diskB/ingest
+  staging_limit: 500G
+  source_roots:
+    - /mnt/diskA
+  copy_chunk_bytes: 1M
+  checkpoint_bytes: 64M
+  blocked_retry_ms: 5000
+  cleanup:
+    delete_owned_source_on_clear: true
+    delete_external_source_on_clear: false
+    delete_owned_source_on_cancel: true
+
+torrent:
+  enabled: true
+  # Bind every interface explicitly. Left unset, the engine derives this from
+  # network.advertise, which is a DNS name here -- libtorrent's
+  # listen_interfaces takes an IP or a device, so it bound nothing at all and
+  # torrents sat in dl-metadata for ever.
+  listen_interfaces: 127.0.0.1:${TORRENT_PORT}
+  listen_port: ${TORRENT_PORT}
+  max_active: 4
+  max_download_rate: 0B
+  max_upload_rate: 0B
+  # libtorrent alert stream threshold, independent of the top-level log_level.
+  log_level: INFO
+  dht: true
+  pex: true
+  lsd: true
+  search:
+    providers: []
+
+streaming:
+  enabled: true
+  temp_path: ${ROOT}/etc/playback
+  max_sessions: 64
+  max_sessions_per_account: 32
+  max_video_transcodes: 1
+  max_audio_transcodes: 4
+  session_idle_ms: 1800000
+  startup_timeout_ms: 15000
+  segment_duration_ms: 4000
+  max_ahead_segments: 8
+  segment_memory_bytes: 64M
+  probe_bytes: 8M
+  probe_analyze_duration_ms: 5000
+  probe_timeout_ms: 20000
+
+
+# Serve the built web client at the root, as fi-1 and es-1 do. No endpoint is
+# baked into the bundle: it probes its own origin and adopts this node when
+# /api/v1/health identifies as Macha.
+web:
+  enabled: true
+  root: ${ROOT}/etc/web
+  index: index.html
+
+# Display name shown in Status (0.70.0).
+node_name: Corvus GBNI-1

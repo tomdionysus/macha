@@ -95,10 +95,11 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 
 Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook startup_stage_hook,
                  MaintenanceStageHook maintenance_stage_hook,
-                 StartupStallHandler startup_stall_handler, MaintenanceInstruments instruments)
+                 StartupStallHandler startup_stall_handler, ServiceInstruments instruments)
     : clock_(instruments.clock ? std::move(instruments.clock)
                                : std::make_shared<SystemMaintenanceClock>()),
-      maintenance_trace_(std::move(instruments.trace)), node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
+      maintenance_trace_(std::move(instruments.trace)),
+      lifecycle_(std::move(instruments.lifecycle)), node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       session_api_(node_), users_api_(node_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
@@ -697,6 +698,7 @@ void Service::initialise_services(std::stop_token stop) {
         });
 
         store_ = std::move(store);
+        store_->set_repair_trace(maintenance_trace_);
         metadata->set_namespace_store(store_.get());
         // Repair is the only component that learns an object is unobtainable,
         // and it learns it in the ordinary course of a maintenance pass. Wire
@@ -722,9 +724,14 @@ void Service::initialise_services(std::stop_token stop) {
         if (stop.stop_requested())
             return;
 
+        note_lifecycle("services constructed");
+        note_lifecycle("start media-information");
         media_information_->start();
+        note_lifecycle("start ingest");
         ingest_->start();
+        note_lifecycle("start cluster-jobs");
         cluster_jobs_->start();
+        note_lifecycle("start torrent-coordinator");
         torrent_coordinator_->start();
         // Only now: a subsystem plugin's context hands out references to the
         // services above (the torrent plugin needs IngestManager), and none
@@ -743,9 +750,15 @@ void Service::initialise_services(std::stop_token stop) {
         context.registry = &registry_;
         context.filesystem = fs_.get();
         context.hydration = hydration_.get();
+        note_lifecycle("start subsystems");
         subsystems_.start(context);
+        for (const auto& subsystem : subsystems_.statuses())
+            note_lifecycle("subsystem " + subsystem.name);
+        note_lifecycle("start streaming");
         streaming_->start();
+        note_lifecycle("start scanner");
         scanner_->start();
+        note_lifecycle("start hydration");
         hydration_->start();
         cluster_status_.attach_metadata(*metadata_);
         // Seed one initial validation pass. Later metadata/topology events use
@@ -753,10 +766,12 @@ void Service::initialise_services(std::stop_token stop) {
         // ordinary maintenance without scheduling redundant metadata work.
         metadata_convergence_.request(node_.known_metadata_generation());
         node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
+        note_lifecycle("start maintenance");
         maintenance_ = std::jthread([this](std::stop_token maintenance_stop) {
             run_supervised_loop("service-maintenance", maintenance_stop, [this, maintenance_stop] { loop(maintenance_stop); });
         });
 
+        note_lifecycle("services ready");
         services_ready_.store(true, std::memory_order_release);
         startup_cv_.notify_all();
         Log::info("server local services ready");
@@ -783,17 +798,23 @@ void Service::start() {
         std::string(kBuildIdentity), std::chrono::minutes(1),
         [this] { return observation_gauges(); });
     observations().event({unix_ms(), "start", {}, {{"version", std::string(kBuildIdentity)}}});
+    note_lifecycle("start observation");
     observation_recorder_->start();
 
     // Status is the first externally visible service. It depends only on the
     // lightweight node identity/membership state constructed from config, so
     // operators can observe startup even before the cluster listener or any
     // durable backend begins recovery.
+    note_lifecycle("start status");
     cluster_status_.start();
-    if (catalogue_http_)
+    if (catalogue_http_) {
+        note_lifecycle("start catalogue-http");
         catalogue_http_->start();
+    }
 
+    note_lifecycle("start node");
     node_.start();
+    note_lifecycle("start startup");
     startup_ = std::jthread([this](std::stop_token stop) {
         run_supervised_once("service-startup", [this, stop] { initialise_services(stop); });
     });
@@ -802,27 +823,46 @@ void Service::start() {
 void Service::request_stop() {
     if (startup_.joinable())
         startup_.request_stop();
-    if (fs_)
+    if (fs_) {
+        note_lifecycle("cancel-io filesystem");
         fs_->request_io_cancellation();
-    if (ingest_)
+    }
+    if (ingest_) {
+        note_lifecycle("request_stop ingest");
         ingest_->request_stop();
-    if (scanner_)
+    }
+    if (scanner_) {
+        note_lifecycle("request_stop scanner");
         scanner_->request_stop();
-    if (media_information_)
+    }
+    if (media_information_) {
+        note_lifecycle("request_stop media-information");
         media_information_->request_stop();
-    if (hydration_)
+    }
+    if (hydration_) {
+        note_lifecycle("request_stop hydration");
         hydration_->request_stop();
+    }
+    note_lifecycle("request_stop status");
     cluster_status_.request_stop();
-    if (catalogue_http_)
+    if (catalogue_http_) {
+        note_lifecycle("request_stop catalogue-http");
         catalogue_http_->request_stop();
-    if (streaming_)
+    }
+    if (streaming_) {
+        note_lifecycle("request_stop streaming");
         streaming_->request_stop();
-    if (manage_api_)
+    }
+    if (manage_api_) {
+        note_lifecycle("request_stop manage-api");
         manage_api_->request_stop();
+    }
     if (maintenance_.joinable()) {
+        note_lifecycle("request_stop maintenance");
         maintenance_.request_stop();
         maintenance_wait_cv_.notify_all();
     }
+    note_lifecycle("request_stop node");
     node_.request_stop();
     // Service maintenance performs synchronous control-replication calls. A
     // thread stop token wakes its event wait but cannot complete an RPC future.
@@ -845,10 +885,15 @@ void Service::stop() {
     // The coordinator calls into ingest and the torrent plugin, so it stops
     // first.
     const auto stop_producers = [this] {
-        if (torrent_coordinator_)
+        if (torrent_coordinator_) {
+            note_lifecycle("stop torrent-coordinator");
             torrent_coordinator_->stop();
-        if (cluster_jobs_)
+        }
+        if (cluster_jobs_) {
+            note_lifecycle("stop cluster-jobs");
             cluster_jobs_->stop();
+        }
+        note_lifecycle("stop subsystems");
         subsystems_.stop();
     };
     // Plugins write into the store until they are stopped -- the torrent
@@ -861,36 +906,54 @@ void Service::stop() {
     if (services_ready_.load(std::memory_order_acquire)) {
         if (startup_.joinable())
             startup_.join();
-        if (fs_)
+        if (fs_) {
+            note_lifecycle("cancel-io filesystem");
             fs_->request_io_cancellation();
+        }
         stop_producers();
     }
     request_stop();
     if (startup_.joinable())
         startup_.join();
     stop_producers();
-    if (ingest_)
+    if (ingest_) {
+        note_lifecycle("stop ingest");
         ingest_->stop();
-    if (scanner_)
+    }
+    if (scanner_) {
+        note_lifecycle("stop scanner");
         scanner_->stop();
-    if (media_information_)
+    }
+    if (media_information_) {
+        note_lifecycle("stop media-information");
         media_information_->stop();
-    if (hydration_)
+    }
+    if (hydration_) {
+        note_lifecycle("stop hydration");
         hydration_->stop();
+    }
     cluster_status_.detach_metadata();
     cluster_status_.detach_subsystem_diagnostics();
     // The provider holds a raw pointer into store_, which is declared after
     // cluster_status_ and therefore destroyed before it. Drop it here rather
     // than relying on nothing calling Status during teardown.
     cluster_status_.detach_repair_diagnostics();
+    note_lifecycle("stop status");
     cluster_status_.stop();
-    if (catalogue_http_)
+    if (catalogue_http_) {
+        note_lifecycle("stop catalogue-http");
         catalogue_http_->stop();
-    if (streaming_)
+    }
+    if (streaming_) {
+        note_lifecycle("stop streaming");
         streaming_->stop();
-    if (manage_api_)
+    }
+    if (manage_api_) {
+        note_lifecycle("stop manage-api");
         manage_api_->stop();
+    }
     if (maintenance_.joinable()) {
+        note_lifecycle("stop maintenance");
         Log::debug("shutdown: service maintenance request_stop");
         maintenance_.request_stop();
         Log::debug("shutdown: service maintenance joining");
@@ -899,6 +962,7 @@ void Service::stop() {
     }
     node_.set_service_event_callback({});
     Log::debug("shutdown: NodeRuntime::stop calling");
+    note_lifecycle("stop node");
     node_.stop();
     Log::debug("shutdown: Service::stop complete");
     if (observation_recorder_) {
@@ -1757,7 +1821,8 @@ void Service::loop(std::stop_token stop) {
                            garbage_due && !rebuilt_inventory && cluster_gc_stable &&
                                maintenance_catalogue_complete_,
                            flag("due", garbage_due) + " " + flag("rebuilt", rebuilt_inventory) +
-                               " " + flag("stable", cluster_gc_stable) + " " +
+                               " " + flag("reachable", cluster_gc_healthy) + " " +
+                               flag("stable", cluster_gc_stable) + " " +
                                flag("catalogue_complete", maintenance_catalogue_complete_));
                 if (garbage_due && !rebuilt_inventory && cluster_gc_stable &&
                     maintenance_catalogue_complete_) {
@@ -1950,6 +2015,7 @@ void Service::loop(std::stop_token stop) {
                                      std::to_string(node_.known_metadata_generation());
                 trace_gate("gate.data", gc_skip_reason.empty(),
                            flag("due", gc_due) + " " + flag("rebuilt", rebuilt_inventory) + " " +
+                               flag("reachable", cluster_gc_healthy) + " " +
                                flag("stable", cluster_gc_stable) + " " +
                                flag("release_view", release_metadata_view.has_value()) + " " +
                                flag("baseline", release_metadata_view &&

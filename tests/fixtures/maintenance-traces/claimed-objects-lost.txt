@@ -5,35 +5,39 @@ step: started
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
   inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
   release-horizon = complete data_live=0 control_live=0
-step: file written
-  state: data_objects=1 data_claims=1 control_claims=0
-  object file: held=1 claimed=1
+step: three files written
+  state: data_objects=3 data_claims=3 control_claims=0
+  object lost-0: held=1 claimed=1
+  object lost-1: held=1 claimed=1
+  object lost-2: held=1 claimed=1
   gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
-  inventory = generation=4 live=1 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=1 control_live=0
-step: backend offline
-  state: data_objects=0 data_claims=1 control_claims=0
-  object file: held=0 claimed=1
+  inventory = generation=8 live=3 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=3 control_live=0
+step: their objects lost
+  state: data_objects=0 data_claims=3 control_claims=0
+  object lost-0: held=0 claimed=1
+  object lost-1: held=0 claimed=1
+  object lost-2: held=0 claimed=1
   gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
-  inventory = generation=4 live=1 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=1 control_live=0
-step: offline past the back-off
-  state: data_objects=0 data_claims=1 control_claims=0
-  object file: held=0 claimed=1
+  inventory = generation=8 live=3 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=3 control_live=0
+step: an unrelated file written
+  state: data_objects=1 data_claims=4 control_claims=0
+  object lost-0: held=0 claimed=1
+  object lost-1: held=0 claimed=1
+  object lost-2: held=0 claimed=1
+  claim-walk: data #1 not-restored
+  claim-walk: data #2 not-restored
+  claim-walk: data #3 not-restored
+  repair: pull #1 unsourceable
+  repair: pull #2 unsourceable
+  repair: pull #3 unsourceable
   gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
-  inventory = generation=4 live=1 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=1 control_live=0
-step: backend back
-  state: data_objects=1 data_claims=1 control_claims=0
-  object file: held=1 claimed=1
-  gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
-  gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
-  gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
-  inventory = generation=4 live=1 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
-  release-horizon = complete data_live=1 control_live=0
+  inventory = generation=10 live=4 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=4 control_live=0

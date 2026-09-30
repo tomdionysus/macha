@@ -629,6 +629,7 @@ if(MACHA_BUILD_TESTS)
             tests/test_framework.cpp
             tests/test_runtime_dependencies.cpp
             tests/test_transcode_timeline.cpp
+            tests/test_lifecycle_record.cpp
             src/config.cpp
             src/media/ffmpeg_log.cpp
             src/media/media_engine.cpp

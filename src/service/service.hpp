@@ -40,11 +40,16 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 // says how, deterministically (ids in hex, no times).
 using MaintenanceTraceHook = std::function<void(std::string_view kind, std::string_view detail)>;
 
-// What a test injects into the maintenance pass. Production passes neither:
-// the system clock and no trace.
-struct MaintenanceInstruments {
+// Each step of the service's start and stop, in order ("start ingest",
+// "request_stop streaming", "subsystem fuse"), for the lifecycle recorder.
+using LifecycleHook = std::function<void(std::string_view event)>;
+
+// What a test injects into a Service. Production passes none of it: the
+// system clock, no trace and no lifecycle record.
+struct ServiceInstruments {
     std::shared_ptr<MaintenanceClock> clock;
     MaintenanceTraceHook trace;
+    LifecycleHook lifecycle;
 };
 
 class Service {
@@ -61,6 +66,11 @@ class Service {
     // Before node_, which is constructed after them.
     std::shared_ptr<MaintenanceClock> clock_;
     MaintenanceTraceHook maintenance_trace_;
+    LifecycleHook lifecycle_;
+    void note_lifecycle(std::string_view event) {
+        if (lifecycle_)
+            lifecycle_(event);
+    }
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin (Phase 1 of
@@ -160,7 +170,7 @@ class Service {
     Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {},
             MaintenanceStageHook maintenance_stage_hook = {},
             StartupStallHandler startup_stall_handler = {},
-            MaintenanceInstruments instruments = {});
+            ServiceInstruments instruments = {});
     ~Service();
     void start();
     void request_stop();
