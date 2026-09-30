@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "contract/work.hpp"
+#include "contract/thread_safety.hpp"
 
 #include "log.hpp"
 
@@ -9,6 +10,9 @@
 #include <string>
 
 namespace macha {
+
+NoIo no_io;
+
 namespace {
 
 std::atomic<WaitGuard::Mode> guard_mode{WaitGuard::Mode::record};

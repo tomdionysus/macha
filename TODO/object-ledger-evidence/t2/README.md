@@ -28,3 +28,29 @@ deadline, context deadline and yield.
 - every class refused (rewritten to compile: `frame_type == static_cast<FrameType>(0) &&`) -> KILLED by contract/test_wait_guard_records_or_throws, contract/test_only_control_is_refused_and_only_device_or_network_waits
 
 13 of 13 killed. Full suite: 642/642 (laptop).
+
+# T2b: I/O as a capability; has()'s index path proven to wait on no I/O
+
+`src/contract/thread_safety.hpp`: Clang thread-safety attributes (ignored by
+GCC), `-Wthread-safety` on for Clang builds of the core. "This code waits on
+no I/O" is a capability, `no_io`, held by a scoped `NoIoRegion`; waiting on
+I/O -- so far, taking a per-object lock a writer holds across its device
+I/O, now always through `ObjectLock` (all 12 sites in `LocalStore`) -- is
+annotated `MACHA_EXCLUDES(no_io)`.
+
+`LocalStore::has()` is split: `presence_from_index()` (the pack index and
+the presence index, holding a `NoIoRegion`), then the pre-warm-up device
+check. Adding `ObjectLock waits_for_a_writer(object_mutex(id));` to
+`presence_from_index` fails the Clang build:
+
+    local_store.cpp: error: cannot call function 'ObjectLock' while no-I/O
+    region 'no_io' is held [-Werror,-Wthread-safety-analysis]
+
+A first attempt annotated the function `EXCLUDES(io_locks)` with object locks
+acquiring `io_locks`; that compiled with the lock inside, because EXCLUDES
+restricts the caller, not the body. The capability was inverted.
+
+Scope, honestly: the analysis is per function. A call inside the region to
+another function that takes an object lock is caught only once that function
+is itself annotated `MACHA_EXCLUDES(no_io)`; that annotation spreads with
+the L track, file by file.

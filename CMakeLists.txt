@@ -359,6 +359,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(macha_core PRIVATE -Werror)
     endif()
 endif()
+# Clang checks the thread-safety annotations (src/contract/thread_safety.hpp);
+# GCC ignores them. Only annotated code is checked.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+    target_compile_options(macha_core PRIVATE -Wthread-safety)
+endif()
 
 # BitTorrent acquisition is a subsystem plugin, not part of macha_core: the
 # whole libtorrent linkage lives behind a dlopen boundary so that a node
