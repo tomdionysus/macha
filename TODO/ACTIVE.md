@@ -32,7 +32,10 @@ experiment's version line ceases to exist.
   conversions into the composition root, S the final sweep; lock
   annotation, just-in-time mapping and test consolidation inside every
   step.
-- **Now: T0, deployed 2026-09-30 07:05Z/07:13Z, soaking.** 0.74.0 (`680047e` on
+- **Now (end of 2026-09-30):** T1 and P built on local branches; T0
+  soaking; fi-1's DATA disk down since 10:27Z (USB over-current on all
+  ports). Stopped for the operator: see the top of the 2026-09-30 handover.
+- **T0, deployed 2026-09-30 07:05Z/07:13Z, soaking.** 0.74.0 (`680047e` on
   `experiment/object-ledger-t0`) instruments the existing code to a local
   file; the spec carries the threshold rule and the K1-K11 table. Next:
   announce the Status `threads` entry `observation` to Core and the
