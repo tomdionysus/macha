@@ -10,6 +10,7 @@ step: catalogue item and a file added
   state: data_objects=1 data_claims=1 control_claims=2
   object claimed: held=1 claimed=1
   control-gate-in-rebuilding-pass: shut
+  control-gate-in-rebuilding-pass: open
   gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
@@ -20,7 +21,7 @@ step: catalogue root lost, file deleted
   object claimed: held=1 claimed=1
   claim-walk: control #1 not-restored
   control-gate-in-rebuilding-pass: shut
-  gate.control = destructive=1 catalogue_complete=0 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
+  gate.control = destructive=1 catalogue_complete=0 control_live=1 generation_current=1; decided shut when destructive=1 catalogue_complete=0 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=0 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=0; decided open when reachable=1 stable=1 catalogue_complete=1
   inventory = generation=6 live=0 control_live=1 garbage=1 stale_garbage=0 catalogue_complete=0
@@ -29,7 +30,7 @@ step: past the grace
   state: data_objects=1 data_claims=1 control_claims=2
   object claimed: held=1 claimed=1
   control-gate-in-rebuilding-pass: shut
-  gate.control = destructive=1 catalogue_complete=0 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
+  gate.control = destructive=1 catalogue_complete=0 control_live=1 generation_current=1; decided shut when destructive=1 catalogue_complete=0 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=0 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=0; decided open when reachable=1 stable=1 catalogue_complete=1
   inventory = generation=6 live=0 control_live=1 garbage=1 stale_garbage=0 catalogue_complete=0
