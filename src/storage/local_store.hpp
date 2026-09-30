@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include "storage/presence_index.hpp"
+#include "contract/thread_safety.hpp"
 #include <map>
 #include <set>
 #include <memory>
@@ -205,6 +206,11 @@ class LocalStore {
     // object: only a crash (rename durable, data not) or external truncation
     // leaves one. Caller holds the object's mutex, not m_. True if pruned.
     bool prune_empty_loose(const ObjectId&, const std::filesystem::path&) const;
+    // has() without the device: the answer from the pack index and the
+    // presence index, or none before warm-up. Waits on nothing but m_, which
+    // no one holds across I/O; its body is a no-I/O region, so taking a lock
+    // held across I/O here does not compile under Clang.
+    std::optional<bool> presence_from_index(const ObjectId&) const;
     std::shared_ptr<std::mutex> object_mutex(const ObjectId&) const;
 
   public:
