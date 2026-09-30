@@ -19,6 +19,7 @@
 #include "api/status_api.hpp"
 #include "torrent/torrent.hpp"
 #include "observation.hpp"
+#include "service/maintenance_clock.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
@@ -34,6 +35,18 @@ namespace macha {
 
 std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
 
+// One decision of the maintenance pass, for the decision trace: `kind` names
+// what was decided (a gate, a claim walked, tombstones erased) and `detail`
+// says how, deterministically (ids in hex, no times).
+using MaintenanceTraceHook = std::function<void(std::string_view kind, std::string_view detail)>;
+
+// What a test injects into the maintenance pass. Production passes neither:
+// the system clock and no trace.
+struct MaintenanceInstruments {
+    std::shared_ptr<MaintenanceClock> clock;
+    MaintenanceTraceHook trace;
+};
+
 class Service {
   public:
     using MaintenanceStageHook = std::function<void(std::string_view)>;
@@ -45,6 +58,9 @@ class Service {
   private:
     // First, so startup time is measured from the start of construction.
     Clock::time_point constructed_{Clock::now()};
+    // Before node_, which is constructed after them.
+    std::shared_ptr<MaintenanceClock> clock_;
+    MaintenanceTraceHook maintenance_trace_;
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin (Phase 1 of
@@ -143,7 +159,8 @@ class Service {
     static std::string_view required_role(const HttpRequest&);
     Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {},
             MaintenanceStageHook maintenance_stage_hook = {},
-            StartupStallHandler startup_stall_handler = {});
+            StartupStallHandler startup_stall_handler = {},
+            MaintenanceInstruments instruments = {});
     ~Service();
     void start();
     void request_stop();
