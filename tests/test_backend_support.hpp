@@ -526,15 +526,21 @@ inline void raw_http_send(int fd, std::string_view request) {
     }
 }
 
+// Reads exactly one response: the header a byte at a time up to its blank
+// line, then exactly Content-Length bytes, so a pipelined response behind it
+// stays in the socket for the next call. Reading the header in blocks took
+// the next response's bytes into this one's body whenever both had arrived
+// (about 1 in 200 on fi-1; 20/20 with both queued).
 inline RawHttpResponse raw_http_read_response(int fd) {
     std::string input;
     std::array<char, 8192> buffer{};
     size_t header_end;
     while ((header_end = input.find("\r\n\r\n")) == std::string::npos) {
-        auto n = recv(fd, buffer.data(), buffer.size(), 0);
+        char c{};
+        auto n = recv(fd, &c, 1, 0);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) throw std::runtime_error("http test response truncated before headers");
-        input.append(buffer.data(), static_cast<size_t>(n));
+        input.push_back(c);
     }
 
     RawHttpResponse response;

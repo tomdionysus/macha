@@ -483,6 +483,31 @@ MACHA_TEST("http_server", test_reactor_stall_watchdog_counts_a_sleeping_pass) {
     server.stop();
 }
 
+// The case that made the pipelining test fail about 1 in 200 on fi-1: both
+// responses already in the socket before the client reads the first. Each
+// read must take exactly its own response.
+MACHA_TEST("http_server", test_pipelined_responses_already_queued_are_read_one_at_a_time) {
+    auto config = loopback_config();
+    HttpServer server(config, [](const HttpRequest& request) {
+        return http_json(200, request.path == "/first" ? "{\"n\":1}" : "{\"n\":2}");
+    });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
+    const int fd = connect_idle(server.bound_port());
+    timeval timeout{2, 0};
+    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    raw_http_send(fd, "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                      "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    // Both answered and queued before the first read.
+    std::this_thread::sleep_for(300ms);
+    const auto first = raw_http_read_response(fd);
+    const auto second = raw_http_read_response(fd);
+    CHECK(first.body == "{\"status\":\"ok\",\"n\":1}");
+    CHECK(second.body == "{\"status\":\"ok\",\"n\":2}");
+    ::close(fd);
+    server.stop();
+}
+
 MACHA_TEST("http_server", test_head_and_pipelined_requests_on_one_connection) {
     auto config = loopback_config();
     HttpServer server(config, [](const HttpRequest& request) {
