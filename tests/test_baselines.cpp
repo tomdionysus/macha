@@ -7,7 +7,9 @@
 // `--filter baseline --verbose` to read the figures. They assert only that
 // the operation did what it was timed doing.
 #include "observation.hpp"
+#include "service/claim_walk.hpp"
 #include "storage/retention.hpp"
+#include "storage/retention_ledger.hpp"
 #include "storage/storage_pool.hpp"
 #include "test_backend_support.hpp"
 
@@ -110,6 +112,36 @@ MACHA_TEST("baseline", test_baseline_claim_walk_per_object) {
     report("claim_walk.per_object", Clock::now() - started, walked);
     CHECK(walked == passes * object_count);
     CHECK(held == walked);
+}
+
+// The same walk through the contracts: ClaimWalk over a RetentionLedger, in
+// its 16-claim steps.
+MACHA_TEST("baseline", test_baseline_claim_walk_on_the_ledger_per_object) {
+    Populated store;
+    RetentionStore retention(store.dir.path() / "retention", store.keys.storage);
+    retention.retain_batch(RetentionClass::data, store.present, {random_node_id(), 1});
+    const RetentionLedger ledger(retention, *store.pool, *store.pool);
+    struct Unreached final : ClaimRestorer {
+        size_t calls{};
+        Outcome restore(RetentionClass, const ObjectId&) override {
+            ++calls;
+            return Outcome::not_restored;
+        }
+    } restorer;
+    constexpr int passes = 10;
+    size_t walked = 0;
+    ClaimWalk walk(RetentionClass::data);
+    const auto started = Clock::now();
+    for (int pass = 0; pass < passes; ++pass)
+        for (;;) {
+            const auto step = walk.step(ledger, restorer);
+            walked += step.examined;
+            if (!step.unfinished)
+                break;
+        }
+    report("claim_walk.ledger_per_object", Clock::now() - started, walked);
+    CHECK(walked == passes * object_count);
+    CHECK(restorer.calls == 0u);
 }
 
 MACHA_FAST_TEST("baseline", test_baseline_observation_probe_costs) {

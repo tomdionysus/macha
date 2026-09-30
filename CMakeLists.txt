@@ -280,6 +280,7 @@ set(MACHA_CORE_SOURCES
     src/storage/local_store.cpp
     src/storage/storage_pool.cpp
     src/storage/retention.cpp
+    src/storage/retention_ledger.cpp
     src/storage/persistent_cache.cpp
     src/cluster/telemetry.cpp
     src/cluster/transcode_rates.cpp
@@ -332,6 +333,7 @@ set(MACHA_CORE_SOURCES
     src/torrent/torrent_common.cpp
     src/torrent/torrent_request.cpp
     src/service/maintenance_clock.cpp
+    src/service/claim_walk.cpp
     src/service/service.cpp
 )
 
@@ -564,7 +566,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_baselines.cpp
         tests/test_maintenance_trace.cpp
         tests/test_presence.cpp
-        tests/test_contract.cpp)
+        tests/test_contract.cpp
+        tests/test_claim_walk.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
