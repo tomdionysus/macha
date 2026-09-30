@@ -25,7 +25,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # macha_core is a shared library so that it, the macha executable and every
-# future dlopen'd subsystem plugin (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md)
+# future dlopen'd subsystem plugin (see TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md)
 # share exactly one copy of its classes and global/static state -- linking it
 # statically into more than one of those would duplicate that state, which is
 # a correctness hazard, not a style question. Executables that link it locate
@@ -37,7 +37,7 @@ else()
     set(MACHA_RPATH_ORIGIN "$ORIGIN")
 endif()
 
-# A subsystem plugin (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md)
+# A subsystem plugin (see TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md)
 # is always built from the same source tree, same commit, in the same CMake
 # invocation as macha_core -- never distributed or versioned independently --
 # so a plugin whose embedded build stamp doesn't match core's own is a build
@@ -371,7 +371,7 @@ endif()
 # whole libtorrent linkage lives behind a dlopen boundary so that a node
 # without the plugin file simply has no torrent capability at runtime, and so
 # an ordinary fault in it degrades that subsystem rather than the process (see
-# TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1). MODULE, not
+# TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1). MODULE, not
 # SHARED: it is only ever dlopen'd, never linked against.
 set(MACHA_PLUGIN_BUILD_DIR "${CMAKE_BINARY_DIR}/plugins")
 # From the installed plugin directory back to the private libdir holding
@@ -442,7 +442,7 @@ if(MACHA_BUILD_SERVER)
     # ALONE -- FuseFrontend, the journal and the mountpoint helpers are core's
     # own code and stay in macha_core, so core keeps its concrete types and
     # the FUSE tests keep linking it directly. See
-    # TODO/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2.
+    # TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2.
     set(MACHA_FUSE_FOUND OFF)
     if(MACHA_ENABLE_FUSE)
         pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
@@ -525,7 +525,7 @@ if(MACHA_BUILD_TESTS)
     enable_testing()
 
     # Real dlopen'd plugins exercising SubsystemSupervisor end to end (see
-    # TODO/2026-09-05-subsystem-plugin-isolation-plan.md), not in-process
+    # TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md), not in-process
     # mocks. Each is a MODULE library -- never linked into an executable,
     # only ever dlopen'd -- and links macha_core so it shares the same
     # Subsystem/SubsystemPluginEntry types and build-identity stamp.

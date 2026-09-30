@@ -303,22 +303,22 @@ RPC message/frame execution summaries are exposed through local Status without
 polling. The second complete run passed 203/203 and runtime dependencies passed
 3/3; the first complete run's catalogue-burst timeout remains an explicit
 follow-up rather than being erased by the successful rerun. See
-`TODO/2026-08-30-phase-5-operational-diagnostics.md`.
+`TODO/archive/2026-08-30-phase-5-operational-diagnostics.md`.
 
 The deployed three-node diagnostic UAT then passed: 514 directory operations
 used 12 publications, the paused replica recovered required history and only
 the final missed accepted head, CONTROL queueing remained isolated from the
 metadata backlog, and all nodes returned to sleeping idle. Physical DATA GC and
 the repeated-burst RSS ceiling remain intentionally open. See
-`TODO/2026-08-30-phase-5-operational-diagnostics-uat.md`.
+`TODO/archive/2026-08-30-phase-5-operational-diagnostics-uat.md`.
 
 The remaining journal-barrier and convergence-run counters are exposed by local
 Status through bounded existing state, with no sampler or polling. The default
 suite passed 204/204 and runtime passed 3/3. The deployed bounded UAT then
 accounted exactly for 130 operations, six publications, 520 journal records,
 272 barriers, and bounded convergence before all nodes returned to idle. See
-`TODO/2026-08-30-phase-5-journal-convergence-status.md` and
-`TODO/2026-08-30-phase-5-journal-convergence-uat.md`.
+`TODO/archive/2026-08-30-phase-5-journal-convergence-status.md` and
+`TODO/archive/2026-08-30-phase-5-journal-convergence-uat.md`.
 
 Exit criteria:
 
@@ -406,7 +406,7 @@ Each future session should:
 - All 27 `storage_metadata` tests passed.
 - All 34 `filesystem_fuse` tests passed.
 - Detailed implementation and continuation notes:
-  `TODO/2026-08-30-phase-0-diagnostic-foundation.md`.
+  `TODO/archive/2026-08-30-phase-0-diagnostic-foundation.md`.
 
 ### 2026-08-30 — Phase 1 bounded record materialization
 
@@ -424,7 +424,7 @@ Each future session should:
 - Full build passed; `storage_metadata` 27/27, `rpc_cluster` 27/27, and
   `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` 1/1 passed.
 - Detailed implementation and continuation notes:
-  `TODO/2026-08-30-phase-1-bounded-record-materialization.md`.
+  `TODO/archive/2026-08-30-phase-1-bounded-record-materialization.md`.
 
 ### 2026-08-30 — Phase 1 shared decoded materialization
 
@@ -443,7 +443,7 @@ Each future session should:
 - A short three-node UAT is now useful for measuring Phase 1 CPU/RPC improvement;
   it will not yet demonstrate batched deletion throughput.
 - Detailed implementation, continuation, and UAT notes:
-  `TODO/2026-08-30-phase-1-shared-decoded-materialization.md`.
+  `TODO/archive/2026-08-30-phase-1-shared-decoded-materialization.md`.
 
 ### 2026-08-30 — Phase 2 bounded namespace publication
 
@@ -464,7 +464,7 @@ Each future session should:
   190/190 and the runtime suite passed 3/3; the catalogue sync/search/artwork GC
   regression test passed within the full run.
 - Detailed implementation, continuation, and UAT notes:
-  `TODO/2026-08-30-phase-2-namespace-batching.md`.
+  `TODO/archive/2026-08-30-phase-2-namespace-batching.md`.
 
 ### 2026-08-30 — Phase 2 three-node deletion UAT
 
@@ -481,4 +481,4 @@ Each future session should:
   stable during the short observation. Retained bounded materializations are a
   plausible but unproven cause; a repeated/larger UAT can establish its ceiling.
 - Detailed measurements and observer-tooling caveats:
-  `TODO/2026-08-30-phase-2-three-node-deletion-uat.md`.
+  `TODO/archive/2026-08-30-phase-2-three-node-deletion-uat.md`.

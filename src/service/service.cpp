@@ -744,7 +744,7 @@ void Service::initialise_services(std::stop_token stop) {
         // whole point of the exercise: a frontend whose journal replay throws
         // faults that subsystem and is retried, instead of unwinding to
         // main() and taking metadata, RPC, the HTTP API and playback down
-        // with it. See TODO/2026-09-14-fuse-supervised-subsystem-plan.md.
+        // with it. See TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md.
         SubsystemContext context;
         context.config = &node_.config();
         context.node = &node_;

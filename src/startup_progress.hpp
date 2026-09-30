@@ -14,7 +14,7 @@ namespace macha {
 // `service_startup_no_progress_ms`, never merely because startup is slow:
 // on 2026-09-06 a 120 s elapsed-time gate turned a 5-minute (quadratic, but
 // progressing) replay into an infinite crash loop. Discipline 2 of
-// TODO/2026-09-06-self-healing-disciplines-plan.md.
+// TODO/archive/2026-09-06-self-healing-disciplines-plan.md.
 inline std::atomic<uint64_t>& startup_progress_counter() {
     static std::atomic<uint64_t> counter{0};
     return counter;

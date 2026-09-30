@@ -186,7 +186,7 @@ Nothing above is trustworthy if an operator cannot see it working.
   `metadata availability changed` precedent — never per-decision.
 - Document in `docs/configuration.md` beside the existing reserves, and in
   `docs/operations.md` as the law-1 mechanism on disk. The
-  [governing laws](../ARCHITECTURE.md#governing-laws) table gains its fourth
+  [governing laws](../../ARCHITECTURE.md#governing-laws) table gains its fourth
   row.
 
 ## Ordering and sizing

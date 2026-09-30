@@ -1,7 +1,7 @@
 # Object ledger stage 0: one interface over today's structures, no behaviour change
 
 **Historical only.** The canonical spec is the most recent version of
-[the object ledger and the component model](2026-09-29-object-ledger-and-components-spec.md).
+[the object ledger and the component model](../2026-09-29-object-ledger-and-components-spec.md).
 This document records how the design evolved and is not read as requirements.
 
 Status: EXPERIMENTAL, on `experiment/object-ledger`. The stage 0 part of

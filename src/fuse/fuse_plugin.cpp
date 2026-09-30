@@ -7,7 +7,7 @@
 // The plugin boundary here is libfuse, not FuseFrontend: the frontend, the
 // journal and the mountpoint helpers are core's own code and stay in
 // macha_core, so core keeps its concrete types and the FUSE tests keep
-// linking it directly. See TODO/2026-09-14-fuse-supervised-subsystem-plan.md,
+// linking it directly. See TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md,
 // decision 2.
 #include "fuse/fuse_adapter.hpp"
 #include "fuse/fuse_subsystem.hpp"
