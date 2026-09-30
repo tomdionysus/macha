@@ -15,7 +15,7 @@ namespace macha {
 //
 // Core and its plugins are always built from the same source tree, same
 // commit, in the same CMake invocation -- never distributed or versioned
-// independently (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md) --
+// independently (see TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md) --
 // so a plain C++ virtual interface across the dlopen boundary is safe; the
 // only part that must cross as a flat C symbol is this one bootstrap entry
 // point.

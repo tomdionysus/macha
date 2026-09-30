@@ -2,7 +2,7 @@
 
 Date: 2026-08-30
 
-Parent plan: `TODO/namespace-publication-and-metadata-efficiency.md`
+Parent plan: `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 
 ## Scope
 

@@ -74,9 +74,9 @@ class Service {
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin (Phase 1 of
-    // TODO/2026-09-05-subsystem-plugin-isolation-plan.md) and FUSE as a
+    // TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md) and FUSE as a
     // supervised builtin (Stage A of
-    // TODO/2026-09-14-fuse-supervised-subsystem-plan.md). `registry_` is
+    // TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md). `registry_` is
     // where each publishes what it provides, and it outlives `subsystems_`
     // deliberately: declared first, destroyed last, so a subsystem being torn
     // down can still withdraw itself.

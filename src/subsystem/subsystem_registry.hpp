@@ -31,7 +31,7 @@ class SubsystemRegistry {
     // FUSE publishes its concrete FuseFrontend rather than an abstract
     // service, because unlike TorrentManager it is core's own class: it lives
     // in macha_core and only the libfuse-facing adapter moves into a plugin
-    // (see TODO/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2).
+    // (see TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2).
     // Status and the manage endpoints therefore keep their concrete types, and
     // tests keep constructing a FuseFrontend directly.
     void publish_fuse(std::shared_ptr<FuseFrontend>);

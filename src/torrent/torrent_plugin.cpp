@@ -2,7 +2,7 @@
 // The libmacha-torrent plugin's boundary with core: the one exported C symbol
 // (kSubsystemEntrySymbol) plus the Subsystem that owns a TorrentManager's
 // lifecycle and publishes it to the SubsystemRegistry while it is running.
-// See TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1.
+// See TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1.
 
 #include "log.hpp"
 #include "macha_version.hpp"

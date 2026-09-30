@@ -359,7 +359,7 @@ MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_wait
 }
 
 MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_refuses_beyond_them) {
-    // Phase 3 of TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md. A
+    // Phase 3 of TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md. A
     // hold is an explicitly admitted resource, so the limits are testable
     // without a thread ever blocking -- which is the property that makes an
     // async HttpServer an improvement here rather than a rewrite.
@@ -538,7 +538,7 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
 }
 
 MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_anything_is_published) {
-    // Phase 2 of TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md.
+    // Phase 2 of TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md.
     // The playlist is a plan, and the plan exists before any media does, so
     // there is nothing to wait for: it is served complete and closed on the
     // first fetch and does not change afterwards.
@@ -605,7 +605,7 @@ MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_a
 
 MACHA_TEST("media_playback", test_media_segment_store_holds_an_init_request_until_it_is_published) {
     // One hold path for anything a client can request -- Phase 1 of
-    // TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md. Once a
+    // TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md. Once a
     // complete playlist is served before anything has been published, the
     // client asks for init.mp4 before the muxer has written the first moof.
     // wait_object() used to return immediately for every non-segment name, so

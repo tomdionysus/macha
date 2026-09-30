@@ -4,7 +4,7 @@
 // Part of the libmacha-torrent plugin, not of macha_core: this is the only
 // header that names libtorrent-backed machinery, and nothing in core includes
 // it. Core addresses BitTorrent acquisition through TorrentService
-// (torrent.hpp) alone. See TODO/2026-09-05-subsystem-plugin-isolation-plan.md.
+// (torrent.hpp) alone. See TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md.
 
 #include "acquisition/ingest.hpp"
 #include "torrent/torrent.hpp"

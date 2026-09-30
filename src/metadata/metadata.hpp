@@ -117,7 +117,7 @@ struct MetadataSnapshot {
     // no field for and `encode_snapshot_v14` refuses entries it would silently
     // drop -- so there is no encoding in which the two can disagree about what
     // the namespace is. See namespace_tree.hpp and
-    // TODO/2026-09-17-namespace-merkle-root-plan.md.
+    // TODO/archive/2026-09-17-namespace-merkle-root-plan.md.
     std::optional<ObjectId> namespace_root;
     std::map<std::string, FsEntry> entries;
     std::vector<GarbageRef> garbage;

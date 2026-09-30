@@ -3,7 +3,7 @@
 """Reproduction and measurement harness for the loader-I/O starvation P0.
 
 Measures whether a node keeps its control plane responsive while its own
-loader work runs. See TODO/2026-09-19-governing-laws-on-disk-io-plan.md.
+loader work runs. See TODO/archive/2026-09-19-governing-laws-on-disk-io-plan.md.
 
 It samples control-plane service time from two vantage points at once --
 on the node against the server's own port, and from here through whatever

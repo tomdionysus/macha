@@ -4,7 +4,7 @@
 // so it has no "not built" branches: an installation without the plugin has no
 // torrent capability at runtime, which core reports as `unavailable` rather
 // than compiling in a stub. See
-// TODO/2026-09-05-subsystem-plugin-isolation-plan.md.
+// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md.
 #include "torrent/torrent_manager.hpp"
 
 #include "crypto.hpp"

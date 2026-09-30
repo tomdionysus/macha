@@ -2246,7 +2246,7 @@ bool DistributedStore::ensure_control_local(const ObjectId& id) {
     // other control-store access takes one. This took a 4 MiB speculative
     // credit to check an 18 KB object, and when the wait was abandoned under
     // DATA pressure the commit that asked failed with it
-    // (TODO/2026-09-23-torrent-writes-starve-publication-incident.md).
+    // (TODO/archive/2026-09-23-torrent-writes-starve-publication-incident.md).
     if (n_.control_store().valid(id))
         return true;
 

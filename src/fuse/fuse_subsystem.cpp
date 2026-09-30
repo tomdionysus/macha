@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The driver-agnostic half of the FUSE subsystem. Nothing here links libfuse;
-// see fuse_subsystem.hpp and TODO/2026-09-14-fuse-supervised-subsystem-plan.md.
+// see fuse_subsystem.hpp and TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md.
 #include "fuse/fuse_subsystem.hpp"
 
 #include "filesystem/filesystem.hpp"

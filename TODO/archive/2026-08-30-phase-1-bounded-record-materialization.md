@@ -4,7 +4,7 @@ Date: 2026-08-30
 
 Status: first Phase 1 slice complete; Phase 1 remains open
 
-Parent plan: `TODO/namespace-publication-and-metadata-efficiency.md`
+Parent plan: `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 
 ## Problem addressed
 
@@ -117,7 +117,7 @@ The complete all-subsystem suite was not run. No claim is made that it passed.
 - `src/metadata.hpp`
 - `src/metadata.cpp`
 - `tests/test_storage_metadata.cpp`
-- `TODO/namespace-publication-and-metadata-efficiency.md`
+- `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 - this checkpoint document
 
 Phase 0 diagnostic files remain modified from the previous documented slice.

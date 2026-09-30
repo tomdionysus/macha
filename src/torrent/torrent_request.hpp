@@ -13,7 +13,7 @@
 // merge_torrent_request() therefore joins rather than conflicts: every field
 // has a deterministic rule, no merge ever needs an operator, and the result
 // does not depend on which side is "left". See
-// TODO/2026-09-27-cluster-torrent-queue-plan.md.
+// TODO/archive/2026-09-27-cluster-torrent-queue-plan.md.
 
 #include "codec.hpp"
 #include "types.hpp"

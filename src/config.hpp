@@ -335,7 +335,7 @@ struct CatalogueApiConfig {
     size_t max_request_bytes{8 * 1024 * 1024};
     // The server is one reactor thread that owns every socket and never
     // waits, plus two bounded pools that only compute (see
-    // TODO/2026-09-15-http-server-reactor-plan.md). `workers` is the data
+    // TODO/archive/2026-09-15-http-server-reactor-plan.md). `workers` is the data
     // lane -- catalogue, playback, web assets, and every body read that can
     // block on a disk or a replica. `control_workers` is the control lane
     // -- health, status, session, users -- so control traffic never queues

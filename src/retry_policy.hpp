@@ -10,8 +10,9 @@ namespace macha {
 // One retry discipline for every unit of work that can fail and try again:
 // exponential backoff with a ceiling, a failure budget over a window, and a
 // terminal "parked" outcome that hands the item to an operator instead of
-// retrying forever. Discipline 2 of TODO/2026-09-06-self-healing-disciplines-
-// plan.md: before it, three separate loops retried at fixed intervals with
+// retrying forever. Discipline 2 of
+// TODO/archive/2026-09-06-self-healing-disciplines-plan.md: before it, three
+// separate loops retried at fixed intervals with
 // no ceiling (a doomed inode at ~35/s for hours), the RPC layer waited
 // without deadline, and the only circuit breaker was the startup timeout.
 //

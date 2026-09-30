@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Crash-isolation UAT for the FUSE subsystem (see
-// TODO/2026-09-14-fuse-supervised-subsystem-plan.md, Stage A). The claim under
+// TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, Stage A). The claim under
 // test is the one the whole exercise exists for: a FUSE mount that cannot be
 // built, or that dies after it was built, degrades to a per-subsystem
 // faulted/restarting state while this node's metadata, RPC, HTTP API and

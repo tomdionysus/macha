@@ -42,7 +42,7 @@ struct FuseMountOutcome {
 // native crash surface here and the only part that cannot run in a test
 // process; separating it is also what lets the whole adapter move into
 // libmacha-fuse in Stage B without anything else moving with it. See
-// TODO/2026-09-14-fuse-supervised-subsystem-plan.md.
+// TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md.
 class FuseMountDriver {
   public:
     virtual ~FuseMountDriver() = default;

@@ -15,7 +15,7 @@ namespace macha {
 
 // A content-addressed Merkle tree over the namespace, keyed by path.
 //
-// This is SM14 (see TODO/2026-09-17-namespace-merkle-root-plan.md). A
+// This is SM14 (see TODO/archive/2026-09-17-namespace-merkle-root-plan.md). A
 // tree-backed MetadataRecord carries only the root of this tree instead of
 // inlining the namespace; its nodes are CONTROL objects, stored to the write
 // floor before any record names the root.

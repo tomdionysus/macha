@@ -1637,7 +1637,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     }
 
     // A torrent has usually published every extent of this file already, as
-    // its pieces verified (TODO/2026-09-23-torrent-disk-backend-plan.md,
+    // its pieces verified (TODO/archive/2026-09-23-torrent-disk-backend-plan.md,
     // stage 2): commit the file by naming them, and do not copy it. The
     // commit's DATA retention barrier refuses a manifest naming objects the
     // cluster does not hold, so a refused commit costs a copy, never data.
