@@ -1,5 +1,6 @@
 step: started
   state: data_objects=0 data_claims=0 control_claims=0
+  control-gate-in-rebuilding-pass: shut
   gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
@@ -10,6 +11,7 @@ step: three files written
   object lost-0: held=1 claimed=1
   object lost-1: held=1 claimed=1
   object lost-2: held=1 claimed=1
+  control-gate-in-rebuilding-pass: shut
   gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1; decided open when destructive=1 catalogue_complete=1 control_live=1 generation_current=1
   gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1; decided open when reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
   gate.tombstones = reachable=1 stable=1 catalogue_complete=1; decided open when reachable=1 stable=1 catalogue_complete=1
@@ -33,6 +35,7 @@ step: an unrelated file written
   claim-walk: data #1 not-restored
   claim-walk: data #2 not-restored
   claim-walk: data #3 not-restored
+  control-gate-in-rebuilding-pass: shut
   repair: pull #1 unsourceable
   repair: pull #2 unsourceable
   repair: pull #3 unsourceable
