@@ -103,7 +103,6 @@ struct CatalogueMaintenance {
     // Catalogue manifest/shards are control-plane objects. They are protected
     // and swept in the dedicated control store, never by DATA placement.
     std::set<ObjectId> control_live;
-    std::set<ObjectId> universal; // intentionally empty in the 0.18 storage model
     // False means current catalogue metadata could not be fully converged, so
     // the live set is conservative but incomplete and physical GC must not run.
     bool complete{true};

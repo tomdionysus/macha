@@ -349,11 +349,9 @@ class DistributedStore {
     // already copied. The node's own repair store enables this; a store
     // without it starts each pass at the beginning.
     void persist_repair_position(std::filesystem::path path);
-    uint64_t repair_once(uint64_t byte_budget = 0, const std::vector<ObjectId>* live = nullptr,
-                         const std::vector<ObjectId>* universal = nullptr);
+    uint64_t repair_once(uint64_t byte_budget = 0, const std::vector<ObjectId>* live = nullptr);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
                              const std::vector<ObjectId>* live = nullptr,
-                             const std::vector<ObjectId>* universal = nullptr,
                              const std::function<bool()>& should_yield = {},
                              uint64_t live_generation = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
