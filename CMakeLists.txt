@@ -268,6 +268,7 @@ set(MACHA_CORE_SOURCES
     src/log.cpp
     src/supervised.cpp
     src/diagnostics.cpp
+    src/contract/work.cpp
     src/observation.cpp
     src/durable_file.cpp
     src/json.cpp
@@ -557,7 +558,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_observation.cpp
         tests/test_baselines.cpp
         tests/test_maintenance_trace.cpp
-        tests/test_presence.cpp)
+        tests/test_presence.cpp
+        tests/test_contract.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
