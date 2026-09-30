@@ -2747,6 +2747,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     } catch (...) {
                     }
                 }
+                trace_repair("push " + to_string(send.id) + " to " + to_string(send.peer.id) +
+                             (ok ? " delivered" : " failed"));
                 if (!ok) {
                     failed.insert(send.id);
                     continue;
@@ -2773,8 +2775,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     auto resource = n_.data_resources().acquire(
                         DataWorkContext(FrameType::speculative, n_.config().extent_size),
                         n_.config().extent_size);
-                    if (resource)
+                    if (resource) {
                         n_.local_store().remove(plan.id);
+                        trace_repair("drop-local " + to_string(plan.id));
+                    }
                 }
                 settle(plan.id);
                 ++settled;
@@ -2827,6 +2831,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 if (!resource)
                     break;
                 (void)n_.local_store().put(id, *cached);
+                trace_repair("pull " + to_string(id) + " from-cache");
                 repair_pull_after_ = id;
                 ++it;
                 ++scanned_total;
@@ -2853,6 +2858,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     break;
                 if (n_.local_store().put(id, data->bytes))
                     transferred += data->bytes.size();
+                trace_repair("pull " + to_string(id) + " fetched");
             } else {
                 // This node should own it, does not have it, the block cache
                 // did not have it, and no peer answered with it. After a node
@@ -2862,6 +2868,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 // too, so this counts rather than concludes.
                 note_repair_unsourceable(id);
                 ++result.pull_unsourceable;
+                trace_repair("pull " + to_string(id) + " unsourceable");
             }
 
             repair_pull_after_ = id;
