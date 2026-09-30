@@ -1943,11 +1943,18 @@ void Service::loop(std::stop_token stop) {
                 }
 
                 const bool control_gate =
-                    gc_due && destructive_gc_enabled && maintenance_catalogue_complete_ &&
+                    gc_due && !rebuilt_inventory && destructive_gc_enabled &&
+                    maintenance_catalogue_complete_ &&
                     maintenance_control_live_ &&
                     maintenance_inventory_generation_ >= node_.known_metadata_generation();
+                // The rule the DATA and tombstone gates keep: a newly built
+                // inventory is never used destructively in the pass that
+                // built it. Traced so a fixture can hold the control gate to it.
+                if (rebuilt_inventory)
+                    trace_action("control-gate-in-rebuilding-pass", control_gate ? "open" : "shut");
                 trace_gate("gate.control", control_gate,
-                           flag("due", gc_due) + " " + flag("destructive", destructive_gc_enabled) +
+                           flag("due", gc_due) + " " + flag("rebuilt", rebuilt_inventory) + " " +
+                               flag("destructive", destructive_gc_enabled) +
                                " " + flag("catalogue_complete", maintenance_catalogue_complete_) +
                                " " + flag("control_live", maintenance_control_live_ != nullptr) +
                                " " +
