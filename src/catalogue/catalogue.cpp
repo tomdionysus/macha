@@ -883,6 +883,19 @@ std::shared_ptr<const CatalogueSnapshot> CatalogueManager::snapshot_view() {
     return current_snapshot();
 }
 
+std::shared_ptr<const CatalogueSnapshot>
+CatalogueManager::snapshot_view(const WorkContext& context) {
+    bool warm = false;
+    {
+        std::lock_guard lock(mutex_);
+        warm = ready_ && cached_;
+    }
+    if (!warm)
+        (void)WaitGuard::enter(context, Waits::state_device | Waits::network,
+                               "CatalogueManager::snapshot_view (cold)");
+    return current_snapshot();
+}
+
 std::optional<CatalogueItem> CatalogueManager::get(std::string_view id) {
     auto snapshot = current_snapshot();
     auto it = snapshot->items.find(std::string(id));

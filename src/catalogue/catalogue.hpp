@@ -216,6 +216,10 @@ class CatalogueManager {
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
     std::shared_ptr<const CatalogueSnapshot> snapshot_view();
+    // The same, for a caller that says who it is. Warm, it waits on nothing
+    // (the cached snapshot); cold, it loads the catalogue from metadata and
+    // the control store, and the wait guard refuses that to control work.
+    std::shared_ptr<const CatalogueSnapshot> snapshot_view(const WorkContext&);
     std::optional<CatalogueItem> get(std::string_view id);
     std::optional<MediaProbeResult> media_profile(std::string_view media_id);
     ResolvedMediaProfile resolve_media_profile(

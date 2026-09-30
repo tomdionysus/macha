@@ -479,7 +479,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             }
             std::optional<std::string_view> parent;
             if (auto it = request.query.find("parent"); it != request.query.end()) parent = it->second;
-            auto snapshot = catalogue_.snapshot_view();
+            auto snapshot = catalogue_.snapshot_view(
+                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/items"));
             return json(200, items_json(catalogue_.list(kind, parent), *snapshot,
                                         {catalogue_.cluster_keys(), artwork_capability_ttl_}));
         }
@@ -513,7 +514,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 if (parent && item.parent_id != parent) return false;
                 return true;
             };
-            auto snapshot = catalogue_.snapshot_view();
+            auto snapshot = catalogue_.snapshot_view(
+                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/search"));
             return json(200, items_json(catalogue_.search(q->second, limit, keep), *snapshot,
                                         {catalogue_.cluster_keys(), artwork_capability_ttl_}));
         }
@@ -646,7 +648,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (request.method == "GET") {
                 auto item = catalogue_.get(id);
                 if (!item) return error(404, "not_found", "catalogue item not found");
-                auto snapshot = catalogue_.snapshot_view();
+                auto snapshot = catalogue_.snapshot_view(
+                WorkContext(FrameType::control, {}, nullptr, "/api/v1/catalogue/items/{id}"));
                 auto response = json(200, item_json(*item, *snapshot,
                                                     {catalogue_.cluster_keys(), artwork_capability_ttl_}));
                 response.headers["ETag"] = "\"rev-" + std::to_string(item->revision) + "\"";
@@ -673,7 +676,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 apply_item_fields(item, root, request.method == "PUT");
                 validate_parent(catalogue_, item);
                 auto saved = catalogue_.upsert(std::move(item), expected_revision(request));
-                auto snapshot = catalogue_.snapshot_view();
+                auto snapshot = catalogue_.snapshot_view(
+                WorkContext(FrameType::control, {}, nullptr, "/api/v1/catalogue/items/{id}"));
                 auto response = json(existing ? 200 : 201, item_json(saved, *snapshot,
                                                     {catalogue_.cluster_keys(), artwork_capability_ttl_}));
                 response.headers["ETag"] = "\"rev-" + std::to_string(saved.revision) + "\"";
