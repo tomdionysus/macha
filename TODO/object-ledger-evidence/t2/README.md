@@ -54,3 +54,28 @@ Scope, honestly: the analysis is per function. A call inside the region to
 another function that takes an object lock is caught only once that function
 is itself annotated `MACHA_EXCLUDES(no_io)`; that annotation spreads with
 the L track, file by file.
+
+# T2c (part): the wait guard on the snapshot views
+
+`MetadataManager::snapshot_view(const WorkContext&)` enters the guard always
+(it may refresh from the replicas: state device and network);
+`CatalogueManager::snapshot_view(const WorkContext&)` only when cold (warm it
+serves the cached snapshot and waits on nothing). `WorkContext` names its
+origin. The seven HTTP call sites ACTIVE item 2 lists now pass a control
+context naming their route.
+
+- A control context entering `MetadataManager::snapshot_view` throws in the
+  guard's test mode; a loader context does not; a control context on a warm
+  catalogue does not. Removing the guard fails the test (mutation-proven).
+- **ACTIVE item 2 corrected:** the four `catalogue_api.cpp` sites call
+  `CatalogueManager::snapshot_view()`, which is memory-only when warm and
+  reaches metadata only when cold; one `manage_api.cpp` site (730) calls
+  `MetadataManager::snapshot_view()` directly.
+- **The audit, from the suites:** a full verbose run (643/643) in the guard's
+  record mode logged no control path into a guarded operation. The catalogue
+  is always warm by the time a test's API read arrives, and the direct
+  metadata call (POST `/api/v1/manage/nodes/{id}/identity-association/reset`
+  with no host, for a node absent from live membership) is not exercised by
+  any test. The guard sees only what the suites drive: the cold-catalogue
+  case and that route need cases of their own before the list can be called
+  complete.

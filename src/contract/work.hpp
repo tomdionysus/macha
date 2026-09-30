@@ -19,11 +19,15 @@ class WorkContext {
   public:
     using Clock = std::chrono::steady_clock;
 
+    // `origin` names who is asking ("GET /api/v1/catalogue/items"): a
+    // string with static storage, reported by the wait guard.
     explicit WorkContext(FrameType frame_type = FrameType::loader, Clock::time_point deadline = {},
-                         std::atomic_bool* cancelled = nullptr) noexcept
-        : frame_type_(frame_type), deadline_(deadline), cancelled_(cancelled) {}
+                         std::atomic_bool* cancelled = nullptr,
+                         const char* origin = "unnamed") noexcept
+        : frame_type_(frame_type), deadline_(deadline), cancelled_(cancelled), origin_(origin) {}
 
     FrameType frame_type() const noexcept { return frame_type_; }
+    const char* origin() const noexcept { return origin_; }
     Clock::time_point deadline() const noexcept { return deadline_; }
     std::atomic_bool* cancellation() const noexcept { return cancelled_; }
     bool cancelled() const noexcept {
@@ -38,6 +42,7 @@ class WorkContext {
     FrameType frame_type_;
     Clock::time_point deadline_;
     std::atomic_bool* cancelled_;
+    const char* origin_;
 };
 
 // What an operation may wait on, declared on its contract. `locks` means it
@@ -69,8 +74,8 @@ constexpr bool may_enter(FrameType frame_type, Waits declared) noexcept {
 
 // The runtime boundary check. Each operation that declares a device or
 // network wait calls enter() with the caller's context. A refusal is counted
-// and logged once per operation name in production; tests switch the guard
-// to throw, so a control path reaching such an operation fails the test.
+// and logged once per (origin, operation) in production; tests switch the
+// guard to throw, so a control path reaching such an operation fails the test.
 class WaitGuard {
   public:
     enum class Mode { record, throw_on_violation };

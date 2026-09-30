@@ -727,7 +727,8 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                         }
                     }
                     if (host.empty()) {
-                        auto view = metadata_.snapshot_view();
+                        auto view = metadata_.snapshot_view(WorkContext(
+                            FrameType::control, {}, nullptr, "POST /api/v1/manage/nodes/{id}"));
                         if (auto found = view.snapshot->node_status.find(*stale_id);
                             found != view.snapshot->node_status.end()) {
                             host = found->second.host;
@@ -755,7 +756,8 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
             // legitimate case: a multi-episode file, bound to several episodes
             // of one season.
             std::map<std::string, std::vector<const CatalogueItem*>> bound;
-            const auto snapshot = catalogue_.snapshot_view();
+            const auto snapshot = catalogue_.snapshot_view(
+                WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/unmatched"));
             for (const auto& [_, item] : snapshot->items) {
                 if (item.kind != CatalogueKind::movie && item.kind != CatalogueKind::episode &&
                     item.kind != CatalogueKind::track)
@@ -1009,7 +1011,8 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 return http_error(400, "not_directory", "path is not a directory");
             std::map<std::string, std::vector<std::string>, std::less<>> bindings;
             try {
-                bindings = media_bindings(*catalogue_.snapshot_view());
+                bindings = media_bindings(*catalogue_.snapshot_view(
+                    WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/filesystem")));
             } catch (const std::exception& e) {
                 // MachaDFS browsing is independent of catalogue availability.
                 // Binding annotations are a convenience only.
