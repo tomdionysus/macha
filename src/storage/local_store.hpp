@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include "storage/presence_index.hpp"
 #include <map>
 #include <set>
 #include <memory>
@@ -119,16 +120,15 @@ class LocalStore {
     std::function<void()> before_pack_compaction_for_tests_;
     static constexpr size_t verified_loose_limit = 4096;
     mutable std::map<ObjectId, VerifiedLoose> verified_loose_;
-    // Loose objects known present: installed by this process or seen by a
-    // positive has() stat, forgotten on remove. has() answers from here
-    // before touching the disk. A quantum commit re-claims every extent of
-    // its file, and a cold dentry stat on a disk saturated by the import
-    // cost ~5 ms each: 3,201 extents took 16 s per commit (gbni-1,
-    // 2026-09-07). ~40 B per object; a 200k-object node spends ~8 MB.
-    mutable std::set<ObjectId> present_loose_;
-    // Objects pruned as empty files, so the presence index warmed from
-    // directory names does not claim them again; a put clears the entry.
-    mutable std::set<ObjectId> pruned_loose_;
+    // Loose objects present, under m_: published by a put once its file is
+    // installed, filled from the object directory at start, forgotten on
+    // remove. Once warm-up has listed the store it is authoritative and has()
+    // answers from it alone -- no per-object lock, no disk (the object ledger
+    // plan, P). A quantum commit re-claims every extent of its file, and a
+    // cold dentry stat on a disk saturated by the import cost ~5 ms each:
+    // 3,201 extents took 16 s per commit (gbni-1, 2026-09-07). ~40 B per
+    // object; a 200k-object node spends ~8 MB.
+    mutable PresenceIndex presence_;
     mutable std::deque<std::pair<uint64_t, ObjectId>> verified_loose_order_;
     mutable uint64_t verified_loose_sequence_{};
     std::atomic_uint64_t loose_reaffirmation_fast_paths_{};
@@ -225,13 +225,19 @@ class LocalStore {
     uint64_t durable_generation() const;
     uint64_t durability_domain_id() const noexcept;
     std::optional<Bytes> get(const ObjectId&) const;
-    // Cheap presence check: an in-memory index hit for a packed object, or a
-    // single stat() for a loose one. Confirms the on-disk size is non-zero
-    // (loose writes are temp-file + rename, so a real object is never
-    // observed partially written; zero bytes only happens post-corruption)
-    // but never decrypts or verifies content. Callers that need to know the
-    // payload is genuinely intact must use get()/valid() instead.
+    // Presence, from the index: true once a put of the object has installed
+    // it, false while a put is still writing it and after a remove. Once
+    // warm-up has listed the store (presence_authoritative()) it waits on
+    // nothing but the store's index mutex and touches no device; before then
+    // a miss is checked on disk under the object's lock, and a zero-byte file
+    // found there is pruned. Never decrypts or verifies content: callers that
+    // need the payload intact use get()/valid().
     bool has(const ObjectId&) const noexcept;
+    // Whether warm-up has finished and has() answers from the index alone.
+    bool presence_authoritative() const {
+        std::lock_guard lock(m_);
+        return presence_.authoritative();
+    }
     bool valid(const ObjectId&) const noexcept;
     bool remove(const ObjectId&);
     bool remove_if_older_than(const ObjectId&, std::chrono::milliseconds);
@@ -264,6 +270,7 @@ class LocalStore {
         std::lock_guard lock(m_);
         before_pack_compaction_for_tests_ = std::move(hook);
     }
+
     uint64_t used() const { return used_.load(std::memory_order_relaxed); }
     uint64_t limit() const { return limit_; }
     bool scan_complete() const { return scan_complete_.load(std::memory_order_acquire); }

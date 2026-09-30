@@ -610,7 +610,7 @@ void LocalStore::remember_verified_loose_locked(const ObjectId& id,
 
 void LocalStore::forget_verified_loose_locked(const ObjectId& id) const {
     verified_loose_.erase(id);
-    present_loose_.erase(id);
+    presence_.forgotten(id);
 }
 
 bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::path& p) const {
@@ -622,8 +622,8 @@ bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::pa
         return false;
     {
         std::lock_guard lock(m_);
-        forget_verified_loose_locked(id);
-        pruned_loose_.insert(id);
+        verified_loose_.erase(id);
+        presence_.pruned(id);
     }
     Log::warn("storage pruned an empty object file id=" + to_string(id) + " path=" + p.string());
     return true;
@@ -973,8 +973,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         reserved_write_bytes_ -= need;
         used_.fetch_add(need, std::memory_order_relaxed);
         remember_verified_loose_locked(id, *installed_stamp);
-        present_loose_.insert(id);
-        pruned_loose_.erase(id);
+        presence_.installed(id);
         uint64_t generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
@@ -1209,11 +1208,24 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
 
 bool LocalStore::has(const ObjectId& id) const noexcept {
     try {
+        // After warm-up the index is the answer. A put publishes presence
+        // only once its file is installed, so a put in progress reads as
+        // absent, never as half-written; nothing else writes objects.
+        {
+            std::lock_guard lock(m_);
+            if (packed_.contains(id))
+                return true;
+            if (const auto known = presence_.answer(id); known != PresenceIndex::Answer::unknown)
+                return known == PresenceIndex::Answer::present;
+        }
+        // Before warm-up has listed the store, a miss is asked of the
+        // device, under the object's lock so a put of it is not seen midway.
         auto object_lock = object_mutex(id);
         std::lock_guard object_guard(*object_lock);
         {
             std::lock_guard lock(m_);
-            if (packed_.contains(id) || present_loose_.contains(id))
+            if (packed_.contains(id) ||
+                presence_.answer(id) == PresenceIndex::Answer::present)
                 return true;
         }
         std::error_code error;
@@ -1222,7 +1234,7 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         const bool present = !error && size > 0;
         if (present) {
             std::lock_guard lock(m_);
-            present_loose_.insert(id);
+            presence_.observed(id);
         } else if (!error) {
             (void)prune_empty_loose(id, p);
         }
@@ -1760,8 +1772,7 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
     const auto flush = [&] {
         if (batch.empty()) return;
         std::lock_guard lock(m_);
-        for (const auto& id : batch)
-            if (!pruned_loose_.contains(id)) present_loose_.insert(id);
+        presence_.listed(batch);
         entries += batch.size();
         batch.clear();
     };
@@ -1778,6 +1789,10 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
     }
     flush();
     presence_index_entries_.store(entries, std::memory_order_relaxed);
+    if (!error) {
+        std::lock_guard lock(m_);
+        presence_.warmed();
+    }
     Log::debug("storage presence index warmed path=" + root_.string() +
                " objects=" + std::to_string(entries) + " elapsed_ms=" +
                std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1811,8 +1826,16 @@ void LocalStore::scan(std::stop_token stop) {
                         std::lock_guard object_guard(*object_lock);
                         (void)prune_empty_loose(*id, it->path());
                     } else if (size > 0) {
-                        std::lock_guard lock(m_);
-                        present_loose_.insert(*id);
+                        // Under the object's lock and only if the file is
+                        // still there: a remove between this listing and here
+                        // must not be undone once presence is authoritative.
+                        auto object_lock = object_mutex(*id);
+                        std::lock_guard object_guard(*object_lock);
+                        std::error_code exists_error;
+                        if (std::filesystem::exists(it->path(), exists_error)) {
+                            std::lock_guard lock(m_);
+                            presence_.observed(*id);
+                        }
                     }
                 }
             }
