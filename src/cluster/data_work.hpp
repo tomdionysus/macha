@@ -4,6 +4,7 @@
 #include "storage/io_pressure.hpp"
 #include "log.hpp"
 #include "cluster/net.hpp"
+#include "contract/work.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,17 +18,11 @@
 
 namespace macha {
 
-// Immutable provenance and bounds for DATA-plane work. CONTROL deliberately
-// remains outside this pool on its independently reserved transport/executors.
-class DataWorkContext {
-  public:
-    using Clock = std::chrono::steady_clock;
-
-  private:
-    FrameType frame_type_{FrameType::loader};
+// Immutable provenance and bounds for DATA-plane work: the DATA
+// specialisation of WorkContext. CONTROL deliberately remains outside this
+// pool on its independently reserved transport/executors.
+class DataWorkContext : public WorkContext {
     uint64_t quantum_bytes_{};
-    Clock::time_point deadline_{};
-    std::atomic_bool* cancelled_{};
     // A no-progress budget, distinct from the absolute deadline above. Work
     // that legitimately takes a long time must not be cancelled for taking it,
     // but work that is not moving at all must eventually fail rather than wait
@@ -45,8 +40,8 @@ class DataWorkContext {
                              std::atomic_bool* cancelled = nullptr,
                              const std::atomic_uint64_t* progress = nullptr,
                              std::chrono::milliseconds no_progress_budget = {})
-        : frame_type_(frame_type), quantum_bytes_(quantum_bytes), deadline_(deadline),
-          cancelled_(cancelled), progress_(progress), no_progress_budget_(no_progress_budget) {
+        : WorkContext(frame_type, deadline, cancelled), quantum_bytes_(quantum_bytes),
+          progress_(progress), no_progress_budget_(no_progress_budget) {
         if (frame_type == FrameType::control)
             throw std::invalid_argument("control is not a DATA work class");
     }
@@ -57,16 +52,7 @@ class DataWorkContext {
     }
     std::chrono::milliseconds no_progress_budget() const noexcept { return no_progress_budget_; }
 
-    FrameType frame_type() const noexcept { return frame_type_; }
     uint64_t quantum_bytes() const noexcept { return quantum_bytes_; }
-    Clock::time_point deadline() const noexcept { return deadline_; }
-    std::atomic_bool* cancellation() const noexcept { return cancelled_; }
-    bool cancelled() const noexcept {
-        return cancelled_ && cancelled_->load(std::memory_order_relaxed);
-    }
-    bool expired(Clock::time_point now = Clock::now()) const noexcept {
-        return deadline_ != Clock::time_point{} && now >= deadline_;
-    }
 };
 
 struct DataResourceStats {

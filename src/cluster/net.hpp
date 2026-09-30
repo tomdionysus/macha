@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "cluster/frame_type.hpp"
 #include "crypto.hpp"
 #include "types.hpp"
 
@@ -158,15 +159,7 @@ const char* transport_lane_name(TransportLane) noexcept;
 inline constexpr size_t max_pending_rpc_requests = 512;
 inline constexpr size_t max_peer_outbound_messages = 256;
 
-enum class FrameType : uint8_t {
-    control = 1,
-    foreground = 2,
-    read_ahead = 3,
-    speculative = 4,
-    // User-requested bulk work. Keep the existing speculative wire value
-    // stable; priority is defined by frame_type_priority(), not enum order.
-    loader = 5,
-};
+
 
 // Bytes this node has put on and taken off the wire, by frame class, since
 // start: every sealed fragment, header and AEAD overhead included. One is
