@@ -79,3 +79,43 @@ context naming their route.
   any test. The guard sees only what the suites drive: the cold-catalogue
   case and that route need cases of their own before the list can be called
   complete.
+
+# T2c (part two): the claim walk on the contracts
+
+`ObjectStore` (`src/contract/object_store.hpp`, B1: `has()` so far, waits on
+nothing) is implemented by `LocalStore` and `StoragePool`. `ObjectLedger`
+(`src/contract/object_ledger.hpp`, B3 as far as the walk needs:
+`claimed(class, cursor, budget)` pages and `held(class, id)`) is implemented
+at stage 0 by `RetentionLedger` over the `RetentionStore` and the two object
+stores. The claim walk left the maintenance lambda for `ClaimWalk`
+(`src/service/claim_walk.{hpp,cpp}`): one 16-claim page per class per step,
+a cursor it keeps, and a `ClaimRestorer` for each claim not held. The
+maintenance pass supplies the restorer (network credit, the fetch, the trace
+line) and reads the step's counts; nothing else in the pass changed.
+
+- **Equivalence, by construction of the test:** the walk is run side by side
+  with a reference copy of the 0.73 lambda (next_retained one claim at a
+  time, 16 per step) over fakes, comparing every step's counts, every
+  restorer call and the cursor: every held pattern over 0..8 claims, credit
+  0..3 with and without refill, with and without a refused restore; 15, 16,
+  17, 32, 33 and 50 claims across the step bound; and a ledger changing
+  between steps. `RetentionLedger` is checked against the store it pages
+  (0..9 claims with released ones skipped, page bounds 1..10, zero budget,
+  cancellation, class routing of `held`).
+- **Mutation:** 16/16 mutants killed (credit wait position, unfinished on
+  bound and on credit wait, resume, cursor advance, restored and missing
+  counts, held claims restored, bound 15 and 17; ledger wrap, next, budget,
+  cancellation, class swap). One first-cut mutant did not compile and was
+  rewritten (`!held || true`).
+- **Traces:** the seven maintenance trace fixtures pass unchanged; two of
+  them (`claimed-objects-lost`, `incomplete-catalogue`) contain claim-walk
+  actions in both classes. Full suite 649/649 (Clang, laptop).
+- **Cost:** `baseline/test_baseline_claim_walk_on_the_ledger_per_object`
+  walks the same 2000 held claims as the T0 per-object baseline. Ten serial
+  runs each, same binary: old walk median ~3.05 us/claim (1.4..4.5), ledger
+  walk median ~3.2 us/claim (1.8..5.0). Both distributions are bimodal
+  (laptop frequency scaling); the difference is inside the spread. The cost
+  per claim is the presence check, not the paging.
+- **One definition moved:** `maintenance.claim_walk.examine_us` timed
+  next_retained plus has(); it now times `held()` alone, the paging being
+  done once per page. Examined and missing counters are unchanged.

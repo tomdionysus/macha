@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/object_store.hpp"
 #include "storage/io_pressure.hpp"
 #include "storage/local_store.hpp"
 
@@ -15,7 +16,7 @@
 
 namespace macha {
 
-class StoragePool {
+class StoragePool final : public ObjectStore {
     struct Backend;
 
   public:
@@ -126,7 +127,7 @@ class StoragePool {
     // online backend has the object.
     std::optional<DurabilityToken> reassert_durable(const ObjectId&);
     std::optional<Bytes> get(const ObjectId&) const;
-    bool has(const ObjectId&) const;
+    bool has(const ObjectId&) const override;
     bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;
