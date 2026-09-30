@@ -1054,8 +1054,7 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
 bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                           StoreWriteDurability durability, uint64_t* deferred_generation) {
     if (object_id(data) != id) throw std::runtime_error("object hash mismatch");
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     std::unique_lock lock(m_);
     wait_for_accounting(lock);
 
@@ -1175,8 +1174,7 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
 }
 
 std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     std::unique_lock lock(m_);
     if (packed_.contains(id))
         return get_packed_locked(id, lock);
@@ -1206,22 +1204,26 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     return plain;
 }
 
+std::optional<bool> LocalStore::presence_from_index(const ObjectId& id) const {
+    NoIoRegion no_io_region;
+    std::lock_guard lock(m_);
+    if (packed_.contains(id))
+        return true;
+    if (const auto known = presence_.answer(id); known != PresenceIndex::Answer::unknown)
+        return known == PresenceIndex::Answer::present;
+    return std::nullopt;
+}
+
 bool LocalStore::has(const ObjectId& id) const noexcept {
     try {
         // After warm-up the index is the answer. A put publishes presence
         // only once its file is installed, so a put in progress reads as
         // absent, never as half-written; nothing else writes objects.
-        {
-            std::lock_guard lock(m_);
-            if (packed_.contains(id))
-                return true;
-            if (const auto known = presence_.answer(id); known != PresenceIndex::Answer::unknown)
-                return known == PresenceIndex::Answer::present;
-        }
+        if (const auto known = presence_from_index(id))
+            return *known;
         // Before warm-up has listed the store, a miss is asked of the
         // device, under the object's lock so a put of it is not seen midway.
-        auto object_lock = object_mutex(id);
-        std::lock_guard object_guard(*object_lock);
+        ObjectLock object_guard(object_mutex(id));
         {
             std::lock_guard lock(m_);
             if (packed_.contains(id) ||
@@ -1327,16 +1329,14 @@ uint64_t LocalStore::durability_domain_id() const noexcept {
 }
 
 bool LocalStore::remove(const ObjectId& id) {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     std::unique_lock lock(m_);
     wait_for_accounting(lock);
     return remove_locked(id, lock);
 }
 
 bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseconds age) {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     std::unique_lock lock(m_);
     wait_for_accounting(lock);
     if (auto found = packed_.find(id); found != packed_.end()) {
@@ -1418,8 +1418,7 @@ std::filesystem::path LocalStore::object_path(const ObjectId& id) const {
 }
 
 uint64_t LocalStore::stored_size(const ObjectId& id) const {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     {
         std::lock_guard lock(m_);
         if (auto found = packed_.find(id); found != packed_.end())
@@ -1431,8 +1430,7 @@ uint64_t LocalStore::stored_size(const ObjectId& id) const {
 }
 
 std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     {
         std::lock_guard lock(m_);
         if (auto found = packed_.find(id); found != packed_.end())
@@ -1444,8 +1442,7 @@ std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const
 }
 
 void LocalStore::touch(const ObjectId& id) {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     std::unique_lock lock(m_);
     if (auto found = packed_.find(id); found != packed_.end()) {
         uint64_t record_size = 0;
@@ -1467,8 +1464,7 @@ void LocalStore::touch(const ObjectId& id) {
 }
 
 bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) const {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     {
         std::lock_guard lock(m_);
         if (auto found = packed_.find(id); found != packed_.end()) {
@@ -1484,8 +1480,7 @@ bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) c
 }
 
 bool LocalStore::is_packed(const ObjectId& id) const {
-    auto object_lock = object_mutex(id);
-    std::lock_guard object_guard(*object_lock);
+    ObjectLock object_guard(object_mutex(id));
     std::lock_guard lock(m_);
     return packed_.contains(id);
 }
@@ -1822,15 +1817,13 @@ void LocalStore::scan(std::stop_token stop) {
             if (root == objects_) {
                 if (auto id = object_id_from_file_name(name)) {
                     if (!size_error && size == 0) {
-                        auto object_lock = object_mutex(*id);
-                        std::lock_guard object_guard(*object_lock);
+                        ObjectLock object_guard(object_mutex(*id));
                         (void)prune_empty_loose(*id, it->path());
                     } else if (size > 0) {
                         // Under the object's lock and only if the file is
                         // still there: a remove between this listing and here
                         // must not be undone once presence is authoritative.
-                        auto object_lock = object_mutex(*id);
-                        std::lock_guard object_guard(*object_lock);
+                        ObjectLock object_guard(object_mutex(*id));
                         std::error_code exists_error;
                         if (std::filesystem::exists(it->path(), exists_error)) {
                             std::lock_guard lock(m_);
