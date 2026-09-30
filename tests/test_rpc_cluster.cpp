@@ -538,7 +538,7 @@ MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
     const std::vector<ObjectId> live{id};
     DistributedStore store(node);
     for (int pass = 0; pass < 4; ++pass)
-        (void)store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+        (void)store.repair_step(8ULL * 1024 * 1024, 16, &live);
     CHECK(probes.load() == 0);
     CHECK(puts.load() == 0);
     // Never dropped for want of a second copy.
@@ -549,7 +549,7 @@ MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
     peer.seen_unix_ms = unix_ms();
     node.membership().observe(peer, true);
     for (int pass = 0; pass < 4 && puts.load() == 0; ++pass)
-        (void)store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+        (void)store.repair_step(8ULL * 1024 * 1024, 16, &live);
     CHECK(puts.load() > 0);
     server.stop();
 }
@@ -620,12 +620,12 @@ MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_w
     // Push: the peer is probed, and the put is charged the object's own size
     // (0.72.0 charged a full extent), so it waits for exactly that much.
     const std::vector<ObjectId> held_live{held};
-    auto push = store.repair_step(held_bytes.size() - 1, 16, &held_live, nullptr);
+    auto push = store.repair_step(held_bytes.size() - 1, 16, &held_live);
     CHECK(probes.load() > 0);
     CHECK(puts.load() == 0);
     CHECK(push.credit_limited);
     CHECK(!push.complete);
-    push = store.repair_step(held_bytes.size(), 16, &held_live, nullptr);
+    push = store.repair_step(held_bytes.size(), 16, &held_live);
     CHECK(puts.load() == 1);
     CHECK(!push.credit_limited);
     peer_holds_held = true;
@@ -637,12 +637,12 @@ MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_w
     DistributedStore puller(node);
     DistributedStore::RepairResult pull;
     for (int step = 0; step < 8 && !pull.credit_limited; ++step)
-        pull = puller.repair_step(short_of_an_extent, 16, &pull_live, nullptr);
+        pull = puller.repair_step(short_of_an_extent, 16, &pull_live);
     CHECK(pull.credit_limited);
     CHECK(fetches.load() == 0);
     CHECK(!node.local_store().has(wanted));
     for (int step = 0; step < 8 && !node.local_store().has(wanted); ++step)
-        (void)puller.repair_step(node.config().extent_size, 16, &pull_live, nullptr);
+        (void)puller.repair_step(node.config().extent_size, 16, &pull_live);
     CHECK(fetches.load() == 1);
     CHECK(node.local_store().has(wanted));
     server.stop();
@@ -757,7 +757,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object
     std::sort(live.begin(), live.end());
 
     DistributedStore store(node);
-    const auto step = store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+    const auto step = store.repair_step(8ULL * 1024 * 1024, 16, &live);
     CHECK(step.push_examined == live.size());
     CHECK(peer.batch_requests.load() == 3); // 16 + 16 + 8
     CHECK(peer.single_probes.load() == 0);
@@ -766,7 +766,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object
     // A peer that predates have_valid_objects is asked one object at a time.
     peer.knows_batch = false;
     DistributedStore older(node);
-    const auto fallback = older.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+    const auto fallback = older.repair_step(8ULL * 1024 * 1024, 16, &live);
     CHECK(fallback.push_examined == live.size());
     CHECK(peer.single_probes.load() == live.size());
     CHECK(peer.puts.load() == 0);
@@ -794,7 +794,7 @@ MACHA_TEST("rpc_cluster", test_repair_pushes_several_objects_at_once) {
 
     DistributedStore store(node);
     const auto started = Clock::now();
-    const auto step = store.repair_step(64ULL * 1024 * 1024, 16, &live, nullptr);
+    const auto step = store.repair_step(64ULL * 1024 * 1024, 16, &live);
     const auto elapsed = Clock::now() - started;
     CHECK(peer.puts.load() == live.size());
     CHECK(step.push_examined == live.size());
@@ -829,11 +829,11 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
     {
         DistributedStore store(node);
         store.persist_repair_position(position);
-        const auto first = store.repair_step(64ULL * 1024 * 1024, 16, &live, nullptr, {}, 1);
+        const auto first = store.repair_step(64ULL * 1024 * 1024, 16, &live, {}, 1);
         CHECK(first.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
         // A new generation continues from where the pass had reached.
-        const auto second = store.repair_step(64ULL * 1024 * 1024, 16, &live, nullptr, {}, 2);
+        const auto second = store.repair_step(64ULL * 1024 * 1024, 16, &live, {}, 2);
         CHECK(second.push_examined == 36);
         CHECK(peer.batch_requests.load() == 4 + 3);
         // The pass spanned a change, so it is not reported settled.
@@ -847,14 +847,14 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
     {
         DistributedStore store(node);
         store.persist_repair_position(restart_position);
-        const auto before = store.repair_step(64ULL * 1024 * 1024, 16, &live, nullptr, {}, 3);
+        const auto before = store.repair_step(64ULL * 1024 * 1024, 16, &live, {}, 3);
         CHECK(before.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
     }
     peer.batch_requests = 0;
     DistributedStore restarted(node);
     restarted.persist_repair_position(restart_position);
-    const auto resumed = restarted.repair_step(64ULL * 1024 * 1024, 16, &live, nullptr, {}, 3);
+    const auto resumed = restarted.repair_step(64ULL * 1024 * 1024, 16, &live, {}, 3);
     CHECK(resumed.push_examined == 36);
     CHECK(peer.batch_requests.load() == 3);
 }
@@ -874,7 +874,7 @@ MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers
     REQUIRE(node.local_store().put(small, small_bytes));
     DistributedStore store(node);
     const std::vector<ObjectId> small_live{small};
-    (void)store.repair_step(64ULL * 1024 * 1024, 16, &small_live, nullptr);
+    (void)store.repair_step(64ULL * 1024 * 1024, 16, &small_live);
     REQUIRE(peer.puts.load() == 1);
     CHECK(store.estimated_network_bps() == 0.0);
 
@@ -883,7 +883,7 @@ MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers
     REQUIRE(node.local_store().put(large, large_bytes));
     DistributedStore extents(node);
     const std::vector<ObjectId> large_live{large};
-    (void)extents.repair_step(64ULL * 1024 * 1024, 16, &large_live, nullptr);
+    (void)extents.repair_step(64ULL * 1024 * 1024, 16, &large_live);
     REQUIRE(peer.puts.load() == 2);
     CHECK(extents.estimated_network_bps() > 0.0);
 
@@ -995,7 +995,7 @@ MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_e
     const auto before = node.data_resources().stats().speculative_admissions;
     size_t examined = 0;
     for (int pass = 0; pass < 8 && examined < live.size(); ++pass) {
-        const auto result = store.repair_step(8ULL * 1024 * 1024, 16, &live, nullptr);
+        const auto result = store.repair_step(8ULL * 1024 * 1024, 16, &live);
         examined += result.pull_examined;
     }
     CHECK(examined >= live.size());
@@ -1054,7 +1054,7 @@ MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_t
     REQUIRE(!node.local_store().has(id));
     const std::vector<ObjectId> live{id};
 
-    auto result = store.repair_step(8ULL * 1024 * 1024, 8, &live, nullptr,
+    auto result = store.repair_step(8ULL * 1024 * 1024, 8, &live,
                                     [&] { return fetches.load() > 0; });
     CHECK(fetches.load() == 1);
     CHECK(result.bytes_transferred == bytes.size());

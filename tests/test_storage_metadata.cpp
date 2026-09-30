@@ -4017,7 +4017,9 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
 
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.replication = c2.replication = 1;
+    // Both nodes own every object, so the one object below is repair's to
+    // push to n2; n2's own repair never pulls it first, having no credit.
+    c1.replication = c2.replication = 2;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.maintenance.idle_bandwidth_fraction = 0.0;
     c2.maintenance.idle_bandwidth_fraction = 0.0;
@@ -4041,12 +4043,11 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     REQUIRE(s1.node().local_store().put(id, bytes));
     REQUIRE(!s2.node().local_store().has(id));
     std::vector<ObjectId> live{id};
-    std::vector<ObjectId> universal{id};
     DistributedStore repair(s1.node());
     const auto full_lists_before = s1.node().local_store().full_list_scans();
 
     auto yielded =
-        repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal, [] { return true; });
+        repair.repair_step(8ULL * 1024 * 1024, 8, &live, [] { return true; });
     CHECK(yielded.yielded);
     CHECK(!yielded.complete);
     CHECK(yielded.bytes_transferred == 0);
@@ -4055,13 +4056,13 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     // One remote operation is enough to probe but not both probe and upload.
     // The pass must report itself incomplete rather than being mistaken for a
     // quiescent namespace simply because it transferred zero bytes.
-    auto bounded = repair.repair_step(8ULL * 1024 * 1024, 1, &live, &universal);
+    auto bounded = repair.repair_step(8ULL * 1024 * 1024, 1, &live);
     CHECK(!bounded.complete);
     CHECK(bounded.bytes_transferred == 0);
     CHECK(bounded.remote_operations == 1);
     CHECK(!s2.node().local_store().has(id));
 
-    auto completed = repair.repair_step(8ULL * 1024 * 1024, 8, &live, &universal);
+    auto completed = repair.repair_step(8ULL * 1024 * 1024, 8, &live);
     CHECK(completed.bytes_transferred == bytes.size());
     CHECK(completed.complete);
     CHECK(completed.remote_operations <= 8);
