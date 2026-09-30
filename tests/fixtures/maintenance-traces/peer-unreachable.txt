@@ -1,0 +1,49 @@
+step: started
+  state: data_objects=0 data_claims=0 control_claims=0
+  gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1
+  gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
+  gate.tombstones = reachable=1 stable=1 catalogue_complete=1
+  inventory = generation=2 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=0
+step: peer joined, file written
+  state: data_objects=1 data_claims=1 control_claims=0
+  object doomed: held=1 claimed=1
+  gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1
+  gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
+  gate.tombstones = reachable=1 stable=1 catalogue_complete=1
+  inventory = generation=4 live=1 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=1 control_live=0
+step: peer gone, file deleted
+  state: data_objects=1 data_claims=1 control_claims=0
+  object doomed: held=1 claimed=1
+  gate.control = destructive=0 catalogue_complete=1 control_live=1 generation_current=1
+  gate.data = reachable=0 stable=0 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
+  gate.tombstones = reachable=0 stable=0 catalogue_complete=1
+  inventory = generation=5 live=0 control_live=0 garbage=1 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=0
+step: peer gone past the grace
+  state: data_objects=1 data_claims=1 control_claims=0
+  object doomed: held=1 claimed=1
+  gate.control = destructive=0 catalogue_complete=1 control_live=1 generation_current=1
+  gate.data = reachable=0 stable=0 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
+  gate.tombstones = reachable=0 stable=0 catalogue_complete=1
+  inventory = generation=5 live=0 control_live=0 garbage=1 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=0
+step: peer back
+  state: data_objects=1 data_claims=0 control_claims=0
+  object doomed: held=1 claimed=0
+  release.data: 1
+  tombstones: erase=[#1] stamp=[]
+  gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1
+  gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
+  gate.tombstones = reachable=1 stable=1 catalogue_complete=1
+  inventory = generation=6 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=0
+step: the pass after the peer returned
+  state: data_objects=1 data_claims=0 control_claims=0
+  object doomed: held=1 claimed=0
+  gate.control = destructive=1 catalogue_complete=1 control_live=1 generation_current=1
+  gate.data = reachable=1 stable=1 release_view=1 baseline=1 catalogue_complete=1 live=1 generation_current=1
+  gate.tombstones = reachable=1 stable=1 catalogue_complete=1
+  inventory = generation=6 live=0 control_live=0 garbage=0 stale_garbage=0 catalogue_complete=1
+  release-horizon = complete data_live=0 control_live=0

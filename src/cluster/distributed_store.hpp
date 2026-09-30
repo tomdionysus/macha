@@ -178,8 +178,20 @@ class DistributedStore {
     std::atomic_uint64_t repair_gate_quiescent_{};
     std::atomic_uint64_t repair_gate_credit_{};
     std::atomic_uint64_t repair_last_credit_{};
+    // The decision trace's view of repair (the object ledger plan, T1): each
+    // copy pushed, each pull and each local copy dropped, in the order repair
+    // decides them; objects it only verifies are not decisions. Set once
+    // before maintenance starts.
+    std::function<void(std::string_view kind, std::string_view detail)> repair_trace_;
+    void trace_repair(const std::string& detail) const {
+        if (repair_trace_)
+            repair_trace_("repair", detail);
+    }
 
   public:
+    void set_repair_trace(std::function<void(std::string_view, std::string_view)> trace) {
+        repair_trace_ = std::move(trace);
+    }
     enum class RepairGate { ran, share, quiescent, credit };
     void note_repair_gate(RepairGate gate, double credit) noexcept {
         repair_last_credit_.store(static_cast<uint64_t>(std::max(0.0, credit)),
