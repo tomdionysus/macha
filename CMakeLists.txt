@@ -275,6 +275,7 @@ set(MACHA_CORE_SOURCES
     src/subsystem/subsystem_registry.cpp
     src/subsystem/subsystem_supervisor.cpp
     src/storage/durability_domain.cpp
+    src/storage/presence_index.cpp
     src/storage/local_store.cpp
     src/storage/storage_pool.cpp
     src/storage/retention.cpp
@@ -555,7 +556,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_models.cpp
         tests/test_observation.cpp
         tests/test_baselines.cpp
-        tests/test_maintenance_trace.cpp)
+        tests/test_maintenance_trace.cpp
+        tests/test_presence.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
