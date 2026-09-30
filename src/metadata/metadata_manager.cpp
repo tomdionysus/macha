@@ -1626,6 +1626,12 @@ MetadataRecord MetadataManager::read_record() {
     }
 }
 
+MetadataSnapshotView MetadataManager::snapshot_view(const WorkContext& context) {
+    (void)WaitGuard::enter(context, Waits::state_device | Waits::network,
+                           "MetadataManager::snapshot_view");
+    return snapshot_view();
+}
+
 MetadataSnapshotView MetadataManager::snapshot_view() {
     if (auto cached = cached_snapshot_view())
         return *cached;

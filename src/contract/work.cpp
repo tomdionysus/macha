@@ -40,14 +40,16 @@ bool WaitGuard::enter(const WorkContext& context, Waits declared, std::string_vi
     if (may_enter(context.frame_type(), declared))
         return true;
     guard_violations.fetch_add(1, std::memory_order_relaxed);
-    const std::string message = "control work entered " + std::string(operation) +
+    const std::string message = "control work (" + std::string(context.origin()) + ") entered " +
+                                std::string(operation) +
                                 ", which waits on the DATA device or the network";
     if (mode() == Mode::throw_on_violation)
         throw std::logic_error(message);
     bool first = false;
     {
         std::lock_guard lock(reported_mutex);
-        first = reported.emplace(operation).second;
+        first = reported.emplace(std::string(context.origin()) + " -> " + std::string(operation))
+                    .second;
     }
     if (first)
         Log::warn(message);

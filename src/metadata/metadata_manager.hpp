@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/work.hpp"
 #include "cluster/cluster.hpp"
 
 #include <atomic>
@@ -229,6 +230,11 @@ class MetadataManager {
     MetadataRecord read_record();
     MetadataSnapshot snapshot();
     MetadataSnapshotView snapshot_view();
+    // The same, for a caller that says who it is: it may refresh a stale
+    // cache from the replicas, so it waits on the state device and the
+    // network, and the wait guard refuses it to control work (T4 splits it
+    // into current() and converged()).
+    MetadataSnapshotView snapshot_view(const WorkContext&);
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
     MetadataClusterStatus cluster_status() const noexcept;
     MetadataHistoryTransferDiagnostics history_transfer_diagnostics() const noexcept {

@@ -8,6 +8,7 @@
 #include "contract/work.hpp"
 #include "log.hpp"
 #include "test_framework.hpp"
+#include "test_support.hpp"
 
 #include <array>
 #include <memory>
@@ -200,6 +201,31 @@ MACHA_FAST_TEST("contract", test_cursor_and_page) {
         page.stopped = stop;
         CHECK(!page.complete());
     }
+}
+
+// The guard on real operations: MetadataManager::snapshot_view may refresh
+// from the replicas, so control work may not enter it; the catalogue's warm
+// snapshot waits on nothing, so control work may.
+MACHA_TEST("contract", test_the_wait_guard_on_snapshot_views) {
+    macha::test_support::TestService fixture("wait-guard");
+    fixture.config().replication = 1;
+    fixture.config().metadata_min_write_replicas = 1;
+    auto& service = fixture.start();
+    (void)service.catalogue().snapshot_view(); // warm it
+
+    WaitGuard::set_mode(WaitGuard::Mode::throw_on_violation);
+    const WorkContext control(FrameType::control, {}, nullptr, "test control");
+    const WorkContext loader(FrameType::loader, {}, nullptr, "test loader");
+    bool threw = false;
+    try {
+        (void)service.metadata_manager().snapshot_view(control);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    (void)service.metadata_manager().snapshot_view(loader);
+    CHECK(service.catalogue().snapshot_view(control) != nullptr);
+    WaitGuard::set_mode(WaitGuard::Mode::record);
 }
 
 } // namespace
