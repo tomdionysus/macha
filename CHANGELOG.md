@@ -226,7 +226,7 @@ the first fragment. The client decides how long to wait; the node fails the
 start only when nothing has moved for `streaming.startup_no_progress_ms`. An
 async `PATCH` keeps the playing generation serving until its replacement is
 ready. Without the parameter nothing changes. Checked with Core and every
-client before it was built (TODO/2026-09-27-playback-start-progress-plan.md).
+client before it was built (TODO/archive/2026-09-27-playback-start-progress-plan.md).
 
 Measured on fi-1 (2026-09-28) with the start counters: a 4K HEVC 10-bit
 transcode start took 8.6-11.9 s, decoding at ~0.33x real time, with output
@@ -888,7 +888,7 @@ the metadata durability floor" while its only peer restarted. It was a bare
 
 ## 0.57.0 — A torrent is imported once it is published, and a metadata outage no longer kills an ingest (development)
 
-Finishes stage 2 of `TODO/2026-09-23-torrent-disk-backend-plan.md`, and
+Finishes stage 2 of `TODO/archive/2026-09-23-torrent-disk-backend-plan.md`, and
 ships the three fixes that plan promised with stage 1.
 
 **A downloaded torrent is handed to the ingest only once every extent is
@@ -1024,7 +1024,7 @@ a torrent's last extent is published.
 
 ## 0.55.0 — A torrent's extents are published as they verify (development)
 
-Stage 2 of `TODO/2026-09-23-torrent-disk-backend-plan.md`. **The torrent's
+Stage 2 of `TODO/archive/2026-09-23-torrent-disk-backend-plan.md`. **The torrent's
 disk backend now publishes each file-relative extent of the payload to the
 store the moment every piece covering it has verified**, and records it in an
 extent journal (`.macha-extents`) in the job's staging directory. When the
@@ -1096,7 +1096,7 @@ declared the device pressured, and the arbiter throttled publication to one
 slot -- which gbni-1 and es-1 then each held across a put to the other.
 Seven ingests died with `CONTROL retention floor unavailable before metadata
 publication`. The diagnosis is in
-`TODO/2026-09-23-torrent-writes-starve-publication-incident.md`.
+`TODO/archive/2026-09-23-torrent-writes-starve-publication-incident.md`.
 
 The backend (`src/torrent_disk_io.cpp`) implements libtorrent's
 `disk_interface` on the public API only, for 2.0 (the nodes) and 2.1:
@@ -1121,7 +1121,7 @@ The backend (`src/torrent_disk_io.cpp`) implements libtorrent's
 Payload is still written in the torrent's own file layout under the save path,
 so the ingest that runs after a download is unchanged. Assembling extents in
 staging and publishing each one as it is verified is the next stage of
-`TODO/2026-09-23-torrent-disk-backend-plan.md`.
+`TODO/archive/2026-09-23-torrent-disk-backend-plan.md`.
 
 **Removed: `torrent.pressure_download_rate`**, the rate clamp that flipped on
 and off with a two-second viewer window. es-1 logged 287 clamps and 287
@@ -2378,7 +2378,7 @@ decoded bytes, encoded payload, extent slots against extents in use, the
 relevant `sizeof`s, and bytes per TiB of library — and `snapshot_resident_bytes`
 is exposed from `metadata.hpp` so the tool charges exactly what the
 materialisation cache charges. This is the measurement behind Stage A of
-`TODO/2026-09-17-namespace-merkle-root-plan.md`, which the same numbers say is
+`TODO/archive/2026-09-17-namespace-merkle-root-plan.md`, which the same numbers say is
 still the load-bearing work: residency remains linear in the size of the
 library and whole-library on every node, including the ones that store no
 extents at all.
@@ -2412,7 +2412,7 @@ idle connection took most of the pool; one deeply prefetching player could
 take all of it; and when the pool was gone the node stopped answering
 `/api/v1/health` and `/api/v1/status`, which is exactly the shape of the
 unexplained 10 s Status response of 2026-09-13. Plan and reasoning:
-`TODO/2026-09-15-http-server-reactor-plan.md`.
+`TODO/archive/2026-09-15-http-server-reactor-plan.md`.
 
 What changed, in the order a request meets it:
 
@@ -2493,7 +2493,7 @@ worker a second connection was waiting for; it is now
 second connection is served while the first keeps its keep-alive.
 
 **Two suite failures that had been called "known flakes" are fixed, with
-their causes written down** (`TODO/2026-09-14-test-suite-must-be-deterministic-plan.md`,
+their causes written down** (`TODO/archive/2026-09-14-test-suite-must-be-deterministic-plan.md`,
 step 3). `IngestManager::ensure_namespace_parents` now treats `EEXIST` from
 `mkdir` as the directory existing and re-checks it: two concurrent imports
 into a scanner root, series or artist directory that did not exist yet both
@@ -2601,7 +2601,7 @@ nothing.** Two node properties, `network.inbound_capable` and
 self-declared and gossiped in every node's record (protocol 21, a
 rolling-upgrade event: mixed clusters refuse each other's handshakes as they
 always have). Plan and the verified state of the transport it builds on:
-`TODO/2026-09-15-inbound-incapable-nodes-plan.md`.
+`TODO/archive/2026-09-15-inbound-incapable-nodes-plan.md`.
 
 The transport already worked in both directions over one session: when a
 node dialled a peer, the peer registered that session as an inbound route
@@ -2826,7 +2826,7 @@ clusters (a per-run `MACHA_TEST_PORT_SALT` now separates them); and
 `TempDir` kept whatever a pid-reused, runner-killed predecessor left behind,
 so a fresh node could "recover" another test's state. Six cases that failed
 under load were classified and fixed; the list and the numbers are in
-`TODO/2026-09-14-test-suite-must-be-deterministic-plan.md`.
+`TODO/archive/2026-09-14-test-suite-must-be-deterministic-plan.md`.
 
 The case that had been waved past most often --
 `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`,
@@ -2877,8 +2877,8 @@ interface so all of that runs without a kernel mount, which is why the mount
 lifecycle has test coverage at all. `foundations/test_main_owns_signals_and_never_runs_the_mount_itself`
 keeps `main()` from growing the branch back. Full suite: 441 passing.
 
-Phase 2 of `TODO/2026-09-05-subsystem-plugin-isolation-plan.md`, planned in
-detail in `TODO/2026-09-14-fuse-supervised-subsystem-plan.md`. That plan's
+Phase 2 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`, planned in
+detail in `TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md`. That plan's
 Stage A and Stage B both landed here. Its Phase 3 audit item was struck as
 already satisfied by Phase 0.
 
@@ -3942,7 +3942,7 @@ twice its planned media.
   before anything is published — a plan that cannot predict its own output
   makes such a playlist wrong from its first line. That work is designed but
   not started: see
-  `TODO/2026-09-08-bounded-vod-playlist-and-segment-holds.md`.
+  `TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md`.
 
 ## 0.36.0 — The playlist says what the fragment holds (development)
 
@@ -4659,7 +4659,7 @@ publication completing.
 
 ## 0.32.0 — Compact history out of the hot path: DLT7, canonical tombstones, conflicts that leave (development)
 
-Discipline 4 of `TODO/2026-09-06-self-healing-disciplines-plan.md`, scoped
+Discipline 4 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`, scoped
 by measurement rather than by the plan's premise. `macha-metadata-dump
 --stats` (new) on the production head, 2026-09-06 23:30: 2,319,777 encoded
 bytes = entries 1,958,969 (of which extent tables 1,768,067 for 36,083
@@ -4708,7 +4708,7 @@ retirement log is not justified by the data and is not built.
 
 ## 0.31.0 — Recovery resolves, it does not refuse (development)
 
-Discipline 3 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. Local
+Discipline 3 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`. Local
 durable state is replayed on every start, so anything recovery *refuses*
 it refuses forever: the node either restarts in a loop or re-raises the
 same fault on every boot. Found on the cluster on 2026-09-06: gbni-1
@@ -4761,7 +4761,7 @@ open at 132 MB / 178 MB and re-parsed each start, with twenty benign
 
 ## 0.30.0 — "Not yet" never becomes "forever": retry budgets, parking, progress gates (development)
 
-Discipline 2 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. Every
+Discipline 2 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`. Every
 "try again later" in the daemon now has either a budget or a progress
 condition, so a fault that does not clear cannot hold a queue, a thread or a
 restart loop indefinitely. The proven cases from 2026-09-06: a FUSE
@@ -4815,7 +4815,7 @@ health is monitored" for 150–230 s.
 
 ## 0.29.0 — Durability is re-derived from disk, not asserted from a dead token (development)
 
-Discipline 1 of `TODO/2026-09-06-self-healing-disciplines-plan.md`. The
+Discipline 1 of `TODO/archive/2026-09-06-self-healing-disciplines-plan.md`. The
 proven 2026-09-06 wedge: gbni-1 had placed 13 extents of a 13.9 GB file on
 es-1; es-1 was restarted; from then on every barrier gbni-1 ran was refused
 with `storage durability epoch changed` and retried, at ~35/s, forever — the
@@ -5010,7 +5010,7 @@ is not what you reach for at 2am.
 
 ## 0.28.0 — BitTorrent acquisition moves into a real plugin (`libmacha-torrent`) (development)
 
-Phase 1 of `TODO/2026-09-05-subsystem-plugin-isolation-plan.md`. The download
+Phase 1 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`. The download
 engine and its whole libtorrent linkage now live in a `dlopen`'d module
 instead of inside `macha_core`, so whether a node can acquire over BitTorrent
 is a runtime fact — the plugin file is present or it isn't — rather than a
@@ -5148,7 +5148,7 @@ clusters keep working, they just cannot repair *from* an old peer.
   on the merging node -- the merging node stores each merge as a 15 MB *full*
   snapshot while shipping the compact delta to its peers. That is why
   history.log reached 25 GB on gbni-2. Separate issue; see
-  `TODO/2026-09-06-unreconstructable-accepted-head-retry-storm-incident.md`.
+  `TODO/archive/2026-09-06-unreconstructable-accepted-head-retry-storm-incident.md`.
 
 ## 0.26.2 — Bound the second, separate retry storm from the same 0.26.1 failure mode (development)
 
@@ -5239,7 +5239,7 @@ Fixes the live 2026-09-06 `corvus-es-1` incident: a bulk movie rsync froze
 data publication for minutes, pinned the maintenance thread near 100% CPU,
 and produced a hard control-RPC timeout against an unrelated peer. Root
 cause, evidence and phased fix are in
-`TODO/2026-09-06-retention-check-batching-and-cheap-presence-plan.md`.
+`TODO/archive/2026-09-06-retention-check-batching-and-cheap-presence-plan.md`.
 
 - `DistributedStore::retain_data()`'s per-extent candidate-presence scan --
   previously one `has_on()`/`have_object` round trip (a full local AES-GCM
@@ -5271,7 +5271,7 @@ cause, evidence and phased fix are in
 
 ## 0.25.0 — Foundation for subsystem crash isolation: a mandatory thread guard, a shared macha_core, and a dlopen'd plugin loader (development)
 
-Phase 0 of `TODO/2026-09-05-subsystem-plugin-isolation-plan.md`, the design
+Phase 0 of `TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md`, the design
 response to 0.24.4's `corvus-es-1` crash-loop (an uncaught exception during
 `FuseFrontend` construction took the entire node down, not just the FUSE
 mount). Single binary, single process throughout -- no separate OS processes
@@ -5618,7 +5618,7 @@ plugin migration is Phase 1/2); this release only lays the foundation.
   (`src/media_metadata_stub.cpp`) for speed, and this fix is verified only by
   live measurement against production content, not a deterministic CI case.
   Building that harness is exactly the Phase 0 exit criterion already
-  described in `TODO/2026-09-03-playback-resilience-and-av-sync-plan.md`;
+  described in `TODO/archive/2026-09-03-playback-resilience-and-av-sync-plan.md`;
   tracked there rather than duplicated here.
 
 ## 0.23.7 — Per-node advertised API address fixes any-node Direct Play failover (development)

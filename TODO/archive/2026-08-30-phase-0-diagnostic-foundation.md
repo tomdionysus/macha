@@ -4,7 +4,7 @@ Date: 2026-08-30
 
 Status: completed implementation slice; Phase 0 remains open
 
-Parent plan: `TODO/namespace-publication-and-metadata-efficiency.md`
+Parent plan: `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 
 ## Scope completed
 
@@ -113,7 +113,7 @@ it passed.
 - `src/metadata.cpp`
 - `tests/test_filesystem_fuse.cpp`
 - `tests/test_storage_metadata.cpp`
-- `TODO/namespace-publication-and-metadata-efficiency.md`
+- `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 - this checkpoint document
 
 ## Next safe resume point

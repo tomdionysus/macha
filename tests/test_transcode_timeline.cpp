@@ -10,7 +10,7 @@
 // that lost nearly all audio) by a person listening again, during development.
 // Neither could have failed a test, because no test ever ran the real encoder.
 // This file closes that gap -- it is Phase 0 of
-// TODO/2026-09-03-playback-resilience-and-av-sync-plan.md, whose stated
+// TODO/archive/2026-09-03-playback-resilience-and-av-sync-plan.md, whose stated
 // prerequisite is a deterministic case longer than 90 seconds carrying
 // non-zero starts, audio priming and a seek.
 //

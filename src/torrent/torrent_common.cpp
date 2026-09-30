@@ -3,7 +3,7 @@
 // types, the API/wire JSON shapes, the URI sanitisers and the Torznab search
 // client, none of which touch libtorrent. The download engine itself
 // (TorrentManager) lives in the libmacha-torrent plugin -- see
-// TODO/2026-09-05-subsystem-plugin-isolation-plan.md and torrent_manager.cpp.
+// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md and torrent_manager.cpp.
 #include "torrent/torrent.hpp"
 
 #include <arpa/inet.h>

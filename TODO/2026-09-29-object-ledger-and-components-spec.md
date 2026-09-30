@@ -8,9 +8,9 @@ code until the operator has read it.
 
 **Canonical version.** The most recent version of this spec is canonical.
 Earlier specs in the series are historical only:
-[the object ledger spec](2026-09-29-object-ledger-spec.md),
-[the first stage 0 spec](2026-09-29-object-ledger-stage-0-spec.md) and
-[the components stage 0 spec](2026-09-29-object-ledger-stage-0-components-spec.md).
+[the object ledger spec](archive/2026-09-29-object-ledger-spec.md),
+[the first stage 0 spec](archive/2026-09-29-object-ledger-stage-0-spec.md) and
+[the components stage 0 spec](archive/2026-09-29-object-ledger-stage-0-components-spec.md).
 They are a record of how the design evolved and are not read as
 requirements.
 
@@ -825,18 +825,18 @@ supersede earlier ones where they conflict.
 
 ## Open questions for the operator
 
-1. **The control gate and `rebuilt_inventory`.** Control GC can run against
+1. **The control gate and `rebuilt_inventory`.** **Answered 2026-09-30** (decision log: the control gate gains `!rebuilt_inventory`). Control GC can run against
    an inventory built in the same pass, contrary to the comment at
    `src/service/service.cpp:1477`. Stage 0 preserves the code. Intended, or
    a defect to fix as a step of the experiment, with its own test?
-2. **`universal`.** Keep `everywhere` for a future placement rule, or remove
+2. **`universal`.** **Answered 2026-09-30** (decision log: `universal` is removed). Keep `everywhere` for a future placement rule, or remove
    the plumbing from repair, since nothing sets it?
-3. **Supervision of core components.** Once core components share the
+3. **Supervision of core components.** **Answered 2026-09-30** (decision log: stage 0 restarts no core component beyond today's; eventually nothing is exempt). Once core components share the
    plugin lifecycle, which may the root restart without restarting the
    process?
-4. **Where the component model lives.** Generalise `src/subsystem/` in
+4. **Where the component model lives.** **Answered 2026-09-30** (decision log: `src/component/`, with `src/subsystem/` the plugin loader over it). Generalise `src/subsystem/` in
    place, or a new home with `subsystem/` as the plugin loader over it?
-5. **The backlog while `develop` is frozen.** ACTIVE's queue, including
+5. **The backlog while `develop` is frozen.** **Answered 2026-09-30** (decision log: backlog fixes are steps on the experiment line). ACTIVE's queue, including
    open P0s (the FUSE recovery test segfault, gbni-1's unexplained heap
    corruption), has nowhere to land while the experiment runs. Do such
    fixes become steps on the experiment branch, or wait until it ends?
@@ -845,5 +845,5 @@ supersede earlier ones where they conflict.
    before the later store relies on it.
 7. **Map-backed snapshots.** Retire them, or keep an adapter into the DAG
    model?
-8. **Context in `Budget`.** Confirm that the work context travels in the
+8. **Context in `Budget`.** **Answered 2026-09-30** (decision log: confirmed; no thread-local context). Confirm that the work context travels in the
    budget, and that point operations which may block take it explicitly.

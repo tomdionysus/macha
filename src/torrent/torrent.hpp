@@ -182,7 +182,7 @@ class TorrentSearchManager {
 // this interface, obtained from SubsystemRegistry::torrent(), and a node with
 // no plugin installed simply has no torrent capability at runtime rather than
 // a differently-compiled binary. See
-// TODO/2026-09-05-subsystem-plugin-isolation-plan.md.
+// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md.
 //
 // Lifecycle (start/stop/restart-on-fault) is not part of this interface --
 // that belongs to the plugin's Subsystem, which SubsystemSupervisor owns.

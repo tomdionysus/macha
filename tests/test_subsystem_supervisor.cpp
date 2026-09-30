@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Fault-injection UAT for SubsystemSupervisor (see
-// TODO/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 0): these load
+// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 0): these load
 // real .so/.dylib plugins via the real dlopen path, not in-process mocks.
 // The core claim under test is that a subsystem plugin whose construction or
 // start() throws -- the exact failure mode that crash-looped corvus-es-1 49

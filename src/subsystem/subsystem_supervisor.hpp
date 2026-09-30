@@ -42,7 +42,7 @@ using SubsystemFactory = std::function<std::unique_ptr<Subsystem>(const Subsyste
 //
 // This directly targets the failure mode that motivated it: FuseFrontend's
 // constructor throwing during journal replay crashed the whole corvus-es-1
-// process 49 times (see TODO/2026-09-05-subsystem-plugin-isolation-plan.md).
+// process 49 times (see TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md).
 // A construction/start failure here degrades to a per-subsystem `faulted`/
 // `disabled` state instead.
 //
@@ -78,7 +78,7 @@ class SubsystemSupervisor {
     // This is what lets FUSE move behind the supervisor (Stage A) before its
     // libfuse adapter moves into libmacha-fuse (Stage B) -- the crash
     // isolation is the valuable half and does not need the dlopen. See
-    // TODO/2026-09-14-fuse-supervised-subsystem-plan.md.
+    // TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md.
     //
     // Must be called before start(); builtins registered afterwards are not
     // run. `name` is what Status reports, alongside the plugin-derived names.

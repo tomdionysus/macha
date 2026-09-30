@@ -4,7 +4,7 @@ Date: 2026-08-30
 
 Status: shared-snapshot slice complete; Phase 1 lock-scope work remains
 
-Parent plan: `TODO/namespace-publication-and-metadata-efficiency.md`
+Parent plan: `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 
 ## Scope completed
 
@@ -156,7 +156,7 @@ namespace-batching result.
 - `src/cluster.cpp`
 - `src/filesystem.cpp`
 - `tests/test_storage_metadata.cpp`
-- `TODO/namespace-publication-and-metadata-efficiency.md`
+- `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 - this checkpoint document
 
 Do not use Git unless the user explicitly reauthorises it in that session.

@@ -8,7 +8,7 @@
 // it when the download is finished and commits each file by naming its
 // extents instead of copying the file's bytes a second time.
 //
-// Stage 2 of TODO/2026-09-23-torrent-disk-backend-plan.md. Nothing here is
+// Stage 2 of TODO/archive/2026-09-23-torrent-disk-backend-plan.md. Nothing here is
 // trusted beyond what the commit itself proves: the DATA retention barrier on
 // the commit refuses a manifest naming objects the cluster does not hold, and
 // the ingest then falls back to copying.

@@ -18,7 +18,7 @@ Detail in `CHANGELOG.md` under each version.
   C, A, E and the multi-file fixes); direct-play Content-Type from the media
   info. **0.68.0:** keyframe byte index for Direct Play. **0.69.0:**
   `start=async`, the startup-timeout contract replaced by reported progress
-  (plan `2026-09-27-playback-start-progress-plan.md`). **0.70.0:** transcode
+  (plan `archive/2026-09-27-playback-start-progress-plan.md`). **0.70.0:** transcode
   rate facts; node names. **0.71.0:** torrents added paused; publication
   progress on finished torrents.
 - **fi-1 became a storage and acquisition node** (2026-09-29): 10 TB drive,
@@ -65,7 +65,7 @@ All deployed on gbni-1 and fi-1, tagged, `main` at `3c3e11a` (0.64.1).
   escalates through the plugin fault sink. Mutation-tested: the incident
   test reproduced the production error with the fix removed.
 - **0.64.0** -- torrents belong to the cluster (plan:
-  `2026-09-27-cluster-torrent-queue-plan.md`): requests in metadata
+  `archive/2026-09-27-cluster-torrent-queue-plan.md`): requests in metadata
   (SM15/SM16, DLT9, protocol 22) merged as a join; a scheduler per capable
   node claims, drives and reports; leases of 10 min; owner-applied intent
   during metadata outages (`torrent_intent`); `/torrents/nodes`, PATCH,
@@ -1098,7 +1098,7 @@ law 2.
   wait longer to be told the same thing.
 
 Collated evidence from all four clients:
-[what the clients report](2026-09-21-what-the-clients-report-against-0.48.0.md).
+[what the clients report](archive/2026-09-21-what-the-clients-report-against-0.48.0.md).
 
 ## One abandoned session held a node's only transcode slot for 30 minutes — fixed in 0.48.1, deployed 2026-09-21
 
@@ -1169,7 +1169,7 @@ transcode the cost of that guarantee is the entire node.
 
 ## The HTTP server without a thread per connection — 0.43.0, cluster UAT passed 2026-09-20
 
-Plan: [the HTTP server without a thread per connection](2026-09-15-http-server-reactor-plan.md).
+Plan: [the HTTP server without a thread per connection](archive/2026-09-15-http-server-reactor-plan.md).
 
 **The API was served by sixteen worker threads, and a worker was spent on every
 kind of waiting the server does** — a kept-alive connection idling up to 15 s, a
@@ -1208,7 +1208,7 @@ and the RPC transport, which is also thread-per-connection.
 
 ## A seek goes where it was asked to go — 0.46.0, 2026-09-18
 
-Plan: [a seek goes where it was asked to go](2026-09-18-seek-does-what-it-is-told-plan.md).
+Plan: [a seek goes where it was asked to go](archive/2026-09-18-seek-does-what-it-is-told-plan.md).
 The open remainder — the seek fast path never being taken — stayed in
 `ACTIVE.md` as a P1 rather than being carried along here.
 
@@ -1217,7 +1217,7 @@ forward, and the content in between is in no generation at all.** No client can
 recover it. Measured on es-1 and fi-1 on 2026-09-17 across four occasions, worst
 case 9,293.9 ms, confirmed independently by the browser's own media-element
 duration arithmetic. The operator watched it happen. Plan:
-[a seek goes where it was asked to go](2026-09-18-seek-does-what-it-is-told-plan.md).
+[a seek goes where it was asked to go](archive/2026-09-18-seek-does-what-it-is-told-plan.md).
 
 `media_vod::indexed_plan` (`src/media_vod.cpp:41-63`) discards every keyframe
 earlier than the request and takes the first survivor; the transcode paths do
@@ -1299,7 +1299,7 @@ looks first.
 
 Resolves the live incident this file's sibling `ACTIVE.md` opened with on
 2026-09-13. Full diagnosis, the mechanism, and the two shapes recovery now
-handles are in `2026-09-13-torn-pack-header-recovery-plan.md`; the release
+handles are in `archive/2026-09-13-torn-pack-header-recovery-plan.md`; the release
 notes are in `CHANGELOG.md` under 0.38.3.
 
 - [x] **gbni-1's 8 TB DATA backend was offline over 125 bytes.** A power loss
@@ -1336,7 +1336,7 @@ notes are in `CHANGELOG.md` under 0.38.3.
 
 Supersedes the "No authorization tiers yet" P0 in `ACTIVE.md`. Design and the
 seven places the implementation diverged from it are in
-`2026-09-12-cluster-users-and-roles-plan.md` (see its "What actually shipped"
+`archive/2026-09-12-cluster-users-and-roles-plan.md` (see its "What actually shipped"
 section — the plan itself was not edited, so it stays usable as evidence).
 
 - [x] **Cluster-replicated users, passwords and roles.** `UserStore`
@@ -1463,14 +1463,14 @@ reintroduced by accident, and `macha-recover` ships saying so.
   non-pipelined `flush()` and counts the wrong thing anyway, and the
   open-writer bound is soft and can overshoot by up to `commit_workers - 1`.
   Neither has fired. Plan and post-deploy audit in
-  [`2026-09-09-publication-hold-and-wait-plan.md`](2026-09-09-publication-hold-and-wait-plan.md);
+  [`archive/2026-09-09-publication-hold-and-wait-plan.md`](archive/2026-09-09-publication-hold-and-wait-plan.md);
   the handover that preceded it is
-  [`2026-09-09-publication-livelock-continuation.md`](2026-09-09-publication-livelock-continuation.md).
+  [`archive/2026-09-09-publication-livelock-continuation.md`](archive/2026-09-09-publication-livelock-continuation.md).
 
 ## Self-healing disciplines — 0.29.0 → 0.32.0
 
 - [x] Executed the whole of
-  [the self-healing disciplines plan](2026-09-06-self-healing-disciplines-plan.md),
+  [the self-healing disciplines plan](archive/2026-09-06-self-healing-disciplines-plan.md),
   written after one afternoon of ordinary load surfaced six P0 defects, each
   hidden behind the previous, all instances of four habits: trusting
   bookkeeping over re-derivable truth, retries that turn "not yet" into
@@ -1502,7 +1502,7 @@ reintroduced by accident, and `macha-recover` ships saying so.
   changes. Plus canonical tombstones and conflicts compacted out of the
   snapshot.
 - [x] Evidence per discipline, and the closing two-writer / rolling-restart
-  run, in [`2026-09-06-self-healing-uat.md`](2026-09-06-self-healing-uat.md).
+  run, in [`archive/2026-09-06-self-healing-uat.md`](archive/2026-09-06-self-healing-uat.md).
   Follow-ups filed there remain open and are indexed in `ACTIVE.md`.
 
 ## Retention-check batching and cheap presence — 0.26.0, 0.32.7–0.32.10
@@ -1517,7 +1517,7 @@ reintroduced by accident, and `macha-recover` ships saying so.
   test suite caught mid-implementation (`rebalance_step`/`repair_step`'s
   presence checks could *not* move to the cheap path, having no downstream
   re-verification) in
-  [retention-check batching and a cheap local presence check](2026-09-06-retention-check-batching-and-cheap-presence-plan.md).
+  [retention-check batching and a cheap local presence check](archive/2026-09-06-retention-check-batching-and-cheap-presence-plan.md).
 - [x] This subsumed the separately-filed scaling item that `LocalStore::valid()`
   was used as a cheap presence check while doing a full read + AES-GCM decrypt
   + SHA-256.
@@ -1526,7 +1526,7 @@ reintroduced by accident, and `macha-recover` ships saying so.
   fan-out; 0.32.9 presence remembered rather than `stat`'ed; 0.32.10 CONTROL
   puts together to the nearest replica): es-1 retention avg 5,217 ms → 121 ms,
   publish avg 556 ms, no `deadline exceeded` or `peer closed` since 0.32.7.
-  Numbers in [`2026-09-06-self-healing-uat.md`](2026-09-06-self-healing-uat.md).
+  Numbers in [`archive/2026-09-06-self-healing-uat.md`](archive/2026-09-06-self-healing-uat.md).
   The N² retention-journal growth that run also recorded stays open in
   `ACTIVE.md`.
 
@@ -1751,7 +1751,7 @@ Evidence: `CHANGELOG.md` 0.23.3.
   binaries are byte-identical. The exact live inode-922 failure occurred once,
   stayed settled, and left the mount and local API responsive.
 
-Evidence: [terminal FUSE recovery loop](2026-09-03-fuse-terminal-recovery-loop.md)
+Evidence: [terminal FUSE recovery loop](archive/2026-09-03-fuse-terminal-recovery-loop.md)
 
 ## Persistent logical-viewer transcode admission
 
@@ -1769,7 +1769,7 @@ Evidence: [terminal FUSE recovery loop](2026-09-03-fuse-terminal-recovery-loop.m
   dependency tests; deployed complete source to all four nodes with identical
   Linux binaries and a healthy, writable generation-3904 clean baseline.
 
-Evidence: [logical viewer transcode admission](2026-09-03-logical-viewer-transcode-admission.md)
+Evidence: [logical viewer transcode admission](archive/2026-09-03-logical-viewer-transcode-admission.md)
 
 ## Phase 2 bounded FUSE operation metadata
 
@@ -1780,7 +1780,7 @@ Evidence: [logical viewer transcode admission](2026-09-03-logical-viewer-transco
 - [x] Added current/peak/limit/wait diagnostics and hard-bound plus liveness
   regressions. The complete filesystem/FUSE suite passed 64/64.
 
-Evidence: [Phase 2 operation-metadata bound](2026-09-02-phase-2-operation-metadata-bound.md)
+Evidence: [Phase 2 operation-metadata bound](archive/2026-09-02-phase-2-operation-metadata-bound.md)
 
 This is the completed-work ledger for the current session. An item belongs here only after implementation and its stated verification are complete. Detailed design notes, exact test results, and UAT measurements remain in the linked records.
 
@@ -1800,7 +1800,7 @@ This is the completed-work ledger for the current session. An item belongs here 
 - [x] Passed 62/62 focused FUSE tests, a clean 260/260 parallel core run, and
   3/3 runtime tests. Loaded stable-RSS acceptance remains active.
 
-Evidence: [shutdown and retained-owner checkpoint](2026-09-02-shutdown-and-retained-owner-checkpoint.md)
+Evidence: [shutdown and retained-owner checkpoint](archive/2026-09-02-shutdown-and-retained-owner-checkpoint.md)
 
 ## Asynchronous identity reset and retired-node status — 0.22.2
 
@@ -1822,7 +1822,7 @@ Evidence: [shutdown and retained-owner checkpoint](2026-09-02-shutdown-and-retai
   recovery from a separate ES-1 disk `EIO`, all four current identities reported
   online, healthy and writable at generation 2234.
 
-Evidence: [identity association retirement](2026-09-01-identity-association-retirement.md)
+Evidence: [identity association retirement](archive/2026-09-01-identity-association-retirement.md)
 
 ## Exact metadata reconciliation recovery — 0.22.2
 
@@ -1842,7 +1842,7 @@ Evidence: [identity association retirement](2026-09-01-identity-association-reti
   331 items and 374 artwork objects. Linux services remained active with zero
   restarts.
 
-Evidence: [metadata reconciliation recovery](2026-09-01-metadata-reconciliation-recovery.md)
+Evidence: [metadata reconciliation recovery](archive/2026-09-01-metadata-reconciliation-recovery.md)
 
 ## Metadata-history bounded-memory and delta-reconciliation checkpoint
 
@@ -1859,7 +1859,7 @@ Evidence: [metadata reconciliation recovery](2026-09-01-metadata-reconciliation-
   The authoritative serial suite passed 246/246 and runtime dependencies passed
   3/3. Live bounded-RSS/restart UAT remains active before loaded ingest resumes.
 
-Evidence: [P0 metadata-history remediation](2026-09-01-metadata-history-memory-remediation.md)
+Evidence: [P0 metadata-history remediation](archive/2026-09-01-metadata-history-memory-remediation.md)
 
 ## Bounded shutdown and clean cluster rejoin
 
@@ -1879,7 +1879,7 @@ Evidence: [P0 metadata-history remediation](2026-09-01-metadata-history-memory-r
   it as the same node at generation 1643; node 51 independently reported it
   online at the same writable generation.
 
-Evidence: [bounded shutdown and rejoin record](2026-09-01-bounded-shutdown-and-rejoin.md)
+Evidence: [bounded shutdown and rejoin record](archive/2026-09-01-bounded-shutdown-and-rejoin.md)
 
 ## Dedicated immutable media-information engine
 
@@ -1901,7 +1901,7 @@ Evidence: [bounded shutdown and rejoin record](2026-09-01-bounded-shutdown-and-r
   deployed the source on all four nodes. Each node reported ready, writable and
   online at metadata generation 1633.
 
-Evidence: [media-information checkpoint](2026-09-01-media-information-engine.md)
+Evidence: [media-information checkpoint](archive/2026-09-01-media-information-engine.md)
 
 ## Manual causal metadata repair and ancestry safety
 
@@ -1923,7 +1923,7 @@ Evidence: [media-information checkpoint](2026-09-01-media-information-engine.md)
   healthy/writable overnight at generation 1569; later ordinary divergent
   branches reconciled automatically with zero conflicts.
 
-Evidence: [manual causal repair record](2026-09-01-metadata-manual-causal-repair.md)
+Evidence: [manual causal repair record](archive/2026-09-01-metadata-manual-causal-repair.md)
 
 ## Phase 1D.4 partial: transient publication cursor preservation
 
@@ -1938,7 +1938,7 @@ Evidence: [manual causal repair record](2026-09-01-metadata-manual-causal-repair
 - [x] Passed focused tests, filesystem/FUSE 58/58, the complete suite 229/229
   and runtime dependencies 3/3.
 
-Evidence: [transient-failure cursor checkpoint](2026-08-31-fuse-publication-phase-1d-transient-failure-cursor.md)
+Evidence: [transient-failure cursor checkpoint](archive/2026-08-31-fuse-publication-phase-1d-transient-failure-cursor.md)
 
 ## Phase 1D.4 partial: pressure-aware retirement selection
 
@@ -1953,7 +1953,7 @@ Evidence: [transient-failure cursor checkpoint](2026-08-31-fuse-publication-phas
 - [x] Passed the focused regression, filesystem/FUSE 57/57, runtime 3/3 and the
   final controlled complete suite 228/228.
 
-Evidence: [retirement-selection checkpoint](2026-08-31-fuse-publication-phase-1d-retirement-selection.md)
+Evidence: [retirement-selection checkpoint](archive/2026-08-31-fuse-publication-phase-1d-retirement-selection.md)
 
 ## Catalogue coalesced-final-state regression correction
 
@@ -1968,7 +1968,7 @@ Evidence: [retirement-selection checkpoint](2026-08-31-fuse-publication-phase-1d
 - [x] Passed 10/10 isolated repetitions and the controlled complete suite
   228/228.
 
-Evidence: [retirement-selection checkpoint verification](2026-08-31-fuse-publication-phase-1d-retirement-selection.md#verification)
+Evidence: [retirement-selection checkpoint verification](archive/2026-08-31-fuse-publication-phase-1d-retirement-selection.md#verification)
 
 ## Phase 1D.4 partial: publication notification coalescing
 
@@ -1987,7 +1987,7 @@ Evidence: [retirement-selection checkpoint verification](2026-08-31-fuse-publica
 - [x] Passed build, filesystem/FUSE 56/56, controlled complete suite 227/227 and
   runtime 3/3.
 
-Evidence: [publication notification checkpoint](2026-08-31-fuse-publication-phase-1d-notification-coalescing.md)
+Evidence: [publication notification checkpoint](archive/2026-08-31-fuse-publication-phase-1d-notification-coalescing.md)
 
 ## Phase 1D.2 partial: sparse changed-range reconstruction
 
@@ -2006,7 +2006,7 @@ Evidence: [publication notification checkpoint](2026-08-31-fuse-publication-phas
   225/226 due to the resource-sensitive catalogue burst test; it passed alone
   and in the complete four-worker run.
 
-Evidence: [sparse changed-range checkpoint](2026-08-31-fuse-publication-phase-1d-sparse-changed-ranges.md)
+Evidence: [sparse changed-range checkpoint](archive/2026-08-31-fuse-publication-phase-1d-sparse-changed-ranges.md)
 
 ## Phase 1D.3 partial: node-wide DATA resource headroom
 
@@ -2025,9 +2025,9 @@ Evidence: [sparse changed-range checkpoint](2026-08-31-fuse-publication-phase-1d
   3/3. The first eight-slot run was accurately retained as 223/225; both
   load-sensitive failures passed isolated and in the clean four-slot rerun.
 
-Evidence: [DATA resource headroom checkpoint](2026-08-31-phase-1d-data-resource-headroom.md)
+Evidence: [DATA resource headroom checkpoint](archive/2026-08-31-phase-1d-data-resource-headroom.md)
 
-Deployment/UAT evidence: [three-node loaded UAT](2026-08-31-phase-1d-data-resource-headroom-uat.md)
+Deployment/UAT evidence: [three-node loaded UAT](archive/2026-08-31-phase-1d-data-resource-headroom-uat.md)
 
 ## Aggregate spool retirement-rate estimator
 
@@ -2043,7 +2043,7 @@ Deployment/UAT evidence: [three-node loaded UAT](2026-08-31-phase-1d-data-resour
 - [x] Passed filesystem/FUSE 50/50, foundations 15/15, runtime 3/3 and complete
   default 218/218 suites, including both catalogue regressions.
 
-Evidence: [aggregate retirement-rate checkpoint](2026-08-31-spool-aggregate-retirement-rate.md)
+Evidence: [aggregate retirement-rate checkpoint](archive/2026-08-31-spool-aggregate-retirement-rate.md)
 
 ## FUSE publication Phase 4A: bounded within-file extent pipeline
 
@@ -2064,8 +2064,8 @@ Evidence: [aggregate retirement-rate checkpoint](2026-08-31-spool-aggregate-reti
   gating exact, a 4 MiB direct read in 0.37 seconds, protected communications,
   and zero failures/timeouts.
 
-Evidence: [Phase 4A implementation](2026-08-31-fuse-publication-phase-4a-extent-pipeline.md)
-and [Phase 4A UAT](2026-08-31-fuse-publication-phase-4a-uat.md)
+Evidence: [Phase 4A implementation](archive/2026-08-31-fuse-publication-phase-4a-extent-pipeline.md)
+and [Phase 4A UAT](archive/2026-08-31-fuse-publication-phase-4a-uat.md)
 
 ## FUSE publication Phase 0/1: diagnostics, loader priority and fair quanta
 
@@ -2094,10 +2094,10 @@ and [Phase 4A UAT](2026-08-31-fuse-publication-phase-4a-uat.md)
   and clean resumption; and failures/timeouts remained zero. That FUSE leg is
   not accepted as viewer UAT evidence after the Phase 1C classification decision.
 
-Evidence: [Phase 0/1 checkpoint](2026-08-31-fuse-publication-phase-0-1-checkpoint.md),
-[Phase 1A loader priority](2026-08-31-fuse-publication-phase-1a-loader-priority.md),
-[Phase 1B fair quanta](2026-08-31-fuse-publication-phase-1b-fair-quanta.md), and
-[Phase 1A/1B UAT](2026-08-31-fuse-publication-phase-1ab-uat.md)
+Evidence: [Phase 0/1 checkpoint](archive/2026-08-31-fuse-publication-phase-0-1-checkpoint.md),
+[Phase 1A loader priority](archive/2026-08-31-fuse-publication-phase-1a-loader-priority.md),
+[Phase 1B fair quanta](archive/2026-08-31-fuse-publication-phase-1b-fair-quanta.md), and
+[Phase 1A/1B UAT](archive/2026-08-31-fuse-publication-phase-1ab-uat.md)
 
 ## Phase 0: diagnostic foundation
 
@@ -2107,7 +2107,7 @@ Evidence: [Phase 0/1 checkpoint](2026-08-31-fuse-publication-phase-0-1-checkpoin
 - [x] Added characterization tests for one-publication-per-recovered-operation baseline behaviour and repeated linear-chain reconstruction.
 - [x] Verified the Phase 0 implementation with its focused suites and recorded the continuation boundary.
 
-Evidence: [Phase 0 diagnostic foundation](2026-08-30-phase-0-diagnostic-foundation.md)
+Evidence: [Phase 0 diagnostic foundation](archive/2026-08-30-phase-0-diagnostic-foundation.md)
 
 ## Phase 1: bounded shared metadata materialization
 
@@ -2119,7 +2119,7 @@ Evidence: [Phase 0 diagnostic foundation](2026-08-30-phase-0-diagnostic-foundati
 - [x] Ran the complete default/runtime suites for this slice, including the catalogue search/artwork/GC regression.
 - [x] Performed a three-node UAT: the cluster converged, remained responsive, and returned to idle without sustained metadata work.
 
-Evidence: [bounded record materialization](2026-08-30-phase-1-bounded-record-materialization.md), [shared decoded materialization](2026-08-30-phase-1-shared-decoded-materialization.md), and [Phase 1 three-node UAT](2026-08-30-phase-1-three-node-uat.md)
+Evidence: [bounded record materialization](archive/2026-08-30-phase-1-bounded-record-materialization.md), [shared decoded materialization](archive/2026-08-30-phase-1-shared-decoded-materialization.md), and [Phase 1 three-node UAT](archive/2026-08-30-phase-1-three-node-uat.md)
 
 ## Phase 1: materialization follow-up closeout
 
@@ -2137,7 +2137,7 @@ Evidence: [bounded record materialization](2026-08-30-phase-1-bounded-record-mat
 - [x] Passed the expanded complete default suite 205/205 and runtime
   dependencies 3/3, including both catalogue regressions.
 
-Evidence: [Phase 1 materialization closeout](2026-08-30-phase-1-materialization-closeout.md)
+Evidence: [Phase 1 materialization closeout](archive/2026-08-30-phase-1-materialization-closeout.md)
 
 ## Phase 2: bounded namespace publication and durability
 
@@ -2152,7 +2152,7 @@ Evidence: [Phase 1 materialization closeout](2026-08-30-phase-1-materialization-
 - [x] Ran the complete suite after durability closeout: default 194/194 and runtime-dependency 3/3, including the explicit catalogue regression.
 - [x] Performed a three-node deletion UAT: 1,001 deletion operations used five publications, completed in 0.77 seconds, kept status responsive, and returned all nodes to idle.
 
-Evidence: [Phase 2 namespace batching](2026-08-30-phase-2-namespace-batching.md), [durability closeout](2026-08-30-phase-2-durability-and-phase-3-scheduler-checkpoint.md), and [Phase 2 three-node deletion UAT](2026-08-30-phase-2-three-node-deletion-uat.md)
+Evidence: [Phase 2 namespace batching](archive/2026-08-30-phase-2-namespace-batching.md), [durability closeout](archive/2026-08-30-phase-2-durability-and-phase-3-scheduler-checkpoint.md), and [Phase 2 three-node deletion UAT](archive/2026-08-30-phase-2-three-node-deletion-uat.md)
 
 ## Phase 3: event-driven convergence foundation
 
@@ -2175,7 +2175,7 @@ Evidence: [Phase 2 namespace batching](2026-08-30-phase-2-namespace-batching.md)
 - [x] Isolated the local pre-pause CPU use to libtorrent peer/UTP work rather than metadata, catalogue, hydration, FUSE, HTTP, or RPC work.
 - [x] Performed a three-node active-burst UAT using 81 paced creates followed by 81 paced deletes. Each half used 20 metadata publications, all three nodes agreed on both the 80-entry intermediate namespace and the final empty state, status remained responsive during active work, RPC connections did not churn, and every node returned immediately to the previously proven idle state.
 
-Evidence: [Phase 3 scheduler checkpoint](2026-08-30-phase-2-durability-and-phase-3-scheduler-checkpoint.md), [Phase 3 three-node idle UAT](2026-08-30-phase-3-three-node-idle-uat.md), and [Phase 3 three-node active-burst UAT](2026-08-30-phase-3-three-node-active-burst-uat.md)
+Evidence: [Phase 3 scheduler checkpoint](archive/2026-08-30-phase-2-durability-and-phase-3-scheduler-checkpoint.md), [Phase 3 three-node idle UAT](archive/2026-08-30-phase-3-three-node-idle-uat.md), and [Phase 3 three-node active-burst UAT](archive/2026-08-30-phase-3-three-node-active-burst-uat.md)
 
 Integrated burst verification: `rpc_cluster/test_service_metadata_repair_coalesces_real_generation_burst` passed six isolated executions; the complete `rpc_cluster` suite passed 28/28, `invariants` passed 36/36, `filesystem_fuse/test_disconnected_maintenance_sleeps_until_peer_event` passed, and `hydration_catalogue/test_catalogue_sync_search_and_artwork_gc` passed.
 
@@ -2210,7 +2210,7 @@ Phase 3 repository-wide checkpoint: `sh run-tests.sh build` passed the complete 
 - [x] Fixed the event-driven follow-up edge exposed by the complete suite: a coalesced convergence run which leaves one follow-up pending now continues immediately without requiring an unrelated external wake, while disconnected settled maintenance remains parked.
 - [x] Performed the Phase 4 three-node recovery UAT: a paused third replica missed a 65-operation workload, the surviving pair remained writable and responsive, the resumed replica converged to the identical 64-entry namespace, and all nodes returned to sleeping idle at the same generation without RPC churn.
 
-Evidence: [Phase 4 bounded metadata RPC executor](2026-08-30-phase-4-bounded-metadata-rpc-executor.md) and [Phase 4 three-node recovery UAT](2026-08-30-phase-4-three-node-recovery-uat.md)
+Evidence: [Phase 4 bounded metadata RPC executor](archive/2026-08-30-phase-4-bounded-metadata-rpc-executor.md) and [Phase 4 three-node recovery UAT](archive/2026-08-30-phase-4-three-node-recovery-uat.md)
 
 Verification: the 27-test `storage_metadata` suite passed; the strengthened cold-chain test proved one reconstruction for eight concurrent callers; and the lagging-third test proved a bounded transfer peak in `(1, 8]`. The first repository-wide run correctly exposed the lost follow-up wake in `hydration_catalogue/test_catalogue_uses_final_state_after_coalesced_metadata_burst`; after correcting that scheduler edge, the catalogue burst and disconnected-idle regressions passed explicitly. The final repository-wide run passed the default suite 203/203 plus runtime dependencies 3/3, including both catalogue burst/search/artwork/GC regressions and the lagging-third recovery test.
 
@@ -2236,7 +2236,7 @@ Verification: the 27-test `storage_metadata` suite passed; the strengthened cold
 - [x] Verified the final handler-only timing implementation with the complete
   `rpc_cluster` group, 34/34.
 
-Evidence: [Phase 5 operational diagnostics](2026-08-30-phase-5-operational-diagnostics.md)
+Evidence: [Phase 5 operational diagnostics](archive/2026-08-30-phase-5-operational-diagnostics.md)
 
 ## Phase 5: three-node operational diagnostics UAT
 
@@ -2255,7 +2255,7 @@ Evidence: [Phase 5 operational diagnostics](2026-08-30-phase-5-operational-diagn
 - [x] Preserved physical DATA GC and repeated-burst RSS as explicit remaining
   work rather than over-claiming them from a directory-only fixture.
 
-Evidence: [Phase 5 operational diagnostics UAT](2026-08-30-phase-5-operational-diagnostics-uat.md)
+Evidence: [Phase 5 operational diagnostics UAT](archive/2026-08-30-phase-5-operational-diagnostics-uat.md)
 
 ## Phase 5: journal and convergence Status diagnostics
 
@@ -2271,7 +2271,7 @@ Evidence: [Phase 5 operational diagnostics UAT](2026-08-30-phase-5-operational-d
 - [x] Passed the focused production-shaped API test, `filesystem_fuse` 44/44,
   `invariants` 36/36, the complete default suite 204/204, and runtime 3/3.
 
-Evidence: [Phase 5 journal and convergence Status diagnostics](2026-08-30-phase-5-journal-convergence-status.md)
+Evidence: [Phase 5 journal and convergence Status diagnostics](archive/2026-08-30-phase-5-journal-convergence-status.md)
 
 ## Phase 5: journal and convergence Status UAT
 
@@ -2289,7 +2289,7 @@ Evidence: [Phase 5 journal and convergence Status diagnostics](2026-08-30-phase-
 - [x] Verified the fixture was absent, direct Status latency was 1-12 ms, and
   delayed process CPU returned to approximately 0.21%, 0.12%, and 0.07%.
 
-Evidence: [Phase 5 journal and convergence Status UAT](2026-08-30-phase-5-journal-convergence-uat.md)
+Evidence: [Phase 5 journal and convergence Status UAT](archive/2026-08-30-phase-5-journal-convergence-uat.md)
 
 ## Phase 5: physical-object GC separation proof
 
@@ -2307,7 +2307,7 @@ Evidence: [Phase 5 journal and convergence Status UAT](2026-08-30-phase-5-journa
 - [x] Documented the operational distinction and bounded cursor semantics in
   the durability and operations guides.
 
-Evidence: [Phase 5 physical-object GC separation proof](2026-08-30-phase-5-physical-object-gc-proof.md)
+Evidence: [Phase 5 physical-object GC separation proof](archive/2026-08-30-phase-5-physical-object-gc-proof.md)
 
 ## Plan-ledger reconciliation
 
@@ -2334,7 +2334,7 @@ Evidence: [Phase 5 physical-object GC separation proof](2026-08-30-phase-5-physi
 - [x] Passed the complete default suite 204/204 and runtime dependencies 3/3,
   including the explicit catalogue search/artwork/GC regression.
 
-Evidence: [Status disk-usage availability correction](2026-08-30-status-disk-usage-availability.md)
+Evidence: [Status disk-usage availability correction](archive/2026-08-30-status-disk-usage-availability.md)
 
 ## Combined Status and repeated-burst UAT
 
@@ -2355,7 +2355,7 @@ Evidence: [Status disk-usage availability correction](2026-08-30-status-disk-usa
   current RSS. The memory-ceiling claim was therefore kept active pending a
   correctly defined metric and repeated post-cap observations.
 
-Evidence: [Combined Status availability and repeated-burst UAT](2026-08-30-combined-status-rss-uat.md)
+Evidence: [Combined Status availability and repeated-burst UAT](archive/2026-08-30-combined-status-rss-uat.md)
 
 ## Cluster Status telemetry aggregation correction
 
@@ -2377,7 +2377,7 @@ Evidence: [Combined Status availability and repeated-burst UAT](2026-08-30-combi
   complete run at four-way concurrency again finished 206/207 with the same
   test timing out at 10.415 seconds.
 
-Evidence: [Cluster Status telemetry aggregation correction](2026-08-30-cluster-status-telemetry-aggregation.md)
+Evidence: [Cluster Status telemetry aggregation correction](archive/2026-08-30-cluster-status-telemetry-aggregation.md)
 
 ## Cluster Status telemetry aggregation UAT
 
@@ -2390,7 +2390,7 @@ Evidence: [Cluster Status telemetry aggregation correction](2026-08-30-cluster-s
 - [x] Confirmed deployed telemetry notifications were executing under the
   speculative RPC class in both canonical route distributions.
 
-Evidence: [Cluster Status telemetry aggregation UAT](2026-08-30-cluster-status-telemetry-aggregation-uat.md)
+Evidence: [Cluster Status telemetry aggregation UAT](archive/2026-08-30-cluster-status-telemetry-aggregation-uat.md)
 
 ## Linux systemd install and uninstall targets
 
@@ -2410,7 +2410,7 @@ Evidence: [Cluster Status telemetry aggregation UAT](2026-08-30-cluster-status-t
   `lib/systemd/system`, while custom paths remain configurable; also removed
   the generated CMake CMP0012 warning.
 
-Evidence: [Linux systemd install and uninstall targets](2026-08-30-linux-systemd-install.md)
+Evidence: [Linux systemd install and uninstall targets](archive/2026-08-30-linux-systemd-install.md)
 
 ## FUSE spool rate backpressure — first checkpoint
 
@@ -2427,7 +2427,7 @@ Evidence: [Linux systemd install and uninstall targets](2026-08-30-linux-systemd
   group passed 45/45, the complete backend suite passed 211/211, and runtime
   dependencies passed 3/3.
 
-Evidence: [FUSE spool rate backpressure](2026-08-30-fuse-spool-rate-backpressure.md)
+Evidence: [FUSE spool rate backpressure](archive/2026-08-30-fuse-spool-rate-backpressure.md)
 
 ## Version 0.21.0
 
@@ -2459,7 +2459,7 @@ Evidence: [FUSE spool rate backpressure](2026-08-30-fuse-spool-rate-backpressure
 - [x] Built and passed the scheduler regression on macOS and natively on both
   Linux nodes 50 and 51, together with all three spool-pressure regressions.
 
-Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md)
+Evidence: [Spool progress-bootstrap admission checkpoint](archive/2026-08-31-spool-progress-bootstrap-admission.md)
 
 ## FUSE write admission shutdown race
 
@@ -2488,7 +2488,7 @@ Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progr
   ownership, all heap reclaim attempts succeeded, and drained RSS remained on
   a stable approximately 204–223 MiB plateau without lifecycle ratcheting.
 
-Evidence: [Transport, allocator and decoder checkpoint](2026-09-02-transport-and-allocator-attribution-checkpoint.md)
+Evidence: [Transport, allocator and decoder checkpoint](archive/2026-09-02-transport-and-allocator-attribution-checkpoint.md)
 
 ## Spool progress-bootstrap admission
 
@@ -2505,7 +2505,7 @@ Evidence: [Transport, allocator and decoder checkpoint](2026-09-02-transport-and
   threshold, with bounded waits, no freeze, no ENOSPC, no backend failure and a
   healthy 3/3 cluster.
 
-Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progress-bootstrap-admission.md)
+Evidence: [Spool progress-bootstrap admission checkpoint](archive/2026-08-31-spool-progress-bootstrap-admission.md)
 
 ## Structural remediation Phase 1 — object-store concurrency and priority
 
@@ -2525,7 +2525,7 @@ Evidence: [Spool progress-bootstrap admission checkpoint](2026-08-31-spool-progr
   durability and compaction regressions; final local verification is 267/267
   core plus 4/4 runtime at 12-way process isolation.
 
-Evidence: [Object-store concurrency checkpoint](2026-09-02-object-store-concurrency-checkpoint.md)
+Evidence: [Object-store concurrency checkpoint](archive/2026-09-02-object-store-concurrency-checkpoint.md)
 
 ## 2026-09-13 — rationalisation pass: work completed through 0.40.1
 
@@ -2623,7 +2623,7 @@ that were buried inside these items were promoted to their own entries in
     on either that ending or credentials for an account with `media_viewer`.
 
   Design, phases and the corrections made during implementation are in
-  [the plan](2026-09-08-bounded-vod-playlist-and-segment-holds.md), which
+  [the plan](archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md), which
   also records that the motivating bug report was retracted in full and that
   this work does not address the DTS/TrueHD cold-start latency below — which
   has itself since been retracted in full; see the item below.

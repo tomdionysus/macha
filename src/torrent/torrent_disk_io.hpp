@@ -9,12 +9,12 @@
 // I/O that neither the DATA arbiter admits nor the disk service monitor
 // measures. On 2026-09-23 that pool wrote 65 MB/s onto es-1's DATA spindle,
 // the monitor blamed publication for the slowness it measured, and seven
-// ingests died (TODO/2026-09-23-torrent-writes-starve-publication-incident.md).
+// ingests died (TODO/archive/2026-09-23-torrent-writes-starve-publication-incident.md).
 // Every read, write and hash this backend performs is admitted at loader class
 // and timed into the monitor, so the torrent is one more loader under the laws
 // rather than an unmetered writer beside them.
 //
-// Stage 1 of TODO/2026-09-23-torrent-disk-backend-plan.md: payload is written
+// Stage 1 of TODO/archive/2026-09-23-torrent-disk-backend-plan.md: payload is written
 // in the torrent's own file layout under the save path.
 //
 // Stage 2: each file-relative extent of that payload is published to the store

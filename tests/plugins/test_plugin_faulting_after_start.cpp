@@ -3,7 +3,7 @@
 // A subsystem that starts cleanly and then faults from its own thread, which
 // is the shape of a lost FUSE mount and the one SubsystemSupervisor could not
 // see until Subsystem::attach_fault_sink existed (see
-// TODO/2026-09-14-fuse-supervised-subsystem-plan.md, Stage A). Before that the
+// TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, Stage A). Before that the
 // supervisor parked on a condition variable until asked to stop, so a
 // subsystem whose background work died after start() stayed `running` forever.
 //

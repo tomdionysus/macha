@@ -2,7 +2,7 @@
 
 Date: 2026-08-30
 
-Parent plan: `TODO/namespace-publication-and-metadata-efficiency.md`
+Parent plan: `TODO/archive/namespace-publication-and-metadata-efficiency.md`
 
 ## Scope
 
@@ -72,7 +72,7 @@ The deployed three-node UAT passed. A 65-create/65-remove burst used six
 metadata publications, produced exact admission and grouped-completion journal
 accounting, converged all nodes at generation 1439, and returned every demand
 epoch and metadata queue to a drained parked state. See
-`TODO/2026-08-30-phase-5-journal-convergence-uat.md`.
+`TODO/archive/2026-08-30-phase-5-journal-convergence-uat.md`.
 
 This closes the remaining Phase 5 live counter comparison. Physical DATA GC and
 the repeated-burst RSS ceiling remain separate measurements.

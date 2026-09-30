@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The reactor's contract, over real sockets. Every case here is a property
-// TODO/2026-09-15-http-server-reactor-plan.md promised: that nothing one
+// TODO/archive/2026-09-15-http-server-reactor-plan.md promised: that nothing one
 // connection does can stall another, that control traffic never queues
 // behind data traffic, that a wait costs no thread, and that the reactor
 // rule -- it may not call anything that sleeps -- is checked at runtime.

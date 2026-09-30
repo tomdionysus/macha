@@ -2,7 +2,7 @@
 
 Date: 2026-08-31
 
-Parent plan: `TODO/2026-08-31-fuse-publication-throughput-plan.md`
+Parent plan: `TODO/archive/2026-08-31-fuse-publication-throughput-plan.md`
 
 Status: implementation, deterministic verification, and coordinated loader
 classification UAT complete; live viewer-pre-emption leg pending

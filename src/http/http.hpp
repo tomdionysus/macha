@@ -206,7 +206,7 @@ struct HttpServerDiagnostics {
 // One reactor thread owns every socket and never waits on anything but
 // poll(); a bounded compute pool in two lanes runs handlers and body reads;
 // a handler that has to wait on the media pipeline defers instead of
-// blocking. See TODO/2026-09-15-http-server-reactor-plan.md for why each
+// blocking. See TODO/archive/2026-09-15-http-server-reactor-plan.md for why each
 // part is where it is, and in particular for the rule the reactor lives by:
 // it may not call anything that sleeps.
 class HttpServer {

@@ -50,7 +50,7 @@ struct Options {
     // Run every selected case this many times and report a per-case failure
     // count at the end. This is the measurement the "known flake" habit never
     // had: a rate on named hardware at real parallelism, instead of a
-    // recollection (TODO/2026-09-14-test-suite-must-be-deterministic-plan.md).
+    // recollection (TODO/archive/2026-09-14-test-suite-must-be-deterministic-plan.md).
     unsigned repeat{1};
     bool list{};
     bool verbose{};

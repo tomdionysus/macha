@@ -2,7 +2,7 @@
 
 Date: 2026-08-31
 
-Parent plan: `TODO/2026-08-31-fuse-publication-throughput-plan.md`
+Parent plan: `TODO/archive/2026-08-31-fuse-publication-throughput-plan.md`
 
 Status: first implementation checkpoint complete; three-node correctness UAT
 passed, but end-to-end throughput UAT failed; Phase 1 remains active
