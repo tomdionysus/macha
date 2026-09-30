@@ -329,6 +329,7 @@ set(MACHA_CORE_SOURCES
     src/torrent/torrent_extent_journal.cpp
     src/torrent/torrent_common.cpp
     src/torrent/torrent_request.cpp
+    src/service/maintenance_clock.cpp
     src/service/service.cpp
 )
 
@@ -553,7 +554,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_invariants.cpp
         tests/test_models.cpp
         tests/test_observation.cpp
-        tests/test_baselines.cpp)
+        tests/test_baselines.cpp
+        tests/test_maintenance_trace.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
