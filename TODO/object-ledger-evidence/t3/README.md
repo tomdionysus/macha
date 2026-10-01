@@ -178,3 +178,40 @@ without sleeping.
   and "releasable read against the inventory" (the fixture's release
   horizon referred to the same ids as the inventory). One mutant did not
   compile and was rewritten ("owned always true"). All 21 killed.
+
+# fi-1: GCC build, suites and coverage (2026-10-02, the `-t3` tip, `dac5098`)
+
+- Build: GCC, `nice -j3`, no warnings. Suites: macha-tests 700/700,
+  macha-tests-runtime 17/17, macha-tests-torrent 21/21.
+- Coverage (`./run-coverage.sh build-coverage`, total 78.8% of 54,325
+  lines). The experiment's sources:
+
+  | file | lines | covered |
+  |---|---|---|
+  | `src/component/composition_root.cpp` | 126 | 100% |
+  | `src/component/dependencies.hpp` | 21 | 100% |
+  | `src/contract/horizon.cpp` | 28 | 100% |
+  | `src/contract/work.cpp` | 23 | 100% |
+  | `src/ledger/node_horizon_builder.cpp` | 54 | 100% |
+  | `src/service/claim_walk.cpp` | 31 | 100% |
+  | `src/ledger/predicate_query.cpp` | 49 | 98.0% |
+  | `src/ledger/retention_ledger.cpp` | 34 | 97.1% |
+  | `src/contract/gates.cpp` | 83 | 96.4% |
+  | `src/contract/published.hpp` | 73 | 91.8% |
+  | `src/contract/predicates.hpp` | 20 | 90.0% |
+  | `src/service/maintenance.cpp` | 804 | 85.7% |
+
+  Every executable line the steps built is covered; what the figures
+  miss, read line by line from per-file gcov output:
+  - exception landing pads (`=====`: `gates.cpp` 3, `retention_ledger.cpp`
+    1), reached only if a `std::string` allocation throws;
+  - `predicate_query.cpp:59`, the closing brace after `return page;`
+    (the returned page's destructor, elided);
+  - headers: the report keeps one translation unit's figure per file (the
+    one with the most lines), not the union, so `published.hpp`'s refusal
+    (tested in `test_contract`), `retained()` and the predicates (tested in
+    their own units) read as missed. A merged report is a tooling change
+    for later;
+  - `maintenance.cpp`: of the 99 lines T3 changed, two are uncovered (919,
+    920), the text of a debug-level log line built only when debug logging
+    is on.

@@ -308,3 +308,11 @@ publish. Not yet used: the ledger's horizons adopt it at T3.
   fixed: the candidate (`available_snapshot_view()`, waits on nothing, may
   read an older snapshot for this fallback lookup) changes behaviour, and
   is the operator's decision.
+
+## fi-1 (2026-10-02)
+
+Built and run on fi-1 as part of the `-t3` tip (`dac5098`), which contains
+T2 unchanged: GCC, no warnings; suites 700/700, 17/17, 21/21;
+`src/component/composition_root.cpp` 100%, `dependencies.hpp` 100%,
+`contract/published.hpp` 91.8% (one translation unit's figure; the refusal
+it misses is tested in `test_contract`). Details in the T3 README.
