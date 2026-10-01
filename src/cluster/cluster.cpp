@@ -191,11 +191,6 @@ RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
     return {MessageType::metadata_identity_reply, writer.take()};
 }
 
-int64_t activity_now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
-        .count();
-}
-
 NodeId load_v18_node_id(const std::filesystem::path& state) {
     static constexpr std::string_view expected = "macha-state-layout-v18";
     const auto marker = state / "storage-layout";
@@ -225,7 +220,8 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 }
 } // namespace
 
-NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook startup_stage_hook)
+NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook startup_stage_hook,
+                         ActivityClock activity_clock)
     : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
       data_resources_(cfg_.data_inflight_bytes, cfg_.data_viewer_reserve_bytes,
@@ -316,6 +312,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           },
           cfg_.max_frame_size, {}, &retained_memory_),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
+    activity_clock_ = activity_clock ? std::move(activity_clock) : [] { return Clock::now(); };
     server_.attach_client(client_);
     // While this node accepts no inbound connections it keeps both lanes
     // dialled to every capable peer itself (see RpcClient::open_requested_lanes);
@@ -977,6 +974,12 @@ AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
     if (outbound_calls_stopped_.load(std::memory_order_acquire))
         throw std::runtime_error("node is stopping; outbound RPC is unavailable");
     return client_.call_async(endpoint, type, payload, frame_type);
+}
+
+int64_t NodeRuntime::activity_now_ms() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               activity_clock_().time_since_epoch())
+        .count();
 }
 
 void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
