@@ -19,7 +19,10 @@
 #include "api/status_api.hpp"
 #include "torrent/torrent.hpp"
 #include "observation.hpp"
+#include "component/composition_root.hpp"
+#include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
+#include "storage/retention_ledger.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
@@ -32,13 +35,6 @@
 #include <vector>
 
 namespace macha {
-
-std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfig&);
-
-// One decision of the maintenance pass, for the decision trace: `kind` names
-// what was decided (a gate, a claim walked, tombstones erased) and `detail`
-// says how, deterministically (ids in hex, no times).
-using MaintenanceTraceHook = std::function<void(std::string_view kind, std::string_view detail)>;
 
 // Each step of the service's start and stop, in order ("start ingest",
 // "request_stop streaming", "subsystem fuse"), for the lifecycle recorder.
@@ -113,39 +109,18 @@ class Service {
     std::string startup_error_;
     StartupStallHandler startup_stall_handler_;
 
-    std::jthread maintenance_;
-    std::mutex maintenance_wait_mutex_;
-    std::condition_variable_any maintenance_wait_cv_;
-    std::atomic_uint64_t maintenance_event_{1};
-    std::atomic_uint64_t maintenance_wakeups_{};
-    // Which stage the maintenance loop is in, for a diagnostic that has to
-    // say where a pass is spending its time (or where it is stuck).
-    std::atomic<const char*> maintenance_stage_{"starting"};
-    // What the last pass decided before sleeping: its wait deadline and the
-    // GC quiet window, both as ms from then (-1 = unbounded, -3 = unset),
-    // plus the busy / gc-due flags. Diagnostic only.
-    std::atomic<int64_t> maintenance_last_wait_ms_{-3};
-    std::atomic<int64_t> maintenance_last_gc_quiet_ms_{-3};
-    std::atomic<uint8_t> maintenance_last_flags_{};
-    ConvergenceDemand metadata_convergence_;
+    // Service rings the maintenance pass through its port, and reads its
+    // diagnostics there, before the pass exists and after it has gone.
+    MaintenancePort maintenance_port_;
     MaintenanceStageHook maintenance_stage_hook_;
-    uint64_t maintenance_inventory_generation_{};
-    std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
-    std::shared_ptr<const std::vector<ObjectId>> maintenance_control_live_;
-    Hash256 retention_release_floor_hash_{};
-    std::shared_ptr<const std::vector<ObjectId>> retention_release_data_live_;
-    std::shared_ptr<const std::vector<ObjectId>> retention_release_control_live_;
-    RetentionClock retention_release_clock_;
-    bool retention_release_complete_{};
-    bool maintenance_catalogue_complete_{true};
-    std::vector<GarbageRef> maintenance_garbage_;
-    std::vector<GarbageRef> maintenance_stale_garbage_;
-    std::optional<ObjectId> retention_data_repair_cursor_;
-    std::optional<ObjectId> retention_control_repair_cursor_;
+    // Built once the node's stores exist; the pass's ObjectLedger.
+    std::unique_ptr<RetentionLedger> ledger_;
+    // Owns the components moved out of Service so far (maintenance). After
+    // every service it uses, so it stops and is destroyed before them.
+    CompositionRoot root_{[this](std::string_view event) { note_lifecycle(event); }};
     // Observation for the object ledger experiment's T0: written to a local
     // file under the state path, never to Status or any API response.
     std::unique_ptr<ObservationRecorder> observation_recorder_;
-    bool cluster_stable_observed_{};
     std::atomic_bool observation_stopping_{};
     std::map<std::string, uint64_t> observation_gauges();
 
@@ -156,11 +131,7 @@ class Service {
     // Unauthenticated liveness: whether this node is serving, and nothing more.
     HttpResponse health_response() const;
     bool capability_request(const HttpRequest&);
-    void loop(std::stop_token);
     void signal_maintenance(ServiceEvent);
-    std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
-    void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
-                                   const std::vector<GarbageRef>& stamp);
     void retain_metadata_publication(const MetadataPublicationContext&);
 
   public:
@@ -223,20 +194,21 @@ class Service {
         return *acquisition_api_;
     }
     uint64_t maintenance_wakeups() const noexcept {
-        return maintenance_wakeups_.load(std::memory_order_acquire);
+        return maintenance_port_.wakeups.load(std::memory_order_acquire);
     }
     const char* maintenance_stage() const noexcept {
-        return maintenance_stage_.load(std::memory_order_acquire);
+        return maintenance_port_.stage.load(std::memory_order_acquire);
     }
     std::string maintenance_sleep_diagnostic() const {
-        const auto flags = maintenance_last_flags_.load(std::memory_order_acquire);
-        return "wait_ms=" + std::to_string(maintenance_last_wait_ms_.load(std::memory_order_acquire)) +
+        const auto flags = maintenance_port_.last_flags.load(std::memory_order_acquire);
+        return "wait_ms=" +
+               std::to_string(maintenance_port_.last_wait_ms.load(std::memory_order_acquire)) +
                " gc_quiet_ms=" +
-               std::to_string(maintenance_last_gc_quiet_ms_.load(std::memory_order_acquire)) +
+               std::to_string(maintenance_port_.last_gc_quiet_ms.load(std::memory_order_acquire)) +
                " busy=" + std::to_string(flags & 1) + " gc_due=" + std::to_string((flags >> 1) & 1);
     }
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
-        return metadata_convergence_.diagnostics();
+        return maintenance_port_.metadata_convergence.diagnostics();
     }
     DistributedStore::RepairDiagnostics repair_diagnostics() const {
         return store_->repair_diagnostics();
