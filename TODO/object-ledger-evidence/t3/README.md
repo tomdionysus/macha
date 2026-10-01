@@ -151,3 +151,30 @@ without sleeping.
   fixture prunes an absent object's tombstone, nothing observes the
   journal. Against the new test all six forwarding mutants are killed
   (`build/claude-t3e-mutate*.py`).
+
+# T3f: the predicate queries
+
+- `src/contract/predicates.hpp`: `ObjectFacts` (referenced, held, owned,
+  claimed), the seven predicates as `satisfies(...)` over them (spec B3's
+  table, defined 2026-10-02: the spec had named seven and defined one),
+  the `Placement` contract (`owns`), implemented by `DistributedStore`
+  over its existing `should_own`, and `query(...)`.
+- `src/ledger/predicate_query.cpp`: a query pages the DATA ids satisfying
+  its predicate, in id order, on A3 cursors: over the inventory's
+  referenced ids, or for `releasable` over the ledger's claims against the
+  release horizon. One budget operation per id examined; with no horizon
+  published it examines nothing. `garbage` throws: it needs a walk of what
+  the store holds in id order, which the stores do not have yet (B1).
+- Called by nothing at stage 0.
+- `tests/test_predicates.cpp`: each predicate over all 16 combinations of
+  facts against the spec's table written out as the reference; each query
+  over a world holding every combination once, at every page bound 1..20,
+  against the predicate applied to the whole set at once, with the page
+  count checked against the bound; spot values; no horizons; cancellation;
+  `garbage` refused.
+- Mutation (`build/claude-t3f-mutate*.py`): 18 then 3. Two survived the
+  first run and were weaknesses of the test, now fixed: "the budget is
+  never taken" (the test checked results, not that a small bound pages),
+  and "releasable read against the inventory" (the fixture's release
+  horizon referred to the same ids as the inventory). One mutant did not
+  compile and was rewritten ("owned always true"). All 21 killed.

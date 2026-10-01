@@ -286,6 +286,7 @@ set(MACHA_CORE_SOURCES
     src/contract/horizon.cpp
     src/contract/gates.cpp
     src/ledger/node_horizon_builder.cpp
+    src/ledger/predicate_query.cpp
     src/component/composition_root.cpp
     src/observation.cpp
     src/durable_file.cpp
@@ -588,6 +589,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_contract.cpp
         tests/test_ledger_gates.cpp
         tests/test_horizon_builder.cpp
+        tests/test_predicates.cpp
         tests/test_claim_walk.cpp
         tests/test_component.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
