@@ -46,7 +46,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
   | T2 slice | `-t2` | `3c6c1fd` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance, dependencies as types; assessment written; also the fixes of 2026-10-01 (handover) |
-  | T3 ledger | `-t3` | (this commit) | T3a activity clock, joiner test; T3b horizons and gates; T3c the horizon builder, the pass on handles and gates; T3d the ledger publishes and holds the horizons; T3e claims as the storage layer's contract; checked out |
+  | T3 ledger | `-t3` | (this commit) | T3a activity clock, joiner test; T3b horizons and gates; T3c the horizon builder, the pass on handles and gates; T3d the ledger publishes and holds the horizons; T3e claims as the storage layer's contract; T3f the predicate queries; checked out |
 
 - **T2 is built**; the written assessment is
   `object-ledger-evidence/t2/assessment.md` (no kill criterion met; point 3
@@ -60,15 +60,26 @@ resumes from `develop` and the experiment's version line ceases to exist.
   so weak as thresholds: fi-1's K3 (2 hours), K7 `start_ready` and
   `update_ready` on both nodes (only the asynchronous paths record them).
   Found along the way, recorded, not fixed:
-  - **shutdown hangs with a FUSE publication in flight**: 2 of 6 top-up
-    restarts (fi-1 17:26Z, gbni-1 15:46Z) were SIGKILLed by systemd at
-    60 s. `Service::stop` began, the FUSE main loop did not return, the
-    FUSE watchdog declared the mount gone during shutdown, and on gbni-1
-    an async data publication retried a cancelled write with back-off
-    (250 ms to 16 s) until the kill. Both recovered alone (fi-1 replayed 8
-    durable FUSE operations; the file survived at full size). Mechanism
-    not proven; reproduce by timing a restart against a FUSE fsync. Beside
-    item 12 (the FUSE recovery segfault);
+  - **shutdown hangs while an fsync waits for publication** (2 of 6
+    top-up restarts SIGKILLed at 60 s; **reproduced first time on fi-1,
+    2026-10-01 21:58Z**: 256 MiB through FUSE, restart at the fsync).
+    Mechanism, from gdb and kernel stacks of the stopping process
+    (`build/repro/claude-repro-fsync-20261001T215759Z/`) and the code:
+    `dd` is in the kernel's `fuse_fsync` waiting for an answer; a libfuse
+    worker is in `op_fsync` -> `FuseFrontend::fsync` waiting on its broker's
+    future; the broker runs `wait_for_inode_publication`
+    (`src/fuse/fuse_frontend.cpp:2178`), which with no deadline is an
+    unbounded `data_cv.wait` -- `cancelled` is checked only between waits,
+    so a stop does not wake it; the publication it waits for never
+    completes and never errors during shutdown (the store's writes are
+    cancelled and the async publication retries them with back-off, seen
+    on gbni-1); `FuseSubsystem::stop()` joins, `SubsystemSupervisor::stop()`
+    joins it, until systemd's SIGKILL. Recovery replays the journal (64
+    operations this time); the data survives. A fix makes the wait
+    stop-aware (notify on cancel, or a bounded wait that rechecks) and
+    fails the publication on stop instead of retrying it; with A1's
+    declared waits this is the class of wait the experiment exists to
+    make visible. Not fixed: for the operator.
   - repair completes no pass: one to three months a pass at its rate
     (baseline.md K4). Repair's pace, not a broken gauge;
   - an unattributed restart of fi-1 at 16:00:01Z from the laptop's
@@ -90,9 +101,11 @@ resumes from `develop` and the experiment's version line ceases to exist.
     once-a-minute writer is not identified. Plausible, not proven: a write
     prepared against one root fails instead of rebasing when another lands
     first. T0's diff touches no catalogue or metadata code, so this is
-    0.73 behaviour the baseline recorded.
-- **T3 next** (plan, T3f): the predicate queries, implemented, tested,
-  unused; then T3's assessment against the kill criteria.
+    0.73 behaviour the baseline recorded. fi-1's restart at 21:59Z did not
+    clear it: 21 more failures by 22:27Z.
+- **T3 next**: its assessment against the kill criteria, as T2's
+  (`object-ledger-evidence/t3/assessment.md`); then the fi-1 GCC run and
+  the chain merge.
 - **Future experiment: memoised horizon builds** (spec, Later stages):
   subtree referenced sets kept by subtree id, partial builds merging in any
   order; first measure how often the inventory and release heads coincide.

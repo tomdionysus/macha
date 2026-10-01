@@ -643,11 +643,30 @@ what it publishes and checks claims before a rebalance removal: both are
 below the ledger, so they use the `ClaimStore` contract (`claims()`), not
 the ledger. Everything above the ledger reaches claims only through it.
 
-**Predicate queries** for later stages (`to_pull`: owner, not held,
-referenced; `to_push_from`; `surplus`; `releasable`; `garbage`;
-`missing_here`; `held_owned`) are implemented and tested but called by
-nothing at stage 0: routing repair through them would change what it
-visits and in what order.
+**Predicate queries** for later stages are implemented and tested but
+called by nothing at stage 0: routing repair through them would change
+what it visits and in what order (`src/contract/predicates.hpp`). Each is
+a predicate over four facts about one DATA object -- referenced (by the
+inventory horizon; by the release horizon for `releasable`), held,
+owned (this node is in placement's owner set: the `Placement` contract,
+implemented by `DistributedStore`), claimed -- and a query that pages the
+ids satisfying it, in id order, on A3 cursors:
+
+| predicate | referenced | held | owned | claimed | pages |
+|---|---|---|---|---|---|
+| `to_pull` | yes | no | yes | | referenced ids |
+| `missing_here` | yes | no | | yes | referenced ids |
+| `held_owned` | yes | yes | yes | | referenced ids |
+| `to_push_from` | yes | yes | no | | referenced ids |
+| `surplus` | yes | yes | no | no | referenced ids |
+| `releasable` | no (release horizon) | | | yes | DATA claims |
+| `garbage` | no | yes | | no | not at stage 0 |
+
+Only `to_pull` was defined before 2026-10-02; the rest are defined here
+(decision log). `garbage` needs a walk of what the store holds in id
+order, which the stores do not have (their walks are directory
+iterations); it is defined and tested as a predicate, and its query
+follows B1's walks.
 
 **Toward pinned roots.** Later, the two horizons become two pins on one
 store, and "referenced" becomes "reachable from any pinned root". Retention
@@ -925,6 +944,12 @@ supersede earlier ones where they conflict.
   baseline is `object-ledger-evidence/t0/baseline.md`; its thin series are
   weak thresholds, marked. The conflict loop and the shutdown hang are
   0.73 behaviour (T0's diff is observation only), recorded in ACTIVE.
+- **2026-10-02 (T3f). The predicates defined** (the table in B3): the
+  spec had named seven and defined one. Each is over four facts of one
+  DATA object; ownership is placement's owner set (`Placement`,
+  implemented by `DistributedStore::should_own`). `garbage` is not
+  queryable until the stores walk what they hold in id order. To revise
+  before any later stage calls them.
 - **2026-10-02 (T3e). Claims are the storage layer's contract** (option A,
   on the operator's "continue" after it was recommended). `ClaimStore` is
   the contract, `RetentionStore` its implementation, owned by `NodeRuntime`

@@ -410,7 +410,8 @@ answers (spec B3, B4; decision log 2026-10-01).
   compaction); the node's RPC handlers and `DistributedStore` use
   `ClaimStore`. The catalogue's staging GC still reaches it through
   `NodeRuntime` until T5 wires the catalogue.
-- **T3f.** The predicate queries implemented, tested, unused.
+- **T3f, done.** The predicate queries implemented, tested, unused
+  (spec B3's table); `garbage`'s query waits for B1's store walks.
 - Metadata is reached through the declared views from T2; the full
   metadata contract and the catalogue's repair split are T4.
 - Q: GC, release and repair scenarios move to trace fixtures and
