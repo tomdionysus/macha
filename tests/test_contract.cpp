@@ -3,7 +3,9 @@
 // The contract vocabulary (the object ledger spec, A1 and A3): work context,
 // wait declarations and their guard, cursor, budget, page. Primitives, each
 // tested over its whole phase space.
+#include "catalogue/catalogue.hpp"
 #include "cluster/data_work.hpp"
+#include "cluster/distributed_store.hpp"
 #include "contract/published.hpp"
 #include "contract/walk.hpp"
 #include "contract/work.hpp"
@@ -368,6 +370,36 @@ MACHA_TEST("contract", test_the_wait_guard_on_snapshot_views) {
     CHECK(threw);
     (void)service.metadata_manager().snapshot_view(loader);
     CHECK(service.catalogue().snapshot_view(control) != nullptr);
+    WaitGuard::set_mode(WaitGuard::Mode::record);
+}
+
+// A cold catalogue loads from metadata and the control store, so control
+// work may not enter it; once a loader has warmed it, control work may.
+MACHA_TEST("contract", test_the_wait_guard_on_a_cold_catalogue) {
+    macha::test_support::TestCluster cluster;
+    auto config = macha::test_support::config_for(cluster.path() / "node", cluster.keyfile(),
+                                                  macha::test_support::free_port());
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    NodeRuntime node(config, cluster.keys());
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
+    DistributedStore store(node);
+    MetadataManager metadata(node);
+    CatalogueManager catalogue(node, store, metadata);
+
+    WaitGuard::set_mode(WaitGuard::Mode::throw_on_violation);
+    const WorkContext control(FrameType::control, {}, nullptr, "test control");
+    const WorkContext loader(FrameType::loader, {}, nullptr, "test loader");
+    bool threw = false;
+    try {
+        (void)catalogue.snapshot_view(control);
+    } catch (const std::logic_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(catalogue.snapshot_view(loader) != nullptr);
+    CHECK(catalogue.snapshot_view(control) != nullptr);
     WaitGuard::set_mode(WaitGuard::Mode::record);
 }
 
