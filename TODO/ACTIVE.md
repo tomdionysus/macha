@@ -46,7 +46,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
   | T2 slice | `-t2` | `3c6c1fd` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance, dependencies as types; assessment written; also the fixes of 2026-10-01 (handover) |
-  | T3 ledger | `-t3` | (this commit) | T3a activity clock, joiner test; T3b horizons and gates; T3c the horizon builder, the pass on handles and gates; checked out |
+  | T3 ledger | `-t3` | (this commit) | T3a activity clock, joiner test; T3b horizons and gates; T3c the horizon builder, the pass on handles and gates; T3d the ledger publishes and holds the horizons; checked out |
 
 - **T2 is built**; the written assessment is
   `object-ledger-evidence/t2/assessment.md` (no kill criterion met; point 3
@@ -74,9 +74,9 @@ resumes from `develop` and the experiment's version line ceases to exist.
     removed, `ENOENT` on every retry;
   - fi-1's playback errors under transcode (seek 503 after ~15 s, segment
     500, `extent unavailable`) match the soak's: the baseline's behaviour.
-- **T3 next** (plan, T3, substages T3d-T3f): the ledger publishes and
-  holds the horizons (refusing an incomplete release horizon); every
-  consumer onto the ledger; the predicate queries.
+- **T3 next** (plan, T3, substages T3e-T3f): every consumer onto the
+  ledger (claims included: rebalance, publication, peer removal, catalogue
+  staging GC, compaction); the predicate queries.
 - **Future experiment: memoised horizon builds** (spec, Later stages):
   subtree referenced sets kept by subtree id, partial builds merging in any
   order; first measure how often the inventory and release heads coincide.
