@@ -45,7 +45,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
   | T2 slice | `-t2` | `3c6c1fd` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance, dependencies as types; assessment written; also the fixes of 2026-10-01 (handover) |
-  | T3 ledger | `-t3` | (local) | begun: the activity clock injected; trace harness without real-time sleeps; joiner test; checked out |
+  | T3 ledger | `-t3` | `e96046a` | part one: the activity clock injected; trace harness without real-time sleeps; joiner test; checked out |
 
 - **T2 is built**; the written assessment is
   `object-ledger-evidence/t2/assessment.md` (no kill criterion met; point 3
