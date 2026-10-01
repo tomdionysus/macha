@@ -4,6 +4,7 @@
 // A5): order from declarations, refusals, the lifecycle steps and their
 // record, a failed start, faults. Primitives over fake components.
 #include "component/composition_root.hpp"
+#include "component/dependencies.hpp"
 #include "log.hpp"
 #include "test_framework.hpp"
 
@@ -16,6 +17,22 @@
 #include <vector>
 
 using namespace macha;
+
+namespace {
+struct Clock {
+    int now{};
+};
+struct Store {
+    int held{};
+};
+} // namespace
+
+template <> struct macha::ContractName<Clock> {
+    static constexpr std::string_view value = "clock";
+};
+template <> struct macha::ContractName<Store> {
+    static constexpr std::string_view value = "store";
+};
 
 namespace {
 
@@ -330,6 +347,35 @@ MACHA_FAST_TEST("component", test_root_routes_faults_by_component) {
     CHECK((events == Events{"stubborn.start", "stubborn.stop"}));
     CHECK((counting->errors ==
            std::vector<std::string>{"composition root: stop during destruction failed: stubborn would not stop"}));
+}
+
+// A component's dependencies are stated once, as types: the references it
+// is handed and the names it declares, in the order listed.
+MACHA_FAST_TEST("component", test_dependencies_hand_out_what_they_declare) {
+    Clock clock{7};
+    Store store{3};
+    const Dependencies<Clock, const Store> dependencies(clock, store);
+    CHECK(&dependencies.get<Clock>() == &clock);
+    CHECK(&dependencies.get<const Store>() == &store);
+    clock.now = 8;
+    CHECK(dependencies.get<Clock>().now == 8);
+    CHECK((Dependencies<Clock, const Store>::names() == std::vector<std::string>{"clock", "store"}));
+    CHECK((Dependencies<const Store, Clock>::names() == std::vector<std::string>{"store", "clock"}));
+    CHECK(Dependencies<>::names().empty());
+}
+
+// The root matches a typed external against a component's declared names.
+MACHA_FAST_TEST("component", test_root_typed_externals_satisfy_declared_dependencies) {
+    Events events;
+    CompositionRoot root;
+    root.external<Clock>();
+    root.external<const Store>();
+    root.add(fake("user", events, Dependencies<Clock, Store>::names()));
+    CHECK((root.order() == std::vector<std::string>{"user"}));
+    CompositionRoot missing;
+    missing.external<Clock>();
+    missing.add(fake("user", events, Dependencies<Clock, Store>::names()));
+    CHECK(throws_invalid([&] { (void)missing.order(); }));
 }
 
 } // namespace

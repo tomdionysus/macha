@@ -88,20 +88,19 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 } // namespace
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
-    : node_(dependencies.node), store_(dependencies.store), metadata_(dependencies.metadata),
-      catalogue_(dependencies.catalogue), filesystem_(dependencies.filesystem),
-      ledger_(dependencies.ledger), port_(dependencies.port), clock_(std::move(dependencies.clock)),
+    : node_(dependencies.contracts.get<NodeRuntime>()),
+      store_(dependencies.contracts.get<DistributedStore>()),
+      metadata_(dependencies.contracts.get<MetadataManager>()),
+      catalogue_(dependencies.contracts.get<CatalogueManager>()),
+      filesystem_(dependencies.contracts.get<FileSystem>()),
+      ledger_(dependencies.contracts.get<const ObjectLedger>()),
+      port_(dependencies.contracts.get<MaintenancePort>()), clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
       maintenance_stage_hook_(std::move(dependencies.stage_hook)),
       constructed_(dependencies.constructed) {}
 
 Maintenance::~Maintenance() {
     stop();
-}
-
-std::vector<std::string> Maintenance::required() const {
-    return {"node", "distributed-store", "metadata", "catalogue", "filesystem", "object-ledger",
-            "maintenance-port"};
 }
 
 void Maintenance::start() {

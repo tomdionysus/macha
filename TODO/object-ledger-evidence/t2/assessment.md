@@ -48,13 +48,16 @@ never gated) hold as they held. No scheduling change was made.
    raced on the pointer; a port owned outside it is the shape. Recorded in
    A5. Every component the root takes from Service at T5 must be checked
    for the same.
-3. **Two lists name the same dependencies.** `Maintenance::required()` and
-   the externals Service declares are kept in step by hand, and the
-   constructor parameters are a third statement of the same thing. The root
-   refuses a mismatch at `start()`, so the first start in any test catches
-   it, but it is the brittle point of the model. Before widening, derive
-   the declaration from the dependency struct (one place), or accept it
-   and say so in the contract.
+3. **Two lists named the same dependencies** (settled 2026-10-01, the
+   operator's go). A component now states its dependencies once, as types:
+   `Dependencies<NodeRuntime, ..., const ObjectLedger, MaintenancePort>`
+   (`src/component/dependencies.hpp`) is both its constructor parameter and
+   the source of `required()`. Every contract's name lives in one trait
+   (`src/component/contracts.hpp`); a type without one does not compile as
+   a dependency. Service declares what it supplies by type
+   (`root_.external<MetadataManager>()`). Consumer and provider each state
+   their side once and the root matches them; no hand-written name lists
+   remain. Two cases, both mutation-proven.
 4. **`NodeRuntime` is still a locator** for the pass (config, membership,
    the replica, three stores, the block cache, viewer signals). Accepted
    for stage 0 (decision log, 2026-10-01); T3 and T4 remove most of it. It
@@ -85,6 +88,6 @@ as a primitive and mutation-proven: 13 + 16 + 9 + 24 mutants, all killed.
 
 ## Verdict
 
-No kill criterion is met. Before widening (T3): settle point 3; carry
+No kill criterion is met. Before widening (T3): carry
 points 2 and 5 into the T5 conversions as a checklist; decide the manage
 route's fix (point 6).
