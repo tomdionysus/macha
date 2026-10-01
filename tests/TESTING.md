@@ -66,9 +66,16 @@ on the cluster nodes, so the GCC summary is aggregated from plain `gcov`
 output rather than depending on a tool someone would have to install first.
 
 Two details that are easy to get wrong and are handled for you. The runner
-executes every case in an isolated child process, so under Clang the profile
-filename must be per-process (`%p`) or the children overwrite each other and
-the report describes whichever exited last. And the build defaults to `Debug`
+executes every case in an isolated child process, so under Clang each case
+must write its own profile or the children overwrite and corrupt one file.
+`%p` alone does not do it: the runtime expands it once, in the parent. Each
+forked case therefore names its file with its own pid, and because every
+image carries a private copy of the profile runtime, `macha_core` names,
+resets and writes its own counters (`src/coverage.hpp`, `<pid>-core.profraw`)
+beside the test binary's. Counters are atomic (`-fprofile-update=atomic`):
+in-process cluster tests run several nodes' threads through the same code,
+and plain increments lose counts that llvm-cov then turns into negative
+branch counts. And the build defaults to `Debug`
 rather than the usual `Release`, because at `-O3` inlining makes a coverage
 report describe the optimiser's view rather than the code's; override with
 `MACHA_COVERAGE_BUILD_TYPE` if you want coverage of an optimised build.

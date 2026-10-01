@@ -199,12 +199,44 @@ publish. Not yet used: the ledger's horizons adopt it at T3.
   compile and was rewritten: `(void)waiting[dependant]`).
 - **Suites:** macha-tests 663/663, macha-tests-runtime 17/17 (Clang,
   laptop).
-- **Coverage, not yet measured.** The laptop's Clang coverage is unusable
-  for the suite's process model: each forked case dumps its counters to
-  the parent's `%p.profraw` (the name is fixed in the parent), so the cases
-  overwrite and corrupt one file per binary (`failed to uncompress data`).
-  The canonical measurement is GCC on fi-1, as T0's; it runs after the
-  soak, with the GCC build and suites the chain needs before acceptance.
+- **Coverage** (laptop, Clang, whole suite, after the coverage fix below):
+  every T2 primitive at 100% lines and 100% branches --
+  `component/composition_root.cpp` 138/138 and 64/64, `component.hpp`,
+  `contract/published.hpp` 15/15 and 2/2, `walk.hpp` 48/48 and 20/20,
+  `work.{hpp,cpp}`, `claim_walk.{hpp,cpp}`, `retention_ledger.cpp`,
+  `maintenance_clock.{hpp,cpp}`. `service/maintenance.cpp`, a functional
+  component (decision log, two classes), 1040/1178 lines (88.3%), 484/608
+  branches (79.6%). Whole library 82.4% lines. Two cases were added to
+  reach the last lines (a yield source destroyed through its interface;
+  `ClaimWalk::type()`) and one to reach the root's destructor catch; each
+  mutation-proven.
+- **The coverage fix.** The laptop's Clang coverage had never measured the
+  library from a test case. Three defects, each proven before the change:
+  (1) the runtime expands `%p` once, in the parent, so every forked case
+  wrote the parent's file, overwriting and corrupting it (a probe: one file
+  without the fix, the child's own with it); (2) each image carries a
+  private copy of the profile runtime (`nm`: `__llvm_profile_*` private
+  in both `libmacha_core.dylib` and `macha-tests`), so the framework reset
+  and dumped only the test binary's counters and `macha_core` read 0% --
+  `src/coverage.{hpp,cpp}` now lets the library name, reset and write its
+  own (`<pid>-core.profraw`); (3) counters were not atomic, and in-process
+  cluster tests run several nodes' threads through the same code, so lost
+  increments became negative derived branch counts (`False: 18.4E`) that
+  wrapped real counts to zero (bisected to the merge; the case's own
+  profile alone had them) -- `-fprofile-update=atomic`. GCC untouched (T0
+  measured the library through it).
+- **Two cases fail only in the laptop's coverage build** (Debug, Clang,
+  instrumented), both P0, reported, not fixed:
+  `hydration_catalogue/test_a_torrent_is_held_by_one_job_and_a_second_add_names_it`
+  fails 50/50 there and passes 50/50 in Release (the first `place()` reports
+  placed, but no job for it is listed or held; the torrent plugin, Debug,
+  against the system libtorrent, Release; untouched by this chain; fi-1's
+  GCC Debug coverage passed it at T0). `rpc_cluster/test_three_node_cluster`
+  failed once in three whole-suite coverage runs (load 15), passing 20/20
+  in isolation in each build: a joining node's pull through repair overran
+  `wait_until`'s fixed 5 s (`tests/test_support.hpp:382`), which the
+  coverage build's timeout scale does not reach -- T0's class, real time in
+  a test. Not compared against the parent commit.
 
 ## Mutation record (laptop, 2026-10-01)
 

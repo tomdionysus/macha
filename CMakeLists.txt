@@ -267,6 +267,7 @@ set(MACHA_CORE_SOURCES
     src/process_allocator.cpp
     src/log.cpp
     src/supervised.cpp
+    src/coverage.cpp
     src/diagnostics.cpp
     src/contract/work.cpp
     src/component/composition_root.cpp
@@ -614,15 +615,24 @@ if(MACHA_BUILD_TESTS)
         # Every case runs in a forked child that leaves through std::_Exit, so
         # the framework has to dump counters by hand; this tells it to.
         target_compile_definitions(macha-tests PRIVATE MACHA_COVERAGE=1)
+        # Under Clang the library carries its own copy of the profile
+        # runtime, which only the library can drive (src/coverage.hpp).
+        target_compile_definitions(macha_core PRIVATE MACHA_COVERAGE=1)
         if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
             target_compile_options(macha_core PRIVATE --coverage)
             target_link_options(macha_core PRIVATE --coverage)
             target_compile_options(macha-tests PRIVATE --coverage)
             target_link_options(macha-tests PRIVATE --coverage)
         elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
-            target_compile_options(macha_core PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+            # Atomic counters: in-process cluster tests run several nodes'
+            # threads through the same code at once, and plain increments
+            # lose counts, which llvm-cov then derives as negative branch
+            # counts (shown as 18.4E) that wrap a real count to zero.
+            target_compile_options(macha_core PRIVATE -fprofile-instr-generate -fcoverage-mapping
+                -fprofile-update=atomic)
             target_link_options(macha_core PRIVATE -fprofile-instr-generate)
-            target_compile_options(macha-tests PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+            target_compile_options(macha-tests PRIVATE -fprofile-instr-generate -fcoverage-mapping
+                -fprofile-update=atomic)
             target_link_options(macha-tests PRIVATE -fprofile-instr-generate)
         else()
             message(FATAL_ERROR "MACHA_TEST_COVERAGE requires GCC, Clang or AppleClang")
@@ -665,7 +675,8 @@ if(MACHA_BUILD_TESTS)
                 target_compile_options(macha-tests-runtime PRIVATE --coverage)
                 target_link_options(macha-tests-runtime PRIVATE --coverage)
             elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
-                target_compile_options(macha-tests-runtime PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+                target_compile_options(macha-tests-runtime PRIVATE -fprofile-instr-generate -fcoverage-mapping
+                    -fprofile-update=atomic)
                 target_link_options(macha-tests-runtime PRIVATE -fprofile-instr-generate)
             endif()
         endif()

@@ -5,6 +5,7 @@
 #include "test_backend_support.hpp"
 #include "retained_memory.hpp"
 #include "supervised.hpp"
+#include "coverage.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -1884,4 +1885,14 @@ MACHA_FAST_TEST("foundations", test_transcode_rates_keep_a_median_per_class_and_
     CHECK(find("truehd").rate_milli == 12500);
     CHECK(find("truehd").concurrent == 3);
     CHECK(find("h264").observations == TranscodeRateBook::kept_observations);
+}
+
+// A forked case's profile name: every %p becomes the child's pid and tag,
+// the rest of the pattern untouched.
+MACHA_FAST_TEST("foundations", test_coverage_child_profile_name) {
+    CHECK(coverage::child_profile_name("/p/%p.profraw", 42, "") == "/p/42.profraw");
+    CHECK(coverage::child_profile_name("/p/%p.profraw", 42, "-core") == "/p/42-core.profraw");
+    CHECK(coverage::child_profile_name("%p/%p", 7, "x") == "7x/7x");
+    CHECK(coverage::child_profile_name("/p/%m.profraw", 7, "x") == "/p/%m.profraw");
+    CHECK(coverage::child_profile_name("", 7, "x").empty());
 }
