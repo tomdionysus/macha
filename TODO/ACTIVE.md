@@ -266,18 +266,14 @@ glibc heap checking on. Items the experiment absorbs say so.
    paused session still shows as a session with no segment lines; the
    operator's call each time.
 12. **Test failures** (no known flakes -- each is P0 work):
-    - **P0, diagnosed 2026-09-30, fix waiting on the operator's go:**
+    - **Fixed 2026-10-01, watching for recurrence:**
       `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
-      segfaults ~60 ms in, ~1.7% at `--jobs 12` (also 5/500 on `c53efd7`, so
-      it predates T2c). ASan: null `this` in
-      `DistributedStore::repair_diagnostics()` via
-      `Service::repair_diagnostics()` (`src/service/service.hpp:241`), which
-      reads `store_` before the asynchronous service start has built it;
-      every sibling accessor calls `wait_services_ready()` first and this one
-      does not. Only this test calls it; production reaches the diagnostics
-      through the Status hook attached after `store_` exists. Proposed fix:
-      `wait_services_ready()` in the accessor (it loses `const`). Logs in
-      `build/claude-asan-paced-6.log`.
+      segfaulted ~60 ms in, ~1.7% at `--jobs 12` (also 5/500 on `c53efd7`).
+      ASan: null `this` in `DistributedStore::repair_diagnostics()` via
+      `Service::repair_diagnostics()`, which read `store_` before the
+      asynchronous service start had built it. The accessor now calls
+      `wait_services_ready()` like its siblings (it lost `const`). 5/5 after
+      the fix (operator: five runs, then watch). Any recurrence reopens it.
     - The same test fails its pacing check (`share_after > share_before`,
       `tests/test_rpc_cluster.cpp:968`) 2/100 with
       `MACHA_TEST_LOG_LEVEL=DEBUG`, 0/300 without. Likely timing under slow
