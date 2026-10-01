@@ -37,11 +37,16 @@ class Fake final : public Component {
             throw std::runtime_error(name_ + " refused to start");
     }
     void request_stop() noexcept override { events_.push_back(name_ + ".request_stop"); }
-    void stop() override { events_.push_back(name_ + ".stop"); }
+    void stop() override {
+        events_.push_back(name_ + ".stop");
+        if (fail_stop)
+            throw std::runtime_error(name_ + " would not stop");
+    }
     void attach_fault_sink(FaultSink sink) override { sink_ = std::move(sink); }
 
     void fault(std::string reason) { sink_(std::move(reason)); }
     bool fail_start{};
+    bool fail_stop{};
 
   private:
     std::string name_;
@@ -311,6 +316,20 @@ MACHA_FAST_TEST("component", test_root_routes_faults_by_component) {
     logging.start();
     c.fault("wedged");
     CHECK((counting->errors == std::vector<std::string>{"component c fault: wedged"}));
+
+    // A stop that throws while the root is destroyed is logged, not thrown
+    // out of a destructor.
+    counting->errors.clear();
+    events.clear();
+    {
+        CompositionRoot root;
+        auto& stubborn = root.add(fake("stubborn", events));
+        stubborn.fail_stop = true;
+        root.start();
+    }
+    CHECK((events == Events{"stubborn.start", "stubborn.stop"}));
+    CHECK((counting->errors ==
+           std::vector<std::string>{"composition root: stop during destruction failed: stubborn would not stop"}));
 }
 
 } // namespace

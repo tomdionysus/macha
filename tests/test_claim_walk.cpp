@@ -233,6 +233,7 @@ void compare(const FakeLedger& ledger, const std::set<ObjectId>& refused, size_t
     ours.refused = theirs.refused = refused;
     ours.credit = theirs.credit = initial;
     ClaimWalk walk(RetentionClass::data);
+    CHECK(walk.type() == RetentionClass::data);
     ReferenceWalk reference;
     for (size_t s = 0; s < steps; ++s) {
         const auto a = walk.step(ledger, ours);
