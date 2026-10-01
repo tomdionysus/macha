@@ -4965,294 +4965,288 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     s2->stop();
 }
 
-MACHA_HEAVY_TEST("rpc_cluster", test_three_node_cluster) {
+// Three nodes whose commits are durable on every replica: what one node
+// writes is on the other two when the call returns, so no claim below waits
+// for replication. Only forming the cluster is waited for. The metadata
+// cache lasts its longest (5 s), far beyond the milliseconds between a
+// commit and its check, so a change seen through another node was made
+// visible by the replica's committed generation, not by a cache expiring.
+struct DurableTrio {
     TestCluster cluster;
-    const auto& keys = cluster.keys();
-    uint16_t p1 = free_port();
-    uint16_t p2 = free_port();
-    uint16_t p3 = free_port();
-    uint16_t p4 = free_port();
+    std::vector<Config> configs;
+    std::vector<std::unique_ptr<Service>> nodes;
 
-    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
-    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
-    auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, {{"127.0.0.1", p1}});
-    c1.storage_packing = c2.storage_packing = c3.storage_packing = c4.storage_packing =
-        StoragePackingConfig{0, 0};
-    // This lifecycle test deliberately corrupts one replica and immediately
-    // requires a healthy peer copy.  Make that synchronous durability
-    // requirement explicit; replicas=3 alone is only the convergence target in
-    // the 0.18 storage contract.
-    c1.min_write_replicas = c2.min_write_replicas = c3.min_write_replicas = c4.min_write_replicas =
-        3;
-
-    {
-        Service s1(c1, keys);
-        Service s2(c2, keys);
-        Service s3(c3, keys);
-        s1.start();
-        s2.start();
-        s3.start();
-
-        REQUIRE(wait_until([&] {
-            return s1.node().membership().active().size() >= 3 &&
-                   s2.node().membership().active().size() >= 3 &&
-                   s3.node().membership().active().size() >= 3;
-        }));
-
-        // Genesis has no privileged coordinator in 0.19. Deliberately initiate
-        // the virgin namespace from the highest NodeId, which cannot be the
-        // historical min-NodeId coordinator, and require the resulting root to
-        // become visible on node 1 before continuing the lifecycle test.
-        Service* genesis_writer = &s1;
-        if (s2.node().node_id() > genesis_writer->node().node_id())
-            genesis_writer = &s2;
-        if (s3.node().node_id() > genesis_writer->node().node_id())
-            genesis_writer = &s3;
-        genesis_writer->filesystem().mkdir("/media", 0755, getuid(), getgid());
-        REQUIRE(wait_until([&] {
-            try {
-                return s1.filesystem().getattr("/media").type == EntryType::directory;
-            } catch (...) {
-                return false;
-            }
-        }));
-        s1.filesystem().create_file("/media/movie.mkv", 0644, getuid(), getgid());
-        auto input = pattern(3 * 1024 * 1024 + 12345);
-        auto writer = s1.filesystem().open_write("/media/movie.mkv", true);
-        size_t offset = 0;
-        while (offset < input.size()) {
-            size_t n = std::min<size_t>(77777, input.size() - offset);
-            CHECK(writer->write(offset, {input.data() + offset, n}) == n);
-            offset += n;
+    explicit DurableTrio(size_t metadata_floor = 3, size_t data_floor = 3) {
+        const uint16_t first = free_port();
+        for (size_t i = 0; i < 3; ++i) {
+            const auto dir = cluster.path() / ("n" + std::to_string(i + 1));
+            auto config = i == 0 ? config_for(dir, cluster.keyfile(), first)
+                                 : config_for(dir, cluster.keyfile(), free_port(),
+                                              {{"127.0.0.1", first}});
+            config.storage_packing = StoragePackingConfig{0, 0};
+            config.replication = 3;
+            config.min_write_replicas = data_floor;
+            config.metadata_min_write_replicas = metadata_floor;
+            config.metadata_cache = 5000ms; // the longest allowed
+            configs.push_back(std::move(config));
         }
+        for (const auto& config : configs)
+            nodes.push_back(std::make_unique<Service>(config, cluster.keys()));
+        for (auto& node : nodes)
+            node->start();
+        REQUIRE(wait_until(
+            [&] {
+                for (auto& node : nodes)
+                    if (node->node().membership().active().size() < 3)
+                        return false;
+                return true;
+            },
+            60s));
+        for (auto& node : nodes)
+            REQUIRE(wait_metadata_writable(*node, 60s));
+    }
+    ~DurableTrio() {
+        for (auto it = nodes.rbegin(); it != nodes.rend(); ++it)
+            if (*it)
+                (*it)->stop();
+    }
+    Service& operator[](size_t i) { return *nodes[i]; }
+    void stop(size_t i) {
+        nodes[i]->stop();
+        nodes[i].reset();
+    }
+    // Writes `bytes` to `path` through node `i`; returns the file's extents.
+    std::vector<ObjectId> write(size_t i, const std::string& path, const Bytes& bytes) {
+        auto& fs = nodes[i]->filesystem();
+        fs.create_file(path, 0644, getuid(), getgid());
+        auto writer = fs.open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
         writer->commit();
-
-        // Removing a committed file records an explicit retirement. Reachability
-        // GC uses the same live inventory for both tombstone pruning and orphan sweep.
-        s1.filesystem().create_file("/media/delete-me.bin", 0644, getuid(), getgid());
-        auto delete_data = pattern(131072);
-        auto delete_writer = s1.filesystem().open_write("/media/delete-me.bin", true);
-        REQUIRE(delete_writer->write(0, delete_data) == delete_data.size());
-        delete_writer->commit();
-        auto delete_entry = s1.filesystem().getattr("/media/delete-me.bin");
-        REQUIRE(delete_entry.extents.size() == 1);
-        auto deleted_id = delete_entry.extents.front().id;
-        s1.filesystem().unlink("/media/delete-me.bin");
-        auto maintenance = s1.filesystem().maintenance_objects();
-        CHECK(std::find_if(maintenance.garbage.begin(), maintenance.garbage.end(),
-                           [&](const GarbageRef& garbage) { return garbage.id == deleted_id; }) !=
-              maintenance.garbage.end());
-        CHECK(std::find(maintenance.live.begin(), maintenance.live.end(), deleted_id) ==
-              maintenance.live.end());
-        auto inventory1 = s1.filesystem().maintenance_objects_cached();
-        auto inventory2 = s1.filesystem().maintenance_objects_cached();
-        CHECK(inventory1.get() == inventory2.get());
-        CHECK(inventory1->metadata_generation != 0);
-        CHECK(inventory1->entries >= 2);
-        CHECK(inventory1->extents >= 1);
-        CHECK(std::is_sorted(inventory1->live.begin(), inventory1->live.end()));
-        CHECK(std::adjacent_find(inventory1->live.begin(), inventory1->live.end()) ==
-              inventory1->live.end());
-        CHECK(std::is_sorted(inventory1->garbage.begin(), inventory1->garbage.end()));
-        s1.filesystem().mkdir("/inventory-generation-change", 0755, getuid(), getgid());
-        auto inventory3 = s1.filesystem().maintenance_objects_cached();
-        CHECK(inventory3->metadata_generation > inventory1->metadata_generation);
-        CHECK(inventory3.get() != inventory1.get());
-
-        REQUIRE(wait_until([&] {
-            try {
-                return s2.filesystem().getattr("/media/movie.mkv").size == input.size();
-            } catch (...) {
-                return false;
-            }
-        }));
-
-        // Warm node 2's namespace cache, mutate through node 1, then require
-        // visibility before the cache TTL can expire. The local replica update
-        // and generation notice are both valid invalidation paths.
-        (void)s2.filesystem().getattr("/media");
-        s1.filesystem().mkdir("/cache-invalidation", 0755, getuid(), getgid());
-        REQUIRE(wait_until(
-            [&] {
-                try {
-                    return s2.filesystem().getattr("/cache-invalidation").type ==
-                           EntryType::directory;
-                } catch (...) {
-                    return false;
-                }
-            },
-            200ms));
-
-        auto reader = s2.filesystem().open_read("/media/movie.mkv");
-        Bytes output(input.size());
-        size_t got = 0;
-        while (got < output.size()) {
-            size_t n = std::min<size_t>(131072, output.size() - got);
-            auto r = reader->read(got, {output.data() + got, n});
-            REQUIRE(r > 0);
-            got += r;
-        }
-        CHECK(output == input);
-
-        Bytes slice(333333);
-        auto random_reader = s3.filesystem().open_read("/media/movie.mkv");
-        auto n = random_reader->read(987654, slice);
-        REQUIRE(n == slice.size());
-        CHECK(std::equal(slice.begin(), slice.end(), input.begin() + 987654));
-
-        s1.filesystem().mkdir("/media/not-a-file", 0755, getuid(), getgid());
-        bool wrong_type_rejected = false;
-        try {
-            s1.filesystem().rename("/media/movie.mkv", "/media/not-a-file", false);
-        } catch (const FsError& error) {
-            wrong_type_rejected = error.code() == EISDIR;
-        }
-        CHECK(wrong_type_rejected);
-
-        // Loss of any one metadata replica must not stop namespace mutations.
-        auto failed_replica = s3.node().node_id();
-        s3.stop();
-        s2.filesystem().mkdir("/survives-one-node-loss", 0755, getuid(), getgid());
-        CHECK(s1.filesystem().getattr("/survives-one-node-loss").type == EntryType::directory);
-
-        // Remove a local replica from node 2; reads must transparently fall back to node 1.
-        auto entry = s2.filesystem().getattr("/media/movie.mkv");
-        REQUIRE(!entry.extents.empty());
-
-        // A damaged encrypted replica must fail authentication, fall back to a
-        // healthy peer, and be restored by the bounded scrub/repair path.
-        auto damaged = entry.extents.front().id;
-        corrupt_object(c2.storage_backends.front().path, damaged);
-        DistributedStore corruption_repair(s2.node());
-        auto recovered = corruption_repair.get(damaged);
-        REQUIRE(recovered.has_value());
-        CHECK(object_id(*recovered) == damaged);
-        corruption_repair.scrub_once(128ULL * 1024 * 1024);
-        for (size_t attempt = 0; attempt < entry.extents.size() + 2; ++attempt)
-            corruption_repair.repair_once(128ULL * 1024 * 1024);
-        REQUIRE(s2.node().local_store().get(damaged).has_value());
-
-        // Remove a local replica entirely; reads must transparently fall back.
-        s2.node().local_store().remove(damaged);
-        auto failover_reader = s2.filesystem().open_read("/media/movie.mkv");
-        Bytes first(1024 * 1024);
-        REQUIRE(failover_reader->read(0, first) == first.size());
-        CHECK(std::equal(first.begin(), first.end(), input.begin()));
-
-        // Enable a persistent SSD-style cache on node 2 at runtime. A playback
-        // fetch that node 2 should own is retained independently of DHT storage
-        // and also promoted back to authoritative storage without another WAN
-        // fetch.
-        auto cache_config = c2;
-        cache_config.cache.path = cluster.path() / "n2-cache";
-        cache_config.cache.max_blocks = 8;
-        s2.node().reconfigure_local(cache_config);
-        DistributedStore playback_store(s2.node());
-        // The failover read above queued an opportunistic promotion of this
-        // object back into node 2's store, and that write is asynchronous:
-        // it can land after the remove below, in which case the fetch is
-        // served from the local store and nothing reaches the cache (2 in
-        // 20 on es-1, 2026-09-15). Remove and fetch until the fetch has to
-        // go remote; the cache write it queues is asynchronous too, so the
-        // condition is "cached", not "fetched".
-        std::optional<Bytes> playback_fetch;
-        REQUIRE(wait_until(
-            [&] {
-                s2.node().local_store().remove(damaged);
-                playback_fetch = playback_store.get(damaged, 0, true);
-                return playback_fetch.has_value() && s2.node().block_cache().has(damaged);
-            },
-            10s, 100ms));
-        REQUIRE(playback_fetch.has_value());
-        CHECK(object_id(*playback_fetch) == damaged);
-        REQUIRE(wait_until([&] { return s2.node().local_store().has(damaged); }));
-        // Prove the cache is genuinely independent: discard the DHT copy again;
-        // subsequent reads can still use the persistent cache.
-        s2.node().local_store().remove(damaged);
-        auto cached_fetch = playback_store.get(damaged, 0, true);
-        REQUIRE(cached_fetch.has_value());
-        CHECK(*cached_fetch == *playback_fetch);
-
-        // Add a replacement storage node. Once the failed node has expired, the
-        // replacement is immediately an eligible metadata replica; no voter-seat
-        // reconfiguration is required.
-        Service s4(c4, keys);
-        s4.start();
-        REQUIRE(wait_until([&] {
-            auto active = s1.node().membership().active();
-            bool has_failed = false;
-            bool has_new = false;
-            for (const auto& peer : active) {
-                has_failed |= peer.id == failed_replica;
-                has_new |= peer.id == s4.node().node_id();
-            }
-            return !has_failed && has_new && active.size() >= 3;
-        }));
-        // A joining owner pulls its assigned live objects automatically. This
-        // no longer depends on an old owner being manually prodded to scan/push.
-        REQUIRE(wait_until([&] {
-            if (!s4.node().readiness().data_storage_ready)
-                return false;
-            return s4.node().local_store().has(entry.extents.front().id);
-        }));
-
-        MetadataManager repair(s1.node());
-        repair.repair_once();
-        REQUIRE(wait_until([&] {
-            try {
-                return s4.filesystem().getattr("/media/movie.mkv").size == input.size();
-            } catch (...) {
-                return false;
-            }
-        }));
-
-        // Node 1 can now also disappear: node 2 + replacement node 4 satisfy
-        // metadata_min_write_replicas=2 regardless of which nodes they are.
-        s1.stop();
-        s2.filesystem().mkdir("/after-arbitrary-replica-failover", 0755, getuid(), getgid());
-        CHECK(s4.filesystem().getattr("/after-arbitrary-replica-failover").type ==
-              EntryType::directory);
-
-        // One surviving node is below metadata_min_write_replicas=2 and cannot publish.
-        s4.stop();
-        bool refused = false;
-        try {
-            s2.filesystem().mkdir("/must-not-commit", 0755, getuid(), getgid());
-        } catch (...) {
-            refused = true;
-        }
-        CHECK(refused);
-        s2.stop();
+        std::vector<ObjectId> ids;
+        for (const auto& extent : fs.getattr(path).extents)
+            ids.push_back(extent.id);
+        return ids;
     }
+};
 
-    // Full process-style restart from persisted state.
-    {
-        Service s1(c1, keys);
-        Service s2(c2, keys);
-        Service s3(c3, keys);
-        s1.start();
-        s2.start();
-        s3.start();
-        REQUIRE(wait_until([&] { return s2.node().membership().active().size() >= 3; }));
-        REQUIRE(wait_until([&] {
-            try {
-                return s2.filesystem().getattr("/media/movie.mkv").size > 0;
-            } catch (...) {
-                return false;
-            }
-        }));
-        auto e = s2.filesystem().getattr("/media/movie.mkv");
-        CHECK(e.size == 3 * 1024 * 1024 + 12345);
-        Bytes tail(65536);
-        auto r = s2.filesystem().open_read("/media/movie.mkv");
-        REQUIRE(r->read(e.size - tail.size(), tail) == tail.size());
-        auto expected = pattern(e.size);
-        CHECK(std::equal(tail.begin(), tail.end(), expected.end() - tail.size()));
-        s3.stop();
-        s2.stop();
-        s1.stop();
+bool is_directory(Service& node, const std::string& path) {
+    try {
+        return node.filesystem().getattr(path).type == EntryType::directory;
+    } catch (const std::exception&) {
+        return false;
     }
+}
+
+Bytes read_whole(Service& node, const std::string& path, size_t size) {
+    Bytes out(size);
+    auto reader = node.filesystem().open_read(path);
+    size_t got = 0;
+    while (got < size) {
+        const auto n = reader->read(got, {out.data() + got, size - got});
+        REQUIRE(n > 0);
+        got += n;
+    }
+    return out;
+}
+
+// Any node may found a virgin namespace -- here the one with the highest
+// NodeId, which no rule of "lowest founds" would pick -- and its root is on
+// every replica when the founding call returns.
+MACHA_HEAVY_TEST("rpc_cluster", test_any_node_founds_the_namespace_on_every_replica) {
+    DurableTrio trio;
+    size_t founder = 0;
+    for (size_t i = 1; i < 3; ++i)
+        if (trio[i].node().node_id() > trio[founder].node().node_id())
+            founder = i;
+    trio[founder].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    for (size_t i = 0; i < 3; ++i)
+        CHECK(is_directory(trio[i], "/media"));
+}
+
+// A node whose namespace view is warm sees another node's change as soon as
+// the change commits: its replica's committed generation outranks the view.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_warm_namespace_view_sees_a_commit_from_another_node) {
+    DurableTrio trio;
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    REQUIRE(is_directory(trio[1], "/media")); // warms node 2's view
+    trio[2].filesystem().mkdir("/media/new", 0755, getuid(), getgid());
+    CHECK(is_directory(trio[1], "/media/new"));
+}
+
+// A file written through one node reads back whole through a second and at
+// an arbitrary offset through a third, as soon as the write commits.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_committed_file_reads_back_through_every_node) {
+    DurableTrio trio;
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const auto input = pattern(3 * 1024 * 1024 + 12345);
+    (void)trio.write(0, "/media/movie.mkv", input);
+    CHECK(read_whole(trio[1], "/media/movie.mkv", input.size()) == input);
+    Bytes slice(333333);
+    auto reader = trio[2].filesystem().open_read("/media/movie.mkv");
+    REQUIRE(reader->read(987654, slice) == slice.size());
+    CHECK(std::equal(slice.begin(), slice.end(), input.begin() + 987654));
+}
+
+// With the metadata floor at two of three: losing one replica leaves the
+// other two committing, and the change is on both when the call returns; a
+// lone survivor refuses to commit.
+MACHA_HEAVY_TEST("rpc_cluster", test_metadata_commits_down_to_its_floor_and_no_further) {
+    DurableTrio trio(2, 1);
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    trio.stop(2);
+    trio[1].filesystem().mkdir("/after-one-loss", 0755, getuid(), getgid());
+    CHECK(is_directory(trio[0], "/after-one-loss"));
+    trio.stop(1);
+    bool refused = false;
+    try {
+        trio[0].filesystem().mkdir("/below-the-floor", 0755, getuid(), getgid());
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    CHECK(refused);
+    CHECK(!is_directory(trio[0], "/below-the-floor"));
+}
+
+// A corrupt local copy (it fails authentication) is never served: the read
+// comes from a peer, and the fetched bytes replace the bad copy.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_read_of_a_corrupt_local_copy_comes_from_a_peer_and_heals_it) {
+    DurableTrio trio;
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const auto ids = trio.write(0, "/media/file.bin", pattern(256 * 1024, 7));
+    REQUIRE(ids.size() == 1);
+    const auto id = ids.front();
+    auto& node = trio[1].node();
+    corrupt_object(trio.configs[1].storage_backends.front().path, id);
+    REQUIRE(!node.local_store().get(id).has_value());
+
+    DistributedStore store(node);
+    const auto fetched = store.get(id);
+    REQUIRE(fetched.has_value());
+    CHECK(object_id(*fetched) == id);
+    node.wait_local_copies_settled();
+    const auto healed = node.local_store().get(id);
+    REQUIRE(healed.has_value());
+    CHECK(object_id(*healed) == id);
+}
+
+// Without a read, the scrub finds a corrupt copy and discards it, and repair
+// restores it from a peer within a few bounded steps.
+MACHA_HEAVY_TEST("rpc_cluster", test_scrub_discards_a_corrupt_copy_and_repair_restores_it) {
+    DurableTrio trio;
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const auto ids = trio.write(0, "/media/file.bin", pattern(256 * 1024, 8));
+    REQUIRE(ids.size() == 1);
+    const auto id = ids.front();
+    auto& node = trio[1].node();
+    corrupt_object(trio.configs[1].storage_backends.front().path, id);
+
+    DistributedStore store(node);
+    store.scrub_once(128ULL * 1024 * 1024);
+    CHECK(!node.local_store().has(id));
+    // Repair pulls what the node's live inventory says it should hold.
+    const auto live = trio[1].filesystem().maintenance_objects().live;
+    for (int step = 0; step < 4 && !node.local_store().has(id); ++step)
+        store.repair_once(128ULL * 1024 * 1024, &live);
+    const auto restored = node.local_store().get(id);
+    REQUIRE(restored.has_value());
+    CHECK(object_id(*restored) == id);
+}
+
+// With its local copy gone, a node reads the file from a peer.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_read_falls_back_to_a_peer_when_the_local_copy_is_gone) {
+    DurableTrio trio;
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const auto input = pattern(512 * 1024, 9);
+    const auto ids = trio.write(0, "/media/file.bin", input);
+    for (const auto& id : ids)
+        REQUIRE(trio[1].node().local_store().remove(id));
+    CHECK(read_whole(trio[1], "/media/file.bin", input.size()) == input);
+}
+
+// A persistent cache enabled at runtime keeps a playback fetch: the fetched
+// bytes land in the cache, and a later read with the local copy gone is
+// answered from it.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_runtime_cache_keeps_a_playback_fetch) {
+    DurableTrio trio;
+    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    const auto ids = trio.write(0, "/media/file.bin", pattern(256 * 1024, 11));
+    REQUIRE(ids.size() == 1);
+    const auto id = ids.front();
+    auto& node = trio[1].node();
+    auto cached = trio.configs[1];
+    cached.cache.path = trio.cluster.path() / "n2-cache";
+    cached.cache.max_blocks = 8;
+    node.reconfigure_local(cached);
+    node.wait_local_copies_settled();
+    REQUIRE(node.local_store().remove(id));
+    REQUIRE(!node.block_cache().has(id));
+
+    DistributedStore store(node);
+    const auto fetched = store.get(id, 0, true);
+    REQUIRE(fetched.has_value());
+    node.wait_local_copies_settled();
+    CHECK(node.block_cache().has(id));
+    REQUIRE(!node.local_store().has(id));
+    const auto again = store.get(id, 0, true);
+    REQUIRE(again.has_value());
+    CHECK(*again == *fetched);
+}
+
+// Unlinking a committed file retires its object: the inventory lists it as
+// garbage, not live. The cached inventory is one shared snapshot until the
+// namespace changes, sorted and without duplicates.
+MACHA_TEST("rpc_cluster", test_unlink_retires_an_object_from_the_maintenance_inventory) {
+    TestService fixture("inventory");
+    fixture.config().replication = 1;
+    fixture.config().metadata_min_write_replicas = 1;
+    auto& service = fixture.start();
+    auto& fs = service.filesystem();
+    fs.mkdir("/media", 0755, getuid(), getgid());
+    for (const char* name : {"/media/a.bin", "/media/b.bin"}) {
+        fs.create_file(name, 0644, getuid(), getgid());
+        auto writer = fs.open_write(name, true);
+        const auto bytes = pattern(131072, static_cast<uint8_t>(name[7]));
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    }
+    const auto doomed = fs.getattr("/media/a.bin").extents.front().id;
+    fs.unlink("/media/a.bin");
+
+    const auto objects = fs.maintenance_objects();
+    CHECK(std::any_of(objects.garbage.begin(), objects.garbage.end(),
+                      [&](const GarbageRef& garbage) { return garbage.id == doomed; }));
+    CHECK(std::find(objects.live.begin(), objects.live.end(), doomed) == objects.live.end());
+
+    const auto first = fs.maintenance_objects_cached();
+    CHECK(fs.maintenance_objects_cached().get() == first.get());
+    CHECK(first->metadata_generation != 0);
+    CHECK(std::is_sorted(first->live.begin(), first->live.end()));
+    CHECK(std::adjacent_find(first->live.begin(), first->live.end()) == first->live.end());
+    CHECK(std::is_sorted(first->garbage.begin(), first->garbage.end()));
+    fs.mkdir("/changed", 0755, getuid(), getgid());
+    const auto after = fs.maintenance_objects_cached();
+    CHECK(after.get() != first.get());
+    CHECK(after->metadata_generation > first->metadata_generation);
+}
+
+// A file cannot be renamed over a directory.
+MACHA_TEST("rpc_cluster", test_rename_of_a_file_onto_a_directory_is_eisdir) {
+    TestService fixture("rename-eisdir");
+    fixture.config().replication = 1;
+    fixture.config().metadata_min_write_replicas = 1;
+    auto& fs = fixture.start().filesystem();
+    fs.mkdir("/media", 0755, getuid(), getgid());
+    fs.create_file("/media/file.bin", 0644, getuid(), getgid());
+    fs.mkdir("/media/dir", 0755, getuid(), getgid());
+    int code = 0;
+    try {
+        fs.rename("/media/file.bin", "/media/dir", false);
+    } catch (const FsError& error) {
+        code = error.code();
+    }
+    CHECK(code == EISDIR);
+    CHECK(fs.getattr("/media/file.bin").type == EntryType::file);
+    CHECK(fs.getattr("/media/dir").type == EntryType::directory);
 }
 
 // Needs the real libmacha-torrent plugin, which only exists in a build where

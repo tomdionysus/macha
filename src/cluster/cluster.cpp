@@ -2213,6 +2213,11 @@ void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> d
     local_copy_cv_.notify_one();
 }
 
+void NodeRuntime::wait_local_copies_settled() {
+    std::unique_lock lock(local_copy_mutex_);
+    local_copy_settled_cv_.wait(lock, [&] { return local_copies_.empty() && !local_copy_writing_; });
+}
+
 void NodeRuntime::local_writer_loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-local-wr");
     while (true) {
@@ -2226,7 +2231,18 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
             job = std::move(local_copies_.front());
             local_copies_.pop_front();
             local_copy_bytes_ -= job.data.size();
+            local_copy_writing_ = true;
         }
+        struct Settled {
+            NodeRuntime& node;
+            ~Settled() {
+                {
+                    std::lock_guard lock(node.local_copy_mutex_);
+                    node.local_copy_writing_ = false;
+                }
+                node.local_copy_settled_cv_.notify_all();
+            }
+        } settled{*this};
         auto resource = data_resources_.acquire(
             DataWorkContext(FrameType::speculative, job.data.size()), job.data.size());
         if (!resource) {

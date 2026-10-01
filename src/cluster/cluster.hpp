@@ -173,6 +173,10 @@ class NodeRuntime {
     std::condition_variable local_copy_cv_;
     std::deque<LocalCopyJob> local_copies_;
     size_t local_copy_bytes_{};
+    // A job taken off the queue and not yet written; with the queue empty and
+    // this false, every opportunity queued so far is settled.
+    bool local_copy_writing_{};
+    std::condition_variable local_copy_settled_cv_;
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
     std::atomic_uint64_t playback_activity_bytes_{};
@@ -338,6 +342,11 @@ class NodeRuntime {
     bool commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch);
     void announce_metadata_generation(uint64_t);
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
+    // Waits until every copy queued by enqueue_fetched() so far has been
+    // written to the cache or the store, or dropped. Never waits for copies
+    // queued after it began only because of them: it returns as soon as the
+    // queue is empty and nothing is being written.
+    void wait_local_copies_settled();
     void reconfigure_local(const Config&);
     void note_activity(FrameType, uint64_t bytes = 0);
     // Cluster bytes on and off the wire by frame class since start, as the

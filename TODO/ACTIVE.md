@@ -266,6 +266,12 @@ glibc heap checking on. Items the experiment absorbs say so.
    paused session still shows as a session with no segment lines; the
    operator's call each time.
 12. **Test failures** (no known flakes -- each is P0 work):
+    - **Rewritten 2026-10-01:** `rpc_cluster/test_three_node_cluster` (a
+      scenario of thirteen claims waiting on background work) became ten
+      claim tests that drive their steps (T2 README). Open: a joiner pulling
+      its objects with no explicit step, and cache-to-store promotion, need
+      the store's activity clock injected; the warm view's freshness
+      mechanism at the metadata layer is not yet traced.
     - **Fixed 2026-10-01, watching for recurrence:**
       `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
       segfaulted ~60 ms in, ~1.7% at `--jobs 12` (also 5/500 on `c53efd7`).
