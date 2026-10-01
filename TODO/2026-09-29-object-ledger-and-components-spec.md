@@ -471,6 +471,10 @@ Stage 0:
   owned outside the component (`MaintenancePort`, owned by Service until
   the root owns the whole node), which the component receives as a
   dependency.
+- **Dependencies are stated once, as types** (T2, 2026-10-01): a
+  component's `Dependencies<...>` is its constructor parameter and the
+  source of its declared requirements; contract names live in one trait;
+  what Service still supplies it declares to the root by type.
 - **Supervision policy for core is unchanged at stage 0.** Core components
   use the lifecycle but are not restarted by the supervisor; a core fault
   behaves as today (open question 3).
