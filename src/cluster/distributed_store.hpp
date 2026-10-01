@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "cluster/cluster.hpp"
+#include "contract/predicates.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/replica_selector.hpp"
 #include <atomic>
@@ -18,7 +19,7 @@
 #include <vector>
 
 namespace macha {
-class DistributedStore {
+class DistributedStore final : public Placement {
   public:
     struct ObjectBuffer {
         Bytes bytes;
@@ -322,6 +323,8 @@ class DistributedStore {
                           std::atomic_bool* cancelled = nullptr);
     bool has_on(const NodeInfo&, const ObjectId&);
     bool should_own(const ObjectId&) const;
+    // Placement: whether this node is in the object's owner set.
+    bool owns(const ObjectId& id) const override { return should_own(id); }
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
     size_t replicate_control(const ObjectId&, std::span<const uint8_t>);
     bool ensure_local(const ObjectId&, bool foreground = false);
