@@ -1882,7 +1882,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
             // Keep the root epoch stable across the local removal. cache() takes
             // the same mutex when publishing a newly observed root, so stale-live
             // GC can never race a root transition and delete that root's staging.
-            if (node_.retention_store().retained(RetentionClass::control, *id))
+            if (node_.claims().retained(RetentionClass::control, *id))
                 continue;
             if (node_.control_store().remove_if_older_than(*id, grace)) {
                 control_gc_unreferenced_epoch_.erase(seen);

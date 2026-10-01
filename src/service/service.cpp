@@ -698,7 +698,7 @@ void Service::initialise_services(std::stop_token stop) {
         // ordinary maintenance without scheduling redundant metadata work.
         maintenance_port_.metadata_convergence.request(node_.known_metadata_generation());
         node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
-        ledger_ = std::make_unique<RetentionLedger>(node_.retention_store(), node_.local_store(),
+        ledger_ = std::make_unique<RetentionLedger>(node_.claims(), node_.local_store(),
                                                     node_.control_store());
         horizon_builder_ = std::make_unique<NodeHorizonBuilder>(*fs_, *catalogue_, node_, *store_);
         // What Service still builds and hands to the root's components.

@@ -798,10 +798,8 @@ void Maintenance::run(std::stop_token stop) {
                     // every durably-known node. A partition may continue to accumulate
                     // causal tombstones/claims, but it cannot reclaim authoritative bytes.
                     if (release) {
-                        const auto released = node_.retention_store().release_unreferenced(
-                            RetentionClass::control,
-                            release->referenced_ids(RetentionClass::control), release->clock(),
-                            64);
+                        const auto released =
+                            ledger_.release_unreferenced(RetentionClass::control, *release, 64);
                         observations().add("retention.released.control", released);
                         if (released)
                             trace_action("release.control", std::to_string(released));
@@ -813,9 +811,7 @@ void Maintenance::run(std::stop_token stop) {
                     observations().add("catalogue.control_gc.removed", removed);
                     if (removed)
                         trace_action("control-gc", std::to_string(removed));
-                    const auto pruned = node_.retention_store().prune_unclaimed(
-                        RetentionClass::control,
-                        [this](const ObjectId& id) { return node_.control_store().has(id); }, 64);
+                    const auto pruned = ledger_.prune_unclaimed(RetentionClass::control, 64);
                     observations().add("retention.pruned.control", pruned);
                     if (pruned)
                         trace_action("prune.control", std::to_string(pruned));
@@ -845,9 +841,8 @@ void Maintenance::run(std::stop_token stop) {
                 }
                 if (data.permitted) {
                     if (release) {
-                        const auto released = node_.retention_store().release_unreferenced(
-                            RetentionClass::data, release->referenced_ids(RetentionClass::data),
-                            release->clock(), 64);
+                        const auto released =
+                            ledger_.release_unreferenced(RetentionClass::data, *release, 64);
                         observations().add("retention.released.data", released);
                         if (released)
                             trace_action("release.data", std::to_string(released));
@@ -896,7 +891,7 @@ void Maintenance::run(std::stop_token stop) {
                                    store_.loader_idle_for() < quiet;
                         },
                         [this](const ObjectId& id) {
-                            return node_.retention_store().retained(RetentionClass::data, id);
+                            return ledger_.retained(RetentionClass::data, id);
                         });
                     if (gc.bytes)
                         trace_action("gc", "reclaimed_bytes=" + std::to_string(gc.bytes));
@@ -924,9 +919,7 @@ void Maintenance::run(std::stop_token stop) {
                                    std::to_string(inventory->size(RetentionClass::data)) +
                                    " protected=" +
                                    std::to_string(protected_ids.size()));
-                    const auto pruned = node_.retention_store().prune_unclaimed(
-                        RetentionClass::data,
-                        [this](const ObjectId& id) { return node_.local_store().has(id); }, 64);
+                    const auto pruned = ledger_.prune_unclaimed(RetentionClass::data, 64);
                     observations().add("retention.pruned.data", pruned);
                     if (pruned)
                         trace_action("prune.data", std::to_string(pruned));
@@ -985,7 +978,7 @@ void Maintenance::run(std::stop_token stop) {
             // cost. Snapshot-before-truncate makes interruption idempotent.
             if (!busy) {
                 enter_stage("retention-compact");
-                (void)node_.retention_store().compact_if_needed(4096);
+                (void)ledger_.compact_if_needed(4096);
             }
 
             // Metadata ancestry is only ever re-rooted once a durable,

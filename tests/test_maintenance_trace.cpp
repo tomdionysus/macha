@@ -180,13 +180,13 @@ class TracedNode {
         std::vector<std::string> lines{
             "state: data_objects=" + std::to_string(node.local_store().list().size()) +
             " data_claims=" +
-            std::to_string(node.retention_store().retained_ids(RetentionClass::data).size()) +
+            std::to_string(node.claims().retained_ids(RetentionClass::data).size()) +
             " control_claims=" +
-            std::to_string(node.retention_store().retained_ids(RetentionClass::control).size())};
+            std::to_string(node.claims().retained_ids(RetentionClass::control).size())};
         for (const auto& [name, id] : watched_)
             lines.push_back("object " + name + ": held=" +
                             (node.local_store().has(id) ? "1" : "0") + " claimed=" +
-                            (node.retention_store().retained(RetentionClass::data, id) ? "1"
+                            (node.claims().retained(RetentionClass::data, id) ? "1"
                                                                                        : "0"));
         return lines;
     }
@@ -578,7 +578,7 @@ MACHA_TEST("maintenance_trace", test_trace_claimed_objects_lost) {
     }
     node.advance(100ms);
     node.step("three files written");
-    for (const auto& id : service.node().retention_store().retained_ids(RetentionClass::data))
+    for (const auto& id : service.node().claims().retained_ids(RetentionClass::data))
         REQUIRE(service.node().local_store().remove(id));
     node.advance(10min);
     // Nothing is walked: repair waits for an event, and a lost file is not

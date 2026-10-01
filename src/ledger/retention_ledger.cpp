@@ -35,6 +35,17 @@ bool RetentionLedger::held(RetentionClass type, const ObjectId& id) const {
 
 void RetentionLedger::publish(InventoryHandle inventory) { inventory_.publish(std::move(inventory)); }
 
+size_t RetentionLedger::release_unreferenced(RetentionClass type, const ReleaseHorizon& release,
+                                             size_t operation_budget) {
+    return claims_.release_unreferenced(type, release.referenced_ids(type), release.clock(),
+                                        operation_budget);
+}
+
+size_t RetentionLedger::prune_unclaimed(RetentionClass type, size_t operation_budget) {
+    return claims_.prune_unclaimed(
+        type, [this, type](const ObjectId& id) { return held(type, id); }, operation_budget);
+}
+
 bool RetentionLedger::publish(ReleaseBuild build) {
     if (!build.complete)
         return false;
