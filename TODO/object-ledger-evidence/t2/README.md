@@ -264,3 +264,20 @@ publish. Not yet used: the ledger's horizons adopt it at T3.
 - request_stop takes no lock -> KILLED by component/test_root_stop_request_during_a_start_reaches_the_started
 - root stopped before status -> KILLED by lifecycle_record/test_lifecycle_of_fi_1, lifecycle_record/test_lifecycle_of_gbni_1
 - root never asked to stop -> KILLED by lifecycle_record/test_lifecycle_of_fi_1, lifecycle_record/test_lifecycle_of_gbni_1
+
+# T2: the wait guard's two unseen paths (assessment point 6)
+
+- **A cold catalogue:** `contract/test_the_wait_guard_on_a_cold_catalogue`
+  builds a fresh `CatalogueManager` over a real node: a control context
+  entering its `snapshot_view` throws in the guard's test mode, a loader
+  context loads it, and control may then enter the warm catalogue. Removing
+  the cold-path guard fails it (mutation-proven); 10/10 repeated.
+- **The manage route** (`POST /api/v1/manage/nodes/{id}/identity-association/reset`
+  without a host, for a node absent from live membership,
+  `src/api/manage_api.cpp:730`) passes a control context into
+  `MetadataManager::snapshot_view`, which is declared to wait on the state
+  device and the network. Whenever that branch runs it is a violation:
+  control work that may wait on a metadata refresh from the replicas. Not
+  fixed: the candidate (`available_snapshot_view()`, waits on nothing, may
+  read an older snapshot for this fallback lookup) changes behaviour, and
+  is the operator's decision.
