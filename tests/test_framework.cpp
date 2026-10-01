@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_framework.hpp"
+#include "coverage.hpp"
 #include "log.hpp"
 
 #include <algorithm>
@@ -219,12 +220,28 @@ std::string read_capture(int fd) {
 //
 // Without this, every case in the suite contributes nothing at all and the
 // report reads 0% however many tests pass.
+//
+// Clang also expands the profile name's %p once, in the parent, so every
+// forked case would dump into the parent's file, overwriting and corrupting
+// it ("failed to uncompress data"). Each case names its own file instead.
+// And each image carries its own copy of the runtime, so macha_core's
+// counters are named, reset and written by macha_core (src/coverage.hpp).
 #if defined(MACHA_COVERAGE)
 #if defined(__clang__)
 extern "C" void __llvm_profile_reset_counters(void);
 extern "C" int __llvm_profile_write_file(void);
-void coverage_reset() { __llvm_profile_reset_counters(); }
-void coverage_dump() { (void)__llvm_profile_write_file(); }
+extern "C" void __llvm_profile_set_filename(const char*);
+void coverage_reset() {
+    if (const char* pattern = std::getenv("LLVM_PROFILE_FILE"))
+        __llvm_profile_set_filename(
+            macha::coverage::child_profile_name(pattern, ::getpid(), "").c_str());
+    __llvm_profile_reset_counters();
+    macha::coverage::begin_child();
+}
+void coverage_dump() {
+    (void)__llvm_profile_write_file();
+    macha::coverage::dump();
+}
 #elif defined(__GNUC__)
 extern "C" void __gcov_reset(void);
 extern "C" void __gcov_dump(void);

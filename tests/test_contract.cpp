@@ -164,6 +164,14 @@ struct FixedYield final : YieldSource {
     }
 };
 
+// A yield source is owned through its interface where it is injected.
+MACHA_FAST_TEST("contract", test_a_yield_source_is_destroyed_through_its_interface) {
+    std::unique_ptr<YieldSource> source = std::make_unique<FixedYield>();
+    CHECK(!source->should_yield());
+    source.reset();
+    CHECK(source == nullptr);
+}
+
 // Every combination of cancelled, budget deadline passed, context deadline
 // passed and yield requested: cancellation wins, then either deadline, then
 // the yield source.
