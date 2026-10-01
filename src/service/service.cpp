@@ -700,16 +700,17 @@ void Service::initialise_services(std::stop_token stop) {
         node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
         ledger_ = std::make_unique<RetentionLedger>(node_.retention_store(), node_.local_store(),
                                                     node_.control_store());
+        horizon_builder_ = std::make_unique<NodeHorizonBuilder>(*fs_, *catalogue_, node_, *store_);
         // What Service still builds and hands to the root's components.
         root_.external<NodeRuntime>();
         root_.external<DistributedStore>();
         root_.external<MetadataManager>();
         root_.external<CatalogueManager>();
-        root_.external<FileSystem>();
+        root_.external<HorizonBuilder>();
         root_.external<ObjectLedger>();
         root_.external<MaintenancePort>();
         root_.add(std::make_unique<Maintenance>(MaintenanceDependencies{
-            MaintenanceContracts(node_, *store_, *metadata_, *catalogue_, *fs_, *ledger_,
+            MaintenanceContracts(node_, *store_, *metadata_, *catalogue_, *horizon_builder_, *ledger_,
                                  maintenance_port_),
             clock_, maintenance_trace_, maintenance_stage_hook_, constructed_}));
         root_.start();

@@ -4,6 +4,7 @@
 #include "crypto.hpp"
 
 #include <filesystem>
+#include <span>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -95,7 +96,7 @@ class RetentionStore {
     // Remove causally-observed claims for objects which are no longer live in
     // the local accepted metadata view. `live` must be sorted/unique. The work
     // is bounded and one durable journal frame covers the complete slice.
-    size_t release_unreferenced(RetentionClass, const std::vector<ObjectId>& live,
+    size_t release_unreferenced(RetentionClass, std::span<const ObjectId> live,
                                 const RetentionClock& observed, size_t operation_budget);
 
     size_t claim_objects(RetentionClass) const;

@@ -7,6 +7,7 @@
 #include "storage/local_store.hpp"
 
 #include <atomic>
+#include <span>
 #include <functional>
 #include <map>
 #include <memory>
@@ -143,7 +144,7 @@ class StoragePool final : public ObjectStore {
     // `protected_ids` must be sorted/unique. An unreferenced object is removed
     // only after it has also aged past orphan_grace; recent uncommitted puts
     // therefore cannot race metadata commit.
-    MaintenanceResult gc_step(const std::vector<ObjectId>& live,
+    MaintenanceResult gc_step(std::span<const ObjectId> live,
                               const std::vector<ObjectId>& protected_ids,
                               std::chrono::milliseconds orphan_grace,
                               size_t operation_budget,
