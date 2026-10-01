@@ -628,11 +628,20 @@ today's logged string, checked in the same order. The gates read the
 horizons' stamps and the facts the caller passes in (`cluster_gc_stable`,
 the release view); they fetch no cluster state themselves.
 
-**Held** forwards to the object store. **Claimed** forwards to
-`RetentionStore` with meaning unchanged: `retain`, `retain_batch`,
-`retained`, `claims`, `next_retained` (on A3 cursors),
-`release_unreferenced`, `prune_unclaimed`, `compact_if_needed`. Journal,
-checkpoints and on-disk layout are untouched.
+**Held** forwards to the object store. **Claimed** forwards to the node's
+`ClaimStore` (`src/contract/claim_store.hpp`, implemented by
+`RetentionStore`) with meaning unchanged: `retained`, `next_retained` (on
+A3 cursors), `release_unreferenced` against a release horizon,
+`prune_unclaimed` (an object counts as present when the ledger holds it),
+`compact_if_needed`. Journal, checkpoints and on-disk layout are
+untouched.
+
+**Claims belong to the storage layer** (decision log, 2026-10-02).
+`NodeRuntime` owns the `ClaimStore` and its RPC handlers serve peers'
+claim writes and delete refusals from it, and `DistributedStore` claims
+what it publishes and checks claims before a rebalance removal: both are
+below the ledger, so they use the `ClaimStore` contract (`claims()`), not
+the ledger. Everything above the ledger reaches claims only through it.
 
 **Predicate queries** for later stages (`to_pull`: owner, not held,
 referenced; `to_push_from`; `surplus`; `releasable`; `garbage`;
@@ -700,9 +709,10 @@ reads it makes declare.
 | tombstone collection | tombstone gate; tombstone lists from the inventory horizon |
 | control release and GC | control gate; `horizon(release)` and `horizon(inventory)` control sets |
 | DATA release and sweep | DATA gate; the same for data; `retained` as `is_retained` |
-| rebalance keep check, peer remove refusal, catalogue staging GC | `retained` |
-| publication claims | `retain_batch` |
-| retention compaction | `compact_if_needed` |
+| rebalance keep check, peer remove refusal | `ClaimStore::retained` (storage layer) |
+| publication claims | `ClaimStore::retain_batch` (storage layer) |
+| catalogue staging GC | `ClaimStore::retained` through `NodeRuntime` until T5 wires the catalogue (listed in Exit) |
+| retention compaction | ledger `compact_if_needed` |
 
 ## Part C: order of work
 
@@ -786,6 +796,9 @@ Repair stays paced by `repair_share`, never gated.
 - No component reaches a collaborator through `NodeRuntime` or `Service`;
   every dependency is declared and wired by the root. Anything remaining is
   listed here with its reason.
+  - `CatalogueManager`'s staging GC reads `ClaimStore::retained` through
+    `NodeRuntime` (T3e): the catalogue is above the ledger and should take
+    it; the catalogue's construction moves to the root at T5.
 - On the cluster, one node at a time and spaced for viewers: repair's bytes
   and examined counts in the same range under the same load; resident
   memory and latency the same or better; no law breached.
@@ -907,6 +920,15 @@ supersede earlier ones where they conflict.
   horizon; it never builds. Only the pass calls the builder. Builds stay
   sequential. Memoised, mergeable builds are a future experiment, not stage
   0 (Later stages).
+- **2026-10-02 (T3e). Claims are the storage layer's contract** (option A,
+  on the operator's "continue" after it was recommended). `ClaimStore` is
+  the contract, `RetentionStore` its implementation, owned by `NodeRuntime`
+  (`claims()`); the node's RPC handlers and `DistributedStore`, which are
+  below the ledger, use it directly; the ledger forwards to it and
+  everything above the ledger goes through the ledger. "No
+  `retention_store()` call outside the ledger" becomes "no `RetentionStore`
+  outside its owner, and nothing above the ledger reaching claims except
+  through it".
 
 ## Open questions for the operator
 
