@@ -175,6 +175,50 @@ MACHA_FAST_TEST("claim_walk", test_retention_ledger_publishes_horizons_and_refus
     CHECK(ledger.release() == complete);
 }
 
+MACHA_FAST_TEST("claim_walk", test_retention_ledger_forwards_claims_releases_prunes_and_compacts) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    RetentionStore retention(t.path() / "state", keys.storage);
+    FakeStore data;
+    FakeStore control;
+    RetentionLedger ledger(retention, data, control);
+    const auto origin = random_node_id();
+
+    // Claims as the store has them, per class.
+    retention.retain(RetentionClass::data, id_of(1), {origin, 1});
+    retention.retain(RetentionClass::data, id_of(2), {origin, 2});
+    retention.retain(RetentionClass::control, id_of(3), {origin, 3});
+    CHECK(ledger.retained(RetentionClass::data, id_of(1)));
+    CHECK(!ledger.retained(RetentionClass::control, id_of(1)));
+    CHECK(ledger.retained(RetentionClass::control, id_of(3)));
+    CHECK(!ledger.retained(RetentionClass::data, id_of(4)));
+
+    // Release against a horizon: a claim it no longer refers to, written
+    // before its clock, is released; one it refers to stays; the other class
+    // is untouched.
+    const ReleaseHorizon release(Hash256{}, {{origin, 10}}, {id_of(2)}, {});
+    CHECK(ledger.release_unreferenced(RetentionClass::data, release, 64) == 1);
+    CHECK(!ledger.retained(RetentionClass::data, id_of(1)));
+    CHECK(ledger.retained(RetentionClass::data, id_of(2)));
+    CHECK(ledger.retained(RetentionClass::control, id_of(3)));
+
+    // Prune forgets the released object's tombstone only once the class's
+    // store no longer holds it.
+    data.objects = {id_of(1)};
+    CHECK(ledger.prune_unclaimed(RetentionClass::data, 64) == 0);
+    data.objects.clear();
+    CHECK(ledger.prune_unclaimed(RetentionClass::data, 64) == 1);
+    // Control's store is asked for control: holding id 1 there does not keep
+    // a data tombstone, and nothing of control is released to prune.
+    CHECK(ledger.prune_unclaimed(RetentionClass::control, 64) == 0);
+
+    // Compaction past the threshold, and not below it.
+    CHECK(!ledger.compact_if_needed(1000000));
+    CHECK(ledger.compact_if_needed(1));
+}
+
 // ---- ClaimWalk against the walk it replaced --------------------------------
 
 // Claims in id order; the ledger honours the budget as the contract says.
@@ -208,6 +252,10 @@ struct FakeLedger final : ObjectLedger {
     ReleaseHandle release() const override { return {}; }
     void publish(InventoryHandle) override {}
     bool publish(ReleaseBuild) override { return false; }
+    bool retained(RetentionClass, const ObjectId&) const override { return false; }
+    size_t release_unreferenced(RetentionClass, const ReleaseHorizon&, size_t) override { return 0; }
+    size_t prune_unclaimed(RetentionClass, size_t) override { return 0; }
+    bool compact_if_needed(size_t) override { return false; }
 };
 
 // Restores until its credit runs out; `refused` ids are fetched but not

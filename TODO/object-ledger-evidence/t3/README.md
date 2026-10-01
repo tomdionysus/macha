@@ -123,3 +123,31 @@ without sleeping.
 - Mutation (`build/claude-t3d-mutate*.py`): the ledger's three publish
   mutants and the pass's two publish calls, all killed.
 - Suites: macha-tests 694/694, macha-tests-runtime 17/17 (laptop, Clang).
+
+# T3e: claims as the storage layer's contract
+
+- `src/contract/claim_store.hpp`: `ClaimStore`, the claims contract
+  (`retain`, `retain_batch`, `retained`, `next_retained`, `retained_ids`,
+  `claim_objects`, `claims`, `release_unreferenced`, `prune_unclaimed`,
+  `compact_if_needed`), with the claim vocabulary (`RetentionClass`,
+  `RetentionDot`, `RetentionClock`) moved into it. `RetentionStore`
+  implements it, unchanged otherwise.
+- `NodeRuntime::retention_store()` is `claims()`, returning the contract.
+  The node's RPC handlers (claim writes, delete refusal) and
+  `DistributedStore` (publication claims, rebalance keep checks) use it:
+  they are the storage layer, below the ledger (spec B3, decision log
+  2026-10-02).
+- `ObjectLedger` forwards `retained`, `release_unreferenced` (against a
+  release horizon), `prune_unclaimed` (present means the ledger holds it)
+  and `compact_if_needed`. The pass calls none of `NodeRuntime`'s claims:
+  every claim operation it makes goes through the ledger.
+- Remaining: the catalogue's staging GC reads `claims()` through
+  `NodeRuntime` until T5 (spec, Exit).
+- Tests: `claim_walk/test_retention_ledger_forwards_claims_releases_prunes_and_compacts`
+  against a real `RetentionStore`. The first mutation run, against the
+  trace fixtures alone, left three survivors (`retained` always false,
+  prune treating everything as held, compaction never): the fixtures never
+  see them -- the sweep's live set covers what `retained` guards, no
+  fixture prunes an absent object's tombstone, nothing observes the
+  journal. Against the new test all six forwarding mutants are killed
+  (`build/claude-t3e-mutate*.py`).

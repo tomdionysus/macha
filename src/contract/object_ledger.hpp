@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/claim_store.hpp"
 #include "contract/horizon.hpp"
 #include "contract/object_store.hpp"
 #include "contract/walk.hpp"
@@ -47,6 +48,22 @@ class ObjectLedger {
     static constexpr Waits publish_waits = Waits::none;
     virtual void publish(InventoryHandle) = 0;
     virtual bool publish(ReleaseBuild) = 0;
+
+    // Claims, forwarded to the node's ClaimStore with meaning unchanged.
+    // Whether the object is claimed: thread-safe, waits on nothing.
+    virtual bool retained(RetentionClass, const ObjectId&) const = 0;
+    // Release the claims of one class that `release` no longer refers to and
+    // whose writes its clock has observed. Bounded; waits on the state device.
+    static constexpr Waits release_waits = ClaimStore::write_waits;
+    virtual size_t release_unreferenced(RetentionClass, const ReleaseHorizon& release,
+                                        size_t operation_budget) = 0;
+    // Forget causality tombstones of one class once no claim remains and the
+    // object is not held. Bounded; waits as held() and on the state device.
+    static constexpr Waits prune_waits = held_waits | ClaimStore::write_waits;
+    virtual size_t prune_unclaimed(RetentionClass, size_t operation_budget) = 0;
+    // Compact the claims' journal past a threshold. Waits on the state device.
+    static constexpr Waits compact_waits = ClaimStore::write_waits;
+    virtual bool compact_if_needed(size_t record_threshold) = 0;
 };
 
 } // namespace macha

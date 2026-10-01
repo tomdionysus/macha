@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/claim_store.hpp"
 #include "crypto.hpp"
 
 #include <filesystem>
@@ -14,26 +15,13 @@
 
 namespace macha {
 
-enum class RetentionClass : uint8_t {
-    data = 1,
-    control = 2,
-};
-
-struct RetentionDot {
-    NodeId origin{};
-    uint64_t sequence{};
-    auto operator<=>(const RetentionDot&) const = default;
-};
-
-using RetentionClock = std::map<NodeId, uint64_t>;
-
 // Durable local liveness evidence for immutable objects.
 //
 // Claims form an observed-remove set. For each object and origin we retain only
 // the highest undominated add sequence and the highest remove context observed.
 // A removal can therefore erase only claims causally visible to the metadata
 // mutation that produced it; a concurrent branch re-affirmation survives.
-class RetentionStore {
+class RetentionStore final : public ClaimStore {
     struct ObjectState {
         std::map<NodeId, uint64_t> adds;
         std::map<NodeId, uint64_t> removed;
@@ -79,38 +67,33 @@ class RetentionStore {
   public:
     RetentionStore(std::filesystem::path state_path, std::array<uint8_t, 32> key);
 
-    void retain(RetentionClass, const ObjectId&, const RetentionDot&);
-    void retain_batch(RetentionClass, const std::vector<ObjectId>&, const RetentionDot&);
-    bool retained(RetentionClass, const ObjectId&) const;
-    // Diagnostic: the observed-remove state of one object, `adds` and
-    // `removed` keyed by origin. Empty when the object has no state.
-    struct Claims {
-        std::map<NodeId, uint64_t> adds;
-        std::map<NodeId, uint64_t> removed;
-    };
-    Claims claims(RetentionClass, const ObjectId&) const;
-    std::vector<ObjectId> retained_ids(RetentionClass) const;
+    void retain(RetentionClass, const ObjectId&, const RetentionDot&) override;
+    void retain_batch(RetentionClass, const std::vector<ObjectId>&, const RetentionDot&) override;
+    bool retained(RetentionClass, const ObjectId&) const override;
+    Claims claims(RetentionClass, const ObjectId&) const override;
+    std::vector<ObjectId> retained_ids(RetentionClass) const override;
     std::optional<ObjectId> next_retained(RetentionClass, std::optional<ObjectId>& cursor,
-                                          bool& complete) const;
+                                          bool& complete) const override;
 
     // Remove causally-observed claims for objects which are no longer live in
     // the local accepted metadata view. `live` must be sorted/unique. The work
     // is bounded and one durable journal frame covers the complete slice.
     size_t release_unreferenced(RetentionClass, std::span<const ObjectId> live,
-                                const RetentionClock& observed, size_t operation_budget);
+                                const RetentionClock& observed,
+                                size_t operation_budget) override;
 
-    size_t claim_objects(RetentionClass) const;
+    size_t claim_objects(RetentionClass) const override;
 
     // Compact the append journal into an atomically-selected generation of 256
     // bounded encrypted shards. The journal is also compacted on a byte ceiling,
     // not only by record count, so recovery never has to absorb an unbounded WAL.
-    bool compact_if_needed(size_t record_threshold = 4096);
+    bool compact_if_needed(size_t record_threshold = 4096) override;
 
     // Forget causality tombstones only when no claim remains and the physical
     // object is absent. Traversal is cursor-based so a small operation budget
     // cannot starve entries later in the ordered map indefinitely.
     size_t prune_unclaimed(RetentionClass, const std::function<bool(const ObjectId&)>& exists,
-                           size_t operation_budget);
+                           size_t operation_budget) override;
 };
 
 } // namespace macha

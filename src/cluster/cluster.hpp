@@ -284,8 +284,10 @@ class NodeRuntime {
     LocalStore& control_store();
     const LocalStore& control_store() const;
     PersistentBlockCache& block_cache();
-    RetentionStore& retention_store();
-    const RetentionStore& retention_store() const;
+    // The node's claims (the object ledger's claimed half). Throws while
+    // retention state is still recovering.
+    ClaimStore& claims();
+    const ClaimStore& claims() const;
     MetadataReplica& metadata_replica();
     const MetadataReplica& metadata_replica() const;
     Membership& membership() {

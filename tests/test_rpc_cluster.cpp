@@ -990,8 +990,8 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_v
     const auto id = object_id(bytes);
     REQUIRE(s1.node().local_store().put(id, bytes));
     const RetentionDot claim{s1.node().node_id(), 0xfeed};
-    s1.node().retention_store().retain(RetentionClass::data, id, claim);
-    s2.node().retention_store().retain(RetentionClass::data, id, claim);
+    s1.node().claims().retain(RetentionClass::data, id, claim);
+    s2.node().claims().retain(RetentionClass::data, id, claim);
     REQUIRE(!s2.node().local_store().valid(id));
     const auto share_before = s2.repair_diagnostics().gate_share;
     s2.node().notify_storage_mutation();
@@ -4043,9 +4043,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     }));
     // The accepted file reference itself must already have installed physical
     // liveness evidence on the DATA durability floor.
-    CHECK(s1.node().retention_store().retained(RetentionClass::data, extent));
-    CHECK(s2.node().retention_store().retained(RetentionClass::data, extent));
-    CHECK(s3->node().retention_store().retained(RetentionClass::data, extent));
+    CHECK(s1.node().claims().retained(RetentionClass::data, extent));
+    CHECK(s2.node().claims().retained(RetentionClass::data, extent));
+    CHECK(s3->node().claims().retained(RetentionClass::data, extent));
 
     const auto before = s1.node().metadata_replica().committed();
     s3->stop();
@@ -4202,8 +4202,8 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     // the concrete claims/copies present on the cohort that will remain online;
     // the invariant is that destructive maintenance must not remove any of
     // those pre-existing resources while a durably-known node is unreachable.
-    const bool n1_claim_before = s1.node().retention_store().retained(RetentionClass::data, extent);
-    const bool n2_claim_before = s2.node().retention_store().retained(RetentionClass::data, extent);
+    const bool n1_claim_before = s1.node().claims().retained(RetentionClass::data, extent);
+    const bool n2_claim_before = s2.node().claims().retained(RetentionClass::data, extent);
     const bool n1_copy_before = s1.node().local_store().valid(extent);
     const bool n2_copy_before = s2.node().local_store().valid(extent);
     REQUIRE(n1_claim_before || n2_claim_before);
@@ -4236,9 +4236,9 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     // or the local bytes disappear while the known third node remains offline.
     std::this_thread::sleep_for(800ms);
     if (n1_claim_before)
-        CHECK(s1.node().retention_store().retained(RetentionClass::data, extent));
+        CHECK(s1.node().claims().retained(RetentionClass::data, extent));
     if (n2_claim_before)
-        CHECK(s2.node().retention_store().retained(RetentionClass::data, extent));
+        CHECK(s2.node().claims().retained(RetentionClass::data, extent));
     if (n1_copy_before)
         CHECK(s1.node().local_store().valid(extent));
     if (n2_copy_before)
@@ -4271,8 +4271,8 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         10s));
     REQUIRE(wait_until(
         [&] {
-            return !s1.node().retention_store().retained(RetentionClass::data, extent) &&
-                   !s2.node().retention_store().retained(RetentionClass::data, extent) &&
+            return !s1.node().claims().retained(RetentionClass::data, extent) &&
+                   !s2.node().claims().retained(RetentionClass::data, extent) &&
                    !s1.node().local_store().valid(extent) && !s2.node().local_store().valid(extent);
         },
         10s));
@@ -4329,8 +4329,8 @@ MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_qui
     const auto id = object_id(bytes);
     REQUIRE(s1.node().local_store().put(id, bytes));
     const RetentionDot claim{s1.node().node_id(), 0xbeef};
-    s1.node().retention_store().retain(RetentionClass::data, id, claim);
-    s2.node().retention_store().retain(RetentionClass::data, id, claim);
+    s1.node().claims().retain(RetentionClass::data, id, claim);
+    s2.node().claims().retain(RetentionClass::data, id, claim);
     REQUIRE(!s2.node().local_store().valid(id));
     s2.node().notify_storage_mutation();
 
@@ -4399,8 +4399,8 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     REQUIRE(s1.node().local_store().put(id, bytes));
     REQUIRE(s2.node().local_store().put(id, bytes));
     const RetentionDot claim{s1.node().node_id(), 0xf00d};
-    s1.node().retention_store().retain(RetentionClass::data, id, claim);
-    s2.node().retention_store().retain(RetentionClass::data, id, claim);
+    s1.node().claims().retain(RetentionClass::data, id, claim);
+    s2.node().claims().retain(RetentionClass::data, id, claim);
 
     // Keep another replica offline while installing a deliberately future/
     // concurrent claim dot which the current branch clock does not dominate.
@@ -4413,7 +4413,7 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     }));
 
     REQUIRE(s2.node().local_store().remove(id));
-    CHECK(s2.node().retention_store().retained(RetentionClass::data, id));
+    CHECK(s2.node().claims().retained(RetentionClass::data, id));
     CHECK(!s2.node().local_store().valid(id));
     // This direct store mutation simulates corruption detection outside the
     // normal RPC/storage wrappers. In the event-driven scheduler that detector
@@ -4428,7 +4428,7 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     auto restored = s2.node().local_store().get(id);
     REQUIRE(restored.has_value());
     CHECK(*restored == bytes);
-    CHECK(s2.node().retention_store().retained(RetentionClass::data, id));
+    CHECK(s2.node().claims().retained(RetentionClass::data, id));
 
     s2.stop();
     s1.stop();
@@ -4475,12 +4475,12 @@ MACHA_TEST("rpc_cluster", test_held_retention_claims_cost_repair_no_credit) {
         const auto held_bytes = pattern(16 * 1024, 500 + i);
         const auto held = object_id(held_bytes);
         REQUIRE(s2.node().local_store().put(held, held_bytes));
-        s2.node().retention_store().retain(RetentionClass::data, held, claim);
+        s2.node().claims().retain(RetentionClass::data, held, claim);
     }
     const auto bytes = pattern(96 * 1024 + 7);
     const auto id = object_id(bytes);
     REQUIRE(s1.node().local_store().put(id, bytes));
-    s2.node().retention_store().retain(RetentionClass::data, id, claim);
+    s2.node().claims().retain(RetentionClass::data, id, claim);
     REQUIRE(!s2.node().local_store().valid(id));
     s2.node().notify_storage_mutation();
 
