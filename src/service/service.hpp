@@ -210,7 +210,8 @@ class Service {
     ConvergenceDemandDiagnostics metadata_convergence_diagnostics() const noexcept {
         return maintenance_port_.metadata_convergence.diagnostics();
     }
-    DistributedStore::RepairDiagnostics repair_diagnostics() const {
+    DistributedStore::RepairDiagnostics repair_diagnostics() {
+        wait_services_ready();
         return store_->repair_diagnostics();
     }
     // Null when this node has no mount: not configured for one, or its FUSE
