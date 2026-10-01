@@ -645,7 +645,7 @@ std::optional<ObjectId> RetentionStore::next_retained(
 }
 
 size_t RetentionStore::release_unreferenced(RetentionClass type,
-                                            const std::vector<ObjectId>& live,
+                                            std::span<const ObjectId> live,
                                             const RetentionClock& observed,
                                             size_t operation_budget) {
     if (!operation_budget || observed.empty())

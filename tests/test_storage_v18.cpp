@@ -1124,8 +1124,8 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
 
     const std::vector<ObjectId> live{id};
     REQUIRE(wait_until([&] {
-        first.store().repair_once(4ULL * 1024 * 1024, &live);
-        second.store().repair_once(4ULL * 1024 * 1024, &live);
+        first.store().repair_once(4ULL * 1024 * 1024, live);
+        second.store().repair_once(4ULL * 1024 * 1024, live);
         return first.node().local_store().has(id) && second.node().local_store().has(id);
     }, 5s));
     REQUIRE(second.node().local_store().get(id).has_value());
@@ -1165,7 +1165,7 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
     std::vector<ObjectId> live{present, missing};
     std::sort(live.begin(), live.end());
     REQUIRE(wait_until([&] {
-        node.store().repair_once(4ULL * 1024 * 1024, &live);
+        node.store().repair_once(4ULL * 1024 * 1024, live);
         return node.store().repair_diagnostics().pull_unsourceable > 0;
     }, 5s));
 
@@ -1184,7 +1184,7 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
     // the counter keeps climbing so a persistent failure is distinguishable
     // from a transient one.
     const auto repeated_before = after.pull_unsourceable;
-    node.store().repair_once(4ULL * 1024 * 1024, &live);
+    node.store().repair_once(4ULL * 1024 * 1024, live);
     const auto repeated = node.store().repair_diagnostics();
     CHECK(repeated.unsourceable_sample.size() == 1);
     CHECK(repeated.pull_unsourceable >= repeated_before);

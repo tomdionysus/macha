@@ -6,6 +6,7 @@
 #include "metadata/metadata_manager.hpp"
 
 #include <map>
+#include <span>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
@@ -268,7 +269,7 @@ class CatalogueManager {
     CatalogueMaintenance maintenance_objects();
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
                                                  const std::optional<ObjectId>& new_root);
-    size_t control_gc_step(const std::vector<ObjectId>& live,
+    size_t control_gc_step(std::span<const ObjectId> live,
                            std::chrono::milliseconds grace, size_t operation_budget = 32);
 };
 

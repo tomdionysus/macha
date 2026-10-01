@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <set>
 #include <vector>
 
@@ -135,7 +136,9 @@ class DistributedStore {
     uint64_t repair_position_saved_{};
     void save_repair_position(bool force);
     std::optional<ObjectId> repair_pull_after_;
-    const std::vector<ObjectId>* repair_live_identity_{};
+    // The live set's identity when no generation is given: its data, or
+    // none for no live set.
+    std::optional<const ObjectId*> repair_live_identity_;
     uint64_t repair_live_generation_{};
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
@@ -349,9 +352,10 @@ class DistributedStore {
     // already copied. The node's own repair store enables this; a store
     // without it starts each pass at the beginning.
     void persist_repair_position(std::filesystem::path path);
-    uint64_t repair_once(uint64_t byte_budget = 0, const std::vector<ObjectId>* live = nullptr);
+    uint64_t repair_once(uint64_t byte_budget = 0,
+                         std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
-                             const std::vector<ObjectId>* live = nullptr,
+                             std::optional<std::span<const ObjectId>> live = std::nullopt,
                              const std::function<bool()>& should_yield = {},
                              uint64_t live_generation = 0);
     uint64_t scrub_once(uint64_t byte_budget = 0);
