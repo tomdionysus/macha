@@ -236,11 +236,34 @@ publish. Not yet used: the ledger's horizons adopt it at T3.
   back empty, and only libtorrent's duplicate backstop refused the second
   add. CMake now drops the generator expression from the imported target;
   5/5 in Debug after. `rpc_cluster/test_three_node_cluster`
-  failed once in three whole-suite coverage runs (load 15), passing 20/20
-  in isolation in each build: a joining node's pull through repair overran
-  `wait_until`'s fixed 5 s (`tests/test_support.hpp:382`), which the
-  coverage build's timeout scale does not reach -- T0's class, real time in
-  a test. Not compared against the parent commit.
+  failed once in three whole-suite coverage runs (load 15): a joining node's
+  pull through background repair overran `wait_until`'s fixed 5 s. **Deleted
+  and rewritten from its concepts** (operator, 2026-10-01: a test that needs
+  a scaled wait is a faulty test). It was one scenario making thirteen
+  claims, most waiting on background work. Claims proven elsewhere (metadata
+  repair visibility, restart from disk) were dropped; the rest became ten
+  tests, each driving its step: a `DurableTrio` whose commits are durable on
+  every replica, so a change is on the others when the call returns, and
+  only forming the cluster is waited for. Any node founds the namespace; a
+  warm view sees another node's commit; a file reads back through every
+  node; metadata commits down to its floor and no further; a corrupt local
+  copy is read from a peer and healed by the write-back (the old test
+  attributed that to repair); scrub discards a corrupt copy and repair
+  restores it; a read falls back to a peer; a runtime cache keeps a
+  playback fetch; unlink retires an object from the inventory; rename of a
+  file onto a directory is `EISDIR`. `NodeRuntime::wait_local_copies_settled()`
+  is new: it waits until queued write-backs are written, so the write-back
+  claims need no timing. 20/20 each. Mutation: 10 killed; three
+  single-guard mutants survived because the guarded property has redundant
+  guards (the metadata floor is enforced at four points; the property-level
+  mutant, floor = 1, is killed), and the warm view's freshness held with
+  both staleness checks in `cached_snapshot_view` removed -- the mechanism
+  that keeps it fresh there is **not yet traced**; the FileSystem-level
+  mutant is killed. **Not covered by the rewrite:** a joiner pulling its
+  objects with no explicit step, and the cache-to-store promotion by idle
+  maintenance. Both are the background pass's pacing, which needs the
+  store's activity clock (`idle_for`) on the injected clock to test without
+  real time (T1's later work).
 
 ## Mutation record (laptop, 2026-10-01)
 
