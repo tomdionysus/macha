@@ -393,13 +393,16 @@ answers (spec B3, B4; decision log 2026-10-01).
   verdict, reason and trace conditions; table tests over every input
   against the pass's conditions copied as the reference; 21 mutants, all
   killed. Not yet called by the pass.
-- **T3c.** The horizon builder extracted from the pass: `inventory` and
-  `release` builds, the inventory still calling `maintenance_objects()`
-  until T4. Tested against fakes; traces identical.
+- **T3c, done.** The horizon builder extracted from the pass
+  (`src/contract/horizon_builder.hpp`, `src/ledger/node_horizon_builder.*`),
+  the inventory still calling `maintenance_objects()` until T4; the pass's
+  reachability members replaced by two handles; the gates wired in;
+  repair, the sweep, release and control GC on spans. Traces identical;
+  two pre-existing gaps closed (stale tombstones, repair's live-set
+  identity).
 - **T3d.** The ledger holds the horizons as `Published` handles and
-  publishes them (incomplete release refused); the pass builds, publishes
-  and reads handles; the gates wired in; the pass's reachability members
-  (`src/service/maintenance.hpp`) deleted.
+  publishes them, refusing an incomplete release horizon (tested at the
+  ledger); the pass publishes and reads handles from it.
 - **T3e.** Consumers moved: repair, tombstone collection, control release
   and GC, DATA release and sweep, rebalance keep checks
   (`src/cluster/distributed_store.cpp`), publication claims
