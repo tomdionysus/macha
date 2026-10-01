@@ -119,3 +119,41 @@ line) and reads the step's counts; nothing else in the pass changed.
 - **One definition moved:** `maintenance.claim_walk.examine_us` timed
   next_retained plus has(); it now times `held()` alone, the paging being
   done once per page. Examined and missing counters are unchanged.
+
+# T2c (part three): `Published<T>`, the snapshot handle
+
+`src/contract/published.hpp` (spec A2, published immutable state; the plan's
+`SnapshotHandle`): a mutex-guarded `shared_ptr<const T>`. `handle()` copies
+the pointer under the lock and nothing else; `publish(Handle)` and
+`publish(T)` swap under the lock and require a snapshot (a published state is
+never withdrawn); the previous snapshot is released after the lock, so a
+reader never waits on its destructor. Empty (null handle) until the first
+publish. Not yet used: the ledger's horizons adopt it at T3.
+
+- **Tests** (`tests/test_contract.cpp`): empty until the first publish and
+  both constructors; a missing snapshot refused by both publish and the
+  constructor, the current one kept; a handle held across two republishes
+  reads its own snapshot, which lives exactly until its last holder lets go,
+  and an unheld one goes with the publish that replaced it (the plan's
+  acceptance line); a reader asking for a handle from inside the previous
+  snapshot's destructor completes during it; four readers racing 20,000
+  publishes see only whole snapshots, never going backwards. Every line and
+  both sides of the one branch are reached.
+- **Mutation:** 9/9 killed (no swap; previous destroyed under the lock;
+  missing snapshot accepted; value overload ignores its value; handle
+  returns nothing; handle does not own; constructor bypasses the
+  precondition; constructor ignores its snapshot; handle reads without the
+  lock -- the last killed by the race test in a plain build, no sanitizer).
+- Full suite 655/655 (Clang, laptop).
+
+## Mutation record (laptop, 2026-10-01)
+
+- publish never swaps -> KILLED by contract/test_a_held_handle_keeps_its_snapshot_across_republish, contract/test_published_is_empty_until_the_first_publish, contract/test_published_readers_see_whole_snapshots_in_order, contract/test_published_refuses_a_missing_snapshot
+- previous destroyed under the lock -> KILLED by contract/test_publish_destroys_the_previous_snapshot_outside_its_lock
+- a missing snapshot accepted -> KILLED by contract/test_published_refuses_a_missing_snapshot
+- the value overload ignores its value -> KILLED by contract/test_a_held_handle_keeps_its_snapshot_across_republish, contract/test_published_is_empty_until_the_first_publish, contract/test_published_readers_see_whole_snapshots_in_order, contract/test_published_refuses_a_missing_snapshot
+- handle returns nothing -> KILLED by contract/test_a_held_handle_keeps_its_snapshot_across_republish, contract/test_published_is_empty_until_the_first_publish, contract/test_published_readers_see_whole_snapshots_in_order, contract/test_published_refuses_a_missing_snapshot
+- handle does not own -> KILLED by contract/test_a_held_handle_keeps_its_snapshot_across_republish, contract/test_published_readers_see_whole_snapshots_in_order
+- constructor bypasses the precondition -> KILLED by contract/test_published_refuses_a_missing_snapshot
+- constructor ignores the initial snapshot -> KILLED by contract/test_published_is_empty_until_the_first_publish, contract/test_published_readers_see_whole_snapshots_in_order, contract/test_published_refuses_a_missing_snapshot
+- handle reads without the lock -> KILLED by contract/test_published_readers_see_whole_snapshots_in_order

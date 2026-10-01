@@ -43,10 +43,9 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
-  | T2 slice | `-t2` | `eacda85` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts; checked out |
+  | T2 slice | `-t2` | `eacda85` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`; checked out |
 
-- **Next in T2**: `Published<T>` (the snapshot handle, with its test); T2d
-  the component contract in `src/component/` and a composition root owning
+- **Next in T2**: T2d the component contract in `src/component/` and a composition root owning
   the maintenance lifecycle, lifecycle fixtures identical; T2's written
   assessment. Then, after the soak: accept T0, merge the chain into
   `experiment/object-ledger` in order and push (standing authorisation,
