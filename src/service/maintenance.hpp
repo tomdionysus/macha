@@ -60,7 +60,7 @@ struct MaintenancePort {
 // 0, the ledger and the horizon builder excepted; the metadata and ledger
 // contracts (T3, T4) replace them. Every reference outlives the component.
 using MaintenanceContracts = Dependencies<NodeRuntime, DistributedStore, MetadataManager,
-                                          CatalogueManager, HorizonBuilder, const ObjectLedger,
+                                          CatalogueManager, HorizonBuilder, ObjectLedger,
                                           MaintenancePort>;
 
 // What the maintenance pass is given: its contracts, and the instruments
@@ -100,18 +100,13 @@ class Maintenance final : public Component {
     MetadataManager& metadata_;
     CatalogueManager& catalogue_;
     HorizonBuilder& builder_;
-    const ObjectLedger& ledger_;
+    ObjectLedger& ledger_;
     MaintenancePort& port_;
     std::shared_ptr<MaintenanceClock> clock_;
     MaintenanceTraceHook maintenance_trace_;
     std::function<void(std::string_view)> maintenance_stage_hook_;
     Clock::time_point constructed_;
 
-    // The pass's state, carried from one pass to the next: the last
-    // inventory built and the last complete release horizon (none until the
-    // first of each).
-    std::shared_ptr<const InventoryHorizon> inventory_;
-    std::shared_ptr<const ReleaseHorizon> release_;
     bool cluster_stable_observed_{};
 
     std::jthread thread_;

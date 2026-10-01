@@ -7,7 +7,7 @@
 // every credit limit that reaches a different decision.
 #include "crypto.hpp"
 #include "service/claim_walk.hpp"
-#include "storage/retention_ledger.hpp"
+#include "ledger/retention_ledger.hpp"
 #include "test_framework.hpp"
 #include "test_backend_support.hpp"
 
@@ -134,6 +134,47 @@ MACHA_FAST_TEST("claim_walk", test_retention_ledger_holds_by_class) {
     CHECK(control.asked == 3u);
 }
 
+MACHA_FAST_TEST("claim_walk", test_retention_ledger_publishes_horizons_and_refuses_an_incomplete_release) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    RetentionStore retention(t.path() / "state", keys.storage);
+    FakeStore data;
+    FakeStore control;
+    RetentionLedger ledger(retention, data, control);
+    CHECK(!ledger.inventory());
+    CHECK(!ledger.release());
+
+    const auto first = std::make_shared<const InventoryHorizon>(
+        3, true, std::vector<ObjectId>{id_of(1)}, std::vector<ObjectId>{}, std::vector<GarbageRef>{});
+    ledger.publish(first);
+    const auto held = ledger.inventory();
+    CHECK(held == first);
+    const auto second = std::make_shared<const InventoryHorizon>(
+        4, false, std::vector<ObjectId>{}, std::vector<ObjectId>{}, std::vector<GarbageRef>{});
+    ledger.publish(second);
+    CHECK(ledger.inventory() == second);
+    // A handle taken before the publish still reads its own snapshot.
+    CHECK(held->generation() == 3);
+
+    Hash256 head{};
+    head.bytes[0] = 1;
+    const auto complete = std::make_shared<const ReleaseHorizon>(
+        head, RetentionClock{}, std::vector<ObjectId>{id_of(1)}, std::vector<ObjectId>{});
+    CHECK(!ledger.publish(ReleaseBuild{complete, false}));
+    CHECK(!ledger.release());
+    CHECK(ledger.publish(ReleaseBuild{complete, true}));
+    CHECK(ledger.release() == complete);
+    Hash256 newer{};
+    newer.bytes[0] = 2;
+    const auto partial = std::make_shared<const ReleaseHorizon>(
+        newer, RetentionClock{}, std::vector<ObjectId>{}, std::vector<ObjectId>{});
+    CHECK(!ledger.publish(ReleaseBuild{partial, false}));
+    // The previous, complete horizon is kept.
+    CHECK(ledger.release() == complete);
+}
+
 // ---- ClaimWalk against the walk it replaced --------------------------------
 
 // Claims in id order; the ledger honours the budget as the contract says.
@@ -162,6 +203,11 @@ struct FakeLedger final : ObjectLedger {
     bool held(RetentionClass, const ObjectId& id) const override {
         return held_ids.contains(id);
     }
+    // The claim walk reads no horizon.
+    InventoryHandle inventory() const override { return {}; }
+    ReleaseHandle release() const override { return {}; }
+    void publish(InventoryHandle) override {}
+    bool publish(ReleaseBuild) override { return false; }
 };
 
 // Restores until its credit runs out; `refused` ids are fetched but not

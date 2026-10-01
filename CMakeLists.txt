@@ -298,7 +298,7 @@ set(MACHA_CORE_SOURCES
     src/storage/local_store.cpp
     src/storage/storage_pool.cpp
     src/storage/retention.cpp
-    src/storage/retention_ledger.cpp
+    src/ledger/retention_ledger.cpp
     src/storage/persistent_cache.cpp
     src/cluster/telemetry.cpp
     src/cluster/transcode_rates.cpp

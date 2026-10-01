@@ -23,7 +23,7 @@
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
 #include "ledger/node_horizon_builder.hpp"
-#include "storage/retention_ledger.hpp"
+#include "ledger/retention_ledger.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>

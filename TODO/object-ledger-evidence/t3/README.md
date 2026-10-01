@@ -95,3 +95,31 @@ without sleeping.
   - an incomplete release horizon kept: no fixture makes one. The rule
     becomes the ledger's publish refusal in T3d, tested there.
 - Suites: macha-tests 693/693, macha-tests-runtime 17/17 (laptop, Clang).
+
+# T3d: the ledger holds and publishes the horizons
+
+- `ObjectLedger` (`src/contract/object_ledger.hpp`) gains `inventory()` and
+  `release()` (handles, null before the first publish; waits on nothing)
+  and `publish` for each; publishing a release build refuses an incomplete
+  one and keeps the previous, so a published release horizon is complete
+  by the ledger's invariant (spec B3). `ReleaseBuild` moved beside the
+  horizons in `contract/horizon.hpp`.
+- `RetentionLedger` moved from `src/storage/` to `src/ledger/` (it now
+  sits above metadata) and holds the horizons as `Published` snapshots.
+- The pass takes the ledger non-const, reads one handle of each horizon
+  per pass, publishes what it builds and then reads the horizon back from
+  the ledger: it holds no horizon of its own across passes, and never uses
+  one the ledger refused. (A first version kept its own copy after
+  publishing; the mutant "the pass keeps its release though refused"
+  survived it, because no fixture builds an incomplete release horizon
+  while a gate is open. Reading back removes the copy rather than testing
+  it.)
+- `claim_walk/test_retention_ledger_publishes_horizons_and_refuses_an_incomplete_release`:
+  publish and read back, a handle held across a publish keeps its
+  snapshot, an incomplete release refused before and after a complete one.
+- Equivalence: the trace fixtures unchanged, 1200/1200 over `--repeat 100`
+  (twelve cases with T3c's `revived-tombstone`) before the read-back
+  change, 240/240 over `--repeat 20` after it.
+- Mutation (`build/claude-t3d-mutate*.py`): the ledger's three publish
+  mutants and the pass's two publish calls, all killed.
+- Suites: macha-tests 694/694, macha-tests-runtime 17/17 (laptop, Clang).

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -74,6 +75,13 @@ class ReleaseHorizon : public ReferencedSets {
   private:
     Hash256 head_;
     RetentionClock clock_;
+};
+
+// A release horizon as built, and whether every catalogue root and tree node
+// it needed was readable. Only a complete one may be published.
+struct ReleaseBuild {
+    std::shared_ptr<const ReleaseHorizon> horizon;
+    bool complete{};
 };
 
 } // namespace macha
