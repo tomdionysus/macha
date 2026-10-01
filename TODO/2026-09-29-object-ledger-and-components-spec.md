@@ -220,6 +220,14 @@ where the slowdown is negligible in normal operation.
 - **Diff-driven repair:** subtree-hash descent between nodes over a
   canonical index; `lost` reported; walks kept as the fallback.
 - **Retire the fallbacks** once every node runs the diff.
+- **Memoised builds** (a future experiment, decision log 2026-10-01): the
+  builder keeps each subtree's referenced sets by the subtree's id, so a
+  build at a new head walks only what changed. Union is associative,
+  commutative and idempotent and completeness combines by AND, so partial
+  builds may run in any order and merge to the same horizon. Stamps (the
+  release clock) and the tombstone split do not merge; memory needs
+  structure-sharing sets. Before it, measure how often the inventory and
+  release heads coincide: when they do, one walk serves both.
 
 ## What the code does today
 
@@ -482,12 +490,14 @@ Stage 0:
   moves onto declared dependencies: HTTP APIs, FUSE, playback, torrent,
   ingest, auth and the catalogue included.
 
-## Part B: three contracts over today's implementations
+## Part B: four contracts over today's implementations
 
 Layering: the object store at the bottom; metadata over it (its tree nodes
 are objects in the control store, through `ControlNamespaceNodeStore`); the
-ledger over both. Nothing below the ledger depends on it. Consumers take the
-narrowest contract they need.
+ledger over both; the horizon builder (B4) over metadata, the catalogue and
+the ledger's horizon types. Nothing below the ledger depends on it, and the
+ledger depends on no builder. Consumers take the narrowest contract they
+need.
 
 ### B1. Object store: bytes by id
 
@@ -586,24 +596,28 @@ claim members above. Domains: `referenced` replicated (derived from pinned
 heads), `held` local, `claimed` local and causal.
 
 **Horizons as pinned heads.** At stage 0 there are exactly two, matching
-today's structures: `inventory` (known generation; carries catalogue
-completeness, the tombstone lists and the `everywhere` ids) and `release`
-(sole accepted head; carries its mutation clock and completeness). Each is
-an immutable snapshot published per A2:
+today's structures (`src/contract/horizon.hpp`): `InventoryHorizon`
+(stamped with the known generation; carries catalogue completeness and the
+tombstones split into collectable and stale) and `ReleaseHorizon` (stamped
+with the sole accepted head and its mutation clock). Each is an immutable
+snapshot published per A2:
 
-- `horizon(kind) -> Handle`; the handle owns the snapshot and exposes
+- `inventory()` and `release()` return handles, one accessor per horizon
+  because their stamps differ; a handle owns its snapshot and exposes
   `referenced(class, id)`, `referenced_ids(class) -> std::span<const ObjectId>`,
-  `stamp()`, `complete()`, `size(class)`.
-- A consumer holds the handle for its pass; a refresh publishes a new
-  snapshot and never invalidates one in use.
-- `everywhere(id)` is false for every id today, passed to repair as the
-  `universal` vector is now (open question 2).
+  `size(class)` and its stamp.
+- A consumer holds the handle for its pass; a publish replaces the snapshot
+  and never invalidates one in use.
+- `everywhere` is gone with `universal` (open question 2, removed).
 
-**Refresh is the caller's decision**, made where `Service` makes it today
-and under the same conditions; the ledger never refreshes itself on a read.
-`refresh_inventory` returns whether it rebuilt; `refresh_release` replaces
-the horizon only when the new one is complete. The caller keeps
-`rebuilt_inventory` for the pass and the `gc_quiescent_until` follow-up.
+**The ledger holds horizons; it does not build them.** Building is the
+horizon builder's (B4), and deciding when is the maintenance pass's, made
+where and under the conditions it makes it today; the ledger never
+refreshes itself on a read. `publish(InventoryHorizon)` replaces the
+inventory; `publish(ReleaseHorizon)` refuses an incomplete one and keeps
+the previous, so a published release horizon is complete by the ledger's
+invariant, not by each caller remembering. The pass keeps
+`rebuilt_inventory` for itself and the `gc_quiescent_until` follow-up.
 
 **Three gates**, one per row of the gate table, each exactly the condition
 in the code, returning `permitted` or the reason; the DATA gate's reason is
@@ -632,16 +646,52 @@ head's clock and survives either way; that is an argument, not a proof, and
 nothing relies on it until it is proved and tested (open question 6).
 
 Declarations: horizon reads and gates `thread_safe`, waiting on `none`;
-refreshes `single_owner` (the maintenance pass), waiting on `state_device`
-plus whatever the metadata and catalogue reads they make declare; claim
-writes on `state_device` as the retention journal does.
+publishes `single_owner` (the maintenance pass), waiting on `none` (a
+pointer swap); claim writes on `state_device` as the retention journal does.
+
+### B4. Horizon builder: referenced sets from a head
+
+What a metadata head refers to, derived: the namespace walk, the conflict
+roots, the catalogue roots and the namespace tree's own nodes, into an
+`InventoryHorizon` at the known generation or a `ReleaseHorizon` at the
+sole accepted head. It is a function of its head and the object reads it
+makes, and holds no state a caller can see.
+
+It is its own component because its role is neither of the others' (decision
+log, 2026-10-01): the maintenance pass decides when, the builder derives,
+the ledger holds and answers, the retention store stores claims. Inside the
+ledger its waits would make every ledger read's declaration the union of a
+lock-free read and a network walk; inside the pass it leaves a scheduler
+owning the reachability computation. Separate, the ledger depends on no
+builder, so the catalogue and the cluster can take the ledger for their
+claim reads without a cycle, and the builder is tested against fakes with
+no pass and no cluster.
+
+- `inventory(...) -> InventoryHorizon` and `release(...) -> ReleaseHorizon`
+  (with its completeness): two functions at stage 0, as today's two builds,
+  traces identical. Their differences (the release control set includes the
+  namespace tree's nodes; the inventory's comes from the catalogue alone)
+  are stated and tested, not merged.
+- Called only by the component that decides to refresh: the maintenance
+  pass. Repair, tombstone collection, control GC, the DATA sweep and
+  retention release take handles from the ledger; none builds.
+- Until T4 the inventory build calls `CatalogueManager::maintenance_objects()`,
+  which runs the catalogue's repair (A4's known case). That side effect is
+  the builder's one exception at stage 0, recorded here; T4 splits it into
+  an explicit step called before the build.
+- Builds run one after another on the pass's thread. Running them at once
+  buys little: both read the same device under one background budget.
+
+Declarations: `single_owner` (the maintenance pass), background class,
+waiting on `state_device` and `network` plus what the metadata and catalogue
+reads it makes declare.
 
 ### Consumers after stage 0
 
 | consumer | through |
 |---|---|
-| inventory build | `refresh_inventory` |
-| release horizon build | `refresh_release` |
+| inventory build | builder `inventory`, then ledger `publish` |
+| release horizon build | builder `release`, then ledger `publish` (refuses incomplete) |
 | repair | `horizon(inventory)`: `referenced_ids(data)`, the `everywhere` ids, `stamp()` |
 | claim walk | `next_retained` + `held` |
 | tombstone collection | tombstone gate; tombstone lists from the inventory horizon |
@@ -670,9 +720,9 @@ fidelity is expected.
 - **0d. The metadata contract (B2)**, the exact call-site survey, the A4
   split of the catalogue's inventory read, the `current()` / `converged()`
   split with every call site mapped one-to-one.
-- **0e. The ledger contract (B3)** and every consumer in the table moved
-  onto it; `Service`'s reachability members and direct `retention_store()`
-  calls gone.
+- **0e. The ledger contract (B3) and the horizon builder (B4)**, every
+  consumer in the table moved onto them; the pass's reachability members
+  and direct `retention_store()` calls gone.
 - **0f. Rewire the root on contracts** instead of concrete classes, every
   component in the service; the A4 audit and A2 markings complete.
 
@@ -715,10 +765,14 @@ Repair stays paced by `repair_share`, never gated.
   the device after warm-up; a backend going offline and being re-adopted
   leaves presence correct.
 - B3: for each gate, a table test over every condition in its row (each
-  false in turn denies, all true permits); refresh keeps the previous
+  false in turn denies, all true permits); publish keeps the previous
   release horizon when the new one is incomplete; the inventory is not
   rebuilt when only repair is due before metadata is ready; each predicate
   query against a hand-built ledger.
+- B4: each build against a fake metadata view and fake tree-node reads
+  gives the referenced sets of today's build for the same head; an
+  unreadable catalogue root or tree node gives an incomplete release
+  horizon; the two builds' stated differences hold.
 - Conformance: each contract has a suite any later implementation must
   pass; the ledger's includes the retention store's existing tests.
 
@@ -842,6 +896,14 @@ supersede earlier ones where they conflict.
   beside them. No narrow contracts are invented ahead of the ledger (T3) and
   the metadata contract (T4), which replace them; until then `NodeRuntime`
   is still a partial locator for the pass.
+- **2026-10-01 (T3). The horizon builder is its own component** (B4).
+  Four roles, previously in two places: the maintenance pass decides when
+  to refresh, the builder derives referenced sets from a head, the ledger
+  holds the published horizons and answers from them, the retention store
+  stores claims. The ledger publishes and refuses an incomplete release
+  horizon; it never builds. Only the pass calls the builder. Builds stay
+  sequential. Memoised, mergeable builds are a future experiment, not stage
+  0 (Later stages).
 
 ## Open questions for the operator
 

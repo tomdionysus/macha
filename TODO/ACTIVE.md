@@ -1,7 +1,8 @@
 # Active tasks and concepts to explore
 
 Last updated: 2026-10-01, on `experiment/object-ledger-t3`. Both nodes run
-0.74.0 (T0's instrumented build); the T0 soak ends 2026-10-01 14:20Z.
+0.74.0 (T0's instrumented build); the T0 soak ended 2026-10-01 14:20Z and a
+six-hour top-up runs to 20:41Z.
 
 This is the authoritative, ordered backlog. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
@@ -38,14 +39,14 @@ resumes from `develop` and the experiment's version line ceases to exist.
 
   | step | branch | tip | state |
   |---|---|---|---|
-  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 deployed both nodes 07:05Z/07:13Z; soaking to 2026-10-01 14:20Z |
+  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 on both nodes; soak ended 2026-10-01 14:20Z; top-up to 20:41Z (below), then the K table and acceptance |
   | T1 instrument | `-t1` | `9ba3e09` | built; accepted with T0 |
   | P presence | `-p` | `afa3e72` | built (has() 4,129 -> 460 ns absent on fi-1) |
   | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
   | T2 slice | `-t2` | `3c6c1fd` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance, dependencies as types; assessment written; also the fixes of 2026-10-01 (handover) |
-  | T3 ledger | `-t3` | `e96046a` | part one: the activity clock injected; trace harness without real-time sleeps; joiner test; checked out |
+  | T3 ledger | `-t3` | `d9968b3` | T3a pushed (activity clock, trace harness without sleeps, joiner test); T3b local (horizons, gates); checked out |
 
 - **T2 is built**; the written assessment is
   `object-ledger-evidence/t2/assessment.md` (no kill criterion met; point 3
@@ -53,8 +54,33 @@ resumes from `develop` and the experiment's version line ceases to exist.
   on fi-1, after the soak. Then accept T0, merge the chain into
   `experiment/object-ledger` in order and push (standing authorisation,
   experiment branches only).
-- **T3 next** (plan, T3): horizons as `Published` handles, the three gates,
-  every consumer onto the ledger, Service's reachability members deleted.
+- **T0's baseline** (2026-10-01): 31 hours per node pulled to `build/soak/`
+  and reported. Strong for K1, K2, K4, K5, K9 and the high-volume routes;
+  thin for K3, K6, K7 (too few values per hour for the threshold rule) and
+  K10 (one real restart on gbni-1). A six-hour top-up fills them: a
+  playback cycle (remux and transcode) and a 32 MiB FUSE write per cycle,
+  the K6 routes polled every 30 s, three restarts per node
+  (`build/topup/`, `/root/claude-topup*` on the nodes; ends 20:41Z).
+  `start_ready_us` and `update_ready_us` come only from transcode sessions,
+  about 10-15 an hour per node, and will stay thinner than the 20-value
+  floor. fi-1's backend recoveries in K10 are the soak's two USB faults
+  only. The report script now totals cumulative gauges across restarts.
+  Found along the way, recorded, not fixed:
+  - repair completes no pass in 31 hours: a pass must settle every local
+    object (push) and every live object (pull) at about 6 and 21 objects a
+    minute, one to three months for ~650-830k objects. Repair's pace, not a
+    broken gauge;
+  - one `ETIMEDOUT` from gbni-1's FUSE lookup of a directory fi-1 had just
+    removed, `ENOENT` on every retry;
+  - fi-1's playback errors under transcode (seek 503 after ~15 s, segment
+    500, `extent unavailable`) match the soak's: the baseline's behaviour.
+- **T3 next** (plan, T3, substages T3c-T3f): the horizon builder extracted
+  (spec B4: the pass decides, the builder derives, the ledger holds and
+  answers); the ledger publishes the horizons and the gates are wired in;
+  every consumer onto the ledger; the predicate queries.
+- **Future experiment: memoised horizon builds** (spec, Later stages):
+  subtree referenced sets kept by subtree id, partial builds merging in any
+  order; first measure how often the inventory and release heads coincide.
 - **Rules for every step**: a branch cut from the previous step, merged
   when accepted, then pushed; 100% line and branch coverage of what the
   step builds or converts, mutation-proven; contracts as preconditions,

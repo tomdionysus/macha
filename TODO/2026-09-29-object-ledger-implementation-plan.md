@@ -380,30 +380,45 @@ and restores missing claimed objects.
 
 ## T3. The ledger, widened
 
-**Goal.** One owner for everything maintenance asks about an object.
+**Goal.** One owner for everything maintenance asks about an object: the
+pass decides when, the horizon builder derives, the ledger holds and
+answers (spec B3, B4; decision log 2026-10-01).
 
-**Work.**
-- Horizons `inventory` and `release` as snapshot handles, with
-  `refresh_inventory` and `refresh_release` under today's conditions.
-- The three gates exactly as the spec's table, returning today's reason
-  strings; the predicate queries implemented, tested, unused;
-  `everywhere` in place of `universal`.
-- Consumers moved: inventory and release builds, repair, tombstone
-  collection, control release and GC, DATA release and sweep, rebalance
-  keep checks (`src/cluster/distributed_store.cpp` 2300, 2764), publication
-  claims (847, `src/cluster/cluster.cpp` 1528), peer remove refusal (1535),
-  catalogue staging GC (`src/catalogue/catalogue.cpp` 1872), retention
-  compaction.
-- `Service`'s reachability members (`src/service/service.hpp:103-114`)
-  deleted.
+**Work, in substages, each its own commit with its evidence.**
+- **T3a, done.** The activity clock injected; the trace harness without
+  real-time sleeps; the joiner test.
+- **T3b, done.** `InventoryHorizon` and `ReleaseHorizon`
+  (`src/contract/horizon.hpp`); the three gates as functions of the pass's
+  facts and the inventory (`src/contract/gates.hpp`), returning today's
+  verdict, reason and trace conditions; table tests over every input
+  against the pass's conditions copied as the reference; 21 mutants, all
+  killed. Not yet called by the pass.
+- **T3c.** The horizon builder extracted from the pass: `inventory` and
+  `release` builds, the inventory still calling `maintenance_objects()`
+  until T4. Tested against fakes; traces identical.
+- **T3d.** The ledger holds the horizons as `Published` handles and
+  publishes them (incomplete release refused); the pass builds, publishes
+  and reads handles; the gates wired in; the pass's reachability members
+  (`src/service/maintenance.hpp`) deleted.
+- **T3e.** Consumers moved: repair, tombstone collection, control release
+  and GC, DATA release and sweep, rebalance keep checks
+  (`src/cluster/distributed_store.cpp`), publication claims
+  (`distributed_store.cpp`, `src/cluster/cluster.cpp`), peer remove
+  refusal (`cluster.cpp`), catalogue staging GC
+  (`src/catalogue/catalogue.cpp`), retention compaction. The ledger
+  depends on no builder, so the catalogue and cluster take it for claims
+  without a cycle.
+- **T3f.** The predicate queries implemented, tested, unused.
 - Metadata is reached through the declared views from T2; the full
-  metadata contract is T4.
+  metadata contract and the catalogue's repair split are T4.
 - Q: GC, release and repair scenarios move to trace fixtures and
   ledger-level tests against fakes.
 
 **Acceptance.**
 - T1 traces identical over every fixture.
 - Each gate: a table test over every condition in its row; mutation-proven.
+- Each build: the referenced sets of today's build for the same head,
+  against fakes; mutation-proven.
 - No `retention_store()` call and no reachability vector outside the ledger.
 - The retention store's existing tests pass through the ledger.
 - On the cluster at T5: repair bytes and examined counts in range under the
