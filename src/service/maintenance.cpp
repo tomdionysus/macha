@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/maintenance.hpp"
 #include "service/claim_walk.hpp"
+#include "contract/gates.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "diagnostics.hpp"
 #include "fuse/fuse_frontend.hpp"
@@ -92,7 +93,7 @@ Maintenance::Maintenance(MaintenanceDependencies dependencies)
       store_(dependencies.contracts.get<DistributedStore>()),
       metadata_(dependencies.contracts.get<MetadataManager>()),
       catalogue_(dependencies.contracts.get<CatalogueManager>()),
-      filesystem_(dependencies.contracts.get<FileSystem>()),
+      builder_(dependencies.contracts.get<HorizonBuilder>()),
       ledger_(dependencies.contracts.get<const ObjectLedger>()),
       port_(dependencies.contracts.get<MaintenancePort>()), clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
@@ -247,6 +248,8 @@ void Maintenance::run(std::stop_token stop) {
     const auto flag = [](std::string_view name, bool value) {
         return std::string(name) + (value ? "=1" : "=0");
     };
+    // The tombstones before the first inventory: none.
+    static const std::vector<GarbageRef> no_garbage;
 
     while (!stop.stop_requested()) {
         port_.wakeups.fetch_add(1, std::memory_order_relaxed);
@@ -508,7 +511,7 @@ void Maintenance::run(std::stop_token stop) {
             if (network_due || garbage_due || gc_due) {
                 enter_stage("inventory");
                 const auto inventory_stage = Clock::now();
-                auto objects = filesystem_.maintenance_objects_cached();
+                auto objects = builder_.namespace_objects();
                 bool rebuilt_inventory = false;
                 // Rebuilding runs the catalogue's repair (maintenance_objects),
                 // which this pass holds back until metadata is ready. A repair
@@ -517,52 +520,25 @@ void Maintenance::run(std::stop_token stop) {
                 // and without this it refreshed the catalogue ahead of the
                 // metadata convergence it depends on.
                 const bool repair_only = network_due && !garbage_due && !gc_due;
-                if ((!maintenance_live_ || !maintenance_catalogue_complete_ ||
-                     maintenance_inventory_generation_ != objects->metadata_generation) &&
-                    (!maintenance_live_ || !repair_only || metadata_ready_for_dependants)) {
-                    auto live = std::make_shared<std::vector<ObjectId>>(objects->live);
-                    auto control_live = std::make_shared<std::vector<ObjectId>>();
-                    auto catalogue_objects = catalogue_.maintenance_objects();
-                    maintenance_catalogue_complete_ = catalogue_objects.complete;
-                    live->insert(live->end(), catalogue_objects.live.begin(),
-                                 catalogue_objects.live.end());
-                    control_live->insert(control_live->end(),
-                                         catalogue_objects.control_live.begin(),
-                                         catalogue_objects.control_live.end());
-                    std::sort(live->begin(), live->end());
-                    live->erase(std::unique(live->begin(), live->end()), live->end());
-                    std::sort(control_live->begin(), control_live->end());
-                    control_live->erase(std::unique(control_live->begin(), control_live->end()),
-                                        control_live->end());
-
-                    maintenance_garbage_.clear();
-                    maintenance_stale_garbage_.clear();
-                    maintenance_garbage_.reserve(objects->garbage.size());
-                    maintenance_stale_garbage_.reserve(objects->garbage.size());
-                    for (const auto& garbage : objects->garbage) {
-                        if (std::binary_search(live->begin(), live->end(), garbage.id))
-                            maintenance_stale_garbage_.push_back(garbage);
-                        else
-                            maintenance_garbage_.push_back(garbage);
-                    }
-
-                    maintenance_inventory_generation_ = objects->metadata_generation;
-                    maintenance_live_ = std::move(live);
-                    maintenance_control_live_ = std::move(control_live);
+                if ((!inventory_ || !inventory_->catalogue_complete() ||
+                     inventory_->generation() != objects->metadata_generation) &&
+                    (!inventory_ || !repair_only || metadata_ready_for_dependants)) {
+                    inventory_ = builder_.inventory(*objects);
                     rebuilt_inventory = true;
                     observations().record("maintenance.inventory.build_us",
                                           elapsed_us(inventory_stage));
-                    trace_action("inventory",
-                                 "generation=" + std::to_string(objects->metadata_generation) +
-                                     " live=" + std::to_string(maintenance_live_->size()) +
-                                     " control_live=" +
-                                     std::to_string(maintenance_control_live_->size()) +
-                                     " garbage=" + std::to_string(maintenance_garbage_.size()) +
-                                     " stale_garbage=" +
-                                     std::to_string(maintenance_stale_garbage_.size()) + " " +
-                                     flag("catalogue_complete", maintenance_catalogue_complete_));
+                    trace_action(
+                        "inventory",
+                        "generation=" + std::to_string(objects->metadata_generation) +
+                            " live=" + std::to_string(inventory_->size(RetentionClass::data)) +
+                            " control_live=" +
+                            std::to_string(inventory_->size(RetentionClass::control)) +
+                            " garbage=" + std::to_string(inventory_->garbage().size()) +
+                            " stale_garbage=" +
+                            std::to_string(inventory_->stale_garbage().size()) + " " +
+                            flag("catalogue_complete", inventory_->catalogue_complete()));
                     observations().add("maintenance.inventory.live_objects",
-                                       maintenance_live_->size());
+                                       inventory_->size(RetentionClass::data));
                     // A newly-derived reachability set is never consumed by a
                     // destructive sweep in the same pass. Schedule exactly one
                     // follow-up after the foreground quiet boundary; without
@@ -575,9 +551,10 @@ void Maintenance::run(std::stop_token stop) {
                                std::to_string(objects->metadata_generation) +
                                " entries=" + std::to_string(objects->entries) +
                                " extents=" + std::to_string(objects->extents) +
-                               " live=" + std::to_string(maintenance_live_->size()) + " garbage=" +
-                               std::to_string(maintenance_garbage_.size()) + " stale_garbage=" +
-                               std::to_string(maintenance_stale_garbage_.size()) +
+                               " live=" + std::to_string(inventory_->size(RetentionClass::data)) +
+                               " garbage=" + std::to_string(inventory_->garbage().size()) +
+                               " stale_garbage=" +
+                               std::to_string(inventory_->stale_garbage().size()) +
                                " elapsed_ms=" + std::to_string(elapsed_ms(inventory_stage)));
                 }
 
@@ -655,14 +632,16 @@ void Maintenance::run(std::stop_token stop) {
                     enter_stage("network-repair");
                     const auto repair_stage = Clock::now();
                     auto repair = store_.repair_step(
-                        byte_budget, operation_budget, maintenance_live_.get(),
+                        byte_budget, operation_budget,
+                        inventory_ ? std::optional(inventory_->referenced_ids(RetentionClass::data))
+                                   : std::nullopt,
                         [&] {
                             // Repair's turn ends at the next operation boundary
                             // once its weighted slice is spent; it is paced,
                             // never stopped.
                             return repair_share.should_yield(clock_->now(), higher_class_active());
                         },
-                        maintenance_inventory_generation_);
+                        inventory_ ? inventory_->generation() : 0);
                     {
                         // Split by whether a higher class was active as the
                         // step ended: repair idle against repair on its share.
@@ -713,8 +692,9 @@ void Maintenance::run(std::stop_token stop) {
                 }
 
                 const bool cluster_gc_healthy = node_.membership().all_known_reachable();
-                const bool cluster_gc_stable =
+                const bool metadata_stable =
                     cluster_gc_healthy && metadata_.cluster_status().stable;
+                const bool cluster_gc_stable = cluster_gc_healthy && metadata_stable;
                 if (cluster_gc_stable && !cluster_stable_observed_) {
                     // Recovery after a restart: every known node reached and
                     // metadata stable, for the first time in this process.
@@ -725,23 +705,29 @@ void Maintenance::run(std::stop_token stop) {
                                           {}});
                 }
 
-                trace_gate("gate.tombstones",
-                           garbage_due && !rebuilt_inventory && cluster_gc_stable &&
-                               maintenance_catalogue_complete_,
-                           flag("due", garbage_due) + " " + flag("rebuilt", rebuilt_inventory) +
-                               " " + flag("reachable", cluster_gc_healthy) + " " +
-                               flag("stable", cluster_gc_stable) + " " +
-                               flag("catalogue_complete", maintenance_catalogue_complete_));
-                if (garbage_due && !rebuilt_inventory && cluster_gc_stable &&
-                    maintenance_catalogue_complete_) {
-                    auto matured = collect_garbage(maintenance_garbage_);
+                // What the gates read. The known generation is read again at
+                // each gate, as the pass always has.
+                PassFacts facts;
+                facts.garbage_due = garbage_due;
+                facts.gc_due = gc_due;
+                facts.busy = busy;
+                facts.gc_waiting_for_event = gc_quiescent_until == Clock::time_point::max();
+                facts.rebuilt_inventory = rebuilt_inventory;
+                facts.reachable = cluster_gc_healthy;
+                facts.metadata_stable = metadata_stable;
+                const auto& garbage = inventory_ ? inventory_->garbage() : no_garbage;
+
+                const auto tombstones = tombstone_gate(facts, inventory_.get());
+                trace_gate("gate.tombstones", tombstones.permitted, tombstones.conditions);
+                if (tombstones.permitted) {
+                    auto matured = collect_garbage(garbage);
                     std::vector<GarbageRef> legacy;
-                    for (const auto& candidate : maintenance_garbage_) {
+                    for (const auto& candidate : garbage) {
                         if (candidate.retired_at_ns == 0)
                             legacy.push_back(candidate);
                     }
 
-                    auto erase = maintenance_stale_garbage_;
+                    auto erase = inventory_ ? inventory_->stale_garbage() : no_garbage;
                     erase.insert(erase.end(), matured.begin(), matured.end());
                     observations().add("maintenance.tombstones.collected", matured.size());
                     if (!erase.empty() || !legacy.empty()) {
@@ -769,120 +755,55 @@ void Maintenance::run(std::stop_token stop) {
                 // before the next maintenance pass observes the successor generation.
                 const auto current_metadata_view = metadata_.available_snapshot_view();
                 const auto release_metadata_view = metadata_.retention_release_view();
-                const bool destructive_gc_enabled =
-                    cluster_gc_stable && release_metadata_view &&
-                    release_metadata_view->snapshot->retention_baseline_complete;
 
                 // Retention release is local and causal. A sole accepted head
                 // provides a complete live-object set plus the mutation clock of
                 // claim dots it has actually observed. Claims from unseen concurrent
                 // branches are not dominated by that clock and therefore survive.
                 if (auto floor = metadata_.retention_release_view();
-                    floor && floor->hash != retention_release_floor_hash_) {
+                    floor && floor->hash != (release_ ? release_->head() : Hash256{})) {
                     ObservedDuration horizon_build(
                         observations().histogram("maintenance.release_horizon.build_us"));
-                    auto data_live = std::make_shared<std::vector<ObjectId>>();
-                    auto control_live = std::make_shared<std::vector<ObjectId>>();
-                    bool complete = true;
-                    // The live set destructive GC acts on. Read the
-                    // namespace in whichever form it is in: an empty one here
-                    // means "collect everything".
-                    auto release_nodes =
-                        ControlNamespaceNodeStore::for_reading(node_, store_);
-                    for_each_namespace_entry(
-                        *floor->snapshot, &release_nodes,
-                        [&](const std::string&, const FsEntry& entry) {
-                            if (entry.type != EntryType::file)
-                                return;
-                            for (const auto& extent_ref : entry.extents)
-                                if (!extent_ref.hole)
-                                    data_live->push_back(extent_ref.id);
-                        });
-                    const auto conflict_extents = metadata_conflict_extent_roots(*floor->snapshot);
-                    data_live->insert(data_live->end(), conflict_extents.begin(),
-                                      conflict_extents.end());
-
-                    for (const auto& root : metadata_catalogue_root_set(*floor->snapshot)) {
-                        try {
-                            auto retained = catalogue_.retention_objects(std::nullopt, root);
-                            data_live->insert(data_live->end(), retained.data.begin(),
-                                              retained.data.end());
-                            control_live->insert(control_live->end(), retained.control.begin(),
-                                                 retained.control.end());
-                        } catch (const std::exception& error) {
-                            complete = false;
-                            Log::debug("retention release horizon catalogue unavailable root=" +
-                                       to_string(root) + " error=" + error.what());
-                        }
-                    }
-                    // The namespace tree itself. A live set that omits it is a
-                    // live set that lets the collector delete the namespace,
-                    // and a partial walk is worse than none -- so an unreadable
-                    // node marks the whole set incomplete and nothing is
-                    // released against it.
-                    if (floor->snapshot->namespace_root) {
-                        try {
-                            collect_namespace_tree_nodes(*floor->snapshot->namespace_root,
-                                                         release_nodes, *control_live);
-                        } catch (const std::exception& error) {
-                            complete = false;
-                            Log::warn("retention release horizon namespace tree unavailable root=" +
-                                      to_string(*floor->snapshot->namespace_root) +
-                                      " error=" + error.what());
-                        }
-                    }
-                    std::sort(data_live->begin(), data_live->end());
-                    data_live->erase(std::unique(data_live->begin(), data_live->end()),
-                                     data_live->end());
-                    std::sort(control_live->begin(), control_live->end());
-                    control_live->erase(std::unique(control_live->begin(), control_live->end()),
-                                        control_live->end());
+                    auto built = builder_.release(*floor);
                     trace_action("release-horizon",
-                                 std::string(complete ? "complete" : "incomplete") +
-                                     " data_live=" + std::to_string(data_live->size()) +
-                                     " control_live=" + std::to_string(control_live->size()));
-                    if (complete) {
-                        retention_release_floor_hash_ = floor->hash;
-                        retention_release_data_live_ = std::move(data_live);
-                        retention_release_control_live_ = std::move(control_live);
-                        retention_release_clock_ = floor->snapshot->mutation_sequences;
-                        retention_release_complete_ = true;
-                    }
+                                 std::string(built.complete ? "complete" : "incomplete") +
+                                     " data_live=" +
+                                     std::to_string(built.horizon->size(RetentionClass::data)) +
+                                     " control_live=" +
+                                     std::to_string(built.horizon->size(RetentionClass::control)));
+                    if (built.complete)
+                        release_ = std::move(built.horizon);
                 }
 
-                const bool control_gate =
-                    gc_due && !rebuilt_inventory && destructive_gc_enabled &&
-                    maintenance_catalogue_complete_ &&
-                    maintenance_control_live_ &&
-                    maintenance_inventory_generation_ >= node_.known_metadata_generation();
+                facts.release_view = release_metadata_view.has_value();
+                facts.retention_baseline_complete =
+                    release_metadata_view && release_metadata_view->snapshot->retention_baseline_complete;
+                facts.known_generation = node_.known_metadata_generation();
+                const auto control = control_gate(facts, inventory_.get());
                 // The rule the DATA and tombstone gates keep: a newly built
                 // inventory is never used destructively in the pass that
                 // built it. Traced so a fixture can hold the control gate to it.
                 if (rebuilt_inventory)
-                    trace_action("control-gate-in-rebuilding-pass", control_gate ? "open" : "shut");
-                trace_gate("gate.control", control_gate,
-                           flag("due", gc_due) + " " + flag("rebuilt", rebuilt_inventory) + " " +
-                               flag("destructive", destructive_gc_enabled) +
-                               " " + flag("catalogue_complete", maintenance_catalogue_complete_) +
-                               " " + flag("control_live", maintenance_control_live_ != nullptr) +
-                               " " +
-                               flag("generation_current", maintenance_inventory_generation_ >=
-                                                              node_.known_metadata_generation()));
-                if (control_gate) {
+                    trace_action("control-gate-in-rebuilding-pass",
+                                 control.permitted ? "open" : "shut");
+                trace_gate("gate.control", control.permitted, control.conditions);
+                if (control.permitted) {
                     // Destructive retention release is fenced by direct reachability of
                     // every durably-known node. A partition may continue to accumulate
                     // causal tombstones/claims, but it cannot reclaim authoritative bytes.
-                    if (retention_release_complete_ && retention_release_control_live_) {
+                    if (release_) {
                         const auto released = node_.retention_store().release_unreferenced(
-                            RetentionClass::control, *retention_release_control_live_,
-                            retention_release_clock_, 64);
+                            RetentionClass::control,
+                            release_->referenced_ids(RetentionClass::control), release_->clock(),
+                            64);
                         observations().add("retention.released.control", released);
                         if (released)
                             trace_action("release.control", std::to_string(released));
                     }
                     enter_stage("control-gc");
-                    const auto removed = catalogue_.control_gc_step(*maintenance_control_live_,
-                                                                     policy.garbage_grace, 32);
+                    const auto removed = catalogue_.control_gc_step(
+                        inventory_->referenced_ids(RetentionClass::control), policy.garbage_grace,
+                        32);
                     observations().add("catalogue.control_gc.removed", removed);
                     if (removed)
                         trace_action("control-gc", std::to_string(removed));
@@ -904,42 +825,10 @@ void Maintenance::run(std::stop_token stop) {
                 // Retention claims are checked immediately before every
                 // physical delete, so an inventory that predates a newer
                 // metadata generation remains safe for orphan cleanup.
-                std::string gc_skip_reason;
-                if (!gc_due)
-                    gc_skip_reason = busy ? "foreground busy"
-                                     : gc_quiescent_until == Clock::time_point::max()
-                                         ? "complete; waiting for an event"
-                                         : "quiet window";
-                else if (rebuilt_inventory)
-                    gc_skip_reason = "inventory rebuilt this pass";
-                else if (!cluster_gc_stable)
-                    gc_skip_reason = cluster_gc_healthy ? "metadata not stable"
-                                                        : "not every known node reachable";
-                else if (!release_metadata_view)
-                    gc_skip_reason = "no sole accepted head for retention release";
-                else if (!release_metadata_view->snapshot->retention_baseline_complete)
-                    gc_skip_reason = "retention baseline incomplete";
-                else if (!maintenance_catalogue_complete_)
-                    gc_skip_reason = "catalogue inventory incomplete";
-                else if (!maintenance_live_)
-                    gc_skip_reason = "no reachability inventory";
-                else if (maintenance_inventory_generation_ < node_.known_metadata_generation())
-                    gc_skip_reason = "inventory generation " +
-                                     std::to_string(maintenance_inventory_generation_) +
-                                     " behind known " +
-                                     std::to_string(node_.known_metadata_generation());
-                trace_gate("gate.data", gc_skip_reason.empty(),
-                           flag("due", gc_due) + " " + flag("rebuilt", rebuilt_inventory) + " " +
-                               flag("reachable", cluster_gc_healthy) + " " +
-                               flag("stable", cluster_gc_stable) + " " +
-                               flag("release_view", release_metadata_view.has_value()) + " " +
-                               flag("baseline", release_metadata_view &&
-                                                    release_metadata_view->snapshot
-                                                        ->retention_baseline_complete) +
-                               " " + flag("catalogue_complete", maintenance_catalogue_complete_) +
-                               " " + flag("live", maintenance_live_ != nullptr) + " " +
-                               flag("generation_current", maintenance_inventory_generation_ >=
-                                                              node_.known_metadata_generation()));
+                facts.known_generation = node_.known_metadata_generation();
+                const auto data = data_gate(facts, inventory_.get());
+                const std::string& gc_skip_reason = data.reason;
+                trace_gate("gate.data", data.permitted, data.conditions);
                 if (gc_skip_reason != last_gc_skip_reason) {
                     last_gc_skip_reason = gc_skip_reason;
                     if (Log::enabled(LogLevel::debug))
@@ -948,13 +837,11 @@ void Maintenance::run(std::stop_token stop) {
                                    (gc_skip_reason.empty() ? std::string(" enabled")
                                                            : " skipped: " + gc_skip_reason));
                 }
-                if (gc_due && !rebuilt_inventory && destructive_gc_enabled &&
-                    maintenance_catalogue_complete_ && maintenance_live_ &&
-                    maintenance_inventory_generation_ >= node_.known_metadata_generation()) {
-                    if (retention_release_complete_ && retention_release_data_live_) {
+                if (data.permitted) {
+                    if (release_) {
                         const auto released = node_.retention_store().release_unreferenced(
-                            RetentionClass::data, *retention_release_data_live_,
-                            retention_release_clock_, 64);
+                            RetentionClass::data, release_->referenced_ids(RetentionClass::data),
+                            release_->clock(), 64);
                         observations().add("retention.released.data", released);
                         if (released)
                             trace_action("release.data", std::to_string(released));
@@ -967,12 +854,12 @@ void Maintenance::run(std::stop_token stop) {
                         Log::debug("retention release skipped: horizon incomplete");
                     }
                     std::vector<ObjectId> protected_ids;
-                    protected_ids.reserve(maintenance_garbage_.size());
+                    protected_ids.reserve(garbage.size());
                     const auto now_ns = clock_->wall_ns();
                     const auto grace_ns =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace)
                             .count();
-                    for (const auto& candidate : maintenance_garbage_) {
+                    for (const auto& candidate : garbage) {
                         const bool matured = candidate.retired_at_ns > 0 &&
                                              now_ns >= candidate.retired_at_ns &&
                                              now_ns - candidate.retired_at_ns >= grace_ns;
@@ -994,7 +881,8 @@ void Maintenance::run(std::stop_token stop) {
                     const auto orphan_grace =
                         std::max(policy.garbage_grace, policy.no_progress_backoff);
                     auto gc = node_.local_store().gc_step(
-                        *maintenance_live_, protected_ids, orphan_grace, 64,
+                        inventory_->referenced_ids(RetentionClass::data), protected_ids,
+                        orphan_grace, 64,
                         [this] {
                             const auto quiet = node_.config().maintenance.foreground_quiet;
                             return store_.foreground_idle_for() < quiet ||
@@ -1027,7 +915,8 @@ void Maintenance::run(std::stop_token stop) {
                                    std::to_string(gc.deferred ? 1 : 0) + " yielded=" +
                                    std::to_string(gc.yielded ? 1 : 0) + " complete=" +
                                    std::to_string(gc.complete ? 1 : 0) + " live=" +
-                                   std::to_string(maintenance_live_->size()) + " protected=" +
+                                   std::to_string(inventory_->size(RetentionClass::data)) +
+                                   " protected=" +
                                    std::to_string(protected_ids.size()));
                     const auto pruned = node_.retention_store().prune_unclaimed(
                         RetentionClass::data,
@@ -1199,7 +1088,7 @@ void Maintenance::run(std::stop_token stop) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace).count();
             const auto wall_now_ns = clock_->wall_ns();
             std::optional<std::chrono::nanoseconds> earliest_remaining;
-            for (const auto& candidate : maintenance_garbage_) {
+            for (const auto& candidate : inventory_ ? inventory_->garbage() : no_garbage) {
                 if (candidate.retired_at_ns <= 0 || grace_ns <= 0)
                     continue;
                 int64_t remaining_ns{};

@@ -22,6 +22,7 @@
 #include "component/composition_root.hpp"
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
+#include "ledger/node_horizon_builder.hpp"
 #include "storage/retention_ledger.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -115,6 +116,7 @@ class Service {
     MaintenanceStageHook maintenance_stage_hook_;
     // Built once the node's stores exist; the pass's ObjectLedger.
     std::unique_ptr<RetentionLedger> ledger_;
+    std::unique_ptr<NodeHorizonBuilder> horizon_builder_;
     // Owns the components moved out of Service so far (maintenance). After
     // every service it uses, so it stops and is destroyed before them.
     CompositionRoot root_{[this](std::string_view event) { note_lifecycle(event); }};

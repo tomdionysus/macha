@@ -1819,7 +1819,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
     return out;
 }
 
-size_t CatalogueManager::control_gc_step(const std::vector<ObjectId>& live,
+size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
                                          std::chrono::milliseconds grace,
                                          size_t operation_budget) {
     if (!operation_budget) return 0;

@@ -16,6 +16,7 @@ namespace macha {
 class CatalogueManager;
 class DistributedStore;
 class FileSystem;
+class HorizonBuilder;
 class MetadataManager;
 class NodeRuntime;
 class ObjectLedger;
@@ -37,6 +38,9 @@ template <> struct ContractName<CatalogueManager> {
 };
 template <> struct ContractName<FileSystem> {
     static constexpr std::string_view value = "filesystem";
+};
+template <> struct ContractName<HorizonBuilder> {
+    static constexpr std::string_view value = "horizon-builder";
 };
 template <> struct ContractName<ObjectLedger> {
     static constexpr std::string_view value = "object-ledger";

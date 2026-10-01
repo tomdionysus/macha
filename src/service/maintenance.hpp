@@ -6,8 +6,9 @@
 #include "cluster/distributed_store.hpp"
 #include "component/component.hpp"
 #include "component/dependencies.hpp"
+#include "contract/horizon.hpp"
+#include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
-#include "filesystem/filesystem.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "service/convergence_demand.hpp"
 #include "service/maintenance_clock.hpp"
@@ -56,10 +57,10 @@ struct MaintenancePort {
 };
 
 // The contracts the maintenance pass requires: concrete components at stage
-// 0, the ledger excepted; the metadata and ledger contracts (T3, T4) replace
-// them. Every reference outlives the component.
+// 0, the ledger and the horizon builder excepted; the metadata and ledger
+// contracts (T3, T4) replace them. Every reference outlives the component.
 using MaintenanceContracts = Dependencies<NodeRuntime, DistributedStore, MetadataManager,
-                                          CatalogueManager, FileSystem, const ObjectLedger,
+                                          CatalogueManager, HorizonBuilder, const ObjectLedger,
                                           MaintenancePort>;
 
 // What the maintenance pass is given: its contracts, and the instruments
@@ -98,7 +99,7 @@ class Maintenance final : public Component {
     DistributedStore& store_;
     MetadataManager& metadata_;
     CatalogueManager& catalogue_;
-    FileSystem& filesystem_;
+    HorizonBuilder& builder_;
     const ObjectLedger& ledger_;
     MaintenancePort& port_;
     std::shared_ptr<MaintenanceClock> clock_;
@@ -106,18 +107,11 @@ class Maintenance final : public Component {
     std::function<void(std::string_view)> maintenance_stage_hook_;
     Clock::time_point constructed_;
 
-    // The pass's state, carried from one pass to the next.
-    uint64_t maintenance_inventory_generation_{};
-    std::shared_ptr<const std::vector<ObjectId>> maintenance_live_;
-    std::shared_ptr<const std::vector<ObjectId>> maintenance_control_live_;
-    Hash256 retention_release_floor_hash_{};
-    std::shared_ptr<const std::vector<ObjectId>> retention_release_data_live_;
-    std::shared_ptr<const std::vector<ObjectId>> retention_release_control_live_;
-    RetentionClock retention_release_clock_;
-    bool retention_release_complete_{};
-    bool maintenance_catalogue_complete_{true};
-    std::vector<GarbageRef> maintenance_garbage_;
-    std::vector<GarbageRef> maintenance_stale_garbage_;
+    // The pass's state, carried from one pass to the next: the last
+    // inventory built and the last complete release horizon (none until the
+    // first of each).
+    std::shared_ptr<const InventoryHorizon> inventory_;
+    std::shared_ptr<const ReleaseHorizon> release_;
     bool cluster_stable_observed_{};
 
     std::jthread thread_;

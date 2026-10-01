@@ -516,6 +516,29 @@ MACHA_TEST("maintenance_trace", test_trace_tombstones_maturing) {
     check_against_fixture("tombstones-maturing", node.trace());
 }
 
+// A deleted file's content is written again under another name before its
+// tombstone matures: the object is live again, so the tombstone is stale and
+// is erased at once, not collected.
+MACHA_TEST("maintenance_trace", test_trace_revived_tombstone) {
+    TracedNode node("trace-revived");
+    auto& service = node.start();
+    auto& fs = service.filesystem();
+    write_file(fs, "/first.bin", pattern(64 * 1024, 4));
+    node.watch("first", "/first.bin");
+    node.advance(100ms);
+    node.step("file written");
+    fs.unlink("/first.bin");
+    node.advance(100ms);
+    node.step("file deleted");
+    write_file(fs, "/again.bin", pattern(64 * 1024, 4));
+    node.watch("again", "/again.bin");
+    node.advance(100ms);
+    node.step("same content written again");
+    node.advance(100ms);
+    node.step("the pass after");
+    check_against_fixture("revived-tombstone", node.trace());
+}
+
 // The DATA backend disappears (the mount is lost; on fi-1 on 2026-09-29, a
 // USB drive dropping off the bus) and comes back.
 MACHA_TEST("maintenance_trace", test_trace_backend_offline_and_back) {

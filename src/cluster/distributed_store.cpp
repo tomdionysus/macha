@@ -2329,7 +2329,8 @@ uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
     return checked;
 }
 
-uint64_t DistributedStore::repair_once(uint64_t byte_budget, const std::vector<ObjectId>* live) {
+uint64_t DistributedStore::repair_once(uint64_t byte_budget,
+                                      std::optional<std::span<const ObjectId>> live) {
     return repair_step(byte_budget ? byte_budget : std::numeric_limits<uint64_t>::max(), 0, live)
         .bytes_transferred;
 }
@@ -2413,7 +2414,7 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
 
 DistributedStore::RepairResult
 DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
-                              const std::vector<ObjectId>* live,
+                              std::optional<std::span<const ObjectId>> live,
                               const std::function<bool()>& should_yield,
                               uint64_t live_generation) {
     RepairResult result;
@@ -2426,9 +2427,11 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     // live-object set on every scheduler slice, then usually examined only a
     // handful of objects before the RPC operation budget was exhausted. On a
     // media-sized store that made idle repair itself an O(store) hot loop.
+    const std::optional<const ObjectId*> live_identity =
+        live ? std::optional<const ObjectId*>(live->data()) : std::nullopt;
     const bool generation_changed =
         live_generation ? repair_live_generation_ != live_generation
-                        : repair_live_identity_ != live;
+                        : repair_live_identity_ != live_identity;
     const auto reset_push_window = [&] {
         repair_push_window_.clear();
         repair_push_presence_.clear();
@@ -2445,7 +2448,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     if (generation_changed &&
         (repair_push_settled_ || repair_pull_after_ || !repair_push_window_.empty()))
         repair_pass_spans_change_ = true;
-    repair_live_identity_ = live;
+    repair_live_identity_ = live_identity;
     repair_live_generation_ = live_generation;
     if (!live || live->empty())
         repair_pull_complete_ = true;
