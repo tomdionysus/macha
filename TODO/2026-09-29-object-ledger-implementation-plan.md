@@ -400,9 +400,10 @@ answers (spec B3, B4; decision log 2026-10-01).
   repair, the sweep, release and control GC on spans. Traces identical;
   two pre-existing gaps closed (stale tombstones, repair's live-set
   identity).
-- **T3d.** The ledger holds the horizons as `Published` handles and
-  publishes them, refusing an incomplete release horizon (tested at the
-  ledger); the pass publishes and reads handles from it.
+- **T3d, done.** The ledger holds the horizons as `Published` handles
+  and publishes them, refusing an incomplete release horizon (tested at
+  the ledger); `RetentionLedger` moved to `src/ledger/`; the pass
+  publishes, then reads every horizon back from the ledger.
 - **T3e.** Consumers moved: repair, tombstone collection, control release
   and GC, DATA release and sweep, rebalance keep checks
   (`src/cluster/distributed_store.cpp`), publication claims
