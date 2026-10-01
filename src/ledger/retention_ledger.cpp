@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "storage/retention_ledger.hpp"
+#include "ledger/retention_ledger.hpp"
 
 namespace macha {
 
@@ -31,6 +31,15 @@ Page<ObjectId, ObjectId> RetentionLedger::claimed(RetentionClass type, Cursor<Ob
 
 bool RetentionLedger::held(RetentionClass type, const ObjectId& id) const {
     return type == RetentionClass::data ? data_.has(id) : control_.has(id);
+}
+
+void RetentionLedger::publish(InventoryHandle inventory) { inventory_.publish(std::move(inventory)); }
+
+bool RetentionLedger::publish(ReleaseBuild build) {
+    if (!build.complete)
+        return false;
+    release_.publish(std::move(build.horizon));
+    return true;
 }
 
 } // namespace macha

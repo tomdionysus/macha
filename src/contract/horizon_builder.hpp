@@ -14,13 +14,6 @@
 // it. Single owner (the pass's thread), background class.
 namespace macha {
 
-// A release horizon as built, and whether every catalogue root and tree node
-// it needed was readable. Only a complete one may be published.
-struct ReleaseBuild {
-    std::shared_ptr<const ReleaseHorizon> horizon;
-    bool complete{};
-};
-
 class HorizonBuilder {
   public:
     virtual ~HorizonBuilder() = default;

@@ -9,7 +9,7 @@
 #include "observation.hpp"
 #include "service/claim_walk.hpp"
 #include "storage/retention.hpp"
-#include "storage/retention_ledger.hpp"
+#include "ledger/retention_ledger.hpp"
 #include "storage/storage_pool.hpp"
 #include "test_backend_support.hpp"
 
