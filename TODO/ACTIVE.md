@@ -39,7 +39,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
 
   | step | branch | tip | state |
   |---|---|---|---|
-  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 on both nodes; soak and top-up done; baseline filled (below); acceptance next |
+  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 on both nodes; baseline filled; **accepted 2026-10-02** |
   | T1 instrument | `-t1` | `9ba3e09` | built; accepted with T0 |
   | P presence | `-p` | `afa3e72` | built (has() 4,129 -> 460 ns absent on fi-1) |
   | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
@@ -79,6 +79,18 @@ resumes from `develop` and the experiment's version line ceases to exist.
     500, `extent unavailable`) are the baseline's behaviour;
   - the fi-1 watch's `journalctl -k -u macha` matched nothing (fixed in
     the handover).
+  - **catalogue writes on fi-1 keep losing to "catalogue changed
+    concurrently"** (reported by Macha Client, 2026-10-02): from 17:29Z on
+    2026-10-01, fi-1's media information publication fails about once a
+    minute (33 by 21:27Z, none in the 42 hours before), and a manage
+    unmatched match returned 409 after up to 184 s. fi-1's catalogue root
+    changes every 40-60 s with the item count fixed (6,563). The onset
+    matches gbni-1's ingest burst (adoptions 32/116/82/0/40 in hours
+    17-21Z); the hourly counts do not track closely and the root's
+    once-a-minute writer is not identified. Plausible, not proven: a write
+    prepared against one root fails instead of rebasing when another lands
+    first. T0's diff touches no catalogue or metadata code, so this is
+    0.73 behaviour the baseline recorded.
 - **T3 next** (plan, T3f): the predicate queries, implemented, tested,
   unused; then T3's assessment against the kill criteria.
 - **Future experiment: memoised horizon builds** (spec, Later stages):
