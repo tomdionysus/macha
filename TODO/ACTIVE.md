@@ -314,6 +314,23 @@ glibc heap checking on. Items the experiment absorbs say so.
     [docs/macha-ebooks-proposal.md](../docs/macha-ebooks-proposal.md), to be
     answered with what the server would need; nothing to build yet.
 
+16. **The API is RESTful, all of it** (operator, 2026-10-01). Resources and
+    HTTP methods, not verbs in paths; any route that is not is a thing to
+    change. Not now: larger problems first. When it comes up:
+    - Audit every route against it and list the ones that are not.
+    - **Identity resets become a resource** (decided): `POST
+      /api/v1/manage/identity-resets` (host, port, node_id, reason) answers
+      202 with the reset's id; `GET /api/v1/manage/identity-resets/{id}`
+      gives its state (queued, applied, audited, failed with a code);
+      node-scoped `POST /api/v1/manage/nodes/{id}/identity-resets`. The
+      endpoint lookup for a node with no host given moves into the queued
+      work, so the request never waits: this also removes the wait-guard
+      violation at `src/api/manage_api.cpp:730` (T2 README). Replaces
+      `POST .../identity-associations/reset` and
+      `POST .../nodes/{id}/identity-association/reset`.
+    - Every change is an API change: announced to Core and every client
+      before it ships.
+
 Then the older ordered items below. Reconciled against 0.57.0 on 2026-09-24:
 what was found already done is ledgered in `COMPLETED.md` under "backlog
 reconciliation", and items only partly done now state what remains. The
