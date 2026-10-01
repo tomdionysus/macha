@@ -461,6 +461,16 @@ Stage 0:
   layering (part B puts the object store below metadata, which removes the
   reason for `set_namespace_store`) or becomes a declared port: a contract
   one component provides and another consumes, wired by the root.
+- **A component's `stop()` includes the request** (T2d): it asks for the
+  stop itself if nobody has, then joins. Service's shutdown asks every
+  component to stop well before it stops each one, and its recorded order
+  has no second request beside each stop.
+- **Signals that precede a component go through a port** (T2d). Events
+  reach maintenance, and its diagnostics are read, from the node's start,
+  before the component exists and after it stops; they live in a port
+  owned outside the component (`MaintenancePort`, owned by Service until
+  the root owns the whole node), which the component receives as a
+  dependency.
 - **Supervision policy for core is unchanged at stage 0.** Core components
   use the lifecycle but are not restarted by the supervisor; a core fault
   behaves as today (open question 3).
@@ -822,6 +832,12 @@ supersede earlier ones where they conflict.
   store's activity clock (`idle_for`) and object ages in the store
   (`older_than`, the orphan grace) are still real time; fixtures reach
   those states in real time. Injecting them is later work (T2 on).
+- **2026-10-01 (T2d). Maintenance takes concrete dependencies at stage 0**:
+  `NodeRuntime`, `DistributedStore`, `MetadataManager`, `CatalogueManager`
+  and `FileSystem` as constructor references, the `ObjectLedger` contract
+  beside them. No narrow contracts are invented ahead of the ledger (T3) and
+  the metadata contract (T4), which replace them; until then `NodeRuntime`
+  is still a partial locator for the pass.
 
 ## Open questions for the operator
 

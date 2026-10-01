@@ -269,6 +269,7 @@ set(MACHA_CORE_SOURCES
     src/supervised.cpp
     src/diagnostics.cpp
     src/contract/work.cpp
+    src/component/composition_root.cpp
     src/observation.cpp
     src/durable_file.cpp
     src/json.cpp
@@ -334,6 +335,7 @@ set(MACHA_CORE_SOURCES
     src/torrent/torrent_request.cpp
     src/service/maintenance_clock.cpp
     src/service/claim_walk.cpp
+    src/service/maintenance.cpp
     src/service/service.cpp
 )
 
@@ -567,7 +569,8 @@ if(MACHA_BUILD_TESTS)
         tests/test_maintenance_trace.cpp
         tests/test_presence.cpp
         tests/test_contract.cpp
-        tests/test_claim_walk.cpp)
+        tests/test_claim_walk.cpp
+        tests/test_component.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
