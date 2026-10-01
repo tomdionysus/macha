@@ -65,9 +65,10 @@ never gated) hold as they held. No scheduling change was made.
    in progress; for maintenance that is a thread spawn. A component whose
    `start()` can block for long must make it cancellable, as FUSE's is.
 6. **The wait guard sees only what the suites drive.** The ACTIVE item 2
-   audit is complete for the paths the suites run and blind to the rest
-   (a cold catalogue under a control context; one manage route). The guard
-   is right; the suites are not yet a complete audit.
+   audit was blind to two paths. The cold catalogue now has its case. The
+   manage route is a real violation (README, "the wait guard's two unseen
+   paths"): a control context into a network-declared metadata read. Its
+   fix waits on the operator.
 7. **The budget is not a value type** and says so (the yield source holds
    service-level state). That held up in the claim walk; it has not been
    tested where a budget crosses a thread.
@@ -85,5 +86,5 @@ as a primitive and mutation-proven: 13 + 16 + 9 + 24 mutants, all killed.
 ## Verdict
 
 No kill criterion is met. Before widening (T3): settle point 3; carry
-points 2 and 5 into the T5 conversions as a checklist; fill point 6's two
-gaps with cases of their own.
+points 2 and 5 into the T5 conversions as a checklist; decide the manage
+route's fix (point 6).
