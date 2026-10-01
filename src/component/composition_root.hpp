@@ -2,6 +2,7 @@
 #pragma once
 
 #include "component/component.hpp"
+#include "component/contracts.hpp"
 
 #include <cstddef>
 #include <functional>
@@ -43,6 +44,7 @@ class CompositionRoot {
 
     // A contract supplied from outside the root. Before start().
     void external(std::string contract);
+    template <class Contract> void external() { external(std::string(contract_name<Contract>)); }
 
     // Takes ownership. Before start(); a component's name is unique.
     template <class T> T& add(std::unique_ptr<T> component) {

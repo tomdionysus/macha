@@ -5,6 +5,7 @@
 #include "cluster/cluster.hpp"
 #include "cluster/distributed_store.hpp"
 #include "component/component.hpp"
+#include "component/dependencies.hpp"
 #include "contract/object_ledger.hpp"
 #include "filesystem/filesystem.hpp"
 #include "metadata/metadata_manager.hpp"
@@ -54,17 +55,17 @@ struct MaintenancePort {
     std::atomic<uint8_t> last_flags{};
 };
 
-// What the maintenance pass is given. Concrete components at stage 0, the
-// ledger excepted; the metadata and ledger contracts (T3, T4) replace them.
-// Every reference outlives the component.
+// The contracts the maintenance pass requires: concrete components at stage
+// 0, the ledger excepted; the metadata and ledger contracts (T3, T4) replace
+// them. Every reference outlives the component.
+using MaintenanceContracts = Dependencies<NodeRuntime, DistributedStore, MetadataManager,
+                                          CatalogueManager, FileSystem, const ObjectLedger,
+                                          MaintenancePort>;
+
+// What the maintenance pass is given: its contracts, and the instruments
+// and policy that are not contracts.
 struct MaintenanceDependencies {
-    NodeRuntime& node;
-    DistributedStore& store;
-    MetadataManager& metadata;
-    CatalogueManager& catalogue;
-    FileSystem& filesystem;
-    const ObjectLedger& ledger;
-    MaintenancePort& port;
+    MaintenanceContracts contracts;
     std::shared_ptr<MaintenanceClock> clock;
     MaintenanceTraceHook trace;
     std::function<void(std::string_view)> stage_hook;
@@ -82,7 +83,7 @@ class Maintenance final : public Component {
     ~Maintenance() override;
 
     std::string_view name() const noexcept override { return "maintenance"; }
-    std::vector<std::string> required() const override;
+    std::vector<std::string> required() const override { return MaintenanceContracts::names(); }
     void start() override;
     void request_stop() noexcept override;
     void stop() override;
