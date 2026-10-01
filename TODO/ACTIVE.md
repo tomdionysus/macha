@@ -330,6 +330,15 @@ glibc heap checking on. Items the experiment absorbs say so.
       `POST .../nodes/{id}/identity-association/reset`.
     - Every change is an API change: announced to Core and every client
       before it ships.
+    - Who calls the reset routes (replies 2026-10-01): the web client only,
+      the node-scoped one, through core's
+      `ManageApi.resetNodeIdentityAssociation` (core
+      `src/api/MachaManageApi.ts:156`), from the Status node card's "Reset
+      association" (manager role, confirmed); it shows the 2xx as an
+      acceptance and refreshes status once. With the resource it would POST
+      then follow `GET .../identity-resets/{id}` for the state. Core's
+      `resetIdentityAssociation` (the general route, :148) is unused by the
+      web. The TV and phone clients call neither.
 
 Then the older ordered items below. Reconciled against 0.57.0 on 2026-09-24:
 what was found already done is ledgered in `COMPLETED.md` under "backlog
