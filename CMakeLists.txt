@@ -236,6 +236,19 @@ if(TARGET LibtorrentRasterbar::torrent-rasterbar)
         message(STATUS "Ignoring libtorrent-rasterbar ${LibtorrentRasterbar_VERSION}; Macha requires >= 2.0")
     else()
         set(MACHA_LIBTORRENT_TARGET LibtorrentRasterbar::torrent-rasterbar)
+        # The exported target adds TORRENT_USE_ASSERTS to any consumer built
+        # in Debug. The macro changes the layout of libtorrent's classes, and
+        # the installed library was built without it, so a Debug plugin read
+        # the library's objects at the wrong offsets (torrent_status came
+        # back without its info hashes). The macro must match the library,
+        # not our build type: drop it.
+        get_target_property(_macha_lt_definitions LibtorrentRasterbar::torrent-rasterbar
+                            INTERFACE_COMPILE_DEFINITIONS)
+        if(_macha_lt_definitions)
+            list(REMOVE_ITEM _macha_lt_definitions "$<$<CONFIG:Debug>:TORRENT_USE_ASSERTS>")
+            set_target_properties(LibtorrentRasterbar::torrent-rasterbar PROPERTIES
+                                  INTERFACE_COMPILE_DEFINITIONS "${_macha_lt_definitions}")
+        endif()
     endif()
 endif()
 if(NOT MACHA_LIBTORRENT_TARGET)

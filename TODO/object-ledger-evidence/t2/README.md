@@ -228,10 +228,14 @@ publish. Not yet used: the ledger's horizons adopt it at T3.
 - **Two cases fail only in the laptop's coverage build** (Debug, Clang,
   instrumented), both P0, reported, not fixed:
   `hydration_catalogue/test_a_torrent_is_held_by_one_job_and_a_second_add_names_it`
-  fails 50/50 there and passes 50/50 in Release (the first `place()` reports
-  placed, but no job for it is listed or held; the torrent plugin, Debug,
-  against the system libtorrent, Release; untouched by this chain; fi-1's
-  GCC Debug coverage passed it at T0). `rpc_cluster/test_three_node_cluster`
+  failed 50/50 there and passed 50/50 in Release. **Fixed:** libtorrent's
+  exported CMake target adds `$<$<CONFIG:Debug>:TORRENT_USE_ASSERTS>`
+  (`LibtorrentRasterbarTargets.cmake`), which changes class layouts in about
+  twenty headers; the installed library was built without it, so the Debug
+  plugin read `torrent_status` at the wrong offsets, `job.info_hash` came
+  back empty, and only libtorrent's duplicate backstop refused the second
+  add. CMake now drops the generator expression from the imported target;
+  5/5 in Debug after. `rpc_cluster/test_three_node_cluster`
   failed once in three whole-suite coverage runs (load 15), passing 20/20
   in isolation in each build: a joining node's pull through repair overran
   `wait_until`'s fixed 5 s (`tests/test_support.hpp:382`), which the
