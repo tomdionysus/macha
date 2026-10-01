@@ -404,14 +404,12 @@ answers (spec B3, B4; decision log 2026-10-01).
   and publishes them, refusing an incomplete release horizon (tested at
   the ledger); `RetentionLedger` moved to `src/ledger/`; the pass
   publishes, then reads every horizon back from the ledger.
-- **T3e.** Consumers moved: repair, tombstone collection, control release
-  and GC, DATA release and sweep, rebalance keep checks
-  (`src/cluster/distributed_store.cpp`), publication claims
-  (`distributed_store.cpp`, `src/cluster/cluster.cpp`), peer remove
-  refusal (`cluster.cpp`), catalogue staging GC
-  (`src/catalogue/catalogue.cpp`), retention compaction. The ledger
-  depends on no builder, so the catalogue and cluster take it for claims
-  without a cycle.
+- **T3e.** Claims as the storage layer's contract (`ClaimStore`,
+  `NodeRuntime::claims()`; spec B3, decision log 2026-10-02); the pass
+  reaches claims only through the ledger (release, prune, retained,
+  compaction); the node's RPC handlers and `DistributedStore` use
+  `ClaimStore`. The catalogue's staging GC still reaches it through
+  `NodeRuntime` until T5 wires the catalogue.
 - **T3f.** The predicate queries implemented, tested, unused.
 - Metadata is reached through the declared views from T2; the full
   metadata contract and the catalogue's repair split are T4.
@@ -423,7 +421,9 @@ answers (spec B3, B4; decision log 2026-10-01).
 - Each gate: a table test over every condition in its row; mutation-proven.
 - Each build: the referenced sets of today's build for the same head,
   against fakes; mutation-proven.
-- No `retention_store()` call and no reachability vector outside the ledger.
+- No `RetentionStore` outside its owner, no reachability vector outside
+  the ledger, and nothing above the ledger reaching claims except through
+  it (the catalogue's staging GC excepted until T5).
 - The retention store's existing tests pass through the ledger.
 - On the cluster at T5: repair bytes and examined counts in range under the
   same load; GC and release proceed once deletion is resumed; memory
