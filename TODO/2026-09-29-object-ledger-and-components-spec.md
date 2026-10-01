@@ -91,20 +91,23 @@ node, same load class):
 Decisions (what is kept, repaired, released, deleted) are not thresholded:
 from T1 they are compared as traces and must be identical.
 
-Baseline and variance columns are filled from the 0.74.0 soak.
+Baseline and variance columns are filled from the 0.74.0 soak and its
+six-hour top-up (2026-09-30 07:04Z to 2026-10-01 20:43Z); every figure,
+the hourly spreads and the thin series are in
+`object-ledger-evidence/t0/baseline.md`.
 
 | # | criterion | metric (series) | node | baseline | variance |
 |---|---|---|---|---|---|
-| K1 | claim walk cost | `maintenance.claim_walk.examine_us` p50/p99; in-suite `claim_walk.per_object` | both | soak | soak |
-| K2 | GC sweep cost | `maintenance.gc.per_object_ns` p50/p99, `maintenance.gc.step_us` | both | soak | soak |
-| K3 | quantum-commit claim latency | `claim.data_barrier_us` p50/p99, idle and loaded | both | soak | soak |
-| K4 | repair throughput | `maintenance.repair.bytes.{idle,loaded}`, `push_examined`, `pull_examined` per minute; `repair_*` gauges | both | soak | soak |
-| K5 | release and GC rates | `retention.released.*`, `retention.pruned.*`, `maintenance.gc.reclaimed_bytes`, `maintenance.tombstones.collected`, `catalogue.control_gc.removed` per minute | both | soak | soak |
-| K6 | API latency | `api GET /api/v1/torrents/jobs`, `api GET /api/v1/catalogue/*`, `api GET /api/v1/status` p50/p99 | both | soak | soak |
-| K7 | playback | `playback.create_us`, `playback.start_ready_us`, `playback.first_fragment_us`, `playback.update_ready_us` (seek) p50/p99 | both | soak | soak |
-| K8 | FUSE publication | `fuse_publication_bytes_committed` rate in loaded windows | gbni-1 | soak | soak |
-| K9 | resident memory | `rss_bytes` median and max | both | soak | soak |
-| K10 | startup, recovery, shutdown | events `services_ready`, `cluster_stable`, `shutdown`; backend `backend_online` minus `backend_offline` | both | soak | soak |
+| K1 | claim walk cost | `maintenance.claim_walk.examine_us` p50/p99; in-suite `claim_walk.per_object` | both | fi-1 2/19 us, gbni-1 3/31 us | hourly p99 fi-1 17-47, gbni-1 21-127 |
+| K2 | GC sweep cost | `maintenance.gc.per_object_ns` p50/p99, `maintenance.gc.step_us` | both | per object fi-1 6.1/164 us, gbni-1 328/1,704 us (ns /1000) | baseline.md K2 |
+| K3 | quantum-commit claim latency | `claim.data_barrier_us` p50/p99, idle and loaded | both | fi-1 4.6 ms/841 ms (n=117), gbni-1 360 ms/2.1 s | fi-1 thin (2 hours); gbni-1 hourly p50 0.20-0.49 s |
+| K4 | repair throughput | `maintenance.repair.bytes.{idle,loaded}`, `push_examined`, `pull_examined` per minute; `repair_*` gauges | both | fi-1 21.1 MB/min, gbni-1 18.8 MB/min; no pass completes | baseline.md K4 |
+| K5 | release and GC rates | `retention.released.*`, `retention.pruned.*`, `maintenance.gc.reclaimed_bytes`, `maintenance.tombstones.collected`, `catalogue.control_gc.removed` per minute | both | released data ~1.1/min both | baseline.md K5 |
+| K6 | API latency | `api GET /api/v1/torrents/jobs`, `api GET /api/v1/catalogue/*`, `api GET /api/v1/status` p50/p99 | both | baseline.md K6 (6 routes per node) | 7-28 hourly values per route |
+| K7 | playback | `playback.create_us`, `playback.start_ready_us`, `playback.first_fragment_us`, `playback.update_ready_us` (seek) p50/p99 | both | baseline.md K7 | `first_fragment` 6-7 hours; `start_ready`, `update_ready` thin on both |
+| K8 | FUSE publication | `fuse_publication_bytes_committed` rate in loaded windows | gbni-1 | 5.26 MB/min over the run (11.8 GB) | baseline.md K8 |
+| K9 | resident memory | `rss_bytes` median and max | both | fi-1 1,118/2,067 MB, gbni-1 1,044/1,920 MB | min 384 and 559 MB |
+| K10 | startup, recovery, shutdown | events `services_ready`, `cluster_stable`, `shutdown`; backend `backend_online` minus `backend_offline` | both | slowest clean shutdown fi-1 8.2 s, gbni-1 5.9 s; ready 11-15 s and 40-43 s; stable 25-123 s | 2 of 6 top-up restarts killed at 60 s (baseline.md K10) |
 | K11 | in-suite | case count, summed and wall time; microbenchmarks (`BENCH` lines); coverage per component | laptop, fi-1 | `object-ledger-evidence/t0/` | 5 runs |
 
 ## This is an experiment

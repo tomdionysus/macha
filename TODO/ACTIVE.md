@@ -1,8 +1,8 @@
 # Active tasks and concepts to explore
 
 Last updated: 2026-10-01, on `experiment/object-ledger-t3`. Both nodes run
-0.74.0 (T0's instrumented build); the T0 soak ended 2026-10-01 14:20Z and a
-six-hour top-up runs to 20:41Z.
+0.74.0 (T0's instrumented build); the T0 soak and its top-up ended
+2026-10-01 20:43Z; the baseline is filled.
 
 This is the authoritative, ordered backlog. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
@@ -39,7 +39,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
 
   | step | branch | tip | state |
   |---|---|---|---|
-  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 on both nodes; soak ended 2026-10-01 14:20Z; top-up to 20:41Z (below), then the K table and acceptance |
+  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 on both nodes; soak and top-up done; baseline filled (below); acceptance next |
   | T1 instrument | `-t1` | `9ba3e09` | built; accepted with T0 |
   | P presence | `-p` | `afa3e72` | built (has() 4,129 -> 460 ns absent on fi-1) |
   | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
@@ -54,26 +54,31 @@ resumes from `develop` and the experiment's version line ceases to exist.
   on fi-1, after the soak. Then accept T0, merge the chain into
   `experiment/object-ledger` in order and push (standing authorisation,
   experiment branches only).
-- **T0's baseline** (2026-10-01): 31 hours per node pulled to `build/soak/`
-  and reported. Strong for K1, K2, K4, K5, K9 and the high-volume routes;
-  thin for K3, K6, K7 (too few values per hour for the threshold rule) and
-  K10 (one real restart on gbni-1). A six-hour top-up fills them: a
-  playback cycle (remux and transcode) and a 32 MiB FUSE write per cycle,
-  the K6 routes polled every 30 s, three restarts per node
-  (`build/topup/`, `/root/claude-topup*` on the nodes; ends 20:41Z).
-  `start_ready_us` and `update_ready_us` come only from transcode sessions,
-  about 10-15 an hour per node, and will stay thinner than the 20-value
-  floor. fi-1's backend recoveries in K10 are the soak's two USB faults
-  only. The report script now totals cumulative gauges across restarts.
+- **T0's baseline is filled** (2026-10-01): soak plus a six-hour top-up,
+  2026-09-30 07:04Z to 2026-10-01 20:43Z,
+  `object-ledger-evidence/t0/baseline.md` and the spec's K table. Thin and
+  so weak as thresholds: fi-1's K3 (2 hours), K7 `start_ready` and
+  `update_ready` on both nodes (only the asynchronous paths record them).
   Found along the way, recorded, not fixed:
-  - repair completes no pass in 31 hours: a pass must settle every local
-    object (push) and every live object (pull) at about 6 and 21 objects a
-    minute, one to three months for ~650-830k objects. Repair's pace, not a
-    broken gauge;
+  - **shutdown hangs with a FUSE publication in flight**: 2 of 6 top-up
+    restarts (fi-1 17:26Z, gbni-1 15:46Z) were SIGKILLed by systemd at
+    60 s. `Service::stop` began, the FUSE main loop did not return, the
+    FUSE watchdog declared the mount gone during shutdown, and on gbni-1
+    an async data publication retried a cancelled write with back-off
+    (250 ms to 16 s) until the kill. Both recovered alone (fi-1 replayed 8
+    durable FUSE operations; the file survived at full size). Mechanism
+    not proven; reproduce by timing a restart against a FUSE fsync. Beside
+    item 12 (the FUSE recovery segfault);
+  - repair completes no pass: one to three months a pass at its rate
+    (baseline.md K4). Repair's pace, not a broken gauge;
+  - an unattributed restart of fi-1 at 16:00:01Z from the laptop's
+    address, not the top-up's loop (baseline.md K10);
   - one `ETIMEDOUT` from gbni-1's FUSE lookup of a directory fi-1 had just
     removed, `ENOENT` on every retry;
   - fi-1's playback errors under transcode (seek 503 after ~15 s, segment
-    500, `extent unavailable`) match the soak's: the baseline's behaviour.
+    500, `extent unavailable`) are the baseline's behaviour;
+  - the fi-1 watch's `journalctl -k -u macha` matched nothing (fixed in
+    the handover).
 - **T3 next** (plan, T3, substages T3e-T3f): every consumer onto the
   ledger (claims included: rebalance, publication, peer removal, catalogue
   staging GC, compaction); the predicate queries.
