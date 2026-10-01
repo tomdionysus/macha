@@ -5359,10 +5359,10 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
                 claims += ' ';
             claims += to_string(id).substr(0, 12);
             claims += ":s1=";
-            claims += s1.node().retention_store().retained(RetentionClass::data, id) ? "held" : "free";
+            claims += s1.node().claims().retained(RetentionClass::data, id) ? "held" : "free";
             claims += ",s2=";
-            claims += s2.node().retention_store().retained(RetentionClass::data, id) ? "held" : "free";
-            const auto state = s2.node().retention_store().claims(RetentionClass::data, id);
+            claims += s2.node().claims().retained(RetentionClass::data, id) ? "held" : "free";
+            const auto state = s2.node().claims().claims(RetentionClass::data, id);
             claims += "(adds:";
             for (const auto& [origin, sequence] : state.adds)
                 claims += to_string(origin).substr(0, 6) + "=" + std::to_string(sequence) + ";";

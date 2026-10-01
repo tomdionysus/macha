@@ -845,7 +845,7 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
             if (!present)
                 return false;
         }
-        n_.retention_store().retain_batch(object_class, ids, dot);
+        n_.claims().retain_batch(object_class, ids, dot);
         return true;
     }
 
@@ -2305,7 +2305,7 @@ void DistributedStore::erase_all(const ObjectId& id) {
                 auto resource = n_.data_resources().acquire(
                     DataWorkContext(FrameType::speculative, n_.config().extent_size),
                     n_.config().extent_size);
-                if (resource && !n_.retention_store().retained(RetentionClass::data, id))
+                if (resource && !n_.claims().retained(RetentionClass::data, id))
                     (void)n_.local_store().remove(id);
                 (void)n_.block_cache().remove(id);
             } else {
@@ -2762,7 +2762,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     continue; // retried from the same place next step
                 if (plan.live && plan.keepers.size() >= plan.target &&
                     !plan.keepers.contains(n_.node_id()) &&
-                    !n_.retention_store().retained(RetentionClass::data, plan.id)) {
+                    !n_.claims().retained(RetentionClass::data, plan.id)) {
                     auto resource = n_.data_resources().acquire(
                         DataWorkContext(FrameType::speculative, n_.config().extent_size),
                         n_.config().extent_size);

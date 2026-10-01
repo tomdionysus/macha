@@ -12,14 +12,14 @@ namespace macha {
 // Holds references to the stores; its owner keeps all three alive for its
 // lifetime.
 class RetentionLedger final : public ObjectLedger {
-    const RetentionStore& claims_;
+    ClaimStore& claims_;
     const ObjectStore& data_;
     const ObjectStore& control_;
     Published<InventoryHorizon> inventory_;
     Published<ReleaseHorizon> release_;
 
   public:
-    RetentionLedger(const RetentionStore& claims, const ObjectStore& data,
+    RetentionLedger(ClaimStore& claims, const ObjectStore& data,
                     const ObjectStore& control) noexcept
         : claims_(claims), data_(data), control_(control) {}
 
@@ -30,6 +30,15 @@ class RetentionLedger final : public ObjectLedger {
     ReleaseHandle release() const override { return release_.handle(); }
     void publish(InventoryHandle) override;
     bool publish(ReleaseBuild) override;
+    bool retained(RetentionClass type, const ObjectId& id) const override {
+        return claims_.retained(type, id);
+    }
+    size_t release_unreferenced(RetentionClass, const ReleaseHorizon&,
+                                size_t operation_budget) override;
+    size_t prune_unclaimed(RetentionClass, size_t operation_budget) override;
+    bool compact_if_needed(size_t record_threshold) override {
+        return claims_.compact_if_needed(record_threshold);
+    }
 };
 
 } // namespace macha

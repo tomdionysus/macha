@@ -428,12 +428,12 @@ PersistentBlockCache& NodeRuntime::block_cache() {
         throw std::runtime_error("persistent cache is still recovering");
     return *cache_;
 }
-RetentionStore& NodeRuntime::retention_store() {
+ClaimStore& NodeRuntime::claims() {
     if (!ready(ready_retention) || !retention_)
         throw std::runtime_error("retention state is still recovering");
     return *retention_;
 }
-const RetentionStore& NodeRuntime::retention_store() const {
+const ClaimStore& NodeRuntime::claims() const {
     if (!ready(ready_retention) || !retention_)
         throw std::runtime_error("retention state is still recovering");
     return *retention_;
@@ -1528,14 +1528,14 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 if (!present)
                     return error_reply("retention object is not durably present");
             }
-            retention_store().retain_batch(object_class, ids, dot);
+            claims().retain_batch(object_class, ids, dot);
             return {MessageType::ok, {}};
         }
         case MessageType::delete_object: {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             reader.finish();
-            if (retention_store().retained(RetentionClass::data, id))
+            if (claims().retained(RetentionClass::data, id))
                 return error_reply("object has an active retention claim");
             auto resource = data_resources_.try_acquire(
                 DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
