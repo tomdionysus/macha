@@ -15,8 +15,9 @@ per-window percentiles. Prints, per histogram series:
     at least 20 values), which is the variance a threshold must clear.
 
 Per counter: the total, and its rate per minute over the covered time.
-Per cumulative gauge (repair_*, fuse_*): the rate between the first and last
-window. Per sampled gauge (rss_bytes): min, median and max. Events are listed
+Per cumulative gauge (repair_*, fuse_*, maintenance_*): its growth summed over
+the windows, a drop counted as a restart from zero, and the rate over the
+covered time. Per sampled gauge (rss_bytes): min, median and max. Events are listed
 in time order.
 """
 import json
@@ -69,6 +70,20 @@ class Series:
             "p99": quantile(self.buckets, self.count, 0.99, self.max),
             "max": self.max,
         }
+
+
+def cumulative_total(points):
+    """The growth of a cumulative gauge over (time, value) points. A process
+    restart resets it to zero, so a drop starts a new run counted from zero:
+    the total is the sum of every run's growth. Returns (total, resets)."""
+    total, resets = 0, 0
+    for (_, then), (_, now) in zip(points, points[1:]):
+        if now >= then:
+            total += now - then
+        else:
+            total += now
+            resets += 1
+    return total, resets
 
 
 def loaded(window, previous):
@@ -165,8 +180,8 @@ def main(argv):
         if name.startswith(("repair_", "fuse_publication", "fuse_publications", "maintenance_")):
             points = [(w["end_ms"], w["gauges"][name]) for w in windows if name in w.get("gauges", {})]
             span = max(1e-9, (points[-1][0] - points[0][0]) / 60000)
-            print(f"  {name}: {points[0][1]} -> {points[-1][1]} "
-                  f"({(points[-1][1] - points[0][1]) / span:.2f}/min, restarts reset it)")
+            total, resets = cumulative_total(points)
+            print(f"  {name}: {total} ({total / span:.2f}/min, {resets} reset(s))")
         else:
             print(f"  {name}: min={min(values)} median={statistics.median(values)} max={max(values)}")
 
