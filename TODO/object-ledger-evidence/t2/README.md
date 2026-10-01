@@ -157,3 +157,78 @@ publish. Not yet used: the ledger's horizons adopt it at T3.
 - constructor bypasses the precondition -> KILLED by contract/test_published_refuses_a_missing_snapshot
 - constructor ignores the initial snapshot -> KILLED by contract/test_published_is_empty_until_the_first_publish, contract/test_published_readers_see_whole_snapshots_in_order, contract/test_published_refuses_a_missing_snapshot
 - handle reads without the lock -> KILLED by contract/test_published_readers_see_whole_snapshots_in_order
+
+# T2d: the component contract, the composition root, maintenance in it
+
+- `src/component/component.hpp`: `Component` -- name, `required()` and
+  `provided()` contracts by name, `start()`, a `request_stop()` that never
+  blocks, a joining `stop()` that includes the request, a fault sink.
+  `Subsystem` is unchanged; plugins meet the root at T5.
+- `src/component/composition_root.{hpp,cpp}`: owns components, derives the
+  start order from the declarations (providers first; adding order where
+  the graph is free), refuses a requirement nothing provides, a contract
+  with two providers (an external one included) and a cycle, naming them;
+  `external()` declares what Service still hands in. Starts once; a failed
+  start stops what started, in reverse, and rethrows; `request_stop()` and
+  `stop()` run in reverse and touch only running components; the
+  destructor stops what runs. Each step is recorded through the lifecycle
+  hook ("start maintenance", ...) before it is taken. One lock over the
+  steps: Service's stop can ask for a stop while its startup thread is
+  still starting the root, and the request then waits for that start and
+  reaches what it started (the old `jthread` had the same race, unguarded).
+- `src/service/maintenance.{hpp,cpp}`: the maintenance pass left Service
+  as the `Maintenance` component: the loop (now `run`), `collect_garbage`,
+  `maintain_garbage_metadata` and all of the pass's state, moved verbatim
+  but for the renames the move needs and the ledger, now injected (built
+  once by Service when the stores exist, where the pass built one per
+  pass). Dependencies are concrete at stage 0 (decision log, 2026-10-01).
+  `MaintenancePort` (owned by Service) holds what precedes and outlives the
+  component: the event counter and wait, the convergence demand, the
+  diagnostics. Two dead members (`retention_*_repair_cursor_`) went.
+- **Lifecycle:** `test_lifecycle_of_gbni_1` and `test_lifecycle_of_fi_1`
+  pass against the fixtures committed at T1, unchanged. Moving the root's
+  stop ahead of status, or dropping its stop request, fails both
+  (mutation-proven).
+- **Traces:** the maintenance trace group 1100/1100 over `--repeat 100`.
+- **Root tests** (`tests/test_component.cpp`, 9 cases): order where free
+  and where constrained (chain, diamond, one provider of two contracts),
+  externals, every refusal, fixed once started, every lifecycle step and
+  its record, repeated requests and stops, the destructor, a failed start,
+  a stop request during a start, faults routed by component and the
+  default handler. Mutation: 22/22 killed (one first-cut mutant did not
+  compile and was rewritten: `(void)waiting[dependant]`).
+- **Suites:** macha-tests 663/663, macha-tests-runtime 17/17 (Clang,
+  laptop).
+- **Coverage, not yet measured.** The laptop's Clang coverage is unusable
+  for the suite's process model: each forked case dumps its counters to
+  the parent's `%p.profraw` (the name is fixed in the parent), so the cases
+  overwrite and corrupt one file per binary (`failed to uncompress data`).
+  The canonical measurement is GCC on fi-1, as T0's; it runs after the
+  soak, with the GCC build and suites the chain needs before acceptance.
+
+## Mutation record (laptop, 2026-10-01)
+
+- ties go to the last added -> KILLED by component/test_root_lifecycle_steps_and_their_record, component/test_root_order_is_adding_order_where_the_graph_is_free, component/test_root_starts_providers_first, component/test_root_unwinds_a_failed_start
+- externals ignored -> KILLED by component/test_root_externals_satisfy_requirements
+- two providers allowed -> KILLED by component/test_root_refuses_a_graph_it_cannot_order
+- an external may also be provided -> KILLED by component/test_root_refuses_a_graph_it_cannot_order
+- a missing provider skipped -> KILLED by component/test_root_refuses_a_graph_it_cannot_order
+- a cycle ends the order early -> KILLED by component/test_root_refuses_a_graph_it_cannot_order
+- duplicate names allowed -> KILLED by component/test_root_refuses_a_graph_it_cannot_order
+- add after start allowed -> KILLED by component/test_root_is_fixed_once_started
+- external after start allowed -> KILLED by component/test_root_is_fixed_once_started
+- start twice allowed -> KILLED by component/test_root_is_fixed_once_started
+- request_stop in start order -> KILLED by component/test_root_lifecycle_steps_and_their_record
+- stop in start order -> KILLED by component/test_root_lifecycle_steps_and_their_record
+- a stopped component stays running -> KILLED by component/test_root_lifecycle_steps_and_their_record, component/test_root_unwinds_a_failed_start
+- request_stop reaches stopped components -> KILLED by component/test_root_lifecycle_steps_and_their_record
+- a failed start not unwound -> KILLED by component/test_root_unwinds_a_failed_start
+- the failing component counted as started -> KILLED by component/test_root_unwinds_a_failed_start
+- no fault sink attached -> KILLED by component/test_root_routes_faults_by_component
+- start not recorded -> KILLED by component/test_root_lifecycle_steps_and_their_record, component/test_root_unwinds_a_failed_start
+- the destructor leaves components running -> KILLED by component/test_root_lifecycle_steps_and_their_record
+- no default fault handler -> KILLED by component/test_root_routes_faults_by_component
+- providers never counted down -> KILLED by component/test_root_lifecycle_steps_and_their_record, component/test_root_starts_providers_first
+- request_stop takes no lock -> KILLED by component/test_root_stop_request_during_a_start_reaches_the_started
+- root stopped before status -> KILLED by lifecycle_record/test_lifecycle_of_fi_1, lifecycle_record/test_lifecycle_of_gbni_1
+- root never asked to stop -> KILLED by lifecycle_record/test_lifecycle_of_fi_1, lifecycle_record/test_lifecycle_of_gbni_1

@@ -43,13 +43,15 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
-  | T2 slice | `-t2` | `eacda85` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`; checked out |
+  | T2 slice | `-t2` | `eacda85` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance; assessment written; checked out |
 
-- **Next in T2**: T2d the component contract in `src/component/` and a composition root owning
-  the maintenance lifecycle, lifecycle fixtures identical; T2's written
-  assessment. Then, after the soak: accept T0, merge the chain into
-  `experiment/object-ledger` in order and push (standing authorisation,
-  experiment branches only).
+- **T2 is built** (T2d: the component contract, the composition root,
+  maintenance as its first component; lifecycle fixtures identical); the
+  written assessment is `object-ledger-evidence/t2/assessment.md` (no kill
+  criterion met; settle its point 3 before T3). Owed before acceptance: GCC
+  build, the three suites and coverage on fi-1, after the soak. Then accept
+  T0, merge the chain into `experiment/object-ledger` in order and push
+  (standing authorisation, experiment branches only).
 - **Rules for every step**: a branch cut from the previous step, merged
   when accepted, then pushed; 100% line and branch coverage of what the
   step builds or converts, mutation-proven; contracts as preconditions,
