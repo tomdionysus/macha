@@ -103,9 +103,10 @@ resumes from `develop` and the experiment's version line ceases to exist.
     first. T0's diff touches no catalogue or metadata code, so this is
     0.73 behaviour the baseline recorded. fi-1's restart at 21:59Z did not
     clear it: 21 more failures by 22:27Z.
-- **T3 next**: its assessment against the kill criteria, as T2's
-  (`object-ledger-evidence/t3/assessment.md`); then the fi-1 GCC run and
-  the chain merge.
+- **T3 is built and assessed** (`object-ledger-evidence/t3/assessment.md`:
+  no kill criterion met). Next: the fi-1 GCC build, three suites, coverage
+  and benchmarks for `-fixes` through `-t3`; then merge the chain into
+  `experiment/object-ledger` in order and push; then T4.
 - **Future experiment: memoised horizon builds** (spec, Later stages):
   subtree referenced sets kept by subtree id, partial builds merging in any
   order; first measure how often the inventory and release heads coincide.
