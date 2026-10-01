@@ -1,6 +1,6 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-10-01, on `experiment/object-ledger-t3`. Both nodes run
+Last updated: 2026-10-02, on `experiment/object-ledger-t4`. Both nodes run
 0.74.0 (T0's instrumented build); the T0 soak and its top-up ended
 2026-10-01 20:43Z; the baseline is filled.
 
@@ -34,26 +34,23 @@ resumes from `develop` and the experiment's version line ceases to exist.
   (`t0`, `t1`, `p`, `control-gate`, `t2`).
 - **The clients** each have `experiment/object-ledger` in their own repos
   and work only there (operator, 2026-10-01); see the handover.
-- **Where it stands** (branches are one chain, all pushed, none merged into
-  `experiment/object-ledger`, which is at `14634ba` on origin):
+- **Where it stands** (2026-10-02): the chain `-t0` .. `-t3` is accepted
+  and merged into `experiment/object-ledger` (`46b3c1f`, pushed), after
+  fi-1's GCC build, three suites and coverage. T4 is cut as
+  `experiment/object-ledger-t4` (checked out, pushed).
 
-  | step | branch | tip | state |
-  |---|---|---|---|
-  | T0 measure | `experiment/object-ledger-t0` | `22082cd` | 0.74.0 on both nodes; baseline filled; **accepted 2026-10-02** |
-  | T1 instrument | `-t1` | `9ba3e09` | built; accepted with T0 |
-  | P presence | `-p` | `afa3e72` | built (has() 4,129 -> 460 ns absent on fi-1) |
-  | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
-  | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
-  | `universal` | `-universal` | `b288352` | question 2: removed |
-  | T2 slice | `-t2` | `3c6c1fd` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance, dependencies as types; assessment written; also the fixes of 2026-10-01 (handover) |
-  | T3 ledger | `-t3` | (this commit) | T3a activity clock, joiner test; T3b horizons and gates; T3c the horizon builder, the pass on handles and gates; T3d the ledger publishes and holds the horizons; T3e claims as the storage layer's contract; T3f the predicate queries; checked out |
+  | step | branch | state |
+  |---|---|---|
+  | T0 measure | `-t0` | accepted 2026-10-02; baseline in `t0/baseline.md` |
+  | T1 instrument | `-t1` | accepted, merged |
+  | P presence | `-p` | merged |
+  | backlog fixes | `-fixes` | merged |
+  | control gate | `-control-gate` | merged |
+  | `universal` | `-universal` | merged |
+  | T2 slice | `-t2` | merged; assessed |
+  | T3 ledger | `-t3` | merged; assessed (`t3/assessment.md`) |
+  | T4 metadata | `-t4` | next |
 
-- **T2 is built**; the written assessment is
-  `object-ledger-evidence/t2/assessment.md` (no kill criterion met; point 3
-  settled). Owed before acceptance: GCC build, the three suites and coverage
-  on fi-1, after the soak. Then accept T0, merge the chain into
-  `experiment/object-ledger` in order and push (standing authorisation,
-  experiment branches only).
 - **T0's baseline is filled** (2026-10-01): soak plus a six-hour top-up,
   2026-09-30 07:04Z to 2026-10-01 20:43Z,
   `object-ledger-evidence/t0/baseline.md` and the spec's K table. Thin and
@@ -103,10 +100,9 @@ resumes from `develop` and the experiment's version line ceases to exist.
     first. T0's diff touches no catalogue or metadata code, so this is
     0.73 behaviour the baseline recorded. fi-1's restart at 21:59Z did not
     clear it: 21 more failures by 22:27Z.
-- **T3 is built and assessed** (`object-ledger-evidence/t3/assessment.md`:
-  no kill criterion met). Next: the fi-1 GCC build, three suites, coverage
-  and benchmarks for `-fixes` through `-t3`; then merge the chain into
-  `experiment/object-ledger` in order and push; then T4.
+- **T4 next** (plan, T4): the metadata contract; the catalogue's hidden
+  repair split out of the inventory build into an explicit step (which the
+  conflict loop gives a second reason to watch).
 - **Future experiment: memoised horizon builds** (spec, Later stages):
   subtree referenced sets kept by subtree id, partial builds merging in any
   order; first measure how often the inventory and release heads coincide.
