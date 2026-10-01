@@ -920,6 +920,11 @@ supersede earlier ones where they conflict.
   horizon; it never builds. Only the pass calls the builder. Builds stay
   sequential. Memoised, mergeable builds are a future experiment, not stage
   0 (Later stages).
+- **2026-10-02. T0 accepted** (operator: "accept T0 if this isn't a
+  problem", of the catalogue conflict loop Macha Client reported). The
+  baseline is `object-ledger-evidence/t0/baseline.md`; its thin series are
+  weak thresholds, marked. The conflict loop and the shutdown hang are
+  0.73 behaviour (T0's diff is observation only), recorded in ACTIVE.
 - **2026-10-02 (T3e). Claims are the storage layer's contract** (option A,
   on the operator's "continue" after it was recommended). `ClaimStore` is
   the contract, `RetentionStore` its implementation, owned by `NodeRuntime`
