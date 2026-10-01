@@ -4,6 +4,7 @@
 // wait declarations and their guard, cursor, budget, page. Primitives, each
 // tested over its whole phase space.
 #include "cluster/data_work.hpp"
+#include "contract/published.hpp"
 #include "contract/walk.hpp"
 #include "contract/work.hpp"
 #include "log.hpp"
@@ -11,9 +12,13 @@
 #include "test_support.hpp"
 
 #include <array>
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace macha;
 using namespace std::chrono_literals;
@@ -201,6 +206,136 @@ MACHA_FAST_TEST("contract", test_cursor_and_page) {
         page.stopped = stop;
         CHECK(!page.complete());
     }
+}
+
+MACHA_FAST_TEST("contract", test_published_is_empty_until_the_first_publish) {
+    Published<int> empty;
+    CHECK(empty.handle() == nullptr);
+    empty.publish(7);
+    CHECK(empty.handle() != nullptr && *empty.handle() == 7);
+    Published<int> initial(std::make_shared<const int>(3));
+    CHECK(*initial.handle() == 3);
+}
+
+MACHA_FAST_TEST("contract", test_published_refuses_a_missing_snapshot) {
+    Published<int> published;
+    bool threw = false;
+    try {
+        published.publish(Published<int>::Handle{});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(published.handle() == nullptr);
+    published.publish(1);
+    threw = false;
+    try {
+        published.publish(Published<int>::Handle{});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(*published.handle() == 1);
+    threw = false;
+    try {
+        Published<int> constructed(nullptr);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// A handle held across a republish still reads its own snapshot, and that
+// snapshot lives until its last holder lets go.
+MACHA_FAST_TEST("contract", test_a_held_handle_keeps_its_snapshot_across_republish) {
+    Published<std::string> published;
+    published.publish(std::string("first"));
+    auto held = published.handle();
+    const std::weak_ptr<const std::string> first = held;
+    published.publish(std::string("second"));
+    CHECK(*held == "first");
+    CHECK(*published.handle() == "second");
+    CHECK(!first.expired());
+    auto second_held = published.handle();
+    const std::weak_ptr<const std::string> second = second_held;
+    published.publish(std::string("third"));
+    CHECK(*held == "first");
+    CHECK(*second_held == "second");
+    held.reset();
+    CHECK(first.expired());
+    CHECK(!second.expired());
+    second_held.reset();
+    CHECK(second.expired());
+    // Unheld, a replaced snapshot goes with the publish that replaced it.
+    const std::weak_ptr<const std::string> third = published.handle();
+    published.publish(std::string("fourth"));
+    CHECK(third.expired());
+}
+
+// The previous snapshot is destroyed after the publish releases its lock: a
+// reader asking for a handle while that destructor runs is not held up.
+MACHA_FAST_TEST("contract", test_publish_destroys_the_previous_snapshot_outside_its_lock) {
+    struct Probe {
+        std::function<void()> on_destroy;
+        Probe(const Probe&) = delete;
+        Probe& operator=(const Probe&) = delete;
+        explicit Probe(std::function<void()> f) : on_destroy(std::move(f)) {}
+        ~Probe() {
+            if (on_destroy)
+                on_destroy();
+        }
+    };
+    Published<Probe> published;
+    std::thread reader;
+    std::atomic<bool> read{false};
+    bool read_during_destruction = false;
+    published.publish(std::make_shared<const Probe>([&] {
+        reader = std::thread([&] {
+            (void)published.handle();
+            read = true;
+        });
+        const auto until = std::chrono::steady_clock::now() + 2s;
+        while (!read && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(1ms);
+        read_during_destruction = read;
+    }));
+    published.publish(std::make_shared<const Probe>(nullptr));
+    reader.join();
+    CHECK(read_during_destruction);
+}
+
+// Readers racing a writer only ever see whole snapshots, in publish order.
+MACHA_FAST_TEST("contract", test_published_readers_see_whole_snapshots_in_order) {
+    struct Pair {
+        uint64_t a;
+        uint64_t b;
+    };
+    constexpr uint64_t publishes = 20000;
+    Published<Pair> published(std::make_shared<const Pair>(Pair{0, 0}));
+    std::atomic<bool> done{false};
+    std::atomic<int> torn{0};
+    std::atomic<int> backwards{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r)
+        readers.emplace_back([&] {
+            uint64_t last = 0;
+            while (!done) {
+                const auto snapshot = published.handle();
+                if (snapshot->a != snapshot->b)
+                    ++torn;
+                if (snapshot->a < last)
+                    ++backwards;
+                last = snapshot->a;
+            }
+        });
+    for (uint64_t i = 1; i <= publishes; ++i)
+        published.publish(Pair{i, i});
+    done = true;
+    for (auto& reader : readers)
+        reader.join();
+    CHECK(torn == 0);
+    CHECK(backwards == 0);
+    CHECK(published.handle()->a == publishes);
 }
 
 // The guard on real operations: MetadataManager::snapshot_view may refresh
