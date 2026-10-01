@@ -194,6 +194,8 @@ class NodeRuntime {
     std::atomic_int64_t last_playback_activity_ms_{};
     std::atomic_int64_t last_interactive_activity_ms_{};
     std::atomic_int64_t last_loader_activity_ms_{};
+    std::function<Clock::time_point()> activity_clock_;
+    int64_t activity_now_ms() const;
     mutable std::mutex service_event_mutex_;
     std::function<void(ServiceEvent)> service_event_;
     mutable std::mutex job_bridge_mutex_;
@@ -234,7 +236,12 @@ class NodeRuntime {
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
 
   public:
-    NodeRuntime(Config, ClusterKeys, StartupStageHook startup_stage_hook = {});
+    // When this node's traffic classes were last active is read from
+    // `activity_clock` (the steady clock when none is given), so idleness
+    // and the maintenance pass's deadlines can run on one injected clock.
+    using ActivityClock = std::function<Clock::time_point()>;
+    NodeRuntime(Config, ClusterKeys, StartupStageHook startup_stage_hook = {},
+                ActivityClock activity_clock = {});
     ~NodeRuntime();
     void start();
     void request_stop();

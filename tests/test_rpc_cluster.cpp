@@ -5249,6 +5249,87 @@ MACHA_TEST("rpc_cluster", test_rename_of_a_file_onto_a_directory_is_eisdir) {
     CHECK(fs.getattr("/media/dir").type == EntryType::directory);
 }
 
+// Waits until a Service's maintenance pass is parked in its wait with no
+// wake-up for five consecutive looks: it has done everything it can at the
+// clock's current time. Observes the pass; it does not time it.
+void settle_maintenance(Service& service) {
+    const auto deadline = Clock::now() + 20s;
+    uint64_t seen = service.maintenance_wakeups();
+    int quiet = 0;
+    while (Clock::now() < deadline && quiet < 5) {
+        std::this_thread::sleep_for(20ms);
+        const auto wakeups = service.maintenance_wakeups();
+        const bool parked = std::string_view(service.maintenance_stage()) == "wait";
+        quiet = parked && wakeups == seen ? quiet + 1 : 0;
+        seen = wakeups;
+    }
+    REQUIRE(quiet >= 5);
+}
+
+// A node that joins pulls the objects it should hold through its own
+// maintenance pass; nobody calls repair. The joiner's pass runs on a manual
+// clock (its deadlines, credit and idleness alike): the test steps the clock
+// and waits only for the pass to park, never for an amount of time.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_maintenance) {
+    TestCluster cluster;
+    const uint16_t first = free_port();
+    auto node_config = [&](size_t i) {
+        const auto dir = cluster.path() / ("n" + std::to_string(i + 1));
+        auto config = i == 0 ? config_for(dir, cluster.keyfile(), first)
+                             : config_for(dir, cluster.keyfile(), free_port(),
+                                          {{"127.0.0.1", first}});
+        config.storage_packing = StoragePackingConfig{0, 0};
+        config.replication = 3;
+        config.min_write_replicas = 2;
+        config.metadata_min_write_replicas = 2;
+        return config;
+    };
+    Service n1(node_config(0), cluster.keys());
+    Service n2(node_config(1), cluster.keys());
+    n1.start();
+    n2.start();
+    REQUIRE(wait_until([&] { return n1.node().membership().active().size() >= 2; }, 60s));
+    REQUIRE(wait_metadata_writable(n1, 60s));
+    n1.filesystem().mkdir("/media", 0755, getuid(), getgid());
+    n1.filesystem().create_file("/media/file.bin", 0644, getuid(), getgid());
+    {
+        const auto bytes = pattern(1024 * 1024, 5);
+        auto writer = n1.filesystem().open_write("/media/file.bin", true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+    }
+    std::vector<ObjectId> ids;
+    for (const auto& extent : n1.filesystem().getattr("/media/file.bin").extents)
+        ids.push_back(extent.id);
+    REQUIRE(!ids.empty());
+
+    auto clock = std::make_shared<ManualMaintenanceClock>();
+    ServiceInstruments instruments;
+    instruments.clock = clock;
+    Service n3(node_config(2), cluster.keys(), NodeRuntime::StartupStageHook{},
+               Service::MaintenanceStageHook{}, Service::StartupStallHandler{}, instruments);
+    n3.start();
+    REQUIRE(wait_until([&] { return n3.node().membership().active().size() >= 3; }, 60s));
+    (void)n3.filesystem(); // services ready
+
+    const auto holds_all = [&] {
+        return std::all_of(ids.begin(), ids.end(),
+                           [&](const ObjectId& id) { return n3.node().local_store().has(id); });
+    };
+    // Each step: let the pass finish what it can now, then move its clock
+    // on a second. The pull is bounded in steps, not in time.
+    int steps = 0;
+    for (; steps < 60 && !holds_all(); ++steps) {
+        settle_maintenance(n3);
+        clock->advance(1s);
+    }
+    settle_maintenance(n3);
+    CHECK(holds_all());
+    n3.stop();
+    n2.stop();
+    n1.stop();
+}
+
 // Needs the real libmacha-torrent plugin, which only exists in a build where
 // libtorrent was found; without it the node has no download engine at all
 // and there is nothing here to assert.

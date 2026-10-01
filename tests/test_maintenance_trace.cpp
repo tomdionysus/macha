@@ -208,9 +208,8 @@ class TracedNode {
         config.replication = 1;
         config.metadata_min_write_replicas = 1;
         config.min_write_replicas = 1;
-        // Short enough that real-time idleness (the store's idle_for, not yet
-        // on the clock) is reached within one settle; the fake clock is then
-        // stepped past it explicitly.
+        // The quiet window, on the manual clock like everything else; the
+        // fixture steps past it explicitly.
         config.maintenance.foreground_quiet = 50ms;
         config.maintenance.garbage_grace = 1h;
         config.maintenance.no_progress_backoff = 5min;
@@ -272,10 +271,9 @@ class TracedNode {
     const std::filesystem::path& backend() const {
         return config_.storage_backends.front().path;
     }
-    // The store's activity clock (idle_for) is still real time, and a pass
-    // that sees the foreground busy arms its wake-up on this clock. Being
-    // quiet in real time first makes the pass after the advance an idle one,
-    // however quickly the fixture got here.
+    // The store's activity clock (idle_for) is this same manual clock, so
+    // stepping past the quiet window first makes the pass after the advance
+    // an idle one, however quickly the fixture got here.
     // Settling first means every event already raised (a write, a peer
     // lost) has reset its quiet window before time moves past it. A pass
     // that rebuilds the inventory schedules one follow-up a quiet window
@@ -284,11 +282,11 @@ class TracedNode {
     // whichever side of the first step the rebuild fell.
     void advance(Clock::duration by) {
         const auto quiet = config_.maintenance.foreground_quiet * 2;
-        std::this_thread::sleep_for(quiet);
+        settle();
+        clock_->advance(quiet);
         settle();
         clock_->advance(by);
         settle();
-        std::this_thread::sleep_for(quiet);
         clock_->advance(quiet);
         settle();
     }
