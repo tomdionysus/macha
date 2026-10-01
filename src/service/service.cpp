@@ -30,7 +30,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
     : clock_(instruments.clock ? std::move(instruments.clock)
                                : std::make_shared<SystemMaintenanceClock>()),
       maintenance_trace_(std::move(instruments.trace)),
-      lifecycle_(std::move(instruments.lifecycle)), node_(std::move(config), keys, std::move(startup_stage_hook)), cluster_status_(node_),
+      lifecycle_(std::move(instruments.lifecycle)), node_(std::move(config), keys, std::move(startup_stage_hook),
+            [clock = clock_] { return clock->now(); }), cluster_status_(node_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       session_api_(node_), users_api_(node_),
       web_(node_.config().web, node_.config().catalogue.api.compression),

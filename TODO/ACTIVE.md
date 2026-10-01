@@ -1,8 +1,7 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-09-30 evening, on `experiment/object-ledger-t2`. Both
-nodes run 0.74.0 (T0's instrumented build); the T0 soak ends 2026-10-01
-14:20Z.
+Last updated: 2026-10-01, on `experiment/object-ledger-t3`. Both nodes run
+0.74.0 (T0's instrumented build); the T0 soak ends 2026-10-01 14:20Z.
 
 This is the authoritative, ordered backlog. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
@@ -10,7 +9,7 @@ finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
 spec and handover (evidence, not requirements). Work top-to-bottom unless
 new evidence changes the order.
 
-**Start here after a clear: read [the handover](HANDOVER-2026-09-30.md),**
+**Start here after a clear: read [the handover](HANDOVER-2026-10-01.md),**
 then the experiment section below, then the canonical spec and plan.
 
 ## First: the object ledger experiment
@@ -32,8 +31,10 @@ resumes from `develop` and the experiment's version line ceases to exist.
   the final sweep.
 - **Evidence** per step: [`object-ledger-evidence/`](object-ledger-evidence/)
   (`t0`, `t1`, `p`, `control-gate`, `t2`).
-- **Where it stands** (branches are one local chain, none pushed, none
-  merged into `experiment/object-ledger`, which is at `14634ba` on origin):
+- **The clients** each have `experiment/object-ledger` in their own repos
+  and work only there (operator, 2026-10-01); see the handover.
+- **Where it stands** (branches are one chain, all pushed, none merged into
+  `experiment/object-ledger`, which is at `14634ba` on origin):
 
   | step | branch | tip | state |
   |---|---|---|---|
@@ -43,15 +44,17 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | backlog fixes | `-fixes` | `759e75a` | two test defects fixed (HTTP pipelined reader; abandoned-pipeline lease) |
   | control gate | `-control-gate` | `01f2156` | question 1: control GC never uses an inventory built in the same pass |
   | `universal` | `-universal` | `b288352` | question 2: removed |
-  | T2 slice | `-t2` | `eacda85` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance; assessment written; checked out |
+  | T2 slice | `-t2` | `3c6c1fd` | T2a vocabulary, T2b NoIo capability, T2c wait guard + claim walk on the contracts + `Published<T>`, T2d component root + maintenance, dependencies as types; assessment written; also the fixes of 2026-10-01 (handover) |
+  | T3 ledger | `-t3` | (local) | begun: the activity clock injected; trace harness without real-time sleeps; joiner test; checked out |
 
-- **T2 is built** (T2d: the component contract, the composition root,
-  maintenance as its first component; lifecycle fixtures identical); the
-  written assessment is `object-ledger-evidence/t2/assessment.md` (no kill
-  criterion met; settle its point 3 before T3). Owed before acceptance: GCC
-  build, the three suites and coverage on fi-1, after the soak. Then accept
-  T0, merge the chain into `experiment/object-ledger` in order and push
-  (standing authorisation, experiment branches only).
+- **T2 is built**; the written assessment is
+  `object-ledger-evidence/t2/assessment.md` (no kill criterion met; point 3
+  settled). Owed before acceptance: GCC build, the three suites and coverage
+  on fi-1, after the soak. Then accept T0, merge the chain into
+  `experiment/object-ledger` in order and push (standing authorisation,
+  experiment branches only).
+- **T3 next** (plan, T3): horizons as `Published` handles, the three gates,
+  every consumer onto the ledger, Service's reachability members deleted.
 - **Rules for every step**: a branch cut from the previous step, merged
   when accepted, then pushed; 100% line and branch coverage of what the
   step builds or converts, mutation-proven; contracts as preconditions,
@@ -268,10 +271,14 @@ glibc heap checking on. Items the experiment absorbs say so.
 12. **Test failures** (no known flakes -- each is P0 work):
     - **Rewritten 2026-10-01:** `rpc_cluster/test_three_node_cluster` (a
       scenario of thirteen claims waiting on background work) became ten
-      claim tests that drive their steps (T2 README). Open: a joiner pulling
-      its objects with no explicit step, and cache-to-store promotion, need
-      the store's activity clock injected; the warm view's freshness
-      mechanism at the metadata layer is not yet traced.
+      claim tests that drive their steps (T2 README), and, once T3 injected
+      the activity clock, the joiner's pull through maintenance. Open:
+      cache-to-store promotion by idle maintenance has no test; the warm
+      view's freshness mechanism at the metadata layer is not yet traced.
+    - **Fixed 2026-10-01:** a Debug build compiled against libtorrent with
+      the wrong class layout (the exported target's `TORRENT_USE_ASSERTS`);
+      `hydration_catalogue/test_a_torrent_is_held_by_one_job_and_a_second_add_names_it`
+      failed every time in Debug. Dropped from the imported target.
     - **Fixed 2026-10-01, watching for recurrence:**
       `rpc_cluster/test_repair_is_paced_not_stopped_while_a_peer_serves_viewers`
       segfaulted ~60 ms in, ~1.7% at `--jobs 12` (also 5/500 on `c53efd7`).
@@ -339,6 +346,20 @@ glibc heap checking on. Items the experiment absorbs say so.
       then follow `GET .../identity-resets/{id}` for the state. Core's
       `resetIdentityAssociation` (the general route, :148) is unused by the
       web. The TV and phone clients call neither.
+
+17. **Core's request (2026-10-01): not now** (operator's answer as relayed
+    by Core: not mid-experiment; Core holds it as a TODO, `6f4c396`, and
+    raises it again when the experiment ends). Nothing built. The request: let
+    `GET /api/v1/manage/providers/artwork` take `item_id` (with `role`) as
+    well as `ref`, resolving the item's own provider reference the way
+    `POST .../artwork/choose` does in `scanner_.choose_artwork` (a TMDB movie
+    or show is its own; a season or episode is its show's with its season
+    and episode numbers; an album its MusicBrainz release). An explicit
+    `ref` still overrides; an item with no reference answers a named code
+    (`no_provider_ref` suggested). Same `{status, options}` answer. For the
+    web's metadata editor: today every client must parse the server's id
+    forms (an episode's show id is only in its season's id). An API change:
+    announce with exact codes before shipping.
 
 Then the older ordered items below. Reconciled against 0.57.0 on 2026-09-24:
 what was found already done is ledgered in `COMPLETED.md` under "backlog
