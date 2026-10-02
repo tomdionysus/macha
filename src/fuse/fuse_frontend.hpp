@@ -665,6 +665,12 @@ class FuseFrontend final : public HydrationHintProvider {
     bool retry_parked_publication(uint64_t inode);
     bool abandon_parked_publication(uint64_t inode);
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));
+    // Ends every wait on a publication with EIO, before the mount is torn
+    // down: an fsync waiting for its data to reach the cluster cannot finish
+    // while the node is stopping (the store's writes are cancelled), and the
+    // mount cannot exit with that request outstanding. The data is already
+    // durable in the local journal; recovery publishes it after the restart.
+    void interrupt_waits();
     void stop();
     // Tests only: whether a viewer is active is decided by this rather than by
     // the foreground clock, so a test can hold loader publication and release

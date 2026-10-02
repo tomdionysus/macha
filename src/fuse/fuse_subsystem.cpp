@@ -129,6 +129,12 @@ void FuseSubsystem::stop() {
     if (frontend_)
         hydration_.remove_provider(frontend_.get());
 
+    // An fsync waiting for its publication would hold the mount open: the
+    // publication cannot finish while the node stops, and until 2026-10-02
+    // the join below waited for it until systemd killed the process (2 of 6
+    // restarts in T0's top-up). End those waits first.
+    if (frontend_)
+        frontend_->interrupt_waits();
     if (mount_.joinable()) {
         mount_.request_stop();
         driver_->request_exit();

@@ -711,10 +711,18 @@ struct FuseFrontend::State {
     // itself.
     std::atomic_size_t open_publications{};
     std::atomic_size_t peak_open_publications{};
+    // Slots taken by workers that selected an inode with no publication and
+    // have not opened its publication yet. Guarded by data_queue_mutex. The
+    // cap counts them with the open ones: a cap read at selection and taken
+    // at creation, under different locks, let every worker in between open
+    // one (2026-10-02: peak above the cap about one run in 200).
+    size_t reserved_publications{};
 
     std::array<BrokerQueue, 6> broker;
     std::atomic_size_t broker_pending{};
     std::atomic_bool stopping{};
+    // Set by interrupt_waits(): no wait on a publication may outlast it.
+    std::atomic_bool waits_interrupted{};
     // -1: the foreground clock decides; 0 or 1: a test has decided.
     std::atomic_int viewer_active_override{-1};
     std::mutex write_request_mutex;
@@ -983,9 +991,10 @@ struct FuseFrontend::State {
         }
     }
 
+    // Caller holds data_queue_mutex (reserved_publications).
     bool writer_cap_reached() const {
         return config.publication_max_open_writers &&
-               open_publications.load(std::memory_order_relaxed) >=
+               open_publications.load(std::memory_order_relaxed) + reserved_publications >=
                    config.publication_max_open_writers;
     }
 
@@ -2193,6 +2202,11 @@ struct FuseFrontend::State {
                 if (inode->published_data_sequence >= target)
                     return;
             }
+            // Read under data_queue_mutex, which interrupt_waits() holds to set
+            // it, so the notify that follows cannot be missed.
+            if (waits_interrupted.load(std::memory_order_acquire))
+                throw FsError(EIO, "FUSE frontend stopping; the data is journalled and "
+                                   "publishes after the restart");
             check_deadline(deadline, cancelled);
             if (deadline == Clock::time_point::max()) {
                 data_cv.wait(queue_lock);
@@ -3853,6 +3867,9 @@ struct FuseFrontend::State {
         while (!stop.stop_requested() && !stopping.load()) {
             std::shared_ptr<Inode> inode;
             bool recovered = false;
+            // This turn holds a reserved publication slot until it opens the
+            // publication or ends.
+            bool reserved = false;
             {
                 std::unique_lock lock(data_queue_mutex);
                 while (!stop.stop_requested() && !stopping.load()) {
@@ -3960,6 +3977,12 @@ struct FuseFrontend::State {
                         1, std::memory_order_relaxed);
                 inode = selected->inode;
                 recovered = selected->recovered;
+                {
+                    std::lock_guard inode_lock(inode->mutex);
+                    reserved = inode->data_publication == nullptr;
+                }
+                if (reserved)
+                    ++reserved_publications;
                 data_queue.erase(selected);
                 weighted_loader.started(Clock::now(), viewer_active(), false);
                 publication_inflight_bytes += config.publication_quantum_bytes;
@@ -4003,6 +4026,12 @@ struct FuseFrontend::State {
                         std::lock_guard lock(inode->mutex);
                         set_data_publication_locked(*inode, created);
                         refresh_retained_owners_locked(*inode);
+                    }
+                    // The reserved slot is now an open publication.
+                    if (reserved) {
+                        std::lock_guard queue_lock(data_queue_mutex);
+                        --reserved_publications;
+                        reserved = false;
                     }
                     publication = std::move(created);
                 }
@@ -4172,6 +4201,9 @@ struct FuseFrontend::State {
             }
             {
                 std::lock_guard lock(data_queue_mutex);
+                // A turn that never opened its publication gives the slot back.
+                if (reserved)
+                    --reserved_publications;
                 publication_inflight_bytes -= config.publication_quantum_bytes;
                 publication_inflight_bytes_diagnostic.store(publication_inflight_bytes,
                                                              std::memory_order_relaxed);
@@ -5239,7 +5271,16 @@ struct FuseFrontend::State {
         namespace_cv.notify_all();
     }
 
+    void interrupt_waits() {
+        {
+            std::lock_guard lock(data_queue_mutex);
+            waits_interrupted.store(true, std::memory_order_release);
+        }
+        data_cv.notify_all();
+    }
+
     void stop() {
+        interrupt_waits();
         if (stopping.exchange(true))
             return;
         namespace_cv.notify_all();
@@ -6802,6 +6843,11 @@ std::vector<HydrationHint> FuseFrontend::hints() {
 void FuseFrontend::set_wake_callback(std::function<void()> callback) {
     std::lock_guard lock(state_->hint_mutex);
     state_->hint_wake_callback = std::move(callback);
+}
+
+void FuseFrontend::interrupt_waits() {
+    if (state_)
+        state_->interrupt_waits();
 }
 
 void FuseFrontend::stop() {
