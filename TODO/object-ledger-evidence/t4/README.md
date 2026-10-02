@@ -140,3 +140,27 @@ compiler's guarantee, not the count's.
   paged at bounds 1, 7, 64 and 4096 (8,173, 1,168, 128 and 2 pages),
   equal to the whole-pass walk in set and order every time. Copies
   removed after.
+
+## fi-1 acceptance run (2026-10-02, `-t4` with the test fixes)
+
+- GCC build, no warnings; suites 708/708, 17/17, 21/21.
+- Coverage (total 78.9%): `namespace_tree.cpp` 93.8%,
+  `metadata_manager.cpp` 77.9%, `catalogue.cpp` 81.9%,
+  `node_horizon_builder.cpp` 100%, the T3 files as before. Of the lines T4
+  changed, four were uncovered; three now have tests (a node that is not a
+  tree node, `entries` on a manager without a store, a head behind the
+  known generation), the fourth is a renamed line inside the catalogue-root
+  conflict reconciliation, which no test drives before or since.
+- The coverage run failed two cases. Both reproduce on the laptop and on
+  `develop` (`75e6f98`), so they predate the experiment:
+  - `rpc_cluster/test_torrent_listing_is_served_from_memory_while_a_peer_is_silent`
+    (1 in 300 on develop, 4 in 300 on T3, 1 in 300 on T4): test defects,
+    fixed (`24ca452`): it counted calls to a stalled peer from every
+    thread (background calls are near-constant: 98% of 20 ms windows held
+    one with no listing at all), and it wrote before the metadata floor
+    formed. 1000/1000 after; a listing put back on the surveying path is
+    killed by the remaining check.
+  - `filesystem_fuse/test_fuse_publication_backlog_wider_than_ledger_completes`
+    (1 in 300 on develop, 3 in 300 on T3, 4 in 300 on T4): **a product
+    bug**, the publication writer cap is checked and taken in two places
+    (ACTIVE). Not fixed: a scheduling change, for the operator.

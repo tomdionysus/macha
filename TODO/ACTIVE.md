@@ -77,6 +77,20 @@ resumes from `develop` and the experiment's version line ceases to exist.
     fails the publication on stop instead of retrying it; with A1's
     declared waits this is the class of wait the experiment exists to
     make visible. Not fixed: for the operator.
+  - **the FUSE publication writer cap can be exceeded** (P0; found by
+    `filesystem_fuse/test_fuse_publication_backlog_wider_than_ledger_completes`
+    failing about 1 run in 100-300, on `develop` as on the experiment).
+    `runnable_data_locked()` (`src/fuse/fuse_frontend.cpp`) reads
+    `writer_cap_reached()` once under the queue lock and admits inodes
+    without a publication while the count is below the cap; each admitted
+    inode opens its publication later under only its own mutex
+    (`set_data_publication_locked`), so workers in that window all open
+    one and the count passes the cap. The cap is what keeps the
+    retained-memory ledger from deadlocking against itself (es-1,
+    2026-09-09). Fix: take the slot at selection, under the queue lock
+    (count reserved-but-not-yet-open publications in the cap), release it
+    if the publication is never opened. A scheduling change: for the
+    operator.
   - repair completes no pass: one to three months a pass at its rate
     (baseline.md K4). Repair's pace, not a broken gauge;
   - an unattributed restart of fi-1 at 16:00:01Z from the laptop's

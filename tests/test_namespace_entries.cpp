@@ -225,3 +225,41 @@ MACHA_TEST("namespace_entries", test_the_metadata_view_pages_a_live_namespace) {
 }
 
 } // namespace
+
+namespace {
+
+MACHA_FAST_TEST("namespace_entries", test_a_node_that_is_not_a_tree_node_throws) {
+    MemoryNamespaceNodeStore store;
+    MetadataSnapshot tree;
+    tree.namespace_root = build_namespace_tree(namespace_of(40), store, small_limits());
+    // The root's address now holds bytes that are no tree node at all.
+    store.put_at(*tree.namespace_root, Bytes{'n', 'o', 'p', 'e', 0, 0, 0, 0});
+    Budget budget;
+    bool threw = false;
+    try {
+        (void)namespace_entries(tree, &store, {}, budget);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+// A manager built without a namespace store (as the tests that need none
+// build it) pages a map-backed view from the map.
+MACHA_TEST("namespace_entries", test_a_manager_without_a_store_pages_a_map_backed_view) {
+    macha::test_support::TestNode fixture("entries-no-store");
+    fixture.prepare();
+    auto& node = fixture.start();
+    MetadataManager metadata(node);
+    MetadataSnapshot snapshot;
+    snapshot.entries = namespace_of(9);
+    const MetadataSnapshotView view{1, 0, Hash256{},
+                                    std::make_shared<const MetadataSnapshot>(snapshot)};
+    Budget budget;
+    budget.operations(100);
+    const auto page = metadata.entries(view, {}, budget);
+    CHECK(page.complete());
+    CHECK(page.items == by_callback(snapshot, nullptr));
+}
+
+} // namespace
