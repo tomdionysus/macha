@@ -49,7 +49,8 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | `universal` | `-universal` | merged |
   | T2 slice | `-t2` | merged; assessed |
   | T3 ledger | `-t3` | merged; assessed (`t3/assessment.md`) |
-  | T4 metadata | `-t4` | built, assessed; fi-1 run owed |
+  | T4 metadata | `-t4` | merged 2026-10-02; assessed (`t4/assessment.md`) |
+  | T5 conversions | `-t5` | next; the first deploy since T0 |
 
 - **T0's baseline is filled** (2026-10-01): soak plus a six-hour top-up,
   2026-09-30 07:04Z to 2026-10-01 20:43Z,
@@ -120,11 +121,9 @@ resumes from `develop` and the experiment's version line ceases to exist.
     reconciles at most one catalogue-root conflict and may commit. Whether
     that second commit per pass feeds the loop is not established; removing
     it is a behaviour change, for the operator.
-- **T4 is built and assessed** (`object-ledger-evidence/t4/assessment.md`:
-  no kill criterion met). Owed before acceptance: fi-1's GCC build, suites
-  and coverage, and `entries` against a copy of each live node's
-  namespace. Then merge `-t4` and cut T5, the first deploy since T0 (plan:
-  nothing deploys between T0 and T5).
+- **T4 is accepted and merged** (`experiment/object-ledger` at `fc72110`).
+  **T5 next** (plan, T5): component conversions into the root, strangler
+  style, and the first deploy since T0.
 - **Future experiment: memoised horizon builds** (spec, Later stages):
   subtree referenced sets kept by subtree id, partial builds merging in any
   order; first measure how often the inventory and release heads coincide.
