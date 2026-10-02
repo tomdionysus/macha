@@ -1904,6 +1904,46 @@ MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_lo
     frontend->stop();
 }
 
+// An fsync waits for its data to be published to the cluster, with no
+// deadline once it has started. On a stopping node the publication can never
+// finish, and the mount cannot exit while the fsync is outstanding: the stop
+// waited until systemd killed the process (2 of 6 restarts in T0's top-up,
+// reproduced 2026-10-01). interrupt_waits() ends the wait with EIO first; the
+// data is already journalled and publishes after the restart.
+MACHA_TEST("filesystem_fuse", test_an_fsync_waiting_for_publication_ends_when_waits_are_interrupted) {
+    TestService fixture("fuse-fsync-interrupted");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.extent_size = 1024 * 1024;
+    auto& service = fixture.start();
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto handle = frontend->create("/fsync-held.bin", 0644, getuid(), getgid(), false, true, false);
+    REQUIRE(frontend->wait_for_idle(10s));
+    // A viewer holds loader publication, so the fsync's publication cannot
+    // complete, as it cannot on a stopping node.
+    frontend->set_viewer_active_for_tests(true);
+    const auto bytes = pattern(64 * 1024, 91);
+    REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+
+    auto synced = std::async(std::launch::async, [&] {
+        try {
+            frontend->fsync(handle.inode);
+            return 0;
+        } catch (const FsError& error) {
+            return error.code();
+        }
+    });
+    CHECK(synced.wait_for(300ms) == std::future_status::timeout);
+    frontend->interrupt_waits();
+    REQUIRE(synced.wait_for(10s) == std::future_status::ready);
+    CHECK(synced.get() == EIO);
+
+    frontend->set_viewer_active_for_tests(false);
+    frontend->release(handle.inode, true);
+    frontend->stop();
+}
+
 MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retirement) {
     TestService fixture("fuse-pressure-retirement-selection");
     auto& config = fixture.config();
