@@ -2978,7 +2978,8 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
     REQUIRE(wait_until([&] { return s1.node().membership().active().size() >= 3; }));
 
     // The quarantined peer cannot block the two compatible replicas that satisfy W=2.
-    s1.filesystem().mkdir("/still-writable", 0755, getuid(), getgid());
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/still-writable", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/still-writable").type == EntryType::directory;
@@ -3650,18 +3651,8 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
         },
         10s));
 
-    // The first write completes the replica set's formation, which a peer's
-    // transient RPC failure can report as not ready; callers retry that.
-    REQUIRE(wait_until(
-        [&] {
-            try {
-                s1.filesystem().mkdir("/lagging-base", 0755, getuid(), getgid());
-                return true;
-            } catch (const MetadataNotReady&) {
-                return false;
-            }
-        },
-        10s));
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/lagging-base", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until(
         [&] {
             try {
@@ -3837,7 +3828,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
                s3->node().membership().active().size() == 3;
     }));
 
-    s1.filesystem().create_file("/retained.bin", 0644, getuid(), getgid());
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().create_file("/retained.bin", 0644, getuid(), getgid()); }));
     auto input = pattern(128 * 1024);
     auto writer = s1.filesystem().open_write("/retained.bin", true);
     REQUIRE(writer->write(0, input) == input.size());
@@ -4178,7 +4170,7 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
                s3->node().membership().active().size() == 3;
     }));
     // An accepted branch first, so maintenance runs against valid metadata.
-    s1.filesystem().mkdir("/base", 0755, getuid(), getgid());
+    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/base").type == EntryType::directory;
@@ -4321,7 +4313,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         }));
 
         // One accepted base everywhere before partitioning into two writable pairs.
-        s1.filesystem().mkdir("/base", 0755, getuid(), getgid());
+        REQUIRE(retry_while_not_ready(
+            [&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
         MetadataManager initial_repair(s1.node());
         initial_repair.repair_once();
         REQUIRE(wait_until([&] {
@@ -4526,7 +4519,8 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
                    s2.node().membership().active().size() >= 2;
         }));
 
-        s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid());
+        REQUIRE(retry_while_not_ready(
+            [&] { s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid()); }));
         MetadataManager m2(s2.node());
         auto snapshot = m2.snapshot();
         CHECK(snapshot.metadata_voters.empty());
@@ -5150,7 +5144,8 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
                s2.node().membership().active().size() >= 2;
     }));
     // Past the virgin generation, so repair takes the read_group()/fan-out path.
-    s1.filesystem().mkdir("/warm", 0755, getuid(), getgid());
+    REQUIRE(
+        retry_while_not_ready([&] { s1.filesystem().mkdir("/warm", 0755, getuid(), getgid()); }));
 
     const auto peer = s2.node().node_id();
     s1.node().stall_peer_for_tests(peer, MessageType::has_metadata_history_entry);
@@ -5631,7 +5626,7 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
                s2.node().membership().active().size() >= 2;
     }));
 
-    s1.filesystem().mkdir("/a", 0755, getuid(), getgid());
+    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/a", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/a").type == EntryType::directory;
@@ -5702,7 +5697,7 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    s1.filesystem().mkdir("/a", 0755, getuid(), getgid());
+    REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/a", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/a").type == EntryType::directory;
@@ -5768,7 +5763,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_concurrent_proposers_
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    s1.filesystem().mkdir("/concurrent", 0755, getuid(), getgid());
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/concurrent", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/concurrent").type == EntryType::directory;
@@ -5827,7 +5823,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_aborts_when_a_partici
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    s1.filesystem().mkdir("/unreachable", 0755, getuid(), getgid());
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/unreachable", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/unreachable").type == EntryType::directory;
@@ -5868,7 +5865,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    s1.filesystem().mkdir("/crash", 0755, getuid(), getgid());
+    REQUIRE(
+        retry_while_not_ready([&] { s1.filesystem().mkdir("/crash", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
             return s2.filesystem().getattr("/crash").type == EntryType::directory;

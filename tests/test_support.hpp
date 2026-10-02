@@ -373,6 +373,23 @@ class TestNode {
     FileSystem& filesystem() { REQUIRE(filesystem_); return *filesystem_; }
 };
 
+// A first write on a forming cluster can find the replica set still forming
+// (a peer not yet answering its survey); product callers retry
+// MetadataNotReady, and so does this, until `write` succeeds or `limit`.
+template <class Write>
+bool retry_while_not_ready(Write&& write, std::chrono::milliseconds limit = std::chrono::seconds(10)) {
+    return wait_until(
+        [&] {
+            try {
+                write();
+                return true;
+            } catch (const MetadataNotReady&) {
+                return false;
+            }
+        },
+        limit);
+}
+
 class TestGate {
     mutable std::mutex mutex_;
     std::condition_variable cv_;
