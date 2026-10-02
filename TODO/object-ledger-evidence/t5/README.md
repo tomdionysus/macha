@@ -110,3 +110,16 @@ backup `/root/macha-0.77.0-installed.tgz`.
 - fi-1's data disk had one USB reset with a single failed read at
   21:54:06Z (0.77.0); the device recovered at once and the backend stayed
   online.
+
+## 0.79.0 smoke test on fi-1 (2026-10-02, late)
+
+T5.15: Accounts (user table, sessions, their gossip) as its own part.
+Suites on fi-1 before install: 703 + 17 + 21 (`7d9ef27`). Tarball md5
+`2d1cc8a37948760007bb469a4cda37ec`; backup `/root/macha-0.78.0-installed.tgz`.
+
+- Installed 23:10:13Z: 0.78.0 stopped in 5 s (2-3 s at the previous
+  installs; within the bound); listening 23:10:19; DATA online 23:10:23;
+  services ready and writable 23:10:31; healthy 23:10:34.
+- A session created on fi-1 (0.79.0) was honoured by gbni-1 (0.75.0) at
+  once (HTTP 200); revoking it on fi-1 had gbni-1 refuse it within 6 s
+  (401). Status normal on both nodes.
