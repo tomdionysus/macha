@@ -19,21 +19,21 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
     // `required` is the commit's metadata write floor: a root may be
     // committed only once every node it addresses has durably reached it.
     // A reader (floor zero) refuses `put`; zero never means "no floor".
-    static ControlNamespaceNodeStore for_reading(NodeRuntime& node, DistributedStore& store) {
-        return ControlNamespaceNodeStore(node, store, 0, Mode::read);
+    static ControlNamespaceNodeStore for_reading(LocalStore& control, DistributedStore& store) {
+        return ControlNamespaceNodeStore(control, store, 0, Mode::read);
     }
-    static ControlNamespaceNodeStore for_commit(NodeRuntime& node, DistributedStore& store,
+    static ControlNamespaceNodeStore for_commit(LocalStore& control, DistributedStore& store,
                                                 size_t required) {
         if (!required)
             throw std::invalid_argument("namespace commit requires a metadata write floor");
-        return ControlNamespaceNodeStore(node, store, required, Mode::commit);
+        return ControlNamespaceNodeStore(control, store, required, Mode::commit);
     }
     // Replay writes locally and replicates nothing: a materialised history
     // entry already reached the floor when committed, and replicating would
     // stop a node with peers down from rebuilding its own head. Content
     // addressing makes a locally rebuilt node identical to the committed one.
-    static ControlNamespaceNodeStore for_replay(NodeRuntime& node, DistributedStore& store) {
-        return ControlNamespaceNodeStore(node, store, 0, Mode::replay);
+    static ControlNamespaceNodeStore for_replay(LocalStore& control, DistributedStore& store) {
+        return ControlNamespaceNodeStore(control, store, 0, Mode::replay);
     }
 
     // Writes the node and returns its content address. Throws
@@ -54,10 +54,10 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
 
   private:
     enum class Mode : uint8_t { read, commit, replay };
-    ControlNamespaceNodeStore(NodeRuntime& node, DistributedStore& store, size_t required,
+    ControlNamespaceNodeStore(LocalStore& control, DistributedStore& store, size_t required,
                               Mode mode);
 
-    NodeRuntime& node_;
+    LocalStore& control_;
     DistributedStore& store_;
     size_t required_;
     Mode mode_;

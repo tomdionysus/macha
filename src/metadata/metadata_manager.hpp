@@ -54,6 +54,7 @@ struct MetadataHistoryTransferDiagnostics {
 
 class MetadataManager final : public MetadataView, public MetadataMaintenance {
     NodeRuntime& node_;
+    LocalState& local_;
     DistributedStore* namespace_store_{};
     std::mutex mutation_mutex_;
     // Guards the multi-head merge-and-publish branch of read_group(). Separate
@@ -165,7 +166,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // each commit is published (the claims barrier: every object the new head
     // refers to is durably claimed first).
     using PublicationRetention = std::function<void(const MetadataPublicationContext&)>;
-    explicit MetadataManager(NodeRuntime&, DistributedStore* namespace_store = nullptr,
+    MetadataManager(NodeRuntime&, LocalState&, DistributedStore* namespace_store = nullptr,
                              PublicationRetention publication_retention = {});
 
     MetadataRecord read_record();

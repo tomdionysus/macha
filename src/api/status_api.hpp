@@ -18,6 +18,7 @@
 namespace macha {
 
 struct MaintenancePort;
+class LocalState;
 class SubsystemRegistry;
 
 // What a status request reads beyond the node: handed in per request by the
@@ -27,6 +28,7 @@ struct StatusSources {
     const MaintenancePort* maintenance{};
     const SubsystemRegistry* registry{};
     const HttpServer* http{};
+    LocalState* local{};
     MetadataView* metadata{};
     const SubsystemSupervisor* subsystems{};
     const DistributedStore* store{};

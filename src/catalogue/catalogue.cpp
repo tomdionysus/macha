@@ -560,9 +560,9 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapsho
     return newest ? newest->artwork : std::vector<CatalogueArtwork>{};
 }
 
-CatalogueManager::CatalogueManager(NodeRuntime& node, DistributedStore& store,
+CatalogueManager::CatalogueManager(NodeRuntime& node, LocalState& local, DistributedStore& store,
                                    MetadataView& metadata)
-    : node_(node), store_(store), metadata_(metadata) {}
+    : node_(node), local_(local), store_(store), metadata_(metadata) {}
 
 std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& snapshot) {
     std::set<ObjectId> ids;
@@ -583,7 +583,7 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
         return {};
     if (!store_.ensure_control_local(*root))
         throw CatalogueUnavailable("catalogue manifest unavailable");
-    auto encoded_manifest = node_.control_store().get(*root);
+    auto encoded_manifest = local_.control().get(*root);
     if (!encoded_manifest)
         throw CatalogueUnavailable("catalogue manifest unavailable locally");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
@@ -592,7 +592,7 @@ CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& roo
         if (!shard_id) continue;
         if (!store_.ensure_control_local(*shard_id))
             throw CatalogueUnavailable("catalogue shard unavailable: " + to_string(*shard_id));
-        auto encoded_shard = node_.control_store().get(*shard_id);
+        auto encoded_shard = local_.control().get(*shard_id);
         if (!encoded_shard)
             throw CatalogueUnavailable("catalogue shard unavailable locally: " + to_string(*shard_id));
         auto shard = decode_catalogue(*encoded_shard);
@@ -634,7 +634,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
     try {
         if (!store_.ensure_control_local(*root))
             throw CatalogueUnavailable("catalogue manifest unavailable for control repair");
-        auto encoded_manifest = node_.control_store().get(*root);
+        auto encoded_manifest = local_.control().get(*root);
         if (!encoded_manifest)
             throw CatalogueUnavailable("catalogue manifest unavailable locally for control repair");
         const auto manifest = decode_catalogue_manifest(*encoded_manifest);
@@ -647,7 +647,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
             if (!store_.ensure_control_local(*shard_id))
                 throw CatalogueUnavailable("catalogue shard unavailable for control repair: " +
                                            to_string(*shard_id));
-            auto encoded = node_.control_store().get(*shard_id);
+            auto encoded = local_.control().get(*shard_id);
             if (!encoded)
                 throw CatalogueUnavailable("catalogue shard unavailable locally for control repair: " +
                                            to_string(*shard_id));
@@ -851,8 +851,8 @@ CatalogueStatus CatalogueManager::status() const {
             for (const auto& artwork : item.artwork) art.insert(artwork.id);
     status.artwork_objects = art.size();
     for (const auto& id : art)
-        status.local_artwork_objects += node_.local_store().has(id) ? 1 : 0;
-    const bool root_local = !status.root || node_.control_store().has(*status.root);
+        status.local_artwork_objects += local_.data().has(id) ? 1 : 0;
+    const bool root_local = !status.root || local_.control().has(*status.root);
     status.ready = status.ready && root_local;
     return status;
 }
@@ -1130,7 +1130,7 @@ void CatalogueManager::commit(
     if (expected_root) {
         if (!store_.ensure_control_local(*expected_root))
             throw CatalogueUnavailable("current catalogue manifest unavailable");
-        auto encoded = node_.control_store().get(*expected_root);
+        auto encoded = local_.control().get(*expected_root);
         if (!encoded)
             throw CatalogueUnavailable("current catalogue manifest unavailable locally");
         old_manifest = decode_catalogue_manifest(*encoded);
@@ -1637,7 +1637,7 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
 
     if (!store_.ensure_control_local(*new_root))
         throw CatalogueUnavailable("catalogue manifest unavailable for retention publication");
-    auto encoded_manifest = node_.control_store().get(*new_root);
+    auto encoded_manifest = local_.control().get(*new_root);
     if (!encoded_manifest)
         throw CatalogueUnavailable("catalogue manifest unavailable locally for retention publication");
     const auto manifest = decode_catalogue_manifest(*encoded_manifest);
@@ -1726,7 +1726,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
         out.control_live.insert(*root);
         try {
             if (store_.ensure_control_local(*root)) {
-                if (auto encoded = node_.control_store().get(*root)) {
+                if (auto encoded = local_.control().get(*root)) {
                     const auto manifest = decode_catalogue_manifest(*encoded);
                     for (const auto& shard : manifest.shards)
                         if (shard) out.control_live.insert(*shard);
@@ -1743,7 +1743,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
                 protected_roots_complete = false;
                 continue;
             }
-            auto encoded_manifest = node_.control_store().get(protected_root);
+            auto encoded_manifest = local_.control().get(protected_root);
             if (!encoded_manifest) {
                 protected_roots_complete = false;
                 continue;
@@ -1757,7 +1757,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
                     protected_roots_complete = false;
                     continue;
                 }
-                auto encoded_shard = node_.control_store().get(*shard_id);
+                auto encoded_shard = local_.control().get(*shard_id);
                 if (!encoded_shard) {
                     protected_roots_complete = false;
                     continue;
@@ -1810,7 +1810,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
     size_t removed = 0;
     bool exhausted = false;
     for (size_t operations = 0; operations < operation_budget && !exhausted; ++operations) {
-        auto id = node_.control_store().next_object(control_gc_cursor_, exhausted);
+        auto id = local_.control().next_object(control_gc_cursor_, exhausted);
         if (!id) continue;
 
         if (std::binary_search(live.begin(), live.end(), *id)) {
@@ -1821,7 +1821,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
 
         // A content-addressed object may be reused by the current publication;
         // put() touches it, so keep any object touched since this root was seen.
-        if (!node_.control_store().older_than(*id, staged_since_root)) {
+        if (!local_.control().older_than(*id, staged_since_root)) {
             std::lock_guard lock(mutex_);
             if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
                 continue;
@@ -1840,16 +1840,16 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
 
             // cache() takes this mutex to publish a new root, so GC never races
             // a root transition and deletes its staging.
-            if (node_.claims().retained(RetentionClass::control, *id))
+            if (local_.retention().retained(RetentionClass::control, *id))
                 continue;
-            if (node_.control_store().remove_if_older_than(*id, grace)) {
+            if (local_.control().remove_if_older_than(*id, grace)) {
                 control_gc_unreferenced_epoch_.erase(seen);
                 ++removed;
             }
         }
     }
     if (exhausted && removed)
-        (void)node_.control_store().compact_packs();
+        (void)local_.control().compact_packs();
     return removed;
 }
 

@@ -224,6 +224,8 @@ class NodeRuntime {
     const ClaimStore& claims() const;
     MetadataReplica& metadata_replica();
     MetadataServer& metadata_server();
+    // Throws until local state has recovered.
+    LocalState& local_state();
     const MetadataReplica& metadata_replica() const;
     Membership& membership() {
         return members_;

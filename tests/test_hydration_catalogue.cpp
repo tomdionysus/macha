@@ -411,8 +411,8 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(n1.wait_local_state_ready(10s));
     REQUIRE(n2.wait_local_state_ready(10s));
 
-    DistributedStore source(n1, n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
-    DistributedStore target(n2, n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
+    DistributedStore source(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
+    DistributedStore target(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
     auto make_remote = [&](uint8_t value) {
         Bytes data(128 * 1024, value);
         auto id = object_id(data);
@@ -1915,9 +1915,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node);
-    CatalogueManager catalogue(node, store, metadata);
+    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
+    MetadataManager metadata(node, node.local_state());
+    CatalogueManager catalogue(node, node.local_state(), store, metadata);
 
     CatalogueItem item;
     item.id = "test:movie:1";
@@ -2598,6 +2598,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_se
     context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
     context.routes = &fixture.node().routes;
+    context.local_state = &fixture.node().local_state();
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2739,6 +2740,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
     context.routes = &fixture.node().routes;
+    context.local_state = &fixture.node().local_state();
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2829,6 +2831,7 @@ MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resum
     context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
     context.routes = &fixture.node().routes;
+    context.local_state = &fixture.node().local_state();
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2914,6 +2917,7 @@ struct TorrentPluginFixture {
         context.data_resources = &fixture.node().resources.data;
         context.retained_memory = &fixture.node().resources.memory;
         context.routes = &fixture.node().routes;
+        context.local_state = &fixture.node().local_state();
         context.ingest = ingest.get();
         context.registry = &registry;
         plugin = std::make_unique<LoadedTorrentPlugin>(context);
@@ -3680,9 +3684,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // genesis while its bootstrap peer has not yet entered active membership.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    DistributedStore store1(n1, n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
-    MetadataManager metadata1(n1);
-    CatalogueManager catalogue1(n1, store1, metadata1);
+    DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
+    MetadataManager metadata1(n1, n1.local_state());
+    CatalogueManager catalogue1(n1, n1.local_state(), store1, metadata1);
 
     CatalogueItem first;
     first.id = "test:movie:remote-first";
@@ -3692,9 +3696,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    DistributedStore store2(n2, n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
-    MetadataManager metadata2(n2);
-    CatalogueManager catalogue2(n2, store2, metadata2);
+    DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
+    MetadataManager metadata2(n2, n2.local_state());
+    CatalogueManager catalogue2(n2, n2.local_state(), store2, metadata2);
 
     // Cold-load node two from node one's committed catalogue. There is no Service
     // here, so no catalogue maintenance thread can refresh it behind the test.
@@ -3730,7 +3734,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // into quorum reads. FUSE may adopt a newer snapshot only after some control-
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
-    FileSystem fs2(n2, store2, metadata2, n2.resources.memory);
+    FileSystem fs2(n2, n2.local_state(), store2, metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
     auto frontend = std::make_shared<FuseFrontend>(fs2, n2.resources.memory, fuse_config);
@@ -3818,11 +3822,11 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     // than turning that expected bootstrap state into an unhandled test failure.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    MetadataManager metadata1(n1);
+    MetadataManager metadata1(n1, n1.local_state());
     const auto initial1 = metadata1.snapshot_view();
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    MetadataManager metadata2(n2);
+    MetadataManager metadata2(n2, n2.local_state());
 
     std::optional<MetadataSnapshotView> initial2;
     REQUIRE(wait_until([&] {
@@ -4557,9 +4561,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node);
-    CatalogueManager catalogue(node, store, metadata);
+    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
+    MetadataManager metadata(node, node.local_state());
+    CatalogueManager catalogue(node, node.local_state(), store, metadata);
 
     CatalogueItem item;
     item.id = "test:movie:artwork-missing";
@@ -4576,7 +4580,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     // Force a cold catalogue load from the sharded CONTROL representation. The
     // referenced artwork DATA is deliberately absent locally and must not be a
     // prerequisite for catalogue readiness.
-    CatalogueManager reloaded(node, store, metadata);
+    CatalogueManager reloaded(node, node.local_state(), store, metadata);
     reloaded.repair_once();
 
     auto status = reloaded.status();
@@ -4602,9 +4606,9 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node);
-    FileSystem filesystem(node, store, metadata, node.resources.memory);
+    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
+    MetadataManager metadata(node, node.local_state());
+    FileSystem filesystem(node, node.local_state(), store, metadata, node.resources.memory);
 
     filesystem.mkdir("/Music", 0755, getuid(), getgid());
 
@@ -4664,9 +4668,9 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node);
-    FileSystem filesystem(node, store, metadata, node.resources.memory);
+    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
+    MetadataManager metadata(node, node.local_state());
+    FileSystem filesystem(node, node.local_state(), store, metadata, node.resources.memory);
 
     filesystem.mkdir("/media", 0755, getuid(), getgid());
     filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());

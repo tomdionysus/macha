@@ -117,6 +117,7 @@ class DistributedStore final : public Placement {
     };
 
     NodeRuntime& n_;
+    LocalState& local_;
     ActivityClocks& activity_;
     DataResourceArbiter& data_resources_;
     RetainedMemoryLedger& retained_memory_;
@@ -281,7 +282,8 @@ class DistributedStore final : public Placement {
     void note_network(uint64_t, Clock::duration);
 
   public:
-    DistributedStore(NodeRuntime& n, ActivityClocks& activity, DataResourceArbiter& data_resources,
+    DistributedStore(NodeRuntime& n, LocalState& local, ActivityClocks& activity,
+                     DataResourceArbiter& data_resources,
                      RetainedMemoryLedger& retained_memory, NodeEvents& events,
                      DistributedStoreOptions options = {});
     ~DistributedStore();

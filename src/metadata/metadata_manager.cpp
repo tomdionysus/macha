@@ -53,17 +53,18 @@ bool bool_reply(const RpcReply& reply) {
 
 } // namespace
 
-MetadataManager::MetadataManager(NodeRuntime& node, DistributedStore* namespace_store,
+MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
+                                 DistributedStore* namespace_store,
                                  PublicationRetention publication_retention)
-    : node_(node), namespace_store_(namespace_store),
+    : node_(node), local_(local), namespace_store_(namespace_store),
       publication_retention_(std::move(publication_retention)) {
     if (!namespace_store_)
         return;
     // Replay writes nodes locally and replicates nothing: the commit reached
     // the floor when made, and rebuilding a local head must not depend on peers.
-    node_.metadata_replica().set_namespace_delta_applier(
+    local_.replica().set_namespace_delta_applier(
         [this](const ObjectId& root, const MetadataDelta& delta) {
-            auto nodes = ControlNamespaceNodeStore::for_replay(node_, *namespace_store_);
+            auto nodes = ControlNamespaceNodeStore::for_replay(local_.control(), *namespace_store_);
             return apply_delta_to_namespace_tree(root, nodes, delta);
         });
 }
@@ -266,7 +267,7 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
 
     // Decode only when the canonical record changes: rebuilding every
     // FsEntry/extent per cache refresh dominates namespace cost.
-    if (auto materialized = node_.metadata_replica().materialized(record.hash);
+    if (auto materialized = local_.replica().materialized(record.hash);
         materialized && materialized->record.generation == record.generation &&
         materialized->record.payload == record.payload)
         return cache_record(record, materialized->snapshot);
@@ -279,7 +280,7 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
     if (!cache_ || Clock::now() >= cache_until_ ||
         cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
-    if (node_.metadata_replica().committed_generation() > cache_->generation ||
+    if (local_.replica().committed_generation() > cache_->generation ||
         node_.remote_metadata_generation() > cache_->generation)
         return {};
     return cache_;
@@ -311,7 +312,7 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
         return {};
     if (cache_->generation != decoded_generation_ || cache_->hash != decoded_hash_)
         return {};
-    if (node_.metadata_replica().committed_generation() > decoded_generation_ ||
+    if (local_.replica().committed_generation() > decoded_generation_ ||
         node_.remote_metadata_generation() > decoded_generation_)
         return {};
     return coherent(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
@@ -320,7 +321,7 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
 
 bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash256& target,
                                                FrameType frame_type) {
-    auto& local = node_.metadata_replica();
+    auto& local = local_.replica();
     if (local.history_contains(target)) {
         // A peer's full checkpoint may lack an older part of its ancestry, so a
         // hole below a continuous suffix can make a real ancestor look rootless.
@@ -448,7 +449,7 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
 }
 
 size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
-    auto& local = node_.metadata_replica();
+    auto& local = local_.replica();
     const auto broken = local.unreconstructable_heads();
     if (broken.empty())
         return 0;
@@ -504,7 +505,7 @@ size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
 
 bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256& target,
                                             FrameType frame_type) {
-    auto& local = node_.metadata_replica();
+    auto& local = local_.replica();
     if (owner.id == node_.node_id())
         return local.history_contains(target);
     if (!local.history_contains(target))
@@ -667,8 +668,8 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
                                       FrameType frame_type) {
     if (owner.id == node_.node_id()) {
         if (compact.body != MetadataHistoryEntry::Body::delta)
-            return node_.metadata_replica().store_commit(record);
-        if (node_.metadata_replica().store_commit(record, compact.payload))
+            return local_.replica().store_commit(record);
+        if (local_.replica().store_commit(record, compact.payload))
             return true;
 
         // The full record is in the proposal. A compact body can be rejected for a
@@ -676,7 +677,7 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
         // body once, as remote replicas do.
         Log::warn("local metadata delta rejected; retrying full record generation=" +
                   std::to_string(record.generation));
-        return node_.metadata_replica().store_commit(record);
+        return local_.replica().store_commit(record);
     }
 
     try {
@@ -740,7 +741,7 @@ size_t MetadataManager::acceptance_floor_for(const MetadataRecord& record) const
     // Policy transitions are certified at the strongest policy on any parent
     // edge: this covers lowering the floor and merges with an older sibling.
     for (const auto& parent_hash : metadata_record_parents(record)) {
-        auto parent = node_.metadata_replica().materialized(parent_hash);
+        auto parent = local_.replica().materialized(parent_hash);
         if (!parent)
             throw MetadataNotReady("metadata commit parent unavailable for policy validation");
         required = std::max(required, snapshot_floor(*parent->snapshot));
@@ -871,7 +872,7 @@ bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
                                               const MetadataAcceptance& acceptance,
                                               FrameType frame_type) {
     if (owner.id == node_.node_id()) {
-        if (!node_.metadata_replica().store_commit(record))
+        if (!local_.replica().store_commit(record))
             return false;
         return node_.metadata_server().accept_commit(acceptance);
     }
@@ -887,7 +888,7 @@ bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
 void MetadataManager::ensure_accepted_head_durable(
     const std::vector<NodeInfo>& nodes, const MetadataRecord& record, size_t required,
     FrameType frame_type) {
-    auto acceptance = node_.metadata_replica().acceptance(record.hash);
+    auto acceptance = local_.replica().acceptance(record.hash);
     if (!acceptance)
         throw MetadataNotReady("metadata mutation is visible locally without acceptance certificate");
     if (acceptance->required != acceptance_floor_for(record))
@@ -937,7 +938,7 @@ bool MetadataManager::propose_history_floor_on(const NodeInfo& owner,
                                                const HistoryCheckpointProof& proposal,
                                                FrameType frame_type) {
     if (owner.id == node_.node_id())
-        return node_.metadata_replica().record_checkpoint_ack(proposal);
+        return local_.replica().record_checkpoint_ack(proposal);
     try {
         const auto encoded = encode_history_checkpoint_proof(proposal);
         return bool_reply(
@@ -951,7 +952,7 @@ bool MetadataManager::propose_history_floor_on(const NodeInfo& owner,
 bool MetadataManager::commit_history_floor_on(const NodeInfo& owner, const Hash256& floor_hash,
                                               const Hash256& epoch, FrameType frame_type) {
     if (owner.id == node_.node_id())
-        return node_.metadata_replica().record_checkpoint_commit(floor_hash, epoch);
+        return local_.replica().record_checkpoint_commit(floor_hash, epoch);
     try {
         HistoryCheckpointProof commit_message;
         commit_message.floor_hash = floor_hash;
@@ -972,16 +973,16 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
     // accepted-head state as read_group()/repair_once() do.
     std::unique_lock mutation_lock(mutation_mutex_);
 
-    const auto diagnostics = node_.metadata_replica().diagnostics();
+    const auto diagnostics = local_.replica().diagnostics();
     if (diagnostics.history_records < record_threshold &&
         diagnostics.history_file_bytes < byte_threshold)
         return;
-    if (node_.metadata_replica().recovery_required())
+    if (local_.replica().recovery_required())
         return;
 
     // Only with exactly one local accepted head and every known participant
     // directly reachable, as for destructive object GC.
-    auto local_heads = node_.metadata_replica().accepted_heads();
+    auto local_heads = local_.replica().accepted_heads();
     if (local_heads.size() != 1)
         return;
     if (!node_.membership().all_known_reachable())
@@ -1046,7 +1047,7 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
 
     // Commit locally first; if refused (a superseding proposal), broadcast
     // nothing.
-    if (!node_.metadata_replica().record_checkpoint_commit(*floor_hash, epoch))
+    if (!local_.replica().record_checkpoint_commit(*floor_hash, epoch))
         return;
 
     for (const auto& owner : participants) {
@@ -1059,7 +1060,7 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
 
     // Compact only once this replica's proof is committed;
     // compact_history_if_safe() re-validates its own preconditions.
-    if (node_.metadata_replica().compact_history_if_safe(record_threshold, byte_threshold))
+    if (local_.replica().compact_history_if_safe(record_threshold, byte_threshold))
         Log::info("metadata history checkpoint committed and compacted floor_generation=" +
                   std::to_string(floor_generation) + " floor_hash=" + to_string(*floor_hash) +
                   " participants=" + std::to_string(participants.size()));
@@ -1099,7 +1100,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             if (found != unacceptable_head_retry_at_.end() && Clock::now() < found->second)
                 continue;
         }
-        auto& local = node_.metadata_replica();
+        auto& local = local_.replica();
         std::vector<NodeInfo> history_sources = head.owners;
         for (const auto& certificate : head.certificates) {
             for (const auto& witness : certificate.replicas) {
@@ -1153,7 +1154,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     // seeing more than one head; heads are re-read once held.
     std::optional<std::unique_lock<std::mutex>> reconciliation_lock;
     for (;;) {
-        auto heads = node_.metadata_replica().accepted_heads();
+        auto heads = local_.replica().accepted_heads();
         if (heads.empty())
             throw MetadataNotReady("metadata accepted-head set is empty");
         std::sort(heads.begin(), heads.end(), [](const MetadataRecord& a,
@@ -1165,7 +1166,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
 
         if (heads.size() == 1) {
             auto selected = heads.front();
-            auto materialized = node_.metadata_replica().materialized(selected.hash);
+            auto materialized = local_.replica().materialized(selected.hash);
             if (!materialized)
                 throw MetadataNotReady("selected metadata head cannot be materialized");
             if (materialized->snapshot->extent_size &&
@@ -1192,21 +1193,21 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         auto left = heads[0];
         auto right = heads[1];
         const auto common =
-            node_.metadata_replica().history_common_ancestor(left.hash, right.hash);
+            local_.replica().history_common_ancestor(left.hash, right.hash);
         if (!common)
             throw MetadataNotReady("divergent metadata heads have no known common ancestor");
-        auto base_materialized = node_.metadata_replica().materialized(*common);
+        auto base_materialized = local_.replica().materialized(*common);
         if (!base_materialized)
             throw MetadataNotReady("metadata common ancestor cannot be reconstructed");
-        auto left_materialized = node_.metadata_replica().materialized(left.hash);
-        auto right_materialized = node_.metadata_replica().materialized(right.hash);
+        auto left_materialized = local_.replica().materialized(left.hash);
+        auto right_materialized = local_.replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
             throw MetadataNotReady("metadata merge head cannot be materialized");
         // The three-way merge is path-wise, so tree-backed branches are
         // materialised for it and the result re-rooted afterwards.
         auto namespace_nodes =
             namespace_store_ ? std::optional<ControlNamespaceNodeStore>(
-                                   ControlNamespaceNodeStore::for_reading(node_, *namespace_store_))
+                                   ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_))
                              : std::nullopt;
         const auto materialise = [&](const MetadataSnapshot& snapshot) {
             if (!snapshot.namespace_root)
@@ -1240,8 +1241,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (tree_backed) {
             if (!namespace_store_)
                 throw MetadataNotReady("no namespace node store is configured");
-            auto commit_nodes = ControlNamespaceNodeStore::for_commit(
-                node_, *namespace_store_, merged.snapshot.metadata_write_replicas_required);
+            auto commit_nodes = ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_, merged.snapshot.metadata_write_replicas_required);
             merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
         }
 
@@ -1382,7 +1382,7 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
         if (owner.id == node_.node_id()) {
             ++completed;
             durable_history = durable_history ||
-                              node_.metadata_replica().committed().generation > 1;
+                              local_.replica().committed().generation > 1;
             continue;
         }
         try {
@@ -1433,7 +1433,7 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
 MetadataRecord MetadataManager::discover_or_form() {
     const auto active = node_.membership().active();
     const size_t need = node_.config().metadata_min_write_replicas;
-    const auto local_snapshot = decode_snapshot(node_.metadata_replica().committed().payload);
+    const auto local_snapshot = decode_snapshot(local_.replica().committed().payload);
     if (local_snapshot.metadata_write_replicas_required &&
         local_snapshot.metadata_write_replicas_required != need)
         throw MetadataNotReady("local metadata write-floor policy does not match configuration");
@@ -1516,15 +1516,15 @@ MetadataRecord MetadataManager::read_record_base() {
     ids.reserve(active.size());
     for (const auto& peer : active)
         ids.push_back(peer.id);
-    if (node_.metadata_replica().committed().generation <= 1)
+    if (local_.replica().committed().generation <= 1)
         return discover_or_form();
     return read_group(ids, FrameType::control);
 }
 
 MetadataRecord MetadataManager::read_record_uncached() {
     auto record = maybe_reconfigure(read_record_base());
-    if (node_.metadata_replica().recovery_required())
-        node_.metadata_replica().mark_recovered();
+    if (local_.replica().recovery_required())
+        local_.replica().mark_recovered();
     return record;
 }
 
@@ -1536,9 +1536,9 @@ MetadataRecord MetadataManager::read_record() {
     } catch (const std::exception& error) {
         // Reads may use the last persisted local snapshot while the write floor is
         // unavailable; mutations never treat it as durable.
-        auto local = node_.metadata_replica().committed();
-        const auto heads = node_.metadata_replica().accepted_heads();
-        if (!node_.metadata_replica().recovery_required() && heads.size() == 1 &&
+        auto local = local_.replica().committed();
+        const auto heads = local_.replica().accepted_heads();
+        if (!local_.replica().recovery_required() && heads.size() == 1 &&
             heads.front().hash == local.hash && local.generation > 1) {
             (void)error;
             return cache_record(local);
@@ -1596,9 +1596,9 @@ MetadataSnapshot MetadataManager::snapshot() {
 }
 
 std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() const {
-    if (node_.metadata_replica().recovery_required())
+    if (local_.replica().recovery_required())
         return {};
-    const auto heads = node_.metadata_replica().accepted_heads();
+    const auto heads = local_.replica().accepted_heads();
     if (heads.size() != 1)
         return {};
 
@@ -1609,7 +1609,7 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
     if (current && current->hash == heads.front().hash)
         return current;
     try {
-        auto materialized = node_.metadata_replica().materialized(heads.front().hash);
+        auto materialized = local_.replica().materialized(heads.front().hash);
         if (!materialized)
             return {};
         // A refusal becomes "no view" below, which stops retention release
@@ -1639,16 +1639,16 @@ MetadataRecord MetadataManager::mutate_impl(
             throw MetadataNotReady("metadata write durability floor unavailable: too few policy-compatible replicas");
 
         MetadataRecord current;
-        auto local_heads = node_.metadata_replica().accepted_heads();
-        const bool recovering = node_.metadata_replica().recovery_required();
+        auto local_heads = local_.replica().accepted_heads();
+        const bool recovering = local_.replica().recovery_required();
         if (recovering || local_heads.empty() ||
             (local_heads.size() == 1 && local_heads.front().generation <= 1)) {
             current = read_record_uncached();
             if (recovering)
-                node_.metadata_replica().mark_recovered();
+                local_.replica().mark_recovered();
         } else if (local_heads.size() > 1 ||
                    node_.remote_metadata_generation() >
-                       node_.metadata_replica().committed_generation()) {
+                       local_.replica().committed_generation()) {
             // Reconciliation is not a prerequisite for a mutation: if the survey
             // cannot complete, use the local accepted head.
             try {
@@ -1660,10 +1660,10 @@ MetadataRecord MetadataManager::mutate_impl(
             } catch (const MetadataNotReady&) {
                 if (local_heads.size() > 1)
                     throw;
-                current = maybe_reconfigure(node_.metadata_replica().committed());
+                current = maybe_reconfigure(local_.replica().committed());
             }
         } else {
-            current = maybe_reconfigure(node_.metadata_replica().committed());
+            current = maybe_reconfigure(local_.replica().committed());
         }
 
         auto snapshot = decode_snapshot(current.payload);
@@ -1691,7 +1691,7 @@ MetadataRecord MetadataManager::mutate_impl(
                 seen == snapshot.mutation_sequences.end() ? 0 : seen->second;
             if (previous == std::numeric_limits<uint64_t>::max())
                 throw std::runtime_error("metadata mutation sequence exhausted");
-            sequence = node_.metadata_replica().reserve_mutation_sequence(previous);
+            sequence = local_.replica().reserve_mutation_sequence(previous);
         }
 
         std::optional<MetadataSnapshot> before;
@@ -1760,7 +1760,7 @@ MetadataRecord MetadataManager::mutate_impl(
             if (!namespace_store_)
                 throw MetadataNotReady("no namespace node store is configured");
             auto nodes =
-                ControlNamespaceNodeStore::for_commit(node_, *namespace_store_, need);
+                ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_, need);
             snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
                                                                     nodes, supplied_delta);
         }
@@ -1823,7 +1823,7 @@ MetadataRecord MetadataManager::mutate_impl(
             // acceptance notice has invalidated the cache, so do not install this
             // branch's snapshot. With W>=2 the later writer sees both heads; reconcile
             // synchronously so both mutations are visible once the writers return.
-            auto post_publish_heads = node_.metadata_replica().accepted_heads();
+            auto post_publish_heads = local_.replica().accepted_heads();
             if (post_publish_heads.size() > 1) {
                 std::vector<NodeId> ids;
                 ids.reserve(all_active.size());
@@ -1901,7 +1901,7 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
             // never be applied.
             auto nodes = namespace_store_
                              ? std::optional<ControlNamespaceNodeStore>(
-                                   ControlNamespaceNodeStore::for_reading(node_, *namespace_store_))
+                                   ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_))
                              : std::nullopt;
             NamespaceWorkingSet working(snapshot, delta, nodes ? &*nodes : nullptr);
             if (chosen)
@@ -1935,7 +1935,7 @@ void MetadataManager::repair_once() {
         throw MetadataNotReady("metadata replicas unavailable");
 
     MetadataRecord record;
-    if (node_.metadata_replica().committed().generation <= 1) {
+    if (local_.replica().committed().generation <= 1) {
         // Do not bypass virgin-cluster policy fencing: read_group() can filter
         // incompatible peers before a protocol-20 policy exists and let a
         // mismatched cohort form.
@@ -1947,7 +1947,7 @@ void MetadataManager::repair_once() {
             ids.push_back(peer.id);
         record = maybe_reconfigure(read_group(ids, FrameType::speculative));
     }
-    auto acceptance = node_.metadata_replica().acceptance(record.hash);
+    auto acceptance = local_.replica().acceptance(record.hash);
     if (!acceptance)
         throw MetadataNotReady("selected metadata head has no acceptance certificate");
 
@@ -1969,10 +1969,10 @@ void MetadataManager::repair_once() {
     mutation_lock.lock();
     if (converged < active.size())
         throw MetadataNotReady("metadata accepted-head replication incomplete");
-    if (node_.metadata_replica().committed_generation() > selected_generation)
+    if (local_.replica().committed_generation() > selected_generation)
         return;
 
-    auto materialized = node_.metadata_replica().materialized(record.hash);
+    auto materialized = local_.replica().materialized(record.hash);
     if (!materialized)
         throw MetadataNotReady("metadata repair head cannot be materialized");
     auto snapshot = *materialized->snapshot;
@@ -2010,7 +2010,7 @@ void MetadataManager::repair_once() {
         const auto found = snapshot.mutation_sequences.find(origin);
         const uint64_t previous_sequence =
             found == snapshot.mutation_sequences.end() ? 0 : found->second;
-        const auto sequence = node_.metadata_replica().reserve_mutation_sequence(previous_sequence);
+        const auto sequence = local_.replica().reserve_mutation_sequence(previous_sequence);
 
         auto baseline = snapshot;
         baseline.retention_baseline_complete = true;
@@ -2052,7 +2052,7 @@ void MetadataManager::repair_once() {
     // Retention release follows each node's sole accepted head and causal
     // clock; unknown concurrent claim dots survive.
 
-    node_.metadata_replica().compact();
+    local_.replica().compact();
     cache_record(record, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
 
@@ -2061,7 +2061,7 @@ MetadataManager::entries(const MetadataSnapshotView& view, Cursor<std::string> f
                          Budget& budget) {
     if (!namespace_store_)
         return namespace_entries(*view.snapshot, nullptr, std::move(from), budget);
-    auto nodes = ControlNamespaceNodeStore::for_reading(node_, *namespace_store_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_);
     return namespace_entries(*view.snapshot, &nodes, std::move(from), budget);
 }
 

@@ -200,7 +200,7 @@ MACHA_TEST("namespace_entries", test_the_metadata_view_pages_a_live_namespace) {
     MetadataView& metadata = service.metadata_manager();
     const auto view = metadata.converged();
 
-    auto nodes = ControlNamespaceNodeStore::for_reading(service.node(), service.filesystem().store());
+    auto nodes = ControlNamespaceNodeStore::for_reading(service.local_state().control(), service.filesystem().store());
     const auto expected = by_callback(*view.snapshot, &nodes);
     CHECK(expected.size() >= 12);
     std::vector<NamespaceItem> paged;
@@ -243,7 +243,7 @@ MACHA_TEST("namespace_entries", test_a_manager_without_a_store_pages_a_map_backe
     macha::test_support::TestNode fixture("entries-no-store");
     fixture.prepare();
     auto& node = fixture.start();
-    MetadataManager metadata(node);
+    MetadataManager metadata(node, node.local_state());
     MetadataSnapshot snapshot;
     snapshot.entries = namespace_of(9);
     const MetadataSnapshotView view{1, 0, Hash256{},

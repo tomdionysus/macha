@@ -20,10 +20,10 @@ class TorrentSubsystem final : public Subsystem {
 
   public:
     TorrentSubsystem(SubsystemRegistry& registry, MessageRoutes& routes, NodeRuntime& node,
-                     DataResourceArbiter& data_resources, IngestManager& ingest,
+                     LocalState& local, DataResourceArbiter& data_resources, IngestManager& ingest,
                      TorrentConfig config, const std::filesystem::path& state_path)
         : registry_(registry), routes_(routes),
-          manager_(std::make_shared<TorrentManager>(node, data_resources, ingest,
+          manager_(std::make_shared<TorrentManager>(node, local, data_resources, ingest,
                                                     std::move(config), state_path)) {
         // Published at construction, which makes the engine usable; start()
         // only runs the worker. A failed start destroys this, withdrawing it.
@@ -69,9 +69,9 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
         macha::kBuildIdentity,
         [](const macha::SubsystemContext& context) -> std::unique_ptr<macha::Subsystem> {
             if (!context.config || !context.node || !context.data_resources ||
-                !context.ingest || !context.registry || !context.routes)
+                !context.ingest || !context.registry || !context.routes || !context.local_state)
                 throw std::runtime_error("torrent subsystem requires config, node, DATA "
-                                         "resources, ingest, registry and routes in its "
+                                         "resources, ingest, registry, routes and local state in its "
                                          "context");
             if (!context.config->torrent.enabled) {
                 // Disabled, not a fault: no instance, and no supervisor retry.
@@ -79,7 +79,8 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
                 return {};
             }
             return std::make_unique<macha::TorrentSubsystem>(
-                *context.registry, *context.routes, *context.node, *context.data_resources,
+                *context.registry, *context.routes, *context.node, *context.local_state,
+                *context.data_resources,
                 *context.ingest,
                 context.config->torrent,
                 context.config->state_path);

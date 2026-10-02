@@ -68,14 +68,14 @@ struct Node {
         node.emplace(config, cluster.keys());
         node->start();
         REQUIRE(node->wait_local_state_ready(10s));
-        store.emplace(*node, node->resources.activity, node->resources.data, node->resources.memory, node->resources.events);
+        store.emplace(*node, node->local_state(), node->resources.activity, node->resources.data, node->resources.memory, node->resources.events);
     }
 };
 
 MACHA_TEST("catalogue_maintenance", test_a_repair_that_cannot_read_metadata_reports_failure) {
     Node fixture;
     FakeMetadataView metadata;
-    CatalogueManager catalogue(*fixture.node, *fixture.store, metadata);
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), *fixture.store, metadata);
     CHECK(!catalogue.maintenance_repair());
     // The head taken against no metadata is not current.
     const auto head = catalogue.maintenance_head();
@@ -92,7 +92,7 @@ MACHA_TEST("catalogue_maintenance", test_the_read_is_complete_only_when_the_repa
     const auto known = fixture.node->known_metadata_generation();
     metadata.view =
         MetadataSnapshotView{known, 0, Hash256{}, std::make_shared<const MetadataSnapshot>()};
-    CatalogueManager catalogue(*fixture.node, *fixture.store, metadata);
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), *fixture.store, metadata);
     const auto head = catalogue.maintenance_head();
     CHECK(head.current);
     CHECK(catalogue.maintenance_repair());
@@ -115,7 +115,7 @@ MACHA_TEST("catalogue_maintenance", test_a_head_behind_the_known_generation_read
                                          std::make_shared<const MetadataSnapshot>()};
     metadata.after_record = MetadataSnapshotView{known, 0, Hash256{},
                                                  std::make_shared<const MetadataSnapshot>()};
-    CatalogueManager catalogue(*fixture.node, *fixture.store, metadata);
+    CatalogueManager catalogue(*fixture.node, fixture.node->local_state(), *fixture.store, metadata);
     const auto head = catalogue.maintenance_head();
     CHECK(head.current);
     CHECK(head.generation == known);

@@ -30,6 +30,7 @@ class NodeRuntime;
 class DataResourceArbiter;
 class RetainedMemoryLedger;
 class MessageRoutes;
+class LocalState;
 class SubsystemRegistry;
 
 // The core references a subsystem may use: `node` and `ingest` for Torrent,
@@ -42,6 +43,7 @@ struct SubsystemContext {
     DataResourceArbiter* data_resources{};
     RetainedMemoryLedger* retained_memory{};
     MessageRoutes* routes{};
+    LocalState* local_state{};
     IngestManager* ingest{};
     SubsystemRegistry* registry{};
     FileSystem* filesystem{};

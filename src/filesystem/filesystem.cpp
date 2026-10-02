@@ -1316,7 +1316,7 @@ void WriteHandle::commit() {
             // generation must be replayed from the WAL. Never retry the batch.
             bool reput_all = !unsatisfiable.empty();
             for (const auto& id : unsatisfiable) {
-                const auto data = fs_.node().local_store().get(id);
+                const auto data = fs_.local_.data().get(id);
                 if (!data) {
                     reput_all = false;
                     break;
@@ -1436,9 +1436,9 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
-FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataView& m,
+FileSystem::FileSystem(NodeRuntime& n, LocalState& local, DistributedStore& s, MetadataView& m,
                        RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
-    : n_(n), retained_memory_(retained_memory), s_(s), m_(m), playback_(playback) {
+    : n_(n), local_(local), retained_memory_(retained_memory), s_(s), m_(m), playback_(playback) {
     extent_worker_limit_ = std::max<size_t>(1, n_.config().fuse.commit_workers);
     extent_task_limit_ = extent_worker_limit_ * 2;
     extent_workers_.reserve(extent_worker_limit_);
@@ -1529,7 +1529,7 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
     built->generation = view.generation;
     built->hash = view.hash;
     built->snapshot = std::move(view.snapshot);
-    auto index_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    auto index_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     for_each_namespace_entry(*built->snapshot, &index_nodes,
                              [&](const std::string& path, const FsEntry&) {
         const auto canonical = macos_fuse_composed_name(path);
@@ -1555,7 +1555,7 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
 std::optional<std::string> FileSystem::resolve_existing_path(const std::string& p) {
     const auto q = normalize_path(p);
     auto index = namespace_index();
-    auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     // Existence only, no copy or extent fetch: every FUSE lookup passes here.
     if (namespace_contains(*index->snapshot, &nodes, q))
         return q;
@@ -1600,7 +1600,7 @@ FsEntry FileSystem::getattr(const std::string& p) {
     auto resolved = resolve_existing_path(p);
     if (!resolved)
         fail(ENOENT, "not found");
-    auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     // With extents: a caller reading `extents` off a stat-only entry would
     // silently see an empty list.
     auto found = namespace_entry(*index->snapshot, &nodes, *resolved);
@@ -1614,7 +1614,7 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
         fail(ENOENT, "not found");
     auto q = *resolved;
     auto index = namespace_index();
-    auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     // Stat-only: only the type matters.
     auto entry = namespace_entry(*index->snapshot, &nodes, q, false);
     if (!entry)
@@ -1802,7 +1802,7 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
     FilesystemNamespaceBatchResult result;
     result.entries.resize(operations.size());
     result.record = m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
         NamespaceWorkingSet working(snapshot, delta, &nodes);
         result.applied = 0;
         result.failure_code.reset();
@@ -2019,7 +2019,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         if (media_index_valid_ && media_index_snapshot_) {
             auto found = media_index_.find(std::string(id));
             if (found != media_index_.end()) {
-                auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+                auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
                 auto entry = namespace_entry(*media_index_snapshot_, &nodes, found->second);
                 if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
                     return std::pair{found->second, *entry};
@@ -2035,7 +2035,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         if (media_index_valid_ && media_index_snapshot_) {
             auto found = media_index_.find(std::string(id));
             if (found != media_index_.end()) {
-                auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+                auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
                 auto entry = namespace_entry(*media_index_snapshot_, &nodes, found->second);
                 if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
                     return std::pair{found->second, *entry};
@@ -2046,7 +2046,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
 
         std::map<std::string, std::string> next;
         // Full pass with extents: file_media_id hashes the extent list.
-        auto index_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        auto index_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
         for_each_namespace_entry(*view.snapshot, &index_nodes,
                                  [&](const std::string& path, const FsEntry& entry) {
             if (entry.type != EntryType::file)
@@ -2065,7 +2065,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         auto found = media_index_.find(std::string(id));
         if (found == media_index_.end())
             return {};
-        auto lookup_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        auto lookup_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
         auto entry = namespace_entry(*media_index_snapshot_, &lookup_nodes, found->second);
         if (!entry || entry->type != EntryType::file)
             return {};
@@ -2214,7 +2214,7 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
     auto q = normalize_path(p);
     FsEntry committed;
     m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
-        auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+        auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
         NamespaceWorkingSet working(s, delta, &nodes);
         // With extents: compared against the basis, and dropped ones retired.
         auto entry = working.get(q);
@@ -2272,14 +2272,14 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         *out = std::move(committed);
 }
 MetadataSnapshot FileSystem::local_snapshot() const {
-    const auto record = n_.metadata_replica().current();
+    const auto record = local_.replica().current();
     if (!valid_metadata_record(record))
         throw std::runtime_error("local metadata replica unavailable");
     return decode_snapshot(record.payload);
 }
 
 MetadataSnapshotView FileSystem::local_snapshot_view() {
-    const auto record = n_.metadata_replica().current();
+    const auto record = local_.replica().current();
     if (!valid_metadata_record(record))
         throw std::runtime_error("local metadata replica unavailable");
 
@@ -2288,7 +2288,7 @@ MetadataSnapshotView FileSystem::local_snapshot_view() {
         local_snapshot_hash_ != record.hash) {
         local_snapshot_generation_ = record.generation;
         local_snapshot_hash_ = record.hash;
-        if (auto materialized = n_.metadata_replica().materialized(record.hash);
+        if (auto materialized = local_.replica().materialized(record.hash);
             materialized && materialized->record.generation == record.generation &&
             materialized->record.payload == record.payload) {
             local_snapshot_cache_ = materialized->snapshot;
@@ -2312,8 +2312,8 @@ std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     // Membership may be empty or lack capacities just after start; never
     // report less than this node's own store.
     const auto local_fallback = [&]() -> std::pair<uint64_t, uint64_t> {
-        const uint64_t limit = n_.local_store().limit();
-        const uint64_t used = std::min(limit, n_.local_store().used());
+        const uint64_t limit = local_.data().limit();
+        const uint64_t used = std::min(limit, local_.data().used());
         return {limit, used};
     };
     if (ns.empty())
@@ -2373,7 +2373,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     // The reachability walk GC trusts. for_each_namespace_entry walks a
     // tree-backed namespace; an empty live set would make every extent look
     // unreachable.
-    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
+    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     size_t walked_entries = 0;
     for_each_namespace_entry(snapshot, &namespace_nodes,
                              [&](const std::string&, const FsEntry& entry) {
