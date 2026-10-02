@@ -350,6 +350,29 @@ NodeReadiness NodeRuntime::readiness() const {
     return out;
 }
 
+void NodeRuntime::advertise_storage(uint64_t used, uint64_t capacity) {
+    members_.storage(used, capacity);
+    advertised_storage_used_.store(used, std::memory_order_relaxed);
+    advertised_storage_capacity_.store(capacity, std::memory_order_relaxed);
+}
+
+void NodeRuntime::advertise_storage_backends(uint32_t online) {
+    advertised_backends_online_.store(online, std::memory_order_relaxed);
+}
+
+void NodeRuntime::advertise_metadata_generation(uint64_t generation) {
+    members_.metadata_generation(generation);
+    advertised_metadata_generation_.store(generation, std::memory_order_relaxed);
+}
+
+void NodeRuntime::advertise_cache(uint64_t capacity, uint64_t used, const CacheActivity& activity) {
+    advertised_cache_capacity_.store(capacity, std::memory_order_relaxed);
+    advertised_cache_used_.store(used, std::memory_order_relaxed);
+    advertised_cache_hits_.store(activity.hits, std::memory_order_relaxed);
+    advertised_cache_misses_.store(activity.misses, std::memory_order_relaxed);
+    advertised_cache_evictions_.store(activity.evictions, std::memory_order_relaxed);
+}
+
 bool NodeRuntime::wait_local_state_ready(std::chrono::milliseconds timeout) {
     if (all_local_state_ready())
         return true;
@@ -438,10 +461,9 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
                       std::to_string(cfg_.io_pressure_outlier_percent) + " min_background=" +
                       std::to_string(cfg_.io_pressure_min_background));
         }
-        members_.storage(used, capacity);
+        advertise_storage(used, capacity);
+        advertise_storage_backends(static_cast<uint32_t>(local_->online_backends()));
         server_.set_local(members_.self());
-        telemetry_storage_used_.store(used, std::memory_order_relaxed);
-        telemetry_storage_capacity_.store(capacity, std::memory_order_relaxed);
         mark_ready(ready_data_storage);
         // An edge node runs an empty pool, so local_store() callers need no
         // special case. Said explicitly, or capacity=0 reads like a missing disk.
@@ -500,9 +522,8 @@ void NodeRuntime::recover_state(std::stop_token stop) {
 
         cache_->remember_metadata(meta_->committed());
         const auto generation = meta_->committed().generation;
-        members_.metadata_generation(generation);
+        advertise_metadata_generation(generation);
         server_.set_local(members_.self());
-        telemetry_metadata_generation_.store(generation, std::memory_order_relaxed);
         mark_ready(ready_metadata);
         Log::info("node metadata ready generation=" + std::to_string(generation));
     } catch (const std::exception& error) {
@@ -924,7 +945,7 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     metadata_announcements_.fetch_add(1, std::memory_order_relaxed);
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
     events_.notify(NodeEvent::metadata);
-    members_.metadata_generation(generation);
+    advertise_metadata_generation(generation);
     server_.set_local(members_.self());
     Writer writer;
     writer.u64(generation);
@@ -953,7 +974,7 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
     if (!metadata_replica().accept_commit(acceptance, &heads_changed))
         return false;
     const auto after = metadata_replica().committed();
-    members_.metadata_generation(std::max(after.generation, acceptance.generation));
+    advertise_metadata_generation(std::max(after.generation, acceptance.generation));
     // Decided under the replica lock: comparing copies taken around the call
     // would count a concurrent acceptance and announce a commit twice.
     if (!heads_changed)
@@ -1243,7 +1264,7 @@ void NodeRuntime::bind_storage_routes() {
                 const auto generation = local_store().put_deferred(id, data);
                 if (!generation)
                     return error_reply("storage limit reached");
-                members_.storage(local_store().used(), local_store().limit());
+                advertise_storage(local_store().used(), local_store().limit());
                 // Bind provisional placement to this process lifetime and
                 // node-wide mutation generation. A later barrier for a covered
                 // generation is a no-op even with newer writes dirty here.
@@ -1256,7 +1277,7 @@ void NodeRuntime::bind_storage_routes() {
             }
             if (!local_store().put(id, data))
                 return error_reply("storage limit reached");
-            members_.storage(local_store().used(), local_store().limit());
+            advertise_storage(local_store().used(), local_store().limit());
             return {MessageType::ok, {}};
         };
         route(MessageType::put_object, handler);
@@ -1324,13 +1345,13 @@ void NodeRuntime::bind_storage_routes() {
                             std::to_string(probe_ids.size()) +
                             " expected=" + to_string(expected_epoch).substr(0, 8) +
                             " current=" + to_string(identity_.durability_epoch).substr(0, 8));
-                  members_.storage(local_store().used(), local_store().limit());
+                  advertise_storage(local_store().used(), local_store().limit());
                   return {MessageType::ok, reply.take()};
               }
               try {
                   local_store().durability_barrier({domain, required_generation, backend_instance},
                                                    DurabilityUrgency::batchable);
-                  members_.storage(local_store().used(), local_store().limit());
+                  advertise_storage(local_store().used(), local_store().limit());
                   return {MessageType::ok, {}};
               } catch (const std::exception& error) {
                   return error_reply(std::string("storage durability barrier failed: ") +
@@ -1390,7 +1411,7 @@ void NodeRuntime::bind_storage_routes() {
               (void)local_store().remove(id);
               if (ready(ready_cache))
                   (void)block_cache().remove(id);
-              members_.storage(local_store().used(), local_store().limit());
+              advertise_storage(local_store().used(), local_store().limit());
               return {MessageType::ok, {}};
           });
 }
@@ -1580,23 +1601,17 @@ void NodeRuntime::refresh_telemetry() {
     // Telemetry runs during recovery: unready planes report zero capacity and
     // usage rather than the node vanishing from the cluster.
     auto info = members_.self();
-    info.used = telemetry_storage_used_.load(std::memory_order_relaxed);
-    info.capacity = telemetry_storage_capacity_.load(std::memory_order_relaxed);
-    info.metadata_generation = telemetry_metadata_generation_.load(std::memory_order_relaxed);
-    uint64_t cache_capacity = 0;
-    uint64_t cache_used = 0;
-    uint32_t storage_backends_online = 0;
+    info.used = advertised_storage_used_.load(std::memory_order_relaxed);
+    info.capacity = advertised_storage_capacity_.load(std::memory_order_relaxed);
+    info.metadata_generation = advertised_metadata_generation_.load(std::memory_order_relaxed);
+    const auto cache_capacity = advertised_cache_capacity_.load(std::memory_order_relaxed);
+    const auto cache_used = advertised_cache_used_.load(std::memory_order_relaxed);
+    const auto storage_backends_online =
+        advertised_backends_online_.load(std::memory_order_relaxed);
     CacheActivity cache_activity;
-    if (ready(ready_cache) && cache_) {
-        cache_capacity = static_cast<uint64_t>(cfg_.cache.max_blocks) * cfg_.extent_size;
-        cache_used = static_cast<uint64_t>(cache_->blocks()) * cfg_.extent_size;
-        const auto stats = cache_->stats();
-        cache_activity.hits = stats.hits;
-        cache_activity.misses = stats.misses;
-        cache_activity.evictions = stats.evictions;
-    }
-    if (ready(ready_data_storage) && local_)
-        storage_backends_online = static_cast<uint32_t>(local_->online_backends());
+    cache_activity.hits = advertised_cache_hits_.load(std::memory_order_relaxed);
+    cache_activity.misses = advertised_cache_misses_.load(std::memory_order_relaxed);
+    cache_activity.evictions = advertised_cache_evictions_.load(std::memory_order_relaxed);
     const auto peers_known = telemetry_peers_known_.load(std::memory_order_relaxed);
     const auto peers_active = telemetry_peers_active_.load(std::memory_order_relaxed);
 
@@ -1887,17 +1902,17 @@ void NodeRuntime::loop(std::stop_token stop) {
             if (refresh_ms >= 100 && Log::enabled(LogLevel::all))
                 Log::trace("DIAG node-stage stage=storage-refresh elapsed_ms=" +
                            std::to_string(refresh_ms));
-            const auto storage_used = local_->used();
-            const auto storage_capacity = local_->limit();
-            members_.storage(storage_used, storage_capacity);
-            telemetry_storage_used_.store(storage_used, std::memory_order_relaxed);
-            telemetry_storage_capacity_.store(storage_capacity, std::memory_order_relaxed);
+            advertise_storage(local_->used(), local_->limit());
+            advertise_storage_backends(static_cast<uint32_t>(local_->online_backends()));
         }
-        if (ready(ready_metadata) && meta_) {
-            const auto metadata_generation = meta_->generation();
-            members_.metadata_generation(metadata_generation);
-            telemetry_metadata_generation_.store(metadata_generation, std::memory_order_relaxed);
+        if (ready(ready_cache) && cache_) {
+            const auto stats = cache_->stats();
+            advertise_cache(static_cast<uint64_t>(cfg_.cache.max_blocks) * cfg_.extent_size,
+                            static_cast<uint64_t>(cache_->blocks()) * cfg_.extent_size,
+                            CacheActivity{stats.hits, stats.misses, stats.evictions});
         }
+        if (ready(ready_metadata) && meta_)
+            advertise_metadata_generation(meta_->generation());
 
         std::set<std::pair<std::string, uint16_t>> exchanged;
         const auto known_nodes = members_.all();
@@ -1963,6 +1978,6 @@ void NodeRuntime::reconfigure_local(const Config& config) {
     cfg_.cache = updated.cache;
     cfg_.hydration = updated.hydration;
     cfg_.read_ahead_extents = updated.read_ahead_extents;
-    members_.storage(local_store().used(), local_store().limit());
+    advertise_storage(local_store().used(), local_store().limit());
 }
 } // namespace macha

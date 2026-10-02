@@ -2877,7 +2877,7 @@ void DistributedStore::local_writer_loop(std::stop_token stop) {
         if (job.promote && (!job.cache || !cached)) {
             auto& local = n_.local_store();
             (void)local.put(job.id, job.data);
-            n_.membership().storage(local.used(), local.limit());
+            n_.advertise_storage(local.used(), local.limit());
         }
         cpu_reporter.tick();
     }
