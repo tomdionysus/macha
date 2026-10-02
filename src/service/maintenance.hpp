@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "metadata/metadata_server.hpp"
 #include "catalogue/catalogue.hpp"
 #include "catalogue/media_information.hpp"
 #include "cluster/cluster.hpp"

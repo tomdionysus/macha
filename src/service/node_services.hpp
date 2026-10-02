@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "metadata/metadata_server.hpp"
 #include "acquisition/ingest.hpp"
 #include "api/acquisition_api.hpp"
 #include "api/catalogue_api.hpp"
@@ -74,7 +75,8 @@ struct NodeServicesInstruments {
 
 class NodeServices {
   public:
-    NodeServices(NodeRuntime&, NodeResources&, MessageRoutes&, SubsystemRegistry&, MaintenancePort&,
+    NodeServices(NodeRuntime&, NodeResources&, LocalState&, MetadataServer&, MessageRoutes&,
+                 SubsystemRegistry&, MaintenancePort&,
                  NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
@@ -117,6 +119,8 @@ class NodeServices {
 
     NodeRuntime& node_;
     NodeResources& resources_;
+    LocalState& local_;
+    MetadataServer& metadata_server_;
     MessageRoutes& routes_;
     SubsystemRegistry& registry_;
     MaintenancePort& port_;

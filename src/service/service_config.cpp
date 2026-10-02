@@ -36,6 +36,10 @@ void Service::reload_config() {
         updated.streaming.probe_timeout != current_streaming.probe_timeout;
     Log::set_logger(std::make_shared<ConsoleLogger>(updated.log_level));
     configure_ffmpeg_logging(updated.ffmpeg_log_level);
+    if (!progress_.complete())
+        throw std::runtime_error("node local state is still recovering");
+    local_->state().reconfigure(updated);
+    local_->storage().refresh();
     node_.reconfigure_local(updated);
     if (services_ready_.load(std::memory_order_acquire))
         services_->reconfigure(updated);

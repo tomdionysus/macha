@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "metadata/metadata_server.hpp"
 #include "api/acquisition_api.hpp"
 #include "catalogue/catalogue.hpp"
 #include "api/catalogue_api.hpp"
@@ -22,6 +23,7 @@
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
 #include "service/node_services.hpp"
+#include "cluster/local_services.hpp"
 #include "cluster/node_resources.hpp"
 #include <atomic>
 #include <condition_variable>
@@ -71,6 +73,8 @@ class Service {
     RecoveryProgress progress_;
     // Inbound requests by message type; each part binds what it answers.
     MessageRoutes routes_;
+    // Local recovery's stages, reported as the node's are.
+    LocalState::StageHook recovery_stage_hook_;
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin and FUSE as a supervised builtin. Each publishes
@@ -88,6 +92,9 @@ class Service {
     // The node's composition root (see node_services.hpp), built once local
     // state has recovered. Set once by the startup thread; published by
     // services_ready_.
+    // Local state and the servers built from it, by the startup thread once
+    // the control plane is online; published by progress_'s completion.
+    std::unique_ptr<LocalServices> local_;
     std::unique_ptr<NodeServices> services_;
 
     std::jthread startup_;
@@ -140,10 +147,12 @@ class Service {
         return resources_;
     }
     LocalState& local_state() {
-        return node_.local_state();
+        wait_services_ready();
+        return local_->state();
     }
     MetadataServer& metadata_server() {
-        return node_.metadata_server();
+        wait_services_ready();
+        return local_->metadata();
     }
     MetadataManager& metadata_manager() {
         wait_services_ready();

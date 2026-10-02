@@ -6,13 +6,11 @@
 #include "cluster/data_work.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
-#include "cluster/storage_server.hpp"
 #include "cluster/local_state.hpp"
 #include "cluster/node_identity.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
 #include "metadata/metadata.hpp"
-#include "metadata/metadata_server.hpp"
 #include "cluster/net.hpp"
 #include "storage/persistent_cache.hpp"
 #include "cluster/public_connectivity.hpp"
@@ -73,8 +71,6 @@ class NodeRuntime {
     // Owned by the root; the node reads it for readiness and telemetry.
     RecoveryProgress& progress_;
     // Owned by the root (NodeResources), which stops them before this node.
-    ActivityClocks& activity_;
-    DataResourceArbiter& data_resources_;
     RetainedMemoryLedger& retained_memory_;
     // Playback records, telemetry publishes.
     TranscodeRateBook& transcode_rates_;
@@ -109,17 +105,9 @@ class NodeRuntime {
     RpcClient client_;
     RpcServer server_;
 
-    // Recovered by local_recovery_; published, with its servers, by
-    // progress_'s completion.
-    std::unique_ptr<LocalState> local_state_;
-    // Built with the replica, so its routes answer from then on.
-    std::unique_ptr<MetadataServer> metadata_server_;
-    // Built when the last local plane recovers, so its routes answer from then.
-    std::unique_ptr<StorageServer> storage_server_;
     StartupStageHook startup_stage_hook_;
     std::atomic_bool control_plane_online_{};
     uint64_t startup_unix_ms_{};
-    std::jthread local_recovery_;
     std::jthread connectivity_worker_;
     std::mutex connectivity_wait_mutex_;
     std::condition_variable_any connectivity_wait_cv_;
@@ -156,7 +144,6 @@ class NodeRuntime {
     std::atomic_bool outbound_calls_stopped_{};
 
 
-    void recover_local(std::stop_token);
     bool all_local_state_ready() const noexcept;
 
     void bind_control_routes();
@@ -174,14 +161,13 @@ class NodeRuntime {
     void exchange(const NodeInfo&);
     void merge(std::span<const uint8_t>);
     void refresh_telemetry();
-    void signal_telemetry_refresh();
     void telemetry_loop(std::stop_token);
     std::chrono::milliseconds stall_notice_for(MessageType) const;
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
-    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
+    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, RetainedMemoryLedger&,
                 TranscodeRateBook&, MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
@@ -211,19 +197,12 @@ class NodeRuntime {
     NodeId durability_epoch() const {
         return identity_.durability_epoch;
     }
-    StoragePool& local_store();
-    const StoragePool& local_store() const;
-    LocalStore& control_store();
-    const LocalStore& control_store() const;
-    PersistentBlockCache& block_cache();
-    // The object ledger's claimed half. Throws while retention is recovering.
-    ClaimStore& claims();
-    const ClaimStore& claims() const;
-    MetadataReplica& metadata_replica();
-    MetadataServer& metadata_server();
-    // Throws until local state has recovered.
-    LocalState& local_state();
-    const MetadataReplica& metadata_replica() const;
+    // Republishes this node's NodeInfo (storage figures, metadata
+    // generation) to peers that connect; owners call it after advertising.
+    void publish_self();
+    // Republishes telemetry now rather than at the next sample, e.g. when
+    // the node's phase changes.
+    void signal_telemetry_refresh();
     Membership& membership() {
         return members_;
     }
@@ -290,12 +269,6 @@ class NodeRuntime {
     }
     uint64_t metadata_announcements() const {
         return metadata_announcements_.load(std::memory_order_acquire);
-    }
-    uint64_t known_metadata_generation() const {
-        const auto local =
-            progress_.complete() ? metadata_server_->known_generation() : 0;
-        const auto remote = remote_metadata_generation_.load();
-        return local > remote ? local : remote;
     }
     bool apply_identity_reset(const IdentityAssociationReset&);
     void propagate_identity_reset(const IdentityAssociationReset&);

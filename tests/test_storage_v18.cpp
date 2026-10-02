@@ -888,7 +888,8 @@ class StorageClusterNode {
         node_.reset();
         started_ = false;
     }
-    NodeRuntime& node() { REQUIRE(node_); return *node_; }
+    BareNode& node() { REQUIRE(node_); return *node_; }
+    LocalState& local_state() { REQUIRE(node_); return node_->local_state(); }
     DistributedStore& store() { REQUIRE(store_); return *store_; }
     MetadataManager& metadata() { REQUIRE(metadata_); return *metadata_; }
     CatalogueManager& catalogue() { REQUIRE(catalogue_); return *catalogue_; }
@@ -1023,12 +1024,12 @@ MACHA_TEST("storage_v18", test_distributed_r1_spills_preferred_full_node_to_next
                large.node().membership().active().size() == 2;
     }, 5s));
 
-    fill_data_store(small.node().local_store());
+    fill_data_store(small.local_state().data());
     auto data = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 77);
     const auto id = object_id(data);
     REQUIRE(large.store().put(id, data));
-    CHECK(!small.node().local_store().has(id));
-    CHECK(large.node().local_store().has(id));
+    CHECK(!small.local_state().data().has(id));
+    CHECK(large.local_state().data().has(id));
     REQUIRE(large.store().get(id).has_value());
     CHECK(*large.store().get(id) == data);
 }
@@ -1056,7 +1057,7 @@ MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replic
                c.node().membership().active().size() == 3;
     }, 5s));
 
-    fill_data_store(a.node().local_store());
+    fill_data_store(a.local_state().data());
     Bytes data;
     std::vector<NodeInfo> order;
     for (unsigned i = 0; i < 4096; ++i) {
@@ -1069,9 +1070,9 @@ MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replic
     REQUIRE(order.front().id == a.node().node_id());
     const auto id = object_id(data);
     REQUIRE(b.store().put(id, data));
-    CHECK(!a.node().local_store().has(id));
-    const unsigned copies = static_cast<unsigned>(b.node().local_store().has(id)) +
-                            static_cast<unsigned>(c.node().local_store().has(id));
+    CHECK(!a.local_state().data().has(id));
+    const unsigned copies = static_cast<unsigned>(b.local_state().data().has(id)) +
+                            static_cast<unsigned>(c.local_state().data().has(id));
     CHECK(copies == 2);
 }
 
@@ -1086,7 +1087,7 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
     auto data = pattern(256 * 1024, 42);
     const auto id = object_id(data);
     REQUIRE(first.store().put(id, data));
-    CHECK(first.node().local_store().has(id));
+    CHECK(first.local_state().data().has(id));
 
     auto second_config = storage_node_config(
         cluster, "second", second_port, 8ULL * 1024 * 1024, 2, 1,
@@ -1097,16 +1098,16 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
         return first.node().membership().active().size() == 2 &&
                second.node().membership().active().size() == 2;
     }, 5s));
-    CHECK(!second.node().local_store().has(id));
+    CHECK(!second.local_state().data().has(id));
 
     const std::vector<ObjectId> live{id};
     REQUIRE(wait_until([&] {
         first.store().repair_once(4ULL * 1024 * 1024, live);
         second.store().repair_once(4ULL * 1024 * 1024, live);
-        return first.node().local_store().has(id) && second.node().local_store().has(id);
+        return first.local_state().data().has(id) && second.local_state().data().has(id);
     }, 5s));
-    REQUIRE(second.node().local_store().get(id).has_value());
-    CHECK(*second.node().local_store().get(id) == data);
+    REQUIRE(second.local_state().data().get(id).has_value());
+    CHECK(*second.local_state().data().get(id) == data);
 }
 
 MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
@@ -1123,10 +1124,10 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
     auto present_bytes = pattern(64 * 1024, 7);
     const auto present = object_id(present_bytes);
     REQUIRE(node.store().put(present, present_bytes));
-    REQUIRE(node.node().local_store().has(present));
+    REQUIRE(node.local_state().data().has(present));
 
     const auto missing = object_id(pattern(64 * 1024, 9));
-    REQUIRE(!node.node().local_store().has(missing));
+    REQUIRE(!node.local_state().data().has(missing));
 
     const auto before = node.store().repair_diagnostics();
     CHECK(before.pull_unsourceable == 0);
@@ -1145,7 +1146,7 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
     CHECK(after.unsourceable_sample.front() == missing);
     CHECK(std::find(after.unsourceable_sample.begin(), after.unsourceable_sample.end(),
                     present) == after.unsourceable_sample.end());
-    CHECK(node.node().local_store().has(present));
+    CHECK(node.local_state().data().has(present));
 
     // Repeated passes deduplicate the sample while the counter keeps climbing.
     const auto repeated_before = after.pull_unsourceable;
@@ -1185,8 +1186,8 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
         const auto id = object_id(data);
         // Write both replicas straight into each LocalStore, without network
         // replication or per-object fsync: only retain_data() is timed.
-        REQUIRE(a.node().local_store().put_deferred(id, data));
-        REQUIRE(b.node().local_store().put_deferred(id, data));
+        REQUIRE(a.local_state().data().put_deferred(id, data));
+        REQUIRE(b.local_state().data().put_deferred(id, data));
         ids.push_back(id);
     }
     CHECK(a.node().local_store().has(ids.front()));

@@ -3929,18 +3929,18 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
 
     auto bytes = pattern(512 * 1024);
     auto id = object_id(bytes);
-    REQUIRE(s1.node().local_store().put(id, bytes));
-    REQUIRE(!s2.node().local_store().has(id));
+    REQUIRE(s1.local_state().data().put(id, bytes));
+    REQUIRE(!s2.local_state().data().has(id));
     std::vector<ObjectId> live{id};
     DistributedStore repair(s1.node(), s1.local_state(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
-    const auto full_lists_before = s1.node().local_store().full_list_scans();
+    const auto full_lists_before = s1.local_state().data().full_list_scans();
 
     auto yielded =
         repair.repair_step(8ULL * 1024 * 1024, 8, live, [] { return true; });
     CHECK(yielded.yielded);
     CHECK(!yielded.complete);
     CHECK(yielded.bytes_transferred == 0);
-    CHECK(!s2.node().local_store().has(id));
+    CHECK(!s2.local_state().data().has(id));
 
     // One remote operation is enough to probe but not both probe and upload.
     // The pass must report itself incomplete rather than being mistaken for a
@@ -3949,14 +3949,14 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     CHECK(!bounded.complete);
     CHECK(bounded.bytes_transferred == 0);
     CHECK(bounded.remote_operations == 1);
-    CHECK(!s2.node().local_store().has(id));
+    CHECK(!s2.local_state().data().has(id));
 
     auto completed = repair.repair_step(8ULL * 1024 * 1024, 8, live);
     CHECK(completed.bytes_transferred == bytes.size());
     CHECK(completed.complete);
     CHECK(completed.remote_operations <= 8);
-    CHECK(s2.node().local_store().has(id));
-    CHECK(s1.node().local_store().full_list_scans() == full_lists_before);
+    CHECK(s2.local_state().data().has(id));
+    CHECK(s1.local_state().data().full_list_scans() == full_lists_before);
     CHECK(yielded.push_examined <= 64);
     CHECK(bounded.push_examined <= 64);
     CHECK(completed.push_examined <= 64);
@@ -4043,7 +4043,7 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
     });
 
     CHECK(service.filesystem().getattr("/full-fallback").type == EntryType::directory);
-    auto history = service.node().metadata_replica().history_entry(committed.hash);
+    auto history = service.local_state().replica().history_entry(committed.hash);
     REQUIRE(history.has_value());
     CHECK(history->body == MetadataHistoryEntry::Body::full);
 }
