@@ -10,6 +10,7 @@
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
 #include "metadata/metadata.hpp"
+#include "metadata/metadata_server.hpp"
 #include "cluster/net.hpp"
 #include "storage/persistent_cache.hpp"
 #include "cluster/public_connectivity.hpp"
@@ -119,6 +120,8 @@ class NodeRuntime {
     std::unique_ptr<PersistentBlockCache> cache_;
     std::unique_ptr<RetentionStore> retention_;
     std::unique_ptr<MetadataReplica> meta_;
+    // Built with the replica, so its routes answer from then on.
+    std::unique_ptr<MetadataServer> metadata_server_;
     StartupStageHook startup_stage_hook_;
     std::atomic_uint32_t ready_bits_{};
     uint64_t startup_unix_ms_{};
@@ -175,7 +178,6 @@ class NodeRuntime {
 
     void bind_control_routes();
     void bind_storage_routes();
-    void bind_metadata_routes();
     void route(MessageType, MessageRoutes::Handler);
     void unbind_routes();
     void loop(std::stop_token);
@@ -236,6 +238,7 @@ class NodeRuntime {
     ClaimStore& claims();
     const ClaimStore& claims() const;
     MetadataReplica& metadata_replica();
+    MetadataServer& metadata_server();
     const MetadataReplica& metadata_replica() const;
     Membership& membership() {
         return members_;
@@ -285,13 +288,8 @@ class NodeRuntime {
     }
     void release_peer_for_tests(const NodeId& peer) { client_.release_peer_for_tests(peer); }
     size_t stalled_calls_for_tests() const { return client_.stalled_calls_for_tests(); }
-    bool store_metadata_commit(const MetadataHistoryEntry&);
-    bool accept_metadata_commit(const MetadataAcceptance&);
-    std::vector<MetadataAcceptance> metadata_heads() const;
-    // RPC side of MetadataManager::attempt_history_checkpoint(); dispatches
-    // straight to the replica, as NodeRuntime has no MetadataManager.
-    bool accept_history_checkpoint_proposal(const HistoryCheckpointProof&);
-    bool commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch);
+    // Tells peers this node's accepted metadata changed: advances the
+    // announcement epoch, advertises the generation and broadcasts a notice.
     void announce_metadata_generation(uint64_t);
     void reconfigure_local(const Config&);
     // Cluster bytes by frame class since start (dialled and served together).

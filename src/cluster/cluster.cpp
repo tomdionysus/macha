@@ -57,12 +57,6 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64
     return node;
 }
 
-RpcMessage error_reply(const std::string& text) {
-    Writer writer;
-    writer.string(text);
-    return {MessageType::error, writer.take()};
-}
-
 // storage.hosts_extents resolved: `auto` is "yes if I have somewhere to put
 // them and peers can fetch them".
 bool resolve_hosts_extents(const Config& config, bool inbound_capable) {
@@ -178,13 +172,6 @@ std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uin
     return out;
 }
 
-RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
-    Writer writer;
-    writer.u64(identity.generation);
-    writer.fixed(identity.hash.bytes);
-    return {MessageType::metadata_identity_reply, writer.take()};
-}
-
 } // namespace
 
 NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, ActivityClocks& activity,
@@ -292,13 +279,13 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, ActivityCl
         apply_identity_reset(reset);
     bind_control_routes();
     bind_storage_routes();
-    bind_metadata_routes();
 }
 
 // The server is stopped first, so no request is in flight.
 NodeRuntime::~NodeRuntime() {
     stop();
     unbind_routes();
+    metadata_server_.reset();
 }
 
 void NodeRuntime::mark_ready(ReadyBit bit) {
@@ -404,6 +391,12 @@ const LocalStore& NodeRuntime::control_store() const {
         throw std::runtime_error("control storage is still recovering");
     return *control_;
 }
+MetadataServer& NodeRuntime::metadata_server() {
+    if (!ready(ready_metadata) || !metadata_server_)
+        throw std::runtime_error("metadata replica is still recovering");
+    return *metadata_server_;
+}
+
 PersistentBlockCache& NodeRuntime::block_cache() {
     if (!ready(ready_cache) || !cache_)
         throw std::runtime_error("persistent cache is still recovering");
@@ -511,14 +504,8 @@ void NodeRuntime::recover_state(std::stop_token stop) {
                                                  cache_->metadata(), cfg_.bootstrap.empty(),
                                                  cfg_.metadata_materialization_cache_bytes);
 
-        // Identity-reset tombstones must be active before metadata exchange.
-        try {
-            const auto committed_snapshot = decode_snapshot(meta_->committed().payload);
-            for (const auto& [_, reset] : committed_snapshot.identity_resets)
-                apply_identity_reset(reset);
-        } catch (const std::exception& error) {
-            Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
-        }
+        metadata_server_ = std::make_unique<MetadataServer>(
+            *this, *meta_, *cache_, routes_, cfg_.metadata_min_write_replicas);
 
         cache_->remember_metadata(meta_->committed());
         const auto generation = meta_->committed().generation;
@@ -952,54 +939,6 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     client_.broadcast({MessageType::metadata_notice, writer.take()});
 }
 
-bool NodeRuntime::store_metadata_commit(const MetadataHistoryEntry& entry) {
-    return metadata_replica().import_history(entry);
-}
-
-bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
-    // Accept only branches whose resulting cluster policy matches the
-    // configured one. The certificate's own `required` may be stronger during
-    // a safe transition (e.g. W=3 -> W=2), so it is not compared directly;
-    // MetadataReplica validates it against the commit and parent policies.
-    if (acceptance.required) {
-        auto materialized = metadata_replica().materialized(acceptance.hash);
-        if (!materialized)
-            return false;
-        if (materialized->snapshot->metadata_write_replicas_required !=
-            cfg_.metadata_min_write_replicas)
-            return false;
-    }
-    const auto before = metadata_replica().committed();
-    bool heads_changed = false;
-    if (!metadata_replica().accept_commit(acceptance, &heads_changed))
-        return false;
-    const auto after = metadata_replica().committed();
-    advertise_metadata_generation(std::max(after.generation, acceptance.generation));
-    // Decided under the replica lock: comparing copies taken around the call
-    // would count a concurrent acceptance and announce a commit twice.
-    if (!heads_changed)
-        return true;
-    if (after.hash != before.hash)
-        block_cache().remember_metadata(after);
-    // A same-generation sibling may leave the preferred head unchanged, but
-    // peers still need a wake-up so cache validation and reconciliation see
-    // the new head set.
-    announce_metadata_generation(std::max(after.generation, acceptance.generation));
-    return true;
-}
-
-std::vector<MetadataAcceptance> NodeRuntime::metadata_heads() const {
-    return metadata_replica().accepted_head_certificates();
-}
-
-bool NodeRuntime::accept_history_checkpoint_proposal(const HistoryCheckpointProof& proposal) {
-    return metadata_replica().record_checkpoint_ack(proposal);
-}
-
-bool NodeRuntime::commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch) {
-    return metadata_replica().record_checkpoint_commit(floor_hash, epoch);
-}
-
 // Health, dialling, membership, telemetry and account gossip.
 void NodeRuntime::bind_control_routes() {
     route(MessageType::ping,
@@ -1416,112 +1355,6 @@ void NodeRuntime::bind_storage_routes() {
           });
 }
 
-// The metadata replica: reads, history, commits and acceptance.
-void NodeRuntime::bind_metadata_routes() {
-    route(MessageType::get_metadata,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return {MessageType::metadata_reply,
-                      encode_metadata_record(metadata_replica().current())};
-          });
-    route(MessageType::get_committed_metadata,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return {MessageType::metadata_reply,
-                      encode_metadata_record(metadata_replica().committed())};
-          });
-    route(MessageType::get_metadata_identity,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return metadata_identity_reply(metadata_replica().committed_identity());
-          });
-    route(MessageType::get_metadata_history_entry,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              Reader reader(request.payload);
-              Hash256 hash;
-              hash.bytes = reader.fixed<32>();
-              reader.finish();
-              auto entry = metadata_replica().history_entry(hash);
-              if (!entry)
-                  return error_reply("metadata history entry unavailable");
-              return {MessageType::metadata_history_entry_reply,
-                      encode_metadata_history_entry(*entry)};
-          });
-    route(MessageType::get_metadata_history_record,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              // Repair of a peer's unreconstructable accepted head: serve the
-              // record as a full body, whatever frame shape is stored (see
-              // MetadataManager::repair_unreconstructable_heads()).
-              Reader reader(request.payload);
-              Hash256 hash;
-              hash.bytes = reader.fixed<32>();
-              reader.finish();
-              auto entry = metadata_replica().full_history_record(hash);
-              if (!entry)
-                  return error_reply("metadata history record unavailable");
-              return {MessageType::metadata_history_entry_reply,
-                      encode_metadata_history_entry(*entry)};
-          });
-    route(MessageType::has_metadata_history_entry,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              Reader reader(request.payload);
-              Hash256 hash;
-              hash.bytes = reader.fixed<32>();
-              reader.finish();
-              Writer writer;
-              writer.u8(metadata_replica().history_contains(hash));
-              return {MessageType::bool_reply, writer.take()};
-          });
-    route(MessageType::put_metadata_history_entry,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto entry = decode_metadata_history_entry(request.payload);
-              Writer writer;
-              writer.u8(metadata_replica().import_history(entry));
-              return {MessageType::bool_reply, writer.take()};
-          });
-    route(MessageType::get_metadata_heads,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              return {MessageType::metadata_heads_reply,
-                      encode_metadata_acceptance_set(metadata_heads())};
-          });
-    route(MessageType::put_metadata_commit,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto entry = decode_metadata_history_entry(request.payload);
-              Writer writer;
-              writer.u8(store_metadata_commit(entry));
-              return {MessageType::bool_reply, writer.take()};
-          });
-    route(MessageType::accept_metadata_commit,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto acceptance = decode_metadata_acceptance(request.payload);
-              Writer writer;
-              writer.u8(accept_metadata_commit(acceptance));
-              return {MessageType::bool_reply, writer.take()};
-          });
-    route(MessageType::propose_history_floor,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto proposal = decode_history_checkpoint_proof(request.payload);
-              Writer writer;
-              writer.u8(accept_history_checkpoint_proposal(proposal));
-              return {MessageType::bool_reply, writer.take()};
-          });
-    route(MessageType::commit_history_floor,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              auto commit = decode_history_checkpoint_proof(request.payload);
-              Writer writer;
-              writer.u8(commit_history_checkpoint(commit.floor_hash, commit.epoch));
-              return {MessageType::bool_reply, writer.take()};
-          });
-}
 
 void NodeRuntime::route(MessageType type, MessageRoutes::Handler handler) {
     routes_.bind(type, std::move(handler));
