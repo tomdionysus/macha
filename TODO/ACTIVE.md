@@ -1,8 +1,8 @@
 # Active tasks and concepts to explore
 
-Last updated: 2026-10-02, on `experiment/object-ledger-t4`. Both nodes run
-0.74.0 (T0's instrumented build); the T0 soak and its top-up ended
-2026-10-01 20:43Z; the baseline is filled.
+Last updated: 2026-10-02, on `experiment/object-ledger-t5`. Both nodes run
+0.75.0 (the experiment through T4 and T5.1), deployed 2026-10-02 11:38Z
+(fi-1) and 11:46Z (gbni-1); soaking.
 
 This is the authoritative, ordered backlog. `COMPLETED.md` is the ledger of
 finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
@@ -10,7 +10,7 @@ finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
 spec and handover (evidence, not requirements). Work top-to-bottom unless
 new evidence changes the order.
 
-**Start here after a clear: read [the handover](HANDOVER-2026-10-01.md),**
+**Start here after a clear: read [the handover](HANDOVER-2026-10-02.md),**
 then the experiment section below, then the canonical spec and plan.
 
 ## First: the object ledger experiment
@@ -122,59 +122,23 @@ resumes from `develop` and the experiment's version line ceases to exist.
 - **Open spec questions still waiting**: 6 (release over pinned roots) and 7
   (map-backed snapshots), both for after stage 0.
 
-## Cluster state (2026-09-30)
+## Cluster state (2026-10-02)
 
 - **gbni-1** (10.44.1.50, `macnessa.macha.network`) and **fi-1** (10.35.1.10,
-  also .50 and .148) both run **0.74.0** (`680047e`, build stamp
-  `0.74.0+unknown`: fi-1's tree has no git), **cluster protocol 22**.
-  Metadata writable 2/2 against `metadata_min_write_replicas: 2`: restarting
-  either node makes metadata read-only until it is back. Install backups
-  `/root/macha-0.73.2-installed.tgz` and `/etc/macha/macha.yaml.bak-0.73.2`
-  on both.
-- **Observation** (T0): `/etc/macha/state/observation/observations.jsonl` on
+  also .50 and .148) both run **0.75.0** (tarball md5
+  `8269255302fa73e8c158c847a06fa249`), **cluster protocol 22**. Metadata
+  writable 2/2 against `metadata_min_write_replicas: 2`: restarting either
+  node makes metadata read-only until it is back. Install backups
+  `/root/macha-0.74.0-installed.tgz` on both. gbni-1 keeps its heap-check
+  drop-in (copy in `/root/heap-check.conf.keep`).
+- **Deletion paused** for the experiment: `garbage_grace_ms: 2592000000`
+  (30 days) on both, until the ledger's deletion decisions have been
+  watched on the real library.
+- **Observation**: `/etc/macha/state/observation/observations.jsonl` on
   both nodes; `object-ledger-evidence/t0/observation_report.py` turns it
-  into the kill criteria table.
-- **The soak's load** (until 2026-10-01 14:20Z): root cron on each node runs
-  `/root/claude-soak-round.sh` every 4 hours (fi-1 at :40, gbni-1 at :10,
-  local time): three driven playback sessions (skipped while a real viewer
-  plays) and 1 GiB written through FUSE to `/mnt/machamedia/claude-soak/`,
-  the previous round's file removed. Log `/root/claude-soak.log`. The script
-  exits after `SOAK_END`; the cron entries and the `claude-soak` directory
-  are removed at the end of the soak. The operator queues torrents.
-- **Git:** `develop` at `75e6f98`, two commits ahead of `origin/develop`,
-  frozen. `main`/`origin/main` at `0e54e7e`. Tags stop at `0.71.0`
-  (`b454c53`): 0.72.0 to 0.74.0 are untagged. Push to `develop` or `main`,
-  and tag, only on the operator's word.
-- **gbni-1 runs with glibc heap checking** (drop-in
-  `/etc/systemd/system/macha.service.d/heap-check.conf`, a copy at
-  `/root/heap-check.conf.keep` because `install-guarded.sh`'s rollback
-  deletes it; cores to `/mnt/diskB/crash`) until the 2026-09-28 heap
-  corruption's writer is found.
-- **fi-1 is a full storage and acquisition node**: a 10 TB WD Elements USB
-  drive at `/mnt/diskB` (fstab `nofail`), DATA backend `/mnt/diskB/data`
-  (`limit: 8T`, `reserve_free: 64G`); scanner, ingest (staging
-  `/mnt/diskB/ingest`, 500G) and torrent enabled. gbni-1 has the lower node
-  id and stays the scan coordinator. The old 10G backend copy is at
-  `/var/lib/macha/data.moved-20260929` (delete on the operator's word).
-- **fi-1's drive has dropped off twice.** 2026-09-29 (USB link CRC errors;
-  reseated onto bus 4). 2026-09-30: fi-1 rebooted 10:03Z (operator's work);
-  at 10:27Z the kernel logged over-current on every USB port at once as
-  the operator plugged in another USB device; the mount went to ext4
-  `shutdown` with EIO. Repaired remotely 13:47-13:54Z on the operator's
-  word (lazy umount, `e2fsck -f -p /dev/sdb1`, remount by UUID); Macha
-  re-adopted the backend without a restart. Power (supply, hub) is the
-  suspect, not the drive. A session monitor watches fi-1's kernel and Macha
-  journal for USB, disk and backend events (re-arm it each session).
-- **fi-1's eth0 negotiates 100 Mbit/s** on a gigabit port (cable or switch
-  port, needs someone on site).
-- **Repair settings on both nodes:** `idle_bandwidth_fraction: 0.9`;
-  `repair_weight` 5 against `foreground_weight` 95 (defaults).
-- **es-1 is offline until November 2026 at the earliest**; fi-1 is the build
-  node. Data lost with es-1: many files dated 2026-08-31 and earlier have
-  extents no node holds; the server still lists them as playable (item 4).
-- **The operator's account for Claude**: `claude`, all roles, credentials
-  on-box in `/root/.macha-claude-credentials` on both nodes. Never copy them
-  off-box.
+  into the kill criteria table; the T0 baseline is
+  `object-ledger-evidence/t0/baseline.md`. No load scripts or cron entries
+  of ours remain on either node.
 
 ## The queue
 
