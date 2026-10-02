@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/status_api.hpp"
+#include "service/maintenance.hpp"
+#include "subsystem/subsystem_registry.hpp"
 
 #include "fuse/fuse_mountpoint.hpp"
 #include "json.hpp"
@@ -467,51 +469,6 @@ ClusterStatusService::ClusterStatusService(NodeRuntime& node, const ActivityCloc
     : node_(node), activity_(activity), data_resources_(data_resources),
       retained_memory_(retained_memory) {}
 
-void ClusterStatusService::attach_fuse_diagnostics(
-    std::function<std::optional<FuseFrontendDiagnostics>()> provider) {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    fuse_diagnostics_ = std::move(provider);
-}
-
-void ClusterStatusService::detach_fuse_diagnostics() {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    fuse_diagnostics_ = {};
-}
-
-void ClusterStatusService::attach_repair_diagnostics(
-    std::function<DistributedStore::RepairDiagnostics()> provider) {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    repair_diagnostics_ = std::move(provider);
-}
-
-void ClusterStatusService::detach_repair_diagnostics() {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    repair_diagnostics_ = {};
-}
-
-void ClusterStatusService::attach_convergence_diagnostics(
-    std::function<ConvergenceDemandDiagnostics()> provider) {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    convergence_diagnostics_ = std::move(provider);
-}
-
-void ClusterStatusService::attach_subsystem_diagnostics(
-    std::function<std::vector<SubsystemStatus>()> provider) {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    subsystem_diagnostics_ = std::move(provider);
-}
-
-void ClusterStatusService::detach_subsystem_diagnostics() {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    subsystem_diagnostics_ = {};
-}
-
-void ClusterStatusService::attach_http_diagnostics(
-    std::function<std::optional<HttpServerDiagnostics>()> provider) {
-    std::lock_guard lock(operational_diagnostics_mutex_);
-    http_diagnostics_ = std::move(provider);
-}
-
 ClusterStatusService::~ClusterStatusService() {
     stop();
 }
@@ -570,8 +527,9 @@ void ClusterStatusService::persistence_loop(std::stop_token stop) {
     }
 }
 
-HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& only) {
-    auto* metadata_manager = metadata_.load(std::memory_order_acquire);
+HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
+                                                   const std::optional<NodeId>& only) {
+    auto* metadata_manager = sources.metadata;
     std::shared_ptr<const MetadataSnapshot> metadata;
     uint64_t metadata_generation = 0;
     if (metadata_manager) {
@@ -894,14 +852,9 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         root["connectivity"] = std::move(connectivity);
     }
 
-    std::function<std::vector<SubsystemStatus>()> subsystem_provider;
-    {
-        std::lock_guard lock(operational_diagnostics_mutex_);
-        subsystem_provider = subsystem_diagnostics_;
-    }
     Json::Array subsystems;
-    if (subsystem_provider) {
-        for (const auto& status : subsystem_provider()) {
+    if (sources.subsystems) {
+        for (const auto& status : sources.subsystems->statuses()) {
             Json::Object entry;
             entry["name"] = status.name;
             entry["state"] = std::string(subsystem_state_name(status.state));
@@ -937,8 +890,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
 // Everything above is state the node already holds decoded: short mutexes, no
 // I/O, no network. What follows touches most subsystems' locks, so it has its
 // own route (see status_api.hpp).
-HttpResponse ClusterStatusService::diagnostics_response() {
-    auto* metadata_manager = metadata_.load(std::memory_order_acquire);
+HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sources) {
+    auto* metadata_manager = sources.metadata;
     std::shared_ptr<const MetadataSnapshot> metadata;
     if (metadata_manager) {
         try {
@@ -1143,197 +1096,186 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     }
     diagnostics["data_store"] = std::move(data_store_diagnostics);
 
-    std::function<std::optional<FuseFrontendDiagnostics>()> fuse_provider;
-    std::function<ConvergenceDemandDiagnostics()> convergence_provider;
-    std::function<DistributedStore::RepairDiagnostics()> repair_provider;
-    std::function<std::optional<HttpServerDiagnostics>()> http_provider;
-    {
-        std::lock_guard lock(operational_diagnostics_mutex_);
-        fuse_provider = fuse_diagnostics_;
-        convergence_provider = convergence_diagnostics_;
-        repair_provider = repair_diagnostics_;
-        http_provider = http_diagnostics_;
-    }
-
     Json::Object filesystem_diagnostics;
     filesystem_diagnostics["available"] = false;
-    if (fuse_provider) {
+    // Held for the call, so a subsystem restart cannot pull the frontend away.
+    const auto fuse = sources.registry ? sources.registry->fuse() : nullptr;
+    if (fuse) {
         try {
-            if (auto values = fuse_provider()) {
-                filesystem_diagnostics["available"] = true;
-                filesystem_diagnostics["timed_out_requests"] = values->timed_out_requests;
-                filesystem_diagnostics["merged_publications"] = values->merged_publications;
-                filesystem_diagnostics["data_publication_requests"] =
-                    values->data_publication_requests;
-                filesystem_diagnostics["data_publication_notifications_suppressed"] =
-                    values->data_publication_notifications_suppressed;
-                filesystem_diagnostics["spool_pressure_publication_sweeps"] =
-                    values->spool_pressure_publication_sweeps;
-                filesystem_diagnostics["data_publication_coalesced_queued"] =
-                    values->data_publication_coalesced_queued;
-                filesystem_diagnostics["data_publication_coalesced_running"] =
-                    values->data_publication_coalesced_running;
-                filesystem_diagnostics["data_publication_coalesced_unconfirmed"] =
-                    values->data_publication_coalesced_unconfirmed;
-                filesystem_diagnostics["data_publications_started"] =
-                    values->data_publications_started;
-                filesystem_diagnostics["data_publications_completed"] =
-                    values->data_publications_completed;
-                filesystem_diagnostics["data_publication_peak_active"] =
-                    values->data_publication_peak_active;
-                filesystem_diagnostics["data_publication_quanta"] =
-                    values->data_publication_quanta;
-                filesystem_diagnostics["data_publication_yields"] =
-                    values->data_publication_yields;
-                filesystem_diagnostics["data_publication_peak_inflight_bytes"] =
-                    values->data_publication_peak_inflight_bytes;
-                filesystem_diagnostics["data_publication_pipeline_limit_bytes"] =
-                    values->data_publication_pipeline_limit_bytes;
-                filesystem_diagnostics["data_publication_peak_pipeline_extents"] =
-                    values->data_publication_peak_pipeline_extents;
-                filesystem_diagnostics["data_closed_priority_selections"] =
-                    values->data_closed_priority_selections;
-                filesystem_diagnostics["data_retirement_priority_selections"] =
-                    values->data_retirement_priority_selections;
-                filesystem_diagnostics["open_publications"] = values->open_publications;
-                filesystem_diagnostics["peak_open_publications"] =
-                    values->peak_open_publications;
-                filesystem_diagnostics["publication_max_open_writers"] =
-                    values->publication_max_open_writers;
-                filesystem_diagnostics["data_publication_selections_under_writer_cap"] =
-                    values->data_publication_selections_under_writer_cap;
-                filesystem_diagnostics["data_publication_progress_events"] =
-                    values->data_publication_progress_events;
-                filesystem_diagnostics["data_publication_bytes_read"] =
-                    values->data_publication_bytes_read;
-                filesystem_diagnostics["data_publication_bytes_committed"] =
-                    values->data_publication_bytes_committed;
-                filesystem_diagnostics["data_publication_bytes_confirmed"] =
-                    values->data_publication_bytes_confirmed;
-                filesystem_diagnostics["data_publication_completed_spool_bytes_read"] =
-                    values->data_publication_completed_spool_bytes_read;
-                filesystem_diagnostics["data_publication_completed_source_bytes_read"] =
-                    values->data_publication_completed_source_bytes_read;
-                filesystem_diagnostics["data_publication_completed_reused_extents"] =
-                    values->data_publication_completed_reused_extents;
-                filesystem_diagnostics["data_publication_completed_put_extents"] =
-                    values->data_publication_completed_put_extents;
-                filesystem_diagnostics["data_overlay_read_queries"] =
-                    values->data_overlay_read_queries;
-                filesystem_diagnostics["data_overlay_ranges_examined"] =
-                    values->data_overlay_ranges_examined;
-                filesystem_diagnostics["data_overlay_descriptors_copied"] =
-                    values->data_overlay_descriptors_copied;
-                filesystem_diagnostics["retained_data_operations"] =
-                    values->retained_data_operations;
-                filesystem_diagnostics["retained_data_operation_bytes"] =
-                    values->retained_data_operation_bytes;
-                filesystem_diagnostics["retained_overlay_ranges"] =
-                    values->retained_overlay_ranges;
-                filesystem_diagnostics["retained_overlay_bytes"] =
-                    values->retained_overlay_bytes;
-                filesystem_diagnostics["retained_publication_operations"] =
-                    values->retained_publication_operations;
-                filesystem_diagnostics["retained_publication_operation_bytes"] =
-                    values->retained_publication_operation_bytes;
-                filesystem_diagnostics["operation_metadata_bytes"] =
-                    values->operation_metadata_bytes;
-                filesystem_diagnostics["peak_operation_metadata_bytes"] =
-                    values->peak_operation_metadata_bytes;
-                filesystem_diagnostics["operation_metadata_limit_bytes"] =
-                    values->operation_metadata_limit_bytes;
-                filesystem_diagnostics["operation_metadata_waits"] =
-                    values->operation_metadata_waits;
-                filesystem_diagnostics["retained_durability_tickets"] =
-                    values->retained_durability_tickets;
-                filesystem_diagnostics["data_publication_inflight_bytes"] =
-                    values->data_publication_inflight_bytes;
-                filesystem_diagnostics["backend_failures"] = values->backend_failures;
-                filesystem_diagnostics["durability_batches"] = values->durability_batches;
-                filesystem_diagnostics["durability_writes"] = values->durability_writes;
-                filesystem_diagnostics["namespace_operations_admitted"] =
-                    values->namespace_operations_admitted;
-                filesystem_diagnostics["namespace_operations_recovered"] =
-                    values->namespace_operations_recovered;
-                filesystem_diagnostics["namespace_publication_attempts"] =
-                    values->namespace_publication_attempts;
-                filesystem_diagnostics["namespace_publication_batches"] =
-                    values->namespace_publication_batches;
-                filesystem_diagnostics["namespace_operations_batched"] =
-                    values->namespace_operations_batched;
-                filesystem_diagnostics["namespace_operations_published"] =
-                    values->namespace_operations_published;
-                filesystem_diagnostics["namespace_operations_confirmed"] =
-                    values->namespace_operations_confirmed;
-                // The mount is stale exactly when refreshed < available. Both
-                // are exposed so an operator can see it without a rebuild.
-                filesystem_diagnostics["namespace_refreshed_revision"] =
-                    values->namespace_refreshed_revision;
-                filesystem_diagnostics["namespace_available_revision"] =
-                    values->namespace_available_revision;
-                // Files whose publication exhausted its retry budget; details
-                // and actions under /api/v1/manage/filesystem/parked-publications.
-                filesystem_diagnostics["parked_publications"] = values->parked_publications;
-                filesystem_diagnostics["publication_retries_backed_off"] =
-                    values->publication_retries_backed_off;
-                filesystem_diagnostics["publications_retrying_persistently"] =
-                    values->publications_retrying_persistently;
-                // What recovery resolved instead of refusing.
-                filesystem_diagnostics["journal_recovery_skipped_frames"] =
-                    values->journal_recovery_skipped_frames;
-                filesystem_diagnostics["journal_recovery_quarantined_bytes"] =
-                    values->journal_recovery_quarantined_bytes;
-                filesystem_diagnostics["recovery_dropped_operations"] =
-                    values->recovery_dropped_operations;
-                filesystem_diagnostics["publications_abandoned"] =
-                    values->publications_abandoned;
-                // The host directory under the mount: entries found there at
-                // startup are hidden by the mount, and whether the directory
-                // is immutable while no mount covers it.
-                filesystem_diagnostics["mountpoint_stray_entries"] =
-                    fuse_mountpoint_preparation().stray_entries;
-                filesystem_diagnostics["mountpoint_immutable"] =
-                    fuse_mountpoint_preparation().immutable;
-                filesystem_diagnostics["journal_append_batches"] = values->journal_append_batches;
-                filesystem_diagnostics["journal_records_appended"] =
-                    values->journal_records_appended;
-                filesystem_diagnostics["journal_durability_barriers"] =
-                    values->journal_durability_barriers;
-                filesystem_diagnostics["spool_bytes"] = values->spool_bytes;
-                filesystem_diagnostics["spool_limit_bytes"] = values->spool_limit_bytes;
-                filesystem_diagnostics["spool_publish_rate_bytes_per_second"] =
-                    values->spool_publish_rate_bytes_per_second;
-                filesystem_diagnostics["spool_publish_rate_window_bytes"] =
-                    values->spool_publish_rate_window_bytes;
-                filesystem_diagnostics["spool_publish_rate_window_ms"] =
-                    values->spool_publish_rate_window_ms;
-                filesystem_diagnostics["spool_throttle_waits"] =
-                    values->spool_throttle_waits;
-                filesystem_diagnostics["spool_throttle_wait_ms"] =
-                    values->spool_throttle_wait_ms;
-                filesystem_diagnostics["pending_write_request_bytes"] =
-                    values->pending_write_request_bytes;
-                filesystem_diagnostics["peak_pending_write_request_bytes"] =
-                    values->peak_pending_write_request_bytes;
-                filesystem_diagnostics["pending_write_request_limit_bytes"] =
-                    values->pending_write_request_limit_bytes;
-                filesystem_diagnostics["extent_executor_workers"] =
-                    values->extent_executor_workers;
-                filesystem_diagnostics["extent_executor_queued"] =
-                    values->extent_executor_queued;
-                filesystem_diagnostics["extent_executor_active"] =
-                    values->extent_executor_active;
-                filesystem_diagnostics["extent_executor_peak_queued"] =
-                    values->extent_executor_peak_queued;
-                filesystem_diagnostics["extent_executor_peak_active"] =
-                    values->extent_executor_peak_active;
-                filesystem_diagnostics["extent_executor_submitted"] =
-                    values->extent_executor_submitted;
-                filesystem_diagnostics["inode_count"] = values->inode_count;
-                filesystem_diagnostics["peak_inode_count"] = values->peak_inode_count;
-                filesystem_diagnostics["reclaimed_inode_count"] =
-                    values->reclaimed_inode_count;
-            }
+            const auto values = fuse->diagnostics();
+            filesystem_diagnostics["available"] = true;
+            filesystem_diagnostics["timed_out_requests"] = values.timed_out_requests;
+            filesystem_diagnostics["merged_publications"] = values.merged_publications;
+            filesystem_diagnostics["data_publication_requests"] =
+                values.data_publication_requests;
+            filesystem_diagnostics["data_publication_notifications_suppressed"] =
+                values.data_publication_notifications_suppressed;
+            filesystem_diagnostics["spool_pressure_publication_sweeps"] =
+                values.spool_pressure_publication_sweeps;
+            filesystem_diagnostics["data_publication_coalesced_queued"] =
+                values.data_publication_coalesced_queued;
+            filesystem_diagnostics["data_publication_coalesced_running"] =
+                values.data_publication_coalesced_running;
+            filesystem_diagnostics["data_publication_coalesced_unconfirmed"] =
+                values.data_publication_coalesced_unconfirmed;
+            filesystem_diagnostics["data_publications_started"] =
+                values.data_publications_started;
+            filesystem_diagnostics["data_publications_completed"] =
+                values.data_publications_completed;
+            filesystem_diagnostics["data_publication_peak_active"] =
+                values.data_publication_peak_active;
+            filesystem_diagnostics["data_publication_quanta"] =
+                values.data_publication_quanta;
+            filesystem_diagnostics["data_publication_yields"] =
+                values.data_publication_yields;
+            filesystem_diagnostics["data_publication_peak_inflight_bytes"] =
+                values.data_publication_peak_inflight_bytes;
+            filesystem_diagnostics["data_publication_pipeline_limit_bytes"] =
+                values.data_publication_pipeline_limit_bytes;
+            filesystem_diagnostics["data_publication_peak_pipeline_extents"] =
+                values.data_publication_peak_pipeline_extents;
+            filesystem_diagnostics["data_closed_priority_selections"] =
+                values.data_closed_priority_selections;
+            filesystem_diagnostics["data_retirement_priority_selections"] =
+                values.data_retirement_priority_selections;
+            filesystem_diagnostics["open_publications"] = values.open_publications;
+            filesystem_diagnostics["peak_open_publications"] =
+                values.peak_open_publications;
+            filesystem_diagnostics["publication_max_open_writers"] =
+                values.publication_max_open_writers;
+            filesystem_diagnostics["data_publication_selections_under_writer_cap"] =
+                values.data_publication_selections_under_writer_cap;
+            filesystem_diagnostics["data_publication_progress_events"] =
+                values.data_publication_progress_events;
+            filesystem_diagnostics["data_publication_bytes_read"] =
+                values.data_publication_bytes_read;
+            filesystem_diagnostics["data_publication_bytes_committed"] =
+                values.data_publication_bytes_committed;
+            filesystem_diagnostics["data_publication_bytes_confirmed"] =
+                values.data_publication_bytes_confirmed;
+            filesystem_diagnostics["data_publication_completed_spool_bytes_read"] =
+                values.data_publication_completed_spool_bytes_read;
+            filesystem_diagnostics["data_publication_completed_source_bytes_read"] =
+                values.data_publication_completed_source_bytes_read;
+            filesystem_diagnostics["data_publication_completed_reused_extents"] =
+                values.data_publication_completed_reused_extents;
+            filesystem_diagnostics["data_publication_completed_put_extents"] =
+                values.data_publication_completed_put_extents;
+            filesystem_diagnostics["data_overlay_read_queries"] =
+                values.data_overlay_read_queries;
+            filesystem_diagnostics["data_overlay_ranges_examined"] =
+                values.data_overlay_ranges_examined;
+            filesystem_diagnostics["data_overlay_descriptors_copied"] =
+                values.data_overlay_descriptors_copied;
+            filesystem_diagnostics["retained_data_operations"] =
+                values.retained_data_operations;
+            filesystem_diagnostics["retained_data_operation_bytes"] =
+                values.retained_data_operation_bytes;
+            filesystem_diagnostics["retained_overlay_ranges"] =
+                values.retained_overlay_ranges;
+            filesystem_diagnostics["retained_overlay_bytes"] =
+                values.retained_overlay_bytes;
+            filesystem_diagnostics["retained_publication_operations"] =
+                values.retained_publication_operations;
+            filesystem_diagnostics["retained_publication_operation_bytes"] =
+                values.retained_publication_operation_bytes;
+            filesystem_diagnostics["operation_metadata_bytes"] =
+                values.operation_metadata_bytes;
+            filesystem_diagnostics["peak_operation_metadata_bytes"] =
+                values.peak_operation_metadata_bytes;
+            filesystem_diagnostics["operation_metadata_limit_bytes"] =
+                values.operation_metadata_limit_bytes;
+            filesystem_diagnostics["operation_metadata_waits"] =
+                values.operation_metadata_waits;
+            filesystem_diagnostics["retained_durability_tickets"] =
+                values.retained_durability_tickets;
+            filesystem_diagnostics["data_publication_inflight_bytes"] =
+                values.data_publication_inflight_bytes;
+            filesystem_diagnostics["backend_failures"] = values.backend_failures;
+            filesystem_diagnostics["durability_batches"] = values.durability_batches;
+            filesystem_diagnostics["durability_writes"] = values.durability_writes;
+            filesystem_diagnostics["namespace_operations_admitted"] =
+                values.namespace_operations_admitted;
+            filesystem_diagnostics["namespace_operations_recovered"] =
+                values.namespace_operations_recovered;
+            filesystem_diagnostics["namespace_publication_attempts"] =
+                values.namespace_publication_attempts;
+            filesystem_diagnostics["namespace_publication_batches"] =
+                values.namespace_publication_batches;
+            filesystem_diagnostics["namespace_operations_batched"] =
+                values.namespace_operations_batched;
+            filesystem_diagnostics["namespace_operations_published"] =
+                values.namespace_operations_published;
+            filesystem_diagnostics["namespace_operations_confirmed"] =
+                values.namespace_operations_confirmed;
+            // The mount is stale exactly when refreshed < available. Both
+            // are exposed so an operator can see it without a rebuild.
+            filesystem_diagnostics["namespace_refreshed_revision"] =
+                values.namespace_refreshed_revision;
+            filesystem_diagnostics["namespace_available_revision"] =
+                values.namespace_available_revision;
+            // Files whose publication exhausted its retry budget; details
+            // and actions under /api/v1/manage/filesystem/parked-publications.
+            filesystem_diagnostics["parked_publications"] = values.parked_publications;
+            filesystem_diagnostics["publication_retries_backed_off"] =
+                values.publication_retries_backed_off;
+            filesystem_diagnostics["publications_retrying_persistently"] =
+                values.publications_retrying_persistently;
+            // What recovery resolved instead of refusing.
+            filesystem_diagnostics["journal_recovery_skipped_frames"] =
+                values.journal_recovery_skipped_frames;
+            filesystem_diagnostics["journal_recovery_quarantined_bytes"] =
+                values.journal_recovery_quarantined_bytes;
+            filesystem_diagnostics["recovery_dropped_operations"] =
+                values.recovery_dropped_operations;
+            filesystem_diagnostics["publications_abandoned"] =
+                values.publications_abandoned;
+            // The host directory under the mount: entries found there at
+            // startup are hidden by the mount, and whether the directory
+            // is immutable while no mount covers it.
+            filesystem_diagnostics["mountpoint_stray_entries"] =
+                fuse_mountpoint_preparation().stray_entries;
+            filesystem_diagnostics["mountpoint_immutable"] =
+                fuse_mountpoint_preparation().immutable;
+            filesystem_diagnostics["journal_append_batches"] = values.journal_append_batches;
+            filesystem_diagnostics["journal_records_appended"] =
+                values.journal_records_appended;
+            filesystem_diagnostics["journal_durability_barriers"] =
+                values.journal_durability_barriers;
+            filesystem_diagnostics["spool_bytes"] = values.spool_bytes;
+            filesystem_diagnostics["spool_limit_bytes"] = values.spool_limit_bytes;
+            filesystem_diagnostics["spool_publish_rate_bytes_per_second"] =
+                values.spool_publish_rate_bytes_per_second;
+            filesystem_diagnostics["spool_publish_rate_window_bytes"] =
+                values.spool_publish_rate_window_bytes;
+            filesystem_diagnostics["spool_publish_rate_window_ms"] =
+                values.spool_publish_rate_window_ms;
+            filesystem_diagnostics["spool_throttle_waits"] =
+                values.spool_throttle_waits;
+            filesystem_diagnostics["spool_throttle_wait_ms"] =
+                values.spool_throttle_wait_ms;
+            filesystem_diagnostics["pending_write_request_bytes"] =
+                values.pending_write_request_bytes;
+            filesystem_diagnostics["peak_pending_write_request_bytes"] =
+                values.peak_pending_write_request_bytes;
+            filesystem_diagnostics["pending_write_request_limit_bytes"] =
+                values.pending_write_request_limit_bytes;
+            filesystem_diagnostics["extent_executor_workers"] =
+                values.extent_executor_workers;
+            filesystem_diagnostics["extent_executor_queued"] =
+                values.extent_executor_queued;
+            filesystem_diagnostics["extent_executor_active"] =
+                values.extent_executor_active;
+            filesystem_diagnostics["extent_executor_peak_queued"] =
+                values.extent_executor_peak_queued;
+            filesystem_diagnostics["extent_executor_peak_active"] =
+                values.extent_executor_peak_active;
+            filesystem_diagnostics["extent_executor_submitted"] =
+                values.extent_executor_submitted;
+            filesystem_diagnostics["inode_count"] = values.inode_count;
+            filesystem_diagnostics["peak_inode_count"] = values.peak_inode_count;
+            filesystem_diagnostics["reclaimed_inode_count"] =
+                values.reclaimed_inode_count;
         } catch (const std::exception& error) {
             Log::debug("status filesystem diagnostics unavailable: " + std::string(error.what()));
         }
@@ -1342,9 +1284,9 @@ HttpResponse ClusterStatusService::diagnostics_response() {
 
     Json::Object convergence_diagnostics;
     convergence_diagnostics["available"] = false;
-    if (convergence_provider) {
+    if (sources.maintenance) {
         try {
-            const auto values = convergence_provider();
+            const auto values = sources.maintenance->metadata_convergence.diagnostics();
             convergence_diagnostics["available"] = true;
             convergence_diagnostics["events_received"] = values.events_received;
             convergence_diagnostics["runs_scheduled"] = values.runs_scheduled;
@@ -1366,9 +1308,9 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     // read back: a failing disk.
     Json::Object repair_diagnostics;
     repair_diagnostics["available"] = false;
-    if (repair_provider) {
+    if (sources.store) {
         try {
-            const auto values = repair_provider();
+            const auto values = sources.store->repair_diagnostics();
             repair_diagnostics["available"] = true;
             repair_diagnostics["unsourceable_objects"] = values.pull_unsourceable;
             repair_diagnostics["local_unreadable_objects"] = values.local_unreadable;
@@ -1410,37 +1352,36 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     // keep-alive connections are counted so connection-holding clients are visible.
     Json::Object http_diagnostics;
     http_diagnostics["available"] = false;
-    if (http_provider) {
+    if (sources.http) {
         try {
-            if (const auto values = http_provider()) {
-                http_diagnostics["available"] = true;
-                http_diagnostics["reactor_passes"] = values->reactor_passes;
-                http_diagnostics["reactor_stalls"] = values->reactor_stalls;
-                http_diagnostics["reactor_longest_pass_ms"] = values->reactor_longest_pass_ms;
-                http_diagnostics["connections_open"] = values->connections_open;
-                http_diagnostics["connections_idle_keep_alive"] =
-                    values->connections_idle_keep_alive;
-                http_diagnostics["connections_writing"] = values->connections_writing;
-                http_diagnostics["connections_deferred"] = values->connections_deferred;
-                http_diagnostics["connections_refused"] = values->connections_refused;
-                http_diagnostics["staged_bytes"] = values->staged_bytes;
-                http_diagnostics["requests_served"] = values->requests_served;
-                http_diagnostics["requests_deferred"] = values->requests_deferred;
-                http_diagnostics["requests_overloaded"] = values->requests_overloaded;
-                http_diagnostics["slow_requests"] = values->slow_requests;
-                http_diagnostics["responses_compressed"] = values->responses_compressed;
-                http_diagnostics["compression_bytes_saved"] = values->compression_bytes_saved;
-                const auto lane_json = [](const HttpServerDiagnostics::Lane& lane) {
-                    return Json::Object{{"workers", lane.workers},
-                                        {"busy", lane.busy},
-                                        {"queued", lane.queued},
-                                        {"peak_queued", lane.peak_queued},
-                                        {"queue_wait_ms_max", lane.queue_wait_ms_max},
-                                        {"handled", lane.handled}};
-                };
-                http_diagnostics["control_lane"] = lane_json(values->control);
-                http_diagnostics["data_lane"] = lane_json(values->data);
-            }
+            const auto values = sources.http->diagnostics();
+            http_diagnostics["available"] = true;
+            http_diagnostics["reactor_passes"] = values.reactor_passes;
+            http_diagnostics["reactor_stalls"] = values.reactor_stalls;
+            http_diagnostics["reactor_longest_pass_ms"] = values.reactor_longest_pass_ms;
+            http_diagnostics["connections_open"] = values.connections_open;
+            http_diagnostics["connections_idle_keep_alive"] =
+                values.connections_idle_keep_alive;
+            http_diagnostics["connections_writing"] = values.connections_writing;
+            http_diagnostics["connections_deferred"] = values.connections_deferred;
+            http_diagnostics["connections_refused"] = values.connections_refused;
+            http_diagnostics["staged_bytes"] = values.staged_bytes;
+            http_diagnostics["requests_served"] = values.requests_served;
+            http_diagnostics["requests_deferred"] = values.requests_deferred;
+            http_diagnostics["requests_overloaded"] = values.requests_overloaded;
+            http_diagnostics["slow_requests"] = values.slow_requests;
+            http_diagnostics["responses_compressed"] = values.responses_compressed;
+            http_diagnostics["compression_bytes_saved"] = values.compression_bytes_saved;
+            const auto lane_json = [](const HttpServerDiagnostics::Lane& lane) {
+                return Json::Object{{"workers", lane.workers},
+                                    {"busy", lane.busy},
+                                    {"queued", lane.queued},
+                                    {"peak_queued", lane.peak_queued},
+                                    {"queue_wait_ms_max", lane.queue_wait_ms_max},
+                                    {"handled", lane.handled}};
+            };
+            http_diagnostics["control_lane"] = lane_json(values.control);
+            http_diagnostics["data_lane"] = lane_json(values.data);
         } catch (const std::exception& error) {
             Log::debug("status http diagnostics unavailable: " + std::string(error.what()));
         }
@@ -1512,12 +1453,13 @@ HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId
     return http_json(200, Json(std::move(root)).dump());
 }
 
-HttpResponse ClusterStatusService::handle(const HttpRequest& request) {
+HttpResponse ClusterStatusService::handle(const HttpRequest& request,
+                                          const StatusSources& sources) {
     if (request.method == "GET" &&
         (request.path == "/api/v1/status" || request.path == "/api/v1/status/nodes"))
-        return status_response();
+        return status_response(sources);
     if (request.method == "GET" && request.path == diagnostics_path)
-        return diagnostics_response();
+        return diagnostics_response(sources);
     if (request.method == "POST" && request.path == "/api/v1/status/connectivity/check")
         return connectivity_check({});
 
@@ -1534,7 +1476,7 @@ HttpResponse ClusterStatusService::handle(const HttpRequest& request) {
         if (!id)
             return http_error(400, "bad_node_id", "node id must be a 32-character hexadecimal id");
         if (request.method == "GET" && !connectivity)
-            return status_response(*id);
+            return status_response(sources, *id);
         if (request.method == "POST" && connectivity)
             return connectivity_check(*id);
     }
