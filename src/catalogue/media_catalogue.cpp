@@ -2610,14 +2610,14 @@ std::optional<ProviderMatch> MusicScanProvider::lookup(const MediaProbe& probe) 
     return {};
 }
 
-CatalogueScanner::CatalogueScanner(NodeRuntime& node, FileSystem& fs,
+CatalogueScanner::CatalogueScanner(NodeRuntime& node, MetadataServer& metadata_server, FileSystem& fs,
                                    CatalogueManager& catalogue, CatalogueHintQueue& hints,
                                    CatalogueScannerConfig config,
                                    std::unique_ptr<HttpClient> http,
                                    std::chrono::milliseconds diagnostic_interval,
                                    std::shared_ptr<MediaEngine> profile_engine,
                                    MediaInformationService* media_information)
-    : node_(node), fs_(fs), catalogue_(catalogue), hints_(hints), config_(std::move(config)),
+    : node_(node), metadata_server_(metadata_server), fs_(fs), catalogue_(catalogue), hints_(hints), config_(std::move(config)),
       http_(http ? std::move(http) : std::make_unique<CurlHttpClient>()),
       provider_http_(std::make_unique<BudgetHttpClient>(*http_)),
       profile_engine_(std::move(profile_engine)),
@@ -3760,7 +3760,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
         node_.config().state_path / "catalogue" / "hints.json");
     std::optional<std::chrono::steady_clock::time_point> mutation_due;
     std::optional<std::chrono::steady_clock::time_point> mutation_first_seen;
-    auto observed_generation = node_.known_metadata_generation();
+    auto observed_generation = metadata_server_.known_generation();
     const auto initial_now = Clock::now();
     auto next_periodic = persisted.next_safety_scan_unix_ms
         ? std::min(steady_due_from_unix_ms(persisted.next_safety_scan_unix_ms),
@@ -3776,7 +3776,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
     auto namespace_identity = [&]() -> std::pair<Hash256, uint64_t> {
         uint64_t generation = 0;
         if (auto available = fs_.available_namespace_signature(&generation);
-            available && generation >= node_.known_metadata_generation())
+            available && generation >= metadata_server_.known_generation())
             return {*available, generation};
         // MetadataManager owns convergence; the strong snapshot path is only
         // for an absent or stale view.
@@ -3796,7 +3796,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
         if (!initial_signature_checked) {
             uint64_t available_generation = 0;
             if (auto current = fs_.available_namespace_signature(&available_generation);
-                current && available_generation >= node_.known_metadata_generation()) {
+                current && available_generation >= metadata_server_.known_generation()) {
                 // Never from a view known stale; metadata convergence catches up.
                 initial_signature_checked = true;
                 observed_generation = std::max(observed_generation, available_generation);
@@ -3882,7 +3882,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
         }
         was_coordinator = is_coordinator;
 
-        const auto generation = node_.known_metadata_generation();
+        const auto generation = metadata_server_.known_generation();
         if (generation != observed_generation) {
             observed_generation = generation;
             if (!mutation_first_seen) mutation_first_seen = now;

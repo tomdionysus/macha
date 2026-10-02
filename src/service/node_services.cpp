@@ -31,14 +31,14 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageR
                                             instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
-      metadata_(node_, node_.local_state(), &store_,
+      metadata_(node_, node_.local_state(), node_.metadata_server(), &store_,
                 [this](const MetadataPublicationContext& context) {
                     retain_metadata_publication(context);
                 }),
-      catalogue_(node_, node_.local_state(), store_, metadata_), filesystem_(node_, node_.local_state(), store_, metadata_, resources_.memory, &playback_),
+      catalogue_(node_, node_.local_state(), node_.metadata_server(), store_, metadata_), filesystem_(node_, node_.local_state(), node_.metadata_server(), store_, metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
-      scanner_(node_, filesystem_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner,
+      scanner_(node_, node_.metadata_server(), filesystem_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner,
                std::unique_ptr<HttpClient>{}, std::chrono::seconds(5), media_engine_,
                &media_information_),
       hydration_(store_, playback_, filesystem_, catalogue_, node_.config().hydration,
@@ -87,7 +87,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageR
       ledger_(node_.local_state().retention(), node_.local_state().data(),
               node_.local_state().control()),
       horizon_builder_(filesystem_, catalogue_, node_.local_state().control(), store_),
-      maintenance_(MaintenanceDependencies{node_, node_.local_state(), store_, metadata_, metadata_, catalogue_,
+      maintenance_(MaintenanceDependencies{node_, node_.local_state(), node_.metadata_server(), store_, metadata_, metadata_, catalogue_,
                                            horizon_builder_, ledger_, media_information_,
                                            resources_.events, port_, instruments_.clock,
                                            instruments_.trace, instruments_.maintenance_stage_hook,

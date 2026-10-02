@@ -2884,7 +2884,7 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     node.membership().observe(phantom, true);
     REQUIRE(node.wait_local_state_ready(10s));
 
-    MetadataManager metadata(node, node.local_state());
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
     bool rejected = false;
     try {
         (void)metadata.snapshot_view();
@@ -3081,7 +3081,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
         }
     }));
 
-    MetadataManager m1(s1.node(), s1.local_state());
+    MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server());
     auto snapshot = m1.snapshot();
     CHECK(snapshot.metadata_voters.empty());
     CHECK(snapshot.data_replication == 2);
@@ -3419,7 +3419,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         },
         10s));
 
-    MetadataManager metadata1(n1, n1.local_state());
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
     // One mutation, so the siblings fork from a real post-genesis record.
     metadata1.mutate([](MetadataSnapshot& snapshot) {
         FsEntry entry;
@@ -4315,7 +4315,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         // One accepted base everywhere before partitioning into two writable pairs.
         REQUIRE(retry_while_not_ready(
             [&] { s1.filesystem().mkdir("/base", 0755, getuid(), getgid()); }));
-        MetadataManager initial_repair(s1.node(), s1.local_state());
+        MetadataManager initial_repair(s1.node(), s1.local_state(), s1.metadata_server());
         initial_repair.repair_once();
         REQUIRE(wait_until([&] {
             try {
@@ -4393,7 +4393,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
             return active2.size() == 2 && active3.size() == 2;
         }));
 
-        MetadataManager reconcile(s2.node(), s2.local_state());
+        MetadataManager reconcile(s2.node(), s2.local_state(), s2.metadata_server());
         REQUIRE(wait_until(
             [&] {
                 try {
@@ -4488,7 +4488,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         // The write floor must be re-established at the new policy first.
         REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
-        MetadataManager m1(s1.node(), s1.local_state());
+        MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server());
         auto snapshot = m1.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
@@ -4521,7 +4521,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
 
         REQUIRE(retry_while_not_ready(
             [&] { s2.filesystem().mkdir("/after-shrink", 0755, getuid(), getgid()); }));
-        MetadataManager m2(s2.node(), s2.local_state());
+        MetadataManager m2(s2.node(), s2.local_state(), s2.metadata_server());
         auto snapshot = m2.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 1);
@@ -4677,7 +4677,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     }));
 
     // One metadata pass makes node 2 a durable checkpoint witness first.
-    MetadataManager witness_repair(s2->node(), s2->local_state());
+    MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server());
     witness_repair.repair_once();
     CHECK(s2->node().metadata_replica().committed().generation > 1);
 

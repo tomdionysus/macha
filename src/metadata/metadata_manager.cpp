@@ -54,9 +54,10 @@ bool bool_reply(const RpcReply& reply) {
 } // namespace
 
 MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
+                                 MetadataServer& metadata_server,
                                  DistributedStore* namespace_store,
                                  PublicationRetention publication_retention)
-    : node_(node), local_(local), namespace_store_(namespace_store),
+    : node_(node), local_(local), metadata_server_(metadata_server), namespace_store_(namespace_store),
       publication_retention_(std::move(publication_retention)) {
     if (!namespace_store_)
         return;
@@ -713,7 +714,7 @@ bool MetadataManager::accept_commit_on(const NodeInfo& owner,
     // NodeRuntime detects and notifies accepted-head changes for the local
     // path; do not announce again after this returns.
     if (owner.id == node_.node_id())
-        return node_.metadata_server().accept_commit(acceptance);
+        return metadata_server_.accept_commit(acceptance);
     try {
         const auto encoded = encode_metadata_acceptance(acceptance);
         return bool_reply(
@@ -851,7 +852,7 @@ std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_a
         try {
             std::vector<MetadataAcceptance> heads;
             if (owner.id == node_.node_id()) {
-                heads = node_.metadata_server().heads();
+                heads = metadata_server_.heads();
             } else {
                 auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
                 if (reply.message.type != MessageType::metadata_heads_reply)
@@ -874,7 +875,7 @@ bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
     if (owner.id == node_.node_id()) {
         if (!local_.replica().store_commit(record))
             return false;
-        return node_.metadata_server().accept_commit(acceptance);
+        return metadata_server_.accept_commit(acceptance);
     }
     if (!push_history_to_peer(owner, record.hash, frame_type)) {
         // Local history may be compactly rooted at this record; a full commit
@@ -917,7 +918,7 @@ MetadataManager::discover_accepted_heads_required(const std::vector<NodeInfo>& n
         try {
             std::vector<MetadataAcceptance> heads;
             if (owner.id == node_.node_id()) {
-                heads = node_.metadata_server().heads();
+                heads = metadata_server_.heads();
             } else {
                 auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
                 if (reply.message.type != MessageType::metadata_heads_reply)
@@ -1124,7 +1125,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             continue;
         bool accepted = false;
         for (const auto& certificate : head.certificates)
-            accepted = node_.metadata_server().accept_commit(certificate) || accepted;
+            accepted = metadata_server_.accept_commit(certificate) || accepted;
         if (!accepted) {
             constexpr auto retry_cooldown = std::chrono::seconds(30);
             {

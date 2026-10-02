@@ -293,7 +293,7 @@ class NodeRuntime {
     }
     uint64_t known_metadata_generation() const {
         const auto local =
-            progress_.complete() ? local_state_->replica().generation() : 0;
+            progress_.complete() ? metadata_server_->known_generation() : 0;
         const auto remote = remote_metadata_generation_.load();
         return local > remote ? local : remote;
     }

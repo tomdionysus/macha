@@ -243,7 +243,7 @@ MACHA_TEST("namespace_entries", test_a_manager_without_a_store_pages_a_map_backe
     macha::test_support::TestNode fixture("entries-no-store");
     fixture.prepare();
     auto& node = fixture.start();
-    MetadataManager metadata(node, node.local_state());
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
     MetadataSnapshot snapshot;
     snapshot.entries = namespace_of(9);
     const MetadataSnapshotView view{1, 0, Hash256{},

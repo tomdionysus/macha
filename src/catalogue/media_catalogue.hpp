@@ -394,6 +394,7 @@ std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
 
 class CatalogueScanner {
     NodeRuntime& node_;
+    MetadataServer& metadata_server_;
     FileSystem& fs_;
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
@@ -454,7 +455,8 @@ class CatalogueScanner {
         const CatalogueHint&, std::stop_token, const MetadataSnapshot& namespace_snapshot,
         uint64_t snapshot_taken_unix_ms, DistributedStore::DurabilityBatch& artwork_batch);
 
-    CatalogueScanner(NodeRuntime&, FileSystem&, CatalogueManager&, CatalogueHintQueue&,
+    CatalogueScanner(NodeRuntime&, MetadataServer&, FileSystem&, CatalogueManager&,
+                     CatalogueHintQueue&,
                      CatalogueScannerConfig, std::unique_ptr<HttpClient> = {},
                      std::chrono::milliseconds diagnostic_interval = std::chrono::seconds(5),
                      std::shared_ptr<MediaEngine> profile_engine = {},

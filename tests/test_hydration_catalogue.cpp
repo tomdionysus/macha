@@ -1474,7 +1474,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
     auto profile_engine = std::make_shared<FakeMediaEngine>();
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                              scanner_config, std::move(fake_http), 5s, profile_engine);
     const auto namespace_before_scan = service.filesystem().namespace_signature();
     CHECK(scanner.scan_once() == 1);
@@ -1602,7 +1602,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     auto* blocking_http_ptr = blocking_http.get();
     auto cancel_config = scanner_config;
     cancel_config.movies.roots = {"/Movies"};
-    CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner cancel_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                     cancel_config, std::move(blocking_http));
     // Scanner startup is idle on an already-operated library, so request the
     // pass whose in-flight provider request this test exercises.
@@ -1651,7 +1651,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     budget_config.movies.roots = {"/Budget"};
     budget_config.max_provider_requests_per_scan = 4;
     budget_config.provider_batch_delay = 1000ms;
-    CatalogueScanner budget_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner budget_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                     budget_config, std::move(budget_http));
     CHECK(budget_scanner.scan_once() == 2);
     CHECK(budget_http_ptr->requests() == 4);
@@ -1702,7 +1702,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     fair_config.music.roots = {"/FairMusic"};
     fair_config.music.musicbrainz.enabled = true;
     fair_config.max_provider_requests_per_scan = 3;
-    CatalogueScanner fair_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner fair_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                   fair_config, std::move(fair_http));
     CHECK(fair_scanner.scan_once() == 0);
     CHECK(fair_http_ptr->requests() == 3);
@@ -1754,7 +1754,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_ignores_paths_carrying_an_ignor
     scanner_config.movies.tmdb.token_file = token;
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                              service.catalogue_hints(), scanner_config, std::move(http), 5s,
                              std::make_shared<FakeMediaEngine>());
     CHECK(scanner.scan_once() == 1);
@@ -1770,7 +1770,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_ignores_paths_carrying_an_ignor
                          R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
     auto everything_config = scanner_config;
     everything_config.ignore_terms.clear();
-    CatalogueScanner everything(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner everything(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                                 service.catalogue_hints(), everything_config,
                                 std::move(everything_http), 5s,
                                 std::make_shared<FakeMediaEngine>());
@@ -1814,7 +1814,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_zero_length_files_wait_for_comm
     scanner_config.movies.tmdb.token_file = token;
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                              service.catalogue_hints(), scanner_config, std::move(fake_http));
 
     // Discovery must not manufacture one shared immutable identity for every
@@ -1883,7 +1883,7 @@ MACHA_TEST("hydration_catalogue", test_terminal_media_profile_job_is_not_requeue
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
     auto profile_engine = std::make_shared<FakeMediaEngine>();
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                              service.catalogue_hints(), scanner_config,
                              std::make_unique<FakeHttpClient>(), 5s, profile_engine);
 
@@ -1916,8 +1916,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state());
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
 
     CatalogueItem item;
     item.id = "test:movie:1";
@@ -2006,7 +2006,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_restart_does_not_rescan
 
     auto fake_http = std::make_unique<FakeHttpClient>();
     auto* fake_http_ptr = fake_http.get();
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                              service.catalogue_hints(), scanner_config, std::move(fake_http));
     scanner.start();
     REQUIRE(wait_until([&] {
@@ -2051,7 +2051,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
 
     auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::all);
     Log::set_logger(capture);
-    CatalogueScanner scanner(non_coordinator->node(), non_coordinator->filesystem(),
+    CatalogueScanner scanner(non_coordinator->node(), non_coordinator->metadata_server(),
+                             non_coordinator->filesystem(),
                              non_coordinator->catalogue(), non_coordinator->catalogue_hints(),
                              scanner_config, std::make_unique<FakeHttpClient>(), 1s);
     scanner.start();
@@ -3685,8 +3686,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
     DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
-    MetadataManager metadata1(n1, n1.local_state());
-    CatalogueManager catalogue1(n1, n1.local_state(), store1, metadata1);
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
+    CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1);
 
     CatalogueItem first;
     first.id = "test:movie:remote-first";
@@ -3697,8 +3698,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
     DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
-    MetadataManager metadata2(n2, n2.local_state());
-    CatalogueManager catalogue2(n2, n2.local_state(), store2, metadata2);
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server());
+    CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2);
 
     // Cold-load node two from node one's committed catalogue. There is no Service
     // here, so no catalogue maintenance thread can refresh it behind the test.
@@ -3734,7 +3735,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // into quorum reads. FUSE may adopt a newer snapshot only after some control-
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
-    FileSystem fs2(n2, n2.local_state(), store2, metadata2, n2.resources.memory);
+    FileSystem fs2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
     auto frontend = std::make_shared<FuseFrontend>(fs2, n2.resources.memory, fuse_config);
@@ -3822,11 +3823,11 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     // than turning that expected bootstrap state into an unhandled test failure.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    MetadataManager metadata1(n1, n1.local_state());
+    MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
     const auto initial1 = metadata1.snapshot_view();
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    MetadataManager metadata2(n2, n2.local_state());
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server());
 
     std::optional<MetadataSnapshotView> initial2;
     REQUIRE(wait_until([&] {
@@ -4562,8 +4563,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state());
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
 
     CatalogueItem item;
     item.id = "test:movie:artwork-missing";
@@ -4580,7 +4581,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     // Force a cold catalogue load from the sharded CONTROL representation. The
     // referenced artwork DATA is deliberately absent locally and must not be a
     // prerequisite for catalogue readiness.
-    CatalogueManager reloaded(node, node.local_state(), store, metadata);
+    CatalogueManager reloaded(node, node.local_state(), node.metadata_server(), store, metadata);
     reloaded.repair_once();
 
     auto status = reloaded.status();
@@ -4607,8 +4608,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state());
-    FileSystem filesystem(node, node.local_state(), store, metadata, node.resources.memory);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    FileSystem filesystem(node, node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
 
     filesystem.mkdir("/Music", 0755, getuid(), getgid());
 
@@ -4669,8 +4670,8 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state());
-    FileSystem filesystem(node, node.local_state(), store, metadata, node.resources.memory);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    FileSystem filesystem(node, node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
 
     filesystem.mkdir("/media", 0755, getuid(), getgid());
     filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());
@@ -5371,7 +5372,7 @@ MACHA_TEST("hydration_catalogue", test_a_hint_newer_than_its_batch_snapshot_is_d
     scanner_config.movies.roots = {"/Movies"};
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                              service.catalogue_hints(), scanner_config, std::make_unique<FakeHttpClient>());
     auto& hints = service.catalogue_hints();
     const auto snapshot = service.metadata_manager().snapshot(); // no such file in it
