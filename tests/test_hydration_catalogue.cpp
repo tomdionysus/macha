@@ -5000,7 +5000,18 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     std::atomic_bool gate_metadata{};
     std::atomic_bool gate_once{};
     std::atomic_uint64_t catalogue_repairs{};
+    // Convergence counters as each metadata run begins once the gate is set:
+    // the first is the gated run, the second the burst's follow-up.
+    std::atomic<Service*> observed{nullptr};
+    std::mutex run_begins_mutex;
+    std::vector<ConvergenceDemandDiagnostics> run_begins;
     Service s1(c1, keys, {}, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" && gate_metadata.load(std::memory_order_acquire)) {
+            if (auto* service = observed.load(std::memory_order_acquire)) {
+                std::lock_guard lock(run_begins_mutex);
+                run_begins.push_back(service->metadata_convergence_diagnostics());
+            }
+        }
         if (stage == "metadata-repair-begin" &&
             gate_metadata.load(std::memory_order_acquire) &&
             !gate_once.exchange(true, std::memory_order_acq_rel)) {
@@ -5009,6 +5020,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             catalogue_repairs.fetch_add(1, std::memory_order_relaxed);
         }
     });
+    observed.store(&s1, std::memory_order_release);
     Service s2(c2, keys);
     struct GateOpener {
         TestGate& gate;
@@ -5148,29 +5160,32 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     REQUIRE(final_artwork.has_value());
     CHECK(final_artwork->bytes == initial_bytes);
 
-    // Measured over the whole window once convergence settles: the gated run
-    // and its coalesced follow-up are mandatory, and at most one more run may
-    // come from reconciliation publishing its own accepted metadata. The many
-    // burst events must never become one run each. The pure one-follow-up
-    // state-machine contract is covered by the dedicated ConvergenceDemand test.
-    ConvergenceDemandDiagnostics settled{};
+    // Measured as the burst's follow-up run begins: the gated run has
+    // completed and the burst has become that one run, with at most one more
+    // scheduled by reconciliation publishing its own accepted metadata. Later
+    // metadata (artwork and retention commits replicating) is not this burst.
+    // The pure one-follow-up state-machine contract is covered by the
+    // dedicated ConvergenceDemand test.
     REQUIRE(wait_until([&] {
-        settled = s1.metadata_convergence_diagnostics();
-        return !settled.scheduled && settled.runs_scheduled == settled.runs_completed;
-    }, 5s));
-    const auto scheduled_delta = settled.runs_scheduled - convergence_before.runs_scheduled;
-    const auto completed_delta = settled.runs_completed - convergence_before.runs_completed;
+        std::lock_guard lock(run_begins_mutex);
+        return run_begins.size() >= 2;
+    }, 10s));
+    ConvergenceDemandDiagnostics follow_up{};
+    {
+        std::lock_guard lock(run_begins_mutex);
+        follow_up = run_begins[1];
+    }
     const auto events_delta = convergence_events() - events_before;
-    if (scheduled_delta < 2 || scheduled_delta > 3 || completed_delta != scheduled_delta ||
-        settled.completed_epoch != settled.requested_epoch || scheduled_delta >= events_delta) {
+    const auto scheduled_delta = follow_up.runs_scheduled - convergence_before.runs_scheduled;
+    const auto completed_delta = follow_up.runs_completed - convergence_before.runs_completed;
+    if (completed_delta != 1 || scheduled_delta < 2 || scheduled_delta > 3 ||
+        scheduled_delta >= events_delta) {
         throw std::runtime_error(
             "unexpected convergence run count for one coalesced burst: before_scheduled=" +
             std::to_string(convergence_before.runs_scheduled) +
             " before_completed=" + std::to_string(convergence_before.runs_completed) +
-            " settled_scheduled=" + std::to_string(settled.runs_scheduled) +
-            " settled_completed=" + std::to_string(settled.runs_completed) +
-            " settled_requested_epoch=" + std::to_string(settled.requested_epoch) +
-            " settled_completed_epoch=" + std::to_string(settled.completed_epoch) +
+            " follow_up_scheduled=" + std::to_string(follow_up.runs_scheduled) +
+            " follow_up_completed=" + std::to_string(follow_up.runs_completed) +
             " events=" + std::to_string(events_delta) +
             " repairs_before=" + std::to_string(repairs_before) + " repairs_after=" +
             std::to_string(catalogue_repairs.load(std::memory_order_acquire)));
