@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/distributed_store.hpp"
+#include "diagnostics.hpp"
 #include "codec.hpp"
 #include "durable_file.hpp"
 #include "log.hpp"
@@ -18,7 +19,7 @@
 
 namespace macha {
 namespace {
-uint64_t elapsed_ms(Clock::time_point since) {
+uint64_t since_ms(Clock::time_point since) {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count());
 }
@@ -865,7 +866,7 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     // Batched, concurrent candidate-presence scan; same preference order and
     // per-object floor as a serial has_on() walk.
     auto selected_by_object = select_present_batched(candidates_by_object, floor);
-    const auto scan_ms = elapsed_ms(started);
+    const auto scan_ms = since_ms(started);
 
     std::vector<ObjectId> short_ids;
     for (const auto& id : ids)
@@ -883,7 +884,7 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
         barrier_ids.fetch_add(ids.size(), std::memory_order_relaxed);
         if (!ok)
             barrier_failed.fetch_add(1, std::memory_order_relaxed);
-        const auto total = elapsed_ms(started);
+        const auto total = since_ms(started);
         if (total >= 250 && Log::enabled(LogLevel::debug))
             Log::debug("DATA retention barrier ids=" + std::to_string(ids.size()) +
                        " nodes=" + std::to_string(batches.size()) + " total_ms=" +
@@ -1150,7 +1151,7 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         if (retained_count >= required)
             break;
     }
-    const auto total_ms = elapsed_ms(started);
+    const auto total_ms = since_ms(started);
     if (total_ms >= 250 && Log::enabled(LogLevel::debug))
         Log::debug("CONTROL retention claim objects=" + std::to_string(ids.size()) +
                    " required=" + std::to_string(required) + " tried=" + std::to_string(tried) +
@@ -1181,6 +1182,9 @@ DistributedStore::DistributedStore(NodeRuntime& n, ActivityClocks& activity,
     prompt_thread_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("prompt-replication", stop, [this, stop] { prompt_replication_loop(stop); });
     });
+    local_writer_ = std::jthread([this](std::stop_token stop) {
+        run_supervised_loop("local-copy-writer", stop, [this, stop] { local_writer_loop(stop); });
+    });
 }
 
 
@@ -1202,6 +1206,12 @@ void DistributedStore::save_repair_position(bool force) {
 }
 
 DistributedStore::~DistributedStore() {
+    if (local_writer_.joinable()) {
+        local_copy_cancelled_.store(true, std::memory_order_release);
+        local_writer_.request_stop();
+        local_copy_cv_.notify_all();
+        local_writer_.join();
+    }
     save_repair_position(true);
     if (prompt_thread_.joinable()) {
         prompt_thread_.request_stop();
@@ -1491,7 +1501,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         if (data) {
             if (foreground) note_foreground(data->bytes.size());
             if (opportunistic_persist)
-                n_.enqueue_fetched(id, data->bytes, should_own(id));
+                enqueue_local_copy(id, data->bytes, should_own(id));
         }
         return data;
     }
@@ -1549,7 +1559,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
                 shared->foreground_accounted = true;
             }
             if (opportunistic_persist && !shared->persist_queued) {
-                n_.enqueue_fetched(id, shared->result->bytes, should_own(id));
+                enqueue_local_copy(id, shared->result->bytes, should_own(id));
                 shared->persist_queued = true;
             }
         }
@@ -1588,7 +1598,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         if (result && account_foreground)
             note_foreground(result->bytes.size());
         if (result && queue_persist)
-            n_.enqueue_fetched(id, result->bytes, should_own(id));
+            enqueue_local_copy(id, result->bytes, should_own(id));
         shared->cv.notify_all();
         return result;
     };
@@ -1754,7 +1764,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         if (interactive)
             activity_.note(frame_type, cached->size());
         if (should_own(id))
-            n_.enqueue_fetched(id, *cached, true);
+            enqueue_local_copy(id, *cached, true);
         auto elapsed = log_playback_read("cache", cached->size(), true);
         if (Log::enabled(LogLevel::all))
             Log::trace("DIAG object-get id=" + to_string(id) +
@@ -2771,4 +2781,106 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     }
     return result;
 }
+void DistributedStore::enqueue_local_copy(const ObjectId& id, std::span<const uint8_t> data,
+                                          bool promote) {
+    bool cache = false;
+    try {
+        cache = n_.block_cache().enabled();
+    } catch (const std::exception&) {
+        // The cache is still recovering: nothing to fill.
+    }
+    if (promote && !n_.readiness().data_storage_ready)
+        promote = false;
+    if (!cache && !promote)
+        return;
+
+    auto memory = retained_memory_.try_acquire(MemoryClass::speculative,
+                                               MemoryOwner::object_payload, data.size());
+    if (!memory) {
+        // Log the drop, so an unfilled cache is distinguishable from a broken one.
+        Log::debug("opportunistic persistence skipped object=" + to_string(id) +
+                   " reason=retained_memory bytes=" + std::to_string(data.size()) +
+                   " cache=" + (cache ? "1" : "0") + " promote=" + (promote ? "1" : "0"));
+        return;
+    }
+
+    // Opportunistic persistence must not back-pressure playback: when the
+    // bounded queue is full the copy is dropped and repair converges later.
+    constexpr size_t max_queued_bytes = 256ULL * 1024 * 1024;
+    std::lock_guard lock(local_copy_mutex_);
+    if (data.size() > max_queued_bytes || local_copy_bytes_ + data.size() > max_queued_bytes) {
+        Log::debug("opportunistic persistence skipped object=" + to_string(id) +
+                   " reason=queue_full queued_bytes=" + std::to_string(local_copy_bytes_));
+        return;
+    }
+    LocalCopyJob job;
+    job.id = id;
+    job.data.assign(data.begin(), data.end());
+    job.promote = promote;
+    job.cache = cache;
+    job.memory = std::move(*memory);
+    local_copy_bytes_ += job.data.size();
+    local_copies_.push_back(std::move(job));
+    local_copy_cv_.notify_one();
+}
+
+void DistributedStore::wait_local_copies_settled() {
+    std::unique_lock lock(local_copy_mutex_);
+    local_copy_settled_cv_.wait(lock, [&] { return local_copies_.empty() && !local_copy_writing_; });
+}
+
+void DistributedStore::local_writer_loop(std::stop_token stop) {
+    ThreadCpuReporter cpu_reporter("macha-local-wr");
+    while (true) {
+        LocalCopyJob job;
+        {
+            std::unique_lock lock(local_copy_mutex_);
+            local_copy_cv_.wait(lock,
+                                [&] { return stop.stop_requested() || !local_copies_.empty(); });
+            if (stop.stop_requested() && local_copies_.empty())
+                return;
+            job = std::move(local_copies_.front());
+            local_copies_.pop_front();
+            local_copy_bytes_ -= job.data.size();
+            local_copy_writing_ = true;
+        }
+        struct Settled {
+            DistributedStore& store;
+            ~Settled() {
+                {
+                    std::lock_guard lock(store.local_copy_mutex_);
+                    store.local_copy_writing_ = false;
+                }
+                store.local_copy_settled_cv_.notify_all();
+            }
+        } settled{*this};
+        auto resource = data_resources_.acquire(
+            DataWorkContext(FrameType::speculative, job.data.size(), {}, &local_copy_cancelled_),
+            job.data.size());
+        if (!resource) {
+            if (stop.stop_requested())
+                return;
+            Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
+                       " reason=data_credit");
+            continue;
+        }
+        bool cached = false;
+        if (job.cache) {
+            cached = n_.block_cache().put(job.id, job.data);
+            if (!cached)
+                Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
+                           " reason=cache_put_failed");
+        }
+        // With a persistent cache, foreground fetches land on the cache device
+        // and HDD promotion is left to idle maintenance. If the cache write
+        // fails (or there is no cache), promote here rather than fetch again.
+        if (job.promote && (!job.cache || !cached)) {
+            auto& local = n_.local_store();
+            (void)local.put(job.id, job.data);
+            n_.membership().storage(local.used(), local.limit());
+        }
+        cpu_reporter.tick();
+    }
+}
+
 } // namespace macha

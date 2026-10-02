@@ -598,9 +598,6 @@ void NodeRuntime::start() {
     telemetry_worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("cluster-telemetry", stop, [this, stop] { telemetry_loop(stop); });
     });
-    local_writer_ = std::jthread([this](std::stop_token stop) {
-        run_supervised_loop("cluster-local-writer", stop, [this, stop] { local_writer_loop(stop); });
-    });
     maintenance_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("cluster-maintenance", stop, [this, stop] { loop(stop); });
     });
@@ -813,11 +810,6 @@ void NodeRuntime::request_stop() {
         maintenance_.request_stop();
         maintenance_wait_cv_.notify_all();
     }
-    if (local_writer_.joinable()) {
-        Log::debug("shutdown: local writer request_stop");
-        local_writer_.request_stop();
-        local_copy_cv_.notify_all();
-    }
     readiness_cv_.notify_all();
 }
 
@@ -845,7 +837,7 @@ void NodeRuntime::stop() {
     Log::debug("shutdown: RpcClient::stop returned");
 
     for (auto* worker : {&connectivity_worker_, &storage_recovery_, &state_recovery_,
-                         &telemetry_worker_, &maintenance_, &local_writer_}) {
+                         &telemetry_worker_, &maintenance_}) {
         if (worker->joinable())
             worker->join();
     }
@@ -1982,100 +1974,6 @@ void NodeRuntime::loop(std::stop_token stop) {
         cpu_reporter.tick();
         std::unique_lock wait_lock(maintenance_wait_mutex_);
         maintenance_wait_cv_.wait_for(wait_lock, stop, cfg_.heartbeat, [] { return false; });
-    }
-}
-
-void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> data, bool promote) {
-    const bool cache = ready(ready_cache) && cache_ && cache_->enabled();
-    if (promote && (!ready(ready_data_storage) || !local_))
-        promote = false;
-    if (!cache && !promote)
-        return;
-
-    auto memory = retained_memory_.try_acquire(MemoryClass::speculative,
-                                               MemoryOwner::object_payload, data.size());
-    if (!memory) {
-        // Log the drop, so an unfilled cache is distinguishable from a broken one.
-        Log::debug("opportunistic persistence skipped object=" + to_string(id) +
-                   " reason=retained_memory bytes=" + std::to_string(data.size()) +
-                   " cache=" + (cache ? "1" : "0") + " promote=" + (promote ? "1" : "0"));
-        return;
-    }
-
-    // Opportunistic persistence must not back-pressure playback: when the
-    // bounded queue is full the copy is dropped and repair converges later.
-    constexpr size_t max_queued_bytes = 256ULL * 1024 * 1024;
-    std::lock_guard lock(local_copy_mutex_);
-    if (data.size() > max_queued_bytes || local_copy_bytes_ + data.size() > max_queued_bytes) {
-        Log::debug("opportunistic persistence skipped object=" + to_string(id) +
-                   " reason=queue_full queued_bytes=" + std::to_string(local_copy_bytes_));
-        return;
-    }
-    LocalCopyJob job;
-    job.id = id;
-    job.data.assign(data.begin(), data.end());
-    job.promote = promote;
-    job.cache = cache;
-    job.memory = std::move(*memory);
-    local_copy_bytes_ += job.data.size();
-    local_copies_.push_back(std::move(job));
-    local_copy_cv_.notify_one();
-}
-
-void NodeRuntime::wait_local_copies_settled() {
-    std::unique_lock lock(local_copy_mutex_);
-    local_copy_settled_cv_.wait(lock, [&] { return local_copies_.empty() && !local_copy_writing_; });
-}
-
-void NodeRuntime::local_writer_loop(std::stop_token stop) {
-    ThreadCpuReporter cpu_reporter("macha-local-wr");
-    while (true) {
-        LocalCopyJob job;
-        {
-            std::unique_lock lock(local_copy_mutex_);
-            local_copy_cv_.wait(lock,
-                                [&] { return stop.stop_requested() || !local_copies_.empty(); });
-            if (stop.stop_requested() && local_copies_.empty())
-                return;
-            job = std::move(local_copies_.front());
-            local_copies_.pop_front();
-            local_copy_bytes_ -= job.data.size();
-            local_copy_writing_ = true;
-        }
-        struct Settled {
-            NodeRuntime& node;
-            ~Settled() {
-                {
-                    std::lock_guard lock(node.local_copy_mutex_);
-                    node.local_copy_writing_ = false;
-                }
-                node.local_copy_settled_cv_.notify_all();
-            }
-        } settled{*this};
-        auto resource = data_resources_.acquire(
-            DataWorkContext(FrameType::speculative, job.data.size()), job.data.size());
-        if (!resource) {
-            if (stop.stop_requested())
-                return;
-            Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
-                       " reason=data_credit");
-            continue;
-        }
-        bool cached = false;
-        if (job.cache && ready(ready_cache) && cache_) {
-            cached = cache_->put(job.id, job.data);
-            if (!cached)
-                Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
-                           " reason=cache_put_failed");
-        }
-        // With a persistent cache, foreground fetches land on the cache device
-        // and HDD promotion is left to idle maintenance. If the cache write
-        // fails (or there is no cache), promote here rather than fetch again.
-        if (job.promote && (!job.cache || !cached) && ready(ready_data_storage) && local_) {
-            (void)local_->put(job.id, job.data);
-            members_.storage(local_->used(), local_->limit());
-        }
-        cpu_reporter.tick();
     }
 }
 

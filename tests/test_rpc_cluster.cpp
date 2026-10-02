@@ -4912,7 +4912,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_read_of_a_corrupt_local_copy_comes_from_a
     const auto fetched = store.get(id);
     REQUIRE(fetched.has_value());
     CHECK(object_id(*fetched) == id);
-    node.wait_local_copies_settled();
+    store.wait_local_copies_settled();
     const auto healed = node.local_store().get(id);
     REQUIRE(healed.has_value());
     CHECK(object_id(*healed) == id);
@@ -4966,14 +4966,14 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_runtime_cache_keeps_a_playback_fetch) {
     cached.cache.path = trio.cluster.path() / "n2-cache";
     cached.cache.max_blocks = 8;
     node.reconfigure_local(cached);
-    node.wait_local_copies_settled();
+    trio[1].store().wait_local_copies_settled();
     REQUIRE(node.local_store().remove(id));
     REQUIRE(!node.block_cache().has(id));
 
     DistributedStore store(node, trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
     const auto fetched = store.get(id, 0, true);
     REQUIRE(fetched.has_value());
-    node.wait_local_copies_settled();
+    store.wait_local_copies_settled();
     CHECK(node.block_cache().has(id));
     REQUIRE(!node.local_store().has(id));
     const auto again = store.get(id, 0, true);
