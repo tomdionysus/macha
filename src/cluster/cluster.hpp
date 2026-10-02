@@ -70,6 +70,8 @@ class NodeRuntime {
     Config cfg_;
     // Owned by the root, which built it under the state path's lock.
     const NodeIdentity& identity_;
+    // Owned by the root; the node reads it for readiness and telemetry.
+    RecoveryProgress& progress_;
     // Owned by the root (NodeResources), which stops them before this node.
     ActivityClocks& activity_;
     DataResourceArbiter& data_resources_;
@@ -108,8 +110,7 @@ class NodeRuntime {
     RpcServer server_;
 
     // Recovered by local_recovery_; published, with its servers, by
-    // local_ready_.
-    RecoveryProgress progress_;
+    // progress_'s completion.
     std::unique_ptr<LocalState> local_state_;
     // Built with the replica, so its routes answer from then on.
     std::unique_ptr<MetadataServer> metadata_server_;
@@ -117,11 +118,7 @@ class NodeRuntime {
     std::unique_ptr<StorageServer> storage_server_;
     StartupStageHook startup_stage_hook_;
     std::atomic_bool control_plane_online_{};
-    std::atomic_bool local_ready_{};
     uint64_t startup_unix_ms_{};
-    std::atomic_uint64_t ready_unix_ms_{};
-    mutable std::mutex readiness_mutex_;
-    std::condition_variable readiness_cv_;
     std::jthread local_recovery_;
     std::jthread connectivity_worker_;
     std::mutex connectivity_wait_mutex_;
@@ -184,7 +181,7 @@ class NodeRuntime {
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
-    NodeRuntime(Config, const NodeIdentity&, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
+    NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
                 TranscodeRateBook&, MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
@@ -296,7 +293,7 @@ class NodeRuntime {
     }
     uint64_t known_metadata_generation() const {
         const auto local =
-            local_ready_.load(std::memory_order_acquire) ? local_state_->replica().generation() : 0;
+            progress_.complete() ? local_state_->replica().generation() : 0;
         const auto remote = remote_metadata_generation_.load();
         return local > remote ? local : remote;
     }
