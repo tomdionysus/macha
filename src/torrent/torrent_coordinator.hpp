@@ -25,7 +25,7 @@ class NodeRuntime;
 // progress back. One per node, plugin or not; a node without it never claims.
 class TorrentCoordinator {
   public:
-    // The torrent intent route's handler (JobRoutes).
+    // The torrent_intent message's handler.
     Bytes handle_intent(std::span<const uint8_t> payload);
     // A claim outlives a node's absence from membership for this long, so a
     // restart or a brief wifi drop does not move a download.

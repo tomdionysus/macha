@@ -216,12 +216,12 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activity,
                          DataResourceArbiter& data_resources,
                          RetainedMemoryLedger& retained_memory,
-                         TranscodeRateBook& transcode_rates, JobRoutes& job_routes, NodeEvents& events,
+                         TranscodeRateBook& transcode_rates, MessageRoutes& routes, NodeEvents& events,
                          StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), keys_(keys),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
       activity_(activity), data_resources_(data_resources), retained_memory_(retained_memory),
-      transcode_rates_(transcode_rates), job_routes_(job_routes), events_(events),
+      transcode_rates_(transcode_rates), routes_(routes), events_(events),
       inbound_(initial_inbound_resolution(cfg_)),
       members_(self_info(cfg_, id_, 0, 0, 0,
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
@@ -273,7 +273,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
       server_(
           cfg_.listen_host, cfg_.port, keys_, members_.self(),
           [this](const NodeInfo& peer, FrameType frame_type, const RpcMessage& request) {
-              return handle(peer, frame_type, request);
+              return routes_.dispatch(peer, frame_type, request);
           },
           [this](const NodeInfo& peer) {
               const auto active_before = members_.active();
@@ -317,10 +317,15 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
     // telemetry are fenced before the control plane starts.
     for (const auto& reset : members_.identity_resets())
         apply_identity_reset(reset);
+    bind_control_routes();
+    bind_storage_routes();
+    bind_metadata_routes();
 }
 
+// The server is stopped first, so no request is in flight.
 NodeRuntime::~NodeRuntime() {
     stop();
+    unbind_routes();
 }
 
 void NodeRuntime::mark_ready(ReadyBit bit) {
@@ -1009,226 +1014,261 @@ bool NodeRuntime::commit_history_checkpoint(const Hash256& floor_hash, const Has
     return metadata_replica().record_checkpoint_commit(floor_hash, epoch);
 }
 
-RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
-                               const RpcMessage& request) {
-    try {
-        // Health/control never depends on storage I/O; capacity is refreshed
-        // by maintenance and after successful mutations.
-        switch (request.type) {
-        case MessageType::ping:
-            return {MessageType::ok, {}};
-        case MessageType::dial_request: {
-            // A non-dialable peer wants a lane. The handshake behind `peer`
-            // authenticates it; the health thread dials under its backoff.
-            Reader reader(request.payload);
-            const auto lane = static_cast<TransportLane>(reader.u8());
-            reader.finish();
-            if (lane != TransportLane::control && lane != TransportLane::data)
-                return error_reply("invalid transport lane");
-            Log::debug("dial request received peer=" + to_string(peer.id).substr(0, 12) +
-                       " lane=" + transport_lane_name(lane));
-            client_.request_lane(peer, lane);
-            return {MessageType::ok, {}};
-        }
-        case MessageType::dial_back_probe: {
-            // "Can you connect to me at this address?" Answered with a fresh
-            // connection whose handshake must authenticate as the asker, never
-            // an existing route. Rate limited per peer, so it cannot be used
-            // to make this node hammer an address.
-            Reader reader(request.payload);
-            Endpoint target;
-            target.host = reader.string(4096);
-            target.port = reader.u16();
-            reader.finish();
-            if (target.host.empty() || !target.port)
-                return error_reply("dial-back probe needs a host and port");
-            {
-                std::lock_guard lock(dial_back_mutex_);
-                const auto now = Clock::now();
-                auto& last = dial_back_last_[peer.id];
-                if (last != Clock::time_point{} && now - last < cfg_.dial_back_probe_min_interval)
-                    return error_reply("dial-back probe rate limited");
-                last = now;
-            }
-            const auto error = client_.probe_dial(target, peer.id);
-            Log::debug("dial-back probe for peer=" + to_string(peer.id).substr(0, 12) +
-                       " endpoint=" + target.host + ":" + std::to_string(target.port) +
-                       " reachable=" + (error.empty() ? "true" : "false") +
-                       (error.empty() ? "" : " error=" + error));
-            Writer writer;
-            writer.u8(error.empty() ? 1 : 0);
-            writer.string(error);
-            return {MessageType::dial_back_probe_reply, writer.take()};
-        }
-        case MessageType::members: {
-            auto nodes = members_.all();
-            Writer writer;
-            writer.u32(nodes.size());
-            for (const auto& node : nodes)
-                encode_node_info(writer, node);
-            return {MessageType::members_reply, writer.take()};
-        }
-        case MessageType::telemetry: {
-            if (!request.payload.empty()) {
-                try {
-                    for (auto& value : decode_telemetry_set(request.payload))
-                        telemetry_.observe(std::move(value));
-                } catch (const DecodeError&) {
-                    // Also accept telemetry sent as a request.
-                    telemetry_.observe(decode_node_telemetry(request.payload), true);
-                }
-            }
-            const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
-            return {MessageType::telemetry_reply,
-                    encode_telemetry_set(telemetry_.recent(gossip_ttl, 64))};
-        }
-        case MessageType::identity_resets: {
-            if (!request.payload.empty())
-                for (const auto& reset : decode_identity_resets(request.payload))
-                    apply_identity_reset(reset);
-            return {MessageType::identity_resets_reply, encode_identity_resets(identity_resets())};
-        }
-        case MessageType::user_sync: {
-            if (!request.payload.empty())
-                (void)users_.apply_all(decode_users(request.payload));
-            return {MessageType::user_sync_reply, encode_users(users_.all())};
-        }
-        case MessageType::session_sync: {
-            if (!request.payload.empty())
-                for (const auto& session : decode_sessions(request.payload))
-                    apply_session(session);
-            const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
-            return {MessageType::session_sync_reply, encode_sessions(sessions_.recent(gossip_ttl, 64))};
-        }
-        case MessageType::have_object: {
-            Reader reader(request.payload);
-            ObjectId id{reader.fixed<32>()};
-            reader.finish();
-            Writer writer;
-            auto resource = data_resources_.try_acquire(
-                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
-            if (!resource)
-                return error_reply("DATA resource admission busy or stopping");
-            // Repair/rebalance trust this "present" without re-verifying, so
-            // authenticate, decrypt and hash: a corrupt replica never counts as
-            // healthy placement. (have_objects and retain_objects check presence.)
-            writer.u8(local_store().valid(id));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::have_objects: {
-            Reader reader(request.payload);
-            const auto count = reader.u32();
-            if (!count || count > 200000)
-                return error_reply("invalid presence batch count");
-            std::vector<ObjectId> ids;
-            ids.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                ObjectId id;
-                id.bytes = reader.fixed<32>();
-                ids.push_back(id);
-            }
-            reader.finish();
-            // Used only by retain_data()'s candidate scan
-            // (select_present_batched), never by repair. "Present" only makes
-            // a node a candidate; retain_objects then claims on index
-            // presence. One admission for the whole batch: no per-object I/O.
-            auto resource = data_resources_.try_acquire(
-                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
-            if (!resource)
-                return error_reply("DATA resource admission busy or stopping");
-            Writer writer;
-            writer.u32(count);
-            for (const auto& id : ids)
-                writer.u8(local_store().has(id));
-            return {MessageType::have_objects_reply, writer.take()};
-        }
-        case MessageType::have_valid_objects: {
-            Reader reader(request.payload);
-            const auto count = reader.u32();
-            if (!count || count > have_valid_objects_max)
-                return error_reply("invalid validated presence batch count");
-            std::vector<ObjectId> ids;
-            ids.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                ObjectId id;
-                id.bytes = reader.fixed<32>();
-                ids.push_back(id);
-            }
-            reader.finish();
-            // Repair trusts "present" as a healthy copy, so each id is read,
-            // decrypted and hashed like have_object; one DATA admission per id.
-            Writer writer;
-            writer.u32(count);
-            for (const auto& id : ids) {
-                auto resource = data_resources_.try_acquire(
-                    DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
-                if (!resource)
-                    return error_reply("DATA resource admission busy or stopping");
-                writer.u8(local_store().valid(id));
-            }
-            return {MessageType::have_valid_objects_reply, writer.take()};
-        }
-        case MessageType::have_control_objects: {
-            // The CONTROL counterpart: answers from control_store() and takes
-            // no DATA admission. Law 1: control never queues behind or runs
-            // inline with bulk data work.
-            Reader reader(request.payload);
-            const auto count = reader.u32();
-            if (!count || count > 200000)
-                return error_reply("invalid control presence batch count");
-            std::vector<ObjectId> ids;
-            ids.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                ObjectId id;
-                id.bytes = reader.fixed<32>();
-                ids.push_back(id);
-            }
-            reader.finish();
-            Writer writer;
-            writer.u32(count);
-            for (const auto& id : ids)
-                writer.u8(control_store().has(id));
-            return {MessageType::have_control_objects_reply, writer.take()};
-        }
-        case MessageType::get_object: {
-            Reader reader(request.payload);
-            ObjectId id{reader.fixed<32>()};
-            reader.finish();
-            auto resource = data_resources_.acquire(
-                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
-            if (!resource)
-                return error_reply("DATA resource admission stopping");
-            auto data = local_store().get(id);
-            if (!data)
-                return error_reply("object not found");
-            activity_.note(frame_type, data->size());
-            Writer writer;
-            writer.fixed(id.bytes);
-            writer.bytes(*data);
-            return {MessageType::object_reply, writer.take()};
-        }
-        case MessageType::get_control_object: {
-            Reader reader(request.payload);
-            ObjectId id{reader.fixed<32>()};
-            reader.finish();
-            auto data = control_store().get(id);
-            if (!data)
-                return error_reply("control object not found");
-            Writer writer;
-            writer.fixed(id.bytes);
-            writer.bytes(*data);
-            return {MessageType::control_object_reply, writer.take()};
-        }
-        case MessageType::put_object:
-        case MessageType::put_object_deferred: {
+// Health, dialling, membership, telemetry and account gossip.
+void NodeRuntime::bind_control_routes() {
+    route(MessageType::ping,
+          []([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              return {MessageType::ok, {}};
+          });
+    route(MessageType::dial_request,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              // A non-dialable peer wants a lane. The handshake behind `peer`
+              // authenticates it; the health thread dials under its backoff.
+              Reader reader(request.payload);
+              const auto lane = static_cast<TransportLane>(reader.u8());
+              reader.finish();
+              if (lane != TransportLane::control && lane != TransportLane::data)
+                  return error_reply("invalid transport lane");
+              Log::debug("dial request received peer=" + to_string(peer.id).substr(0, 12) +
+                         " lane=" + transport_lane_name(lane));
+              client_.request_lane(peer, lane);
+              return {MessageType::ok, {}};
+          });
+    route(MessageType::dial_back_probe,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              // "Can you connect to me at this address?" Answered with a fresh
+              // connection whose handshake must authenticate as the asker, never
+              // an existing route. Rate limited per peer, so it cannot be used
+              // to make this node hammer an address.
+              Reader reader(request.payload);
+              Endpoint target;
+              target.host = reader.string(4096);
+              target.port = reader.u16();
+              reader.finish();
+              if (target.host.empty() || !target.port)
+                  return error_reply("dial-back probe needs a host and port");
+              {
+                  std::lock_guard lock(dial_back_mutex_);
+                  const auto now = Clock::now();
+                  auto& last = dial_back_last_[peer.id];
+                  if (last != Clock::time_point{} && now - last < cfg_.dial_back_probe_min_interval)
+                      return error_reply("dial-back probe rate limited");
+                  last = now;
+              }
+              const auto error = client_.probe_dial(target, peer.id);
+              Log::debug("dial-back probe for peer=" + to_string(peer.id).substr(0, 12) +
+                         " endpoint=" + target.host + ":" + std::to_string(target.port) +
+                         " reachable=" + (error.empty() ? "true" : "false") +
+                         (error.empty() ? "" : " error=" + error));
+              Writer writer;
+              writer.u8(error.empty() ? 1 : 0);
+              writer.string(error);
+              return {MessageType::dial_back_probe_reply, writer.take()};
+          });
+    route(MessageType::members,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              auto nodes = members_.all();
+              Writer writer;
+              writer.u32(nodes.size());
+              for (const auto& node : nodes)
+                  encode_node_info(writer, node);
+              return {MessageType::members_reply, writer.take()};
+          });
+    route(MessageType::telemetry,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              if (!request.payload.empty()) {
+                  try {
+                      for (auto& value : decode_telemetry_set(request.payload))
+                          telemetry_.observe(std::move(value));
+                  } catch (const DecodeError&) {
+                      // Also accept telemetry sent as a request.
+                      telemetry_.observe(decode_node_telemetry(request.payload), true);
+                  }
+              }
+              const auto gossip_ttl =
+                  std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
+              return {MessageType::telemetry_reply,
+                      encode_telemetry_set(telemetry_.recent(gossip_ttl, 64))};
+          });
+    route(MessageType::identity_resets,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              if (!request.payload.empty())
+                  for (const auto& reset : decode_identity_resets(request.payload))
+                      apply_identity_reset(reset);
+              return {MessageType::identity_resets_reply,
+                      encode_identity_resets(identity_resets())};
+          });
+    route(MessageType::user_sync,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              if (!request.payload.empty())
+                  (void)users_.apply_all(decode_users(request.payload));
+              return {MessageType::user_sync_reply, encode_users(users_.all())};
+          });
+    route(MessageType::session_sync,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              if (!request.payload.empty())
+                  for (const auto& session : decode_sessions(request.payload))
+                      apply_session(session);
+              const auto gossip_ttl =
+                  std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
+              return {MessageType::session_sync_reply,
+                      encode_sessions(sessions_.recent(gossip_ttl, 64))};
+          });
+}
+
+// DATA and CONTROL objects: presence, reads, writes, durability and retention.
+void NodeRuntime::bind_storage_routes() {
+    route(MessageType::have_object,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              ObjectId id{reader.fixed<32>()};
+              reader.finish();
+              Writer writer;
+              auto resource = data_resources_.try_acquire(
+                  DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+              if (!resource)
+                  return error_reply("DATA resource admission busy or stopping");
+              // Repair/rebalance trust this "present" without re-verifying, so
+              // authenticate, decrypt and hash: a corrupt replica never counts as
+              // healthy placement. (have_objects and retain_objects check presence.)
+              writer.u8(local_store().valid(id));
+              return {MessageType::bool_reply, writer.take()};
+          });
+    route(MessageType::have_objects,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              const auto count = reader.u32();
+              if (!count || count > 200000)
+                  return error_reply("invalid presence batch count");
+              std::vector<ObjectId> ids;
+              ids.reserve(count);
+              for (uint32_t i = 0; i < count; ++i) {
+                  ObjectId id;
+                  id.bytes = reader.fixed<32>();
+                  ids.push_back(id);
+              }
+              reader.finish();
+              // Used only by retain_data()'s candidate scan
+              // (select_present_batched), never by repair. "Present" only makes
+              // a node a candidate; retain_objects then claims on index
+              // presence. One admission for the whole batch: no per-object I/O.
+              auto resource = data_resources_.try_acquire(
+                  DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+              if (!resource)
+                  return error_reply("DATA resource admission busy or stopping");
+              Writer writer;
+              writer.u32(count);
+              for (const auto& id : ids)
+                  writer.u8(local_store().has(id));
+              return {MessageType::have_objects_reply, writer.take()};
+          });
+    route(MessageType::have_valid_objects,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              const auto count = reader.u32();
+              if (!count || count > have_valid_objects_max)
+                  return error_reply("invalid validated presence batch count");
+              std::vector<ObjectId> ids;
+              ids.reserve(count);
+              for (uint32_t i = 0; i < count; ++i) {
+                  ObjectId id;
+                  id.bytes = reader.fixed<32>();
+                  ids.push_back(id);
+              }
+              reader.finish();
+              // Repair trusts "present" as a healthy copy, so each id is read,
+              // decrypted and hashed like have_object; one DATA admission per id.
+              Writer writer;
+              writer.u32(count);
+              for (const auto& id : ids) {
+                  auto resource = data_resources_.try_acquire(
+                      DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+                  if (!resource)
+                      return error_reply("DATA resource admission busy or stopping");
+                  writer.u8(local_store().valid(id));
+              }
+              return {MessageType::have_valid_objects_reply, writer.take()};
+          });
+    route(MessageType::have_control_objects,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              // The CONTROL counterpart: answers from control_store() and takes
+              // no DATA admission. Law 1: control never queues behind or runs
+              // inline with bulk data work.
+              Reader reader(request.payload);
+              const auto count = reader.u32();
+              if (!count || count > 200000)
+                  return error_reply("invalid control presence batch count");
+              std::vector<ObjectId> ids;
+              ids.reserve(count);
+              for (uint32_t i = 0; i < count; ++i) {
+                  ObjectId id;
+                  id.bytes = reader.fixed<32>();
+                  ids.push_back(id);
+              }
+              reader.finish();
+              Writer writer;
+              writer.u32(count);
+              for (const auto& id : ids)
+                  writer.u8(control_store().has(id));
+              return {MessageType::have_control_objects_reply, writer.take()};
+          });
+    route(MessageType::get_object,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              ObjectId id{reader.fixed<32>()};
+              reader.finish();
+              auto resource = data_resources_.acquire(DataWorkContext(frame_type, cfg_.extent_size),
+                                                      cfg_.extent_size);
+              if (!resource)
+                  return error_reply("DATA resource admission stopping");
+              auto data = local_store().get(id);
+              if (!data)
+                  return error_reply("object not found");
+              activity_.note(frame_type, data->size());
+              Writer writer;
+              writer.fixed(id.bytes);
+              writer.bytes(*data);
+              return {MessageType::object_reply, writer.take()};
+          });
+    route(MessageType::get_control_object,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              ObjectId id{reader.fixed<32>()};
+              reader.finish();
+              auto data = control_store().get(id);
+              if (!data)
+                  return error_reply("control object not found");
+              Writer writer;
+              writer.fixed(id.bytes);
+              writer.bytes(*data);
+              return {MessageType::control_object_reply, writer.take()};
+          });
+    {
+        const MessageRoutes::Handler handler =
+            [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                   [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
             Reader reader(request.payload);
             ObjectId id{reader.fixed<32>()};
             auto data = reader.bytes(128 * 1024 * 1024);
             reader.finish();
             if (data.size() > cfg_.extent_size)
                 return error_reply("DATA object exceeds configured extent size");
-            auto resource = data_resources_.acquire(
-                DataWorkContext(frame_type, data.size()), data.size());
+            auto resource =
+                data_resources_.acquire(DataWorkContext(frame_type, data.size()), data.size());
             if (!resource)
                 return error_reply("DATA resource admission stopping");
             activity_.note(frame_type, data.size());
@@ -1253,245 +1293,259 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 return error_reply("storage limit reached");
             members_.storage(local_store().used(), local_store().limit());
             return {MessageType::ok, {}};
-        }
-        case MessageType::put_control_object: {
-            Reader reader(request.payload);
-            ObjectId id{reader.fixed<32>()};
-            auto data = reader.bytes(128 * 1024 * 1024);
-            reader.finish();
-            if (!control_store().put(id, data))
-                return error_reply("control storage limit reached");
-            return {MessageType::ok, {}};
-        }
-        case MessageType::object_durability_barrier: {
-            Reader reader(request.payload);
-            NodeId expected_epoch{reader.fixed<16>()};
-            const auto domain = reader.u64();
-            const auto required_generation = reader.u64();
-            const auto backend_instance = reader.u64();
-            // An optional trailing id list turns a refusal into a probe.
-            std::vector<ObjectId> probe_ids;
-            if (reader.remaining()) {
-                const auto count = reader.u32();
-                if (count > 4096)
-                    return error_reply("too many durability probe ids");
-                probe_ids.reserve(count);
-                for (uint32_t i = 0; i < count; ++i)
-                    probe_ids.push_back(ObjectId{reader.fixed<32>()});
-            }
-            reader.finish();
-            if (expected_epoch != durability_epoch_) {
-                // The requester's placement token is from a previous process
-                // incarnation and cannot become true again, but the objects may
-                // be on disk. With ids, answer from disk with fresh tokens
-                // (discipline 1: re-derive, don't assert); without, refuse.
-                if (probe_ids.empty()) {
-                    Log::debug("object durability barrier refused: epoch changed expected=" +
-                               to_string(expected_epoch).substr(0, 8) +
-                               " current=" + to_string(durability_epoch_).substr(0, 8) +
-                               " domain=" + std::to_string(domain) +
-                               " generation=" + std::to_string(required_generation));
-                    return error_reply("storage durability epoch changed");
-                }
-                Writer reply;
-                reply.fixed(durability_epoch_.bytes);
-                std::vector<std::pair<ObjectId, StoragePool::DurabilityToken>> present;
-                present.reserve(probe_ids.size());
-                for (const auto& id : probe_ids)
-                    if (auto token = local_store().reassert_durable(id))
-                        present.emplace_back(id, *token);
-                reply.u32(static_cast<uint32_t>(present.size()));
-                for (const auto& [id, token] : present) {
-                    reply.fixed(id.bytes);
-                    reply.u64(token.domain);
-                    reply.u64(token.generation);
-                    reply.u64(token.backend_instance);
-                }
-                Log::info("object durability re-derived after epoch change present=" +
-                          std::to_string(present.size()) + "/" +
-                          std::to_string(probe_ids.size()) + " expected=" +
-                          to_string(expected_epoch).substr(0, 8) +
-                          " current=" + to_string(durability_epoch_).substr(0, 8));
-                members_.storage(local_store().used(), local_store().limit());
-                return {MessageType::ok, reply.take()};
-            }
-            try {
-                local_store().durability_barrier({domain, required_generation, backend_instance},
-                                                 DurabilityUrgency::batchable);
-                members_.storage(local_store().used(), local_store().limit());
-                return {MessageType::ok, {}};
-            } catch (const std::exception& error) {
-                return error_reply(std::string("storage durability barrier failed: ") +
-                                   error.what());
-            }
-        }
-        case MessageType::retain_objects: {
-            Reader reader(request.payload);
-            const auto raw_class = reader.u8();
-            if (raw_class < static_cast<uint8_t>(RetentionClass::data) ||
-                raw_class > static_cast<uint8_t>(RetentionClass::control))
-                return error_reply("invalid retention object class");
-            const auto object_class = static_cast<RetentionClass>(raw_class);
-            RetentionDot dot;
-            dot.origin.bytes = reader.fixed<16>();
-            dot.sequence = reader.u64();
-            const auto count = reader.u32();
-            if (!count || count > 1000000)
-                return error_reply("invalid retention object count");
-            std::vector<ObjectId> ids;
-            ids.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) {
-                ObjectId id;
-                id.bytes = reader.fixed<32>();
-                ids.push_back(id);
-            }
-            reader.finish();
-            // A retention claim says "this node holds the object": index
-            // presence, not a re-read, since a quantum commit re-claims every
-            // extent of its file inside the writer's metadata mutation. The
-            // bytes were verified when put and on every read; scrub finds later
-            // corruption. No DATA admission: there is no read buffer.
-            for (const auto& id : ids) {
-                const bool present = object_class == RetentionClass::data
-                                         ? local_store().has(id)
-                                         : control_store().has(id);
-                if (!present)
-                    return error_reply("retention object is not durably present");
-            }
-            claims().retain_batch(object_class, ids, dot);
-            return {MessageType::ok, {}};
-        }
-        case MessageType::delete_object: {
-            Reader reader(request.payload);
-            ObjectId id{reader.fixed<32>()};
-            reader.finish();
-            if (claims().retained(RetentionClass::data, id))
-                return error_reply("object has an active retention claim");
-            auto resource = data_resources_.try_acquire(
-                DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
-            if (!resource)
-                return error_reply("DATA resource admission busy or stopping");
-            (void)local_store().remove(id);
-            if (ready(ready_cache))
-                (void)block_cache().remove(id);
-            members_.storage(local_store().used(), local_store().limit());
-            return {MessageType::ok, {}};
-        }
-        case MessageType::get_metadata:
-            return {MessageType::metadata_reply,
-                    encode_metadata_record(metadata_replica().current())};
-        case MessageType::get_committed_metadata:
-            return {MessageType::metadata_reply,
-                    encode_metadata_record(metadata_replica().committed())};
-        case MessageType::get_metadata_identity:
-            return metadata_identity_reply(metadata_replica().committed_identity());
-        case MessageType::get_metadata_history_entry: {
-            Reader reader(request.payload);
-            Hash256 hash;
-            hash.bytes = reader.fixed<32>();
-            reader.finish();
-            auto entry = metadata_replica().history_entry(hash);
-            if (!entry)
-                return error_reply("metadata history entry unavailable");
-            return {MessageType::metadata_history_entry_reply,
-                    encode_metadata_history_entry(*entry)};
-        }
-        case MessageType::get_metadata_history_record: {
-            // Repair of a peer's unreconstructable accepted head: serve the
-            // record as a full body, whatever frame shape is stored (see
-            // MetadataManager::repair_unreconstructable_heads()).
-            Reader reader(request.payload);
-            Hash256 hash;
-            hash.bytes = reader.fixed<32>();
-            reader.finish();
-            auto entry = metadata_replica().full_history_record(hash);
-            if (!entry)
-                return error_reply("metadata history record unavailable");
-            return {MessageType::metadata_history_entry_reply,
-                    encode_metadata_history_entry(*entry)};
-        }
-        case MessageType::has_metadata_history_entry: {
-            Reader reader(request.payload);
-            Hash256 hash;
-            hash.bytes = reader.fixed<32>();
-            reader.finish();
-            Writer writer;
-            writer.u8(metadata_replica().history_contains(hash));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::put_metadata_history_entry: {
-            auto entry = decode_metadata_history_entry(request.payload);
-            Writer writer;
-            writer.u8(metadata_replica().import_history(entry));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::get_metadata_heads:
-            return {MessageType::metadata_heads_reply,
-                    encode_metadata_acceptance_set(metadata_heads())};
-        case MessageType::get_ingest_jobs: {
-            auto reply = job_routes_.call(JobRoutes::Route::ingest_jobs, request.payload);
-            if (!reply) return error_reply("ingest not available on this node");
-            return {MessageType::ingest_jobs_reply, std::move(*reply)};
-        }
-        case MessageType::ingest_job_action: {
-            auto reply = job_routes_.call(JobRoutes::Route::ingest_action, request.payload);
-            if (!reply) return error_reply("ingest not available on this node");
-            return {MessageType::ingest_job_action_reply, std::move(*reply)};
-        }
-        case MessageType::get_torrent_jobs: {
-            auto reply = job_routes_.call(JobRoutes::Route::torrent_jobs, request.payload);
-            if (!reply) return error_reply("torrents not available on this node");
-            return {MessageType::torrent_jobs_reply, std::move(*reply)};
-        }
-        case MessageType::torrent_job_action: {
-            auto reply = job_routes_.call(JobRoutes::Route::torrent_action, request.payload);
-            if (!reply) return error_reply("torrents not available on this node");
-            return {MessageType::torrent_job_action_reply, std::move(*reply)};
-        }
-        case MessageType::torrent_intent: {
-            auto reply = job_routes_.call(JobRoutes::Route::torrent_intent, request.payload);
-            if (!reply) return error_reply("torrents not available on this node");
-            return {MessageType::torrent_intent_reply, std::move(*reply)};
-        }
-        case MessageType::put_metadata_commit: {
-            auto entry = decode_metadata_history_entry(request.payload);
-            Writer writer;
-            writer.u8(store_metadata_commit(entry));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::accept_metadata_commit: {
-            auto acceptance = decode_metadata_acceptance(request.payload);
-            Writer writer;
-            writer.u8(accept_metadata_commit(acceptance));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::propose_history_floor: {
-            auto proposal = decode_history_checkpoint_proof(request.payload);
-            Writer writer;
-            writer.u8(accept_history_checkpoint_proposal(proposal));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::commit_history_floor: {
-            auto commit = decode_history_checkpoint_proof(request.payload);
-            Writer writer;
-            writer.u8(commit_history_checkpoint(commit.floor_hash, commit.epoch));
-            return {MessageType::bool_reply, writer.take()};
-        }
-        case MessageType::seed_metadata:
-        case MessageType::checkpoint_metadata:
-        case MessageType::commit_metadata:
-        case MessageType::cas_metadata:
-        case MessageType::cas_metadata_delta:
-            return error_reply(
-                "legacy metadata CAS/PREPARE/COMMIT RPC is unavailable in protocol 20");
-        case MessageType::metadata_notice:
-            return error_reply("metadata notice is server-originated");
-        default:
-            return error_reply("unsupported request");
-        }
-    } catch (const std::exception& error) {
-        return error_reply(error.what());
+        };
+        route(MessageType::put_object, handler);
+        route(MessageType::put_object_deferred, handler);
     }
+    route(MessageType::put_control_object,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              ObjectId id{reader.fixed<32>()};
+              auto data = reader.bytes(128 * 1024 * 1024);
+              reader.finish();
+              if (!control_store().put(id, data))
+                  return error_reply("control storage limit reached");
+              return {MessageType::ok, {}};
+          });
+    route(MessageType::object_durability_barrier,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              NodeId expected_epoch{reader.fixed<16>()};
+              const auto domain = reader.u64();
+              const auto required_generation = reader.u64();
+              const auto backend_instance = reader.u64();
+              // An optional trailing id list turns a refusal into a probe.
+              std::vector<ObjectId> probe_ids;
+              if (reader.remaining()) {
+                  const auto count = reader.u32();
+                  if (count > 4096)
+                      return error_reply("too many durability probe ids");
+                  probe_ids.reserve(count);
+                  for (uint32_t i = 0; i < count; ++i)
+                      probe_ids.push_back(ObjectId{reader.fixed<32>()});
+              }
+              reader.finish();
+              if (expected_epoch != durability_epoch_) {
+                  // The requester's placement token is from a previous process
+                  // incarnation and cannot become true again, but the objects may
+                  // be on disk. With ids, answer from disk with fresh tokens
+                  // (discipline 1: re-derive, don't assert); without, refuse.
+                  if (probe_ids.empty()) {
+                      Log::debug("object durability barrier refused: epoch changed expected=" +
+                                 to_string(expected_epoch).substr(0, 8) +
+                                 " current=" + to_string(durability_epoch_).substr(0, 8) +
+                                 " domain=" + std::to_string(domain) +
+                                 " generation=" + std::to_string(required_generation));
+                      return error_reply("storage durability epoch changed");
+                  }
+                  Writer reply;
+                  reply.fixed(durability_epoch_.bytes);
+                  std::vector<std::pair<ObjectId, StoragePool::DurabilityToken>> present;
+                  present.reserve(probe_ids.size());
+                  for (const auto& id : probe_ids)
+                      if (auto token = local_store().reassert_durable(id))
+                          present.emplace_back(id, *token);
+                  reply.u32(static_cast<uint32_t>(present.size()));
+                  for (const auto& [id, token] : present) {
+                      reply.fixed(id.bytes);
+                      reply.u64(token.domain);
+                      reply.u64(token.generation);
+                      reply.u64(token.backend_instance);
+                  }
+                  Log::info("object durability re-derived after epoch change present=" +
+                            std::to_string(present.size()) + "/" +
+                            std::to_string(probe_ids.size()) +
+                            " expected=" + to_string(expected_epoch).substr(0, 8) +
+                            " current=" + to_string(durability_epoch_).substr(0, 8));
+                  members_.storage(local_store().used(), local_store().limit());
+                  return {MessageType::ok, reply.take()};
+              }
+              try {
+                  local_store().durability_barrier({domain, required_generation, backend_instance},
+                                                   DurabilityUrgency::batchable);
+                  members_.storage(local_store().used(), local_store().limit());
+                  return {MessageType::ok, {}};
+              } catch (const std::exception& error) {
+                  return error_reply(std::string("storage durability barrier failed: ") +
+                                     error.what());
+              }
+          });
+    route(MessageType::retain_objects,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              const auto raw_class = reader.u8();
+              if (raw_class < static_cast<uint8_t>(RetentionClass::data) ||
+                  raw_class > static_cast<uint8_t>(RetentionClass::control))
+                  return error_reply("invalid retention object class");
+              const auto object_class = static_cast<RetentionClass>(raw_class);
+              RetentionDot dot;
+              dot.origin.bytes = reader.fixed<16>();
+              dot.sequence = reader.u64();
+              const auto count = reader.u32();
+              if (!count || count > 1000000)
+                  return error_reply("invalid retention object count");
+              std::vector<ObjectId> ids;
+              ids.reserve(count);
+              for (uint32_t i = 0; i < count; ++i) {
+                  ObjectId id;
+                  id.bytes = reader.fixed<32>();
+                  ids.push_back(id);
+              }
+              reader.finish();
+              // A retention claim says "this node holds the object": index
+              // presence, not a re-read, since a quantum commit re-claims every
+              // extent of its file inside the writer's metadata mutation. The
+              // bytes were verified when put and on every read; scrub finds later
+              // corruption. No DATA admission: there is no read buffer.
+              for (const auto& id : ids) {
+                  const bool present = object_class == RetentionClass::data
+                                           ? local_store().has(id)
+                                           : control_store().has(id);
+                  if (!present)
+                      return error_reply("retention object is not durably present");
+              }
+              claims().retain_batch(object_class, ids, dot);
+              return {MessageType::ok, {}};
+          });
+    route(MessageType::delete_object,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              ObjectId id{reader.fixed<32>()};
+              reader.finish();
+              if (claims().retained(RetentionClass::data, id))
+                  return error_reply("object has an active retention claim");
+              auto resource = data_resources_.try_acquire(
+                  DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
+              if (!resource)
+                  return error_reply("DATA resource admission busy or stopping");
+              (void)local_store().remove(id);
+              if (ready(ready_cache))
+                  (void)block_cache().remove(id);
+              members_.storage(local_store().used(), local_store().limit());
+              return {MessageType::ok, {}};
+          });
+}
+
+// The metadata replica: reads, history, commits and acceptance.
+void NodeRuntime::bind_metadata_routes() {
+    route(MessageType::get_metadata,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              return {MessageType::metadata_reply,
+                      encode_metadata_record(metadata_replica().current())};
+          });
+    route(MessageType::get_committed_metadata,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              return {MessageType::metadata_reply,
+                      encode_metadata_record(metadata_replica().committed())};
+          });
+    route(MessageType::get_metadata_identity,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              return metadata_identity_reply(metadata_replica().committed_identity());
+          });
+    route(MessageType::get_metadata_history_entry,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              Hash256 hash;
+              hash.bytes = reader.fixed<32>();
+              reader.finish();
+              auto entry = metadata_replica().history_entry(hash);
+              if (!entry)
+                  return error_reply("metadata history entry unavailable");
+              return {MessageType::metadata_history_entry_reply,
+                      encode_metadata_history_entry(*entry)};
+          });
+    route(MessageType::get_metadata_history_record,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              // Repair of a peer's unreconstructable accepted head: serve the
+              // record as a full body, whatever frame shape is stored (see
+              // MetadataManager::repair_unreconstructable_heads()).
+              Reader reader(request.payload);
+              Hash256 hash;
+              hash.bytes = reader.fixed<32>();
+              reader.finish();
+              auto entry = metadata_replica().full_history_record(hash);
+              if (!entry)
+                  return error_reply("metadata history record unavailable");
+              return {MessageType::metadata_history_entry_reply,
+                      encode_metadata_history_entry(*entry)};
+          });
+    route(MessageType::has_metadata_history_entry,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              Reader reader(request.payload);
+              Hash256 hash;
+              hash.bytes = reader.fixed<32>();
+              reader.finish();
+              Writer writer;
+              writer.u8(metadata_replica().history_contains(hash));
+              return {MessageType::bool_reply, writer.take()};
+          });
+    route(MessageType::put_metadata_history_entry,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              auto entry = decode_metadata_history_entry(request.payload);
+              Writer writer;
+              writer.u8(metadata_replica().import_history(entry));
+              return {MessageType::bool_reply, writer.take()};
+          });
+    route(MessageType::get_metadata_heads,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              return {MessageType::metadata_heads_reply,
+                      encode_metadata_acceptance_set(metadata_heads())};
+          });
+    route(MessageType::put_metadata_commit,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+             [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              auto entry = decode_metadata_history_entry(request.payload);
+              Writer writer;
+              writer.u8(store_metadata_commit(entry));
+              return {MessageType::bool_reply, writer.take()};
+          });
+    route(MessageType::accept_metadata_commit,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              auto acceptance = decode_metadata_acceptance(request.payload);
+              Writer writer;
+              writer.u8(accept_metadata_commit(acceptance));
+              return {MessageType::bool_reply, writer.take()};
+          });
+    route(MessageType::propose_history_floor,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              auto proposal = decode_history_checkpoint_proof(request.payload);
+              Writer writer;
+              writer.u8(accept_history_checkpoint_proposal(proposal));
+              return {MessageType::bool_reply, writer.take()};
+          });
+    route(MessageType::commit_history_floor,
+          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
+                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
+              auto commit = decode_history_checkpoint_proof(request.payload);
+              Writer writer;
+              writer.u8(commit_history_checkpoint(commit.floor_hash, commit.epoch));
+              return {MessageType::bool_reply, writer.take()};
+          });
+}
+
+void NodeRuntime::route(MessageType type, MessageRoutes::Handler handler) {
+    routes_.bind(type, std::move(handler));
+    bound_routes_.push_back(type);
+}
+
+void NodeRuntime::unbind_routes() {
+    for (const auto type : bound_routes_)
+        routes_.unbind(type);
+    bound_routes_.clear();
 }
 
 void NodeRuntime::merge(std::span<const uint8_t> payload) {
