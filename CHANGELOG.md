@@ -1,5 +1,26 @@
 # Current release
 
+## 0.77.0 — T5: the replica and the stores are served by their own parts (experiment)
+
+The object ledger experiment's T5, continued. No wire format, protocol or
+on-disk format changes; either node can go back to 0.76.0 or 0.75.0 by
+reinstalling it.
+
+**A restarting node answers storage requests once all its local state has
+recovered.** Peers' DATA and CONTROL object requests were answered plane by
+plane as each recovered; they are now answered once the DATA pool, control
+store, cache and retention claims have all recovered. Until then a peer
+gets "<message> is not available on this node", which it treats as it
+treated "still recovering", except that a durability barrier then retries
+later instead of probing at once. Metadata requests are answered from the
+moment the replica recovers, as before.
+
+Inside, unchanged in behaviour: the metadata replica's serving side
+(handlers, commit acceptance, history checkpoints, the identity-reset
+preload) and the stores' serving side (handlers and the periodic refresh of
+their advertised figures) are their own parts, built from the node's
+recovered state.
+
 ## 0.76.0 — T5: the node's parts move into the root (experiment)
 
 The object ledger experiment's T5 so far: parts that lived inside the node
