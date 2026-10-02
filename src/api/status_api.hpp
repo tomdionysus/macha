@@ -33,12 +33,9 @@ class ClusterStatusService {
     void persistence_loop(std::stop_token);
     void persist_local_status();
     HttpResponse status_response(const std::optional<NodeId>& only = {});
-    // The expensive half, behind its own route. Every field in it is an
-    // in-memory counter, but reaching them means touching most of the node's
-    // subsystems -- the RPC client and server, the storage pool, the retained
-    // memory ledger, the FUSE frontend -- each under its own lock, and some of
-    // those locks are held by exactly the busy paths that make an operator
-    // reach for Status in the first place. Ordinary polling must not pay that.
+    // The expensive half, behind its own route: its counters sit behind most
+    // subsystems' locks, some held by the busy paths an operator is investigating.
+    // Ordinary polling must not pay that.
     HttpResponse diagnostics_response();
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
@@ -53,15 +50,12 @@ class ClusterStatusService {
     void attach_fuse_diagnostics(std::function<std::optional<FuseFrontendDiagnostics>()> provider);
     void detach_fuse_diagnostics();
     void attach_convergence_diagnostics(std::function<ConvergenceDemandDiagnostics()> provider);
-    // Replica repair's own view of what it could not obtain. ClusterStatusService
-    // holds a NodeRuntime, not the DistributedStore, so this arrives the same way
-    // FUSE and convergence diagnostics do.
+    // Replica repair's view of what it could not obtain. Arrives like the FUSE and
+    // convergence diagnostics, since this service holds a NodeRuntime, not the store.
     void attach_repair_diagnostics(std::function<DistributedStore::RepairDiagnostics()> provider);
     void detach_repair_diagnostics();
-    // Cheap, always-present per-subsystem health (see SubsystemSupervisor):
-    // unlike the expensive diagnostics block below, this belongs in the
-    // lightweight part of the response -- it's exactly the kind of thing an
-    // operator needs promptly, and costs nothing to compute.
+    // Cheap per-subsystem health (see SubsystemSupervisor), in the lightweight
+    // part of the response.
     void attach_subsystem_diagnostics(std::function<std::vector<SubsystemStatus>()> provider);
     void detach_subsystem_diagnostics();
     // The HTTP server's own counters: reactor stalls, open and idle

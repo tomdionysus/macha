@@ -4,31 +4,19 @@
 //
 //   macha-namespace-migrate <state_path> <cluster.key> [options]
 //
-// The record stops carrying the namespace and starts pointing at it. Today a
-// metadata record IS the serialised namespace and its identity is a SHA-256
-// over those bytes, so every commit re-serialises and re-hashes the whole
-// library; after this, a commit rewrites the leaf holding the changed path and
-// the branches above it.
+// The migrated record points at the tree root instead of carrying the
+// serialised namespace, so a commit rewrites only the changed leaf and the
+// branches above it.
 //
-// **This is destructive and offline.** It quarantines the node's checkpoint,
-// journal, history, heads and acceptance proof under a timestamped suffix --
-// they stay on the disk -- and installs a new head with no ancestry. What is
-// discarded is the ability to roll back past this point; what is not touched,
-// at all, is a single extent. Paths, stat fields and the ObjectIds naming
-// content are copied across unchanged, and those ObjectIds address objects in
-// the data backends that no metadata format change rewrites or moves.
+// Destructive and offline. It quarantines the checkpoint, journal, history,
+// heads and acceptance proof under a timestamped suffix and installs a head
+// with no ancestry. No extent is touched: paths, stat fields and ObjectIds are
+// copied unchanged.
 //
-// **Run it on every node, with every node stopped, after they have converged.**
-// The new record is a pure function of the namespace the node already holds:
-// the tree's shape is determined by the entry set alone, so every node
-// computes the same nodes, the same root and the same record hash
-// independently. Nothing is shipped between nodes and nothing needs to be.
-// That is also the check: `--expect-hash` makes a node refuse to install
-// anything other than the record another node already produced.
-//
-// Which is why converged matters. Two nodes at different heads produce two
-// different records and the cluster comes back split, each node authoritative
-// for a namespace nobody else has.
+// Run it on every node, all stopped and converged. The tree's shape depends on
+// the entry set alone, so every node computes the same root independently;
+// `--expect-hash` refuses any record but the one another node produced. Nodes
+// at different heads would come back split.
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "storage/local_store.hpp"
@@ -128,9 +116,8 @@ Options parse(int argc, char** argv) {
         }
     }
     if (options.objects.empty()) {
-        // Where the daemon puts it in the shipped configuration, then the
-        // documented default. Guessing wrong writes tree nodes the node will
-        // not find, so a missing store is an error rather than a fresh one.
+        // The shipped configuration's location, then the documented default. A
+        // missing store is an error: a fresh one would hold nodes the daemon never finds.
         const auto beside = options.state.parent_path() / "metadata-objects";
         const auto inside = options.state / "metadata-objects";
         if (std::filesystem::exists(beside))
@@ -198,10 +185,9 @@ int main(int argc, char** argv) {
                            keys.storage);
         LocalNamespaceNodeStore nodes(objects);
 
-        // Builds the tree, verifies it reads back as the namespace it came
-        // from, and returns the record that would replace the head. Installs
-        // nothing: everything up to here is additive, and the tree nodes it
-        // wrote are content-addressed objects nothing points at yet.
+        // Builds the tree, verifies it reads back as the source namespace, and
+        // returns the replacement record. Installs nothing: the content-addressed
+        // tree nodes written so far are unreferenced.
         const auto migration = plan_namespace_migration(head, nodes);
         const auto& stats = migration.stats;
         std::cout << "tree root=" << to_string(migration.root)
@@ -216,11 +202,9 @@ int main(int argc, char** argv) {
                   << bytes_human(migration.previous_payload_bytes) << ")\n";
         const auto& record = migration.record;
 
-        // Who is being re-rooted. The default is what this node knows: the
-        // durable participant roster, and the nodes it has status for. Naming
-        // them explicitly is better, because this list is a claim about what
-        // the operator is about to do on the other machines, not a fact this
-        // node can check.
+        // Defaults to the nodes this one knows (participant roster and node status).
+        // Naming them is better: the list is a claim about the other machines this
+        // node cannot check.
         auto witnesses = options.witnesses;
         if (witnesses.empty()) {
             std::set<NodeId> known(snapshot.metadata_participants.begin(),
@@ -251,18 +235,10 @@ int main(int argc, char** argv) {
             std::cout << "exported record to " << options.export_record.string() << '\n';
         }
 
-        // Adopting another node's record. This cluster commits constantly --
-        // catalogue discovery alone moves the head tens of times a minute --
-        // so three nodes stopped back to back do not land on the same
-        // generation, and their own computed records differ in `previous`, in
-        // `generation` and in whatever catalogue root the last commit carried.
-        //
-        // What must match is the namespace, and that is what is checked: this
-        // node builds its own tree from its own head and adopts the supplied
-        // record only if the root it computed is the root that record names. A
-        // node whose namespace really has diverged is refused, and the operator
-        // starts it alongside the leader to catch up rather than re-rooting it
-        // onto a namespace it does not have.
+        // Adopting another node's record. Nodes stopped back to back differ in
+        // `previous`, `generation` and catalogue root because the head moves
+        // constantly, so only the namespace root must match; a node whose namespace
+        // diverged is refused and must catch up first.
         auto installing = record;
         if (!options.adopt_record.empty()) {
             std::ifstream in(options.adopt_record, std::ios::binary);

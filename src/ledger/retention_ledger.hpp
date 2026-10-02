@@ -7,10 +7,9 @@
 
 namespace macha {
 
-// ObjectLedger at stage 0: claims forward to the RetentionStore, holdings to
-// the class's object store, the horizons are published snapshots it owns.
-// Holds references to the stores; its owner keeps all three alive for its
-// lifetime.
+// Claims forward to the ClaimStore, holdings to the class's object store;
+// owns the published horizons. The owner keeps all three stores alive for the
+// ledger's lifetime.
 class RetentionLedger final : public ObjectLedger {
     ClaimStore& claims_;
     const ObjectStore& data_;

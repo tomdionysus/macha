@@ -43,10 +43,8 @@ struct IdentityAssociationReset {
     auto operator<=>(const IdentityAssociationReset&) const = default;
 };
 
-// Self-declared node properties, gossiped with the node so every peer makes
-// the same dialling and placement decisions (protocol 21). Both default to
-// set: a node that predates the flags, or one built in a test with the
-// fields left alone, is the ordinary dialable storage node.
+// Self-declared node properties, gossiped so every peer makes the same dialling
+// and placement decisions. Both default to set: an ordinary dialable storage node.
 inline constexpr uint8_t node_flag_inbound_capable = 1U << 0;
 inline constexpr uint8_t node_flag_hosts_extents = 1U << 1;
 inline constexpr uint8_t node_flags_default = node_flag_inbound_capable | node_flag_hosts_extents;
@@ -60,9 +58,9 @@ struct NodeInfo {
     uint64_t used{};
     uint64_t seen_unix_ms{};
     uint64_t metadata_generation{};
-    // Protocol 20 metadata safety policy. Every metadata-capable node in a
-    // cluster must advertise the same floor; mismatches fail closed rather than
-    // allowing a weaker node to mint an acceptance certificate.
+    // Metadata safety floor. Every metadata-capable node must advertise the same
+    // value; mismatches fail closed so a weaker node cannot mint an acceptance
+    // certificate.
     uint32_t metadata_write_replicas_required{};
     // node_flag_* bits. `inbound_capable` clear means peers must never dial
     // this node's advertised endpoint: it reaches them, they answer over the
@@ -87,17 +85,14 @@ struct NodeIdHash {
     size_t operator()(const NodeId&) const noexcept;
 };
 
-// Minimal per-request view attached to an authenticated HttpRequest by
-// HttpServer once its bearer token has been validated against the cluster
-// session store (see session.hpp). Deliberately excludes version/revoked/
-// expiry bookkeeping that ordinary route handlers have no business touching.
+// Identity HttpServer attaches to a request once its bearer token validates
+// against the session store (session.hpp); no revocation or expiry bookkeeping.
 struct SessionIdentity {
     std::string id;
     Hash256 token_hash{};
     std::vector<std::string> roles;
-    // Default-initialised so designated-initialiser construction elsewhere
-    // (tests build these with .id/.roles only) does not trip
-    // -Wmissing-field-initializers, which GCC treats as an error here.
+    // Default member initialiser keeps designated-initialiser construction clear
+    // of -Wmissing-field-initializers.
     std::string user_id{}; // empty for an anonymous session
 };
 

@@ -60,9 +60,8 @@ HttpResponse error(int status, std::string_view code, std::string_view message) 
                             json_escape(message) + "}");
 }
 
-// Same shape as error(), plus the engine's own account of why it could not
-// produce facts. The server states the reason; the client decides whether to
-// ask another node, transcode from somewhere else, or give up.
+// Same shape as error(), plus the engine's reason it could not produce facts;
+// the client decides whether to try another node, another source, or give up.
 HttpResponse media_error(int status, std::string_view code, std::string_view message,
                          MediaFailure failure) {
     return json(status, "{\"error\":" + json_escape(code) + ",\"message\":" +
@@ -74,13 +73,9 @@ std::string optional_number(const std::optional<int32_t>& value) {
     return value ? std::to_string(*value) : "null";
 }
 
-// Signs/verifies artwork capability URLs so catalogue responses can embed a
-// ready-to-use, already-authorized <img src> without a bearer header, the
-// same way playback stream/subtitle URLs carry their own embedded secret
-// rather than requiring a separate Authorization header. Unlike the
-// session-scoped stream token (whose validity window is the session's own
-// lifecycle), artwork has no session to lean on, so the expiry is explicit
-// and carried in the URL alongside the signature.
+// Signs and verifies artwork capability URLs, so catalogue responses embed an
+// already-authorised <img src> without a bearer header. Artwork has no session
+// to bound it, so the expiry is explicit and carried beside the signature.
 struct ArtworkUrlContext {
     const ClusterKeys& keys;
     std::chrono::milliseconds ttl;
@@ -97,22 +92,10 @@ std::array<uint8_t, 32> artwork_capability_mac(const ClusterKeys& keys, std::str
                        {reinterpret_cast<const uint8_t*>(material.data()), material.size()});
 }
 
-// The expiry is quantized to a bucket of the TTL rather than computed from the
-// instant of signing, and that is what makes artwork cacheable at all.
-//
-// A browser keys its cache on the full URL including the query, so a fresh
-// `exp` means a fresh cache key: until 0.40.0 every catalogue read minted a new
-// one, at millisecond granularity, for every item -- twice per item, since
-// `artwork` and `effective_artwork` are both emitted -- and the 24 hour
-// `immutable` header on the artwork response was therefore never once
-// consulted. Posters were re-fetched over the network on every page load, and
-// two clients independently built an id-to-URL memo to work around it.
-//
-// Rounding up to the bucket *after* next, rather than to the next one, is
-// deliberate: a naive bucket boundary would give a URL minted just before it a
-// lifetime of almost nothing, invisibly to the client holding it. This way the
-// URL is byte-identical for every request inside a bucket, and its remaining
-// validity is always at least the configured TTL and at most twice it.
+// The expiry is quantised to a TTL bucket so the URL is byte-identical for
+// every request in a bucket: a browser keys its cache on the full URL, so a
+// fresh `exp` would defeat caching. Rounding to the bucket after next keeps
+// remaining validity between one and two TTLs.
 std::string signed_artwork_url(const ArtworkUrlContext& ctx, std::string_view id) {
     const auto now = unix_ms();
     const auto ttl = ctx.ttl.count() > 0 ? static_cast<uint64_t>(ctx.ttl.count()) : uint64_t{0};
@@ -122,9 +105,8 @@ std::string signed_artwork_url(const ArtworkUrlContext& ctx, std::string_view id
           "&sig=" + hex(mac);
 }
 
-// Only a valid, unexpired signature grants the exemption -- an unsigned
-// request to this same path still requires the ordinary bearer token when
-// one is configured, exactly as before this feature existed.
+// Only a valid, unexpired signature grants the exemption; an unsigned request
+// to this path still needs the ordinary bearer token when one is configured.
 bool artwork_capability_valid(const ClusterKeys& keys, std::string_view id,
                               const std::map<std::string, std::string, std::less<>>& query) {
     auto exp_it = query.find("exp");
@@ -554,17 +536,13 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 return error(400, "bad_media_id", "immutable macha media ID required");
             auto profile = catalogue_.media_profile(media_id);
             if (!profile && resolve_media_profile_) {
-                // No stored profile: produce one now and persist it, rather
-                // than telling a client to come back. It is the same
-                // foreground path a session create uses, and background
-                // profiling yields to it.
+                // No stored profile: produce and persist one now on the foreground path a
+                // session create uses; background profiling yields to it.
                 try {
                     profile = resolve_media_profile_(media_id);
                 } catch (const MediaError& e) {
-                    // Report which kind of failure this was and let the client
-                    // decide what to do with it. A source this node cannot read
-                    // may be perfectly good elsewhere; one that will not parse
-                    // will not parse anywhere.
+                    // Report the failure kind: an unreadable source may be fine elsewhere; an
+                    // unparseable one is unparseable everywhere.
                     return media_error(422, "profile_failed", e.what(), e.failure());
                 } catch (const std::exception& e) {
                     return error(422, "profile_failed", e.what());
@@ -601,11 +579,9 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 request.method == "DELETE") {
                 auto id = url_decode(rest.substr(0, metadata_suffix));
                 const auto revision = expected_revision(request);
-                // A known-current negative is a routing/result decision, not a
-                // distributed metadata operation. Avoid a replica repair merely
-                // to discover that this DELETE is a 404. If the local catalogue
-                // cannot prove the negative from current immutable state, fall
-                // through to the existing strong mutation path.
+                // A known-current negative answers 404 without a replica repair. If the local
+                // catalogue cannot prove it from current immutable state, fall through to the
+                // strong mutation path.
                 if (catalogue_.definitely_absent(id))
                     return error(404, "not_found", "catalogue item not found");
 
@@ -616,9 +592,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                     try {
                         request_media_rescan_(cleared.media_ids);
                     } catch (const std::exception& e) {
-                        // The metadata mutation is already committed. Targeted
-                        // rematching is recoverable background work; the normal
-                        // namespace/safety scanner remains the fallback.
+                        // The metadata mutation is committed; targeted rematching is recoverable
+                        // background work, with the scanner as fallback.
                         Log::warn("catalogue metadata clear rematch enqueue failed: " +
                                   std::string(e.what()));
                     }
@@ -660,9 +635,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 if (request.method == "PATCH" && !existing)
                     return error(404, "not_found", "catalogue item not found");
                 const auto root = parse_item_body(request.body);
-                // A whole PUT replaces the descriptive fields, but files and
-                // artwork are only ever changed by naming them: an edit that
-                // leaves media_ids out must not unbind every file.
+                // A PUT replaces descriptive fields, but files and artwork change only when
+                // named: leaving media_ids out must not unbind every file.
                 CatalogueItem item;
                 if (request.method == "PATCH") {
                     item = *existing;
@@ -697,19 +671,15 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             if (!decoded || decoded->size() != 32) return error(400, "bad_id", "bad artwork object id");
             ObjectId id;
             std::copy(decoded->begin(), decoded->end(), id.bytes.begin());
-            // The id is a content hash: identical bytes forever, so this is
-            // genuinely immutable, not just cacheable for a while, and the id
-            // itself is the entity tag. A browser revalidating a poster it
-            // already holds is answered before the artwork is fetched at all,
-            // so it never pays a cold read for bytes it has.
+            // The id is a content hash, so the bytes are immutable and the id is the
+            // entity tag: a revalidating browser is answered before any artwork read.
             const auto tag = "\"" + to_string(id) + "\"";
             const auto max_age =
                 std::chrono::duration_cast<std::chrono::seconds>(artwork_capability_ttl_).count();
             std::map<std::string, std::string, std::less<>> headers{
                 {"Cache-Control", "public, max-age=" + std::to_string(max_age) + ", immutable"},
                 {"ETag", tag},
-                // Without it the browser zeroes every timing for a
-                // cross-origin poster, and a client cannot measure this.
+                // Without it the browser zeroes every timing for a cross-origin poster.
                 {"Timing-Allow-Origin", "*"}};
             if (auto it = request.headers.find("if-none-match");
                 it != request.headers.end() && it->second == tag)

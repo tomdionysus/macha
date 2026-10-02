@@ -58,16 +58,13 @@ struct TorrentJob {
     std::optional<std::string> ingest_job_id;
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
-    // Why the job is blocked or failed: `error_code` is the snake_case code
-    // clients act on, `error` the English message beside it. A failure that
-    // is the ingest's carries the ingest's own code.
+    // Why the job is blocked or failed: the code clients act on and its English
+    // message. An ingest failure carries the ingest's code.
     std::string error_code;
     std::string error;
-    // How far the owner has published the torrent's verified extents into the
-    // store, while its disk backend tracks the torrent (from the first
-    // verified piece until the ingest is submitted). Transient: carried on the
-    // wire, never persisted. `progress_age_ms` is how long ago the published
-    // count last advanced, on the owner's clock at its last sample.
+    // Extent publication progress, from the first verified piece until the
+    // ingest is submitted. Wire only, never persisted. `progress_age_ms`: since
+    // the published count last advanced, on the owner's clock.
     struct Publication {
         uint64_t published_extents{};
         uint64_t extents{};
@@ -76,38 +73,29 @@ struct TorrentJob {
         uint64_t progress_age_ms{};
     };
     std::optional<Publication> publication;
-    // Why a job that has stopped is waiting, as a code: "extent_publication"
-    // (downloaded, handed to the ingest once every extent is published), or
-    // empty. Transient, like `publication`.
+    // Why a stopped job waits: "extent_publication" (handed to the ingest once
+    // every extent is published) or empty. Wire only.
     std::string waiting_reason;
 };
 
-// HTTP/RPC-facing JSON shape for a torrent job -- shared by the local HTTP
-// handler (acquisition_api.cpp) and the cluster-wide RPC bridge, so a remote
-// job renders identically to a local one (plus a "node_id" field the caller
-// tags on afterward). Named distinctly from torrent_job_json()/
-// parse_torrent_job() in torrent.cpp (the on-disk jobs.json persistence
-// shape, file-local) since both live in that translation unit.
+// API JSON for a torrent job, shared by the HTTP handler and the cluster RPC
+// so remote and local jobs render alike.
 Json torrent_job_api_json(const TorrentJob&);
 Json torrent_publication_json(const TorrentJob::Publication&);
-// jobs.json persistence shape, and the cluster RPC shape (persistence plus
-// the transient rates, peers and ETA). Core decodes peers' replies with the
-// wire parser; the plugin writes both.
+// The jobs.json shape, and the cluster RPC shape (plus the transient rates,
+// peers and ETA).
 Json torrent_job_json(const TorrentJob&);
-// What an update changed in a job's persisted form (torrent_job_json), apart
-// from updated_unix_ms: nothing; only the transfer counters, which move on
-// every tick while bytes move; or the record itself.
+// What an update changed in a job's persisted form, ignoring updated_unix_ms:
+// nothing, only the transfer counters, or the record.
 enum class TorrentJobChange : uint8_t { none, progress, record };
 TorrentJobChange torrent_job_change(const TorrentJob& before, const TorrentJob& after);
 TorrentJob parse_torrent_job(const Json&);
 Json torrent_job_wire_json(const TorrentJob&);
 TorrentJob parse_torrent_job_wire(const Json&);
 
-// The listen_interfaces string the download engine binds, in libtorrent's own
-// syntax. An explicit torrent.listen_interfaces wins; otherwise the node's
-// advertised address is used, because libtorrent's default enumeration binds
-// eth0 and loopback but never wlan0 -- which on a wireless-only node leaves
-// the session on loopback alone, reaching no peer and raising no error.
+// libtorrent's listen_interfaces: torrent.listen_interfaces if set, else the
+// advertised address, as the default enumeration never binds wlan0 and a
+// wireless-only node would silently listen on loopback alone.
 std::string torrent_listen_interfaces(const TorrentConfig&, std::string_view advertise);
 
 struct ClusterTorrentJob {
@@ -118,7 +106,7 @@ struct ClusterTorrentJob {
 struct TorrentActionResult {
     bool exists{};
     bool changed{};
-    // The job is known to be on a node that could not be reached.
+    // The job's node could not be reached.
     bool unreachable{};
     std::optional<ClusterTorrentJob> updated;
 };
@@ -176,23 +164,16 @@ class TorrentSearchManager {
     std::optional<std::string> resolve(std::string_view acquisition_ref);
 };
 
-// Everything core is allowed to know about BitTorrent acquisition. The
-// implementation (TorrentManager, torrent_manager.hpp) and its libtorrent
-// linkage live in the libmacha-torrent plugin, not in macha_core: core holds
-// this interface, obtained from SubsystemRegistry::torrent(), and a node with
-// no plugin installed simply has no torrent capability at runtime rather than
-// a differently-compiled binary. See
-// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md.
-//
-// Lifecycle (start/stop/restart-on-fault) is not part of this interface --
-// that belongs to the plugin's Subsystem, which SubsystemSupervisor owns.
+// Core's whole view of BitTorrent acquisition, from SubsystemRegistry::torrent().
+// TorrentManager implements it in the libmacha-torrent plugin; without the
+// plugin a node has no torrent capability. Lifecycle is the plugin
+// Subsystem's, not this interface's.
 class TorrentService {
   public:
     virtual ~TorrentService() = default;
 
     virtual bool enabled() const noexcept = 0;
-    // Live configuration reload (Service::reload_config). Only the limits an
-    // implementation can change without a restart take effect.
+    // Live reload: only limits changeable without a restart take effect.
     virtual void reconfigure(TorrentConfig) = 0;
 
     virtual std::string add(std::string magnet_uri) = 0;
@@ -206,27 +187,22 @@ class TorrentService {
     virtual bool cancel(std::string_view id) = 0;
     virtual bool clear(std::string_view id) = 0;
 
-    // Adds a torrent on this node, the one the placement chose. Which node
-    // downloads is decided by the caller (ClusterJobView), never here: they
-    // differ in disk, in memory, and in what else they are serving.
+    // Adds a torrent on this node; the caller (ClusterJobView) chose the node.
     struct Placement {
         NodeId node_id;
         std::string job_id;
         bool placed{};
-        // Why it was not placed: a snake_case code (node_not_member,
-        // node_not_torrent_capable, node_refused, node_unreachable,
-        // node_did_not_start, missing_uri, add_failed,
-        // torrent_already_added, or the peer's own), and the English message
-        // beside it. For torrent_already_added, job_id is the job on node_id
-        // that already holds the torrent.
+        // Why not placed: a code (node_not_member, node_not_torrent_capable,
+        // node_refused, node_unreachable, node_did_not_start, missing_uri,
+        // add_failed, torrent_already_added, or the peer's own) and its English
+        // message. For torrent_already_added, job_id is the existing job.
         std::string reason;
         std::string error;
-        // The job as the placing node recorded it, when it was placed.
+        // The job as recorded, when placed.
         std::optional<TorrentJob> job;
     };
-    // `search_result` is true only for a URI resolved from a torrent search
-    // result (an acquisition_ref), which may be a trusted provider's .torrent
-    // URL this node fetches; anything else must be a magnet.
+    // `search_result`: a URI resolved from an acquisition_ref, which may be a
+    // trusted provider's .torrent URL; anything else must be a magnet.
     virtual Placement place(std::string_view magnet_or_uri, bool search_result) = 0;
     // What this node offers for new jobs, for GET /api/v1/torrents/nodes.
     struct Offer {
@@ -237,8 +213,7 @@ class TorrentService {
     };
     virtual Offer offer() const = 0;
     // A URI's canonical magnet, info hash and name, without adding it. A
-    // search result's .torrent URL is fetched here (0.64.0): only a node
-    // running the plugin can parse metainfo.
+    // .torrent URL is fetched here, as only the plugin parses metainfo.
     struct Resolved {
         std::string magnet;
         std::string info_hash;

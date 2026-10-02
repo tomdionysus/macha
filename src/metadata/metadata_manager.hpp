@@ -16,10 +16,8 @@
 
 namespace macha {
 
-// Metadata discovery can legitimately be incomplete while a new cluster is
-// forming, the configured write floor is unavailable, or divergent histories
-// are waiting for reconciliation. This is a lifecycle state, not a daemon-fatal
-// error.
+// Discovery incomplete: cluster forming, write floor unavailable, or divergent
+// histories awaiting reconciliation. A lifecycle state, not daemon-fatal.
 class MetadataNotReady final : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -27,21 +25,9 @@ class MetadataNotReady final : public std::runtime_error {
 
 
 
-// A snapshot carries its namespace one way or the other, never both, and this
-// is checked where the rest of the system gets one.
-//
-// This began as a stronger rule: while readers still read `snapshot->entries`
-// directly, a tree-backed snapshot was refused outright at this boundary,
-// because an empty map is not an error to any of them -- it reads as "the
-// namespace is empty", which for the reachability readers means "nothing is
-// live", which is the input destructive GC wants before it deletes. Those
-// readers now go through the namespace primitives, so a tree-backed view is
-// ordinary and the scaffold came down.
-//
-// What remains is the invariant that cannot be allowed to drift: a root and a
-// map together would let the two disagree about what the namespace is, and
-// every reader would be free to pick. The encoders refuse to write that state;
-// this refuses to hand it out. Throws MetadataNotReady.
+// A snapshot carries its namespace as a tree root or an entry map, never both:
+// both would let the two disagree and every reader pick. The encoders refuse to
+// write that state; this refuses to hand it out. Throws MetadataNotReady.
 void require_coherent_namespace(const MetadataSnapshot&);
 
 class DistributedStore;
@@ -70,21 +56,12 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     NodeRuntime& node_;
     DistributedStore* namespace_store_{};
     std::mutex mutation_mutex_;
-    // Guards only the multi-head merge-and-publish branch of read_group().
-    // Kept separate from mutation_mutex_ because mutate_impl() already holds
-    // mutation_mutex_ across its whole body while calling read_group()
-    // internally; reusing mutation_mutex_ here would self-deadlock on that path.
+    // Guards the multi-head merge-and-publish branch of read_group(). Separate
+    // from mutation_mutex_, which mutate_impl() holds while calling read_group().
     std::mutex reconciliation_mutex_;
-    // An observed peer certificate that this replica cannot accept (its
-    // record fails to materialize locally) is rejected fresh on every single
-    // read_group() call otherwise -- read_group() runs on essentially every
-    // ordinary metadata read cluster-wide, and unlike MetadataReplica's own
-    // accepted-head reconstruction (which has its own cooldown, see
-    // unreconstructable_head_retry_at_ in metadata.hpp), this rejection path
-    // is a separate call (MetadataReplica::accept_commit()'s own early
-    // materialize check, not accepted_heads()) and was not covered by that
-    // fix. Bounds the resulting "ignoring metadata head without a valid
-    // acceptance certificate" log volume the same way.
+    // Retry cooldown for peer certificates this replica cannot accept (record
+    // fails to materialise locally). read_group() runs on nearly every read;
+    // without it each call rejects and logs them afresh.
     mutable std::mutex unacceptable_head_mutex_;
     mutable std::map<Hash256, Clock::time_point> unacceptable_head_retry_at_;
     mutable std::mutex cache_mutex_;
@@ -99,9 +76,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     Hash256 decoded_hash_{};
     std::function<void(const MetadataPublicationContext&)> publication_retention_;
 
-    // Published operational metadata-replica state. This is observational only:
-    // reads are lock-free and never initiate metadata/network I/O. The state is
-    // refreshed by the existing background metadata repair owner.
+    // Observational replica state: lock-free reads, no I/O. Refreshed by the
+    // background repair owner.
     std::atomic_uint64_t replica_generation_{};
     std::atomic_uint64_t replica_observed_unix_ms_{};
     std::atomic_uint32_t metadata_replicas_{};
@@ -113,12 +89,12 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     std::atomic_uint64_t history_transfers_{};
     std::atomic_uint64_t history_entries_submitted_{};
     std::atomic_uint64_t history_peak_in_flight_{};
-    // Discipline 4: conflicts that left the snapshot because a later
-    // mutation decided them, and ones an operator resolved explicitly.
+    // Discipline 4: conflicts decided by a later mutation, and ones an
+    // operator resolved.
     std::atomic_uint64_t conflicts_superseded_{};
     std::atomic_uint64_t conflicts_resolved_{};
-    // Where a mutation's wall time goes: the pre-publication retention
-    // barrier and the commit fan-out. Totals and maxima since start.
+    // Mutation wall time split into retention barrier and commit fan-out;
+    // totals and maxima since start.
     std::atomic_uint64_t mutations_{};
     std::atomic_uint64_t mutation_retention_ms_total_{};
     std::atomic_uint64_t mutation_retention_ms_max_{};
@@ -164,11 +140,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
                                    std::span<const uint8_t> delta, FrameType);
     std::vector<std::pair<NodeInfo, MetadataAcceptance>> discover_accepted_heads(
         const std::vector<NodeInfo>&, FrameType);
-    // Full-roster, abort-on-any-miss sibling of discover_accepted_heads(). Used
-    // only by attempt_history_checkpoint(): a compaction proposal must never
-    // proceed against an incomplete or uncertain view of the cluster. Returns
-    // nullopt (not a partial result) the moment any participant is missing,
-    // errors, or does not recognise the request.
+    // Full-roster discover_accepted_heads() for attempt_history_checkpoint():
+    // compaction must not proceed on a partial view. Returns nullopt if any
+    // participant is missing, errors, or does not recognise the request.
     std::optional<std::vector<std::pair<NodeInfo, MetadataAcceptance>>>
     discover_accepted_heads_required(const std::vector<NodeInfo>&, FrameType);
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
@@ -185,35 +159,21 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     void publish_replica_state(bool validated, std::string_view reason = {});
 
   public:
-    // `namespace_store`, when given, is where tree-backed namespaces' nodes
-    // are read and written; construction installs the replica's commit
-    // application for tree deltas through it (spec B2: commit application
-    // is declared here, unchanged). Without one the manager serves
-    // map-backed namespaces only, as the tests that need no store do.
-    // `publication_retention`, when given, runs before every commit is
-    // published: Service's claims barrier, which makes every object the new
-    // head refers to durably claimed first.
+    // `namespace_store`: where tree namespace nodes live; construction installs
+    // tree-delta commit application through it (spec B2). Without it only
+    // map-backed namespaces are served. `publication_retention`: runs before
+    // each commit is published (the claims barrier: every object the new head
+    // refers to is durably claimed first).
     using PublicationRetention = std::function<void(const MetadataPublicationContext&)>;
     explicit MetadataManager(NodeRuntime&, DistributedStore* namespace_store = nullptr,
                              PublicationRetention publication_retention = {});
 
-    // Where namespace tree nodes live, for a snapshot whose namespace is a
-    // tree. Supplied rather than constructed here because the manager has a
-    // NodeRuntime and not a DistributedStore, and because the node store a
-    // commit uses is bound to the write floor that commit is being made under:
-    // a namespace root may name a node only once that node has durably reached
-    // the same floor as the record naming it.
-    //
-    // Unset until Service has a store, and irrelevant while no snapshot
-    // carries a root -- which is every snapshot today.
     MetadataRecord read_record();
     MetadataRecord record() override { return read_record(); }
     MetadataSnapshot snapshot();
     MetadataSnapshotView snapshot_view();
-    // The same, for a caller that says who it is: it may refresh a stale
-    // cache from the replicas, so it waits on the state device and the
-    // network, and the wait guard refuses it to control work (T4 splits it
-    // into current() and converged()).
+    // May refresh a stale cache from the replicas: waits on the state device
+    // and the network; the wait guard refuses it to control work.
     MetadataSnapshotView snapshot_view(const WorkContext&);
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
     MetadataClusterStatus cluster_status() const noexcept;
@@ -238,11 +198,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     uint64_t conflicts_resolved() const noexcept override {
         return conflicts_resolved_.load(std::memory_order_relaxed);
     }
-    // Operator resolution of one standing conflict: install the chosen
-    // alternative ("left", "right" or "base") for its subject and drop the
-    // record, in one metadata commit. Returns false when no conflict with
-    // that id stands (already superseded, resolved, or never existed);
-    // throws std::invalid_argument for an unknown choice.
+    // Installs the chosen alternative ("left", "right" or "base") and drops the
+    // conflict in one commit. False if no such conflict stands;
+    // std::invalid_argument for an unknown choice.
     bool resolve_conflict(const std::string& id, std::string_view choice) override;
     void note_replica_validation(bool available, std::string_view reason = {}) override {
         publish_replica_state(available, reason);
@@ -261,44 +219,27 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     }
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&,
                           size_t retries = 8) override;
-    // Fast path for callers that can describe the exact delta as they mutate the
-    // decoded snapshot. Avoids retaining a second deep copy of the namespace.
-    // `identity`, when given, is an idempotency key in the snapshot's
-    // mutation-sequence clock: the mutation is applied only if
-    // mutation_sequences[identity.origin] < identity.sequence, and stamps that
-    // clock to identity.sequence when it is. A caller that must know after a
-    // crash whether its mutation took effect (the FUSE namespace loop's mixed
-    // batches) reads the clock instead of re-deriving per-operation effects.
+    // Caller supplies the exact delta; avoids a second deep copy of the
+    // namespace. `identity` is an idempotency key: applied only if
+    // mutation_sequences[identity.origin] < identity.sequence, which it then
+    // stamps, so a caller can tell after a crash whether it took effect.
     MetadataRecord mutate_delta(
         const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
         std::optional<MetadataMutationIdentity> identity = {}) override;
-    // Snapshot at the last causal stability horizon. Retention release may use
-    // this view; ordinary reads must use snapshot_view()/available_snapshot_view().
+    // Snapshot at the last causal stability horizon; for retention release only.
     std::optional<MetadataSnapshotView> retention_release_view() const;
     void repair_once();
-    // One propose/ack/commit round toward safely re-rooting local history.
-    // Gated internally on local size thresholds, a single local accepted
-    // head, and every durably-known participant being currently, directly
-    // reachable (mirrors Membership::all_known_reachable()'s existing use as
-    // the destructive-GC fence). A no-op most of the time: it returns
-    // immediately unless compaction is actually due. Driven by the same
-    // maintenance cycle as repair_once(). Thresholds default to
-    // compact_history_if_safe()'s own defaults and exist as parameters for
-    // the same reason that method's do: so tests can force an otherwise
-    // rare, size-gated round deterministically.
+    // One propose/ack/commit round toward re-rooting local history. No-op
+    // unless size thresholds are met, there is one local accepted head, and
+    // every known participant is directly reachable. Thresholds are
+    // parameters so tests can force a round.
     void attempt_history_checkpoint(size_t record_threshold = 256,
                                     uint64_t byte_threshold = 64ULL * 1024 * 1024) override;
-    // Live repair for accepted heads the local replica has flagged as
-    // unreconstructable (MetadataReplica::unreconstructable_heads()): ask each
-    // reachable peer for the record as a self-contained full body
-    // (get_metadata_history_record) and re-anchor it locally
-    // (MetadataReplica::reanchor_history()). No restart, no quarantine. Driven
-    // by the maintenance cycle; a no-op when nothing is flagged. Returns the
-    // number of heads repaired this call.
+    // Fetches each head flagged unreconstructable as a full body from a
+    // reachable peer and re-anchors it locally. Returns heads repaired.
     size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control) override;
 
-    // MetadataView (spec B2): the operations above under the contract's
-    // names, each calling the one it names.
+    // MetadataView (spec B2) under the contract's names.
     std::optional<MetadataSnapshotView> current() const override {
         return available_snapshot_view();
     }

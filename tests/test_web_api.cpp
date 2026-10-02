@@ -50,8 +50,7 @@ HttpRequest get_accepting_gzip(std::string path) {
     return request;
 }
 
-// Big enough to be worth compressing and repetitive enough to compress well,
-// which is what a real client bundle looks like to gzip.
+// Large and repetitive, as a real client bundle looks to gzip.
 std::string bundle(size_t repeats = 200) {
     std::string out = "// macha client bundle\n";
     for (size_t i = 0; i < repeats; ++i)
@@ -70,10 +69,8 @@ std::string gzip_of(std::string_view text) {
 } // namespace
 
 MACHA_FAST_TEST("web_api", test_unknown_routes_reach_the_client_and_real_files_do_not) {
-    // A single-page application owns its own routing: a deep link is a route
-    // the client resolves once it has loaded, so the server must hand it the
-    // index document rather than a 404 it can never recover from. A path that
-    // does name a file is that file.
+    // A single-page application routes client-side: a deep link gets the index
+    // document, not a 404. A path that names a file is that file.
     TempDir t;
     const auto root = t.path() / "web";
     write_file(root / "index.html", "<!doctype html><title>macha</title>");
@@ -87,7 +84,6 @@ MACHA_FAST_TEST("web_api", test_unknown_routes_reach_the_client_and_real_files_d
     CHECK(index.content_type == "text/html; charset=utf-8");
     CHECK(body_of(index) == "<!doctype html><title>macha</title>");
 
-    // The client's own routes, which exist only in the browser.
     for (const auto* route : {"/library", "/library/artist/anything", "/settings?tab=playback"}) {
         auto deep = web.handle(get(route));
         CHECK(deep.status == 200);
@@ -103,8 +99,8 @@ MACHA_FAST_TEST("web_api", test_unknown_routes_reach_the_client_and_real_files_d
     CHECK(style.status == 200);
     CHECK(style.content_type == "text/css; charset=utf-8");
 
-    // The index document is revalidated on every load or a deploy stays
-    // invisible; the assets it names may be held.
+    // The index document revalidates on every load so a deploy is seen; the
+    // assets it names may be cached.
     CHECK(index.headers.at("Cache-Control") == "no-cache");
     CHECK(script.headers.at("Cache-Control") == "public, max-age=3600");
 
@@ -127,9 +123,8 @@ MACHA_FAST_TEST("web_api", test_the_api_namespace_is_never_the_clients) {
 }
 
 MACHA_FAST_TEST("web_api", test_a_request_cannot_climb_out_of_the_web_root) {
-    // The fallback is what makes traversal interesting: a refused path must
-    // not fall through to something else on disk, and must not become a 404
-    // that tells an attacker whether a file exists.
+    // A refused path must not fall through to the index fallback or another
+    // file, and must not become a 404 that reveals whether a file exists.
     TempDir t;
     const auto root = t.path() / "web";
     write_file(root / "index.html", "INDEX");
@@ -162,14 +157,12 @@ MACHA_FAST_TEST("web_api", test_a_web_client_is_read_only_and_optional) {
     head.path = "/library";
     CHECK(web.handle(head).status == 200);
 
-    // A node that serves no client keeps the behaviour every node had before
-    // this existed: non-API paths are simply not found.
+    // A node that serves no client answers non-API paths with not found.
     WebApi none{WebConfig{}};
     CHECK(!none.enabled());
     CHECK(none.handle(get("/library")).status == 404);
 
-    // A node configured for a client whose files are not there yet says so,
-    // rather than pretending the route does not exist.
+    // A configured client whose files are missing is reported, not a 404.
     WebConfig missing;
     missing.root = t.path() / "not-deployed-yet";
     WebApi absent(missing);
@@ -184,8 +177,8 @@ MACHA_FAST_TEST("web_api", test_a_web_client_is_read_only_and_optional) {
 }
 
 MACHA_FAST_TEST("web_api", test_a_client_asset_is_gzipped_only_for_a_client_that_takes_one) {
-    // The reason this exists: a first page load pulls the whole bundle, and
-    // over a WAN link that is the user-visible cost of opening the client.
+    // A first page load pulls the whole bundle; over a WAN that is the cost
+    // of opening the client.
     TempDir t;
     const auto root = t.path() / "web";
     const auto script = bundle();
@@ -199,7 +192,6 @@ MACHA_FAST_TEST("web_api", test_a_client_asset_is_gzipped_only_for_a_client_that
     CHECK(compressed.content_type == "text/javascript; charset=utf-8");
     CHECK(compressed.headers.at("Content-Encoding") == "gzip");
     CHECK(compressed.headers.at("Vary") == "Accept-Encoding");
-    // What the browser ends up with must be the file, byte for byte.
     CHECK(gunzip(body_of(compressed)) == script);
     CHECK(body_of(compressed).size() < script.size() / 2);
 
@@ -208,11 +200,10 @@ MACHA_FAST_TEST("web_api", test_a_client_asset_is_gzipped_only_for_a_client_that
     CHECK(plain.status == 200);
     CHECK(!plain.headers.contains("Content-Encoding"));
     CHECK(body_of(plain) == script);
-    // Still stated, so a shared cache keys the two representations apart
-    // rather than handing this body to the next client that asks for gzip.
+    // Vary is still stated, so a shared cache keys the representations apart.
     CHECK(plain.headers.at("Vary") == "Accept-Encoding");
 
-    // A PNG is already compressed; a second pass would only spend CPU.
+    // Already-compressed types are not recompressed.
     auto image = web.handle(get_accepting_gzip("/logo.png"));
     CHECK(image.status == 200);
     CHECK(!image.headers.contains("Content-Encoding"));
@@ -220,13 +211,11 @@ MACHA_FAST_TEST("web_api", test_a_client_asset_is_gzipped_only_for_a_client_that
 }
 
 MACHA_FAST_TEST("web_api", test_a_precompressed_sibling_is_served_rather_than_compressed_again) {
-    // A build that emits app.js.gz has already paid for the compression. The
-    // server must spend nothing per request to use it.
+    // A precompressed app.js.gz sibling is served as is.
     TempDir t;
     const auto root = t.path() / "web";
     const auto script = bundle();
-    // Deliberately not the gzip of app.js: if the sibling is what gets sent,
-    // this is what comes back, and nothing else could produce it.
+    // Not the gzip of app.js, so only the sibling could produce this body.
     const auto sibling_contents = bundle(7) + "// served from the sibling\n";
     write_file(root / "index.html", "<!doctype html><title>macha</title>");
     write_file(root / "app.js", script);
@@ -246,17 +235,15 @@ MACHA_FAST_TEST("web_api", test_a_precompressed_sibling_is_served_rather_than_co
     CHECK(!plain.headers.contains("Content-Encoding"));
     CHECK(body_of(plain) == script);
 
-    // The sibling is never reachable as a resource in its own right under a
-    // type that would make a browser try to execute it.
+    // The sibling is never served on its own under an executable type.
     auto direct = web.handle(get("/app.js.gz"));
     CHECK(direct.status == 200);
     CHECK(direct.content_type == "application/octet-stream");
 }
 
 MACHA_FAST_TEST("web_api", test_the_gzip_and_identity_representations_never_share_an_entity_tag) {
-    // The trap this closes: one tag for two different bodies lets a cache --
-    // or the browser's own store -- answer a client with a representation it
-    // cannot read, and makes a 304 a lie.
+    // Each representation has its own ETag, so no cache can answer a client
+    // with a body it cannot read and a 304 is never wrong.
     TempDir t;
     const auto root = t.path() / "web";
     write_file(root / "index.html", "<!doctype html><title>macha</title>");
@@ -278,8 +265,7 @@ MACHA_FAST_TEST("web_api", test_the_gzip_and_identity_representations_never_shar
     revalidate_plain.headers["if-none-match"] = identity_tag;
     CHECK(web.handle(revalidate_plain).status == 304);
 
-    // And never against the other's: a client holding the identity body must
-    // be sent the gzip one in full rather than told it is unchanged.
+    // Never against the other's: an identity tag gets the gzip body in full.
     auto crossed = get_accepting_gzip("/app.js");
     crossed.headers["if-none-match"] = identity_tag;
     auto crossed_response = web.handle(crossed);
@@ -294,8 +280,7 @@ MACHA_FAST_TEST("web_api", test_the_gzip_and_identity_representations_never_shar
 }
 
 MACHA_FAST_TEST("web_api", test_compression_is_configurable_and_off_means_off) {
-    // A node behind a proxy that already compresses has no reason to pay for
-    // it twice, so this is a supported deployment rather than a degraded one.
+    // Compression can be disabled, for a node behind a compressing proxy.
     TempDir t;
     const auto root = t.path() / "web";
     const auto script = bundle();
@@ -313,8 +298,7 @@ MACHA_FAST_TEST("web_api", test_compression_is_configurable_and_off_means_off) {
     CHECK(!untouched.headers.contains("Vary"));
     CHECK(body_of(untouched) == script);
 
-    // The floor is honoured: below it there is nothing to win and gzip's own
-    // header is a real fraction of the body.
+    // Bodies below the size floor are not compressed.
     HttpCompressionConfig floored;
     floored.min_bytes = script.size() + 1;
     WebApi high_floor(config_for(root), floored);
@@ -322,9 +306,8 @@ MACHA_FAST_TEST("web_api", test_compression_is_configurable_and_off_means_off) {
     CHECK(small.status == 200);
     CHECK(!small.headers.contains("Content-Encoding"));
 
-    // An asset past the on-demand ceiling is streamed as it is rather than
-    // read whole into memory once per request -- but a precompressed sibling
-    // is still free, so it is still preferred.
+    // An asset past the on-demand ceiling is streamed uncompressed, but a
+    // precompressed sibling is still preferred.
     HttpCompressionConfig capped;
     capped.max_asset_bytes = 16;
     WebApi tight(config_for(root), capped);

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A subsystem plugin that deliberately reports a build identity that cannot
-// match any real core build, used only by
-// foundations/test_subsystem_supervisor_refuses_a_mismatched_plugin to prove
-// a partial-deploy-style ABI skew is refused at load time rather than run.
+// A plugin whose build identity matches no real core build: the supervisor
+// must refuse it at load time.
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
 

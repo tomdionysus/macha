@@ -22,11 +22,8 @@
 
 namespace macha {
 namespace {
-// TEL3: the tagged, length-delimited format introduced in 0.48.0. The magic
-// changes with the format, so a node speaking the old positional one rejects
-// the set outright -- "bad telemetry set" -- rather than misreading it. There
-// is deliberately no compatibility with TEL1 or TEL2: every node moves at
-// once, and a half-understood record is worse than a refused one.
+// TEL3: the tagged format. Any other magic is refused ("bad telemetry set"),
+// not misread: a half-understood record is worse than a refused one.
 constexpr std::array<uint8_t, 8> magic{'M', 'A', 'C', 'H', 'T', 'E', 'L', '3'};
 constexpr size_t max_persisted_records = 1024;
 
@@ -55,25 +52,11 @@ uint32_t load1_milli() {
     return static_cast<uint32_t>(std::min<double>(load * 1000.0, UINT32_MAX));
 }
 
-// A telemetry record is a sequence of tagged, length-delimited fields inside
-// a length-delimited record. Nothing about it is positional.
-//
-// It was positional until 0.48.0: fields were appended in order, optional
-// trailing ones were detected by asking the reader whether any bytes were
-// left, and adding a field meant another level of nested "if there is more".
-// That works between peers of one version and fails across two, which is the
-// only time it matters. A newer sender's record carries bytes an older reader
-// does not know to consume, so in a SET -- up to 64 records on the gossip
-// path -- the older reader begins the next record part-way through the
-// previous one and every record after it is garbage. One added field cost a
-// mixed-version cluster every multi-node telemetry set it exchanged, for as
-// long as the versions differed.
-//
-// With tags and lengths: an unknown field is skipped by its own length, a
-// missing field keeps its default and means "this node did not say", and the
-// record length says where the next record starts regardless of what either
-// side understood. Fields may be added, and versions may differ, without a
-// flag day.
+// A record is a sequence of tagged, length-delimited fields inside a
+// length-delimited record; nothing is positional. An unknown field is skipped
+// by its length, a missing one keeps its default ("did not say"), and the
+// record length locates the next record, so fields can be added and versions
+// can differ.
 enum TelemetryFieldId : uint16_t {
     field_node_id = 1,
     field_boot_id = 2,
@@ -129,14 +112,9 @@ void put_field(Writer& writer, uint16_t id, std::span<const uint8_t> value) {
     writer.raw(value);
 }
 
-// Absence already means "this node did not say", and a default-valued field
-// says nothing a decoder would not have assumed -- every record decodes into a
-// freshly defaulted struct, never merged into a previous one. So a zero or an
-// empty string is simply left out. On a node with streaming disabled, an edge
-// node holding no extents, or one with an empty cache, that is most of the
-// record; at up to 64 records a set, it is the difference between a gossip
-// message and a large one. Nothing is lost: a reader cannot distinguish an
-// omitted zero from a transmitted one, because they mean the same thing.
+// Default-valued fields are omitted: absence means "did not say", and every
+// record decodes into a fresh default struct, so an omitted zero and a sent
+// one are indistinguishable. Keeps a 64-record set gossip-sized.
 template <typename T> void put_uint(Writer& writer, uint16_t id, T value) {
     if (value == T{})
         return;
@@ -184,8 +162,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     put_uint(body, field_rpc_connections_created, value.rpc_connections_created);
     put_uint(body, field_rpc_connections_reused, value.rpc_connections_reused);
     put_uint(body, field_rpc_connections_canonical, value.rpc_connections_canonical);
-    // Always stated even at its default: an omitted phase reads as `ready`,
-    // which is an assertion about the node rather than an absence of one.
+    // Always stated: an omitted phase reads as `ready`, which is an assertion.
     put_field(body, field_phase, std::array<uint8_t, 1>{static_cast<uint8_t>(value.phase)});
     put_string(body, field_api_endpoint, value.api_endpoint);
     put_uint(body, field_cpu_cores, value.cpu_cores);
@@ -241,8 +218,7 @@ void encode(Writer& writer, const NodeTelemetry& value) {
     put_uint(body, field_cache_misses, value.cache_misses);
     put_uint(body, field_cache_evictions, value.cache_evictions);
 
-    // The record's own length, so a reader that understood none of the above
-    // still knows exactly where the next record begins.
+    // The record's length tells any reader where the next record begins.
     const auto& encoded = body.data();
     writer.u32(static_cast<uint32_t>(encoded.size()));
     writer.raw(encoded);
@@ -258,9 +234,7 @@ uint64_t field_uint(std::span<const uint8_t> value, size_t width, const char* wh
 }
 
 NodeTelemetry decode(Reader& reader) {
-    // Borrowed, not copied: the record body is walked in place and only the
-    // values that the struct owns are copied out of it. At up to 64 records a
-    // set this is the difference between one allocation per record and none.
+    // The body is walked in place; only owned values are copied out.
     const auto length = reader.u32();
     Reader fields(reader.view(length));
     NodeTelemetry value;
@@ -442,8 +416,7 @@ NodeTelemetry decode(Reader& reader) {
             value.cache_evictions = field_uint(payload, 8, "cache_evictions");
             break;
         default:
-            // A field this build does not know. Skipped by its own length,
-            // which is the entire point.
+            // Unknown field: skipped by its own length.
             break;
         }
     }
@@ -531,8 +504,7 @@ TelemetryStore::TelemetryStore(NodeId self, std::filesystem::path persisted_path
                 persisted_[telemetry.node_id] = std::move(telemetry);
         }
     } catch (const std::exception& error) {
-        // Telemetry is observational state only. Corruption or an incompatible
-        // cache must never prevent the node from starting.
+        // Observational state only: corruption must never block startup.
         Log::warn("persisted telemetry ignored: " + std::string(error.what()));
         persisted_.clear();
     }
@@ -748,8 +720,7 @@ void TelemetryStore::persist() {
     durable_replace_file(persisted_path_, contents);
 
     std::lock_guard lock(mutex_);
-    // Mirror exactly the bounded set just made durable. This keeps the cache
-    // bounded even across years of node replacements.
+    // Mirror the bounded set just made durable, keeping the cache bounded.
     persisted_.clear();
     for (auto& telemetry : values) {
         const auto node = telemetry.node_id;

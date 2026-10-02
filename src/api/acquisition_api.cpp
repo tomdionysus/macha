@@ -109,8 +109,8 @@ std::map<NodeId, uint64_t> AcquisitionApi::live_ages() const {
     return out;
 }
 
-// One torrent job as the API shows it (0.64.0): the cluster request from
-// metadata, with the owner's live state laid over it.
+// One torrent job as the API shows it: the cluster request from metadata,
+// with the owner's live state laid over it.
 Json AcquisitionApi::request_json(const TorrentRequest& r, const std::map<NodeId, uint64_t>& as_of) const {
     const auto live = torrents_.live_job(r);
     Json::Object out;
@@ -175,9 +175,8 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             cleanup["delete_owned_source_on_cancel"] = ingest_.delete_owned_source_on_cancel();
             out["cleanup"] = std::move(cleanup);
             out["staging"] = std::move(staging);
-            // Without these, a queue stalled behind a wedged job is
-            // indistinguishable from an idle one: every job reads "queued"
-            // and nothing says whether a worker is holding any of them.
+            // Without these, a queue stalled behind a wedged job looks idle: every job
+            // reads "queued" and nothing says whether a worker holds one.
             Json::Object concurrency;
             concurrency["max_jobs"] = static_cast<uint64_t>(ingest_.max_concurrent_jobs());
             concurrency["active_jobs"] = static_cast<uint64_t>(ingest_.active_jobs());
@@ -212,7 +211,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             if (const auto* value = body.find("delete_source_on_clear"))
                 delete_source_on_clear = value->asBool();
             else if (const auto* value = body.find("remove_source"))
-                delete_source_on_clear = value->asBool(); // 0.13 compatibility alias
+                delete_source_on_clear = value->asBool(); // alias of delete_source_on_clear
             const auto id = ingest_.submit_path(path->asString(), "filesystem", {},
                                                 std::move(display_name), delete_source_on_clear,
                                                 false, false);
@@ -249,28 +248,22 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             }
         }
 
-        // The download engine lives in the libmacha-torrent plugin, so its
-        // presence is a runtime fact, per node, that can also change while
-        // the process runs (a faulted subsystem is withdrawn until it
-        // restarts). Take one snapshot for this request rather than looking
-        // it up repeatedly and racing with a restart mid-handler.
+        // The download engine is a plugin that may be absent or withdrawn while it
+        // restarts; take one snapshot for this request rather than racing a restart.
         const auto torrents = subsystems_.torrent();
 
         if (request.method == "GET" && request.path == "/api/v1/torrents/status") {
             Json::Object out;
             out["enabled"] = torrents && torrents->enabled();
-            // Retains the pre-0.28.0 field name: it used to report whether
-            // libtorrent was compiled in, and now reports whether the plugin
-            // providing it is loaded and running here -- the same question a
-            // client was asking, answered at runtime.
+            // Whether the torrent plugin is loaded and running here.
             out["build_available"] = torrents != nullptr;
             out["search_enabled"] = search_.enabled();
             return http_json(200, Json(std::move(out)).dump());
         }
 
         if (request.method == "GET" && request.path == "/api/v1/torrents/jobs") {
-            // The requests from this node's metadata, with each owner's live
-            // state from the cluster view (0.64.0).
+            // The requests from this node's metadata, with each owner's live state from
+            // the cluster view.
             const auto listing = jobs_.torrent_jobs();
             std::map<NodeId, uint64_t> as_of;
             for (const auto& source : listing.sources) as_of[source.node_id] = source.as_of_unix_ms;
@@ -313,7 +306,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
 
         if (request.method == "POST" && request.path == "/api/v1/torrents/jobs") {
             const auto body = parse_body(request);
-            // Optional pin (0.64.0): absent or null lets the cluster choose.
+            // Optional pin: absent or null lets the cluster choose.
             std::optional<NodeId> pin;
             if (const auto* node = body.find("node_id")) {
                 std::string error;
@@ -324,7 +317,7 @@ HttpResponse AcquisitionApi::handle(const HttpRequest& request) {
             std::optional<std::optional<uint64_t>> remove_after;
             if (std::string error; !parse_remove_after(body, remove_after, error))
                 return http_error(400, "bad_request", error);
-            // Optional (0.71.0): created already paused, in the same write.
+            // Optional: created already paused, in the same write.
             bool paused = false;
             if (const auto* value = body.find("paused"); value && !value->isNull()) {
                 if (!value->isBool()) return http_error(400, "bad_request", "paused must be a boolean");

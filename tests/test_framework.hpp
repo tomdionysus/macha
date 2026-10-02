@@ -34,8 +34,7 @@ class Registrar {
 void check(bool passed, std::string_view expression, const char* file, int line);
 [[noreturn]] void require_failed(std::string_view expression, const char* file, int line);
 
-// The parent runner assigns each child a deterministic namespace before the
-// test body starts. Test helpers use it for collision-free loopback ports.
+// Set by the runner before each case; helpers derive collision-free loopback ports from it.
 void set_case_index(std::size_t index) noexcept;
 std::size_t case_index() noexcept;
 

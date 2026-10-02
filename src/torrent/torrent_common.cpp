@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The half of BitTorrent acquisition that stays in macha_core: the job value
-// types, the API/wire JSON shapes, the URI sanitisers and the Torznab search
-// client, none of which touch libtorrent. The download engine itself
-// (TorrentManager) lives in the libmacha-torrent plugin -- see
-// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md and torrent_manager.cpp.
+// BitTorrent acquisition's core half, free of libtorrent: job types, API and
+// wire JSON, URI sanitisers and the Torznab client. The engine is in the plugin.
 #include "torrent/torrent.hpp"
 
 #include <arpa/inet.h>
@@ -240,9 +237,8 @@ Json torrent_job_api_json(const TorrentJob& job) {
     return Json(std::move(out));
 }
 
-// The persistence shape of jobs.json and, with the transient fields added,
-// the cluster RPC shape. In core since 0.64.0 so a node without the plugin
-// can decode a peer's jobs.
+// The jobs.json shape and, with the transient fields, the cluster RPC shape.
+// In core so a node without the plugin can decode a peer's jobs.
 Json torrent_job_json(const TorrentJob& job) {
     Json::Object o;
     o["id"] = job.id;
@@ -306,17 +302,13 @@ TorrentJob parse_torrent_job(const Json& value) {
     if (const auto* v = value.find("updated_unix_ms")) job.updated_unix_ms = v->asUInt64();
     if (const auto* v = value.find("error")) job.error = v->asString();
     if (const auto* v = value.find("error_code")) job.error_code = v->asString();
-    // Recorded before error codes existed: an error is never shown without one.
+    // A record with an error but no code gets one: an error never shows without a code.
     if (!job.error.empty() && job.error_code.empty()) job.error_code = "torrent_failed";
     return job;
 }
 
-// Wire shape for the cluster RPC survey: the persistence shape
-// (torrent_job_json/parse_torrent_job) plus the transient fields it
-// deliberately never persists (download_rate, upload_rate, peers, seeds,
-// eta_seconds -- resetting those across a local restart is intentional; a
-// remote peer answering a live survey should still report its own current
-// values).
+// The persistence shape plus the transient rates, peers, seeds and ETA, which
+// are never persisted but a live peer still reports.
 Json torrent_job_wire_json(const TorrentJob& job) {
     auto out = torrent_job_json(job);
     out["download_rate"] = job.download_rate;
@@ -520,9 +512,8 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
         auto uri = result.magnet_uri ? result.magnet_uri : result.torrent_url;
         if (!uri) continue;
         while (acquisitions_.size() >= max_acquisitions_) {
-            // References are opaque and equivalent except for expiry. Retire
-            // the one with the least remaining lifetime before admitting a new
-            // owner so repeated searches cannot grow the process indefinitely.
+            // At capacity, retire the reference nearest expiry, so repeated
+            // searches cannot grow memory without bound.
             auto victim = std::min_element(
                 acquisitions_.begin(), acquisitions_.end(), [](const auto& a, const auto& b) {
                     return a.second.expires_unix_ms < b.second.expires_unix_ms;
@@ -547,10 +538,8 @@ std::optional<std::string> TorrentSearchManager::resolve(std::string_view acquis
 }
 
 bool advertise_is_ip_literal(std::string_view advertise) {
-    // libtorrent's listen_interfaces takes an IP literal or a device name --
-    // never a hostname. A name reaches its device enumeration, matches no
-    // device, and binds nothing at all, silently. Only an address can be used
-    // here, so only an address is accepted.
+    // listen_interfaces takes an IP literal or device name; a hostname matches
+    // no device and silently binds nothing.
     if (advertise.find(':') != std::string_view::npos) {
         in6_addr v6{};
         return inet_pton(AF_INET6, std::string(advertise).c_str(), &v6) == 1;
@@ -564,20 +553,11 @@ std::string torrent_listen_interfaces(const TorrentConfig& config, std::string_v
         return config.listen_interfaces;
     const auto port = ":" + std::to_string(config.listen_port);
     const auto wildcard = "0.0.0.0" + port + ",[::]" + port;
-    // No usable advertised address: fall back to libtorrent's own default and
-    // accept whatever its device enumeration produces.
+    // No usable advertised address: bind every interface.
     if (advertise.empty() || advertise == "0.0.0.0" || advertise == "::")
         return wildcard;
-    // An advertised address that is not an IP literal cannot be bound. This is
-    // the ordinary case once a node advertises a DNS name -- and worse, that
-    // name usually resolves to a public address the node does not hold at all,
-    // because it is behind NAT. Binding every interface is the only honest
-    // answer: peer traffic then leaves by whichever route the kernel picks,
-    // exactly as it did before 0.37.2 tried to be more specific.
-    //
-    // Observed 2026-09-12: three nodes moved to public DNS advertise values
-    // and every one of them bound nothing on 6881, leaving torrents in
-    // dl-metadata for ever with no error anywhere.
+    // A DNS name cannot be bound, and behind NAT usually resolves to an address
+    // the node does not hold: bind every interface and let the kernel route.
     if (!advertise_is_ip_literal(advertise)) {
         Log::info("torrent listen: advertised address '" + std::string(advertise) +
                   "' is not an IP literal, binding all interfaces instead" + port +

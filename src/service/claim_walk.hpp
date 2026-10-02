@@ -26,11 +26,10 @@ struct ClaimWalkStep {
     bool unfinished{};
 };
 
-// A durable retention claim is a promise about this physical node, not an
-// annotation on its namespace view: a claimed copy that scrub or corruption
-// removed, belonging only to an unseen branch, is invisible to live-set
-// repair. The claim walk examines a bounded slice of one class's claims per
-// step, from a cursor it keeps across steps, and asks the restorer for each
+// A durable retention claim is a promise about this physical node: a claimed
+// copy lost to scrub or corruption and belonging only to an unseen branch is
+// invisible to live-set repair. Each step examines a bounded slice of one
+// class's claims from a persistent cursor and asks the restorer for each
 // claim not held. Presence costs nothing; only a missing claim may spend.
 class ClaimWalk {
   public:

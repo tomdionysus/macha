@@ -70,9 +70,8 @@ Tristate yaml_tristate(const YAML::Node& node, const char* what) {
     return parse_tristate(node.as<std::string>(), what);
 }
 
-// A YAML node that records the path of every key the loader reads, so that
-// load_yaml_config() can refuse a file carrying a key nothing read. The set
-// of known keys is therefore exactly the set the parsers below consult.
+// Records every key path the loader reads, so load_yaml_config() can refuse
+// a file carrying a key nothing read.
 class ConfigNode {
   public:
     ConfigNode(YAML::Node node, std::string path, std::shared_ptr<std::set<std::string>> read)
@@ -199,8 +198,7 @@ void parse_dht(const ConfigNode& root, Config& c) {
     if (d["metadata_min_write_replicas"])
         c.metadata_min_write_replicas = d["metadata_min_write_replicas"].as<size_t>();
     else if (d["metadata_replicas"]) {
-        // 0.18 metadata_replicas was a fixed voter count whose write floor was
-        // majority. Preserve that durability when reading an old config.
+        // Legacy key: a voter count with a majority write floor.
         const auto legacy = d["metadata_replicas"].as<size_t>();
         c.metadata_min_write_replicas = legacy ? legacy / 2 + 1 : 0;
     }
@@ -293,7 +291,7 @@ void parse_filesystem(const ConfigNode& root, Config& c) {
     if (f["root_mode"])
         c.filesystem.root_mode = parse_mode(f["root_mode"], "filesystem.root_mode");
 
-    // 0.12.x compatibility: old FUSE keys under filesystem remain accepted.
+    // Legacy FUSE keys under filesystem.
     if (f["allow_other"]) c.fuse.allow_other = f["allow_other"].as<bool>();
     if (f["entry_timeout_ms"]) c.fuse.entry_timeout = milliseconds(f["entry_timeout_ms"], "filesystem.entry_timeout_ms");
     if (f["attr_timeout_ms"]) c.fuse.attr_timeout = milliseconds(f["attr_timeout_ms"], "filesystem.attr_timeout_ms");
@@ -406,10 +404,8 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
             c.catalogue.api.port = api["port"].as<uint16_t>();
         if (api["advertised_endpoint"]) {
             auto value = api["advertised_endpoint"].as<std::string>();
-            // This string is handed to clients verbatim and they build every
-            // request URL from it, so a malformed one produces requests that
-            // fail somewhere far away with no hint of where it came from.
-            // Reject it here, where the file that set it is still in hand.
+            // Clients build every request URL from this verbatim, so reject a
+            // malformed one here, where its source is known.
             const bool http = value.starts_with("http://");
             const bool https = value.starts_with("https://");
             if (!http && !https)
@@ -419,9 +415,7 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
             const auto authority = value.substr(http ? 7 : 8);
             if (authority.empty())
                 throw std::runtime_error("catalogue.api.advertised_endpoint has no host");
-            // A proxy fronting a node at a subpath is not a deployment this
-            // serves: a client treats this as an origin and would append its
-            // own paths, silently 404ing against the prefix.
+            // No path: clients treat this as an origin and would 404 against a prefix.
             if (authority.find('/') != std::string::npos)
                 throw std::runtime_error(
                     "catalogue.api.advertised_endpoint must not contain a path; "
@@ -431,8 +425,7 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
                 authority.find('#') != std::string::npos)
                 throw std::runtime_error(
                     "catalogue.api.advertised_endpoint must be scheme://host[:port] only");
-            // An unbracketed IPv6 literal cannot be parsed back out of a URL:
-            // its colons are indistinguishable from a port separator.
+            // An unbracketed IPv6 literal is ambiguous with the port separator.
             const auto colons = std::count(authority.begin(), authority.end(), ':');
             if (colons > 1 && authority.front() != '[')
                 throw std::runtime_error(
@@ -448,10 +441,7 @@ void parse_catalogue(const ConfigNode& root, Config& c) {
             c.catalogue.api.workers = api["workers"].as<size_t>();
         if (api["control_workers"])
             c.catalogue.api.control_workers = api["control_workers"].as<size_t>();
-        // 0.43.0 renamed this: the server no longer queues accepted
-        // connections for a worker, it holds them open. The old key is
-        // still read as the connection cap so an existing config keeps
-        // its meaning.
+        // Legacy key, read as the connection cap; max_connections wins.
         if (api["max_queued_connections"])
             c.catalogue.api.max_connections = api["max_queued_connections"].as<size_t>();
         if (api["max_connections"])
@@ -629,9 +619,7 @@ void parse_torrent(const ConfigNode& root, Config& c) {
     }
     if (auto search = torrent["search"]) {
         if (auto providers = search["providers"]) {
-            // YAML `providers:` with only commented examples is a null node.
-            // Treat it exactly like an empty list rather than rejecting an
-            // otherwise valid torrent configuration.
+            // `providers:` with only commented examples is null: an empty list.
             if (!providers.IsNull()) {
                 if (!providers.IsSequence())
                     throw std::runtime_error("torrent.search.providers must be a sequence");
@@ -658,8 +646,7 @@ void parse_streaming(const ConfigNode& root, Config& c) {
         return;
     if (streaming["enabled"])
         c.streaming.enabled = streaming["enabled"].as<bool>();
-    // Legacy executable-path keys are accepted but ignored; media execution is
-    // in-process through libav.
+    // Legacy executable-path keys are accepted but ignored.
     if (streaming["temp_path"])
         c.streaming.temp_path = std::filesystem::path(streaming["temp_path"].as<std::string>());
     if (streaming["max_sessions"])
@@ -856,9 +843,8 @@ Config load_yaml_config(const std::filesystem::path& path) {
         throw std::runtime_error("storage must be a mapping with data and metadata sections");
     if (storage["hosts_extents"])
         c.hosts_extents = yaml_tristate(storage["hosts_extents"], "storage.hosts_extents");
-    // storage.data is optional since 0.42.0: an edge node (hosts_extents
-    // false, or auto with nothing configured) stores no extents. A node that
-    // does host them still needs at least one backend; validate() says so.
+    // storage.data is optional: an edge node stores no extents. validate()
+    // requires a backend on a node that hosts them.
     auto data_storage = storage["data"];
     if (data_storage && !data_storage.IsMap())
         throw std::runtime_error("storage.data must be a mapping");

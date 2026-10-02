@@ -13,13 +13,10 @@
 #include <span>
 #include <vector>
 
-// The claims a node holds (the object ledger spec, B3, "claimed"): which
-// objects it has promised to keep, durably, by causal dot. The storage layer
-// owns it -- the node's RPC handlers serve peers' claim writes and delete
-// refusals from it, and the distributed store claims what it publishes --
-// and the ledger forwards to it; nothing above the ledger reaches it except
-// through the ledger. Implemented by RetentionStore, journal and checkpoints
-// unchanged.
+// The claims a node holds (object ledger spec, B3, "claimed"): the objects it
+// has durably promised to keep, by causal dot. Owned by the storage layer;
+// above the ledger it is reached only through the ledger. Implemented by
+// RetentionStore.
 namespace macha {
 
 enum class RetentionClass : uint8_t {
@@ -27,8 +24,7 @@ enum class RetentionClass : uint8_t {
     control = 2,
 };
 
-// One claim's causal identity: the node that wrote it and that node's
-// sequence.
+// One claim's causal identity: the writing node and its sequence.
 struct RetentionDot {
     NodeId origin{};
     uint64_t sequence{};
@@ -42,8 +38,7 @@ class ClaimStore {
   public:
     virtual ~ClaimStore() = default;
 
-    // Claim writes: one durable journal frame each. Waits on the state
-    // device.
+    // Claim writes: one durable journal frame each. Waits on the state device.
     static constexpr Waits write_waits = Waits::state_device;
     virtual void retain(RetentionClass, const ObjectId&, const RetentionDot&) = 0;
     virtual void retain_batch(RetentionClass, const std::vector<ObjectId>&,

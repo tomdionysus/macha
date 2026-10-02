@@ -113,10 +113,9 @@ std::vector<uint64_t> shard_quotas(const std::vector<uint64_t>& capacities, size
 
     auto level = water_level(capacities, replicas);
     if (!level.numerator) {
-        // No capacity-capable R-way placement exists (or every capacity is
-        // unknown/zero). Keep the mapping deterministic and evenly spread so
-        // startup/tests still have a complete fallback order; writes will fail
-        // normally if the selected nodes really cannot store data.
+        // No capacity-weighted R-way placement exists (or all capacities are
+        // zero): spread evenly and deterministically; writes fail normally if
+        // the chosen nodes cannot store.
         const uint64_t base = static_cast<uint64_t>(required / n);
         uint64_t remainder = static_cast<uint64_t>(required % n);
         for (size_t i = 0; i < n; ++i) {
@@ -166,8 +165,7 @@ std::vector<uint64_t> shard_quotas(const std::vector<uint64_t>& capacities, size
         }
     }
 
-    // The sum of ideal quotas is exactly R*S; flooring can lose fewer than n
-    // slots. This branch is defensive against future arithmetic changes.
+    // Ideal quotas sum to R*S; flooring loses fewer than n slots. Defensive.
     for (size_t i = 0; assigned < required && i < quota.size(); ++i) {
         if (quota[i] < placement_shards) {
             ++quota[i];
@@ -203,9 +201,8 @@ std::vector<size_t> systematic_shard_sample(std::span<const uint8_t> key,
         begin = end;
     }
 
-    // Integer quota construction should make this exact. Retain a deterministic
-    // safety fallback rather than returning a short owner set if future changes
-    // violate that invariant.
+    // Unreachable with exact quotas; fill deterministically rather than return
+    // a short owner set.
     if (selected.size() < replicas) {
         for (size_t i = 0; i < capacities.size() && selected.size() < replicas; ++i) {
             if (std::find(selected.begin(), selected.end(), i) == selected.end())
@@ -305,9 +302,7 @@ std::vector<NodeInfo> rendezvous_nodes(std::span<const uint8_t> key,
     std::set<std::string> domains;
     std::set<NodeId> chosen;
 
-    // Prefer failure-domain diversity while preserving HRW order within each
-    // choice. Placement remains deterministic on every node; no coordinator-local
-    // topology knowledge is required.
+    // Prefer failure-domain diversity, keeping HRW order within each choice.
     for (const auto& item : scored) {
         if (out.size() == count)
             break;
@@ -319,8 +314,7 @@ std::vector<NodeInfo> rendezvous_nodes(std::span<const uint8_t> key,
         }
     }
 
-    // If there are fewer domains than replicas, fill the remaining slots using
-    // ordinary rendezvous order.
+    // Fewer domains than replicas: fill the rest in rendezvous order.
     for (const auto& item : scored) {
         if (out.size() == count)
             break;
@@ -336,10 +330,8 @@ std::vector<NodeInfo> capacity_placement_nodes(std::span<const uint8_t> key,
         return {};
     count = std::min(count, nodes.size());
 
-    // R=1 has a simpler and stronger solution: weighted rendezvous over the
-    // stable shard key. Adding a backend/node only steals shards won by the
-    // newcomer; existing owners never exchange shards among themselves. This
-    // is particularly important for node-local backend growth.
+    // R=1: weighted rendezvous over the shard key. A newcomer only takes the
+    // shards it wins; existing owners never exchange shards.
     if (count == 1) {
         auto out = nodes;
         const auto stable_key = shard_key(key);
@@ -392,9 +384,8 @@ std::vector<NodeInfo> capacity_placement_nodes(std::span<const uint8_t> key,
         }
     }
 
-    // Preferred owners are followed by deterministic capacity-aware fallbacks.
-    // A full/offline preferred owner can therefore spill without changing the
-    // replica target or making free-space itself part of the placement weight.
+    // Fallbacks let a full or offline owner spill without changing the replica
+    // target or weighting placement by free space.
     std::vector<NodeInfo> fallback;
     for (const auto& node : nodes) {
         if (!chosen.contains(node.id))

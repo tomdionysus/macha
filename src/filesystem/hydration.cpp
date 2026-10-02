@@ -393,11 +393,8 @@ std::vector<HydrationHint> CatalogueSequenceHintProvider::hints() {
     if (!enabled_.load() || !priority_.load() || !lookahead_.load())
         return {};
 
-    // Do not touch or copy the catalogue when there is no active playback.
-    // The hydrator wakes frequently by design; previously this provider called
-    // CatalogueManager::snapshot() every interval even on an idle node, which
-    // repairs metadata and copies the complete catalogue merely to discover
-    // there is no current media to predict from.
+    // No playback, no catalogue snapshot: the hydrator wakes often and a
+    // snapshot copies the whole catalogue.
     auto active = playback_.active(std::chrono::milliseconds(timeout_ms_.load()));
     if (active.empty())
         return {};
@@ -614,9 +611,8 @@ std::optional<std::future<bool>> CacheHydrator::submit(HydrationRequest request)
             fetch_rejected_.fetch_add(1, std::memory_order_relaxed);
             return {};
         }
-        // The scheduler owns at most max_inflight outstanding futures and the
-        // executor owns exactly max_inflight workers. This assertion makes a
-        // future ownership regression fail locally instead of growing a queue.
+        // At most max_inflight futures and exactly max_inflight workers, so the
+        // queue can never exceed the worker count.
         if (fetch_queue_.size() >= fetch_workers_.size())
             throw std::runtime_error("hydration executor queue ownership bound exceeded");
         fetch_queue_.push_back(std::move(task));
@@ -811,18 +807,16 @@ void CacheHydrator::loop(std::stop_token stop) {
             return wake_revision_.load(std::memory_order_acquire) != observed_wake_revision;
         };
 
-        // A provider may have signalled while this pass was collecting hints or
-        // dispatching I/O. Do not swallow that edge by taking a fresh baseline
-        // immediately before sleeping; consume it with another scheduling pass.
+        // A wake signalled during this pass gets another pass, not swallowed by
+        // a fresh baseline before sleeping.
         if (wake_changed()) {
             observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
             continue;
         }
 
         if (!pending.empty()) {
-            // std::future has no portable completion notification. Poll only while
-            // real hydration I/O is outstanding; provider notifications still
-            // interrupt the wait immediately.
+            // std::future has no completion notification: poll while I/O is
+            // outstanding; provider wakes still interrupt the wait.
             cv_.wait_for(lock, stop, config_.interval, wake_changed);
             observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
             continue;

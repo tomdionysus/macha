@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The contract vocabulary (the object ledger spec, A1 and A3): work context,
-// wait declarations and their guard, cursor, budget, page. Primitives, each
-// tested over its whole phase space.
+// The contract vocabulary: work context, wait declarations and their guard,
+// cursor, budget, page. Each is tested over its whole phase space.
 #include "catalogue/catalogue.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/distributed_store.hpp"
@@ -356,7 +355,7 @@ MACHA_TEST("contract", test_the_wait_guard_on_snapshot_views) {
     fixture.config().replication = 1;
     fixture.config().metadata_min_write_replicas = 1;
     auto& service = fixture.start();
-    (void)service.catalogue().snapshot_view(); // warm it
+    (void)service.catalogue().snapshot_view();
 
     WaitGuard::set_mode(WaitGuard::Mode::throw_on_violation);
     const WorkContext control(FrameType::control, {}, nullptr, "test control");

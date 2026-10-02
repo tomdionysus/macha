@@ -8,13 +8,12 @@
 #include <cstdint>
 #include <string_view>
 
-// The vocabulary every contract uses to say who is asking and what an
-// operation may wait on (the object ledger spec, A1). Primitives: no I/O,
-// tested exhaustively.
+// Who is asking and what an operation may wait on (object ledger spec, A1).
+// Primitives: no I/O.
 namespace macha {
 
-// Who is asking, for how long, and whether they have given up. Every class,
-// control included; DataWorkContext is the DATA specialisation.
+// Who is asking, for how long, and whether they have given up. Covers every
+// class; DataWorkContext is the DATA specialisation.
 class WorkContext {
   public:
     using Clock = std::chrono::steady_clock;
@@ -63,19 +62,17 @@ constexpr bool includes(Waits declared, Waits wait) noexcept {
     return (static_cast<uint8_t>(declared) & static_cast<uint8_t>(wait)) != 0;
 }
 
-// Control work must never wait on the DATA device or the network (law 1):
-// the one combination the guard refuses. State-device waits are control's
-// own (metadata, the control store); a lock wait is refused only through
-// what it waits on, which the declaration names.
+// Control work must never wait on the DATA device or the network (law 1);
+// this is the only combination refused. State-device waits are control's own;
+// a lock wait is refused only through what its declaration names.
 constexpr bool may_enter(FrameType frame_type, Waits declared) noexcept {
     return frame_type != FrameType::control ||
            !(includes(declared, Waits::data_device) || includes(declared, Waits::network));
 }
 
-// The runtime boundary check. Each operation that declares a device or
-// network wait calls enter() with the caller's context. A refusal is counted
-// and logged once per (origin, operation) in production; tests switch the
-// guard to throw, so a control path reaching such an operation fails the test.
+// The runtime boundary check, called by each operation that declares a
+// device or network wait. A refusal is counted and logged once per (origin,
+// operation); tests switch the guard to throw.
 class WaitGuard {
   public:
     enum class Mode { record, throw_on_violation };
@@ -83,8 +80,8 @@ class WaitGuard {
     static Mode mode() noexcept;
     // Refusals since start.
     static uint64_t violations() noexcept;
-    // Returns whether the entry was allowed. Throws std::logic_error on a
-    // refusal in throw mode.
+    // Whether the entry was allowed; throws std::logic_error on a refusal in
+    // throw mode.
     static bool enter(const WorkContext&, Waits declared, std::string_view operation);
 };
 

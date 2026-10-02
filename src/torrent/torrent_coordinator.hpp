@@ -19,13 +19,10 @@ namespace macha {
 
 class NodeRuntime;
 
-// Torrents belong to the cluster (0.64.0). An add becomes a request in
-// metadata (torrent_request.hpp) that any node can list and act on; any
-// torrent-capable node may claim it and download it; the owner drives its
-// local download from the request and writes its progress back.
-//
-// One per node, in core, whether or not the plugin runs here: a node without
-// torrents still takes adds and actions, and simply never claims.
+// Torrents belong to the cluster: an add is a request in metadata
+// (torrent_request.hpp) any node can list and act on, and any torrent-capable
+// node may claim. The owner drives its download from the request and writes
+// progress back. One per node, plugin or not; a node without it never claims.
 class TorrentCoordinator {
   public:
     // A claim outlives a node's absence from membership for this long, so a

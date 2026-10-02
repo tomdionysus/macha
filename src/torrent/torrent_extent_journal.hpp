@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-// The record of which extents of a torrent's payload have already been
-// published to the store, kept beside the payload in the job's staging
-// directory. The torrent disk backend (plugin) appends to it the moment an
-// extent's whole range has verified and been stored; the ingest (core) reads
-// it when the download is finished and commits each file by naming its
-// extents instead of copying the file's bytes a second time.
-//
-// Stage 2 of TODO/archive/2026-09-23-torrent-disk-backend-plan.md. Nothing here is
-// trusted beyond what the commit itself proves: the DATA retention barrier on
-// the commit refuses a manifest naming objects the cluster does not hold, and
-// the ingest then falls back to copying.
+// Which extents of a torrent's payload are published, kept in the job's
+// staging directory. The disk backend appends as each extent is verified and
+// stored; the ingest reads it to commit files by naming extents, not copying.
+// Trusted no further than the commit proves: the retention barrier refuses a
+// manifest naming objects the cluster lacks, and the ingest then copies.
 
 #include "metadata/metadata.hpp"
 #include "types.hpp"
@@ -40,9 +34,8 @@ class TorrentExtentJournal {
 
     static std::filesystem::path path_for(const std::filesystem::path& save_path);
 
-    // Every file with at least one recorded extent, keyed by its path
-    // relative to the save path. A torn final line (a crash mid-append) is
-    // ignored; so is any line that does not parse.
+    // Every file with a recorded extent, by path relative to the save path.
+    // A torn final line or unparsable line is ignored.
     static std::map<std::string, File> load(const std::filesystem::path& save_path);
 
     // The manifest for a file of `size` bytes, if the recorded extents cover

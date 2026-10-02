@@ -14,11 +14,9 @@
 namespace macha {
 
 // The time the maintenance pass decides by: grace periods, quiet windows,
-// back-offs, credit accrual, repair's share and every wake-up deadline. It is
-// the pass's first injected dependency (the object ledger plan, T1), so a
-// test can step time instead of sleeping through it. Time that is only
-// measured -- how long a stage took, for a log line or an observation --
-// stays on the real steady clock.
+// back-offs, credit accrual, repair's share and every wake-up deadline.
+// Injected so tests can step time. Time only measured (stage durations for
+// logs or observations) stays on the real steady clock.
 //
 // Contract: now() is monotonic non-decreasing and wall_ns() moves with it;
 // both are safe from any thread. wait_until() returns once `ready()` holds,
@@ -50,12 +48,9 @@ class SystemMaintenanceClock final : public MaintenanceClock {
 };
 
 // Tests: time stands still until advance() moves it. It starts at the real
-// clocks' readings so that anything stamped with real time (a tombstone
-// retired by the filesystem, say) is comparable with it.
-//
-// A waiter notices an advance within one poll interval of real time: the
-// clock cannot notify a condition variable it was never told about, and
-// polling keeps the waiter's own predicate authoritative.
+// clocks' readings so real-time stamps (a filesystem-retired tombstone, say)
+// compare with it. Waiters poll, so they notice an advance within one poll
+// interval and their own predicate stays authoritative.
 class ManualMaintenanceClock final : public MaintenanceClock {
     std::atomic<Clock::rep> steady_;
     std::atomic<int64_t> wall_ns_;

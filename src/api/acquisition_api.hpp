@@ -10,18 +10,15 @@
 
 namespace macha {
 
-// HTTP surface for host-filesystem ingest and acquisition producers.  This
-// deliberately exposes Macha-owned typed state only; torrent provider HTML,
-// download links and credentials never cross the API boundary.
+// HTTP surface for host-filesystem ingest and acquisition producers. Exposes
+// Macha-owned typed state only; torrent provider HTML, download links and
+// credentials never cross the API boundary.
 //
-// The download engine is reached through the registry rather than held
-// directly: it is provided by the libmacha-torrent plugin, may be absent on
-// this node, and is replaced in place if it faults and restarts.
-//
-// Job lists and lookups answer from `jobs` -- this node's live state plus what
-// it last heard from each peer -- and never survey peers while the client
-// waits (0.64.0). Every route works on every node, with or without the
-// torrent plugin.
+// The download engine is reached through the registry: the libmacha-torrent
+// plugin provides it, may be absent here, and is replaced in place on restart.
+// Job lists and lookups answer from `jobs` (live local state plus each peer's
+// last report) and never survey peers while the client waits. Every route
+// works on every node, with or without the torrent plugin.
 class AcquisitionApi {
     IngestManager& ingest_;
     SubsystemRegistry& subsystems_;

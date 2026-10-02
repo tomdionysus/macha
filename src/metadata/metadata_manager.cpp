@@ -59,11 +59,8 @@ MetadataManager::MetadataManager(NodeRuntime& node, DistributedStore* namespace_
       publication_retention_(std::move(publication_retention)) {
     if (!namespace_store_)
         return;
-    // Replay writes nodes locally and replicates nothing: a history entry
-    // being materialised is a commit that already reached the floor when it
-    // was made, and re-establishing that here would make rebuilding a local
-    // head depend on peers being up. That is the shape of outage this codebase
-    // has already had once.
+    // Replay writes nodes locally and replicates nothing: the commit reached
+    // the floor when made, and rebuilding a local head must not depend on peers.
     node_.metadata_replica().set_namespace_delta_applier(
         [this](const ObjectId& root, const MetadataDelta& delta) {
             auto nodes = ControlNamespaceNodeStore::for_replay(node_, *namespace_store_);
@@ -98,8 +95,8 @@ MetadataClusterStatus MetadataManager::cluster_status() const noexcept {
 
 void MetadataManager::publish_replica_state(bool validated, std::string_view reason) {
     // Every known node is metadata-capable. The write policy is a durability
-    // floor, not a fixed voter set: any metadata_min_write_replicas currently
-    // reachable replicas may accept a mutation.
+    // floor, not a voter set: any metadata_min_write_replicas reachable replicas
+    // may accept a mutation.
     auto view = available_snapshot_view();
     const auto membership = node_.membership().snapshot();
     const size_t required = node_.config().metadata_min_write_replicas;
@@ -120,10 +117,9 @@ void MetadataManager::publish_replica_state(bool validated, std::string_view rea
 
     MetadataAvailability next = MetadataAvailability::unavailable;
     if (view) {
-        // Replica-set validation describes convergence/stability, not write
-        // authority.  A locally committed branch plus the configured number of
-        // reachable metadata replicas is enough to attempt a mutation; any
-        // divergent peer is reconciled by the mutation/read path itself.
+        // Validation describes convergence, not write authority: a local committed
+        // branch plus the floor of reachable replicas suffices to attempt a
+        // mutation; divergent peers are reconciled by the mutation/read path.
         next = !local_policy_mismatch && online >= required ? MetadataAvailability::writable
                                                             : MetadataAvailability::read_only;
     }
@@ -228,25 +224,21 @@ void MetadataManager::require_metadata_policy_match(const std::vector<NodeInfo>&
 
 MetadataRecord MetadataManager::cache_record(
     const MetadataRecord& record, std::shared_ptr<const MetadataSnapshot> decoded) {
-    // Durable management tombstones are operational constraints as soon as a
-    // committed metadata generation is decoded, not merely data for the UI.
+    // Durable management tombstones are operational constraints once decoded.
     for (const auto& [_, reset] : decoded->identity_resets)
         node_.apply_identity_reset(reset);
 
     std::lock_guard lock(cache_mutex_);
-    // Concurrent replica/local reads can complete out of order. Never let an
-    // older completion move the process cache backwards after a newer immutable
-    // record has already been observed.
+    // Reads can complete out of order; never move the cache back to an older
+    // record.
     if (cache_ && newer_than(*cache_, record))
         return *cache_;
     cache_ = record;
     cache_until_ = Clock::now() + node_.config().metadata_cache;
     cache_remote_epoch_ = node_.remote_metadata_epoch();
     if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
-        // The witness FUSE and the catalogue wake up on. It compares roots for
-        // a tree-backed namespace: comparing the entry maps would compare two
-        // empty maps and report "unchanged" for every change there will ever
-        // be, which is a mount that stops seeing remote writes for good.
+        // The change witness FUSE and the catalogue wake on. Tree-backed namespaces
+        // compare roots: their entry maps are always empty.
         const bool namespace_changed =
             !decoded_cache_ || namespace_differs(*decoded_cache_, *decoded);
         decoded_cache_ = std::move(decoded);
@@ -272,9 +264,8 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
             return record;
     }
 
-    // Decode only when the canonical record actually changes. Metadata reads can
-    // refresh their short metadata cache frequently; rebuilding tens of thousands
-    // of FsEntry/extent objects on every getattr was the dominant namespace cost.
+    // Decode only when the canonical record changes: rebuilding every
+    // FsEntry/extent per cache refresh dominates namespace cost.
     if (auto materialized = node_.metadata_replica().materialized(record.hash);
         materialized && materialized->record.generation == record.generation &&
         materialized->record.payload == record.payload)
@@ -301,8 +292,8 @@ void require_coherent_namespace(const MetadataSnapshot& snapshot) {
 }
 
 namespace {
-// The view is where the rest of the system gets a namespace, so it is where
-// the invariant above is enforced. See require_coherent_namespace.
+// The view is where the system gets a namespace, so the invariant is
+// enforced here.
 MetadataSnapshotView coherent(MetadataSnapshotView view) {
     if (view.snapshot)
         require_coherent_namespace(*view.snapshot);
@@ -312,10 +303,9 @@ MetadataSnapshotView coherent(MetadataSnapshotView view) {
 
 std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     std::lock_guard lock(cache_mutex_);
-    // The decoded snapshot is reusable indefinitely for a specific immutable
-    // metadata record, but it is not evidence that the record is still current.
-    // Honour the same short TTL as cached_record() so missed generation notices
-    // eventually force a replica validation instead of making metadata stale forever.
+    // The decoded snapshot is valid for its record but not proof the record is
+    // current: honour cached_record()'s TTL so missed generation notices
+    // eventually force replica validation.
     if (!cache_ || !decoded_cache_ || Clock::now() >= cache_until_ ||
         cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
@@ -332,14 +322,11 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
                                                FrameType frame_type) {
     auto& local = node_.metadata_replica();
     if (local.history_contains(target)) {
-        // A prior peer may have supplied a full checkpoint while lacking an
-        // older part of its authenticated ancestry. Looking only at the head's
-        // direct parent misses a hole below an otherwise continuous suffix and
-        // can make a real ancestor appear rootless. Heal only while the accepted
-        // heads actually lack a common ancestor, and stop as soon as that proof
-        // becomes possible. Traversal uses the resident link index: reading the
-        // multi-megabyte checkpoint payload for every historical record caused
-        // severe CPU/RSS amplification during the original recovery.
+        // A peer's full checkpoint may lack an older part of its ancestry, so a
+        // hole below a continuous suffix can make a real ancestor look rootless.
+        // Heal only while the accepted heads lack a common ancestor, and stop once
+        // it is provable. Traverses the resident link index, not checkpoint
+        // payloads (multi-megabyte each).
         auto remains_rootless = [&] {
             const auto certificates = local.accepted_head_certificates();
             for (size_t left = 0; left < certificates.size(); ++left) {
@@ -424,12 +411,10 @@ bool MetadataManager::import_history_from_peer(const NodeInfo& owner, const Hash
             }
 
             std::vector<std::pair<Hash256, bool>> dependencies;
-            // A full checkpoint is independently materializable. Its previous
-            // and merge-parent links are useful ancestry, not transfer
-            // prerequisites; recursively pulling them copied gigabytes of
-            // unrelated retained history for every newly observed head. A
-            // delta alone requires its primary predecessor, so follow exactly
-            // that chain until the nearest full checkpoint.
+            // A full checkpoint is self-contained; its previous/merge-parent links are
+            // ancestry, not transfer prerequisites, and following them would copy
+            // unrelated retained history. A delta needs its primary predecessor, so
+            // follow that chain to the nearest full checkpoint.
             for (const auto& dependency :
                  metadata_history_materialization_dependencies(task.entry))
                 dependencies.emplace_back(dependency, true);
@@ -578,12 +563,8 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
             task.expanded = true;
 
             std::vector<std::pair<Hash256, bool>> dependencies;
-            // Mirror the pull-side rule: only a delta's primary predecessor is
-            // required to materialize it. Full checkpoints are self-contained;
-            // their previous and merge-parent links preserve ancestry but are
-            // not transfer prerequisites. Walking those optional links here
-            // caused peers which already shared the current head to exchange
-            // their entire retained history during convergence.
+            // As on the pull side: only a delta's primary predecessor is required;
+            // following optional links would exchange entire retained histories.
             for (const auto& dependency :
                  metadata_history_materialization_dependencies(*entry))
                 dependencies.emplace_back(dependency, true);
@@ -612,9 +593,8 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
         stack.pop_back();
     }
 
-    // Requests on one peer retain FIFO execution order at the receiver. Keep a
-    // small window in flight so network latency and durable history appends can
-    // overlap without allowing an unbounded recovery chain into RPC memory.
+    // Requests to one peer execute FIFO at the receiver. A small in-flight
+    // window overlaps latency and appends while bounding RPC memory.
     constexpr size_t transfer_window = 8;
     struct PendingTransfer {
         bool required{};
@@ -691,12 +671,9 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
         if (node_.metadata_replica().store_commit(record, compact.payload))
             return true;
 
-        // The immutable full record is already present in the publication
-        // proposal. A compact body can be rejected because its parent is absent
-        // or because an exact caller supplied a non-reconstructing delta; neither
-        // condition should make the local path weaker than a remote replica,
-        // which already retries the full body below. This is a single bounded
-        // fallback, not a retry loop.
+        // The full record is in the proposal. A compact body can be rejected for a
+        // missing parent or a non-reconstructing exact delta; fall back to the full
+        // body once, as remote replicas do.
         Log::warn("local metadata delta rejected; retrying full record generation=" +
                   std::to_string(record.generation));
         return node_.metadata_replica().store_commit(record);
@@ -708,11 +685,9 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
         if (bool_reply(reply))
             return true;
 
-        // A compact delta may arrive at a perfectly valid replica which simply
-        // has not imported its parent yet. Supply that immutable dependency and
-        // retry the compact body before considering a full fallback. Otherwise
-        // ordinary replica lag turns every reconciliation into another complete
-        // namespace snapshot on the lagging node.
+        // A valid replica may not yet have the delta's parent. Supply it and retry
+        // the compact body before a full fallback, so replica lag does not turn
+        // every reconciliation into a full snapshot.
         if (compact.body == MetadataHistoryEntry::Body::delta) {
             if (push_history_to_peer(owner, compact.previous, frame_type)) {
                 encoded = encode_metadata_history_entry(compact);
@@ -734,9 +709,8 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
 bool MetadataManager::accept_commit_on(const NodeInfo& owner,
                                        const MetadataAcceptance& acceptance,
                                        FrameType frame_type) {
-    // NodeRuntime owns accepted-head change detection and notification for the
-    // local path. Do not add a second publication-level announcement after
-    // this returns: repeated evidence is intentionally a no-op there.
+    // NodeRuntime detects and notifies accepted-head changes for the local
+    // path; do not announce again after this returns.
     if (owner.id == node_.node_id())
         return node_.accept_metadata_commit(acceptance);
     try {
@@ -763,9 +737,8 @@ size_t MetadataManager::acceptance_floor_for(const MetadataRecord& record) const
     if (!required)
         throw std::runtime_error("protocol-20 metadata commit has no write-floor policy");
 
-    // Policy transitions are certified at the strongest policy visible on any
-    // parent edge. This matters for lowering the floor and for merge commits
-    // which reconcile a policy-transition branch with an older sibling.
+    // Policy transitions are certified at the strongest policy on any parent
+    // edge: this covers lowering the floor and merges with an older sibling.
     for (const auto& parent_hash : metadata_record_parents(record)) {
         auto parent = node_.metadata_replica().materialized(parent_hash);
         if (!parent)
@@ -791,11 +764,10 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
         return node_.peer_latency(peer);
     });
 
-    // Store the immutable commit independently on the nearest available
-    // registered replicas until the configured durability floor is reached. A
-    // receiver never compares it with its current head; it validates the commit
-    // and durably appends it to the DAG. The caller's local replica is required
-    // to participate so the operation can immediately continue from the commit.
+    // Store the commit on the nearest registered replicas until the floor is
+    // reached. Receivers validate and append to the DAG without comparing to
+    // their head. The local replica must participate so the caller can
+    // continue from the commit.
     const bool trace = Log::enabled(LogLevel::debug);
     for (const auto& owner : ordered) {
         const auto started = Clock::now();
@@ -830,11 +802,9 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
         std::unique(out.acceptance.replicas.begin(), out.acceptance.replicas.end()),
         out.acceptance.replicas.end());
 
-    // Acceptance is evidence about the already-completed immutable stores, not
-    // a second consensus decision. Before installing the certificate, make the
-    // commit's parent policy/history available on each holder. This is required
-    // to validate a lowering transition and means every certificate holder can
-    // later reconstruct the branch rather than possessing an opaque head only.
+    // Acceptance is evidence about completed stores, not a second consensus.
+    // Each holder first receives the commit's parent policy/history, needed to
+    // validate a lowering transition and to reconstruct the branch later.
     const auto parents = metadata_record_parents(record);
     size_t accepted = 0;
     bool local_accepted = false;
@@ -906,9 +876,8 @@ bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
         return node_.accept_metadata_commit(acceptance);
     }
     if (!push_history_to_peer(owner, record.hash, frame_type)) {
-        // The local history may have been compactly rooted at this accepted
-        // record. A full immutable commit is sufficient for an arbitrary fresh
-        // replica even when earlier ancestry is not locally materialised.
+        // Local history may be compactly rooted at this record; a full commit
+        // suffices for any replica without earlier ancestry.
         if (!store_commit_on(owner, commit_history_entry(record), record, frame_type))
             return false;
     }
@@ -999,11 +968,8 @@ bool MetadataManager::commit_history_floor_on(const NodeInfo& owner, const Hash2
 
 void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
                                                  uint64_t byte_threshold) {
-    // The round reads and depends on accepted-head/committed state exactly
-    // like read_group()/repair_once() do, and repair_once() already holds
-    // mutation_mutex_ across its own full network round trip. Match that
-    // shape: serialise against a concurrent foreground mutation for the
-    // whole round rather than just the final local compaction step.
+    // Serialise the whole round against foreground mutations: it depends on
+    // accepted-head state as read_group()/repair_once() do.
     std::unique_lock mutation_lock(mutation_mutex_);
 
     const auto diagnostics = node_.metadata_replica().diagnostics();
@@ -1013,10 +979,8 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
     if (node_.metadata_replica().recovery_required())
         return;
 
-    // Gate: only ever attempt this with exactly one local accepted head, and
-    // only once every durably-known participant is currently, directly
-    // reachable -- mirrors the one other irreversible, cluster-wide-consensus
-    // decision this codebase already makes this way (destructive object GC).
+    // Only with exactly one local accepted head and every known participant
+    // directly reachable, as for destructive object GC.
     auto local_heads = node_.metadata_replica().accepted_heads();
     if (local_heads.size() != 1)
         return;
@@ -1030,17 +994,15 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
     std::sort(participants.begin(), participants.end(),
               [](const NodeInfo& a, const NodeInfo& b) { return a.id < b.id; });
 
-    // epoch fingerprints exactly this participant set. A membership change
-    // mid-round changes the epoch on the next attempt, which invalidates any
-    // in-flight proposal automatically -- no separate membership-version
-    // bookkeeping needed.
+    // The epoch fingerprints this participant set, so a membership change
+    // invalidates any in-flight proposal.
     Writer epoch_writer;
     for (const auto& participant : participants)
         epoch_writer.fixed(participant.id.bytes);
     const auto epoch = sha256(epoch_writer.take());
 
-    // Survey: require every participant to answer, and every participant to
-    // report exactly one accepted head, identical to this node's own.
+    // Every participant must answer with exactly one accepted head, this
+    // node's own.
     auto surveyed = discover_accepted_heads_required(participants, FrameType::control);
     if (!surveyed)
         return;
@@ -1074,35 +1036,29 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
         proposal.participants.push_back(participant.id);
     proposal.status = HistoryCheckpointProof::Status::acked;
 
-    // Propose + durable ack: every participant must ack before anyone
-    // commits. Abort outright on the first failure; the next maintenance
-    // cycle re-proposes the identical (floor_hash, epoch), which is cheap to
-    // re-ack since the content is unchanged.
+    // Every participant must durably ack before anyone commits. Abort on the
+    // first failure; the next cycle re-proposes the identical (floor_hash,
+    // epoch).
     for (const auto& owner : participants) {
         if (!propose_history_floor_on(owner, proposal, FrameType::control))
             return;
     }
 
-    // Commit locally first. If even the local commit is refused (a stale
-    // proposal already superseded it), do not broadcast a commit no one
-    // durably acked.
+    // Commit locally first; if refused (a superseding proposal), broadcast
+    // nothing.
     if (!node_.metadata_replica().record_checkpoint_commit(*floor_hash, epoch))
         return;
 
     for (const auto& owner : participants) {
         if (owner.id == node_.node_id())
             continue;
-        // Best-effort from here: a participant that misses this broadcast
-        // simply remains at `acked` and adopts the commit on the next
-        // maintenance cycle, via an identical re-proposal -- see the class
-        // comment on HistoryCheckpointProof.
+        // Best-effort: a participant that misses this stays `acked` and adopts the
+        // commit via the next cycle's identical re-proposal.
         (void)commit_history_floor_on(owner, *floor_hash, epoch, FrameType::control);
     }
 
-    // Only ever compact once *this* replica's own proof is committed.
-    // compact_history_if_safe() re-validates its own preconditions
-    // independently -- this protocol is an added prerequisite gate, not a
-    // replacement for them.
+    // Compact only once this replica's proof is committed;
+    // compact_history_if_safe() re-validates its own preconditions.
     if (node_.metadata_replica().compact_history_if_safe(record_threshold, byte_threshold))
         Log::info("metadata history checkpoint committed and compacted floor_generation=" +
                   std::to_string(floor_generation) + " floor_hash=" + to_string(*floor_hash) +
@@ -1132,14 +1088,11 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     if (observed.empty())
         throw MetadataNotReady("no accepted metadata heads available");
 
-    // Import every accepted head independently. A receiver is not asked to
-    // replace its current head; it merely stores the immutable DAG material and
-    // the acceptance certificate. This is the central 0.19 semantic boundary.
+    // Import each accepted head independently: the receiver stores the DAG
+    // material and certificate, and is never asked to replace its head.
     for (const auto& [hash, head] : observed) {
-        // See unacceptable_head_retry_at_'s declaration: a hash this replica
-        // recently confirmed it cannot accept is skipped outright -- no
-        // repeated import RPCs, no repeated rejection -- rather than
-        // re-attempted on every single read_group() call.
+        // Skip hashes recently confirmed unacceptable (see
+        // unacceptable_head_retry_at_).
         {
             std::lock_guard lock(unacceptable_head_mutex_);
             auto found = unacceptable_head_retry_at_.find(hash);
@@ -1184,10 +1137,9 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                 std::lock_guard lock(unacceptable_head_mutex_);
                 unacceptable_head_retry_at_.erase(hash);
             }
-            // Installing this certificate may have exposed a second head whose
-            // common ancestry crosses a compacted boundary. Revisit the now-
-            // local head so the lightweight, rootless-only healer can request
-            // just the missing proof records in this same convergence event.
+            // This certificate may expose a second head whose common ancestry crosses
+            // a compacted boundary; revisit it so the rootless healer fetches the
+            // missing proof records now.
             for (const auto& owner : history_sources) {
                 if (owner.id != node_.node_id())
                     (void)import_history_from_peer(owner, hash, frame_type);
@@ -1196,11 +1148,9 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     }
 
     const size_t need = node_.config().metadata_min_write_replicas;
-    // Only the merge-and-publish branch below needs serializing: concurrent
-    // foreground reads that all observe a divergence must not each mint their
-    // own reconciliation commit for it. Acquired lazily on first observing
-    // more than one head, and re-checked immediately after acquiring it, since
-    // another caller may have already reconciled while this one waited.
+    // Serialises only merge-and-publish, so concurrent readers seeing one
+    // divergence do not each mint a reconciliation commit. Taken lazily on
+    // seeing more than one head; heads are re-read once held.
     std::optional<std::unique_lock<std::mutex>> reconciliation_lock;
     for (;;) {
         auto heads = node_.metadata_replica().accepted_heads();
@@ -1221,10 +1171,9 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             if (materialized->snapshot->extent_size &&
                 materialized->snapshot->extent_size != node_.config().extent_size)
                 throw std::runtime_error("cluster extent size does not match local configuration");
-            // A whole-cluster configuration change may legitimately leave the
-            // accepted branch carrying the previous write floor. Return the
-            // accepted head here; maybe_reconfigure() performs the explicit
-            // transition commit at max(old_floor, new_floor) before any write.
+            // A cluster-wide configuration change may leave the accepted branch on
+            // the old write floor; maybe_reconfigure() commits the transition at
+            // max(old_floor, new_floor) before any write.
             return cache_record(selected, materialized->snapshot);
         }
 
@@ -1237,12 +1186,9 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             throw MetadataNotReady(
                 "divergent metadata heads await reconciliation; write durability floor unavailable");
 
-        // Deterministically fold the maximal accepted-head set two branches at a
-        // time. Each merge commit explicitly names both parents and applies
-        // three-way conflict-presence semantics so explicit resolutions survive.
-        // Three or more partitions therefore
-        // converge as a sequence of immutable two-parent merges rather than by
-        // inventing a winner or blocking on an N-way special case.
+        // Fold the maximal head set deterministically, two branches at a time.
+        // Each merge names both parents and applies three-way conflict-presence
+        // semantics so explicit resolutions survive.
         auto left = heads[0];
         auto right = heads[1];
         const auto common =
@@ -1256,13 +1202,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         auto right_materialized = node_.metadata_replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
             throw MetadataNotReady("metadata merge head cannot be materialized");
-        // Reconciliation is the one path that still wants whole namespaces:
-        // the three-way merge is path-wise, so a tree-backed branch is
-        // materialised for it and the result is re-rooted afterwards. A merge
-        // therefore costs what it costs today -- it is the operation this work
-        // has not yet made cheaper -- but it is correct, which an empty map
-        // would not be: it would merge to an empty namespace and call that
-        // agreement.
+        // The three-way merge is path-wise, so tree-backed branches are
+        // materialised for it and the result re-rooted afterwards.
         auto namespace_nodes =
             namespace_store_ ? std::optional<ControlNamespaceNodeStore>(
                                    ControlNamespaceNodeStore::for_reading(node_, *namespace_store_))
@@ -1283,23 +1224,19 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
 
-        // Use the lower hash as the primary parent so every reconciler which
-        // observes the same maximal head pair produces the same immutable merge
-        // commit. Reconciliation is a pure join of already-authored histories,
-        // not a new user mutation: the merged vector clock already causally
-        // covers both parents and every live object in the result was retained
-        // by one of those authored parent mutations. Adding a fresh local
-        // origin/sequence here makes simultaneous reconcilers manufacture
-        // equivalent sibling merges forever (A+B -> M1/M2 -> M3/M4 ...).
+        // The lower hash is the primary parent so every reconciler of the same
+        // head pair produces the same merge commit. A merge is a pure join, not a
+        // user mutation: the merged clock covers both parents. A fresh local
+        // origin/sequence here would make simultaneous reconcilers mint sibling
+        // merges forever.
         if (right.hash < left.hash) {
             std::swap(left, right);
         }
         merged.snapshot.metadata_voters.clear();
         merged.snapshot.merge_parents = {right.hash};
 
-        // Back into a tree if the branches were trees, which also means the
-        // merge result is written and replicated as tree nodes before the
-        // record naming its root is published.
+        // Back into a tree if the branches were trees; its nodes are written and
+        // replicated before the record naming the root is published.
         if (tree_backed) {
             if (!namespace_store_)
                 throw MetadataNotReady("no namespace node store is configured");
@@ -1322,11 +1259,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             left_materialized->record.hash == reconciliation.previous
                 ? left_materialized->snapshot.get()
                 : right_materialized->snapshot.get();
-        // metadata_delta diffs two entry maps. The merged snapshot is a tree
-        // again by now, so there is nothing to diff against and the merge is
-        // published as a full record -- which is what it was before 0.28.2
-        // anyway. A tree-native merge would carry its own change set and make
-        // this a delta again.
+        // metadata_delta diffs entry maps; a tree-backed merge has none, so it is
+        // published as a full record.
         if (auto delta = tree_backed ? std::nullopt
                                      : metadata_delta(*primary_snapshot, merged.snapshot)) {
             auto encoded = encode_metadata_delta(*delta);
@@ -1348,9 +1282,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                   " superseded=" + std::to_string(merged.conflicts_superseded) +
                   " standing=" + std::to_string(merged.snapshot.conflicts.size()) +
                   " remaining_heads=" + std::to_string(heads.size() - 1));
-        // accept_commit() removes accepted ancestors from the local head set. The
-        // loop therefore naturally folds any remaining divergent heads into the
-        // newly accepted reconciliation commit.
+        // accept_commit() drops accepted ancestors from the head set, so the loop
+        // folds any remaining heads into this commit.
     }
 }
 
@@ -1370,20 +1303,17 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     const bool data_policy_change = snapshot.data_replication != node_.config().replication;
 
     const auto active = node_.membership().active();
-    // Before a durable protocol-20 policy exists, every active peer must agree
-    // on the configured write floor. Filtering mismatched peers first can let
-    // two incompatible cohorts independently establish authority from the same
-    // legacy/genesis state. Established protocol-20 clusters continue to ignore
-    // mismatched peers while the persisted floor remains satisfiable.
+    // Until a durable protocol-20 policy exists, every active peer must agree
+    // on the write floor, or two incompatible cohorts could each establish
+    // authority from the same genesis. Once established, mismatched peers
+    // are ignored while the floor remains satisfiable.
     if (!snapshot.metadata_write_replicas_required)
         require_metadata_policy_match(active);
     const auto compatible = compatible_replicas(active);
 
-    // `metadata_participants` was introduced during the protocol-20 bring-up as
-    // a migration roster. It is not authority: every authenticated, policy-
-    // compatible node is metadata-capable. Preserve/reconstruct the roster only
-    // long enough to establish the one-time legacy retention baseline, then
-    // clear it permanently.
+    // `metadata_participants` is a migration roster, not authority. Kept only
+    // until the one-time legacy retention baseline is established, then
+    // cleared.
     auto participants = snapshot.metadata_participants;
     bool migration_roster_change = false;
     if (!snapshot.retention_baseline_complete && participants.empty()) {
@@ -1408,8 +1338,8 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
         !migration_roster_change && !clear_migration_roster)
         return initial;
 
-    // Policy transitions are ordinary immutable commits certified at the
-    // stronger of old/new floors. No node-seat roster participates.
+    // Policy transitions are commits certified at the stronger of the old and
+    // new floors.
     const size_t transition_floor = std::max(configured, persisted);
     if (compatible.size() < transition_floor)
         return initial;
@@ -1493,10 +1423,8 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // This survey has one job in 0.19: a configured joiner may form a virgin
-    // namespace only after every currently-active bootstrap peer has positively
-    // demonstrated that no durable post-genesis history exists. It does not
-    // elect/replace authorities.
+    // A joiner may form a virgin namespace only once every active bootstrap
+    // peer has shown no durable post-genesis history exists.
     survey.complete = failed == 0;
     survey.durable_history = durable_history;
     return survey;
@@ -1526,9 +1454,8 @@ MetadataRecord MetadataManager::discover_or_form() {
     for (const auto& peer : active)
         ids.push_back(peer.id);
 
-    // First discover accepted heads. Unlike the old protocol there is no
-    // genesis-election race: if any post-genesis accepted commit exists, import
-    // it (and any siblings) through the ordinary branch path.
+    // Import any post-genesis accepted commit (and siblings) through the
+    // ordinary branch path.
     bool any_post_genesis = false;
     for (const auto& [_, acceptance] : discover_accepted_heads(active, FrameType::control)) {
         if (acceptance.generation > 1) {
@@ -1557,19 +1484,16 @@ MetadataRecord MetadataManager::discover_or_form() {
     root->second.gid = node_.config().filesystem.root_gid;
     root->second.mode = node_.config().filesystem.root_mode;
 
-    // Virgin founders must construct byte-identical generation 2 without a
-    // coordinator. Root timestamps therefore use a deterministic non-zero
-    // protocol sentinel; subsequent filesystem timestamps are ordinary wall
-    // time. This removes startup leadership from the metadata model entirely.
+    // Virgin founders build byte-identical generation 2 without a
+    // coordinator, so root timestamps use a fixed non-zero sentinel.
     root->second.ctime_ns = root->second.mtime_ns = 1;
     snapshot.metadata_voters.clear();
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     snapshot.extent_size = node_.config().extent_size;
     snapshot.metadata_write_replicas_required = static_cast<uint32_t>(need);
     snapshot.metadata_participants.clear();
-    // Genesis itself is the first accepted branch point; there is no older
-    // protocol-20 causal horizon yet. Background convergence advances this to
-    // generation 2 once every founding participant has durably accepted it.
+    // Genesis is the first branch point; background convergence advances the
+    // horizon to generation 2 once every founder has durably accepted it.
     snapshot.metadata_branch_floor = {};
     snapshot.retention_baseline_complete = true; // virgin namespace has no inherited objects
 
@@ -1610,9 +1534,8 @@ MetadataRecord MetadataManager::read_record() {
     try {
         return cache_record(read_record_uncached());
     } catch (const std::exception& error) {
-        // Reads may continue from the last durably persisted local snapshot
-        // while the metadata write floor is unavailable. Mutations never use
-        // this fallback as proof of publication durability.
+        // Reads may use the last persisted local snapshot while the write floor is
+        // unavailable; mutations never treat it as durable.
         auto local = node_.metadata_replica().committed();
         const auto heads = node_.metadata_replica().accepted_heads();
         if (!node_.metadata_replica().recovery_required() && heads.size() == 1 &&
@@ -1637,14 +1560,9 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
     if (auto cached = cached_snapshot_view())
         return *cached;
 
-    // A successful read installed a fully decoded, immutable snapshot.  A
-    // concurrent metadata notice can advance remote_metadata_generation()
-    // between that read and the second cached_snapshot_view() above, making the
-    // freshly installed generation look stale immediately.  That is not an I/O
-    // error: this filesystem operation may safely finish against the coherent
-    // generation it just obtained.  Return the installed snapshot even when a
-    // newer generation is already known; the next operation will refresh via
-    // the normal fast-path staleness check.
+    // A concurrent notice can make the just-installed generation look stale.
+    // That is not an error: return the coherent snapshot just obtained; the
+    // next operation refreshes.
     {
         std::lock_guard lock(cache_mutex_);
         if (decoded_cache_ &&
@@ -1656,18 +1574,15 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
         }
     }
 
-    // If another reader displaced the decoded cache in an unusual interleave,
-    // the record returned by read_record() is still self-contained and valid.
-    // Decode that exact generation rather than turning cache churn into FUSE
-    // EIO.  This path is exceptional; normal operations reuse decoded_cache_.
+    // Another reader may have displaced the decoded cache; decode the returned
+    // record rather than fail with EIO.
     auto decoded = std::make_shared<MetadataSnapshot>(decode_snapshot(record.payload));
     return coherent(MetadataSnapshotView{record.generation, 0, record.hash, std::move(decoded)});
 }
 
 std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() const {
-    // This is deliberately a no-I/O view.  Consumers such as FUSE use it to
-    // adopt a newer snapshot which MetadataManager has already obtained and
-    // decoded, but never to turn an OS metadata lookup into metadata traffic.
+    // No I/O: adopts a snapshot already obtained and decoded, never turns an OS
+    // lookup into metadata traffic.
     std::lock_guard lock(cache_mutex_);
     if (!decoded_cache_)
         return {};
@@ -1687,11 +1602,9 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
     if (heads.size() != 1)
         return {};
 
-    // Claim release is local and causal, not a global-stability decision. The
-    // sole accepted head's complete live set determines which local claims are
-    // still needed, while its mutation clock can remove only claim dots that
-    // this branch actually observed. Concurrent/unseen branch claims therefore
-    // survive without requiring every participant to be online.
+    // Claim release is local and causal: the sole accepted head's live set
+    // decides which claims are needed, and its clock removes only dots this
+    // branch observed, so unseen branch claims survive.
     auto current = available_snapshot_view();
     if (current && current->hash == heads.front().hash)
         return current;
@@ -1699,9 +1612,8 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
         auto materialized = node_.metadata_replica().materialized(heads.front().hash);
         if (!materialized)
             return {};
-        // The catch below turns a refusal here into "no view", which stops
-        // retention release rather than running it against an empty live set.
-        // Fail-closed is the correct direction for the one reader that deletes.
+        // A refusal becomes "no view" below, which stops retention release
+        // rather than running it against an empty live set.
         return coherent(MetadataSnapshotView{heads.front().generation, 0, heads.front().hash,
                                                  materialized->snapshot});
     } catch (...) {
@@ -1737,10 +1649,8 @@ MetadataRecord MetadataManager::mutate_impl(
         } else if (local_heads.size() > 1 ||
                    node_.remote_metadata_generation() >
                        node_.metadata_replica().committed_generation()) {
-            // Reconciliation is useful when already known, but it is not a
-            // prerequisite for accepting another branch mutation. If the survey
-            // cannot complete, fall back to the locally materialised accepted
-            // head and preserve availability.
+            // Reconciliation is not a prerequisite for a mutation: if the survey
+            // cannot complete, use the local accepted head.
             try {
                 std::vector<NodeId> ids;
                 ids.reserve(all_active.size());
@@ -1770,8 +1680,7 @@ MetadataRecord MetadataManager::mutate_impl(
             auto clock = snapshot.mutation_sequences.find(identity->origin);
             if (clock != snapshot.mutation_sequences.end() &&
                 clock->second >= identity->sequence) {
-                // Already accepted (by this process before a crash, or by a
-                // peer that merged it): the caller's work is done.
+                // Already accepted (before a crash, or merged by a peer).
                 ensure_accepted_head_durable(active, current, need, FrameType::read_ahead);
                 cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
                 return current;
@@ -1819,11 +1728,9 @@ MetadataRecord MetadataManager::mutate_impl(
                 supplied_delta.mutation_sequences[identity->origin] = identity->sequence;
         }
 
-        // Discipline 4. Keep the tombstone vector in canonical order so the
-        // next reconciliation's union is a delta, not a 5-8 MB full frame
-        // (DLT7 sorts after applying the edits, so the replay matches), and
-        // drop conflicts this mutation has just decided by rewriting their
-        // subject.
+        // Discipline 4. Keep tombstones in canonical order so the next
+        // reconciliation's union is a delta (DLT7 sorts after applying edits), and
+        // drop conflicts this mutation decided by rewriting their subject.
         const bool resorted = !garbage_is_canonical(snapshot.garbage);
         if (resorted)
             canonicalise_garbage(snapshot.garbage);
@@ -1838,22 +1745,15 @@ MetadataRecord MetadataManager::mutate_impl(
                 supplied_delta.replace_conflicts = snapshot.conflicts;
         }
 
-        // A tree-backed namespace commits by updating the tree with the change
-        // set this mutation already carries, rather than by re-serialising the
-        // library. Unreachable today: nothing produces a snapshot with a root.
+        // A tree-backed namespace commits by applying this mutation's change set
+        // to the tree.
         if (snapshot.namespace_root) {
-            // Without an exact delta there is no change set, and rediscovering
-            // one means materialising both namespaces and diffing them --
-            // precisely the cost this replaces. A caller that cannot describe
-            // its own edit cannot mutate a tree-backed namespace.
+            // Without an exact delta there is no change set, and diffing both
+            // namespaces is the cost the tree avoids.
             if (!exact_delta)
                 throw MetadataNotReady("a tree-backed namespace requires an exact delta");
-            // A callback that wrote into the map has made a change the delta
-            // does not describe, and applying the delta alone would silently
-            // drop it. Refuse rather than guess which of the two is the
-            // mutation. This is the contract each mutation callback is
-            // converted to, one at a time, and the loud failure is how the
-            // conversion is driven.
+            // A map write is a change the delta does not describe and would be
+            // silently dropped; refuse it.
             if (!snapshot.entries.empty())
                 throw std::runtime_error(
                     "metadata mutation wrote the namespace map on a tree-backed snapshot");
@@ -1881,13 +1781,9 @@ MetadataRecord MetadataManager::mutate_impl(
         std::optional<MetadataDelta> delta;
         if (exact_delta) {
             delta = std::move(supplied_delta);
-            // An exact caller describes only its own edit; the branch topology
-            // it inherited is settled here. The first write after a
-            // reconciliation leaves the merge commit's merge_parents behind
-            // (cleared above). Until 0.28.2 this write was forced to a full
-            // snapshot instead -- 3-30 s and 15 MB per replica on the cluster,
-            // after every one of ~100 merges a day; until 0.32.0 (DLT7) it
-            // also had to carry the whole standing conflict set.
+            // An exact caller describes only its own edit; inherited branch topology
+            // (merge_parents, cleared above) is settled here, so the write stays a
+            // delta.
             if (clear_merge_parent_topology)
                 delta->replace_merge_parents = snapshot.merge_parents;
         } else {
@@ -1923,14 +1819,10 @@ MetadataRecord MetadataManager::mutate_impl(
             raise(mutation_retention_ms_max_, retention_ms);
             raise(mutation_publish_ms_max_, publish_ms);
 
-            // A concurrent writer can durably accept a sibling of `proposed`
-            // while this publication is in flight.  In that case the mutation
-            // must not bless its branch-specific decoded snapshot as current
-            // after the acceptance notice has already invalidated the cache.
-            // With W>=2, at least the later of two mutually-published writers
-            // observes both accepted heads locally before returning.  Reconcile
-            // that local divergence synchronously so both completed mutations
-            // are visible once the writers have returned.
+            // A concurrent writer may accept a sibling while this publishes; the
+            // acceptance notice has invalidated the cache, so do not install this
+            // branch's snapshot. With W>=2 the later writer sees both heads; reconcile
+            // synchronously so both mutations are visible once the writers return.
             auto post_publish_heads = node_.metadata_replica().accepted_heads();
             if (post_publish_heads.size() > 1) {
                 std::vector<NodeId> ids;
@@ -1940,10 +1832,8 @@ MetadataRecord MetadataManager::mutate_impl(
                 try {
                     return read_group(ids, FrameType::read_ahead);
                 } catch (const MetadataNotReady&) {
-                    // The authored commit is already durably accepted.  Do not
-                    // overwrite the invalidated cache with one sibling merely
-                    // because reconciliation could not complete immediately; a
-                    // subsequent read will retry the accepted-head survey.
+                    // The commit is durably accepted; leave the cache invalidated and let a
+                    // later read retry the survey.
                     return proposed;
                 }
             }
@@ -1962,11 +1852,9 @@ MetadataRecord MetadataManager::mutate_impl(
             }
             return proposed;
         } catch (const MetadataNotReady& error) {
-            // If the commit crossed the store floor but certificate fan-out was
-            // interrupted, the local accepted-head set may already contain this
-            // exact mutation. Preserve the sequence across retries so the next
-            // iteration recognises and returns it instead of generating a second
-            // logical mutation.
+            // If the commit reached the floor but certificate fan-out was interrupted,
+            // the head set may already hold it; keep the sequence so the next
+            // iteration recognises it rather than minting a second mutation.
             if (Log::enabled(LogLevel::debug))
                 Log::debug("metadata mutation publish failed sequence=" +
                            std::to_string(*sequence) + " attempt=" +
@@ -1999,9 +1887,7 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
     if (choice != "left" && choice != "right" && choice != "base")
         throw std::invalid_argument("conflict resolution choice must be left, right or base");
     bool resolved = false;
-    // mutate_delta rather than mutate: this edits the namespace, and a
-    // tree-backed commit needs the change set declared rather than
-    // rediscovered by diffing two namespaces.
+    // A tree-backed commit needs the change set declared, not diffed.
     mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
         auto found = snapshot.conflicts.find(id);
         if (found == snapshot.conflicts.end())
@@ -2011,9 +1897,8 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
             const auto& chosen = choice == "left"    ? conflict.left_entry
                                  : choice == "right" ? conflict.right_entry
                                                      : conflict.base_entry;
-            // Resolving a conflict is a namespace edit like any other, so it
-            // goes through the working set: on a tree-backed snapshot writing
-            // the map here would be a decision nothing ever applied.
+            // Through the working set: on a tree-backed snapshot a map write would
+            // never be applied.
             auto nodes = namespace_store_
                              ? std::optional<ControlNamespaceNodeStore>(
                                    ControlNamespaceNodeStore::for_reading(node_, *namespace_store_))
@@ -2031,8 +1916,7 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
             delta.catalogue_root = snapshot.catalogue_root;
         }
         snapshot.conflicts.erase(found);
-        // The standing conflict set is part of the record, so an exact delta
-        // has to carry it rather than leave the replay to infer it.
+        // The conflict set is part of the record, so the exact delta carries it.
         delta.replace_conflicts = snapshot.conflicts;
         resolved = true;
     });
@@ -2042,8 +1926,8 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
 }
 
 void MetadataManager::repair_once() {
-    // The background reconciliation owner must not race a foreground mutation
-    // through discovery, accepted-head selection, or reconfiguration.
+    // Must not race a foreground mutation through discovery, head selection
+    // or reconfiguration.
     std::unique_lock mutation_lock(mutation_mutex_);
     const auto all_active = node_.membership().active();
     const auto active = compatible_replicas(all_active);
@@ -2052,9 +1936,9 @@ void MetadataManager::repair_once() {
 
     MetadataRecord record;
     if (node_.metadata_replica().committed().generation <= 1) {
-        // Maintenance must not bypass virgin-cluster discovery/policy fencing.
-        // read_group() can otherwise filter incompatible peers before any
-        // protocol-20 policy exists and allow a mismatched cohort to form.
+        // Do not bypass virgin-cluster policy fencing: read_group() can filter
+        // incompatible peers before a protocol-20 policy exists and let a
+        // mismatched cohort form.
         record = discover_or_form();
     } else {
         std::vector<NodeId> ids;
@@ -2067,10 +1951,9 @@ void MetadataManager::repair_once() {
     if (!acceptance)
         throw MetadataNotReady("selected metadata head has no acceptance certificate");
 
-    // Convergence is replication, not head replacement. Every active node is
-    // offered the accepted immutable head plus its proof. A node holding a
-    // different accepted branch keeps that branch as another head; read_group()
-    // will reconcile the maximal set rather than overwriting it.
+    // Convergence is replication, not head replacement: every active node is
+    // offered the head and proof; a node on another branch keeps it as a
+    // second head for read_group() to reconcile.
     const auto selected_generation = record.generation;
     size_t converged = 0;
     mutation_lock.unlock();
@@ -2118,11 +2001,10 @@ void MetadataManager::repair_once() {
         }
     }
 
-    // A migrated SM12 cluster has no physical retention baseline. Establish it
-    // only after *every durable branch-capable participant* has converged onto
-    // this reconciled head. The publication guard then places/claims every
-    // reachable DATA/CONTROL object before the baseline commit itself can be
-    // accepted. Until this succeeds destructive mark/sweep is fenced in Service.
+    // A migrated SM12 cluster has no retention baseline. Establish it only once
+    // every durable participant is at this head; the publication guard
+    // claims every reachable object before the baseline commit is accepted.
+    // Until then destructive mark/sweep is fenced in Service.
     if (all_participants_at_head && !snapshot.retention_baseline_complete) {
         const auto origin = node_.node_id();
         const auto found = snapshot.mutation_sequences.find(origin);
@@ -2167,9 +2049,8 @@ void MetadataManager::repair_once() {
                       " migration_participants=" + std::to_string(participants.size()));
     }
 
-    // Retention release is driven independently by each node's sole accepted
-    // head and causal mutation clock. No globally advanced branch floor is
-    // needed for physical GC; unknown concurrent claim dots simply survive.
+    // Retention release follows each node's sole accepted head and causal
+    // clock; unknown concurrent claim dots survive.
 
     node_.metadata_replica().compact();
     cache_record(record, std::make_shared<MetadataSnapshot>(std::move(snapshot)));

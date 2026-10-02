@@ -32,8 +32,6 @@ HistogramSnapshot recorded(std::initializer_list<uint64_t> values) {
     return histogram.snapshot();
 }
 
-// ---- Buckets: the whole phase space is the bucket index and its bounds ----
-
 MACHA_FAST_TEST("observation", test_observation_buckets_tile_the_value_range) {
     constexpr auto top = std::numeric_limits<uint64_t>::max();
     CHECK(observation_bucket_lower(0) == 0);
@@ -73,8 +71,6 @@ MACHA_FAST_TEST("observation", test_observation_bucket_contains_every_small_valu
         }
     }
 }
-
-// ---- Snapshots ---------------------------------------------------------
 
 MACHA_FAST_TEST("observation", test_observation_quantiles) {
     CHECK(HistogramSnapshot{}.quantile(0.5) == 0);
@@ -148,8 +144,6 @@ MACHA_FAST_TEST("observation", test_observation_histogram_records_from_many_thre
             expected_sum += value * 4 + thread;
     CHECK(snapshot.sum == expected_sum);
 }
-
-// ---- The registry --------------------------------------------------------
 
 MACHA_FAST_TEST("observation", test_observation_registry_is_bounded) {
     Observations registry(2, 2);
@@ -237,8 +231,6 @@ MACHA_FAST_TEST("observation", test_observation_route_labels) {
         CHECK(observation_route_label(method, path) == label);
 }
 
-// ---- Rendering -----------------------------------------------------------
-
 MACHA_FAST_TEST("observation", test_observation_window_rendering) {
     ObservationSnapshot window;
     window.histograms["idle"] = HistogramSnapshot{};
@@ -261,8 +253,6 @@ MACHA_FAST_TEST("observation", test_observation_event_rendering) {
           R"({"at_ms":5,"event":"backend_online","fields":{"elapsed_ms":12,)"
           R"("path":"/mnt/\"d\""},"kind":"event"})");
 }
-
-// ---- The file ------------------------------------------------------------
 
 MACHA_FAST_TEST("observation", test_observation_log_rotates_at_its_bound) {
     TempDir dir;
@@ -330,8 +320,6 @@ MACHA_FAST_TEST("observation", test_observation_log_survives_an_unwritable_path)
     Log::set_logger(std::make_shared<ConsoleLogger>());
 }
 
-// ---- The recorder ----------------------------------------------------------
-
 MACHA_FAST_TEST("observation", test_observation_recorder_writes_windows_and_events) {
     TempDir dir;
     const auto path = dir.path() / "observations.jsonl";
@@ -361,8 +349,8 @@ MACHA_FAST_TEST("observation", test_observation_recorder_writes_windows_and_even
     CHECK(second.find("gauges")->asObject().empty());
     CHECK(second.find("start_ms")->asUInt64() == 100);
 
-    // Only a std::exception from the sampler is absorbed; anything else
-    // leaves tick() for the supervised loop around the thread to record.
+    // Only a std::exception from the sampler is absorbed; anything else leaves
+    // tick() for the supervised loop to record.
     ObservationRecorder strange(registry, log, "v", 1h, []() -> std::map<std::string, uint64_t> {
         throw 42;
     });
@@ -402,8 +390,6 @@ MACHA_FAST_TEST("observation", test_observation_recorder_thread_and_final_window
     recorder.stop(); // a second stop writes nothing
     CHECK(read_lines(path).size() == lines.size());
 }
-
-// ---- The service ----------------------------------------------------------
 
 MACHA_TEST("observation", test_a_service_writes_its_lifecycle_to_the_observation_file) {
     TestService fixture("observation-lifecycle");

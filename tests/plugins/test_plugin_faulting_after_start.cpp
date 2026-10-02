@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A subsystem that starts cleanly and then faults from its own thread, which
-// is the shape of a lost FUSE mount and the one SubsystemSupervisor could not
-// see until Subsystem::attach_fault_sink existed (see
-// TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, Stage A). Before that the
-// supervisor parked on a condition variable until asked to stop, so a
-// subsystem whose background work died after start() stayed `running` forever.
-//
-// Each instance faults once, shortly after start(), so the supervisor is
-// driven through faulted -> restarting -> running for as many cycles as the
-// retry policy allows.
+// A subsystem that starts cleanly, then faults once from its own thread through
+// the fault sink (the shape of a lost FUSE mount). The supervisor is driven
+// through faulted -> restarting -> running for as many cycles as retry allows.
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"
@@ -34,8 +27,7 @@ class FaultingAfterStartSubsystem final : public macha::Subsystem {
 
     void start() override {
         worker_ = std::thread([this] {
-            // Long enough that the supervisor has published `running` before
-            // the fault arrives, short enough to keep the test quick.
+            // Lets the supervisor publish `running` before the fault arrives.
             for (int i = 0; i < 20 && !stopping_.load(); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (stopping_.load())

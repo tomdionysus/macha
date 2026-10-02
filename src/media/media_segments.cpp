@@ -36,19 +36,11 @@ struct MediaSegmentStore::Impl {
     size_t max_ahead{8};
     uint64_t memory_limit{64ULL * 1024 * 1024};
     uint64_t memory_bytes{};
-    // Media produced by this generation, and the encoder time it actually
-    // took -- parked-on-demand intervals excluded. See Snapshot.
-    //
-    // The two must cover the same fragments or their ratio is wrong where it
-    // matters most. Measuring only the gaps BETWEEN publications would time
-    // n-1 fragments while counting the media of n, overstating the rate by
-    // n/(n-1) -- 2x after the second fragment, which is exactly when a
-    // handover decision gets made. So the clock starts at construction and
-    // the first fragment is timed like every other one, which also charges
-    // pipeline start-up to the rate rather than hiding it. That reads low
-    // early and settles as the generation runs: the conservative direction,
-    // since the cost of understating is a handover deferred, not a viewer
-    // stalled on a promise the node could not keep.
+    // Media produced and encoder time spent, parked intervals excluded (see
+    // Snapshot). Both cover the same fragments: the clock starts at construction
+    // so the first fragment is timed too. Timing only gaps between publications
+    // would overstate the rate by n/(n-1); including start-up reads low early,
+    // the conservative direction (a deferred handover, not a stalled viewer).
     std::chrono::duration<double> produced_media{};
     std::chrono::duration<double> producing{};
     std::optional<std::chrono::steady_clock::time_point> produced_since;
@@ -56,13 +48,12 @@ struct MediaSegmentStore::Impl {
     std::filesystem::path spill_directory;
     std::chrono::milliseconds target_duration{4000};
     std::optional<RetainedMemoryLedger::Lease> retained_memory;
-    // Deferred requests waiting for the next publication or ending; each
-    // fires once. Registered under `mutex`, fired after it is released.
+    // Deferred requests awaiting the next publication or ending; each fires once.
+    // Registered under `mutex`, fired after it is released.
     mutable std::vector<std::function<void()>> wakers;
 
-    // Collects the wakers a state change owes, and fires them when the
-    // caller's lock scope has ended: declared before the lock, destroyed
-    // after it, so no waker runs with the store's mutex held.
+    // Collects owed wakers and fires them at scope end: declared before the lock,
+    // destroyed after it, so no waker runs under the store mutex.
     struct Wakeups {
         std::vector<std::function<void()>> list;
         Wakeups() = default;
@@ -92,8 +83,8 @@ struct MediaSegmentStore::Impl {
         std::filesystem::create_directories(spill_directory, ec);
         if (ec) return;
         for (size_t i = 0; i < segments.size() && memory_bytes > memory_limit; ++i) {
-            // Keep the most recently consumed fragments resident. Everything
-            // older remains seekable through the spill file.
+            // Keep the most recently consumed fragments resident; older ones stay
+            // seekable through the spill file.
             if (i + 2 >= highest_requested || !segments[i].memory) continue;
             auto path = spill_directory / ("segment-" + [&] {
                 std::ostringstream n;
@@ -128,10 +119,8 @@ struct MediaSegmentStore::Impl {
 
     bool publish_segment(Bytes bytes, double duration) {
         Wakeups wakeups;
-        // Encode time for this fragment is the gap since the previous call
-        // returned. Measuring it here rather than around the cv.wait below is
-        // what excludes the parked interval: the wait happens after this
-        // point, so a producer blocked on demand adds nothing to the total.
+        // Encode time is the gap since the previous call returned; the demand wait
+        // comes after this point, so parked time is excluded.
         const auto entered = std::chrono::steady_clock::now();
         std::unique_lock lock(mutex);
         if (produced_since) producing += entered - *produced_since;
@@ -162,26 +151,18 @@ struct MediaSegmentStore::Impl {
     void mark_finished() {
         Wakeups wakeups;
         std::lock_guard lock(mutex);
-        // Fragment count is not the invariant. A planned boundary can pass
-        // without producing a fragment -- the first flush of a fragmented MP4
-        // writes the delayed moov and no moof -- and its media and its length
-        // are then carried into the fragment that absorbed them. Counting made
-        // every such generation finish in an error state, which is worse than
-        // cosmetic: playlist() withholds a playlist entirely once an error is
-        // set, so a transcode that had in fact produced all of its media ended
-        // by serving an empty one.
-        //
-        // What must hold is that the generation published the media it planned
-        // to. publish_duration() consumes the plan as it publishes, so equal
-        // totals mean every planned length was accounted for by some fragment.
+        // The invariant is planned media published, not fragment count: a boundary
+        // can pass without a fragment (the delayed-moov flush) and its length is
+        // carried into the next. publish_duration() consumes the plan, so equal
+        // totals account for every planned length. An error here makes playlist()
+        // withhold the playlist.
         if (!vod_segment_durations.empty()) {
             double planned = 0.0;
             for (const auto duration : vod_segment_durations) planned += duration;
             double published = 0.0;
             for (const auto& segment : segments) published += segment.duration;
-            // One fragment's worth of slack: the tail is bounded by however
-            // much media the source really had, and a source that ends a
-            // little short of its container duration is ordinary.
+            // One fragment of slack: a source may end a little short of its container
+            // duration.
             const double tolerance = std::max(1.0, vod_segment_durations.back());
             if (published + tolerance < planned && error.empty())
                 error = "media pipeline published " + std::to_string(published) +
@@ -270,28 +251,14 @@ std::string MediaSegmentStore::playlist() const {
     if (durations.empty()) return {};
     double longest = 1.0;
     for (const double duration : durations) longest = std::max(longest, duration);
-    // A complete, closed VOD list, served on the first fetch with no readiness
-    // gate. This is the spec-correct form for playback of a known-duration
-    // source -- we probed it -- and it is what comparable just-in-time servers
-    // do: compute the whole playlist from runtime and segment length before
-    // any segment exists, then make the wait for not-yet-produced media the
-    // server's problem. Two things follow from ENDLIST being here. A player
-    // stops polling entirely, so a generation costs one playlist fetch instead
-    // of hundreds, and with it go all the opportunities for a level-load
-    // failure to be read as node health. And a failure to produce a fragment
-    // now surfaces as fragLoadError, which has its own retry policy, rather
-    // than levelLoadError, which a client weighs as node health and which has
-    // promoted a live session off its node.
-    //
-    // EXTINF is the plan, necessarily. An unproduced fragment has no measured
-    // length, and a VOD playlist must be immutable across fetches, so a
-    // produced fragment cannot be described differently from an unproduced
-    // one. That is only honest because the plan now predicts the output
-    // exactly, one fragment per planned entry -- until the early-moov-flush
-    // fix the transcode path merged fragments 0 and 1 and a playlist written
-    // up front would have been wrong from its first line. Gated by
-    // tests/test_transcode_timeline.cpp, which measures every declared
-    // duration against the media the fragment really carries.
+    // A complete, closed VOD list served on first fetch with no readiness gate:
+    // the duration is known, and waiting for unproduced media is the server's
+    // problem. With ENDLIST a player fetches the playlist once, and a production
+    // failure surfaces as fragLoadError (own retry policy) rather than
+    // levelLoadError, which clients weigh as node health.
+    // EXTINF is the plan: a VOD playlist is immutable, so produced and unproduced
+    // fragments are described alike. This holds because the plan predicts the
+    // output exactly, one fragment per entry (tests/test_transcode_timeline.cpp).
     std::ostringstream out;
     const bool mpegts = impl_->container == MediaContainer::mpegts;
     out << "#EXTM3U\n#EXT-X-VERSION:" << (mpegts ? 3 : 7)
@@ -340,14 +307,9 @@ std::optional<Bytes> MediaSegmentStore::object(std::string_view name) const {
 std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
                                                     std::chrono::milliseconds timeout) const {
     const auto parsed = segment_number(name);
-    // One hold path for anything a client can ask for, rather than a special
-    // case per object kind. init.mp4 waits exactly as a fragment does: a
-    // playlist served before anything has been published sends the client for
-    // the initialization fragment before the muxer has written it, and
-    // answering 404 for an object the playlist promises exists is the same
-    // defect for init as it was for a not-yet-produced segment. MPEG-TS has no
-    // init fragment at all, so there is nothing to wait for and a miss there
-    // is genuine.
+    // One hold path for every object kind: init.mp4 waits like a fragment, since
+    // the playlist can send a client for it before the muxer writes it. MPEG-TS
+    // has no init, so a miss there is genuine.
     const bool init_object =
         !parsed && name == "init.mp4" && impl_->container != MediaContainer::mpegts;
     if (!parsed && !init_object) return object(name);
@@ -357,9 +319,7 @@ std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
     if (!init_object && !impl_->vod_segment_durations.empty() &&
         index >= impl_->vod_segment_durations.size())
         return {};
-    // The only thing that differs between object kinds is whether the object
-    // asked for is present yet. Everything that ends a wait -- cancellation,
-    // supersession, failure, the generation finishing -- is shared.
+    // Kinds differ only in presence; everything that ends a wait is shared.
     const auto present = [&] {
         return init_object ? static_cast<bool>(impl_->init) : index < impl_->segments.size();
     };
@@ -436,8 +396,8 @@ MediaSegmentStore::Awaited MediaSegmentStore::object_or_subscribe(
     const auto parsed = segment_number(name);
     const bool init_object =
         !parsed && name == "init.mp4" && impl_->container != MediaContainer::mpegts;
-    // The same shape as wait_object: anything that is not a fragment or a
-    // holdable init is an immediate lookup with nothing to subscribe to.
+    // As wait_object: anything but a fragment or holdable init is an immediate
+    // lookup.
     if (!parsed && !init_object) return {object(name), true};
     const uint64_t index = parsed ? *parsed : 0;
 

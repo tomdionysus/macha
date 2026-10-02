@@ -55,11 +55,9 @@ FuseJournalScanResult scan_fuse_journal_frames(std::span<const uint8_t> bytes,
         std::copy_n(bytes.begin() + static_cast<ptrdiff_t>(position + 4 + length), 32,
                     expected.bytes.begin());
         if (sha256(payload) != expected) {
-            // A crash can expose the final append at its full logical length
-            // while tail sectors were not durably written. An EOF checksum
-            // failure is therefore a torn append. Corruption before a later
-            // frame is not a crash tail: report it so the caller can
-            // quarantine everything from here rather than refuse to start.
+            // A bad checksum on the final frame is a torn append (a crash can
+            // expose its length before its sectors). Earlier corruption is
+            // reported so the caller can quarantine from here and still start.
             if (position + frame_size == bytes.size())
                 break;
             return {last_good, bytes.size() - last_good, position};

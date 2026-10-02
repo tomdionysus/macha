@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The catalogue's half of the maintenance inventory, split into head,
-// repair and read (the object ledger spec, A4; T4b), against a fake
-// metadata view: the contract is what lets the catalogue run without a
-// metadata manager behind it.
+// The catalogue's maintenance inventory (head, repair, read) against a fake
+// metadata view, so no metadata manager is needed behind it.
 #include "catalogue/catalogue.hpp"
 #include "cluster/distributed_store.hpp"
 #include "metadata/namespace_tree.hpp"
@@ -29,8 +27,8 @@ struct FakeMetadataView final : MetadataView {
     MetadataSnapshotView converged(const WorkContext&) override { return converged(); }
     uint64_t current_generation() const noexcept override { return view ? view->generation : 0; }
     uint64_t current_namespace_revision() const noexcept override { return 0; }
-    // When set, a committed read brings the view up to date (as a replica
-    // read does); otherwise it fails as an unreachable replica set does.
+    // When set, a committed read brings the view up to date; otherwise it
+    // fails as an unreachable replica set does.
     std::optional<MetadataSnapshotView> after_record;
     MetadataRecord record() override {
         if (!after_record)

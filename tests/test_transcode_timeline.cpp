@@ -1,26 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A/V timeline regressions against the real (non-stub) transcode pipeline.
-//
-// Every other playback test injects a media engine, which is the right choice
-// for planning, negotiation and HTTP behaviour but says nothing about what
-// libav actually produces. Both audio defects of 0.23.8 and 0.23.9 lived
-// entirely inside that gap: the first (resample-ratio compensation shifting
-// pitch) was caught by a person listening, the second (a unit-fraction error
-// that lost nearly all audio) by a person listening again, during development.
-// Neither could have failed a test, because no test ever ran the real encoder.
-// This file closes that gap -- it is Phase 0 of
-// TODO/archive/2026-09-03-playback-resilience-and-av-sync-plan.md, whose stated
-// prerequisite is a deterministic case longer than 90 seconds carrying
-// non-zero starts, audio priming and a seek.
-//
-// What it measures, from the fragments the pipeline really published: where
-// each output stream starts, how much media each one produced, and whether
-// those two answers stay together over the length of the case. What it cannot
-// measure: pitch. A resample-ratio change of the kind 0.23.8 shipped alters
-// how the audio *sounds* while keeping the timeline honest, so it would pass
-// here. That remains a listening test, and this file does not pretend
-// otherwise.
+// A/V timeline checks against the real libav transcode pipeline, over a
+// deterministic source longer than 90 seconds with non-zero starts, audio
+// priming and a seek. From the fragments actually published it measures where
+// each stream starts, how much media each carries, and whether they stay
+// together. It cannot measure pitch.
 
 #include "test_backend_support.hpp"
 
@@ -53,39 +37,27 @@ constexpr int kFrameRate = 25;
 constexpr int kSampleRate = 48000;
 constexpr int kChannels = 2;
 
-// Longer than ninety seconds, because drift is a rate. A ten-second case
-// cannot tell a millisecond of rounding from a defect that would be seconds
-// out by the end of an episode; the 0.23.8 investigation only became legible
-// when measured over minutes.
+// Long, because drift is a rate: a short case cannot tell rounding from a defect.
 constexpr double kSourceSeconds = 100.0;
 
-// The source's audio starts after its video, which is ordinary in a real
-// container and is exactly the offset that "applied exactly once, by one
-// documented owner" is about. Applied twice it doubles; applied never it
-// disappears; either way this is where it shows.
+// Audio starts after video, as is ordinary; the offset must be applied exactly once.
 constexpr double kAudioStartSeconds = 0.05;
 
 constexpr auto kSegmentDuration = std::chrono::milliseconds{4000};
 
-// End-to-end tolerance for how far the two output streams may disagree about
-// how much media they carry. Bounded correction legitimately adds or drops
-// whole audio frames (1024 samples, ~21ms at 48kHz), and the encoders flush
-// on different frame boundaries, so this cannot be zero. It is far below what
-// any of the real defects produced: 0.23.9 lost nearly all audio, and an
-// uncompensated free-running audio clock diverged by seconds over this length.
+// How far the two streams may disagree about how much media they carry: bounded
+// correction adds or drops whole audio frames (~21 ms at 48 kHz) and the
+// encoders flush on different boundaries, so it cannot be zero.
 constexpr double kDurationGapToleranceSeconds = 0.25;
 
 // How far a fragment's declared length may differ from the media it carries.
-// One video frame either side of the boundary the encoder actually chose.
 constexpr double kFragmentDurationToleranceSeconds = 0.10;
 
-// How far the playlist's accumulated timeline may drift from the media across
-// the whole generation. This is the number a player's seek map is built from.
+// How far the playlist's accumulated timeline (a player's seek map) may drift
+// from the media across the whole generation.
 constexpr double kTimelineDriftToleranceSeconds = 0.25;
 
-// How far apart the two streams may begin. A whole-frame difference at the
-// start is expected; a priming or seek offset applied to one stream and not
-// the other is not.
+// How far apart the two streams may begin: a frame, not a one-sided offset.
 constexpr double kStartGapToleranceSeconds = 0.15;
 
 void require_av(int rc, const char* what) {
@@ -96,11 +68,7 @@ void require_av(int rc, const char* what) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// A deterministic source, built here rather than committed as a fixture: the
-// case has to be long, and a hundred seconds of media is not something to put
-// in a git repository when the same bytes can be generated in a second.
-// ---------------------------------------------------------------------------
+// A deterministic source, generated rather than committed as a fixture.
 
 struct Synthesized {
     Bytes bytes;
@@ -114,9 +82,8 @@ struct EncoderContext {
     ~EncoderContext() { avcodec_free_context(&ctx); }
 };
 
-// Drain one encoder into the muxer. `flush` sends the null frame that makes
-// the encoder emit whatever it is still holding, which for AAC is the priming
-// tail -- omitting it is how an audio track ends early.
+// Drains one encoder into the muxer; a null frame flushes what it still holds
+// (for AAC, the priming tail).
 void drain_encoder(AVFormatContext* out, AVCodecContext* enc, AVStream* stream, AVFrame* frame) {
     require_av(avcodec_send_frame(enc, frame), "send frame to source encoder");
     AVPacket* packet = av_packet_alloc();
@@ -141,9 +108,7 @@ void drain_encoder(AVFormatContext* out, AVCodecContext* enc, AVStream* stream, 
 }
 
 Synthesized synthesize_source(const std::filesystem::path& path, const char* muxer = "matroska") {
-    // mpeg4 for the source video: it is present in every ordinary build and
-    // encodes a hundred seconds of this frame size in about a second. The
-    // source codec is not what is under test -- the transcode of it is.
+    // mpeg4: in every ordinary build, and fast; the source codec is not under test.
     const auto* video_codec = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
     const auto* audio_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
     if (!video_codec || !audio_codec) throw std::runtime_error("source encoders unavailable");
@@ -165,8 +130,7 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     video.ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     video.ctx->time_base = AVRational{1, kFrameRate};
     video.ctx->framerate = AVRational{kFrameRate, 1};
-    // A keyframe every second, so a seek has somewhere to land that is not the
-    // start of the file.
+    // A keyframe every second, so a seek can land past the start.
     video.ctx->gop_size = kFrameRate;
     video.ctx->bit_rate = 200000;
     if (out->oformat->flags & AVFMT_GLOBALHEADER)
@@ -223,10 +187,8 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     const int64_t total_audio_samples = static_cast<int64_t>(kSourceSeconds * kSampleRate);
     const int64_t audio_start_sample = static_cast<int64_t>(kAudioStartSeconds * kSampleRate);
 
-    // Content is deterministic but deliberately cheap: a moving luma ramp and
-    // a fixed tone. Nothing here inspects pixels or samples -- what matters is
-    // that the same bytes are produced on every run and on every machine, so a
-    // drift measurement is comparable between them.
+    // Cheap deterministic content: a moving luma ramp and a fixed tone, the
+    // same bytes on every run and machine.
     int64_t audio_sample = 0;
     for (int64_t frame_index = 0; frame_index < total_video_frames; ++frame_index) {
         require_av(av_frame_make_writable(video_frame), "make source video frame writable");
@@ -243,9 +205,7 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
         video_frame->pts = frame_index;
         drain_encoder(out, video.ctx, video_stream, video_frame);
 
-        // Keep audio just ahead of video so the interleaver never has to buffer
-        // a whole stream, which is what an unbounded av_interleaved_write_frame
-        // queue would otherwise do over a hundred seconds.
+        // Keep audio just ahead of video so the interleaver never buffers a whole stream.
         const int64_t audio_target =
             av_rescale(frame_index + 1, kSampleRate, kFrameRate);
         while (audio_sample < audio_target && audio_sample < total_audio_samples) {
@@ -263,9 +223,7 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
         }
     }
 
-    // Flush both encoders. The AAC encoder is holding priming samples at this
-    // point; a source that never drains them is not the source we meant to
-    // build.
+    // Flush both encoders; AAC still holds priming samples.
     drain_encoder(out, video.ctx, video_stream, nullptr);
     drain_encoder(out, audio.ctx, audio_stream, nullptr);
     require_av(av_write_trailer(out), "write source trailer");
@@ -288,9 +246,7 @@ Synthesized synthesize_source(const std::filesystem::path& path, const char* mux
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// The source as the engine sees it: bytes in memory, no filesystem, no DHT.
-// ---------------------------------------------------------------------------
+// The source as bytes in memory: no filesystem, no DHT.
 
 class MemoryInput final : public MediaInput {
     const Bytes& bytes_;
@@ -308,12 +264,8 @@ class MemoryInput final : public MediaInput {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Measuring what was actually published. The fragments are read back through
-// libav rather than trusted from the pipeline's own bookkeeping, because the
-// bookkeeping is the thing under test: a timeline defect that also reports
-// itself correctly is not one this harness would be able to see.
-// ---------------------------------------------------------------------------
+// Published fragments are read back through libav, not taken from the
+// pipeline's own bookkeeping, which is what is under test.
 
 struct StreamTimeline {
     bool present{};
@@ -321,9 +273,7 @@ struct StreamTimeline {
     double first_seconds{};
     double last_seconds{};
     double end_seconds{}; // last presentation time plus that packet's duration
-    // Media actually carried, start to end. This is the number a drift defect
-    // moves: an audio clock running fast or slow relative to video produces a
-    // different span from the same source over the same wall time.
+    // Media actually carried, start to end: the number drift moves.
     double span_seconds() const { return end_seconds - first_seconds; }
 };
 
@@ -430,9 +380,7 @@ Timeline measure(const Bytes& fragmented_mp4) {
             target->last_seconds = seconds;
             target->end_seconds = seconds + duration;
         }
-        // Fragments are read in order, but a stream's packets are not
-        // necessarily monotonic in a B-frame container, so take the maximum
-        // rather than the last one seen.
+        // Packets are not monotonic with B-frames: take the maximum, not the last.
         target->last_seconds = std::max(target->last_seconds, seconds);
         target->end_seconds = std::max(target->end_seconds, seconds + duration);
         ++target->packets;
@@ -441,20 +389,14 @@ Timeline measure(const Bytes& fragmented_mp4) {
     return timeline;
 }
 
-// ---------------------------------------------------------------------------
-// Driving the real pipeline and collecting everything it published.
-// ---------------------------------------------------------------------------
-
 struct TranscodeRun {
     Timeline timeline;
     size_t segments{};
     size_t planned_segments{};
     double planned_seconds{};
     double probed_seconds{};
-    // Set when the pipeline finished having published fewer fragments than the
-    // plan promised. This is reported rather than thrown, because a plan that
-    // over-promises and a timeline that drifts are separate findings and the
-    // first must not hide the second.
+    // Set when fewer fragments were published than planned; reported, not
+    // thrown, so it cannot hide a timeline defect.
     std::string production_error;
     std::vector<double> fragment_media_seconds;
     std::vector<double> fragment_declared_seconds;
@@ -476,10 +418,8 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
         return std::make_shared<MemoryInput>(synthesized.bytes);
     };
 
-    // Plan from what the engine itself reports about the source, not from what
-    // the synthesizer intended: production plans from `session.probe`, and a
-    // duration the planner disagrees with would make this harness measure a
-    // disagreement it invented rather than one the pipeline has.
+    // Plan from the engine's own probe, as production does, not from what the
+    // synthesizer intended.
     const auto probe = engine.probe(source, std::chrono::milliseconds{30000});
 
     PlaybackPlan plan;
@@ -506,9 +446,8 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     const auto* progress = session->start_progress();
     REQUIRE(progress != nullptr);
 
-    // Consume in order, exactly as a client does. The store bounds production
-    // ahead of the consumer, so a harness that never asks for a fragment gets
-    // a pipeline that correctly stops producing -- and then times out.
+    // Consume in order as a client does: the store bounds production ahead of
+    // the consumer, so an idle consumer stalls the pipeline.
     Bytes collected;
     const auto init = store->object("init.mp4");
     REQUIRE(init.has_value());
@@ -525,10 +464,8 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     run.planned_seconds = 0.0;
     for (double d : vod.segment_durations) run.planned_seconds += d;
 
-    // A plan entry does not have to become a fragment of its own -- a boundary
-    // whose flush produced no moof is carried into the next one -- so consume
-    // until the store stops producing rather than demanding one fragment per
-    // planned entry.
+    // Consume until the store stops producing rather than demanding one fragment
+    // per planned entry.
     for (size_t i = 0; i < vod.segment_durations.size(); ++i) {
         session->note_segment_requested(i);
         std::ostringstream name;
@@ -538,9 +475,7 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
         collected.insert(collected.end(), fragment->begin(), fragment->end());
         fragments.push_back(*fragment);
         ++run.segments;
-        // The store withholds a playlist once an error is set, so keep the
-        // last one it was willing to serve; a generation that ends badly is
-        // then still describable.
+        // The store withholds the playlist once an error is set; keep the last one served.
         if (auto text = store->playlist(); !text.empty()) run.playlist = std::move(text);
     }
     if (auto text = store->playlist(); !text.empty()) run.playlist = std::move(text);
@@ -555,16 +490,9 @@ TranscodeRun transcode(MediaEngine& engine, const Synthesized& synthesized,
     session->stop();
     run.timeline = measure(collected);
 
-    // Per-fragment media spans, measured from the fragments rather than taken
-    // from the playlist: the playlist is the claim under test. Phase 0 asks
-    // for fragment media durations precisely so a boundary that produced no
-    // fragment cannot hide behind an aggregate that still adds up.
-    //
-    // A fragment's span is the distance to where the next one starts, which is
-    // what a player accumulates and what EXTINF has to equal. Taking it from
-    // the fragment's own last packet instead would add that packet's duration
-    // to every fragment and drift by a frame per boundary -- an artefact of
-    // the measurement, not of the pipeline.
+    // Per-fragment spans measured from the fragments, since the playlist is
+    // under test. A span is the distance to the next fragment's start, which is
+    // what a player accumulates and what EXTINF must equal.
     std::vector<double> starts;
     for (const auto& fragment : fragments) {
         Bytes one(init->begin(), init->end());
@@ -583,22 +511,12 @@ bool transcode_available(MediaEngine& engine) {
     return status.available && status.h264_encoder && status.aac_encoder;
 }
 
-// The playlist is a promise about where each fragment sits on the viewer's
-// timeline, and a player builds its seek map by accumulating EXTINF. Checking
-// each declared duration against the media that fragment really carries is
-// therefore the difference between "the file plays" and "the file plays and
-// seeking lands where the viewer asked".
+// Each declared EXTINF must match the media its fragment carries, since a
+// player builds its seek map by accumulating them.
 void check_playlist_describes_the_media(const TranscodeRun& run) {
-    // One fragment per planned entry. This is what lets a complete playlist be
-    // written before anything is published: if the plan and the output can
-    // disagree on how many fragments there are, a playlist built from the plan
-    // is wrong from its first line. Transcode used to produce one fewer than
-    // planned, because the delayed moov was flushed at the first real boundary
-    // and consumed it, merging fragments 0 and 1.
+    // One fragment per planned entry, so a playlist built from the plan is right.
     CHECK(run.segments == run.planned_segments);
-    // And the first fragment is the short startup fragment it was planned as,
-    // not a merged double-length one -- the merge cost time to first frame as
-    // well as correctness.
+    // The first fragment is the short startup fragment it was planned as.
     if (!run.fragment_media_seconds.empty())
         CHECK(run.fragment_media_seconds.front() < 2.0 * kSegmentDuration.count() / 1000.0);
     REQUIRE(run.fragment_declared_seconds.size() == run.fragment_media_seconds.size());
@@ -609,12 +527,9 @@ void check_playlist_describes_the_media(const TranscodeRun& run) {
         const double measured = run.fragment_media_seconds[i];
         declared_total += declared;
         measured_total += measured;
-        // Per fragment: a video frame either side, no more. Before the fix
-        // this file found, fragment 0 carried six seconds and declared two.
         CHECK(std::fabs(declared - measured) <= kFragmentDurationToleranceSeconds);
     }
-    // And cumulatively, because a per-fragment tolerance repeated twenty-five
-    // times is not a bound on where the last fragment lands.
+    // Cumulatively too: per-fragment tolerance does not bound the last fragment.
     CHECK(std::fabs(declared_total - measured_total) <= kTimelineDriftToleranceSeconds);
 }
 
@@ -632,11 +547,8 @@ void report(const char* label, const TranscodeRun& run) {
 } // namespace
 
 MACHA_HEAVY_TEST("transcode_timeline", test_transcoded_audio_and_video_carry_the_same_timeline) {
-    // The regression the plan asks for: a hundred seconds of real transcode,
-    // measured from the published fragments. An audio clock that free-runs
-    // against a re-anchored video clock diverges by seconds over this length;
-    // 0.23.9's unit error produced almost no audio at all. Both are span
-    // failures, and both are invisible in a ten-second case.
+    // A hundred seconds of real transcode, measured from the published
+    // fragments: audio drift or lost audio shows as a span difference.
     StreamingConfig streaming;
     auto engine = make_libav_media_engine(streaming);
     REQUIRE(engine != nullptr);
@@ -654,39 +566,31 @@ MACHA_HEAVY_TEST("transcode_timeline", test_transcoded_audio_and_video_carry_the
                                std::chrono::milliseconds{0});
     report("transcode timeline", run);
 
-    // A generation that produced all of its media finishes clean. It did not
-    // before: the store compared fragment count against plan entries, called a
-    // correct run an error, and then withheld the playlist entirely.
+    // A generation that produced all of its media finishes clean.
     CHECK(run.production_error.empty());
     check_playlist_describes_the_media(run);
 
     REQUIRE(run.timeline.video.present);
     REQUIRE(run.timeline.audio.present);
 
-    // Both streams begin together. A priming or start-time offset applied to
-    // one and not the other lands here.
+    // Both streams begin together: no one-sided priming or start offset.
     const double start_gap =
         std::fabs(run.timeline.audio.first_seconds - run.timeline.video.first_seconds);
     CHECK(start_gap <= kStartGapToleranceSeconds);
 
-    // Both streams carry the same amount of media. This is the drift gate.
+    // Both streams carry the same amount of media: the drift gate.
     const double span_gap =
         std::fabs(run.timeline.audio.span_seconds() - run.timeline.video.span_seconds());
     CHECK(span_gap <= kDurationGapToleranceSeconds);
 
-    // And that amount is the source's, not some fraction of it. 0.23.9 would
-    // have failed here even without the comparison above, because the audio
-    // span collapsed rather than drifting.
+    // And that amount is the source's, not a fraction of it.
     CHECK(run.timeline.video.span_seconds() > kSourceSeconds * 0.95);
     CHECK(run.timeline.audio.span_seconds() > kSourceSeconds * 0.95);
 }
 
 MACHA_HEAVY_TEST("transcode_timeline", test_transcoded_seek_starts_both_streams_at_the_origin) {
-    // A seek generation publishes a timeline relative to zero -- run_pipeline
-    // states that contract directly ("Keep the public playback generation
-    // relative to zero, including after a seek"). The failure this guards
-    // against is one stream honouring the seek offset and the other not,
-    // which is silent in the playlist and audible immediately.
+    // A seek generation's timeline is relative to zero for both streams; one
+    // stream honouring the seek offset and not the other is silent in the playlist.
     StreamingConfig streaming;
     auto engine = make_libav_media_engine(streaming);
     REQUIRE(engine != nullptr);
@@ -720,17 +624,14 @@ MACHA_HEAVY_TEST("transcode_timeline", test_transcoded_seek_starts_both_streams_
         std::fabs(run.timeline.audio.span_seconds() - run.timeline.video.span_seconds());
     CHECK(span_gap <= kDurationGapToleranceSeconds);
 
-    // The generation covers what remains after the seek, so a seek that was
-    // silently ignored (a full-length generation) fails here.
+    // The generation covers only what remains after the seek.
     const double remaining = kSourceSeconds - static_cast<double>(kSeek.count()) / 1000.0;
     CHECK(run.timeline.video.span_seconds() < remaining + 5.0);
 }
 
 MACHA_HEAVY_TEST("transcode_timeline", test_a_transcode_start_reports_its_preroll) {
-    // A transcode seek decodes from the keyframe before the origin and throws
-    // those frames away. On a 4K HEVC source that pre-roll is the suspected
-    // cost of a slow start, so the engine reports it: here the keyframes are a
-    // second apart and the seek is half a second past one.
+    // A seek decodes from the preceding keyframe and discards those frames; the
+    // engine reports that pre-roll. Keyframes are 1 s apart; the seek is 0.5 s past one.
     StreamingConfig streaming;
     auto engine = make_libav_media_engine(streaming);
     REQUIRE(engine != nullptr);
@@ -760,9 +661,8 @@ MACHA_HEAVY_TEST("transcode_timeline", test_a_transcode_start_reports_its_prerol
 }
 
 MACHA_HEAVY_TEST("transcode_timeline", test_a_keyframe_index_places_every_keyframe_by_byte) {
-    // A Direct Play client maps the byte ranges it holds to times with this
-    // index. The source has a keyframe every second; the index must name them
-    // in byte order, inside the file, with the file's end as its anchor.
+    // Clients map byte ranges to times with this index: keyframes in byte
+    // order, inside the file, anchored at the file's end.
     StreamingConfig streaming;
     auto engine = make_libav_media_engine(streaming);
     REQUIRE(engine != nullptr);

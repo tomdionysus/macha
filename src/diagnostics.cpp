@@ -122,11 +122,8 @@ void ThreadCpuReporter::tick(uint64_t iterations) {
         Log::trace(thread_cpu_message("DIAG thread", name_, wall_ms, cpu_ms, pct, iterations_));
     }
 
-    // ALL already carries the complete periodic stream. DEBUG should stay quiet
-    // for healthy threads but must make sustained CPU consumption attributable
-    // without requiring an operator to reproduce the incident at ALL. Use
-    // hysteresis and a long repeat interval so a genuinely hot worker is visible
-    // without turning the diagnostic itself into log traffic.
+    // ALL already logs every period. DEBUG reports only sustained hot threads, with
+    // hysteresis and a long repeat interval so the diagnostic stays quiet.
     if (!Log::enabled(LogLevel::all) && Log::enabled(LogLevel::debug)) {
         if (pct >= debug_high_thread_cpu_pct) {
             if (!debug_high_cpu_ ||

@@ -337,9 +337,7 @@ void MediaInformationService::process_hint(const CatalogueHint& hint,
         auto deadline = Clock::now() + std::chrono::seconds(30);
         (void)resolve(media_id, source->first, source->second, false, deadline);
         hints_.mark_catalogued(hint.id, "media-information", media_id, {}, "profile_prepared");
-        // The keyframe index rides the same background pass, so a client
-        // asking for it later finds it stored. Its failure is not the
-        // profile's: the route builds it on demand instead.
+        // Prebuild the keyframe index; on failure the route builds it on demand.
         try {
             (void)keyframe_index(media_id, Clock::now() + std::chrono::seconds(30));
         } catch (const KeyframeIndexUnsupported&) {
@@ -467,9 +465,8 @@ void MediaInformationService::loop(std::stop_token stop) {
         }
         if (publication) {
             try {
-                // Retain the completed probe until publication commits. A
-                // catalogue CAS conflict must retry this result, not discard
-                // it and force a second media scan.
+                // Kept until publication commits, so a CAS conflict retries it
+                // without a second scan.
                 publish_one(publication->first, publication->second);
             } catch (const std::exception& e) {
                 Log::warn("media information publication failed: " + std::string(e.what()));

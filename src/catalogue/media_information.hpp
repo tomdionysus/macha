@@ -28,10 +28,9 @@ inline constexpr int background = 10;
 inline constexpr int requested = 50;
 }
 
-// Event-driven immutable media-profile discovery. Producers submit hints and
-// never perform optional inspection themselves. All background reads remain
-// speculative (below loader globally); foreground playback can take over the
-// one per-media flight rather than waiting behind optional work.
+// Event-driven discovery of immutable media profiles. Producers only submit
+// hints. Background reads are speculative (below loader); foreground playback
+// takes over the per-media flight rather than waiting behind it.
 class MediaInformationService {
     struct Flight;
 
@@ -53,9 +52,8 @@ class MediaInformationService {
     bool prune_requested_{true};
     bool started_{};
     std::function<void(std::string, MediaProbeResult)> profile_publisher_;
-    // One keyframe index is built at a time on a node: each is one demux
-    // context reading from DATA, and a second request for the same file
-    // waits here and then finds it stored.
+    // One keyframe index build at a time per node; a second request for the
+    // same file waits here, then finds it stored.
     std::mutex keyframe_index_mutex_;
 
     std::optional<std::pair<std::string, FsEntry>> source_for(std::string_view media_id) const;
@@ -89,10 +87,9 @@ class MediaInformationService {
     MediaProbeResult resolve_playback(std::string media_id, std::string path, FsEntry entry,
                                       Clock::time_point deadline);
     void request_prune();
-    // The keyframe byte index of a media, as the route serves it: the stored
-    // object, or built from the file, stored, then returned. Empty when the
-    // media is not in the namespace. Throws MediaError when the file cannot be
-    // read, and KeyframeIndexUnsupported for a container without one.
+    // A media's keyframe byte index: stored, or built, stored and returned.
+    // Empty when the media is not in the namespace. Throws MediaError when the
+    // file cannot be read, KeyframeIndexUnsupported for a container without one.
     std::optional<Bytes> keyframe_index(const std::string& media_id, Clock::time_point deadline);
 
     CatalogueHintQueue& hints() noexcept { return hints_; }
