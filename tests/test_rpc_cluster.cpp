@@ -827,8 +827,7 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
     const auto position = fixture.config().state_path / "repair" / "push-position";
 
     {
-        DistributedStore store(node);
-        store.persist_repair_position(position);
+        DistributedStore store(node, DistributedStoreOptions{position, {}});
         const auto first = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 1);
         CHECK(first.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
@@ -845,15 +844,13 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
     const auto restart_position = fixture.config().state_path / "repair" / "restart-position";
     peer.batch_requests = 0;
     {
-        DistributedStore store(node);
-        store.persist_repair_position(restart_position);
+        DistributedStore store(node, DistributedStoreOptions{restart_position, {}});
         const auto before = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 3);
         CHECK(before.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
     }
     peer.batch_requests = 0;
-    DistributedStore restarted(node);
-    restarted.persist_repair_position(restart_position);
+    DistributedStore restarted(node, DistributedStoreOptions{restart_position, {}});
     const auto resumed = restarted.repair_step(64ULL * 1024 * 1024, 16, live, {}, 3);
     CHECK(resumed.push_examined == 36);
     CHECK(peer.batch_requests.load() == 3);

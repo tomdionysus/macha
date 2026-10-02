@@ -4,8 +4,6 @@
 #include "catalogue/catalogue.hpp"
 #include "cluster/cluster.hpp"
 #include "cluster/distributed_store.hpp"
-#include "component/component.hpp"
-#include "component/dependencies.hpp"
 #include "contract/horizon.hpp"
 #include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
@@ -56,18 +54,18 @@ struct MaintenancePort {
     std::atomic<uint8_t> last_flags{};
 };
 
-// The contracts the maintenance pass requires: concrete components at stage
-// 0, the ledger and the horizon builder excepted; the metadata and ledger
-// contracts (T3, T4) replace them. Every reference outlives the component.
-using MaintenanceContracts = Dependencies<NodeRuntime, DistributedStore, MetadataView,
-                                          MetadataMaintenance,
-                                          CatalogueManager, HorizonBuilder, ObjectLedger,
-                                          MaintenancePort>;
-
-// What the maintenance pass is given: its contracts, and the instruments
-// and policy that are not contracts.
+// What the maintenance pass is given at construction: the collaborators it
+// works on, and the instruments and policy that are not collaborators. Every
+// reference outlives the pass.
 struct MaintenanceDependencies {
-    MaintenanceContracts contracts;
+    NodeRuntime& node;
+    DistributedStore& store;
+    MetadataView& metadata;
+    MetadataMaintenance& metadata_upkeep;
+    CatalogueManager& catalogue;
+    HorizonBuilder& builder;
+    ObjectLedger& ledger;
+    MaintenancePort& port;
     std::shared_ptr<MaintenanceClock> clock;
     MaintenanceTraceHook trace;
     std::function<void(std::string_view)> stage_hook;
@@ -75,20 +73,22 @@ struct MaintenanceDependencies {
     Clock::time_point constructed;
 };
 
-// The node's maintenance pass, as a component: metadata and catalogue
+// The node's maintenance pass: metadata and catalogue
 // convergence, the claim walk and network repair, tombstones, retention
 // release, garbage collection, rebalance, compaction and scrub, on one
 // thread, paced against the classes above it.
-class Maintenance final : public Component {
+class Maintenance final {
   public:
     explicit Maintenance(MaintenanceDependencies);
-    ~Maintenance() override;
+    ~Maintenance();
+    Maintenance(const Maintenance&) = delete;
+    Maintenance& operator=(const Maintenance&) = delete;
 
-    std::string_view name() const noexcept override { return "maintenance"; }
-    std::vector<std::string> required() const override { return MaintenanceContracts::names(); }
-    void start() override;
-    void request_stop() noexcept override;
-    void stop() override;
+    void start();
+    // Signals the pass to stop and returns.
+    void request_stop() noexcept;
+    // Stops the pass, requesting it first if nobody has, and joins it.
+    void stop();
 
   private:
     void run(std::stop_token);

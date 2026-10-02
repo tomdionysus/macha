@@ -19,11 +19,9 @@
 #include "api/status_api.hpp"
 #include "torrent/torrent.hpp"
 #include "observation.hpp"
-#include "component/composition_root.hpp"
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
-#include "ledger/node_horizon_builder.hpp"
-#include "ledger/retention_ledger.hpp"
+#include "service/node_services.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
@@ -37,9 +35,6 @@
 
 namespace macha {
 
-// Each step of the service's start and stop, in order ("start ingest",
-// "request_stop streaming", "subsystem fuse"), for the lifecycle recorder.
-using LifecycleHook = std::function<void(std::string_view event)>;
 
 // What a test injects into a Service. Production passes none of it: the
 // system clock, no trace and no lifecycle record.
@@ -78,48 +73,28 @@ class Service {
     // deliberately: declared first, destroyed last, so a subsystem being torn
     // down can still withdraw itself.
     SubsystemRegistry registry_;
-    SubsystemSupervisor subsystems_;
     SessionApi session_api_;
     UsersApi users_api_;
     WebApi web_;
     std::unique_ptr<HttpServer> catalogue_http_;
-
-    std::unique_ptr<DistributedStore> store_;
-    std::unique_ptr<MetadataManager> metadata_;
-    std::unique_ptr<CatalogueManager> catalogue_;
-    PlaybackTracker playback_;
-    std::unique_ptr<FileSystem> fs_;
-    std::unique_ptr<CatalogueHintQueue> catalogue_hints_;
-    std::unique_ptr<MediaInformationService> media_information_;
-    std::unique_ptr<CatalogueScanner> scanner_;
-    std::unique_ptr<HydrationManager> hydration_;
-    std::unique_ptr<IngestManager> ingest_;
-    std::unique_ptr<TorrentSearchManager> torrent_search_;
-    std::unique_ptr<ClusterJobView> cluster_jobs_;
-    std::unique_ptr<TorrentCoordinator> torrent_coordinator_;
-    std::unique_ptr<AcquisitionApi> acquisition_api_;
-    std::unique_ptr<CatalogueApi> catalogue_api_;
-    std::unique_ptr<ManageApi> manage_api_;
-    std::unique_ptr<PlaybackManager> streaming_;
+    // Service rings the maintenance pass through its port, and reads its
+    // diagnostics there, before the pass exists and after it has gone.
+    MaintenancePort maintenance_port_;
+    MaintenanceStageHook maintenance_stage_hook_;
+    // Everything built once the node's local state has recovered: the
+    // node's composition root (see node_services.hpp). Set once by the
+    // startup thread and published by services_ready_.
+    std::unique_ptr<NodeServices> services_;
 
     std::jthread startup_;
     std::atomic_bool services_ready_{};
+    std::atomic_bool stopped_{};
     std::atomic_bool startup_failed_{};
     mutable std::mutex startup_mutex_;
     std::condition_variable startup_cv_;
     std::string startup_error_;
     StartupStallHandler startup_stall_handler_;
 
-    // Service rings the maintenance pass through its port, and reads its
-    // diagnostics there, before the pass exists and after it has gone.
-    MaintenancePort maintenance_port_;
-    MaintenanceStageHook maintenance_stage_hook_;
-    // Built once the node's stores exist; the pass's ObjectLedger.
-    std::unique_ptr<RetentionLedger> ledger_;
-    std::unique_ptr<NodeHorizonBuilder> horizon_builder_;
-    // Owns the components moved out of Service so far (maintenance). After
-    // every service it uses, so it stops and is destroyed before them.
-    CompositionRoot root_{[this](std::string_view event) { note_lifecycle(event); }};
     // Observation for the object ledger experiment's T0: written to a local
     // file under the state path, never to Status or any API response.
     std::unique_ptr<ObservationRecorder> observation_recorder_;
@@ -134,7 +109,6 @@ class Service {
     HttpResponse health_response() const;
     bool capability_request(const HttpRequest&);
     void signal_maintenance(ServiceEvent);
-    void retain_metadata_publication(const MetadataPublicationContext&);
 
   public:
     // The role a request needs, or empty when a valid session is enough.
@@ -153,30 +127,30 @@ class Service {
     }
     FileSystem& filesystem() {
         wait_services_ready();
-        return *fs_;
+        return services_->filesystem();
     }
     NodeRuntime& node() {
         return node_;
     }
     MetadataManager& metadata_manager() {
         wait_services_ready();
-        return *metadata_;
+        return services_->metadata();
     }
     CatalogueManager& catalogue() {
         wait_services_ready();
-        return *catalogue_;
+        return services_->catalogue();
     }
     CatalogueHintQueue& catalogue_hints() {
         wait_services_ready();
-        return *catalogue_hints_;
+        return services_->catalogue_hints();
     }
     HydrationManager& hydration() {
         wait_services_ready();
-        return *hydration_;
+        return services_->hydration();
     }
     IngestManager& ingest() {
         wait_services_ready();
-        return *ingest_;
+        return services_->ingest();
     }
     // Null when no torrent plugin is loaded here, or while a faulted one is
     // between restarts. Callers hold the returned pointer for the duration of
@@ -186,14 +160,14 @@ class Service {
         return registry_.torrent();
     }
     ClusterJobView& cluster_jobs() {
-        return *cluster_jobs_;
+        return services_->cluster_jobs();
     }
     TorrentCoordinator& torrent_coordinator() {
-        return *torrent_coordinator_;
+        return services_->torrent_coordinator();
     }
     AcquisitionApi& acquisition_api() {
         wait_services_ready();
-        return *acquisition_api_;
+        return services_->acquisition_api();
     }
     uint64_t maintenance_wakeups() const noexcept {
         return maintenance_port_.wakeups.load(std::memory_order_acquire);
@@ -214,7 +188,7 @@ class Service {
     }
     DistributedStore::RepairDiagnostics repair_diagnostics() {
         wait_services_ready();
-        return store_->repair_diagnostics();
+        return services_->store().repair_diagnostics();
     }
     // Null when this node has no mount: not configured for one, or its FUSE
     // subsystem is faulted between restarts. See SubsystemRegistry.

@@ -287,7 +287,6 @@ set(MACHA_CORE_SOURCES
     src/contract/gates.cpp
     src/ledger/node_horizon_builder.cpp
     src/ledger/predicate_query.cpp
-    src/component/composition_root.cpp
     src/observation.cpp
     src/durable_file.cpp
     src/json.cpp
@@ -355,6 +354,7 @@ set(MACHA_CORE_SOURCES
     src/service/claim_walk.cpp
     src/service/maintenance.cpp
     src/service/service.cpp
+    src/service/node_services.cpp
 )
 
 add_library(macha_core SHARED ${MACHA_CORE_SOURCES})
@@ -592,8 +592,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_predicates.cpp
         tests/test_catalogue_maintenance.cpp
         tests/test_namespace_entries.cpp
-        tests/test_claim_walk.cpp
-        tests/test_component.cpp)
+        tests/test_claim_walk.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"

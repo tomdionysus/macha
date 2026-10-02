@@ -468,11 +468,12 @@ Stage 0:
 - **One component model for core and plugins.** `Subsystem`'s lifecycle and
   fault sink are generalised into a component contract that core
   components implement too.
-- **A composition root** builds the graph from the declarations and hands
-  each component exactly its declared dependencies as contracts.
-  Dependencies are constructor parameters typed by contract, so a missing
-  dependency does not compile; the graph and its order are assembled at run
-  time. `SubsystemContext` becomes a view of the graph.
+- **A composition root, written as code** (decision log 2026-10-02, T5):
+  a class whose members are the concrete components in dependency order,
+  each constructed with references to the members before it; start in that
+  order, stop in reverse. No run-time registry, no names: a missing
+  dependency does not compile, and the graph is read off the declarations.
+  `SubsystemContext` is filled from the root's members.
 - **Start and stop order is behaviour.** The order the root derives is
   tested equal to today's construction, start and stop order, or pinned
   where the graph leaves it free; startup waits (`wait_services_ready`) and
@@ -964,6 +965,24 @@ supersede earlier ones where they conflict.
   baseline is `object-ledger-evidence/t0/baseline.md`; its thin series are
   weak thresholds, marked. The conflict loop and the shutdown hang are
   0.73 behaviour (T0's diff is observation only), recorded in ACTIVE.
+- **2026-10-02 (T5). The composition root is code, not a framework**
+  (operator: "no sacred cows ... rewrite all the code for IoC (no silly
+  framework style injection, instantiate concrete classes, work out the dep
+  graph)"). T2's run-time root (`CompositionRoot`, `Component`,
+  `Dependencies<...>`, `ContractName`) is removed. The node's services are
+  one class, `NodeServices` (`src/service/node_services.*`), whose members
+  are the concrete components declared in dependency order, each given its
+  collaborators as constructor references: construction follows the graph,
+  destruction reverses it, `start()` walks it, `stop()` reverses it. The
+  graph is worked out and written in the header. `Service` stays the node's
+  shell: what exists before local state recovers (node, status, HTTP,
+  registry, the maintenance port). Today's lifecycle order is not
+  preserved where the graph says otherwise: hydration starts before the
+  plugins that use it; maintenance stops first among the consumers; the
+  HTTP server stops before the services it routes into; the shell stops
+  once, not twice. The one free choice pinned: producers (plugins, torrent
+  coordinator, cluster jobs) stop first, while the node still admits DATA
+  work and outbound RPC, then outbound calls are cancelled.
 - **2026-10-02 (T4a). The metadata contract is two contracts**: the view
   (`MetadataView`) and the component's upkeep (`MetadataMaintenance`), so
   no reader sees repair; the survey is the compiler's, the contract's

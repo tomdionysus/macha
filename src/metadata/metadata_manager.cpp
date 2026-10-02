@@ -53,8 +53,10 @@ bool bool_reply(const RpcReply& reply) {
 
 } // namespace
 
-MetadataManager::MetadataManager(NodeRuntime& node, DistributedStore* namespace_store)
-    : node_(node), namespace_store_(namespace_store) {
+MetadataManager::MetadataManager(NodeRuntime& node, DistributedStore* namespace_store,
+                                 PublicationRetention publication_retention)
+    : node_(node), namespace_store_(namespace_store),
+      publication_retention_(std::move(publication_retention)) {
     if (!namespace_store_)
         return;
     // Replay writes nodes locally and replicates nothing: a history entry
