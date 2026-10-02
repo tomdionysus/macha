@@ -1,5 +1,22 @@
 # Current release
 
+## 0.79.0 — T5: accounts are their own part (experiment)
+
+The object ledger experiment's T5, continued. No wire format, protocol or
+on-disk format changes; either node can go back to 0.78.0 (or earlier) by
+reinstalling it.
+
+**Account gossip runs on its own schedule.** The user table and sessions
+are still pushed to peers at once when they change; the periodic backstop
+now runs on its own thread at the telemetry cadence and on topology
+changes, so a peer that joins learns the table promptly, rather than on the
+telemetry thread.
+
+Inside, unchanged in behaviour: the user table, sessions, their gossip and
+the first-account creation on a founding node belong to an Accounts part
+the node's root builds; Status, the session and users APIs and request
+authentication use it.
+
 ## 0.78.0 — T5: the root owns local state; the node is the control plane (experiment)
 
 The object ledger experiment's T5, continued. No wire format, protocol or
