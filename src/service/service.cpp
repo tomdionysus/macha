@@ -33,7 +33,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       lifecycle_(std::move(instruments.lifecycle)),
       resources_(config, [clock = clock_] { return clock->now(); }),
       node_(std::move(config), keys, resources_.activity, resources_.data, resources_.memory,
-            resources_.transcode_rates, job_routes_, std::move(startup_stage_hook)),
+            resources_.transcode_rates, job_routes_, resources_.events,
+            std::move(startup_stage_hook)),
       cluster_status_(node_, resources_.activity, resources_.data, resources_.memory),
       session_api_(node_), users_api_(node_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
@@ -504,7 +505,6 @@ void Service::initialise_services(std::stop_token stop) {
 
         auto services = std::make_unique<NodeServices>(
             node_, resources_, job_routes_, registry_, maintenance_port_,
-            [this](ServiceEvent event) { signal_maintenance(event); },
             NodeServicesInstruments{clock_, maintenance_trace_, maintenance_stage_hook_, lifecycle_,
                                     constructed_});
         if (stop.stop_requested())
@@ -518,11 +518,6 @@ void Service::initialise_services(std::stop_token stop) {
             [store = &services->store()] { return store->repair_diagnostics(); });
         cluster_status_.attach_metadata(services->metadata());
         services_ = std::move(services);
-        // Seed one initial validation pass. Later metadata/topology events use
-        // the edge-triggered high-water object; storage-only events still wake
-        // ordinary maintenance without scheduling redundant metadata work.
-        maintenance_port_.metadata_convergence.request(node_.known_metadata_generation());
-        node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
 
         note_lifecycle("services ready");
         services_ready_.store(true, std::memory_order_release);
@@ -621,7 +616,6 @@ void Service::stop() {
         cluster_status_.detach_metadata();
         cluster_status_.detach_subsystem_diagnostics();
         cluster_status_.detach_repair_diagnostics();
-        node_.set_service_event_callback({});
         services_->stop();
     }
     request_stop();
@@ -672,20 +666,6 @@ std::map<std::string, uint64_t> Service::observation_gauges() {
         gauges["fuse_parked_publications"] = fuse.parked_publications;
     }
     return gauges;
-}
-
-void Service::signal_maintenance(ServiceEvent event) {
-    if (event == ServiceEvent::metadata && services_ready_.load(std::memory_order_acquire))
-        services_->media_information().request_prune();
-    bool wake = true;
-    if (event == ServiceEvent::metadata || event == ServiceEvent::topology)
-        wake = maintenance_port_.metadata_convergence.request(node_.known_metadata_generation());
-    maintenance_port_.event.fetch_add(1, std::memory_order_release);
-    // A burst while the pass is queued or running only advances the high-water
-    // epoch; the active owner schedules one follow-up, so waking it per notice
-    // adds nothing.
-    if (wake)
-        maintenance_port_.wait_cv.notify_all();
 }
 
 

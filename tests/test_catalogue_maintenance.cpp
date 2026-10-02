@@ -68,7 +68,7 @@ struct Node {
         node.emplace(config, cluster.keys());
         node->start();
         REQUIRE(node->wait_local_state_ready(10s));
-        store.emplace(*node, node->resources.activity, node->resources.data, node->resources.memory);
+        store.emplace(*node, node->resources.activity, node->resources.data, node->resources.memory, node->resources.events);
     }
 };
 

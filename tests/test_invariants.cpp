@@ -2335,7 +2335,7 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
 
-    DistributedStore distributed(n1, n1.resources.activity, n1.resources.data, n1.resources.memory);
+    DistributedStore distributed(n1, n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
     const auto bytes = pattern(128 * 1024, 9);
     const auto id = object_id(bytes);
     REQUIRE(distributed.put(id, bytes));

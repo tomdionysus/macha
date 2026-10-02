@@ -109,7 +109,6 @@ class Service {
     // Unauthenticated liveness: whether this node is serving, and nothing more.
     HttpResponse health_response() const;
     bool capability_request(const HttpRequest&);
-    void signal_maintenance(ServiceEvent);
 
   public:
     // The role a request needs, or empty when a valid session is enough.

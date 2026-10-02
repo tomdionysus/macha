@@ -91,7 +91,9 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
     : node_(dependencies.node), store_(dependencies.store), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
-      builder_(dependencies.builder), ledger_(dependencies.ledger), port_(dependencies.port),
+      builder_(dependencies.builder), ledger_(dependencies.ledger),
+      media_information_(dependencies.media_information), events_(dependencies.events),
+      port_(dependencies.port),
       clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
       maintenance_stage_hook_(std::move(dependencies.stage_hook)),
@@ -112,7 +114,10 @@ void Maintenance::request_stop() noexcept {
     if (!thread_.joinable())
         return;
     thread_.request_stop();
-    port_.wait_cv.notify_all();
+    {
+        std::lock_guard lock(events_.wait_mutex);
+    }
+    events_.wait_cv.notify_all();
 }
 
 void Maintenance::stop() {
@@ -203,7 +208,14 @@ void Maintenance::run(std::stop_token stop) {
     auto catalogue_retry_due = Clock::time_point{};
     auto formation_settle_due = Clock::time_point{};
     uint64_t last_local_metadata_generation = node_.metadata_replica().committed_generation();
-    uint64_t observed_event = port_.event.load(std::memory_order_acquire);
+    // Events before the pass existed are not replayed; one convergence run
+    // validates the state they left.
+    absorbed_storage_ = events_.count(NodeEvent::storage);
+    absorbed_metadata_ = events_.count(NodeEvent::metadata);
+    absorbed_topology_ = events_.count(NodeEvent::topology);
+    absorbed_total_ = absorbed_storage_ + absorbed_metadata_ + absorbed_topology_;
+    port_.metadata_convergence.request(node_.known_metadata_generation());
+    uint64_t observed_event = absorbed_total_;
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
     auto gc_quiescent_until = Clock::time_point{};
@@ -247,13 +259,14 @@ void Maintenance::run(std::stop_token stop) {
         };
         enter_stage("pass-begin");
         auto now = clock_->now();
+        absorb_events();
         metadata_dirty = port_.metadata_convergence.pending();
         const auto metadata_demand = port_.metadata_convergence.diagnostics().requested_epoch;
         if (metadata_demand != last_metadata_demand_epoch) {
             metadata_retry_due = Clock::time_point{};
             last_metadata_demand_epoch = metadata_demand;
         }
-        const auto current_event = port_.event.load(std::memory_order_acquire);
+        const auto current_event = events_.total();
         const bool event_changed = current_event != observed_event;
         observed_event = current_event;
         const auto local_metadata_generation = node_.metadata_replica().committed_generation();
@@ -1151,7 +1164,7 @@ void Maintenance::run(std::stop_token stop) {
 
         // A maintenance action can itself commit metadata (retiring a matured garbage
         // marker, say); that event must not be lost for arriving before the wait.
-        if (port_.event.load(std::memory_order_acquire) != observed_event)
+        if (events_.total() != observed_event)
             continue;
 
         enter_stage("wait");
@@ -1171,12 +1184,37 @@ void Maintenance::run(std::stop_token stop) {
                                                                (gc_due_this_pass ? 2 : 0)),
                                           std::memory_order_release);
         }
-        std::unique_lock wait_lock(port_.wait_mutex);
-        const auto waiting_event = port_.event.load(std::memory_order_acquire);
-        auto changed = [this, waiting_event] {
-            return port_.event.load(std::memory_order_acquire) != waiting_event;
-        };
-        clock_->wait_until(port_.wait_cv, wait_lock, stop, deadline, changed);
+        wait_for_events(stop, deadline);
+    }
+}
+
+bool Maintenance::absorb_events() {
+    const auto storage = events_.count(NodeEvent::storage);
+    const auto metadata = events_.count(NodeEvent::metadata);
+    const auto topology = events_.count(NodeEvent::topology);
+    bool wake = storage != absorbed_storage_;
+    if (metadata != absorbed_metadata_)
+        media_information_.request_prune();
+    if (metadata != absorbed_metadata_ || topology != absorbed_topology_)
+        wake = port_.metadata_convergence.request(node_.known_metadata_generation()) || wake;
+    absorbed_storage_ = storage;
+    absorbed_metadata_ = metadata;
+    absorbed_topology_ = topology;
+    absorbed_total_ = storage + metadata + topology;
+    return wake;
+}
+
+void Maintenance::wait_for_events(std::stop_token stop, Clock::time_point deadline) {
+    // The predicate only compares counts: absorbing reads the metadata
+    // replica, which must not happen under the lock notify() takes.
+    while (!stop.stop_requested() && clock_->now() < deadline) {
+        {
+            std::unique_lock wait_lock(events_.wait_mutex);
+            clock_->wait_until(events_.wait_cv, wait_lock, stop, deadline,
+                               [this] { return events_.total() != absorbed_total_; });
+        }
+        if (events_.total() != absorbed_total_ && absorb_events())
+            return;
     }
 }
 } // namespace macha
