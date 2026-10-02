@@ -33,7 +33,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       lifecycle_(std::move(instruments.lifecycle)),
       resources_(config, [clock = clock_] { return clock->now(); }),
       identity_(config.state_path, keys),
-      node_(std::move(config), identity_, resources_.activity, resources_.data, resources_.memory,
+      node_(std::move(config), identity_, progress_, resources_.activity, resources_.data, resources_.memory,
             resources_.transcode_rates, routes_, resources_.events,
             std::move(startup_stage_hook)),
       cluster_status_(node_, resources_.activity, resources_.data, resources_.memory),

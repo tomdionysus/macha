@@ -174,12 +174,13 @@ std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uin
 
 } // namespace
 
-NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, ActivityClocks& activity,
+NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryProgress& progress,
+                         ActivityClocks& activity,
                          DataResourceArbiter& data_resources,
                          RetainedMemoryLedger& retained_memory,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes, NodeEvents& events,
                          StartupStageHook startup_stage_hook)
-    : cfg_(normalize_config(std::move(config))), identity_(identity),
+    : cfg_(normalize_config(std::move(config))), identity_(identity), progress_(progress),
       activity_(activity), data_resources_(data_resources), retained_memory_(retained_memory),
       transcode_rates_(transcode_rates), routes_(routes), events_(events),
       inbound_(initial_inbound_resolution(cfg_)),
@@ -290,7 +291,7 @@ NodeRuntime::~NodeRuntime() {
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
-    return local_ready_.load(std::memory_order_acquire) && !progress_.failed();
+    return progress_.complete() && !progress_.failed();
 }
 
 NodeReadiness NodeRuntime::readiness() const {
@@ -304,7 +305,7 @@ NodeReadiness NodeRuntime::readiness() const {
     out.local_state_ready = all_local_state_ready();
     out.failed = progress_.failed();
     out.started_unix_ms = startup_unix_ms_;
-    out.ready_unix_ms = ready_unix_ms_.load(std::memory_order_acquire);
+    out.ready_unix_ms = progress_.ready_unix_ms();
     out.error = progress_.error();
     return out;
 }
@@ -333,13 +334,9 @@ void NodeRuntime::advertise_cache(uint64_t capacity, uint64_t used, const CacheA
 }
 
 bool NodeRuntime::wait_local_state_ready(std::chrono::milliseconds timeout) {
-    if (all_local_state_ready())
-        return true;
-    std::unique_lock lock(readiness_mutex_);
-    readiness_cv_.wait_for(lock, timeout, [this] {
-        return all_local_state_ready() || progress_.failed() || !started_.load();
-    });
-    return all_local_state_ready();
+    if (!started_.load(std::memory_order_acquire) && !all_local_state_ready())
+        return false;
+    return progress_.wait_complete(timeout) && !progress_.failed();
 }
 
 StoragePool& NodeRuntime::local_store() {
@@ -408,7 +405,6 @@ void NodeRuntime::recover_local(std::stop_token stop) {
         return;
     } catch (const std::exception&) {
         // LocalState recorded and logged the failure.
-        readiness_cv_.notify_all();
         signal_telemetry_refresh();
         return;
     }
@@ -428,12 +424,7 @@ void NodeRuntime::recover_local(std::stop_token stop) {
                               local_state_->cache()},
         data_resources_, activity_, events_, routes_, cfg_.extent_size, cfg_.cache.max_blocks,
         cfg_.heartbeat);
-    ready_unix_ms_.store(unix_ms(), std::memory_order_release);
-    local_ready_.store(true, std::memory_order_release);
-    {
-        std::lock_guard lock(readiness_mutex_);
-    }
-    readiness_cv_.notify_all();
+    progress_.mark_complete(unix_ms());
     // Publish the phase now rather than up to a sampling interval later, so
     // peers do not keep seeing "recovering" after the node is ready.
     signal_telemetry_refresh();
@@ -706,7 +697,6 @@ void NodeRuntime::request_stop() {
         maintenance_.request_stop();
         maintenance_wait_cv_.notify_all();
     }
-    readiness_cv_.notify_all();
 }
 
 void NodeRuntime::cancel_outbound_calls() {
@@ -1338,7 +1328,7 @@ void NodeRuntime::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         // Readiness is orthogonal to membership: refresh available local
         // planes, then exchange regardless.
-        if (local_ready_.load(std::memory_order_acquire))
+        if (progress_.complete())
             advertise_metadata_generation(local_state_->replica().generation());
 
         std::set<std::pair<std::string, uint16_t>> exchanged;

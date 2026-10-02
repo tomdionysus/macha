@@ -262,6 +262,7 @@ class TestService {
 struct BareNodeResources {
     NodeResources resources;
     NodeIdentity identity;
+    RecoveryProgress progress;
     MessageRoutes routes;
     BareNodeResources(const Config& config, ClusterKeys keys)
         : resources(config), identity(config.state_path, std::move(keys)) {}
@@ -273,7 +274,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
   public:
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
         : BareNodeResources(config, keys),
-          NodeRuntime(std::move(config), identity, resources.activity, resources.data,
+          NodeRuntime(std::move(config), identity, progress, resources.activity, resources.data,
                       resources.memory, resources.transcode_rates, routes,
                       resources.events, std::move(hook)) {}
     ~BareNode() { stop(); }
