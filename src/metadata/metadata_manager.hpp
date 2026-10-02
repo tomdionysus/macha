@@ -190,7 +190,12 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // application for tree deltas through it (spec B2: commit application
     // is declared here, unchanged). Without one the manager serves
     // map-backed namespaces only, as the tests that need no store do.
-    explicit MetadataManager(NodeRuntime&, DistributedStore* namespace_store = nullptr);
+    // `publication_retention`, when given, runs before every commit is
+    // published: Service's claims barrier, which makes every object the new
+    // head refers to durably claimed first.
+    using PublicationRetention = std::function<void(const MetadataPublicationContext&)>;
+    explicit MetadataManager(NodeRuntime&, DistributedStore* namespace_store = nullptr,
+                             PublicationRetention publication_retention = {});
 
     // Where namespace tree nodes live, for a snapshot whose namespace is a
     // tree. Supplied rather than constructed here because the manager has a
@@ -201,9 +206,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     //
     // Unset until Service has a store, and irrelevant while no snapshot
     // carries a root -- which is every snapshot today.
-    void set_publication_retention(std::function<void(const MetadataPublicationContext&)> guard) {
-        publication_retention_ = std::move(guard);
-    }
     MetadataRecord read_record();
     MetadataRecord record() override { return read_record(); }
     MetadataSnapshot snapshot();

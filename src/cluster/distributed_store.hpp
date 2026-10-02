@@ -19,6 +19,14 @@
 #include <vector>
 
 namespace macha {
+// How a store is built beyond its node: where repair keeps its place across
+// restarts (none: each pass starts at the beginning), and the decision trace
+// repair reports to (tests; none in production).
+struct DistributedStoreOptions {
+    std::optional<std::filesystem::path> repair_position;
+    std::function<void(std::string_view, std::string_view)> repair_trace;
+};
+
 class DistributedStore final : public Placement {
   public:
     struct ObjectBuffer {
@@ -193,9 +201,6 @@ class DistributedStore final : public Placement {
     }
 
   public:
-    void set_repair_trace(std::function<void(std::string_view, std::string_view)> trace) {
-        repair_trace_ = std::move(trace);
-    }
     enum class RepairGate { ran, share, quiescent, credit };
     void note_repair_gate(RepairGate gate, double credit) noexcept {
         repair_last_credit_.store(static_cast<uint64_t>(std::max(0.0, credit)),
@@ -274,7 +279,7 @@ class DistributedStore final : public Placement {
     void note_network(uint64_t, Clock::duration);
 
   public:
-    explicit DistributedStore(NodeRuntime& n);
+    explicit DistributedStore(NodeRuntime& n, DistributedStoreOptions options = {});
     ~DistributedStore();
     struct PromptReplicationStats {
         uint64_t queued{};
@@ -354,7 +359,6 @@ class DistributedStore final : public Placement {
     // does not re-check (a full read each on the peer) everything it had
     // already copied. The node's own repair store enables this; a store
     // without it starts each pass at the beginning.
-    void persist_repair_position(std::filesystem::path path);
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,

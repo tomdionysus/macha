@@ -1235,19 +1235,21 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     return true;
 }
 
-DistributedStore::DistributedStore(NodeRuntime& n) : n_(n) {
+DistributedStore::DistributedStore(NodeRuntime& n, DistributedStoreOptions options)
+    : n_(n), repair_trace_(std::move(options.repair_trace)) {
+    // Keep where the push pass has reached, and resume from it.
+    if (options.repair_position) {
+        repair_position_path_ = std::move(*options.repair_position);
+        std::ifstream in(repair_position_path_);
+        uint64_t settled = 0;
+        if (in >> settled && settled)
+            repair_push_resume_ = settled;
+    }
     prompt_thread_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("prompt-replication", stop, [this, stop] { prompt_replication_loop(stop); });
     });
 }
 
-void DistributedStore::persist_repair_position(std::filesystem::path path) {
-    repair_position_path_ = std::move(path);
-    std::ifstream in(repair_position_path_);
-    uint64_t settled = 0;
-    if (in >> settled && settled)
-        repair_push_resume_ = settled;
-}
 
 void DistributedStore::save_repair_position(bool force) {
     if (repair_position_path_.empty() || repair_push_settled_ == repair_position_saved_)

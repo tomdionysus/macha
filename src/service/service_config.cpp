@@ -37,15 +37,12 @@ void Service::reload_config() {
     Log::set_logger(std::make_shared<ConsoleLogger>(updated.log_level));
     configure_ffmpeg_logging(updated.ffmpeg_log_level);
     node_.reconfigure_local(updated);
-    scanner_->reconfigure(updated.catalogue.scanner);
-    hydration_->reconfigure(updated.hydration, updated.read_ahead_extents);
-    ingest_->reconfigure(updated.ingest);
-    cluster_jobs_->reconfigure(updated.torrent);
+    if (services_ready_.load(std::memory_order_acquire))
+        services_->reconfigure(updated);
     if (auto torrents = registry_.torrent())
         torrents->reconfigure(updated.torrent);
     if (streaming_restart_required)
         Log::warn("streaming enable/buffer/probe/path/codec changes require restart; live limits were reloaded");
-    streaming_->reconfigure(updated.streaming);
     Log::info("reloaded storage backends, persistent cache, catalogue scanner, ingest, torrent, hydration and streaming limits");
 }
 

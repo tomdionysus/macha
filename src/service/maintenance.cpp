@@ -89,14 +89,10 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 } // namespace
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
-    : node_(dependencies.contracts.get<NodeRuntime>()),
-      store_(dependencies.contracts.get<DistributedStore>()),
-      metadata_(dependencies.contracts.get<MetadataView>()),
-      metadata_upkeep_(dependencies.contracts.get<MetadataMaintenance>()),
-      catalogue_(dependencies.contracts.get<CatalogueManager>()),
-      builder_(dependencies.contracts.get<HorizonBuilder>()),
-      ledger_(dependencies.contracts.get<ObjectLedger>()),
-      port_(dependencies.contracts.get<MaintenancePort>()), clock_(std::move(dependencies.clock)),
+    : node_(dependencies.node), store_(dependencies.store), metadata_(dependencies.metadata),
+      metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
+      builder_(dependencies.builder), ledger_(dependencies.ledger), port_(dependencies.port),
+      clock_(std::move(dependencies.clock)),
       maintenance_trace_(std::move(dependencies.trace)),
       maintenance_stage_hook_(std::move(dependencies.stage_hook)),
       constructed_(dependencies.constructed) {}

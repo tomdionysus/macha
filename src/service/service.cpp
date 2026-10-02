@@ -32,14 +32,12 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       maintenance_trace_(std::move(instruments.trace)),
       lifecycle_(std::move(instruments.lifecycle)), node_(std::move(config), keys, std::move(startup_stage_hook),
             [clock = clock_] { return clock->now(); }), cluster_status_(node_),
-      subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       session_api_(node_), users_api_(node_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
-      startup_stall_handler_(std::move(startup_stall_handler)),
-      maintenance_stage_hook_(std::move(maintenance_stage_hook)) {
+      maintenance_stage_hook_(std::move(maintenance_stage_hook)),
+      startup_stall_handler_(std::move(startup_stall_handler)) {
     cluster_status_.attach_convergence_diagnostics(
         [this] { return maintenance_port_.metadata_convergence.diagnostics(); });
-    cluster_status_.attach_subsystem_diagnostics([this] { return subsystems_.statuses(); });
     // Installed once, for the life of the Service, rather than re-attached
     // whenever a mount comes and goes: the registry already answers "is there
     // a frontend right now", and a supervised FUSE can be rebuilt underneath
@@ -233,10 +231,10 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     }
 
     if (request.path.starts_with("/api/v1/playback/"))
-        return streaming_->handle(request);
+        return services_->streaming().handle(request);
     if (request.path.starts_with("/api/v1/ingest/") ||
         request.path.starts_with("/api/v1/torrents/"))
-        return acquisition_api_->handle(request);
+        return services_->acquisition_api().handle(request);
     constexpr std::string_view blocked_namespace_op_path =
         "/api/v1/manage/filesystem/blocked-namespace-operation";
     if (request.path == blocked_namespace_op_path) {
@@ -391,8 +389,8 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
         return {204, "application/json; charset=utf-8", {}, {}};
     }
     if (request.path.starts_with("/api/v1/manage"))
-        return manage_api_->handle(request);
-    return catalogue_api_->handle(request);
+        return services_->manage_api().handle(request);
+    return services_->catalogue_api().handle(request);
 }
 
 HttpResponse Service::health_response() const {
@@ -456,9 +454,9 @@ bool Service::capability_request(const HttpRequest& request) {
         return true;
     if (!services_ready_.load(std::memory_order_acquire))
         return false;
-    if (streaming_ && streaming_->capability_request(request))
+    if (services_->streaming().capability_request(request))
         return true;
-    return catalogue_api_ && catalogue_api_->capability_request(request);
+    return services_->catalogue_api().capability_request(request);
 }
 
 std::string Service::describe_readiness_stall() const {
@@ -560,160 +558,27 @@ void Service::initialise_services(std::stop_token stop) {
         if (stop.stop_requested())
             return;
 
-        auto store = std::make_unique<DistributedStore>(node_);
-        store->persist_repair_position(node_.config().state_path / "repair" / "push-position");
-        auto metadata = std::make_unique<MetadataManager>(node_, store.get());
-        auto catalogue = std::make_unique<CatalogueManager>(node_, *store, *metadata);
-        auto fs = std::make_unique<FileSystem>(node_, *store, *metadata, &playback_);
-        auto catalogue_hints = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
-        std::shared_ptr<MediaEngine> media_engine;
-        if (node_.config().streaming.enabled)
-            media_engine = make_libav_media_engine(node_.config().streaming);
-        auto media_information = std::make_unique<MediaInformationService>(
-            *fs, *catalogue, media_engine, node_.config().state_path);
-        auto scanner = std::make_unique<CatalogueScanner>(node_, *fs, *catalogue, *catalogue_hints,
-                                                          node_.config().catalogue.scanner,
-                                                          std::unique_ptr<HttpClient>{},
-                                                          std::chrono::seconds(5), media_engine,
-                                                          media_information.get());
-        auto hydration = std::make_unique<HydrationManager>(*store, playback_, *fs, *catalogue,
-                                                            node_.config().hydration,
-                                                            node_.config().read_ahead_extents);
-        auto ingest = std::make_unique<IngestManager>(
-            node_, *fs, *catalogue_hints, node_.config().ingest, media_information.get());
-        auto torrent_search = std::make_unique<TorrentSearchManager>(node_.config().torrent);
-        auto cluster_jobs = std::make_unique<ClusterJobView>(node_, *ingest, registry_);
-        auto torrent_coordinator = std::make_unique<TorrentCoordinator>(
-            node_, *metadata, registry_, *cluster_jobs, node_.config().state_path);
-        auto acquisition_api = std::make_unique<AcquisitionApi>(*ingest, registry_, *torrent_search,
-                                                                *cluster_jobs, *torrent_coordinator);
-        auto catalogue_api = std::make_unique<CatalogueApi>(
-            *catalogue, *catalogue_hints,
-            [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
-                scanner_ptr->request_media_rescan(media_ids);
-            },
-            [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
-                return scanner_ptr->request_media_profiles(media_ids);
-            },
-            [information = media_information.get(), fs_ptr = fs.get()](const std::string& media_id)
-                -> std::optional<MediaProbeResult> {
-                // Facts on demand: resolve at foreground priority and persist,
-                // so a client asking what a file is never gets "not yet".
-                if (!information) return std::nullopt;
-                auto found = fs_ptr->find_media(media_id);
-                if (!found) return std::nullopt;
-                return information->resolve_playback(media_id, found->first, found->second,
-                                                     Clock::now() + std::chrono::seconds(30));
-            },
-            node_.config().catalogue.api.artwork_capability_ttl,
-            [fs_ptr = fs.get()](const std::string& media_id) -> std::optional<uint64_t> {
-                auto found = fs_ptr->find_media(media_id);
-                if (!found) return std::nullopt;
-                return found->second.size;
-            },
-            [information = media_information.get()](const std::string& media_id)
-                -> std::optional<Bytes> {
-                if (!information) return std::nullopt;
-                return information->keyframe_index(media_id, Clock::now() + std::chrono::seconds(30));
-            });
-        auto manage_api = std::make_unique<ManageApi>(node_, *metadata, *fs, *catalogue,
-                                                      *catalogue_hints, *scanner);
-        auto streaming = std::make_unique<PlaybackManager>(
-            *fs, *catalogue, node_.config().catalogue.api, node_.config().streaming,
-            media_engine,
-            [scanner_ptr = scanner.get()](const std::vector<std::string>& media_ids) {
-                return scanner_ptr->request_media_profiles(media_ids);
-            }, media_information.get());
-
-        metadata->set_publication_retention([this](const MetadataPublicationContext& context) {
-            retain_metadata_publication(context);
-        });
-
-        store_ = std::move(store);
-        store_->set_repair_trace(maintenance_trace_);
-        // Repair is the only component that learns an object is unobtainable,
-        // and it learns it in the ordinary course of a maintenance pass. Wire
-        // its counters to Status now that the store exists.
-        cluster_status_.attach_repair_diagnostics(
-            [store = store_.get()] { return store->repair_diagnostics(); });
-        metadata_ = std::move(metadata);
-        catalogue_ = std::move(catalogue);
-        fs_ = std::move(fs);
-        catalogue_hints_ = std::move(catalogue_hints);
-        media_information_ = std::move(media_information);
-        scanner_ = std::move(scanner);
-        hydration_ = std::move(hydration);
-        ingest_ = std::move(ingest);
-        torrent_search_ = std::move(torrent_search);
-        cluster_jobs_ = std::move(cluster_jobs);
-        torrent_coordinator_ = std::move(torrent_coordinator);
-        acquisition_api_ = std::move(acquisition_api);
-        catalogue_api_ = std::move(catalogue_api);
-        manage_api_ = std::move(manage_api);
-        streaming_ = std::move(streaming);
-
+        auto services = std::make_unique<NodeServices>(
+            node_, registry_, maintenance_port_,
+            [this](ServiceEvent event) { signal_maintenance(event); },
+            NodeServicesInstruments{clock_, maintenance_trace_, maintenance_stage_hook_, lifecycle_,
+                                    constructed_});
         if (stop.stop_requested())
             return;
-
-        note_lifecycle("services constructed");
-        note_lifecycle("start media-information");
-        media_information_->start();
-        note_lifecycle("start ingest");
-        ingest_->start();
-        note_lifecycle("start cluster-jobs");
-        cluster_jobs_->start();
-        note_lifecycle("start torrent-coordinator");
-        torrent_coordinator_->start();
-        // Only now: a subsystem plugin's context hands out references to the
-        // services above (the torrent plugin needs IngestManager), and none
-        // of them existed when this Service was constructed.
-        //
-        // FUSE is one of them now (libmacha-fuse), discovered from
-        // plugin_path exactly as the torrent plugin is. What that buys is the
-        // whole point of the exercise: a frontend whose journal replay throws
-        // faults that subsystem and is retried, instead of unwinding to
-        // main() and taking metadata, RPC, the HTTP API and playback down
-        // with it. See TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md.
-        SubsystemContext context;
-        context.config = &node_.config();
-        context.node = &node_;
-        context.ingest = ingest_.get();
-        context.registry = &registry_;
-        context.filesystem = fs_.get();
-        context.hydration = hydration_.get();
-        note_lifecycle("start subsystems");
-        subsystems_.start(context);
-        for (const auto& subsystem : subsystems_.statuses())
-            note_lifecycle("subsystem " + subsystem.name);
-        note_lifecycle("start streaming");
-        streaming_->start();
-        note_lifecycle("start scanner");
-        scanner_->start();
-        note_lifecycle("start hydration");
-        hydration_->start();
-        cluster_status_.attach_metadata(*metadata_);
+        services->start();
+        // Status reads the graph through providers that outlive it: attached
+        // now, detached before the graph stops.
+        cluster_status_.attach_subsystem_diagnostics(
+            [subsystems = &services->subsystems()] { return subsystems->statuses(); });
+        cluster_status_.attach_repair_diagnostics(
+            [store = &services->store()] { return store->repair_diagnostics(); });
+        cluster_status_.attach_metadata(services->metadata());
+        services_ = std::move(services);
         // Seed one initial validation pass. Later metadata/topology events use
         // the edge-triggered high-water object; storage-only events still wake
         // ordinary maintenance without scheduling redundant metadata work.
         maintenance_port_.metadata_convergence.request(node_.known_metadata_generation());
         node_.set_service_event_callback([this](ServiceEvent event) { signal_maintenance(event); });
-        ledger_ = std::make_unique<RetentionLedger>(node_.claims(), node_.local_store(),
-                                                    node_.control_store());
-        horizon_builder_ = std::make_unique<NodeHorizonBuilder>(*fs_, *catalogue_, node_, *store_);
-        // What Service still builds and hands to the root's components.
-        root_.external<NodeRuntime>();
-        root_.external<DistributedStore>();
-        root_.external<MetadataView>();
-        root_.external<MetadataMaintenance>();
-        root_.external<CatalogueManager>();
-        root_.external<HorizonBuilder>();
-        root_.external<ObjectLedger>();
-        root_.external<MaintenancePort>();
-        root_.add(std::make_unique<Maintenance>(MaintenanceDependencies{
-            MaintenanceContracts(node_, *store_, *metadata_, *metadata_, *catalogue_, *horizon_builder_, *ledger_,
-                                 maintenance_port_),
-            clock_, maintenance_trace_, maintenance_stage_hook_, constructed_}));
-        root_.start();
 
         note_lifecycle("services ready");
         services_ready_.store(true, std::memory_order_release);
@@ -767,133 +632,54 @@ void Service::start() {
 void Service::request_stop() {
     if (startup_.joinable())
         startup_.request_stop();
-    if (fs_) {
-        note_lifecycle("cancel-io filesystem");
-        fs_->request_io_cancellation();
-    }
-    if (ingest_) {
-        note_lifecycle("request_stop ingest");
-        ingest_->request_stop();
-    }
-    if (scanner_) {
-        note_lifecycle("request_stop scanner");
-        scanner_->request_stop();
-    }
-    if (media_information_) {
-        note_lifecycle("request_stop media-information");
-        media_information_->request_stop();
-    }
-    if (hydration_) {
-        note_lifecycle("request_stop hydration");
-        hydration_->request_stop();
-    }
+    if (services_ready_.load(std::memory_order_acquire))
+        services_->request_stop();
     note_lifecycle("request_stop status");
     cluster_status_.request_stop();
     if (catalogue_http_) {
         note_lifecycle("request_stop catalogue-http");
         catalogue_http_->request_stop();
     }
-    if (streaming_) {
-        note_lifecycle("request_stop streaming");
-        streaming_->request_stop();
-    }
-    if (manage_api_) {
-        note_lifecycle("request_stop manage-api");
-        manage_api_->request_stop();
-    }
-    root_.request_stop();
     note_lifecycle("request_stop node");
     node_.request_stop();
-    // Service maintenance performs synchronous control-replication calls. A
-    // thread stop token wakes its event wait but cannot complete an RPC future.
-    // Close client routes now so every pending call fails promptly before
-    // Service::stop joins the maintenance owner. NodeRuntime::stop later closes
-    // the server and completes the remaining node-owned teardown.
-    node_.cancel_outbound_calls();
     startup_cv_.notify_all();
 }
 
 void Service::stop() {
+    if (stopped_.exchange(true))
+        return;
     Log::debug("shutdown: Service::stop begin");
     const auto stop_started = Clock::now();
     // Gauges read services this stop tears down; the final window goes
     // without them.
     observation_stopping_.store(true, std::memory_order_release);
-    // Before ingest: a subsystem plugin holds references to the services
-    // below it (the torrent plugin submits completed downloads to ingest), so
-    // every plugin instance must be destroyed while they are all still alive.
-    // The coordinator calls into ingest and the torrent plugin, so it stops
-    // first.
-    const auto stop_producers = [this] {
-        if (torrent_coordinator_) {
-            note_lifecycle("stop torrent-coordinator");
-            torrent_coordinator_->stop();
-        }
-        if (cluster_jobs_) {
-            note_lifecycle("stop cluster-jobs");
-            cluster_jobs_->stop();
-        }
-        note_lifecycle("stop subsystems");
-        subsystems_.stop();
-    };
-    // Plugins write into the store until they are stopped -- the torrent
-    // subsystem publishes each verified extent as it goes -- so they stop
-    // while the node still admits DATA work and outbound RPC. Filesystem I/O
-    // is cancelled first, so a FUSE publication in flight ends promptly
-    // rather than holding the stop on a slow peer. Once startup has finished
-    // its thread has returned; a stop during startup keeps the order below,
-    // since startup may be waiting on recovery that request_stop() ends.
-    if (services_ready_.load(std::memory_order_acquire)) {
-        if (startup_.joinable())
-            startup_.join();
-        if (fs_) {
-            note_lifecycle("cancel-io filesystem");
-            fs_->request_io_cancellation();
-        }
-        stop_producers();
-    }
-    request_stop();
-    if (startup_.joinable())
+    // The node's services stop first and completely, while the node still
+    // admits DATA work and outbound RPC: a plugin writes into the store until
+    // it is stopped. A startup still in progress is ended first; it may be
+    // waiting on recovery, which the node's stop request ends.
+    if (startup_.joinable()) {
+        startup_.request_stop();
+        if (!services_ready_.load(std::memory_order_acquire))
+            node_.request_stop();
         startup_.join();
-    stop_producers();
-    if (ingest_) {
-        note_lifecycle("stop ingest");
-        ingest_->stop();
     }
-    if (scanner_) {
-        note_lifecycle("stop scanner");
-        scanner_->stop();
-    }
-    if (media_information_) {
-        note_lifecycle("stop media-information");
-        media_information_->stop();
-    }
-    if (hydration_) {
-        note_lifecycle("stop hydration");
-        hydration_->stop();
-    }
-    cluster_status_.detach_metadata();
-    cluster_status_.detach_subsystem_diagnostics();
-    // The provider holds a raw pointer into store_, which is declared after
-    // cluster_status_ and therefore destroyed before it. Drop it here rather
-    // than relying on nothing calling Status during teardown.
-    cluster_status_.detach_repair_diagnostics();
-    note_lifecycle("stop status");
-    cluster_status_.stop();
+    // The HTTP server routes requests into the services, so it stops before
+    // them; Status reads them only through providers, detached first, and
+    // stays until the node goes.
     if (catalogue_http_) {
         note_lifecycle("stop catalogue-http");
         catalogue_http_->stop();
     }
-    if (streaming_) {
-        note_lifecycle("stop streaming");
-        streaming_->stop();
+    if (services_) {
+        cluster_status_.detach_metadata();
+        cluster_status_.detach_subsystem_diagnostics();
+        cluster_status_.detach_repair_diagnostics();
+        node_.set_service_event_callback({});
+        services_->stop();
     }
-    if (manage_api_) {
-        note_lifecycle("stop manage-api");
-        manage_api_->stop();
-    }
-    root_.stop();
-    node_.set_service_event_callback({});
+    request_stop();
+    note_lifecycle("stop status");
+    cluster_status_.stop();
     Log::debug("shutdown: NodeRuntime::stop calling");
     note_lifecycle("stop node");
     node_.stop();
@@ -915,12 +701,12 @@ std::map<std::string, uint64_t> Service::observation_gauges() {
     const auto idle_ms = [](std::chrono::milliseconds idle) {
         return static_cast<uint64_t>(std::max<int64_t>(0, idle.count()));
     };
-    gauges["foreground_idle_ms"] = idle_ms(store_->foreground_idle_for());
-    gauges["interactive_idle_ms"] = idle_ms(store_->interactive_idle_for());
-    gauges["loader_idle_ms"] = idle_ms(store_->loader_idle_for());
+    gauges["foreground_idle_ms"] = idle_ms(services_->store().foreground_idle_for());
+    gauges["interactive_idle_ms"] = idle_ms(services_->store().interactive_idle_for());
+    gauges["loader_idle_ms"] = idle_ms(services_->store().loader_idle_for());
     // Cumulative since start, as Status reports them; a window's rate is the
     // difference between consecutive windows.
-    const auto repair = store_->repair_diagnostics();
+    const auto repair = services_->store().repair_diagnostics();
     gauges["repair_push_examined"] = repair.push_examined;
     gauges["repair_pull_examined"] = repair.pull_examined;
     gauges["repair_bytes_transferred"] = repair.bytes_transferred;
@@ -942,8 +728,8 @@ std::map<std::string, uint64_t> Service::observation_gauges() {
 }
 
 void Service::signal_maintenance(ServiceEvent event) {
-    if (event == ServiceEvent::metadata && media_information_)
-        media_information_->request_prune();
+    if (event == ServiceEvent::metadata && services_ready_.load(std::memory_order_acquire))
+        services_->media_information().request_prune();
     bool wake = true;
     if (event == ServiceEvent::metadata || event == ServiceEvent::topology)
         wake = maintenance_port_.metadata_convergence.request(node_.known_metadata_generation());
@@ -956,168 +742,5 @@ void Service::signal_maintenance(ServiceEvent event) {
         maintenance_port_.wait_cv.notify_all();
 }
 
-void Service::retain_metadata_publication(const MetadataPublicationContext& context) {
-    const RetentionDot dot{context.origin, context.sequence};
-    std::vector<ObjectId> data;
-    std::vector<ObjectId> control;
-    // Phase timing for the pre-publication barrier: on the live cluster
-    // (2026-09-07) mutations spent 9-15 s here while retain_data() itself
-    // reported nothing over 250 ms, so the seconds were in the collection
-    // step (a full parent snapshot decode, catalogue root diffs) or the
-    // CONTROL claim. Name the phase instead of guessing.
-    const auto barrier_started = Clock::now();
-    uint64_t decode_ms = 0, collect_ms = 0, catalogue_ms = 0, data_ms = 0, control_ms = 0;
-    const auto since_ms = [](Clock::time_point t) {
-        return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t).count());
-    };
-    const auto report = [&](const char* outcome) {
-        const auto total = since_ms(barrier_started);
-        const bool failed = std::string_view(outcome) != "ok";
-        if ((total >= 250 || failed) && Log::enabled(LogLevel::debug))
-            Log::debug("metadata retention barrier dot=" + to_string(dot.origin).substr(0, 6) +
-                       ":" + std::to_string(dot.sequence) + " total_ms=" + std::to_string(total) +
-                       " decode_ms=" + std::to_string(decode_ms) +
-                       " collect_ms=" + std::to_string(collect_ms) +
-                       " catalogue_ms=" + std::to_string(catalogue_ms) +
-                       " data_ms=" + std::to_string(data_ms) +
-                       " control_ms=" + std::to_string(control_ms) +
-                       " data_objects=" + std::to_string(data.size()) +
-                       " control_objects=" + std::to_string(control.size()) +
-                       " outcome=" + outcome);
-    };
-
-    auto add_entry = [&](const FsEntry& entry) {
-        if (entry.type != EntryType::file)
-            return;
-        for (const auto& extent : entry.extents)
-            if (!extent.hole)
-                data.push_back(extent.id);
-    };
-
-    const auto decode_started = Clock::now();
-    auto before = decode_snapshot(context.parent.payload);
-    decode_ms = since_ms(decode_started);
-    const auto collect_started = Clock::now();
-    // Both namespaces below may be trees rather than maps, so every read of
-    // them goes through the namespace primitives. These are retention claims:
-    // an entry missed here is an object that never acquires liveness evidence
-    // and can be collected while it is still referenced.
-    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(node_, *store_);
-    const bool establish_baseline =
-        !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
-    if (establish_baseline) {
-        // Migration safety: before protocol-20 retention-aware GC is enabled for
-        // an upgraded namespace, every object reachable from the reconciled
-        // migration view must acquire physical liveness evidence. This is a
-        // one-time potentially-large publication; normal partition-time GC does
-        // not require global convergence after the baseline exists.
-        for_each_namespace_entry(context.proposed, &namespace_nodes,
-                                 [&](const std::string&, const FsEntry& entry) {
-                                     add_entry(entry);
-                                 });
-        const auto conflict_extents = metadata_conflict_extent_roots(context.proposed);
-        data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());
-        for (const auto& root : metadata_catalogue_root_set(context.proposed)) {
-            auto objects = catalogue_->retention_objects(std::nullopt, root);
-            data.insert(data.end(), objects.data.begin(), objects.data.end());
-            control.insert(control.end(), objects.control.begin(), objects.control.end());
-        }
-        // The namespace tree is control objects too, every one of them
-        // reachable from the root and none of them from anything else.
-        if (context.proposed.namespace_root)
-            collect_namespace_tree_nodes(*context.proposed.namespace_root, namespace_nodes,
-                                         control);
-    } else {
-        if (context.delta) {
-            for (const auto& [_, entry] : context.delta->upsert_entries)
-                add_entry(entry);
-            // A DLT8 append carries only the new extents, but the semantic
-            // change is to the whole file: like the upsert it replaces, it
-            // needs a fresh retention dot on every extent the file now holds
-            // (a touch that carries no extents included), or a concurrent
-            // delete could release the inherited claim.
-            for (const auto& [path, _] : context.delta->append_entries) {
-                if (auto found = namespace_entry(context.proposed, &namespace_nodes, path))
-                    add_entry(*found);
-            }
-        } else {
-            // The no-delta path: rediscover what changed by comparing the
-            // two namespaces entry by entry. Under trees that is a walk of
-            // one plus a lookup per path in the other, which is worse than
-            // the two map walks it replaces -- and it is exactly the cost
-            // Stage C removes by carrying the change set into the commit
-            // instead. This branch is the fallback; every ordinary mutation
-            // arrives with a delta and takes the cheap path above.
-            for_each_namespace_entry(
-                context.proposed, &namespace_nodes,
-                [&](const std::string& path, const FsEntry& entry) {
-                    const auto found = namespace_entry(before, &namespace_nodes, path);
-                    if (!found || *found != entry)
-                        add_entry(entry);
-                });
-        }
-
-        // The tree nodes this commit introduced need claims exactly as the
-        // catalogue shards it changed do. Without them the nodes that say
-        // where every file lives are unreferenced control objects to the
-        // collector, which is what they were from the cutover until this line.
-        if (context.proposed.namespace_root &&
-            before.namespace_root != context.proposed.namespace_root)
-            collect_namespace_tree_changes(before.namespace_root, *context.proposed.namespace_root,
-                                           namespace_nodes, control);
-
-        const bool catalogue_changed =
-            context.delta ? context.delta->catalogue != CatalogueDelta::unchanged
-                          : before.catalogue_root != context.proposed.catalogue_root;
-        if (catalogue_changed && context.proposed.catalogue_root) {
-            const auto catalogue_started = Clock::now();
-            auto objects = catalogue_->retention_objects(before.catalogue_root,
-                                                         context.proposed.catalogue_root);
-            catalogue_ms += since_ms(catalogue_started);
-            data.insert(data.end(), objects.data.begin(), objects.data.end());
-            control.insert(control.end(), objects.control.begin(), objects.control.end());
-        }
-        // A reconciliation may preserve catalogue conflict alternatives which
-        // are not the effective root. New alternatives must be retained before
-        // the merge commit can become accepted.
-        if (!context.delta) {
-            auto before_roots = metadata_catalogue_root_set(before);
-            auto after_roots = metadata_catalogue_root_set(context.proposed);
-            for (const auto& root : after_roots) {
-                if (before_roots.contains(root))
-                    continue;
-                auto objects = catalogue_->retention_objects(std::nullopt, root);
-                data.insert(data.end(), objects.data.begin(), objects.data.end());
-                control.insert(control.end(), objects.control.begin(), objects.control.end());
-            }
-        }
-    }
-
-    std::sort(data.begin(), data.end());
-    data.erase(std::unique(data.begin(), data.end()), data.end());
-    std::sort(control.begin(), control.end());
-    control.erase(std::unique(control.begin(), control.end()), control.end());
-    collect_ms = since_ms(collect_started) - catalogue_ms;
-
-    const auto data_started = Clock::now();
-    const bool data_ok = data.empty() || store_->retain_data(data, dot);
-    data_ms = since_ms(data_started);
-    if (!data_ok) {
-        report("data-floor-unavailable");
-        throw MetadataNotReady("DATA retention floor unavailable before metadata publication");
-    }
-    const auto control_started = Clock::now();
-    const bool control_ok =
-        control.empty() ||
-        store_->retain_control(control, dot, context.proposed.metadata_write_replicas_required);
-    control_ms = since_ms(control_started);
-    if (!control_ok) {
-        report("control-floor-unavailable");
-        throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
-    }
-    report("ok");
-    signal_maintenance(ServiceEvent::storage);
-}
 
 } // namespace macha
