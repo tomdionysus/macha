@@ -4331,7 +4331,11 @@ MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_qui
     REQUIRE(!s2.node().local_store().valid(id));
     s2.node().notify_storage_mutation();
 
-    CHECK(s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    // The loader thread may not have run yet on a busy machine (fi-1's suite,
+    // 2026-10-02): wait for its first note before calling the node busy.
+    REQUIRE(wait_until([&] {
+        return s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
+    }, 5s));
     const bool restored = wait_until([&] { return s2.node().local_store().valid(id); }, 10s);
     // The loader never paused: this copy came back during a busy period.
     CHECK(s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
