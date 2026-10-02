@@ -6,6 +6,7 @@
 #include "cluster/data_work.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
+#include "cluster/storage_server.hpp"
 #include "cluster/node_identity.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
@@ -122,6 +123,8 @@ class NodeRuntime {
     std::unique_ptr<MetadataReplica> meta_;
     // Built with the replica, so its routes answer from then on.
     std::unique_ptr<MetadataServer> metadata_server_;
+    // Built when the last local plane recovers, so its routes answer from then.
+    std::unique_ptr<StorageServer> storage_server_;
     StartupStageHook startup_stage_hook_;
     std::atomic_uint32_t ready_bits_{};
     uint64_t startup_unix_ms_{};
@@ -177,7 +180,6 @@ class NodeRuntime {
     bool all_local_state_ready() const noexcept;
 
     void bind_control_routes();
-    void bind_storage_routes();
     void route(MessageType, MessageRoutes::Handler);
     void unbind_routes();
     void loop(std::stop_token);
