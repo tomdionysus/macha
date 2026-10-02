@@ -1,25 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Read-only forensic decoder for a metadata replica's on-disk state. Unlike
-// macha-metadata-repair this never constructs a MetadataReplica, so it can
-// examine a quarantined (`*.corrupt.<ts>`) or otherwise unloadable state
-// directory without triggering recovery, and it walks the history exactly the
-// way MetadataReplica::materialized_locked() does so a reconstruction failure
-// can be pinned to the precise frame that breaks the chain.
+// Read-only forensic decoder for a metadata replica's on-disk state. It never
+// constructs a MetadataReplica, so it can examine a quarantined
+// (`*.corrupt.<ts>`) or unloadable state directory without triggering
+// recovery, and it walks history as MetadataReplica::materialized_locked()
+// does, to pin a reconstruction failure to the frame that breaks the chain.
 //
 //   macha-metadata-dump <cluster.key> <history.log> [heads.meta] [--all] [--stats]
 //
-// Prints one line per anomalous history frame (delta whose parent is absent
-// or whose generation is not parent+1, duplicate hash, undecodable frame),
-// a summary, and for every accepted head in heads.meta the delta chain walk
-// with the exact point at which materialization would fail. --all prints
-// every frame. --stats materializes each reconstructible head and prints
-// what its snapshot is made of (entries, extents, tombstones, conflicts,
-// node status) and how many encoded bytes each part accounts for -- the
-// measurement behind discipline 4 of the self-healing plan. --entries-check
-// (with --objects, implies --stats) pages each tree-backed head's namespace
-// with the resumable walk at several bounds and checks it visits exactly
-// what the whole-pass walk visits, in the same order.
+// Prints anomalous history frames (absent parent, generation not parent+1,
+// duplicate hash, undecodable), a summary, and each accepted head's delta
+// chain walk with the point where materialization would fail. --all prints
+// every frame. --stats materializes each reconstructible head and attributes
+// its encoded bytes to the snapshot's parts. --entries-check (with --objects,
+// implies --stats) checks that the resumable walk, at several page bounds,
+// visits exactly what the whole-pass walk visits, in order.
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
@@ -78,9 +73,8 @@ void print(const Frame& frame, const std::string& note = {}) {
 }
 } // namespace
 
-// Reads the root directory out of the tree and says what it cost. This is the
-// claim an operator most wants to check on a migrated node: that a stat is a
-// path from the root rather than the namespace.
+// Reads the root directory from the tree and reports the cost: a stat is one
+// path from the root, not the whole namespace.
 void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
     const auto started = std::chrono::steady_clock::now();
     const auto entry = namespace_tree_lookup(root, "/", nodes, false);
@@ -91,10 +85,8 @@ void nodes_read_probe(const NamespaceNodeStore& nodes, const ObjectId& root) {
               << "ms\n";
 }
 
-// Reads tree nodes from the node's own control store and keeps everything it
-// writes in memory. A diagnostic run against a live node must not add objects to
-// that node's store: replay reconstructs nodes that are almost all already
-// there, and the handful it recomputes are nobody's business but this process's.
+// Reads tree nodes from the node's control store and keeps writes in memory,
+// so a diagnostic run never adds objects to a live node's store.
 class ReplayNodeStore final : public NamespaceNodeStore {
   public:
     explicit ReplayNodeStore(const LocalStore& disk) : disk_(disk) {}
@@ -127,10 +119,8 @@ int main(int argc, char** argv) {
     bool tree = false;
     bool entries_check = false;
     std::filesystem::path objects;
-    // Replay writing reconstructed nodes into the store, the way a replica
-    // does, rather than into memory. Point it at a COPY of a node's store: the
-    // question it answers is whether the write path accepts nodes that are
-    // already there.
+    // Replay writes reconstructed nodes into the store, as a replica does. Point
+    // it at a COPY: it tests whether the write path accepts nodes already present.
     bool replay_write = false;
     std::string heads_path;
     for (int i = 3; i < argc; ++i) {
@@ -141,9 +131,7 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--replay-write") {
             replay_write = true;
         } else if (std::string(argv[i]) == "--objects") {
-            // The control object store, so a tree-backed namespace can be
-            // walked rather than merely named. Without it this tool can only
-            // report that the record points somewhere.
+            // The control object store, needed to walk a tree-backed namespace.
             if (++i >= argc) {
                 std::cerr << "--objects needs a path\n";
                 return 2;
@@ -153,8 +141,7 @@ int main(int argc, char** argv) {
             entries_check = true;
             stats = true;
         } else if (std::string(argv[i]) == "--tree") {
-            // Implies --stats: the tree is built from the materialised head,
-            // which is what --stats already produces.
+            // Implies --stats, which materialises the head the tree is built from.
             tree = true;
             stats = true;
         }
@@ -219,7 +206,7 @@ int main(int argc, char** argv) {
                        std::to_string(parent->second.generation) + " child gen=" +
                        std::to_string(frame.generation);
             else if (parent->second.generation + 1 != frame.generation)
-                ++gap_deltas; // Legitimate (merge commit); pre-0.27.0 readers rejected these.
+                ++gap_deltas; // Legitimate: a merge commit.
         } else {
             ++full_count;
         }
@@ -318,13 +305,8 @@ int main(int argc, char** argv) {
             }
             working = *it;
         }
-        // Structural reconstructibility says the links line up. It does not say
-        // the replay reproduces the record, and on 2026-09-22 the cluster
-        // wedged on exactly that gap: every node reported "delta replay from
-        // anchor over 25 frames does not reproduce the record hash", so nothing
-        // could advance and every node was waiting for a peer that was
-        // equally stuck. This replays the chain for real and names the first
-        // frame whose reconstruction diverges.
+        // Links that line up structurally can still fail to reproduce the record
+        // hash on replay; this replays the chain and names the first diverging frame.
         if (ok && !objects.empty() && !chain.empty()) {
             try {
                 LocalStore store(objects,
@@ -409,11 +391,9 @@ int main(int argc, char** argv) {
         // that part removed.
         MetadataSnapshot snapshot;
         size_t record_bytes = 0;
-        // With --objects, a tree-backed head is materialised the way a replica
-        // does it: each delta applied to the tree through the control store,
-        // the nodes it writes kept in memory (ReplayNodeStore) so the copy is
-        // never written. The walk below reads the same overlay, since the
-        // head's newest nodes exist only there.
+        // With --objects, a tree-backed head materialises as a replica does it:
+        // deltas applied through the control store, written nodes kept in memory
+        // (ReplayNodeStore). The walk below reads the same overlay.
         std::optional<LocalStore> stats_store;
         std::optional<ReplayNodeStore> stats_nodes;
         NamespaceDeltaApplier stats_applier;
@@ -452,12 +432,8 @@ int main(int argc, char** argv) {
             for (const auto& extent : value.extents)
                 holes += extent.hole ? 1 : 0;
         }
-        // A tree-backed head carries a root instead of entries, so the
-        // whole-namespace arithmetic below is about a map that is not there and
-        // encode_snapshot refuses it outright. Say what the record is and stop,
-        // rather than crashing on the operator's forensics tool the first time
-        // it is pointed at a migrated node. `--tree` is the mode that reads a
-        // tree-backed namespace.
+        // A tree-backed head carries a root, not entries, and encode_snapshot refuses
+        // it: describe the record instead. `--tree` reads a tree-backed namespace.
         if (snapshot.namespace_root) {
             std::cout << "  snapshot: tree-backed namespace_root="
                       << to_string(*snapshot.namespace_root)
@@ -483,8 +459,7 @@ int main(int argc, char** argv) {
                           << " bytes=" << shape.bytes
                           << " largest_node=" << shape.largest_node_bytes
                           << " entries=" << shape.entries << " extents=" << shape.extents << '\n';
-                // A stat against the tree, which is what a getattr now costs:
-                // one path from the root, no extent node fetched.
+                // A stat against the tree: one path from the root, no extent node fetched.
                 nodes_read_probe(nodes, *snapshot.namespace_root);
                 if (entries_check) {
                     std::vector<NamespaceItem> whole;
@@ -547,17 +522,9 @@ int main(int argc, char** argv) {
                   << (full - entry_bytes - garbage_bytes - conflict_bytes - node_status_bytes)
                   << '\n';
         if (tree) {
-            // What one namespace write costs TODAY, which is the measurement
-            // the plan says every urgency argument rests on. `mutate_impl`
-            // re-encodes the whole snapshot and re-hashes the result on every
-            // commit, because the record payload IS the namespace and its
-            // identity is a hash over those bytes. Timed here on the real head
-            // rather than estimated.
-            //
-            // This is CPU only. It excludes the decode on the way in, the
-            // element-wise entries comparison, and the replication of the
-            // result to peers -- so it is a floor on the real cost, not the
-            // whole of it.
+            // Cost of a whole-snapshot commit (re-encode and re-hash), timed on the real
+            // head. CPU only: decode, entries comparison and replication are excluded, so
+            // it is a floor.
             {
                 const auto encode_started = std::chrono::steady_clock::now();
                 const auto payload = encode_snapshot(snapshot);
@@ -575,11 +542,8 @@ int main(int argc, char** argv) {
                           << payload.size() << " bytes, per namespace write\n";
             }
 
-            // Stage B of the Merkle plan, measured against a real namespace
-            // rather than a generated one. Everything here is offline and
-            // read-only: the tree is built in memory from the head that
-            // --stats just materialised, and nothing is written to the record,
-            // the history or the control store.
+            // Offline and read-only: the tree is built in memory from the materialised
+            // head; nothing is written to the record, history or control store.
             MemoryNamespaceNodeStore nodes;
             const auto root = build_namespace_tree(snapshot.entries, nodes);
             const auto shape = namespace_tree_stats(root, nodes);
@@ -589,14 +553,8 @@ int main(int argc, char** argv) {
                       << " extent_nodes=" << shape.extent_nodes << " depth=" << shape.depth
                       << " largest_node=" << shape.largest_node_bytes << '\n';
 
-            // The number the whole plan turns on: what one ordinary write
-            // costs. Today it is the entire library -- re-serialised,
-            // re-hashed and replicated -- because the record payload IS the
-            // namespace and its identity is a hash over those bytes.
-            //
-            // Pick a real file rather than a synthetic one, and pick the
-            // median by extent count so the answer is not flattered by a
-            // one-extent file or distorted by the largest.
+            // Cost of one ordinary write against the tree, on the median file by extent
+            // count so neither a one-extent file nor the largest skews it.
             std::vector<std::pair<size_t, std::string>> by_extents;
             for (const auto& [path, value] : snapshot.entries)
                 if (value.type != EntryType::directory)
@@ -607,9 +565,8 @@ int main(int argc, char** argv) {
                 auto touched = snapshot.entries;
                 auto found = touched.find(median.second);
                 if (found != touched.end()) {
-                    // An mtime bump: the commonest namespace write there is,
-                    // and a value change on an existing path, which is the
-                    // case key-only boundaries exist to keep cheap.
+                    // An mtime bump: the commonest namespace write, and a value change on an
+                    // existing path, the case key-only boundaries keep cheap.
                     found->second.mtime_ns += 1;
                     nodes.forget_written();
                     const auto after = build_namespace_tree(touched, nodes);
@@ -626,10 +583,8 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // Encoded bytes are what replication and the journal carry; resident
-        // bytes are what every node holds while it is running. They are
-        // different numbers and the second one is the larger, so report both
-        // rather than letting the file size stand in for the cost.
+        // Encoded bytes are what replication and the journal carry; resident bytes,
+        // the larger, are what a running node holds. Report both.
         uint64_t extent_capacity = 0;
         for (const auto& [path, value] : snapshot.entries)
             extent_capacity += value.extents.capacity();
@@ -643,8 +598,7 @@ int main(int argc, char** argv) {
                   << " sizeof_map_value=" << sizeof(std::map<std::string, FsEntry>::value_type)
                   << " sizeof_snapshot=" << sizeof(MetadataSnapshot) << '\n';
         if (snapshot.extent_size && extents) {
-            // Extents, not files, are what scales with a media library, so the
-            // only projection worth printing is per unit of stored content.
+            // Projected per TiB of content: extents, not files, scale with a library.
             const long double library_tb =
                 static_cast<long double>(extents) *
                 static_cast<long double>(snapshot.extent_size) / (1024.0L * 1024.0L * 1024.0L * 1024.0L);

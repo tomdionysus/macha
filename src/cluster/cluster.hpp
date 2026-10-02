@@ -30,11 +30,10 @@ enum class ServiceEvent : uint8_t {
     topology,
 };
 
-// How this node currently answers "can peers connect to me?" and "do I host
-// extents?" (0.42.0). The configured modes travel beside the resolved values
-// so Status can show both; `source` says what decided the inbound answer:
-// "configured", "persisted", "default" (auto, no evidence yet, behaving as
-// capable) or "probe:<peer>".
+// How this node answers "can peers connect to me?" and "do I host extents?",
+// with the configured modes beside the resolved values. `source` decided the
+// inbound answer: "configured", "persisted", "default" (auto, no evidence yet,
+// behaving as capable) or "probe:<peer>".
 struct InboundResolution {
     Tristate inbound_capable_mode{Tristate::automatic};
     Tristate hosts_extents_mode{Tristate::automatic};
@@ -65,11 +64,8 @@ struct NodeReadiness {
 class NodeRuntime {
   public:
     using StartupStageHook = std::function<void(std::string_view)>;
-    // Payload-agnostic bridge to whichever component owns ingest/torrent job
-    // state (IngestManager / TorrentManager). NodeRuntime never needs to know
-    // what "ingest" or "torrent" even means — it just carries opaque JSON
-    // bytes between the RPC wire and the owning component, same as it does
-    // for the raw storage/metadata payloads elsewhere in this class.
+    // Opaque JSON bridge between the RPC wire and the owner of ingest/torrent
+    // job state (IngestManager / TorrentManager).
     using JobsQueryHandler = std::function<Bytes(std::span<const uint8_t> request_payload)>;
     using JobActionHandler = std::function<Bytes(std::span<const uint8_t> request_payload)>;
 
@@ -99,26 +95,21 @@ class NodeRuntime {
     NodeId durability_epoch_;
     DataResourceArbiter data_resources_;
     RetainedMemoryLedger retained_memory_;
-    // What this node has sustained transcoding each kind of source; playback
-    // records, telemetry publishes.
+    // Playback records, telemetry publishes.
     TranscodeRateBook transcode_rates_;
     // Declared before members_ so the roster is built with the right flags.
     mutable std::mutex inbound_mutex_;
     InboundResolution inbound_;
 
-    // The control plane is intentionally constructed before any storage or
-    // metadata backend. A node is therefore reachable/authenticated while its
-    // local durable state is still recovering.
+    // The control plane is constructed before storage and metadata, so the
+    // node is reachable while its durable state recovers.
     Membership members_;
     PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
     SessionManager sessions_;
     UserStore users_;
-    // What the last gossip broadcast said, and which peers have been told it.
-    // A set of ids rather than a count: a count changes whenever membership
-    // churns, which would re-broadcast on every flap, and the question being
-    // asked is "is there a peer that has not heard this", which only an
-    // identity can answer.
+    // The last gossiped table and which peers have been told it. A set of ids,
+    // not a count, so membership churn does not re-broadcast.
     Hash256 gossiped_user_table_{};
     std::set<NodeId> gossiped_user_peers_;
     Clock::time_point gossip_users_retry_after_{};
@@ -173,23 +164,19 @@ class NodeRuntime {
     std::condition_variable local_copy_cv_;
     std::deque<LocalCopyJob> local_copies_;
     size_t local_copy_bytes_{};
-    // A job taken off the queue and not yet written; with the queue empty and
-    // this false, every opportunity queued so far is settled.
+    // A dequeued job not yet written; with the queue empty and this false,
+    // every queued copy is settled.
     bool local_copy_writing_{};
     std::condition_variable local_copy_settled_cv_;
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
     std::atomic_uint64_t playback_activity_bytes_{};
     std::atomic_uint64_t interactive_activity_bytes_{};
-    // A loader clock beside the two viewer ones, deliberately NOT folded into
-    // them. Maintenance decides it is idle from the viewer clocks alone, and
-    // an ingest is loader-class and touched neither, so during an operator's
-    // 36 GB import on 2026-09-22 gbni-1 reported itself idle and maintenance
-    // took its idle share of a disk somebody was waiting on: sdb at 91%
-    // utilisation, macha-maint reading 51.6 MB/s, the import's writes getting
-    // 2.8 MB/s. Keeping it separate matters: viewer reserves and the DATA
-    // pressure gate key off the viewer clocks, and conflating them would make
-    // an import look like a viewer and gate other loader work behind it.
+    // A loader clock kept apart from the viewer clocks. Maintenance must see
+    // loader work to avoid taking an idle share of a disk an import needs;
+    // folding it into the viewer clocks would make an import look like a
+    // viewer, so the viewer reserves and DATA pressure gate would hold other
+    // loader work behind it.
     std::atomic_uint64_t loader_activity_bytes_{};
     std::atomic_int64_t last_playback_activity_ms_{};
     std::atomic_int64_t last_interactive_activity_ms_{};
@@ -220,7 +207,7 @@ class NodeRuntime {
     void loop(std::stop_token);
     void local_writer_loop(std::stop_token);
     // Public-endpoint discovery, then (for `inbound_capable: auto`) the
-    // dial-back resolution state machine, for the life of the node.
+    // dial-back resolution state machine, for the node's life.
     void connectivity_loop(std::stop_token);
     bool resolve_hosts_extents_for(bool inbound_capable) const;
     void apply_inbound_resolution(bool inbound_capable, std::string source);
@@ -236,28 +223,25 @@ class NodeRuntime {
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
 
   public:
-    // When this node's traffic classes were last active is read from
-    // `activity_clock` (the steady clock when none is given), so idleness
-    // and the maintenance pass's deadlines can run on one injected clock.
+    // Activity times and maintenance deadlines read `activity_clock` (default:
+    // the steady clock).
     using ActivityClock = std::function<Clock::time_point()>;
     NodeRuntime(Config, ClusterKeys, StartupStageHook startup_stage_hook = {},
                 ActivityClock activity_clock = {});
     ~NodeRuntime();
     void start();
     void request_stop();
-    // Close outbound/inbound client routes and fail every pending synchronous
-    // call without waiting for the rest of NodeRuntime teardown. Service-owned
-    // workers must be able to leave an RPC wait before Service joins them.
+    // Closes client routes and fails every pending synchronous call now, so
+    // Service-owned workers can leave an RPC wait before Service joins them.
     void cancel_outbound_calls();
     void stop();
     void set_service_event_callback(std::function<void(ServiceEvent)> callback);
-    // Registered once, at construction, by whichever component owns that job
-    // type (IngestManager / TorrentManager). The handler bodies must answer
-    // using only that component's local-only state -- never survey peers
-    // themselves -- or a single cluster-wide query fans out unboundedly.
+    // Registered once by the owning component. Handlers must answer from that
+    // component's local state only, never surveying peers, or one
+    // cluster-wide query fans out unboundedly.
     void set_ingest_bridge(JobsQueryHandler jobs, JobActionHandler action);
     void set_torrent_bridge(JobsQueryHandler jobs, JobActionHandler action);
-    // The torrent coordinator's handler for torrent_intent (0.64.0).
+    // The torrent coordinator's torrent_intent handler.
     void set_torrent_intent_handler(JobActionHandler);
     void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
@@ -284,8 +268,7 @@ class NodeRuntime {
     LocalStore& control_store();
     const LocalStore& control_store() const;
     PersistentBlockCache& block_cache();
-    // The node's claims (the object ledger's claimed half). Throws while
-    // retention state is still recovering.
+    // The object ledger's claimed half. Throws while retention is recovering.
     ClaimStore& claims();
     const ClaimStore& claims() const;
     MetadataReplica& metadata_replica();
@@ -315,16 +298,14 @@ class NodeRuntime {
         return users_;
     }
     bool apply_session(const AuthSession&);
-    // Both of these are notify-only: they merge locally and queue the record
-    // on whatever control-lane connections are already usable, then return.
-    // Nothing in an HTTP request path ever waits on a peer -- a node that is
-    // alone mints and answers at full speed, and a peer that was unreachable
-    // converges on the next gossip tick instead.
+    // Notify-only: merge locally, queue on already-usable control-lane
+    // connections, and return. No HTTP request path waits on a peer; an
+    // unreachable peer converges on the next gossip tick.
     void propagate_session(const AuthSession&);
     bool apply_user(const UserRecord&);
     void propagate_users();
-    // Periodic repair, not a heartbeat: sends only when this node's table has
-    // actually changed or a peer has appeared that may not have seen it.
+    // Periodic repair, not a heartbeat: sends only when the table changed or
+    // a peer appeared that may not have seen it.
     void gossip_users_if_changed();
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
@@ -343,35 +324,27 @@ class NodeRuntime {
     bool store_metadata_commit(const MetadataHistoryEntry&);
     bool accept_metadata_commit(const MetadataAcceptance&);
     std::vector<MetadataAcceptance> metadata_heads() const;
-    // RPC-side of MetadataManager::attempt_history_checkpoint()'s
-    // propose/commit round. Thin pass-throughs to MetadataReplica, mirroring
-    // store_metadata_commit()/accept_metadata_commit() -- NodeRuntime has no
-    // reference to MetadataManager, so dispatch goes directly to the replica.
+    // RPC side of MetadataManager::attempt_history_checkpoint(); dispatches
+    // straight to the replica, as NodeRuntime has no MetadataManager.
     bool accept_history_checkpoint_proposal(const HistoryCheckpointProof&);
     bool commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch);
     void announce_metadata_generation(uint64_t);
     void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
-    // Waits until every copy queued by enqueue_fetched() so far has been
-    // written to the cache or the store, or dropped. Never waits for copies
-    // queued after it began only because of them: it returns as soon as the
-    // queue is empty and nothing is being written.
+    // Waits until every copy queued by enqueue_fetched() so far is written or
+    // dropped: returns once the queue is empty and nothing is being written.
     void wait_local_copies_settled();
     void reconfigure_local(const Config&);
     void note_activity(FrameType, uint64_t bytes = 0);
-    // Cluster bytes on and off the wire by frame class since start, as the
-    // transport counted them (client dials and served sessions together).
+    // Cluster bytes by frame class since start (dialled and served together).
     TrafficTotals traffic_totals() const;
-    // Whether any other node reports viewer-class cluster traffic (foreground
-    // or read-ahead, either direction) over its last telemetry interval, from
-    // a sample no older than `fresh_for`. Repair counts it as busy for its
-    // weighted share, as it counts this node's own viewers: its transfers
-    // share those viewers' links, so it runs paced, never stopped.
+    // Whether another node reports viewer-class traffic in a sample no older
+    // than `fresh_for`. Repair paces against it as against local viewers,
+    // since its transfers share their links.
     bool peer_viewers_active(std::chrono::milliseconds fresh_for) const;
     uint64_t take_activity_bytes(FrameType);
     std::chrono::milliseconds activity_idle_for(FrameType) const;
-    // Is somebody watching right now, within `window`? The arbiter and the
-    // torrent rate clamp both need law 3's "unless it would make the viewer
-    // wait" clause, and neither can reach the filesystem to ask.
+    // Whether a viewer was active within `window`: law 3's "unless it would
+    // make the viewer wait", for callers that cannot reach the filesystem.
     bool viewer_recently_active(std::chrono::milliseconds window) const;
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
@@ -401,8 +374,7 @@ class NodeRuntime {
     bool hosts_extents() const {
         return inbound_resolution().hosts_extents;
     }
-    // Test-only: run one dial-back probe round now instead of waiting for
-    // the connectivity loop's next deadline.
+    // Test-only: run a dial-back probe round now.
     void probe_inbound_now_for_tests() {
         connectivity_wake_.fetch_add(1, std::memory_order_acq_rel);
         connectivity_wait_cv_.notify_all();

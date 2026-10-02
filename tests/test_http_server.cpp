@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The reactor's contract, over real sockets. Every case here is a property
-// TODO/archive/2026-09-15-http-server-reactor-plan.md promised: that nothing one
-// connection does can stall another, that control traffic never queues
-// behind data traffic, that a wait costs no thread, and that the reactor
-// rule -- it may not call anything that sleeps -- is checked at runtime.
+// The reactor's contract, over real sockets: nothing one connection does can
+// stall another, control traffic never queues behind data traffic, a wait
+// costs no thread, and the rule that the reactor never sleeps is checked at
+// runtime.
 #include "test_backend_support.hpp"
 
 #include <sys/resource.h>
@@ -96,8 +95,8 @@ HttpResponse json_response(int status, std::string body) { return http_json(stat
 } // namespace
 
 MACHA_FAST_TEST("http_server", test_every_json_object_response_carries_a_snake_case_status) {
-    // Operator rule, 2026-09-24: every response carries a status code, success
-    // included; normal flow has no message.
+    // Every response carries a status code, success included; normal flow has
+    // no message.
     auto ok = json_response(200, R"({"items":[1,2]})");
     http_stamp_status(ok);
     CHECK(body_of(ok) == R"({"status":"ok","items":[1,2]})");
@@ -273,7 +272,7 @@ MACHA_TEST("http_server",
 
 MACHA_TEST("http_server", test_a_client_that_stops_reading_does_not_delay_another_clients_body) {
     auto config = loopback_config();
-    config.workers = 1; // one pool thread, so the stalled body cannot be "on another worker"
+    config.workers = 1; // so the stalled body cannot be on another worker
     constexpr uint64_t body_size = 4 * 1024 * 1024;
     HttpServer server(config, [&](const HttpRequest& request) {
         HttpResponse response;
@@ -289,10 +288,8 @@ MACHA_TEST("http_server", test_a_client_that_stops_reading_does_not_delay_anothe
     server.start();
     REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
 
-    // Two clients that never read: their receive windows fill, the kernel
-    // stops taking bytes, and the reactor stops asking for chunks on their
-    // behalf. Neither the reactor nor the single data worker is occupied
-    // by them once the staging window is full.
+    // Two clients that never read: once their staging windows fill, neither
+    // the reactor nor the single data worker is occupied by them.
     const int stalled_pool = connect_and_stall(server.bound_port(), "/pool");
     const int stalled_resident = connect_and_stall(server.bound_port(), "/resident");
     REQUIRE(wait_until([&] { return server.diagnostics().connections_writing == 2; }, 2s));
@@ -355,8 +352,7 @@ MACHA_TEST("http_server", test_hundreds_of_idle_keep_alive_connections_cost_noth
     REQUIRE(wait_until(
         [&] { return server.diagnostics().connections_idle_keep_alive == connections; }, 2s));
 
-    // Every one of them idle, and the node answers at once. Until 0.43.0
-    // sixteen of these would have been the whole worker pool.
+    // With every one of them idle, the node still answers at once.
     const auto started = Clock::now();
     const auto health = raw_http_get(server.bound_port(), "/api/v1/health");
     CHECK(Clock::now() - started < 500ms);
@@ -388,15 +384,11 @@ MACHA_TEST("http_server", test_a_client_that_closes_mid_body_releases_the_body_s
     REQUIRE(wait_until([&] { return server.diagnostics().connections_writing == 1; }, 2s));
     ::close(fd);
 
-    // The reactor notices on its next pass and drops the pump with the
-    // connection; the source is destroyed with it. Nothing waits for a
-    // send timeout.
+    // The reactor drops the pump and its source on its next pass, without
+    // waiting for a send timeout.
     CHECK(wait_until([&] { return destroyed->load(); }, 2s));
-    // connections_open is a gauge the reactor publishes at the end of each
-    // pass, and the source is destroyed mid-pass by close_connection. Read
-    // immediately, it could still say 1 from the pass before: 1/40 on macOS
-    // and <= 1/20 on es-1, always this line. The promptness this case exists
-    // for is the destruction above; the gauge only has to follow.
+    // connections_open is published at the end of each pass, after the
+    // mid-pass destruction above, so it is awaited rather than read at once.
     CHECK(wait_until([&] { return server.diagnostics().connections_open == 0; }, 2s));
     server.stop();
 }
@@ -467,7 +459,7 @@ MACHA_TEST("http_server", test_reactor_stall_watchdog_counts_a_sleeping_pass) {
     config.reactor_stall_threshold = 20ms;
     HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
     std::atomic_bool slept{};
-    // The one thing the reactor must never do, done once on purpose.
+    // Sleep once on the reactor, which it must never do.
     server.set_reactor_pass_hook([&] {
         if (!slept.exchange(true))
             std::this_thread::sleep_for(60ms);
@@ -483,9 +475,8 @@ MACHA_TEST("http_server", test_reactor_stall_watchdog_counts_a_sleeping_pass) {
     server.stop();
 }
 
-// The case that made the pipelining test fail about 1 in 200 on fi-1: both
-// responses already in the socket before the client reads the first. Each
-// read must take exactly its own response.
+// Both responses are already in the socket before the client reads the first;
+// each read must take exactly its own response.
 MACHA_TEST("http_server", test_pipelined_responses_already_queued_are_read_one_at_a_time) {
     auto config = loopback_config();
     HttpServer server(config, [](const HttpRequest& request) {
@@ -525,10 +516,9 @@ MACHA_TEST("http_server", test_head_and_pipelined_requests_on_one_connection) {
     timeval timeout{2, 0};
     REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
 
-    // HEAD: the length of the body it is not sending, and the connection
-    // stays usable because no body was ever owed. Read by hand, because the
-    // shared reader would wait for the Content-Length bytes a HEAD answer
-    // never carries.
+    // HEAD states the body length but sends no body, and the connection stays
+    // usable. Read by hand: the shared reader would wait for Content-Length
+    // bytes.
     raw_http_send(fd, "HEAD /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
     std::string head;
     std::array<char, 4096> buffer{};
@@ -542,8 +532,8 @@ MACHA_TEST("http_server", test_head_and_pipelined_requests_on_one_connection) {
     CHECK(head.find("Accept-Ranges: bytes\r\n") != std::string::npos);
     CHECK(head.ends_with("\r\n\r\n")); // and nothing after the headers
 
-    // Two requests in one write. The reactor parses the second out of the
-    // bytes left over after the first, without waiting for more input.
+    // Two requests in one write: the second is parsed from the leftover bytes
+    // without waiting for more input.
     raw_http_send(fd, "GET /inline HTTP/1.1\r\nHost: localhost\r\n\r\n"
                       "GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
     auto first = raw_http_read_response(fd);
@@ -561,10 +551,8 @@ MACHA_TEST("http_server", test_head_and_pipelined_requests_on_one_connection) {
 } // namespace
 
 MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodies_are_left_alone) {
-    // Compression is a lane-worker job, never a reactor one: the reactor may
-    // not call anything that sleeps or burn CPU on a socket's behalf. And the
-    // zero-copy path for a resident body -- the thing the reactor rewrite
-    // exists for -- must come through untransformed.
+    // Compression runs on lane workers, never the reactor, and a resident body
+    // on the zero-copy path is never transformed.
     auto config = loopback_config();
     std::string catalogue = "{\"items\":[";
     for (int i = 0; i < 400; ++i) {
@@ -600,8 +588,7 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
     const auto compressed_body = body_of(compressed);
     CHECK(gunzip(compressed_body) == served);
     CHECK(compressed_body.size() < catalogue.size() / 3);
-    // Content-Length describes what was actually sent, or the client hangs
-    // waiting for bytes that are never coming.
+    // Content-Length describes the compressed bytes actually sent.
     CHECK(compressed.find("Content-Length: " + std::to_string(compressed_body.size())) !=
           std::string::npos);
 
@@ -610,8 +597,7 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
     CHECK(identity.find("Content-Encoding") == std::string::npos);
     CHECK(body_of(identity) == served);
 
-    // Already compressed, and served straight from resident memory. A
-    // transform here would undo the path it is sent on.
+    // A resident streamed body is sent untransformed.
     const auto media = raw_http_get(port, "/media", gzip);
     CHECK(media.find("HTTP/1.1 200") != std::string::npos);
     CHECK(media.find("Content-Encoding") == std::string::npos);
@@ -632,8 +618,7 @@ MACHA_TEST("http_server", test_text_is_compressed_on_the_pool_and_streamed_bodie
 }
 
 MACHA_TEST("http_server", test_compression_can_be_disabled_for_a_node_behind_a_proxy) {
-    // Some nodes sit behind a TLS terminator that already compresses and some
-    // are exposed directly, so this has to be a setting rather than a rule.
+    // Compression is a setting, for nodes behind a compressing TLS terminator.
     auto config = loopback_config();
     config.compression.enabled = false;
     std::string catalogue(8192, 'x');

@@ -24,9 +24,8 @@ std::string lower(std::string value) {
     return value;
 }
 
-// What a built web client is made of. Anything not named here is served as
-// bytes: a client asset with an unknown extension is still the client's, and
-// application/octet-stream is the honest answer for it.
+// What a built web client is made of. Anything else is served as
+// application/octet-stream: an unknown extension is still the client's asset.
 struct AssetType {
     std::string_view extension;
     std::string_view mime;
@@ -69,9 +68,8 @@ std::string asset_mime(const fs::path& path) {
     return "application/octet-stream";
 }
 
-// A file on disk, read as the response is written. The client's assets are
-// small, but a bundle is not something to hold twice in memory per request,
-// and this keeps a large asset from deciding how much a node allocates.
+// A file on disk, streamed as the response is written, so no asset is held in
+// memory per request.
 class FileBody final : public HttpBodySource {
     int fd_{-1};
     uint64_t size_{};
@@ -110,11 +108,9 @@ class FileBody final : public HttpBodySource {
     }
 };
 
-// One path segment at a time, so the checks are on what the segments say
-// rather than on what the joined string looks like. A segment that is empty,
-// `.`, `..`, or begins with a dot is refused: the first three are how a
-// request climbs out of the root, and the last is how it reads the build
-// tooling's leftovers (.env, .git) that have no business being served.
+// Checked one path segment at a time. A segment that is empty, `.`, `..`, or
+// begins with a dot is refused: the first three climb out of the root, the
+// last reaches build leftovers (.env, .git).
 std::optional<fs::path> relative_request_path(std::string_view path) {
     fs::path out;
     size_t begin = 0;
@@ -152,15 +148,14 @@ std::string entity_tag(const fs::path& path, uint64_t size, bool gzip) {
     std::error_code ec;
     const auto written = fs::last_write_time(path, ec);
     const auto stamp = ec ? 0LL : static_cast<long long>(written.time_since_epoch().count());
-    // The encoding is part of the tag, not decoration on it. A cache handed
-    // the gzip body under the identity tag would go on to serve it to a client
-    // that cannot read one, and a client revalidating with the wrong tag would
-    // be told 304 about a representation it does not have.
+    // The encoding is part of the tag: otherwise a cache could serve a gzip body
+    // to a client that cannot read it, or answer 304 for a representation the
+    // client lacks.
     return "\"" + std::to_string(size) + "-" + std::to_string(stamp) + (gzip ? "-gzip\"" : "\"");
 }
 
-// The whole file, or nothing. Used only for an asset small enough to be worth
-// compressing on demand; anything larger keeps streaming through FileBody.
+// The whole file, or nothing; only for assets small enough to compress on
+// demand. Larger ones stream through FileBody.
 std::optional<Bytes> read_whole(const fs::path& path, uint64_t size) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -185,15 +180,11 @@ std::optional<Bytes> read_whole(const fs::path& path, uint64_t size) {
     return out;
 }
 
-// Content negotiation for the client's own assets happens here rather than in
-// the server's generic compressor, because this is the one handler doing real
-// cache revalidation: the entity tag and the encoding have to be decided
-// together, before If-None-Match is compared, or the two disagree.
-//
-// A precompressed sibling written by the client's build (app.js.gz next to
-// app.js) is preferred and costs no CPU at all. When the build did not make
-// one, a small enough text asset is compressed in memory instead, so a node
-// gets the win without waiting on a change to the client's build.
+// Content negotiation for the client's assets happens here, not in the generic
+// compressor, because the entity tag and encoding must be decided together
+// before If-None-Match is compared. A precompressed sibling from the client's
+// build (app.js.gz) is preferred; otherwise a small enough text asset is
+// compressed in memory.
 HttpResponse serve(const fs::path& path, bool is_index, const HttpRequest& request,
                    const HttpCompressionConfig& compression) {
     std::error_code ec;
@@ -236,13 +227,11 @@ HttpResponse serve(const fs::path& path, bool is_index, const HttpRequest& reque
     HttpResponse response;
     response.content_type = std::move(mime);
     response.headers["ETag"] = tag;
-    // The index document names the current asset bundle, so it must be
-    // revalidated on every load or a deploy is invisible until the browser
-    // decides otherwise. The assets it names are content-addressed by the
-    // client's own build and can be held.
+    // The index document names the current bundle, so it is revalidated on every
+    // load; the content-addressed assets it names can be cached.
     response.headers["Cache-Control"] = is_index ? "no-cache" : "public, max-age=3600";
-    // Stated whenever the resource could be compressed, not only when this
-    // response was, so a shared cache keys both representations apart.
+    // Stated whenever the resource could be compressed, so a shared cache keys
+    // both representations apart.
     if (compressible)
         response.headers["Vary"] = "Accept-Encoding";
     if (gzip)
@@ -296,10 +285,8 @@ HttpResponse WebApi::handle(const HttpRequest& request) const {
                           "the configured web root does not exist on this node");
     const auto index = root / config_.index;
 
-    // A path naming a file under the root is that file. Everything else is
-    // the client's own route, and the client is the index document -- which
-    // is the whole point: /library/artist/x is a route it will resolve for
-    // itself once it has loaded, and 404 would never let it load.
+    // A path naming a file under the root is that file; anything else is a client
+    // route, answered with the index document so the client can load and resolve it.
     if (const auto relative = relative_request_path(request.path); relative && !relative->empty()) {
         const auto candidate = fs::weakly_canonical(root / *relative, ec);
         if (!ec && within(root, candidate) && fs::is_regular_file(candidate, ec))

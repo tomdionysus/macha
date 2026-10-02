@@ -48,8 +48,8 @@ Page<ObjectId, ObjectId> query_referenced(Predicate predicate, const ObjectLedge
     }
 }
 
-// Pages the ledger's DATA claims and keeps those the release horizon no
-// longer refers to. Without a release horizon nothing is releasable.
+// Pages the ledger's DATA claims, keeping those the release horizon does not
+// refer to. Without a release horizon nothing is releasable.
 Page<ObjectId, ObjectId> query_releasable(const ObjectLedger& ledger, const Placement& placement,
                                           Cursor<ObjectId> from, Budget& budget) {
     const auto release = ledger.release();

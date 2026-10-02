@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Authoritative presence (the object ledger plan, P). PresenceIndex is a
-// primitive and is tested exhaustively against a reference model; the store
-// and the pool are tested for what the plan requires of has(): it never
-// reports an object a put is still writing, never waits for that put, never
-// consults the device once warm-up has finished, and is exact across a
-// restart and across a backend going offline and being re-adopted.
+// Authoritative presence. PresenceIndex is tested exhaustively against a
+// reference model; for the store and pool, has() never reports an object a put
+// is still writing, never waits for that put, never consults the device after
+// warm-up, and is exact across a restart and a backend going offline and back.
 #include "storage/local_store.hpp"
 #include "storage/presence_index.hpp"
 #include "storage/storage_pool.hpp"

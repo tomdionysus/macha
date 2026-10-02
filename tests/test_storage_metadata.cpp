@@ -44,17 +44,16 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claims_are_causal_durable_and
         retention.retain(RetentionClass::data, object, {origin_a, 1});
         CHECK(retention.retained(RetentionClass::data, object));
 
-        // A removal may clear only claims which are causally visible in its
-        // metadata mutation clock. A concurrent branch claim from B therefore
-        // survives an A-only delete context.
+        // A removal clears only claims causally visible in its mutation clock, so B's
+        // concurrent claim survives an A-only delete context.
         retention.retain(RetentionClass::data, object, {origin_b, 1});
         std::vector<ObjectId> no_live;
         CHECK(retention.release_unreferenced(RetentionClass::data, no_live,
                                              RetentionClock{{origin_a, 1}}, 16) == 1);
         CHECK(retention.retained(RetentionClass::data, object));
 
-        // Once a reconciled metadata view has observed both branch dots the
-        // now-unreferenced object may lose both claims.
+        // Once a reconciled view has seen both branch dots, the unreferenced object
+        // may lose both claims.
         CHECK(retention.release_unreferenced(RetentionClass::data, no_live,
                                              RetentionClock{{origin_a, 1}, {origin_b, 1}},
                                              16) == 1);
@@ -69,15 +68,13 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claims_are_causal_durable_and
 
         retention.retain(RetentionClass::control, second, {origin_b, 7});
         CHECK(retention.retained(RetentionClass::control, second));
-        // Compaction must preserve exactly the same causal state while bounding
-        // the append-only foreground journal.
+        // Compaction preserves the causal state while bounding the journal.
         CHECK(retention.compact_if_needed(1));
         CHECK(!retention.compact_if_needed(1));
     }
 
-    // Claim and remove contexts are crash/restart state, not process-local GC
-    // hints. Reopening must preserve both the live later DATA claim and CONTROL
-    // claim, as well as the tombstone which suppresses a delayed A:1 replay.
+    // Claims and remove contexts survive a restart: the later DATA and CONTROL
+    // claims, and the tombstone that suppresses a delayed A:1 replay.
     {
         RetentionStore reopened(state, keys.storage);
         CHECK(reopened.retained(RetentionClass::data, object));
@@ -107,15 +104,14 @@ MACHA_FAST_TEST("storage_metadata", test_retention_prune_cursor_cannot_starve_la
     CHECK(retention.release_unreferenced(RetentionClass::data, {}, RetentionClock{{origin, 1}},
                                          32) == objects.size());
 
-    // The first two tombstones are still backed by physical objects. A fixed
-    // budget must nevertheless make forward progress to the later dead rows,
-    // rather than restarting at map.begin() forever.
+    // The first two tombstones are still backed by objects; a fixed budget must
+    // still progress to the later dead rows rather than restart at the beginning.
     auto exists = [&](const ObjectId& id) { return id == objects[0] || id == objects[1]; };
     CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 2) == 0);
     CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 2) == 2);
 
-    // A pruned causal tombstone no longer suppresses an ancient replay. This is
-    // a useful externally visible probe that the later row was actually erased.
+    // A pruned tombstone no longer suppresses an ancient replay, showing the row
+    // was erased.
     retention.retain(RetentionClass::data, objects[2], {origin, 1});
     CHECK(retention.retained(RetentionClass::data, objects[2]));
 
@@ -200,8 +196,8 @@ MACHA_FAST_TEST("storage_metadata", test_retention_claim_is_physical_gc_barrier)
     CHECK(protected_pass.complete);
     CHECK(pool.has(id));
 
-    // Metadata has now causally observed and removed the only reference. The
-    // claim can disappear first; only then may ordinary physical GC reclaim it.
+    // Metadata has observed and removed the only reference: the claim goes first,
+    // then physical GC may reclaim the object.
     CHECK(retention.release_unreferenced(RetentionClass::data, none, RetentionClock{{origin, 1}},
                                          16) == 1);
     CHECK(!retention.retained(RetentionClass::data, id));
@@ -226,10 +222,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_record_payload_copy_is_shared)
     CHECK(copy.payload.data() != backing);
     CHECK(record.payload.data() == second_copy.payload.data());
 
-    // Regression for the Raspberry Pi OOM: retaining many MetadataRecord values
-    // must retain one immutable namespace payload, not one payload allocation per
-    // record. The pointer identity check is portable; Linux additionally guards
-    // the process-level resident-memory consequence.
+    // Many MetadataRecord values share one immutable namespace payload rather
+    // than one allocation each; on Linux resident memory is checked too.
     record.payload = Bytes(8 * 1024 * 1024, 0xa5);
     const auto large_backing = record.payload.data();
     const auto rss_before = process_rss_kib();
@@ -239,8 +233,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_record_payload_copy_is_shared)
     if (rss_before) {
         const auto rss_after = process_rss_kib();
         REQUIRE(rss_after.has_value());
-        // A deep-copy regression would add roughly 512 MiB here. Leave ample
-        // allocator/test-runner headroom while still failing that failure mode.
+        // A deep copy would add about 512 MiB.
         CHECK(*rss_after <= *rss_before + 64 * 1024);
     }
 }
@@ -285,9 +278,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_seed_sibling_replays_after_res
         CHECK(replica.committed().hash == second.hash);
     }
 
-    // Journal replay must reproduce every state transition that seed() accepted
-    // while the process was live. This specifically guards the replacement-node
-    // restart path exercised by test_three_node_cluster.
+    // Journal replay reproduces every transition seed() accepted while live.
     MetadataReplica replayed(replica_path, keys.storage);
     CHECK(replayed.current().hash == second.hash);
     CHECK(replayed.committed().hash == second.hash);
@@ -490,9 +481,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     MetadataAcceptance left_accept{left.generation, left.hash, 2, {a, b}};
     MetadataAcceptance right_accept{right.generation, right.hash, 2, {b, c}};
 
-    // The transitional SM13 `metadata_participants` roster is migration
-    // bookkeeping, not an eligibility/voter set. A certificate may therefore
-    // name any real metadata replica even when an old snapshot's roster does not.
+    // The SM13 `metadata_participants` roster is migration bookkeeping, not a
+    // voter set: a certificate may name any real metadata replica it omits.
     {
         auto rostered_snapshot = decode_snapshot(genesis.payload);
         rostered_snapshot.metadata_write_replicas_required = 2;
@@ -579,9 +569,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
     REQUIRE(certificate.has_value());
     CHECK(*certificate == merge_accept);
 
-    // A globally-converged owner may establish a new local ancestry floor. The
-    // sole accepted committed head remains fully reconstructable, while obsolete
-    // branch history no longer consumes disk or restart RSS indefinitely.
+    // A globally converged owner may set a new local ancestry floor: the sole
+    // committed head stays reconstructable and obsolete branch history is dropped.
     const auto history_path = path / "metadata" / "history.log";
     const auto history_before = std::filesystem::file_size(history_path);
     REQUIRE(reopened.compact_history_if_safe(1, 1));
@@ -599,21 +588,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
 
 MACHA_FAST_TEST("storage_metadata",
                test_accept_commit_refreshes_checkpoint_on_both_repair_and_ordinary_paths) {
-    // accept_commit() used to update committed_/cur_ and write the full
-    // checkpoint (reset_checkpoint) in one step, always under `m_`. It now
-    // splits that into an in-memory update under `m_`
-    // (refresh_materialized_head_in_memory_locked) and the actual checkpoint
-    // persist() after `m_` is released, on both of accept_commit()'s
-    // checkpoint-refreshing call sites. This is a same-behavior refactor:
-    // this test pins the observable result (checkpoint reflects the new
-    // head, reload survives) rather than the lock scope itself, which a
-    // wall-clock race cannot reliably isolate here -- the checkpoint write
-    // is a small fraction of accept_commit()'s total cost even at large
-    // payload sizes, dominated by unrelated off-lock materialization. The
-    // lock-scope change is verified by code review (mirrors the same
-    // off-lock-write/on-lock-bookkeeping pattern import_history() already
-    // uses for write_history_frame) plus the full existing concurrency
-    // suite (rpc_cluster, storage_metadata) passing unchanged.
+    // accept_commit() persists the checkpoint after releasing its lock: the
+    // checkpoint reflects the new head and survives a reload.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -643,21 +619,18 @@ MACHA_FAST_TEST("storage_metadata",
 
     MetadataReplica replica(path, keys.storage);
     REQUIRE(replica.store_commit(child));
-    // Ordinary accept branch: no existing heads, so this exercises the
-    // "changed" path at the bottom of accept_commit().
+    // No existing heads: the "changed" path at the end of accept_commit().
     REQUIRE(replica.accept_commit(MetadataAcceptance{child.generation, child.hash, 1, {a}}));
     CHECK(replica.committed().hash == child.hash);
     {
-        // Reopening forces a fresh load from the on-disk checkpoint --
-        // proves persist() actually landed, not just the in-memory update.
+        // Reopening loads the on-disk checkpoint, proving persist() landed.
         MetadataReplica reopened(path, keys.storage);
         CHECK(reopened.committed().hash == child.hash);
     }
 
     REQUIRE(replica.store_commit(grandchild));
-    // Accepting a direct descendant of the current sole head prunes child
-    // (now an ancestor, not a head) from accepted_heads_ and moves the
-    // preferred materialized head -- and its checkpoint -- forward again.
+    // A direct descendant of the sole head prunes child from accepted_heads_ and
+    // moves the materialized head and its checkpoint forward.
     REQUIRE(
         replica.accept_commit(MetadataAcceptance{grandchild.generation, grandchild.hash, 1, {a}}));
     auto heads = replica.accepted_heads();
@@ -745,19 +718,10 @@ MACHA_FAST_TEST("storage_metadata", test_merge_delta_primary_may_precede_merge_g
 
 MACHA_FAST_TEST("storage_metadata",
                 test_merge_delta_with_generation_gap_reconstructs_after_cache_eviction_and_reopen) {
-    // 2026-09-06 root cause (three real occurrences, confirmed from the
-    // quarantined on-disk state of every affected node): a reconciliation
-    // merge commit is numbered max(parents)+1 with the lower-hash parent as
-    // its primary, so its delta body legitimately sits more than one
-    // generation above that parent. store_commit()/import_history()/
-    // load_history() all accept that -- and the test above proves the head
-    // reads back -- but only because the reopened checkpoint *is* the merge
-    // and seeds the materialization cache. Both reconstruction walks demanded
-    // exactly parent+1, so the instant the merge left the cache (committed
-    // moved to a different branch, other reconstructions churned the cache)
-    // it became permanently unreconstructable: every reconciliation that
-    // could fold it away had to materialize it first, the cluster wedged,
-    // and a restart quarantined the entire history.
+    // A reconciliation merge is numbered max(parents)+1 with the lower-hash
+    // parent as primary, so its delta sits more than one generation above that
+    // parent; it must still reconstruct once evicted from the cache, live and
+    // after a restart.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -808,9 +772,8 @@ MACHA_FAST_TEST("storage_metadata",
     REQUIRE(delta.has_value());
     const auto encoded_delta = encode_metadata_delta(*delta);
 
-    // A concurrent, unrelated branch that races ahead of the merge -- exactly
-    // the incident: `committed` moves to this head, the merge stays accepted
-    // (neither is the other's ancestor) and nothing pins it in the cache.
+    // An unrelated concurrent branch overtakes the merge: `committed` moves to it,
+    // the merge stays accepted, and nothing pins it in the cache.
     MetadataRecord divergent;
     auto divergent_snapshot = newer_snapshot;
     divergent_snapshot.entries["/divergent"] = directory;
@@ -820,9 +783,8 @@ MACHA_FAST_TEST("storage_metadata",
     divergent.hash = metadata_hash(divergent.generation, divergent.previous, divergent.payload);
 
     {
-        // A one-byte materialization budget: nothing but the pinned
-        // current/committed head survives in the cache, so every other
-        // read must genuinely reconstruct from history.log.
+        // A one-byte materialization budget: only the pinned current/committed head
+        // stays cached, so other reads reconstruct from history.log.
         MetadataReplica replica(path, keys.storage, {}, true, 1);
         REQUIRE(replica.store_commit(older));
         REQUIRE(replica.accept_commit({older.generation, older.hash, 2, {a, b}}));
@@ -840,7 +802,7 @@ MACHA_FAST_TEST("storage_metadata",
         // Any further materialization evicts the now-unpinned merge.
         REQUIRE(replica.materialized(divergent.hash));
 
-        // Live: the merge must still reconstruct from disk once evicted.
+        // The merge still reconstructs from disk once evicted.
         auto reconstructed = replica.materialized(merge.hash);
         REQUIRE(reconstructed);
         CHECK(reconstructed->record.hash == merge.hash);
@@ -848,8 +810,7 @@ MACHA_FAST_TEST("storage_metadata",
         CHECK(replica.accepted_heads().size() == 2);
     }
 
-    // Restart: must not throw (which quarantined the whole replica in the
-    // incident) and must still see both heads.
+    // A restart does not throw and still sees both heads.
     MetadataReplica reopened(path, keys.storage, {}, true, 1);
     const auto heads = reopened.accepted_heads();
     REQUIRE(heads.size() == 2);
@@ -862,11 +823,9 @@ MACHA_FAST_TEST("storage_metadata",
 
 MACHA_FAST_TEST("storage_metadata",
                 test_unreconstructable_accepted_head_is_kept_at_startup_and_reanchored_live) {
-    // The other half of the 2026-09-06 fix. Whatever makes an accepted head
-    // unreplayable locally, the response must be (a) do not throw the whole
-    // replica away at startup, (b) say exactly what is wrong, (c) accept a
-    // self-contained full record from a peer and re-anchor the head in place
-    // -- live, with no restart and no quarantine.
+    // An accepted head that cannot be replayed locally does not discard the
+    // replica at startup, is reported precisely, and is re-anchored live from a
+    // peer's self-contained full record.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -954,8 +913,7 @@ MACHA_FAST_TEST("storage_metadata",
                                target_path / "metadata" / "heads.meta",
                                std::filesystem::copy_options::overwrite_existing);
 
-    // (a) Startup keeps the certificate and flags the head instead of
-    // throwing (which quarantined every metadata file before).
+    // (a) Startup keeps the certificate and flags the head instead of throwing.
     MetadataReplica target(target_path, keys.storage, {}, true, 1);
     CHECK(!target.recovery_required());
     REQUIRE(target.accepted_head_certificates().size() == 2);
@@ -987,9 +945,8 @@ MACHA_FAST_TEST("storage_metadata",
     // Re-anchoring over an *indexed* but unreplayable frame supersedes it in
     // place, and a restart prefers the full frame over the older delta.
     {
-        // Simulate the incident's shape, not a replica that lies forever:
-        // reconstruction fails for the enumeration that flags the head and
-        // for the repair's own pre-check, then the re-anchored frame reads.
+        // Reconstruction fails for the enumeration that flags the head and for the
+        // repair's pre-check, then the re-anchored frame reads.
         size_t forced = 0;
         source.set_force_unreconstructable_for_tests([&](const Hash256& hash) {
             return hash == merge.hash && ++forced <= 2;
@@ -1083,9 +1040,8 @@ MACHA_FAST_TEST("storage_metadata", test_full_fallback_boundary_heals_when_paren
         REQUIRE(boundary.has_value());
         CHECK(!boundary->previous_known);
 
-        // The current head's direct predecessor exists. The missing ancestry is
-        // one level deeper, matching the live failure where head-only healing
-        // stopped before reaching a compacted checkpoint boundary.
+        // The head's direct predecessor exists and the missing ancestry is one level
+        // deeper, so healing the head alone does not reach the compacted boundary.
         REQUIRE(target.store_commit(descendant));
         REQUIRE(target.history_contains(descendant.previous));
         CHECK(!target.history_contains(parent.hash));
@@ -1182,15 +1138,8 @@ MACHA_FAST_TEST("storage_metadata", test_compacted_direct_predecessor_cannot_res
 
 MACHA_FAST_TEST("storage_metadata",
                test_unreconstructable_accepted_head_is_rate_limited_not_hammered) {
-    // 2026-09-06 concurrent-write stress test incident: once an accepted head
-    // failed to reconstruct, every caller up the stack (checkpoint
-    // maintenance, catalogue publication, conflict reconciliation, ordinary
-    // reads) re-attempted and re-threw immediately, with no backoff -- one
-    // narrow reconstruction failure turned into an unbounded tight retry loop
-    // that pinned a thread for hours under load. The exact original trigger
-    // was not conclusively pinned down; this proves the fix regardless of
-    // cause: a still-broken head does not re-attempt reconstruction or
-    // re-throw on every single call once its cooldown is set.
+    // Once a head fails to reconstruct and its cooldown is set, later calls
+    // neither re-attempt reconstruction nor re-throw.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -1211,8 +1160,8 @@ MACHA_FAST_TEST("storage_metadata",
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
-    // Three genuine siblings forked from genesis -- each accept_commit() below
-    // is a real, independent conflicting-branch acceptance, not a no-op.
+    // Three siblings forked from genesis: each accept_commit() below is a real
+    // conflicting-branch acceptance.
     const auto head_a = make_child(genesis, "/a");
     const auto head_b = make_child(genesis, "/b");
     const auto head_c = make_child(genesis, "/c");
@@ -1222,9 +1171,7 @@ MACHA_FAST_TEST("storage_metadata",
     REQUIRE(replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 0, {}}));
     REQUIRE(replica.accepted_heads().size() == 1);
 
-    // head_a is genuinely fine right now; force it to report as
-    // unreconstructable from here on, simulating the incident's failure mode
-    // directly rather than needing to reproduce its unconfirmed root cause.
+    // Force head_a to report as unreconstructable from here on.
     size_t reconstruct_attempts = 0;
     replica.set_force_unreconstructable_for_tests([&](const Hash256& hash) {
         if (hash != head_a.hash)
@@ -1241,12 +1188,11 @@ MACHA_FAST_TEST("storage_metadata",
         threw = true;
         CHECK(std::string(error.what()).find("cannot be reconstructed") != std::string::npos);
     }
-    CHECK(threw); // The first occurrence still surfaces -- unchanged behaviour.
+    CHECK(threw); // The first occurrence still surfaces.
     CHECK(reconstruct_attempts == 1);
 
-    // A second, distinct fork accepted moments later -- exactly the shape of
-    // repeated real calls under load -- must not re-attempt reconstructing
-    // the still-broken head_a or re-throw because of it. This is the fix.
+    // A second fork accepted shortly after neither re-attempts reconstructing
+    // head_a nor re-throws.
     REQUIRE(replica.store_commit(head_c));
     bool threw_again = false;
     try {
@@ -1257,10 +1203,8 @@ MACHA_FAST_TEST("storage_metadata",
     CHECK(!threw_again);
     CHECK(reconstruct_attempts == 1); // Not retried again within the cooldown.
 
-    // accepted_heads() is the hottest path into this failure mode -- called on
-    // essentially every metadata read/reconciliation attempt cluster-wide --
-    // and must likewise stay quiet under repeated calls, returning the
-    // reconstructable heads rather than throwing.
+    // accepted_heads(), the hottest path, also stays quiet under repeated calls
+    // and returns the reconstructable heads.
     for (int i = 0; i < 5; ++i) {
         std::vector<MetadataRecord> heads;
         bool heads_threw = false;
@@ -1348,9 +1292,8 @@ MACHA_FAST_TEST("storage_metadata", test_pristine_joiner_adopts_compacted_cluste
         REQUIRE(entry.has_value());
         genesis_entry = *entry;
 
-        // A pristine node imports a valid established head whose physical
-        // ancestry was compacted away. Canonical genesis is a semantic ancestor,
-        // not a competing rootless branch, so adoption is immediate.
+        // A pristine node imports a valid head whose ancestry was compacted away;
+        // canonical genesis is a semantic ancestor, so adoption is immediate.
         REQUIRE(joiner.import_history(compacted_head));
         REQUIRE(joiner.accept_commit(established_accept));
         const auto heads = joiner.accepted_heads();
@@ -1406,10 +1349,8 @@ MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_only_trusted_o
     CHECK(!replica.checkpoint_proof().has_value());
 
     replica.record_checkpoint_ack(proposal);
-    // The ack is durably visible, but only ever as `acked` -- callers that
-    // gate on authority (compact_history_if_safe() and the
-    // accepted_head_is_ancestor_locked() checkpoint-floor trust rule) must
-    // check status == committed themselves; this accessor does not filter.
+    // The ack is visible only as `acked`: this accessor does not filter, so
+    // callers that gate on authority must check status == committed.
     auto acked = replica.checkpoint_proof();
     REQUIRE(acked.has_value());
     CHECK(acked->status == HistoryCheckpointProof::Status::acked);
@@ -1430,16 +1371,9 @@ MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_only_trusted_o
 }
 
 MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_ack_refuses_a_floor_this_replica_has_already_superseded) {
-    // Regression: a proposer whose own survey of the cluster was already
-    // stale by the time this ack arrives (e.g. it fell behind and proposed a
-    // floor every other replica had already moved past) must not be able to
-    // extract an ack for a floor this replica no longer holds as its single
-    // accepted head. Acking unconditionally let the stale proposer alone
-    // durably commit and compact its own history to that stale floor,
-    // discarding the only shared ancestry other replicas still needed for
-    // ordinary two-parent reconciliation -- with no automatic recovery
-    // possible afterward (observed live: three nodes permanently stuck on
-    // "divergent metadata heads have no known common ancestor").
+    // A stale proposer cannot extract an ack for a floor that is no longer this
+    // replica's single accepted head; acking it would let that proposer alone
+    // commit and compact away ancestry other replicas need to reconcile.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -1462,8 +1396,7 @@ MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_ack_refuses_a_floor_
     CHECK(!replica.record_checkpoint_ack(stale));
     CHECK(!replica.checkpoint_proof().has_value());
 
-    // A genuine proposal for this replica's actual current head still acks
-    // normally -- the fix rejects a mismatched floor, not every proposal.
+    // A proposal for this replica's actual current head still acks.
     HistoryCheckpointProof genuine;
     genuine.floor_hash = genuine_head;
     genuine.floor_generation = replica.committed().generation;
@@ -1524,8 +1457,8 @@ MACHA_FAST_TEST("storage_metadata", test_history_checkpoint_proof_reload_validat
         REQUIRE(replica.accept_commit({advanced.generation, advanced.hash, 0, {}}));
     }
     {
-        // The proof's floor_hash no longer matches committed_ -- a restart
-        // must never trust it, not even partially.
+        // The proof's floor_hash no longer matches committed_: a restart must not
+        // trust it at all.
         MetadataReplica reopened(path, keys.storage);
         CHECK(!reopened.checkpoint_proof().has_value());
     }
@@ -1592,15 +1525,9 @@ MACHA_FAST_TEST("storage_metadata",
     floor.hash = metadata_hash(floor.generation, floor.previous, floor.payload);
     const MetadataAcceptance floor_accept{floor.generation, floor.hash, 2, {a, b}};
 
-    // A later cluster head descending from `floor` via mutations this node
-    // never witnessed, itself already compacted a second time on the peer
-    // side: its recorded direct predecessor is some further intermediate
-    // record this node never had either, not `floor` itself. This is the
-    // real gap -- history_is_ancestor_locked() already walks a single
-    // compacted hop's *direct* previous hash even when previous_known is
-    // false (see its own comment), so a one-hop-removed compacted root is
-    // not actually the unresolvable case. Two hops (an intermediate this
-    // node never received, itself pruned away too) is.
+    // A later head descending from `floor` through two compacted hops this node
+    // never saw. One compacted hop resolves through its direct previous hash;
+    // two do not.
     Hash256 pruned_intermediate{};
     pruned_intermediate.bytes[0] = 0x77;
     auto beyond_snapshot = floor_snapshot;
@@ -1620,10 +1547,8 @@ MACHA_FAST_TEST("storage_metadata",
     beyond_compacted_root.body = MetadataHistoryEntry::Body::full;
     beyond_compacted_root.payload.assign(beyond.payload.begin(), beyond.payload.end());
 
-    // Negative case: a replica with no checkpoint proof for `floor` must
-    // never silently adopt `beyond` on generation alone -- that is exactly
-    // the defect a prior incident was caused by. It stays genuinely
-    // divergent, awaiting real reconciliation.
+    // Without a checkpoint proof for `floor`, a replica never adopts `beyond` on
+    // generation alone; it stays divergent until reconciled.
     {
         MetadataReplica replica(t.path() / "no-proof", keys.storage);
         REQUIRE(replica.store_commit(floor));
@@ -1635,12 +1560,9 @@ MACHA_FAST_TEST("storage_metadata",
         CHECK(!replica.history_common_ancestor(floor.hash, beyond.hash).has_value());
     }
 
-    // Positive case: a replica that itself durably committed a checkpoint
-    // proof for exactly `floor` trusts it as a universal ancestor of
-    // anything that now materialises at a later generation, exactly like
-    // genesis -- because reaching that proof already required every then-
-    // known participant, including this replica, to agree floor was the
-    // cluster's sole accepted head.
+    // With a committed checkpoint proof for exactly `floor`, the replica trusts it
+    // as an ancestor of anything at a later generation, as with genesis: the proof
+    // required every participant to agree floor was the sole accepted head.
     {
         MetadataReplica replica(t.path() / "with-proof", keys.storage);
         REQUIRE(replica.store_commit(floor));
@@ -1752,9 +1674,8 @@ MACHA_FAST_TEST("storage_metadata",
     const auto left = record_for(50, left_snapshot, 10);
     const auto right = record_for(50, right_snapshot, 20);
 
-    // Concurrent, neither dominates: causal-dominance repair must refuse this
-    // pair (that refusal is exactly what routes an operator to the
-    // conflict-preserving repair instead).
+    // Concurrent, neither dominates: causal-dominance repair refuses, leaving the
+    // conflict-preserving repair.
     CHECK(!plan_causally_dominant_metadata_repair(left, left_snapshot, right, right_snapshot));
 
     auto plan = plan_conflict_preserving_metadata_repair(left, left_snapshot, right, right_snapshot);
@@ -1784,10 +1705,8 @@ MACHA_FAST_TEST("storage_metadata",
     REQUIRE(repaired.merge_parents.size() == 1);
     CHECK(repaired.merge_parents.front() == std::max(left.hash, right.hash));
 
-    // Refuses outright when the two heads differ by more than in-place
-    // changes: an empty base also disables the rename/move-collision
-    // detection that a real common ancestor would drive, so an add/remove
-    // asymmetry is not safe for this code path to arbitrate.
+    // Refused when the heads differ by more than in-place changes: an empty base
+    // disables rename/move-collision detection, so add/remove asymmetry is unsafe.
     auto right_with_extra = right_snapshot;
     right_with_extra.entries["/right-only"] = directory;
     const auto right_extra_record = record_for(50, right_with_extra, 20);
@@ -1847,13 +1766,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_recovery_cache_seed_is_not_acc
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_truncates_not_reseeds) {
-    // Discipline 3: one unauthenticatable frame in the middle of the journal
-    // used to throw out of load_journal(), and the constructor answered by
-    // quarantining every metadata file (checkpoint, history, heads) and
-    // falling back to a cache seed — or failing outright without one. The
-    // journal is a CAS chain: the durable prefix before the bad frame is
-    // exactly a crash before that append. Keep it, quarantine the tail,
-    // start normally.
+    // An unauthenticatable frame mid-journal: the journal is a CAS chain, so the
+    // prefix before it is exactly a crash before that append. The prefix is kept,
+    // the tail quarantined, and startup proceeds normally.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -1920,7 +1835,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_journal_mid_frame_corruption_t
             quarantined = true;
     CHECK(quarantined);
 
-    // And the replica is usable: the same mutation applies again.
+    // The replica is usable: the same mutation applies again.
     MetadataRecord observed;
     REQUIRE(reopened.cas(genesis.generation, genesis.hash, first.payload, &observed));
     CHECK(observed.hash == first.hash);
@@ -2008,9 +1923,8 @@ MACHA_FAST_TEST("storage_metadata",
         REQUIRE(replica.cas(genesis.generation, genesis.hash, high.payload, &observed));
         CHECK(observed.hash == high.hash);
 
-        // Legacy pre-0.19 PREPARE journal state remains readable deterministically.
-        // This is storage/restart compatibility only; protocol 20 never uses
-        // MetadataReplica::cas() for live distributed publication.
+        // Legacy PREPARE journal state stays readable; protocol 20 never uses
+        // MetadataReplica::cas() for live publication.
         REQUIRE(replica.cas(genesis.generation, genesis.hash, low.payload, &observed));
         CHECK(observed.hash == low.hash);
         CHECK(!replica.cas(genesis.generation, genesis.hash, high.payload, &observed));
@@ -2018,8 +1932,8 @@ MACHA_FAST_TEST("storage_metadata",
         CHECK(replica.committed().hash == genesis.hash);
     }
 
-    // The old PREPARE replacement sequence must still replay after upgrade so an
-    // interrupted pre-0.19 journal can be recovered/migrated without data loss.
+    // A legacy PREPARE replacement sequence still replays, so an interrupted
+    // legacy journal recovers without data loss.
     MetadataReplica reopened(path, keys.storage);
     CHECK(reopened.current().hash == low.hash);
     CHECK(reopened.committed().hash == genesis.hash);
@@ -2061,9 +1975,8 @@ MACHA_FAST_TEST("storage_metadata",
         CHECK(replica.committed().hash == record.hash);
     }
 
-    // Simulate loss of the independent acceptance-proof file while retaining a
-    // perfectly readable SM12 checkpoint/history. The checkpoint is recovery
-    // material only; protocol 20 must never manufacture authority from it.
+    // The acceptance-proof file is lost while the SM12 checkpoint/history stays
+    // readable: the checkpoint is recovery material, never authority.
     REQUIRE(std::filesystem::remove(path / "metadata" / "heads.meta"));
     MetadataReplica reopened(path, keys.storage);
     CHECK(reopened.committed().hash == record.hash);
@@ -2234,9 +2147,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_chain_reuses_bounded_mat
     CHECK(after.materialization_cache_hits - middle.materialization_cache_hits == 1);
     CHECK(middle.materialization_cache_misses - before.materialization_cache_misses == 1);
     CHECK(after.materialization_cache_entries <= 64);
-    // Replaying a long delta chain must not retain every full intermediate
-    // decoded namespace. Only the requested immutable result may enter the
-    // cache; this is the regression for multi-gigabyte restart RSS.
+    // Replaying a long delta chain caches only the requested result, not every
+    // intermediate namespace.
     CHECK(middle.materialization_cache_entries <= before.materialization_cache_entries + 1);
     CHECK(middle.materialization_cache_bytes >= results.front()->resident_bytes);
 
@@ -2494,7 +2406,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
     standing.right_head = sha256(pattern(52));
     parent.conflicts.emplace(metadata_conflict_id(standing), standing);
     parent.merge_parents = {sha256(pattern(53))};
-    // Append (legacy) order: guaranteed non-canonical by reversing a sort.
+    // Append order, made non-canonical by reversing a sort.
     parent.garbage = {tombstone(3), tombstone(1), tombstone(2)};
     canonicalise_garbage(parent.garbage);
     std::reverse(parent.garbage.begin(), parent.garbage.end());
@@ -2519,7 +2431,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
         return encoded.size();
     };
 
-    // Nothing topological, tombstones untouched: DLT5 as before.
+    // Nothing topological, tombstones untouched: DLT5.
     auto plain = parent;
     plain.mutation_sequences[random_node_id()] = 1;
     round_trip(plain, '5');
@@ -2535,15 +2447,14 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
     conflicts_only.conflicts.clear();
     round_trip(conflicts_only, '7');
 
-    // Both changed: still DLT6, so a mixed-version cluster keeps its cheap
-    // merges through a rolling upgrade.
+    // Both changed: still DLT6.
     auto both = parent;
     both.merge_parents.clear();
     both.conflicts.clear();
     round_trip(both, '6');
 
     // Canonical tombstone order alone (a reconciliation's union over an
-    // append-ordered primary parent): expressible now, was a full snapshot.
+    // append-ordered primary parent) is expressible as a delta.
     auto canonical = parent;
     canonicalise_garbage(canonical.garbage);
     REQUIRE(garbage_is_canonical(canonical.garbage));
@@ -2574,10 +2485,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt7_presence_flags_round_trip
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_dlt8_append_extents_delta) {
-    // A large file publishes one quantum at a time; each commit used to
-    // re-send the whole extent table (105 KB per 32 MB quantum for a
-    // 13.9 GB file, 124 MB of history per node in 35 min on 2026-09-07).
-    // DLT8 carries only the appended extents and the new attributes.
+    // A large file publishes one quantum at a time: DLT8 carries only the
+    // appended extents and new attributes, not the whole extent table.
     auto before = dlt7_base_snapshot();
     FsEntry file;
     file.type = EntryType::file;
@@ -2641,10 +2550,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_dlt8_append_extents_delta) {
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_merge_over_append_ordered_tombstones_is_a_delta) {
-    // On the cluster (2026-09-06) 4 of 5 reconciliations were 5-8 MB full
-    // frames: the merge canonicalises the tombstone union by ObjectId while
-    // the primary parent's vector was in append order, and pre-DLT7 deltas
-    // could not reorder retained tombstones.
+    // A merge canonicalises the tombstone union by ObjectId while the primary
+    // parent is in append order; that reorder must still go as a delta.
     auto base = dlt7_base_snapshot();
     base.garbage = {tombstone(9), tombstone(4), tombstone(7)};
     canonicalise_garbage(base.garbage);
@@ -2677,11 +2584,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_over_append_ordered_tomb
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the_snapshot) {
-    // A conflict whose subject a later mutation rewrote is decided: the
-    // later write is the resolution. 116 such records (336 KB) stood in the
-    // production snapshot on 2026-09-06 -- 49 on media paths both writers had
-    // since republished, 67 on catalogue roots the scanner had long moved on
-    // from -- and rode along in every merge delta.
+    // A conflict whose subject a later mutation rewrote is decided: the later
+    // write is the resolution, and the record leaves the snapshot.
     auto base = dlt7_base_snapshot();
     FsEntry file;
     file.type = EntryType::file;
@@ -2744,9 +2648,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_superseded_conflicts_leave_the
     CHECK(later.conflicts_superseded == 1);
     CHECK(later.snapshot.conflicts.size() == 1);
 
-    // Same bytes on both sides (two writers publishing duplicate media):
-    // the merge settles it deterministically instead of recording a
-    // conflict, and a pre-0.32 record of that shape settles at pruning.
+    // Same bytes on both sides (duplicate media): the merge settles it without a
+    // conflict, and an existing record of that shape settles at pruning.
     auto dup_base = dlt7_base_snapshot();
     auto dup_left = dup_base;
     auto dup_right = dup_base;
@@ -2806,14 +2709,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_conflict_resolution_is_not_res
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing_conflicts) {
-    // Regression for the 2026-09-06 "local metadata delta rejected; retrying
-    // full record" storm. When both parents of a reconciliation carry the same
-    // unresolved conflict, the merge leaves the conflict set unchanged and
-    // metadata_delta() left replace_conflicts unset. DLT6 cannot say
-    // "unchanged": the decoder reads the empty list back as "replace with
-    // nothing", the replay loses the standing conflict, the reconstruction no
-    // longer matches the record, and every replica -- local and peer -- fell
-    // back to a 15 MB full snapshot for every conflict-free merge.
+    // Both parents of a reconciliation carry the same unresolved conflict. DLT6
+    // cannot say "unchanged": an empty list replays as "replace with nothing",
+    // so the delta must not drop the standing conflict.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2877,7 +2775,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     const auto encoded = encode_metadata_delta(*delta);
     REQUIRE(encoded.size() >= 8);
     // DLT7: only merge_parents changed, so the standing conflict set is not
-    // carried -- the delta is a few hundred bytes, not the conflict set.
+    // carried.
     CHECK(encoded[7] == '7');
     CHECK(delta->replace_merge_parents.has_value());
     CHECK(!delta->replace_conflicts.has_value());
@@ -2886,7 +2784,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
     CHECK(replayed.conflicts.contains(standing_id));
     CHECK(encode_snapshot(replayed) == merge.payload);
 
-    // The replica's own exact-reconstruction check is what rejected these.
+    // The replica's exact-reconstruction check accepts the merge as a delta.
     MetadataReplica replica(t.path() / "standing-conflict", keys.storage);
     REQUIRE(replica.store_commit(base_record));
     REQUIRE(replica.store_commit(left_record));
@@ -2900,10 +2798,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_merge_delta_preserves_standing
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_reconstructs) {
-    // The first ordinary mutation after a reconciliation clears merge_parents.
-    // DLT6 expresses that replacement, so the write must not need a full
-    // snapshot -- and, with a standing conflict on the merge commit, the
-    // delta has to carry the conflict set along with the cleared parents.
+    // The first mutation after a reconciliation clears merge_parents. DLT6
+    // expresses that, and with a standing conflict on the merge commit the delta
+    // carries the conflict set too.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2975,12 +2872,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_child_of_merge_commit_re
 }
 
 MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_linear) {
-    // gbni-1, 2026-09-06: replaying one reconciliation delta (45-65k tombstone
-    // upserts against ~270k tombstones) took minutes because every erase and
-    // upsert scanned the whole garbage vector, and the node crash-looped on
-    // its 120 s startup budget. The indexed replacement must keep the exact
-    // old semantics -- checked against a naive reference on a small input --
-    // and finish a large input in bounded time.
+    // Tombstone edits apply through an index: the same result as a naive
+    // reference on a small input, and bounded time on a large one.
     auto make_id = [](uint64_t n) {
         ObjectId id{};
         for (int b = 0; b < 8; ++b)
@@ -3040,8 +2933,8 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
         const auto started = std::chrono::steady_clock::now();
         const auto after = apply_metadata_delta(before, delta);
         const auto elapsed = std::chrono::steady_clock::now() - started;
-        // The scanning version needs ~10^10 comparisons here; 10 s is a
-        // generous bound for the indexed one on a loaded test host.
+        // A linear scan would need ~10^10 comparisons here; 10 s is generous on a
+        // loaded host.
         CHECK(elapsed < 10s);
         CHECK(after.garbage.size() == count + 1 - (edits + 1) + edits);
         CHECK(std::none_of(after.garbage.begin(), after.garbage.end(),
@@ -3231,8 +3124,8 @@ MACHA_TEST("storage_metadata", test_local_store) {
         CHECK(*reopened.get(id) == plain);
     }
 
-    // Corrupt/missing state is a migration/recovery case: fall back to one full
-    // reconciliation, then recreate a trusted checkpoint for later O(1) boots.
+    // Corrupt or missing state falls back to one full reconciliation, then writes
+    // a trusted checkpoint again.
     {
         std::ofstream out(root / ".macha.accounting", std::ios::binary | std::ios::trunc);
         Bytes junk(256, 0x5a);
@@ -3384,8 +3277,8 @@ MACHA_TEST("storage_metadata", test_storage_pool_and_persistent_cache) {
     CHECK(gc_yielded.yielded);
     CHECK(gc_yielded.objects == 0);
 
-    // Re-putting an identical hash reaffirms its physical age. This closes the
-    // race where a new uncommitted write reuses an ancient orphan already on an owner.
+    // Re-putting an identical hash reaffirms its physical age, so a new
+    // uncommitted write cannot reuse an old orphan about to be collected.
     auto gc_reaffirmed_object = put_gc_object(0x35);
     const auto gc_reaffirmed = gc_reaffirmed_object.first;
     age_object(gc_reaffirmed);
@@ -3617,8 +3510,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(encode_snapshot(apply_metadata_delta(delta_target, garbage_delta_roundtrip)) ==
           encode_snapshot(garbage_compacted));
 
-    // Legacy SM7 snapshots remain valid on disk. Their tombstones intentionally
-    // decode as legacy (no retirement time/id) and are stamped by 0.10.x GC.
+    // Legacy SM7 snapshots remain valid; their tombstones decode without
+    // retirement time/id and are stamped by GC.
     Writer old_v7;
     const std::array<uint8_t, 8> old_v7_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '7'};
     old_v7.raw(old_v7_magic);
@@ -3649,8 +3542,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     CHECK(upgraded_v7.garbage.front().retired_at_ns == 0);
     CHECK(upgraded_v7.garbage.front().retirement_id == NodeId{});
 
-    // DLT1 is accepted only as a persisted-journal format compatibility path.
-    // New encoders emit DLT5; old journal records still replay byte-for-byte.
+    // DLT1 is accepted only from persisted journals: encoders emit DLT5, and old
+    // records still replay byte-for-byte.
     Writer old_delta;
     const std::array<uint8_t, 8> old_delta_magic{'D', 'H', 'T', 'M', 'D', 'L', 'T', '1'};
     old_delta.raw(old_delta_magic);
@@ -3697,9 +3590,8 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
         CHECK(replayed_snapshot.garbage.back().retired_at_ns == 0);
     }
 
-    // Legacy metadata snapshots had no catalogue-root field. Current code must read
-    // them directly so an existing namespace upgrades to an empty catalogue
-    // rather than requiring destructive state migration.
+    // Snapshots without a catalogue-root field decode to an empty catalogue,
+    // without migration.
     Writer old;
     const std::array<uint8_t, 8> old_magic{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'};
     old.raw(old_magic);
@@ -3766,11 +3658,9 @@ MACHA_HEAVY_TEST("storage_metadata", test_metadata_codec_and_replica) {
     REQUIRE(reopened.remember_current_committed(delta_next.generation, delta_next.hash));
     auto journal_size = std::filesystem::file_size(replica_path / "metadata" / "journal.log");
     const auto journal_growth = journal_size - journal_before_delta;
-    // The journal contains two authenticated frames (prepare + commit), so for
-    // deliberately tiny snapshots the fixed nonce/tag/framing overhead can be
-    // larger than the snapshot itself. What matters is that growth tracks the
-    // compact delta plus bounded framing, rather than embedding the full
-    // successor snapshot in the ordinary mutation path.
+    // For tiny snapshots the two frames' fixed overhead can exceed the snapshot;
+    // growth must track the compact delta plus bounded framing, not the full
+    // successor snapshot.
     CHECK(delta_bytes.size() < delta_next.payload.size());
     CHECK(journal_growth >= delta_bytes.size());
     CHECK(journal_growth < delta_bytes.size() + 512);
@@ -4032,9 +3922,8 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    // Cluster reachability deliberately precedes DATA readiness now. Repair is
-    // a storage-plane operation, so this test must wait for that plane rather
-    // than treating membership activity as an implicit backend-ready signal.
+    // Reachability precedes DATA readiness, and repair is a storage-plane
+    // operation, so wait for local state.
     REQUIRE(s1.node().wait_local_state_ready(std::chrono::seconds{10}));
     REQUIRE(s2.node().wait_local_state_ready(std::chrono::seconds{10}));
 
@@ -4114,11 +4003,9 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_rejects_unrepresentable_
               [](const GarbageRef& a, const GarbageRef& b) { return a.id < b.id; });
     REQUIRE(reordered.garbage != before.garbage);
 
-    // DLT5/6 can erase, replace and append tombstones, but cannot reorder
-    // retained entries. A reordering *into* canonical ObjectId order is what
-    // DLT7 expresses (the delta sorts after applying its edits); any other
-    // reordering is still not compact, because claiming it were would
-    // reconstruct a semantically equal but byte-different immutable record.
+    // DLT5/6 cannot reorder retained tombstones and DLT7 only into canonical
+    // ObjectId order; any other reorder is not compact, since replay would
+    // produce a byte-different record.
     auto canonical = metadata_delta(before, reordered);
     REQUIRE(canonical.has_value());
     CHECK(canonical->canonical_garbage);
@@ -4151,9 +4038,8 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
         entry.type = EntryType::directory;
         entry.mode = 0755;
         snapshot.entries["/full-fallback"] = entry;
-        // Deliberately omit the entry from the supplied exact delta. The local
-        // replica must reject that compact body and retry the immutable full
-        // record, matching the existing remote-replica safety path.
+        // The supplied exact delta omits the entry: the local replica must reject it
+        // and retry with the full record, as a remote replica does.
     });
 
     CHECK(service.filesystem().getattr("/full-fallback").type == EntryType::directory);
@@ -4163,12 +4049,8 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
 }
 
 MACHA_FAST_TEST("storage_metadata", test_decoded_extent_vectors_carry_no_allocator_slack) {
-    // Extent vectors are the whole of a media namespace's residency, and the
-    // decoded head is pinned in the materialization cache for as long as it is
-    // current -- so any capacity() beyond size() is permanent RAM on every
-    // node. Geometric push_back growth was leaving up to 2x: measured on es-1
-    // (2026-09-17, 1.6 TiB / 424,222 extents) the decoded snapshot held 610,567
-    // extent slots, 10.4 MB of slack in a 36 MB snapshot.
+    // The decoded head stays pinned in the materialization cache, so extent
+    // vectors must carry no capacity beyond their size.
     auto snapshot = decode_snapshot(genesis_metadata().payload);
     // Sizes either side of a power of two: geometric growth is only visible
     // when the final count is not itself the capacity the doubling lands on.
@@ -4236,9 +4118,9 @@ TorrentRequest sample_torrent_request(const std::string& id, const std::string& 
 } // namespace
 
 MACHA_FAST_TEST("storage_metadata", test_torrent_requests_join_without_conflicts) {
-    // 0.64.0. Metadata writes are not compare-and-swap and history branches, so
-    // two replicas can change one request at once. Every field has a rule and
-    // the merge is a join: the same answer from either side, and again.
+    // Metadata writes are not compare-and-swap and history branches, so two
+    // replicas can change one request at once. Every field has a rule and the
+    // merge is a join: the same answer from either side, and again.
     const auto a_node = random_node_id();
     const auto b_node = random_node_id();
     auto base = sample_torrent_request(std::string(32, 'a'), std::string(40, '1'), 100);

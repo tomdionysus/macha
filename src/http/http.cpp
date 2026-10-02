@@ -36,9 +36,8 @@ using namespace std::chrono_literals;
 constexpr size_t max_header_bytes = 64 * 1024;
 constexpr size_t recv_buffer_bytes = 16 * 1024;
 constexpr size_t recv_per_pass_bytes = 64 * 1024;
-// Input a connection may accumulate while it is not being read for a
-// request (a pipelining client sending ahead): past this the reactor stops
-// asking for POLLIN until the current response is done.
+// Input a connection may buffer while not being read (pipelining ahead);
+// past this the reactor stops polling for POLLIN until the response is done.
 constexpr size_t parked_input_bytes = max_header_bytes;
 
 std::string lower(std::string value) {
@@ -142,17 +141,15 @@ int64_t ms_between(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
 }
 
-// What the compute pool hands back to the reactor. The reactor never sees
-// the HttpBodySource itself: it sees a pump, whose only reactor-callable
-// surface is memory already read.
+// Handed from the pool to the reactor. The reactor sees only the pump, whose
+// reactor-callable surface is memory already read.
 class BodyPump {
     std::shared_ptr<HttpBodySource> source_;
     uint64_t size_{};
     const uint8_t* resident_{};
 
   public:
-    // Constructed on a pool thread: size() and resident() are the source's
-    // to answer, and this is the one place they are asked.
+    // Constructed on a pool thread, the one place size() and resident() are asked.
     explicit BodyPump(std::shared_ptr<HttpBodySource> source)
         : source_(std::move(source)), size_(source_->size()), resident_(source_->resident()) {}
     uint64_t size() const noexcept {
@@ -183,9 +180,8 @@ struct Event {
     bool ok{};
 };
 
-// The one way anything reaches the reactor from another thread. A pipe
-// rather than eventfd because macOS has no eventfd, and one byte is all the
-// reactor needs to know there is something to drain.
+// The only route into the reactor from another thread. A pipe, not eventfd
+// (absent on macOS); one byte signals something to drain.
 class Inbox {
     std::mutex mutex_;
     std::deque<Event> events_;
@@ -236,8 +232,7 @@ class Inbox {
         std::array<char, 64> sink{};
         while (::read(wake_read_, sink.data(), sink.size()) > 0) {
         }
-        // Cleared before the events are taken, so a post that lands between
-        // the two writes the pipe again rather than being missed.
+        // Cleared before taking events, so a post landing between rewrites the pipe.
         signalled_.store(false);
         std::deque<Event> out;
         std::lock_guard lock(mutex_);
@@ -252,7 +247,7 @@ class Inbox {
     }
 };
 
-// A bounded pool of threads that only ever compute: handlers and body reads.
+// Bounded compute-only pool: handlers and body reads.
 struct Lane {
     struct Job {
         std::function<void()> run;
@@ -297,10 +292,8 @@ struct Lane {
         queue.clear();
     }
 
-    // False when the lane is full and the caller has to answer for itself.
-    // Body reads bypass the cap: they are bounded by the staging windows of
-    // the connections already admitted, and a viewer mid-fragment is not a
-    // new request to refuse.
+    // False when the lane is full and the caller must answer itself. Body reads
+    // bypass the cap: admitted connections' staging windows already bound them.
     bool post(std::function<void()> run, bool bypass_cap = false) {
         {
             std::lock_guard lock(mutex);
@@ -354,16 +347,14 @@ struct Lane {
 
 enum class ConnectionState { reading, dispatched, deferred, writing };
 
-// Everything the reactor knows about one socket. Deliberately nothing here
-// can be called into: no handler, no body source, no ReadHandle, no
-// authenticator. The pump exposes memory the pool has already filled and
-// nothing else, so the reactor cannot sleep on anything it holds.
+// Everything the reactor knows about one socket. Nothing here can be called
+// into (no handler, body source, ReadHandle or authenticator); the pump
+// exposes only memory the pool filled, so the reactor cannot sleep on it.
 struct Connection {
     uint64_t id{};
     int fd{-1};
     ConnectionState state{ConnectionState::reading};
-    // Bumped when a request starts; an event carrying an older generation
-    // belongs to a request this connection has already finished with.
+    // Bumped per request; an event with an older generation is stale.
     uint64_t generation{};
     std::string input;
     size_t requests_served{};
@@ -371,14 +362,13 @@ struct Connection {
     bool input_closed{};
     Clock::time_point deadline{Clock::time_point::max()};
 
-    // The request in flight, kept so a deferral can be resumed.
+    // Kept so a deferral can be resumed.
     HttpRequest request;
     bool head_only{};
     bool keep_alive{};
     std::optional<HttpDeferral> deferral;
 
-    // The response being written: status line, headers and, for an inline
-    // body, the body itself, in one buffer.
+    // Status line, headers and any inline body, in one buffer.
     std::string out;
     size_t out_sent{};
     std::shared_ptr<BodyPump> pump;
@@ -429,8 +419,7 @@ HttpResponse http_error(int status, std::string_view code, std::string_view mess
     Json::Object error{{"code", std::string(code)}, {"message", std::string(message)}};
     if (!reason.empty())
         error["reason"] = std::string(reason);
-    // Omitted rather than defaulted: an axis this server cannot honestly state
-    // must read as "no answer" to the client, not as "false".
+    // Omitted, not defaulted: an axis not honestly known reads as "no answer".
     if (axes.scope)
         error["scope"] = std::string(failure_scope_name(*axes.scope));
     if (axes.node_healthy)
@@ -599,14 +588,14 @@ struct HttpServer::Impl {
     bool startup_complete{};
     std::string startup_error;
 
-    // Reactor-owned. Nothing below is touched from any other thread.
+    // Reactor-owned; touched from no other thread.
     std::map<uint64_t, std::unique_ptr<Connection>> connections;
     uint64_t next_connection_id{1};
     std::vector<pollfd> pollfds;
     std::vector<uint64_t> poll_ids;
     Clock::time_point last_accept_warning{};
 
-    // Diagnostics: written by the reactor and the lanes, read from anywhere.
+    // Diagnostics: written by the reactor and lanes, read from anywhere.
     std::atomic<uint64_t> passes{};
     std::atomic<uint64_t> stalls{};
     std::atomic<uint64_t> longest_pass_ms{};
@@ -647,8 +636,6 @@ struct HttpServer::Impl {
         return std::max<size_t>(1, config.staging_chunks);
     }
 
-    // ---- the compute side: what a lane job does -------------------------
-
     HttpResponse run_handler(HttpRequest& request) {
         const auto started = Clock::now();
         HttpResponse response;
@@ -678,8 +665,7 @@ struct HttpServer::Impl {
             response = http_error(500, "internal", "the request could not be completed");
         }
         const auto elapsed = ms_between(started, Clock::now());
-        // A deferred response has not been answered yet; its time is the
-        // wait it asked for, not the handler's cost.
+        // A deferred response's time is the wait it asked for, not handler cost.
         if (!response.defer)
             observations().record(observation_route_label(request.method, request.path),
                                   elapsed_us(started));
@@ -693,36 +679,23 @@ struct HttpServer::Impl {
         return response;
     }
 
-    // Runs here, on a lane worker, never on the reactor: gzip is CPU work and
-    // the reactor may not do any (see the class comment on HttpServer). By the
-    // time the reactor sees this response the body is final, so the
-    // Content-Length it writes is already the compressed length.
-    //
-    // Only a complete in-memory body is eligible. A response carrying a
-    // `stream` is media or a large file being pumped chunk by chunk, and the
-    // reactor sends it from resident memory with no copy; that path is left
-    // exactly as it was.
+    // Runs on a lane worker, never the reactor (gzip is CPU work), so the
+    // Content-Length the reactor writes is already compressed. Streamed bodies
+    // are never compressed.
     void compress_response(const HttpRequest& request, HttpResponse& response) const {
         if (!config.compression.enabled || response.stream)
             return;
-        // 204 and 304 have no body to compress; 206 is a range, and an
-        // encoding applied to one part of a representation is not something a
-        // client can reassemble.
+        // 204/304 have no body; a range (206) cannot be reassembled under an encoding.
         if (response.status == 204 || response.status == 206 || response.status == 304)
             return;
         if (!compressible_content_type(response.content_type))
             return;
-        // A handler that already chose an encoding owns that negotiation, and
-        // its entity tag -- if it set one -- names the representation it
-        // chose. WebApi does exactly this for the client's assets.
+        // A handler that chose an encoding owns the negotiation and its entity tag.
         if (response.headers.contains("Content-Encoding"))
             return;
 
-        // Say the response varies even when this particular client did not ask
-        // for gzip. On a deployment where some nodes sit behind a proxy and
-        // some are exposed directly, a shared cache that stored the identity
-        // body under an unqualified key would go on to hand it to a client
-        // that did ask -- and, worse, the reverse.
+        // Vary even when this client did not ask for gzip, so a shared cache never
+        // serves one encoding to a client wanting the other.
         response.headers.try_emplace("Vary", "Accept-Encoding");
 
         if (response.body.size() < config.compression.min_bytes)
@@ -733,11 +706,8 @@ struct HttpServer::Impl {
         if (!compressed)
             return;
 
-        // Entity tags are deliberately left alone. The suffix convention other
-        // servers use would corrupt the catalogue's `rev-N` tags, which are
-        // If-Match concurrency tokens a client sends back on a write rather
-        // than cache validators. Vary above is the mechanism that keeps caches
-        // honest here.
+        // Entity tags are left alone: suffixing would corrupt the catalogue's `rev-N`
+        // If-Match tokens. Vary keeps caches honest.
         compression_saved.fetch_add(response.body.size() - compressed->size(),
                                     std::memory_order_relaxed);
         compressed_responses.fetch_add(1, std::memory_order_relaxed);
@@ -766,8 +736,7 @@ struct HttpServer::Impl {
                     compress_response(request, event.response);
                 }
                 if (event.response.stream) {
-                    // The one place the source is asked anything on behalf of
-                    // the reactor: here, on the pool.
+                    // The one place the source is asked anything for the reactor, on the pool.
                     event.pump = std::make_shared<BodyPump>(event.response.stream);
                     event.response.stream.reset();
                 }
@@ -778,10 +747,8 @@ struct HttpServer::Impl {
             });
         if (!posted) {
             overloaded.fetch_add(1, std::memory_order_relaxed);
-            // Answered by the reactor with no handler involved, so it says
-            // what the health route would have said about who is answering:
-            // a client confirming an endpoint by its body must still be able
-            // to tell a busy Macha node from something that is not Macha.
+            // Answered without a handler, so it identifies the responder as the health
+            // route would: a client must tell a busy Macha node from something else.
             Json::Object root;
             root["service"] = "macha";
             root["status"] = "busy";
@@ -821,8 +788,6 @@ struct HttpServer::Impl {
             },
             true);
     }
-
-    // ---- the reactor ---------------------------------------------------
 
     int bind_listener() {
         addrinfo hints{};
@@ -905,8 +870,8 @@ struct HttpServer::Impl {
             if (pass_hook)
                 pass_hook();
 
-            // Cross-thread events first: a response or a chunk that is ready
-            // is what most often makes a socket worth writing to.
+            // Cross-thread events first: a ready response or chunk is what most often
+            // makes a socket writable.
             if (pollfds[1].revents & POLLIN) {
                 for (auto& event : inbox->drain()) {
                     if (event.kind == EventKind::stop) {
@@ -928,9 +893,8 @@ struct HttpServer::Impl {
                 auto found = connections.find(poll_ids[i]);
                 if (found == connections.end())
                     continue;
-                // on_readable() and flush() can close the connection, which
-                // destroys it: whether it survived is asked by id, never by
-                // reading the object that may be gone.
+                // on_readable() and flush() may destroy the connection; check survival by
+                // id, never through the object.
                 const auto id = poll_ids[i];
                 Connection& connection = *found->second;
                 if (revents & (POLLERR | POLLNVAL)) {
@@ -1048,9 +1012,8 @@ struct HttpServer::Impl {
             staged_bytes.fetch_sub(chunk.size(), std::memory_order_relaxed);
         ::shutdown(connection.fd, SHUT_RDWR);
         ::close(connection.fd);
-        // Dropping the connection drops its pump, its deferral state and
-        // its parked request: a hold is released here, a body source
-        // closed, within the pass that noticed the client had gone.
+        // Dropping the connection releases its pump, deferral and parked request
+        // within the pass that noticed the client had gone.
         connections.erase(found);
     }
 
@@ -1079,8 +1042,8 @@ struct HttpServer::Impl {
             try_parse(connection);
             return;
         }
-        // Parked between requests: input is kept for the pipelined next
-        // request, bounded by build_pollfds.
+        // Parked between requests: input kept for a pipelined next request, bounded
+        // by build_pollfds.
     }
 
     void try_parse(Connection& connection) {
@@ -1137,9 +1100,6 @@ struct HttpServer::Impl {
             }
         }
 
-        // HTTP/1.1 connections default to persistent unless the client asks
-        // to close; HTTP/1.0 connections default to close unless the client
-        // explicitly asks to keep the connection alive.
         const auto connection_header = request.headers.find("connection");
         const std::string connection_value = connection_header != request.headers.end()
                                                  ? lower(connection_header->second)
@@ -1154,8 +1114,7 @@ struct HttpServer::Impl {
 
         const auto body_start = header_end + 4;
         if (content_length > config.max_request_bytes) {
-            // The body is never read, so the connection cannot be reused:
-            // the next "request" on it would be the tail of this one.
+            // The body is never read, so the connection cannot be reused.
             input.clear();
             connection.keep_alive = false;
             begin_response(connection, http_error(413, "too_large", "request body too large"), {});
@@ -1197,8 +1156,8 @@ struct HttpServer::Impl {
                 return;
             connection.read_in_flight = false;
             if (!event.ok) {
-                // Fewer bytes than the declared Content-Length: the response
-                // cannot be completed and the connection cannot be reused.
+                // Short of Content-Length: the response cannot complete and the connection
+                // cannot be reused.
                 close_connection(connection.id);
                 return;
             }
@@ -1259,11 +1218,8 @@ struct HttpServer::Impl {
             "Access-Control-Expose-Headers",
             "Accept-Ranges, Content-Length, Content-Range, Location, Retry-After");
         response.headers.try_emplace("Accept-Ranges", pump ? "bytes" : "none");
-        // A node can advertise a public endpoint, and everything it serves
-        // is a private media library: the API, artwork, the web client. The
-        // client's own robots meta tag covers HTML and nothing else; this
-        // covers all of it. Not a security control -- the session gate is
-        // that -- just the standard way of staying out of search results.
+        // Everything served is a private library (API, artwork, web client); the
+        // client's robots meta tag covers only HTML. Not a security control.
         response.headers.try_emplace("X-Robots-Tag", "noindex, nofollow");
         const uint64_t content_length = pump ? pump->size() : response.body.size();
 
@@ -1293,7 +1249,7 @@ struct HttpServer::Impl {
     }
 
     // Keep the staging window full: at most one read outstanding, at most
-    // staging_chunks chunks waiting, never past the end of the body.
+    // staging_chunks waiting, never past the end of the body.
     void top_up(Connection& connection) {
         if (!connection.pump || connection.pump->resident())
             return;
@@ -1304,8 +1260,8 @@ struct HttpServer::Impl {
         post_chunk_read(connection);
     }
 
-    // Send whatever is ready. Returns with want_write set when the socket
-    // would block, and with the connection finished or closed otherwise.
+    // Send what is ready. Returns with want_write set when the socket would block;
+    // otherwise the connection is finished or closed.
     void flush(Connection& connection) {
         if (connection.state != ConnectionState::writing)
             return;

@@ -65,9 +65,8 @@ struct CatalogueHint {
     std::string provider;
     std::string media_id;
     std::vector<std::string> catalogue_item_ids;
-    // The outcome as a snake_case code (matched, no_provider_match, ...): no
-    // message in normal flow. A deferral or failure carries `error_code`, the
-    // code clients act on, and `error`, the English message beside it.
+    // The outcome code (matched, no_provider_match, ...). A deferral or failure
+    // adds `error_code` and its English `error`.
     std::string result;
     std::string error_code;
     std::string error;

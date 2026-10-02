@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Decision traces of the maintenance pass (the object ledger plan, T1). A
-// fixture drives one node through a scripted history on a manual clock and
-// records what the pass decided: gate verdicts as they change, and every
-// action. The trace is compared with a committed file under
-// tests/fixtures/maintenance-traces/, so any change to what maintenance
-// decides -- a gate, an order, a release -- fails here in seconds, where it
-// used to need a cluster soak to see. MACHA_WRITE_TRACE_FIXTURES=1 rewrites
-// the files instead of comparing (then read the diff before committing it).
+// Decision traces of the maintenance pass. A fixture drives one node through a
+// scripted history on a manual clock and records gate verdicts and every
+// action; the trace must match tests/fixtures/maintenance-traces/, so any
+// change to a gate, an order or a release fails here.
+// MACHA_WRITE_TRACE_FIXTURES=1 rewrites the files instead of comparing.
 #include "service/maintenance_clock.hpp"
 #include "test_backend_support.hpp"
 
@@ -22,10 +19,8 @@ using namespace macha::test_support;
 
 namespace {
 
-// Object and node ids differ on every run (random keys, random node ids),
-// so each distinct id -- 64 hex digits for an object, 32 for a node --
-// becomes #1, #2, ... in order of first appearance: which is which, and the
-// order, still have to match.
+// Ids differ on every run, so each distinct object (64 hex) or node (32 hex)
+// id becomes #1, #2, ... in order of first appearance.
 std::vector<std::string> normalise(const std::vector<std::string>& lines) {
     static const std::regex id("[0-9a-f]{64}|[0-9a-f]{32}");
     std::map<std::string, std::string> names;
@@ -46,19 +41,8 @@ std::vector<std::string> normalise(const std::vector<std::string>& lines) {
     return out;
 }
 
-// What a fixture compares, per step: the outcome (store and claim counts,
-// named objects), the actions the pass took since the previous step, grouped
-// by kind in the order taken, then the settled state: every gate's verdict
-// and the inventory and release horizon it last built. How many
-// passes ran between two steps, and so the path a gate took to its verdict,
-// depends on when asynchronous events land (a first pass either sees a
-// startup event or does not); the actions and the settled verdicts are the
-// decisions.
-// A gate's inputs without the scheduling ones. Whether a gate was due, or
-// its inventory was rebuilt in the same pass, and so whether it reads open or
-// shut at the moment a step is taken, depends on which passes ran; what it
-// did when it opened is in the actions. The node-state inputs (stable,
-// destructive, catalogue complete, generation current...) are the fixture's.
+// A gate's node-state inputs, without the scheduling ones (open/shut, due,
+// rebuilt, share, quiescent), which depend on how many passes ran.
 std::string node_conditions(std::string_view detail) {
     std::istringstream words{std::string(detail)};
     std::string kept;
@@ -72,6 +56,11 @@ std::string node_conditions(std::string_view detail) {
     return kept;
 }
 
+// Per step: the outcome (store and claim counts, named objects), the actions
+// since the previous step grouped by kind, then the settled state: each gate's
+// verdict and the inventory and release horizon last built. How many passes
+// ran between steps depends on when asynchronous events land, so only actions
+// and settled verdicts are compared.
 class TraceLog {
     std::mutex mutex_;
     std::set<std::string, std::less<>> ignored_;
@@ -97,19 +86,15 @@ class TraceLog {
         std::lock_guard lock(mutex_);
         if (ignored_.contains(kind))
             return;
-        // Gates and the two derived views are state: the last value before
-        // a step is the settled one. A pass may rebuild a view at an
-        // intermediate generation while a fixture is still writing.
-        // Repair's gate is scheduling only (its share of time, and whether
-        // it is waiting for an event); what repair did is in the actions.
+        // Gates and the two derived views are state: the last value before a
+        // step is the settled one. Repair's gate is scheduling only; what
+        // repair did is in the actions.
         if (kind == "gate.repair")
             return;
         if (kind.starts_with("gate.")) {
-            // Two things per gate: the node conditions it last saw, and its
-            // verdict on the last pass where it was due and its inventory
-            // not rebuilt in the same pass -- the gate function's answer on
-            // settled inputs, with the inputs it was given ("not yet" until
-            // such a pass).
+            // Per gate: the node conditions it last saw, and its verdict on
+            // the last pass where it was due and its inventory not rebuilt in
+            // that pass ("not yet" until such a pass).
             const bool decided = detail.find("due=1") != std::string_view::npos &&
                                  detail.find("rebuilt=1") == std::string_view::npos;
             auto& verdict = verdicts_[std::string(kind)];
@@ -122,9 +107,8 @@ class TraceLog {
                                   : node_conditions(detail);
             return;
         }
-        // A claim walk stopping for credit is pacing: credit is scaled by
-        // the process's real CPU load, so whether one pass lacked it is
-        // timing. What was restored, and in what order, is compared.
+        // Stopping for credit is pacing on real CPU load, so timing; what was
+        // restored, and in what order, is compared.
         else if (kind == "claim-walk" && detail.ends_with("waiting-for-credit"))
             return;
         else if (kind == "inventory" || kind == "release-horizon")
@@ -137,10 +121,8 @@ class TraceLog {
         lines_.push_back("step: " + std::string(name));
         for (const auto& line : state)
             lines_.push_back("  " + line);
-        // Order within a kind is the pass's decision order; order across
-        // kinds is which pass ran when. An action repeated by later passes
-        // (a claim that cannot be restored, retried every pass) is the same
-        // decision: it is kept once, where it was first taken.
+        // Order within a kind is decision order; across kinds it is timing. An
+        // action repeated by later passes is kept once, where first taken.
         std::stable_sort(actions_.begin(), actions_.end(), [](const auto& a, const auto& b) {
             return a.substr(0, a.find(':')) < b.substr(0, b.find(':'));
         });
@@ -160,9 +142,8 @@ class TraceLog {
     }
 };
 
-// One isolated node whose maintenance pass runs on a manual clock and
-// reports its decisions to a TraceLog. Fixture steps are marked in the trace
-// ("step: ...") so a difference says where it happened.
+// One isolated node whose maintenance pass runs on a manual clock and reports
+// to a TraceLog; steps are marked ("step: ...") so a difference says where.
 class TracedNode {
     TempDir temp_;
     ClusterKeys keys_;
@@ -172,9 +153,8 @@ class TracedNode {
     std::unique_ptr<Service> service_;
     std::vector<std::pair<std::string, ObjectId>> watched_;
 
-    // The outcome, beside the decisions: how many objects each store holds
-    // and each class has claims on, and for each object the fixture named,
-    // whether it is held and whether it is claimed.
+    // Objects held and claimed per store and class, and for each named object
+    // whether it is held and claimed.
     std::vector<std::string> state() {
         auto& node = service_->node();
         std::vector<std::string> lines{
@@ -203,13 +183,12 @@ class TracedNode {
     TracedNode(Config config, ClusterKeys keys) : keys_(keys) {
         configure(std::move(config));
     }
-    // The settings every node of a trace fixture runs with, traced or not.
+    // Settings for every node of a trace fixture, traced or not.
     static void apply_trace_settings(Config& config) {
         config.replication = 1;
         config.metadata_min_write_replicas = 1;
         config.min_write_replicas = 1;
-        // The quiet window, on the manual clock like everything else; the
-        // fixture steps past it explicitly.
+        // On the manual clock; the fixture steps past it explicitly.
         config.maintenance.foreground_quiet = 50ms;
         config.maintenance.garbage_grace = 1h;
         config.maintenance.no_progress_backoff = 5min;
@@ -242,9 +221,8 @@ class TracedNode {
                                              Service::StartupStallHandler{}, instruments);
         service_->start();
         (void)service_->filesystem();
-        // Whether a startup event lands before the first pass decides whether
-        // that pass opens GC or waits out a quiet window; past the window the
-        // two histories agree, so the first recorded step starts there.
+        // Whether a startup event precedes the first pass varies; past the
+        // quiet window both histories agree, so recording starts there.
         advance(config_.maintenance.foreground_quiet * 2);
         step("started");
         return *service_;
@@ -271,15 +249,10 @@ class TracedNode {
     const std::filesystem::path& backend() const {
         return config_.storage_backends.front().path;
     }
-    // The store's activity clock (idle_for) is this same manual clock, so
-    // stepping past the quiet window first makes the pass after the advance
-    // an idle one, however quickly the fixture got here.
-    // Settling first means every event already raised (a write, a peer
-    // lost) has reset its quiet window before time moves past it. A pass
-    // that rebuilds the inventory schedules one follow-up a quiet window
-    // later (so a new inventory is never used destructively in the pass that
-    // built it); the second, small step makes that follow-up happen here,
-    // whichever side of the first step the rebuild fell.
+    // Settling first lets every raised event reset its quiet window; stepping
+    // past the window (idle_for runs on this clock) makes the next pass idle.
+    // An inventory rebuild schedules a follow-up a quiet window later, so the
+    // final small step makes that follow-up happen here either way.
     void advance(Clock::duration by) {
         const auto quiet = config_.maintenance.foreground_quiet * 2;
         settle();
@@ -299,9 +272,8 @@ class TracedNode {
         int quiet = 0;
         while (Clock::now() < deadline && quiet < 5) {
             std::this_thread::sleep_for(20ms);
-            // Parked, not finished: work deferred to a deadline on the
-            // manual clock (a metadata retry, say) waits for the fixture to
-            // move time, and is part of the settled state.
+            // Parked, not finished: work deferred to a manual-clock deadline
+            // waits for the fixture to move time.
             const auto wakeups = service_->maintenance_wakeups();
             const bool parked = std::string_view(service_->maintenance_stage()) == "wait";
             quiet = parked && wakeups == seen ? quiet + 1 : 0;
@@ -344,8 +316,6 @@ void check_against_fixture(std::string_view name, const std::vector<std::string>
     }
     CHECK(trace == expected);
 }
-
-// ---- The clock: a primitive, tested exhaustively ---------------------------
 
 MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_only_when_advanced) {
     ManualMaintenanceClock clock;
@@ -392,8 +362,7 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_wait_returns_on_ready_sto
         std::unique_lock lock(mutex);
         clock.wait_until(cv, lock, stop.get_token(), clock.now(), [] { return false; });
     }
-    // A deadline reached only when another thread advances the clock; real
-    // time alone never gets there.
+    // Reached only when another thread advances the clock, never by real time.
     {
         std::atomic_bool advanced{};
         std::jthread advancer([&] {
@@ -418,7 +387,7 @@ MACHA_FAST_TEST("maintenance_trace", test_manual_clock_wait_returns_on_ready_sto
                          [&] { return ready.load(); });
         CHECK(ready.load());
     }
-    // And when stop is requested.
+    // Or when stop is requested.
     {
         std::jthread stopper([&] {
             std::this_thread::sleep_for(20ms);
@@ -448,9 +417,8 @@ MACHA_FAST_TEST("maintenance_trace", test_system_clock_reads_and_waits_in_real_t
         CHECK(Clock::now() - started >= 20ms);
     }
     {
-        // Unbounded means unbounded: still waiting after 50 ms, ended only by
-        // stop. A timed wait to time_point::max() can overflow and return at
-        // once on some standard libraries, which would make this a busy loop.
+        // Still waiting after 50 ms, ended only by stop: a timed wait to
+        // time_point::max() can overflow and return at once on some libraries.
         std::atomic_bool returned{};
         std::jthread waiter([&] {
             std::unique_lock lock(mutex);
@@ -502,10 +470,8 @@ MACHA_TEST("maintenance_trace", test_trace_tombstones_maturing) {
     node.advance(100ms);
     node.step("one deleted");
     node.advance(30min);
-    // An unrelated event wakes the pass mid-grace. Without one the pass
-    // sleeps until the deadline it armed at retirement plus grace, and only
-    // the grace check in collect_garbage keeps the tombstone when it wakes
-    // sooner -- as it does on a node with anything else going on.
+    // An unrelated event wakes the pass mid-grace, so the grace check in
+    // collect_garbage, not the armed deadline, must keep the tombstone.
     write_file(fs, "/unrelated.bin", pattern(64 * 1024, 30));
     node.advance(100ms);
     node.step("half the grace, an unrelated write");
@@ -539,8 +505,7 @@ MACHA_TEST("maintenance_trace", test_trace_revived_tombstone) {
     check_against_fixture("revived-tombstone", node.trace());
 }
 
-// The DATA backend disappears (the mount is lost; on fi-1 on 2026-09-29, a
-// USB drive dropping off the bus) and comes back.
+// The DATA backend disappears (its mount is lost) and comes back.
 MACHA_TEST("maintenance_trace", test_trace_backend_offline_and_back) {
     TracedNode node("trace-backend");
     auto& service = node.start();
@@ -564,9 +529,8 @@ MACHA_TEST("maintenance_trace", test_trace_backend_offline_and_back) {
 }
 
 // Claimed objects vanish from the only node that held them (a disk losing
-// files). The claim walk visits each claim and the pull pass each object
-// the node should own, in their own orders; with no peer to fetch from,
-// every visit says so. A change to either order changes this trace.
+// files). The claim walk and the pull pass each visit in their own order, with
+// no peer to fetch from; a change to either order changes this trace.
 MACHA_TEST("maintenance_trace", test_trace_claimed_objects_lost) {
     TracedNode node("trace-lost");
     auto& service = node.start();
@@ -581,8 +545,7 @@ MACHA_TEST("maintenance_trace", test_trace_claimed_objects_lost) {
     for (const auto& id : service.node().claims().retained_ids(RetentionClass::data))
         REQUIRE(service.node().local_store().remove(id));
     node.advance(10min);
-    // Nothing is walked: repair waits for an event, and a lost file is not
-    // one (0.73.2 behaviour, recorded, not endorsed).
+    // Nothing is walked: repair waits for an event, and a lost file is not one.
     node.step("their objects lost");
     write_file(fs, "/unrelated.bin", pattern(64 * 1024, 20));
     node.advance(100ms);
@@ -600,20 +563,16 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     auto config_b = cluster.node_config("trace-peer-b", port_b, {{"127.0.0.1", port_a}});
     TracedNode::apply_trace_settings(config_b);
     TracedNode node(cluster.node_config("trace-peer-a", port_a), cluster.keys());
-    // Both nodes own every object, so what each holds does not depend on
-    // which of them copied first; and which did -- this node pushing or the
-    // peer pulling -- is a race by design, so repair is not compared here.
-    // Repair's order is compared on one node (test_trace_claimed_objects_lost).
+    // Both nodes own every object; which copies first is a race by design, so
+    // repair is not compared here (test_trace_claimed_objects_lost covers it).
     node.config().replication = 2;
     config_b.replication = 2;
-    // And the write claims on both, not on whichever the barrier found first.
+    // Write claims on both, not on whichever the barrier found first.
     node.config().min_write_replicas = 2;
     config_b.min_write_replicas = 2;
     node.ignore("repair");
-    // Whether a GC-due pass falls inside the window while the peer is away
-    // depends on when its topology events land, which this fixture does
-    // not control; the gates' node conditions and every action (a tombstone
-    // erased or a claim released while it is away) are still compared.
+    // Whether a GC-due pass falls while the peer is away depends on topology
+    // event timing; node conditions and every action are still compared.
     node.skip_verdicts();
     auto peer = std::make_unique<Service>(config_b, cluster.keys());
     auto& service = node.start();
@@ -637,9 +596,8 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
 
     peer = std::make_unique<Service>(config_b, cluster.keys());
     peer->start();
-    // Rejoining is membership and a metadata merge, over real time; either
-    // arriving after the clock steps restarts GC's quiet window. Step once
-    // the cluster has settled.
+    // Rejoining runs on real time and restarts GC's quiet window, so step only
+    // once the cluster has settled.
     REQUIRE(wait_until(
         [&] {
             return service.node().membership().all_known_reachable() &&

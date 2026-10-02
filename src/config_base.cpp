@@ -46,9 +46,7 @@ void validate(Config& config) {
         throw std::runtime_error("network port must be nonzero");
     if (config.cache.max_blocks && config.cache.path.empty())
         throw std::runtime_error("cache.path is required when cache.max_blocks is nonzero");
-    // A node that hosts extents needs somewhere to put them. One that does
-    // not (an edge node, or `auto` with nothing configured, which resolves to
-    // not hosting) runs an empty StoragePool and has nothing to validate here.
+    // A node not hosting extents runs an empty StoragePool; nothing to check.
     if (config.hosts_extents == Tristate::yes && config.storage_backends.empty())
         throw std::runtime_error("storage.hosts_extents is true but storage.data has no backends");
     for (const auto& backend : config.storage_backends) {
@@ -78,14 +76,13 @@ void validate(Config& config) {
         config.data_viewer_reserve_bytes >= config.data_inflight_bytes)
         throw std::runtime_error(
             "dht.data_inflight_bytes must exceed nonzero data_viewer_reserve_bytes");
-    // Release below the pressure point, or the device never leaves pressure
-    // once it enters. Zero slowdown disables the mechanism entirely.
+    // Release must be below the pressure point or pressure never clears.
+    // Zero slowdown disables the mechanism.
     if (config.io_pressure_slowdown_percent &&
         config.io_pressure_release_percent >= config.io_pressure_slowdown_percent)
         throw std::runtime_error("dht.io_pressure_release_percent must be below "
                                  "dht.io_pressure_slowdown_percent");
-    // An expectation of zero makes every operation infinitely slow by
-    // definition, which would gate everything for ever.
+    // A zero expectation would make every operation infinitely slow.
     if (config.io_pressure_slowdown_percent &&
         !config.io_pressure_overhead_ms && !config.io_pressure_per_mib_ms)
         throw std::runtime_error("dht.io_pressure_overhead_ms and dht.io_pressure_per_mib_ms "
@@ -97,9 +94,8 @@ void validate(Config& config) {
         config.data_inflight_bytes - config.data_viewer_reserve_bytes)
         throw std::runtime_error(
             "dht DATA non-viewer capacity must fit one complete extent");
-    // DATA placement uses a compact bounded owner set. Metadata publication is
-    // an any-node durability floor and must not inherit that historical voter
-    // count limit; large clusters may legitimately require more than 31 copies.
+    // Unlike DATA's bounded owner set, the metadata floor is any-node and may
+    // exceed 31 copies in a large cluster.
     if (config.replication > 31)
         throw std::runtime_error("dht.replicas must be <= 31");
     if (config.read_ahead_extents > 64)
@@ -173,8 +169,7 @@ void validate(Config& config) {
     if (!config.fuse.viewer_weight || config.fuse.viewer_weight > 10000 ||
         !config.fuse.loader_weight || config.fuse.loader_weight > 10000)
         throw std::runtime_error("fuse viewer_weight and loader_weight must be 1..10000");
-    // A zero repair weight would be a repair that stops whenever the node is
-    // busy, which is exactly what this pair exists to rule out.
+    // A zero repair weight would stop repair whenever the node is busy.
     if (!config.maintenance.foreground_weight || config.maintenance.foreground_weight > 10000 ||
         !config.maintenance.repair_weight || config.maintenance.repair_weight > 10000)
         throw std::runtime_error(
@@ -203,17 +198,11 @@ void validate(Config& config) {
         throw std::runtime_error(
             "fuse.publication_pipeline_bytes must be an extent-size multiple from "
             "extent_size..min(publication_quantum_bytes, 8 extents)");
-    // An open writer holds at most one filling extent buffer plus its pipeline,
-    // and holds them across yields and retryable failures. Bound how many may
-    // be open so that worst case fits the loader's guaranteed share of the
-    // retained-memory ledger: then a writer waiting for admission is waiting
-    // for control/viewer work, not for another publication which is itself
-    // waiting (es-1 hold-and-wait, 2026-09-09). The bound is soft -- see
-    // FuseConfig::publication_max_open_writers -- so treat this as a target
-    // rather than a ceiling. Never below
-    // commit_workers -- a worker with no admissible inode is worse than a
-    // slightly overcommitted reserve, and the no-progress deadline still
-    // bounds the wait.
+    // Fit the open writers' worst case (one filling buffer plus pipeline each)
+    // into the loader reserve, avoiding hold-and-wait between publications
+    // (soft; see FuseConfig::publication_max_open_writers). Never below
+    // commit_workers: an idle worker is worse than a slightly overcommitted
+    // reserve, and the no-progress deadline still bounds the wait.
     if (!config.fuse.publication_max_open_writers) {
         const auto per_writer = static_cast<uint64_t>(config.extent_size) +
                                 config.fuse.publication_pipeline_bytes;
@@ -293,12 +282,8 @@ void validate(Config& config) {
         throw std::runtime_error("torrent.listen_port must be nonzero");
     if (config.torrent.enabled && !config.ingest.enabled)
         throw std::runtime_error("torrent requires ingest.enabled");
-    // Whether BitTorrent acquisition can actually run here is a runtime fact
-    // as of 0.28.0 -- the libmacha-torrent plugin is present or it isn't (see
-    // TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md) -- so config
-    // validation no longer rejects torrent.enabled on a build without it.
-    // A node with the setting on and no plugin reports the subsystem as
-    // unavailable in Status and answers 503 on /api/v1/torrents/*.
+    // Plugin presence is a runtime fact: without libmacha-torrent the
+    // subsystem shows unavailable in Status and /api/v1/torrents/* answers 503.
     if (!config.torrent.max_active || config.torrent.max_active > 64)
         throw std::runtime_error("torrent.max_active must be 1..64");
     for (const auto& provider : config.torrent.search_providers) {
@@ -325,20 +310,12 @@ void validate(Config& config) {
         throw std::runtime_error("streaming.session_idle_ms must be >= 30000");
     if (config.streaming.session_unused_idle < std::chrono::seconds(30))
         throw std::runtime_error("streaming.session_unused_idle_ms must be >= 30000");
-    // Deliberately no check that the unused clock is shorter than the ordinary
-    // one: lowering session_idle alone is a reasonable thing for an operator to
-    // do, and refusing it by naming a knob they never set would be a poor
-    // trade. The reaper takes the lesser of the two, so the ordering invariant
-    // holds whatever the file says.
+    // No ordering check against session_idle: the reaper takes the lesser.
     if (config.session.anonymous_ttl < std::chrono::minutes(1))
         throw std::runtime_error("session.anonymous_ttl_ms must be >= 60000");
     if (!config.session.max_sessions || config.session.max_sessions > 1'000'000)
         throw std::runtime_error("session.max_sessions must be 1..1000000");
-    // The advertised API endpoint is a URL: scheme, host, optional port, and
-    // deliberately no path. A proxy fronting a node at a subpath is not a
-    // supported deployment, and the failure it produces is silent -- a client
-    // that treats the value as an origin drops the path and 404s against a
-    // node that looks configured correctly.
+    // Scheme, host, optional port; no path, since clients treat it as an origin.
     if (!config.catalogue.api.advertised_endpoint.empty()) {
         const auto& endpoint = config.catalogue.api.advertised_endpoint;
         const auto scheme_end = endpoint.find("://");
@@ -359,8 +336,7 @@ void validate(Config& config) {
         if (authority.find('?') != std::string::npos || authority.find('#') != std::string::npos)
             throw std::runtime_error(
                 "catalogue.api.advertised_endpoint must not include a query or fragment");
-        // An IPv6 literal has to be bracketed or the port cannot be told from
-        // the address.
+        // IPv6 literals must be bracketed to separate the port.
         const auto close = authority.find(']');
         const auto host_part = authority.front() == '[' ? authority.substr(0, close + 1) : authority;
         if (authority.front() == '[' && close == std::string::npos)
@@ -402,12 +378,8 @@ void validate(Config& config) {
         throw std::runtime_error("streaming.max_session_holds must be 1..64");
     if (config.streaming.max_concurrent_holds < 1 || config.streaming.max_concurrent_holds > 4096)
         throw std::runtime_error("streaming.max_concurrent_holds must be 1..4096");
-    // The upper bound is the client's patience, not ours. hls.js aborts a
-    // fragment that has sent no bytes after 10s
-    // (fragLoadPolicy.default.maxTimeToFirstByteMs), and a server that answers
-    // after the client has stopped listening has held a worker for nothing.
-    // The range stays wider than that because other clients have other
-    // deadlines; the default is what encodes ours.
+    // Bounded by client patience (hls.js time-to-first-byte is 10 s); the range
+    // is wider for other clients, the default encodes ours.
     if (config.streaming.segment_timeout < std::chrono::milliseconds(1000) ||
         config.streaming.segment_timeout > std::chrono::seconds(20))
         throw std::runtime_error("streaming.segment_timeout_ms must be 1000..20000");

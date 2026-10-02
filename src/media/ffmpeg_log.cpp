@@ -52,9 +52,8 @@ LogLevel to_macha_level(int level) noexcept {
 }
 
 void ffmpeg_log_callback(void* avcl, int level, const char* fmt, va_list vl) {
-    // libav applies av_log_get_level() before invoking the callback in normal
-    // use. Keep the guard here as well so the bridge has one explicit admission
-    // rule even if the callback is invoked directly.
+    // libav already applies av_log_get_level() before the callback; repeated so
+    // direct invocation follows the same admission rule.
     if (level > av_log_get_level())
         return;
 

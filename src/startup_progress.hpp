@@ -6,15 +6,10 @@
 
 namespace macha {
 
-// A process-wide "recovery is doing something" counter. Every unit of
-// startup work that can legitimately take a long time on a big node -- a
-// history frame parsed, a delta applied, a journal record read, a pack
-// scanned, a readiness stage reached -- ticks it. Service::wait_services_ready
-// kills the process for its supervisor only when this has not moved for
-// `service_startup_no_progress_ms`, never merely because startup is slow:
-// on 2026-09-06 a 120 s elapsed-time gate turned a 5-minute (quadratic, but
-// progressing) replay into an infinite crash loop. Discipline 2 of
-// TODO/archive/2026-09-06-self-healing-disciplines-plan.md.
+// Process-wide startup progress, ticked by each unit of long recovery work
+// (history frame, delta, journal record, pack, readiness stage).
+// Service::wait_services_ready kills the process only when this has not moved
+// for `service_startup_no_progress_ms`, never merely because startup is slow.
 inline std::atomic<uint64_t>& startup_progress_counter() {
     static std::atomic<uint64_t> counter{0};
     return counter;

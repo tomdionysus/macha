@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-// A torrent the cluster has been asked to download (0.64.0): the durable,
-// cluster-wide half of a torrent job, carried in metadata as
-// MetadataSnapshot::torrent_requests. Only what must survive any node and
-// changes rarely lives here -- the request, who has claimed it, what the
-// operator wants, and how far it has got. Progress and rates never do: each
-// metadata write costs seconds and, on a two-replica cluster, both nodes.
-//
-// Metadata writes are not compare-and-swap and history can branch
-// (docs/metadata.md), so two replicas may change the same request at once.
-// merge_torrent_request() therefore joins rather than conflicts: every field
-// has a deterministic rule, no merge ever needs an operator, and the result
-// does not depend on which side is "left". See
-// TODO/archive/2026-09-27-cluster-torrent-queue-plan.md.
+// A torrent the cluster was asked to download: the durable half of a job, in
+// MetadataSnapshot::torrent_requests. Only rarely changing state lives here
+// (request, claim, intent, phase); never progress or rates, as each metadata
+// write costs seconds. History can branch (docs/metadata.md), so
+// merge_torrent_request() joins deterministically and needs no operator.
 
 #include "codec.hpp"
 #include "types.hpp"
@@ -95,9 +87,8 @@ struct TorrentRequest {
     std::string error;
     uint64_t completed_unix_ms{};
 
-    // Removed (cleared, or removed after completion). A tombstone, kept so
-    // a branch that has not seen the removal cannot resurrect the request;
-    // erased from metadata after its grace period.
+    // A tombstone, so a branch that missed the removal cannot resurrect the
+    // request; erased after its grace period.
     uint64_t removed_unix_ms{};
 
     auto operator<=>(const TorrentRequest&) const = default;
@@ -110,12 +101,10 @@ TorrentRequest decode_torrent_request(Reader&);
 // associative and idempotent.
 TorrentRequest merge_torrent_request(const TorrentRequest& a, const TorrentRequest& b);
 
-// Merges two whole collections from a common base. A key present in the base
-// and removed from one side (a tombstone erased after its grace) stays erased
-// unless the other side changed it since the base. Afterwards, of two live
-// requests for one info hash -- two nodes took the same add at once -- the
-// earlier (created_unix_ms, id) keeps it and the other is cancelled with
-// error_code `duplicate_torrent`.
+// Merges two collections from a common base. A key erased on one side stays
+// erased unless the other changed it since the base. Of two live requests for
+// one info hash, the earlier (created_unix_ms, id) keeps it and the other is
+// cancelled as `duplicate_torrent`.
 std::map<std::string, TorrentRequest, std::less<>>
 merge_torrent_requests(const std::map<std::string, TorrentRequest, std::less<>>& base,
                        const std::map<std::string, TorrentRequest, std::less<>>& left,

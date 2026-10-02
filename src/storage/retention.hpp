@@ -29,10 +29,9 @@ class RetentionStore final : public ClaimStore {
 
     using StateMap = std::map<ObjectId, ObjectState>;
 
-    // claims.meta is the protocol-20 legacy monolithic checkpoint. New
-    // checkpoints are generation directories selected by claims.current and
-    // split by the first SHA-256 byte, so no checkpoint read/write is O(total
-    // retained objects) in temporary buffer size.
+    // claims.meta is the protocol-20 monolithic checkpoint, read if present.
+    // Checkpoints are generation directories selected by claims.current and
+    // sharded by the first SHA-256 byte, so no buffer is O(retained objects).
     std::filesystem::path legacy_checkpoint_path_;
     std::filesystem::path checkpoint_root_;
     std::filesystem::path checkpoint_manifest_path_;

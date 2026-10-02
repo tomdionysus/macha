@@ -103,12 +103,8 @@ void print_entry(std::string_view label, const FsEntry& entry) {
     std::cout << '\n';
 }
 
-// Read-only, additive to the causal-merge machinery above: prints exactly
-// which namespace paths differ between two accepted heads, field by field,
-// rather than only the aggregate counts the ordinary report prints. Intended
-// for a concurrent (neither-dominates) divergence, where the causal-merge
-// plan refuses to run and an operator needs to see precisely what is at
-// stake before deciding how to proceed by hand.
+// Prints, field by field, which namespace paths differ between two accepted
+// heads: for a concurrent divergence, where the causal-merge plan refuses to run.
 void diff_heads(MetadataReplica& replica) {
     auto heads = replica.accepted_heads();
     if (heads.size() != 2)

@@ -144,9 +144,8 @@ MACHA_TEST("storage_v18", test_pack_compaction_reclaims_dead_space_incrementally
     const auto after_one = store.used();
     CHECK(after_one < before);
 
-    // More dead packs remain after one bounded victim rewrite. A second
-    // maintenance slice therefore makes additional progress instead of the
-    // first call requiring temporary space for the complete packed corpus.
+    // Dead packs remain after one bounded victim rewrite, so a second slice
+    // makes further progress; no call needs space for the whole packed corpus.
     REQUIRE(store.compact_packs());
     const auto after_two = store.used();
     CHECK(after_two < after_one);
@@ -269,9 +268,8 @@ MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_load
     });
     REQUIRE(loader_entered_future.wait_for(2s) == std::future_status::ready);
 
-    // The loader is deliberately stopped after capacity/accounting admission
-    // but before crypto and disk I/O. An unrelated viewer object must need only
-    // the short index lock and then complete its physical read independently.
+    // The loader is held after admission but before crypto and disk I/O; an
+    // unrelated viewer read needs only the short index lock and completes.
     auto viewer_read = std::async(std::launch::async, [&] { return store.get(viewer_id); });
     REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
     REQUIRE(viewer_read.get().has_value());
@@ -330,9 +328,8 @@ MACHA_TEST("storage_v18", test_unrelated_object_read_bypasses_blocked_packed_rea
                                   [&] { return store.get(blocked_id); });
     REQUIRE(read_entered_future.wait_for(2s) == std::future_status::ready);
 
-    // The packed inode has been pinned, but its physical read and decrypt are
-    // deliberately stalled. An unrelated viewer read must still acquire the
-    // short index lock and complete.
+    // The packed inode is pinned with its read and decrypt stalled; an
+    // unrelated viewer read must still take the index lock and complete.
     auto viewer_read = std::async(std::launch::async,
                                   [&] { return store.get(viewer_id); });
     REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
@@ -384,9 +381,8 @@ MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_wri
                                    [&] { return store.put(loader_id, loader); });
     REQUIRE(write_entered_future.wait_for(2s) == std::future_status::ready);
 
-    // The packed loader append is stalled before crypto and physical I/O. Its
-    // capacity reservation and per-object ownership must not retain the global
-    // index mutex needed by an unrelated viewer read.
+    // The packed append is stalled before crypto and I/O; its reservation and
+    // per-object ownership must not hold the index mutex a viewer read needs.
     auto viewer_read = std::async(std::launch::async,
                                   [&] { return store.get(viewer_id); });
     REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
@@ -402,8 +398,7 @@ MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_wri
     CHECK(packed_write.get());
     REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
     CHECK(same_object.get());
-    // The second PUT may append its compact crash-recoverable touch only after
-    // the first mutation has completed; it must never overlap the first write.
+    // The second PUT appends its touch only after the first write completes.
     CHECK(hook_calls.load(std::memory_order_relaxed) == 2);
     CHECK(store.get(loader_id) == std::optional<Bytes>{loader});
 }
@@ -497,9 +492,9 @@ MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
     auto compaction =
         std::async(std::launch::async, [&] { return store.compact_packs(); });
 
-    // The reader owns only a logical lease and has not called open(2). The
-    // compactor may build and switch its replacement, but cannot unlink the
-    // selected victim until this exact reader has opened and finished it.
+    // The reader holds only a logical lease and has not called open(2). The
+    // compactor may switch to its replacement but cannot unlink the victim
+    // until this reader has opened and finished it.
     CHECK(compaction.wait_for(20ms) == std::future_status::timeout);
     release_reader.set_value();
     REQUIRE(read.wait_for(2s) == std::future_status::ready);
@@ -527,8 +522,8 @@ MACHA_TEST("storage_v18", test_presence_index_warms_from_object_names_at_start) 
             ids.push_back(id);
         }
     }
-    // A fresh process learns what it holds from the directory names alone,
-    // so the first claim on each object after a restart does not stat it.
+    // A fresh process learns what it holds from directory names alone, so the
+    // first claim after a restart does not stat the object.
     LocalStore reopened(t.path() / "store", options, keys.storage);
     REQUIRE(wait_until([&] { return reopened.diagnostics().presence_index_entries == ids.size(); }, 5s));
     for (const auto& id : ids) CHECK(reopened.has(id));
@@ -549,8 +544,7 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     store_holder.emplace(t.path() / "store", options, keys.storage);
     auto& store = *store_holder;
 
-    // Loose (above pack_threshold) and packed (below it) objects exercise the
-    // two different presence-check code paths.
+    // Loose and packed objects take different presence-check paths.
     auto loose = pattern(512 * 1024, 0x71);
     auto loose_id = object_id(loose);
     auto packed = pattern(64 * 1024, 0x72);
@@ -565,17 +559,14 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     store.set_before_loose_read_for_tests([&](const ObjectId&) { loose_read = true; });
     store.set_before_packed_read_for_tests([&](const ObjectId&) { packed_read = true; });
 
-    // The regression this guards against: has() silently going back through
-    // get()/valid() (a full read, AES-GCM decrypt and integrity check) instead
-    // of the cheap index/stat-only path. Assert on the actual decrypt-path
-    // hook firing, not just on the returned boolean, so a revert is caught
-    // even if it happens to still return the right answer.
+    // has() must not read or decrypt; the read hooks prove it, not just the
+    // returned boolean.
     CHECK(store.has(loose_id));
     CHECK(store.has(packed_id));
     CHECK(!loose_read.load());
     CHECK(!packed_read.load());
 
-    // Confirm the hooks actually work: a real read must still fire them.
+    // A real read does fire the hooks.
     CHECK(store.get(loose_id).has_value());
     CHECK(store.get(packed_id).has_value());
     CHECK(loose_read.load());
@@ -583,15 +574,10 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
 
     CHECK(!store.has(ObjectId{}));
 
-    // A loose write is temp-file-then-rename, so a real object is never
-    // observed partially written, and every object carries a fixed header, so
-    // an empty object file is never an object: only a crash (rename durable,
-    // data not) or external truncation leaves one. has() remembers what this
-    // process installed instead of stat'ing it again (3,201 cold stats took
-    // 16 s per quantum commit on a saturated disk), and a reopened store warms
-    // presence from directory names alone, so the empty file is found where it
-    // is read: the first read prunes it and reports the object absent, and
-    // nothing claims it afterwards.
+    // An empty object file is never an object (writes rename into place and
+    // every object has a header); only a crash or external truncation leaves
+    // one. Presence is not stat'ed, so the empty file is found on read: the
+    // first read prunes it and reports the object absent.
     auto truncated = pattern(512 * 1024, 0x73);
     auto truncated_id = object_id(truncated);
     REQUIRE(store.put(truncated_id, truncated));
@@ -606,7 +592,6 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     CHECK(!reopened.get(truncated_id).has_value());
     CHECK(!std::filesystem::exists(truncated_path));
     CHECK(!reopened.has(truncated_id));
-    // The same object stored again is present again.
     REQUIRE(reopened.put(truncated_id, truncated));
     CHECK(reopened.has(truncated_id));
     CHECK(reopened.has(loose_id));
@@ -706,12 +691,9 @@ std::filesystem::path only_pack(const std::filesystem::path& store) {
 }
 } // namespace
 
-// A power loss between the pack write() and the durability domain's syncfs
-// can leave the file extended by a header-sized span whose block never held
-// the header (zero-filled or partial). That is exactly pack_header_size bytes
-// -- 93-byte prefix plus a 32-byte SHA-256 -- one byte too many for the
-// "fewer bytes than a header" branch, and undecodable, so until 0.38.3
-// recovery threw and the whole backend went offline (gbni-1, 2026-09-12).
+// A power loss between the pack write() and syncfs can leave an undecodable
+// header (zeroed or garbage, perhaps with partial payload) at the tail;
+// recovery truncates it as a torn tail rather than taking the backend offline.
 MACHA_TEST("storage_v18", test_pack_recovery_truncates_undecodable_header_at_tail) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -777,11 +759,9 @@ MACHA_TEST("storage_v18", test_pack_recovery_truncates_undecodable_header_at_tai
     }
 }
 
-// Damage inside a pack -- a header that fails its checksum with intact records
-// after it -- is not a torn tail. Truncating there would discard the live
-// records behind it, and refusing the pack would take the backend offline over
-// one record. Recovery skips the unreadable span, keeps everything after it,
-// reports the loss, and leaves the span as dead bytes for compaction.
+// A header failing its checksum with intact records after it is not a torn
+// tail: recovery skips the span, keeps what follows, reports the loss, and
+// leaves the span as dead bytes for compaction.
 MACHA_TEST("storage_v18", test_pack_recovery_skips_unreadable_region_before_live_records) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -936,24 +916,15 @@ Config storage_node_config(const TestCluster& cluster, std::string_view name, ui
 }
 
 Bytes preferred_for(NodeRuntime& observer, const NodeId& preferred, size_t bytes, uint8_t salt_start = 0) {
-    // Placement is computed over the observer's *active* membership, so no
-    // object can prefer a node the observer does not currently count as
-    // alive. Callers reach here right after forming a cluster, when the
-    // preferred node may not have been observed yet (or, under load, has
-    // just missed a heartbeat window): searching 4096 candidates then finds
-    // nothing and this threw "could not find object preferring requested
-    // node" 1 in 2,646 case-runs (2026-09-15). Wait for the precondition
-    // the search actually depends on instead of asserting it by accident.
+    // Placement uses the observer's active membership, so the preferred node
+    // must be active there before any candidate can prefer it.
     REQUIRE(wait_until([&] {
         const auto active = observer.membership().active();
         return std::any_of(active.begin(), active.end(),
                            [&](const NodeInfo& node) { return node.id == preferred; });
     }, 10s));
-    // Every candidate is distinct: the whole counter is written into the
-    // object. Until 2026-10-02 the salt and the xor were both the counter cast
-    // to a byte, so the 4096 iterations made only 256 distinct objects; with a
-    // node weighted 2% of the capacity, all 256 missed it about 1 run in 400
-    // (fi-1's suite on 2026-10-02, 11 in 3000 on the laptop).
+    // The whole counter is written into the object so all 4096 candidates are
+    // distinct, enough to find a node with a small capacity weight.
     auto data = pattern(bytes, salt_start);
     for (uint32_t i = 0; i < 4096; ++i) {
         for (size_t b = 0; b < 4 && b < data.size(); ++b)
@@ -1066,9 +1037,8 @@ MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replic
     const auto a_port = free_port();
     const auto b_port = free_port();
     const auto c_port = free_port();
-    // Keep configured placement weights equal, then physically fill A.  The
-    // test is about fallback from a full preferred replica, not about making a
-    // deliberately tiny node win capacity-weighted placement.
+    // Equal placement weights, then fill A: this tests fallback from a full
+    // preferred replica, not capacity-weighted placement.
     constexpr uint64_t node_limit = 2ULL * 1024 * 1024;
     auto a_config = storage_node_config(cluster, "a", a_port, node_limit, 2, 1, {}, 2);
     auto b_config = storage_node_config(cluster, "b", b_port, node_limit, 2, 1,
@@ -1139,21 +1109,16 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
 }
 
 MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
-    // After a node leaves the cluster, the operator's question is "is anything
-    // now unreachable?" -- and until 0.40.0 nothing could answer it.
-    // repair_step() contained no Log:: call at all, so an object the live
-    // namespace still referenced, that this node should own, and that no peer
-    // would supply, was passed over in silence on every pass forever.
+    // A live object this node should own and no peer can supply is counted
+    // and sampled, not passed over silently.
     TestCluster cluster;
     const auto port = free_port();
     auto config = storage_node_config(cluster, "lonely", port, 8ULL * 1024 * 1024, 2, 1);
     StorageClusterNode node(std::move(config), cluster.keys());
     node.start();
 
-    // One object this node holds, and one it does not and cannot obtain --
-    // the id of bytes that were never put anywhere. With no peers, the pull
-    // path exhausts every candidate and comes back empty, which is exactly
-    // the shape of an extent whose only replica left with a departed node.
+    // One object held, and one never stored anywhere; with no peers its pull
+    // exhausts every candidate, as for an extent whose only replica departed.
     auto present_bytes = pattern(64 * 1024, 7);
     const auto present = object_id(present_bytes);
     REQUIRE(node.store().put(present, present_bytes));
@@ -1165,9 +1130,7 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
     const auto before = node.store().repair_diagnostics();
     CHECK(before.pull_unsourceable == 0);
 
-    // Both objects are live: the namespace references them whether or not any
-    // node still holds the bytes. live must be sorted -- repair binary-searches
-    // it rather than copying it per slice.
+    // live must be sorted: repair binary-searches it.
     std::vector<ObjectId> live{present, missing};
     std::sort(live.begin(), live.end());
     REQUIRE(wait_until([&] {
@@ -1176,19 +1139,14 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
     }, 5s));
 
     const auto after = node.store().repair_diagnostics();
-    // Specificity matters as much as the count: an object that is present
-    // must never be reported as unsourceable, or the counter means nothing
-    // and every operator who reads it is misled at the worst moment.
+    // A present object is never reported as unsourceable.
     REQUIRE(after.unsourceable_sample.size() == 1);
     CHECK(after.unsourceable_sample.front() == missing);
     CHECK(std::find(after.unsourceable_sample.begin(), after.unsourceable_sample.end(),
                     present) == after.unsourceable_sample.end());
     CHECK(node.node().local_store().has(present));
 
-    // The sample deduplicates rather than growing without bound: repeated
-    // passes over the same unobtainable object must not consume memory, and
-    // the counter keeps climbing so a persistent failure is distinguishable
-    // from a transient one.
+    // Repeated passes deduplicate the sample while the counter keeps climbing.
     const auto repeated_before = after.pull_unsourceable;
     node.store().repair_once(4ULL * 1024 * 1024, live);
     const auto repeated = node.store().repair_diagnostics();
@@ -1197,19 +1155,10 @@ MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
 }
 
 MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_within_bounded_time) {
-    // Reproduces the 2026-09-06 incident at test scale: a single metadata
-    // publication whose delta references thousands of DATA extents (the real
-    // incident was tens of thousands; this test uses fewer so setup -- which
-    // this test does not exercise the fix for -- doesn't dominate runtime).
-    // Before
-    // batching, retain_data() checked candidate presence with one
-    // has_on()/have_object round trip (a full local decrypt, or a real
-    // network RPC) per (extent, candidate) pair, serially, on the thread that
-    // also drives metadata-publication acceptance -- this is exactly what
-    // pinned a CPU core and froze publication for minutes. min_write_replicas
-    // == replication == 2 here so every extent's floor requires checking
-    // *both* nodes, exercising both the local cheap-presence path and the
-    // batched remote have_objects RPC path.
+    // One publication referencing thousands of extents: retain_data() must
+    // batch presence checks rather than make a round trip per extent.
+    // min_write_replicas == replication == 2, so both the local presence path
+    // and the batched remote have_objects path are exercised.
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
@@ -1233,13 +1182,8 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
         auto data = pattern(256, static_cast<uint8_t>(i));
         data[0] ^= static_cast<uint8_t>(i >> 8);
         const auto id = object_id(data);
-        // Placement directly through each node's own LocalStore, bypassing
-        // DistributedStore::put()'s network replication and (via
-        // put_deferred) an immediate per-object fsync barrier: setup only
-        // needs both replicas visible on disk, exactly as an already
-        // fully-replicated foreground write would be by the time a
-        // publication naming it is accepted. What this test times is
-        // retain_data() itself, not getting these objects onto disk.
+        // Write both replicas straight into each LocalStore, without network
+        // replication or per-object fsync: only retain_data() is timed.
         REQUIRE(a.node().local_store().put_deferred(id, data));
         REQUIRE(b.node().local_store().put_deferred(id, data));
         ids.push_back(id);
@@ -1251,21 +1195,14 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
     const auto started = std::chrono::steady_clock::now();
     CHECK(a.store().retain_data(ids, dot));
     const auto elapsed = std::chrono::steady_clock::now() - started;
-    // Batched presence checks complete in a handful of have_objects round
-    // trips regardless of extent count; this bound is far looser than that to
-    // stay robust on slow/loaded CI hardware, but comfortably catches a
-    // regression back to one round trip (of any kind) per extent.
+    // Batched checks need a handful of round trips; the bound is loose for
+    // loaded hardware but still catches one round trip per extent.
     CHECK(elapsed < 10s);
 }
 
 MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer_restart) {
-    // Discipline 1 of the self-healing plan. gbni-1, 2026-09-06: a 13.9 GB
-    // publication had placed extents on es-1; es-1 restarted; every barrier
-    // afterwards was refused with "storage durability epoch changed" and
-    // retried forever, because the batch named a token that died with es-1's
-    // process. The bytes were on es-1's disk the whole time. A barrier must
-    // re-derive the token from the peer's disk and re-stamp the batch, and
-    // it must do so without re-sending a byte.
+    // After a peer restarts, the barrier re-derives its durability token from
+    // the peer's disk and re-stamps the batch without re-sending any bytes.
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
@@ -1297,11 +1234,8 @@ MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer
     }, 10s));
     REQUIRE(b.node().local_store().has(id));
 
-    // The dead token is re-derived, not re-sent: the barrier succeeds and the
-    // batch now names b's new epoch, with the object still present exactly
-    // once on b. Membership is liveness, not a route: a's dial to b failed
-    // while b was down, so the first barriers may be refused with "peer in
-    // retry backoff" -- transient, and the contract is to ask again.
+    // a's dial to b failed while b was down, so early barriers may be refused
+    // as in retry backoff; that is transient, and the contract is to ask again.
     std::vector<ObjectId> unsatisfiable;
     REQUIRE(wait_until([&] {
         unsatisfiable.clear();
@@ -1317,15 +1251,13 @@ MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer
                 restamped = replica.epoch == b.node().durability_epoch();
             }
     CHECK(restamped);
-    // And the ordinary path from here on: no probe needed, still durable.
+    // Subsequent barriers take the ordinary path.
     CHECK(a.store().durability_barrier(batch));
 }
 
 MACHA_TEST("storage_v18", test_durability_barrier_treats_an_unreachable_peer_as_transient) {
-    // A peer that is down is not a peer that lost the object. The barrier
-    // must fail without naming the object as unsatisfiable, so the writer
-    // retries the barrier later instead of re-sending bytes the peer still
-    // holds (the first live run of 0.29.0 re-put extents on a Broken pipe).
+    // A down peer has not lost the object: the barrier fails without naming it
+    // unsatisfiable, so the writer retries rather than re-sending bytes.
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
@@ -1351,9 +1283,8 @@ MACHA_TEST("storage_v18", test_durability_barrier_treats_an_unreachable_peer_as_
     CHECK(!a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
     CHECK(unsatisfiable.empty());
 
-    // Back up with a new incarnation: the same batch is now re-derived. The
-    // RPC client re-dials a peer it just failed against on its own schedule,
-    // so the first barrier after the restart may still be transient.
+    // Back with a new incarnation, the same batch is re-derived. The RPC client
+    // re-dials on its own schedule, so early barriers may still be transient.
     b.start();
     REQUIRE(wait_until([&] {
         return a.node().membership().active().size() == 2 &&
@@ -1367,9 +1298,8 @@ MACHA_TEST("storage_v18", test_durability_barrier_treats_an_unreachable_peer_as_
 }
 
 MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_peer_lost) {
-    // The one case a probe cannot fix: the peer restarted *and* no longer
-    // holds the object. The barrier must say which ids, so the writer can
-    // re-put them, rather than fail opaquely.
+    // The peer restarted and lost the object: the barrier names the ids so
+    // the writer can re-put them.
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
@@ -1398,9 +1328,8 @@ MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_pe
     REQUIRE(b.node().local_store().remove(id));
     REQUIRE(!b.node().local_store().has(id));
 
-    // Ask until the answer is definitive. Until a's backoff from the failed
-    // dial expires the barrier cannot reach b, which is transient and names
-    // nothing; the loss can only be reported once b has been asked.
+    // Ask until definitive: while a's dial backoff lasts the barrier cannot
+    // reach b and names nothing.
     std::vector<ObjectId> unsatisfiable;
     bool durable = false;
     REQUIRE(wait_until([&] {
@@ -1414,23 +1343,9 @@ MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_pe
 }
 
 MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget_still_publishes) {
-    // A metadata publication claims retention on its whole control graph
-    // before it may commit, and it pipelines those puts rather than paying a
-    // round trip each. Until 0.53.1 it pipelined *all* of them at once, which
-    // was fine while a graph was 65 catalogue shards and became an outage when
-    // the namespace went tree-backed and a commit started touching 838
-    // objects: one connection holds at most max_pending_rpc_requests replies
-    // outstanding across every caller on the lane, so the 513th put was
-    // refused, the batch was cancelled, and every peer was skipped in turn.
-    //
-    // gbni-1 then had retained=1 against required=2 and killed the operator's
-    // ingest job -- deterministically, on every commit over the line, for
-    // hours (2026-09-22). The measured signature was unmistakable once looked
-    // at: every commit of 65 objects or fewer succeeded, every commit of 828
-    // or more failed, and the failures came back *faster* than the successes
-    // because nothing was ever sent.
-    //
-    // So the size of a namespace must not decide whether it can be published.
+    // retain_control() pipelines puts, but a connection holds at most
+    // max_pending_rpc_requests outstanding; a graph larger than that must
+    // still publish.
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
     const auto b_port = free_port();
@@ -1446,8 +1361,7 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
                b.node().membership().active().size() == 2;
     }, 10s));
 
-    // Comfortably past the budget, and past it by more than one window, so a
-    // fix that merely raised the limit by a constant would not pass either.
+    // Two windows past the budget.
     const size_t count = max_pending_rpc_requests * 2;
     std::vector<ObjectId> ids;
     ids.reserve(count);
@@ -1463,20 +1377,15 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
     const RetentionDot dot{a.node().node_id(), 1};
     REQUIRE(a.store().retain_control(ids, dot, 2));
 
-    // The floor was met by a real second replica, not by the writer counting
-    // itself twice: the peer holds every object in the graph.
+    // The peer holds every object: the floor was met by a real second replica.
     size_t on_peer = 0;
     for (const auto& id : ids)
         if (b.node().control_store().has(id))
             ++on_peer;
     CHECK(on_peer == ids.size());
 
-    // And the second commit over the same graph sends nothing at all. This is
-    // the part that matters: a metadata commit references its whole spine, so
-    // without a presence check the cost of publishing scales with how large
-    // the library has grown rather than with what changed. Measured on gbni-1
-    // before this existed: three minutes of importing, 25 commits, 5,469
-    // control objects pushed to peers, and the control store grew by zero.
+    // A second retain over the same graph sends nothing, so commit cost
+    // scales with what changed rather than with library size.
     const auto puts_before =
         b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
     REQUIRE(puts_before > 0);
@@ -1486,8 +1395,7 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
         b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
     CHECK(puts_after == puts_before);
 
-    // Removing part of the graph from the peer brings back exactly that part,
-    // so the probe is selecting rather than simply never sending.
+    // Removing part of the graph from the peer resends exactly that part.
     for (size_t i = 0; i < 10; ++i)
         REQUIRE(b.node().control_store().remove(ids[i]));
     const RetentionDot third{a.node().node_id(), 3};
@@ -1601,9 +1509,8 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
         CHECK(a.node().control_store().valid(id));
 }
 
-// 0.42.0: an edge node -- no storage.data at all -- joins, is never an owner
-// or a fallback for any key, and what it writes lands on the nodes that do
-// host extents.
+// An edge node (no storage.data) is never an owner or fallback for any key,
+// and its writes land on nodes that host extents.
 MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owners) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto& keys = cluster.keys();
@@ -1626,17 +1533,9 @@ MACHA_TEST("storage_v18", test_edge_node_never_owns_and_its_writes_land_on_owner
     CHECK(edge.node().inbound_capable());
     CHECK(edge.node().local_store().limit() == 0);
     const auto edge_id = edge.node().node_id();
-    // Placement is computed from each observer's own membership view, and
-    // single-replica placement is weighted by the capacity that view holds
-    // for each node. A handshake carries the peer's NodeInfo as it was at
-    // connect time, and a node connects before its storage has reported a
-    // capacity, so until the first gossip round refreshes it an observer can
-    // hold a peer at capacity 0 -- weight 1 against its own 64 MB -- and
-    // claim nearly every key for itself. The agreement asserted below is
-    // therefore only meaningful once both observers hold the same hosting
-    // set with the same capacities; waiting on active-set sizes alone let
-    // this case fail 2 in 30 on es-1 (2026-09-15, owned_by_s1 + owned_by_s2
-    // != 512).
+    // Placement is capacity-weighted per observer, and a handshake can carry a
+    // peer at capacity 0 until gossip refreshes it. Wait until both observers
+    // hold the same hosting set with the same capacities.
     const auto hosting_view = [](NodeRuntime& node) {
         std::vector<std::tuple<std::string, uint64_t, uint8_t>> out;
         for (const auto& member : node.membership().active())
@@ -1718,9 +1617,8 @@ MACHA_TEST("storage_v18", test_node_that_stops_hosting_drains_through_repair) {
     }
     REQUIRE(owned.size() == 4);
 
-    // s2 restarts declaring it hosts nothing. The backends are still
-    // configured (a warning, not an error), so the objects are still there
-    // to be drained.
+    // s2 restarts declaring it hosts nothing; its backends stay configured, so
+    // the objects remain to be drained.
     s2.stop();
     s2.config().hosts_extents = Tristate::no;
     s2.start();

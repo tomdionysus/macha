@@ -19,9 +19,8 @@
 #include <vector>
 
 namespace macha {
-// How a store is built beyond its node: where repair keeps its place across
-// restarts (none: each pass starts at the beginning), and the decision trace
-// repair reports to (tests; none in production).
+// Where repair keeps its place across restarts (none: each pass starts at the
+// beginning), and the repair decision trace (tests only).
 struct DistributedStoreOptions {
     std::optional<std::filesystem::path> repair_position;
     std::function<void(std::string_view, std::string_view)> repair_trace;
@@ -49,33 +48,27 @@ class DistributedStore final : public Placement {
         bool credit_limited{};
     };
 
-    // Bounded, snapshot-shaped: a cumulative count plus a small sample of the
-    // object ids involved, so Status can answer "is anything unreachable?"
-    // without an operator grepping journals on every node.
+    // A cumulative count plus a bounded sample of ids, so Status can show
+    // whether anything is unreachable.
     struct RepairDiagnostics {
         uint64_t pull_unsourceable{};
         uint64_t local_unreadable{};
         std::vector<ObjectId> unsourceable_sample;
-        // Progress, cumulative since start (0.62.2). Until then the only view
-        // of whether repair was moving was a trace-level log line.
+        // Progress, cumulative since start.
         uint64_t push_examined{};
         uint64_t pull_examined{};
         uint64_t bytes_transferred{};
         uint64_t passes_completed{};
         bool push_phase_complete{};
-        // Why the maintenance loop did or did not run a repair step, per
-        // pass. With progress stuck at zero there was no way to tell a gate
-        // from a loop that never got here. gate_credit counts steps that ran
-        // and stopped at a transfer the credit could not yet cover.
+        // Per maintenance pass: why a repair step did or did not run.
+        // gate_credit counts steps stopped at a transfer credit could not cover.
         uint64_t gate_ran{};
         uint64_t gate_share{};
         uint64_t gate_quiescent{};
         uint64_t gate_credit{};
         uint64_t last_credit_bytes{};
-        // Prompt replication (0.64.1), cumulative since start: the loop that
-        // copies each new object to a second owner at once. Until 0.64.1 it
-        // was counted nowhere, and it pushed every new object into fi-1's
-        // full backend and retried the refusal every 30 s for ever.
+        // Prompt replication (copy of each new object to a second owner),
+        // cumulative since start.
         uint64_t prompt_queued{};
         uint64_t prompt_copies{};
         uint64_t prompt_failures{};
@@ -126,14 +119,13 @@ class DistributedStore final : public Placement {
     NodeRuntime& n_;
     StoragePool::Cursor repair_push_cursor_;
     // Objects taken from the push cursor and not yet settled, in cursor order,
-    // with what one batched presence round found for each on its candidate
-    // peers. A step that stops (credit, a viewer, a failed operation) leaves
-    // both in place and the next step resumes at the same object.
+    // with one batched presence round's findings. A step that stops leaves
+    // both in place; the next resumes at the same object.
     std::deque<ObjectId> repair_push_window_;
     std::map<std::pair<NodeId, ObjectId>, bool> repair_push_presence_;
     std::set<ObjectId> repair_push_probed_;
     bool repair_push_cursor_exhausted_{};
-    // At most this many repair pushes in flight at once (0.73.1).
+    // Maximum concurrent repair pushes.
     static constexpr size_t repair_sends_in_flight = 8;
     // Objects the current push pass has settled, saved so a restart resumes
     // there (persist_repair_position), and the value to resume from.
@@ -145,19 +137,17 @@ class DistributedStore final : public Placement {
     uint64_t repair_position_saved_{};
     void save_repair_position(bool force);
     std::optional<ObjectId> repair_pull_after_;
-    // The live set's identity when no generation is given: its data, or
-    // none for no live set.
+    // The live set's identity when no generation is given: its data, or none
+    // for no live set.
     std::optional<const ObjectId*> repair_live_identity_;
     uint64_t repair_live_generation_{};
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
     std::atomic<double> network_bps_{};
-    // Prompt second copy. A put stops at min_write_replicas; until 0.32.13 the
-    // extra copies waited for the repair cursor to come round, which on a
-    // busy import was hours, and a writer's death in that window stranded
-    // its recent data (129 files, 2026-09-07). Objects that reached only
-    // the floor are queued here and pushed to the next placement owner by
-    // one worker, admitted as speculative DATA work behind viewers.
+    // Prompt second copy. A put stops at min_write_replicas; objects that
+    // reached only that floor are queued here and pushed to the next owner by
+    // one worker as speculative DATA work, so a writer's death does not
+    // strand recent data until the repair cursor comes round.
     std::mutex prompt_mutex_;
     std::condition_variable_any prompt_cv_;
     std::deque<ObjectId> prompt_queue_;
@@ -167,18 +157,12 @@ class DistributedStore final : public Placement {
     std::atomic_uint64_t prompt_failures_{};
     std::atomic_uint64_t prompt_skipped_no_room_{};
     std::atomic_uint64_t prompt_dropped_{};
-    // Repair's two silent failures, made countable. The pull side is the one
-    // that matters after a node leaves: an object the live namespace still
-    // references, that this node should own, that is not here, not in the
-    // block cache, and that no peer would supply. That is an unavailable
-    // extent, and until 0.40.0 repair passed over it without a word -- there
-    // is no Log:: call anywhere in repair_step(). The push side counts a local
-    // object the cursor listed but the store could not read back, which is
-    // what a failing disk looks like from here.
-    // Neither is proof on its own: a pull can miss because a peer was busy,
-    // the RPC failed, or a budget ran out, and the next pass will try again.
-    // A total that keeps climbing across passes, or the same ids reappearing
-    // in the sample, is the signal.
+    // Repair's silent failures, counted. Pull: a live object this node should
+    // own that is not here, not cached, and no peer would supply (an
+    // unavailable extent). Push: a listed local object that cannot be read
+    // back (a failing disk). A single miss proves nothing (busy peer, failed
+    // RPC, budget); a total climbing across passes, or ids recurring in the
+    // sample, is the signal.
     std::atomic_uint64_t repair_pull_unsourceable_{};
     std::atomic_uint64_t repair_push_examined_total_{};
     std::atomic_uint64_t repair_pull_examined_total_{};
@@ -190,10 +174,9 @@ class DistributedStore final : public Placement {
     std::atomic_uint64_t repair_gate_quiescent_{};
     std::atomic_uint64_t repair_gate_credit_{};
     std::atomic_uint64_t repair_last_credit_{};
-    // The decision trace's view of repair (the object ledger plan, T1): each
-    // copy pushed, each pull and each local copy dropped, in the order repair
-    // decides them; objects it only verifies are not decisions. Set once
-    // before maintenance starts.
+    // Decision trace for repair: each copy pushed, pull and local drop, in
+    // decision order (verifications are not decisions). Set once before
+    // maintenance starts.
     std::function<void(std::string_view kind, std::string_view detail)> repair_trace_;
     void trace_repair(const std::string& detail) const {
         if (repair_trace_)
@@ -240,30 +223,23 @@ class DistributedStore final : public Placement {
                                   FrameType = FrameType::control);
     bool retain_on(const NodeInfo&, RetentionClass, const std::vector<ObjectId>&,
                    const RetentionDot&);
-    // Batched, bounded-concurrency replacement for a per-(object, candidate)
-    // serial have_object scan. For every object, walks its candidate list in
-    // preference order accumulating up to `floor` present nodes, but checks
-    // presence in node-grouped have_objects round trips (many ids per peer per
-    // round) instead of one RPC/decrypt per (object, candidate) pair. Selection
-    // order and the floor requirement are unchanged from the serial form; only
-    // the shape of how presence gets checked changes.
+    // For each object, walks its candidates in preference order collecting up
+    // to `floor` present nodes, with presence checked in node-grouped
+    // have_objects rounds rather than one RPC per (object, candidate).
     std::map<ObjectId, std::vector<NodeInfo>>
     select_present_batched(const std::map<ObjectId, std::vector<NodeInfo>>& candidates_by_object,
                            size_t floor);
-    // One round of batched_have_objects: checks presence of every (node, ids)
-    // pair in ids_by_node, answering the local node's entries directly (cheap
-    // presence check, no RPC) and the rest via chunked have_objects RPCs, at
-    // most retention_check_concurrency chunks in flight at once across every
-    // peer combined.
+    // Presence for every (node, ids) pair: local entries answered directly,
+    // the rest by chunked have_objects RPCs, at most
+    // retention_check_concurrency chunks in flight across all peers.
     std::map<NodeId, std::map<ObjectId, bool>>
     batched_have_objects(const std::map<NodeId, NodeInfo>& node_info,
                         const std::map<NodeId, std::vector<ObjectId>>& ids_by_node,
                         FrameType frame_type = FrameType::loader);
     // Repair's presence round: whether each peer holds a copy that reads back
-    // intact, have_valid_objects_max ids a request, all requests in flight at
-    // once. A peer that does not know have_valid_objects is asked one
-    // have_object at a time. A failed request answers false for its ids, as a
-    // failed have_object always has.
+    // intact, have_valid_objects_max ids per request, all requests concurrent.
+    // Peers without have_valid_objects are asked per id via have_object. A
+    // failed request answers false for its ids.
     std::map<NodeId, std::map<ObjectId, bool>>
     validated_presence(const std::map<NodeId, NodeInfo>& node_info,
                        const std::map<NodeId, std::vector<ObjectId>>& ids_by_node);
@@ -294,9 +270,8 @@ class DistributedStore final : public Placement {
              std::atomic_bool* cancelled = nullptr);
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&,
                           std::atomic_bool* cancelled = nullptr);
-    // `work`, when it carries a no-progress budget, bounds a put whose remote
-    // replicas have all gone silent: the put fails (retryably) once nothing in
-    // the pipeline has moved for the budget, instead of waiting forever.
+    // A `work` no-progress budget fails the put (retryably) once no replica
+    // in the pipeline has moved for that long.
     ObjectId put_deferred(std::span<const uint8_t>, DurabilityBatch&, FrameType,
                           std::atomic_bool* cancelled = nullptr,
                           const DataWorkContext* work = nullptr);
@@ -307,16 +282,13 @@ class DistributedStore final : public Placement {
                       const DataWorkContext* work = nullptr);
     // True when every requirement in `batch` has reached its durability floor.
     // A replica whose placement token died with a peer's process or backend
-    // incarnation is re-derived by probing the peer with the object ids and
-    // the batch is re-stamped in place, so the next call is ordinary; ids a
-    // peer no longer holds are appended to `unsatisfiable` (if given) and the
-    // caller must re-put them.
+    // incarnation is re-derived by probing and the batch re-stamped in place;
+    // ids a peer no longer holds go to `unsatisfiable` (if given) for re-put.
     bool durability_barrier(DurabilityBatch&, FrameType = FrameType::loader,
                             std::vector<ObjectId>* unsatisfiable = nullptr);
-    // Publication liveness barrier. Every referenced object touched by a metadata
-    // mutation acquires a causal retention claim before that metadata commit may
-    // be accepted. DATA uses dht.min_write_replicas; CONTROL uses the supplied
-    // metadata write floor.
+    // Publication liveness barrier: every object a metadata mutation
+    // references gets a causal retention claim before the commit is accepted.
+    // DATA needs dht.min_write_replicas; CONTROL the given metadata floor.
     bool retain_data(const std::vector<ObjectId>&, const RetentionDot&);
     bool retain_control(const std::vector<ObjectId>&, const RetentionDot&, size_t required);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
@@ -344,21 +316,15 @@ class DistributedStore final : public Placement {
     void interactive_activity(uint64_t bytes) { n_.note_activity(FrameType::read_ahead, bytes); }
     void loader_activity(uint64_t bytes) { n_.note_activity(FrameType::loader, bytes); }
 
-    // Converges remote placement and proactively pulls live objects for which
-    // this node has become an owner. Bounded repair_step() calls retain push/pull
-    // cursors across scheduler slices; they never rebuild complete object vectors.
-    // The byte limit is network transfer, not block count (repair_once: zero
-    // means unlimited). It gates transfers only: presence probes and index
-    // lookups run without it, bounded by operation_budget, and a step stops at
-    // the first transfer the budget cannot cover (RepairResult::credit_limited).
-    // should_yield is consulted between operations only: an extent already in
-    // flight completes and is kept, so a pacer can shorten repair's turns
-    // without ever making them fruitless.
-    // Keep where the push pass has reached in `path`, saved at most every
-    // 30 s and at the end of each pass, and resume from it: a restart then
-    // does not re-check (a full read each on the peer) everything it had
-    // already copied. The node's own repair store enables this; a store
-    // without it starts each pass at the beginning.
+    // Pushes local objects to their owners and pulls live objects this node
+    // should own. repair_step() keeps push/pull cursors across calls and never
+    // materialises full object lists. The byte budget covers transfers only
+    // (repair_once: zero = unlimited); probes and lookups are bounded by
+    // operation_budget, and a step stops at the first transfer the budget
+    // cannot cover (credit_limited). should_yield is consulted between
+    // operations, so a transfer in flight completes and is kept. With a
+    // repair_position file the push pass resumes there after a restart
+    // (saved at most every 30 s and at each pass end).
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
@@ -375,9 +341,8 @@ class DistributedStore final : public Placement {
     std::chrono::milliseconds interactive_idle_for() const {
         return n_.activity_idle_for(FrameType::read_ahead);
     }
-    // Durable work the user asked for -- FUSE publication, ingest, acquisition
-    // -- which must finish but need not finish first. Law 3 puts it above
-    // background maintenance, so maintenance has to be able to see it.
+    // Durable user-requested work (FUSE publication, ingest, acquisition);
+    // law 3 ranks it above background maintenance, which must see it.
     std::chrono::milliseconds loader_idle_for() const {
         return n_.activity_idle_for(FrameType::loader);
     }

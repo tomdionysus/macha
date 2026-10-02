@@ -198,29 +198,13 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
         return true;
     if (waiters_[index(MemoryClass::control)] || waiters_[index(MemoryClass::viewer)])
         return false;
-    // Inbound RPC frame reassembly draws on a small dedicated reserve ahead of
-    // the gates below, because it is the path that RELEASES what those gates
-    // protect: publication holds its bytes until a peer confirms, and the
-    // confirmation is a frame that must be reassembled into this ledger first.
-    // The loader gate and the durable-lower budget therefore deadlock against
-    // it -- publication waits for memory, the frame that would let publication
-    // finish is refused because publication is waiting, and neither proceeds
-    // (es-1, 2026-09-08 and again 2026-09-09: publication pinned at ~500 MB,
-    // reclaimable 0, ~1 refusal per second, spool draining at 0 B/s).
-    //
-    // It sits BELOW the control/viewer waiter gate above, and must stay there.
-    // Governing law 2 is that the viewer never waits, and a queued viewer
-    // outranks reassembly unconditionally; a viewer cannot be the party
-    // publication is deadlocked against anyway, because the viewer reserve is
-    // headroom that loader and speculative work can never consume.
-    //
-    // Bounded deliberately. Granting reassembly priority over every gate
-    // instead -- the 2026-09-09 first attempt -- simply inverts the deadlock:
-    // on a node receiving from two peers, inbound frames then take everything
-    // below the control reserve and starve that node's own publication
-    // completely. The invariant needs a few frames in flight, so beyond the
-    // reserve reassembly queues like anything else, and MessageAssembler
-    // bounds incomplete reassembly independently.
+    // Inbound RPC reassembly gets a small dedicated reserve ahead of the gates
+    // below: it releases what they protect, since publication holds its bytes until
+    // a peer's confirmation frame is reassembled here. Without the reserve the
+    // loader gate and durable-lower budget deadlock against it.
+    // It sits below the control/viewer waiter gate (law 2: the viewer never waits)
+    // and is bounded, so inbound frames from several peers cannot starve this
+    // node's own publication; beyond it reassembly queues like anything else.
     if (owner == MemoryOwner::rpc_frame &&
         owner_bytes_[index(MemoryOwner::rpc_frame)] + bytes <= reassembly_reserve_bytes_)
         return true;
@@ -228,25 +212,10 @@ inline bool RetainedMemoryLedger::available_locked(MemoryClass memory_class, Mem
         return false;
     if (reclaimable)
         return true;
-    // RPC reassembly is exempt from the durable-lower budget, because
-    // completing a durable write is what releases that budget.
-    //
-    // Publication holds its bytes until a peer confirms the write, and the
-    // confirmation arrives as an RPC message that must first be reassembled
-    // into this ledger. Charged against the same budget the two meet:
-    // publication fills it, reassembly is refused, MessageAssembler throws,
-    // the peer channel drops, so nothing confirms and nothing is released.
-    // Seen live on es-1 on 2026-09-08 -- publication holding 508 MB of a
-    // 512 MB durable-lower budget, 49,680 reassembly refusals, a 576-byte
-    // FUSE admission waiting 35 minutes, and the node unable to drain itself
-    // across a restart, because publication resumed from the spool and
-    // re-entered the same state within minutes.
-    //
-    // This is not an unbounded exemption. Incomplete reassembly is already
-    // bounded independently by MessageAssembler's own max_partial_bytes_
-    // ("incomplete RPC reassembly budget exceeded"), and a frame is transient
-    // where a publication lease is long-lived, so the ledger does not need to
-    // bound it a second time. The class reserves above still apply.
+    // RPC reassembly is exempt from the durable-lower budget: completing a durable
+    // write is what releases that budget, so charging both to it deadlocks. The
+    // exemption is bounded by MessageAssembler's max_partial_bytes_; the class
+    // reserves above still apply.
     if (owner == MemoryOwner::rpc_frame)
         return true;
     const auto durable_lower_capacity = non_control_capacity - viewer_reserve_bytes_;

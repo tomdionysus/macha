@@ -10,8 +10,8 @@
 
 namespace macha {
 namespace {
-// Keep in step with media_engine.cpp: a short first fragment so a seek's
-// generation answers after 2 s of encoding, not 4.
+// Keep in step with media_engine.cpp: a short first fragment so a generation
+// answers sooner.
 constexpr double kStartupFragmentSeconds = 2.0;
 
 std::vector<double> fixed_vod_durations(double duration_seconds, double seek_seconds,
@@ -53,11 +53,8 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
     result.playback.seek_requested = std::chrono::milliseconds(requested_ms);
 
     if (prepared.playback.mode == PlaybackMode::transcode) {
-        // The encoder can start on any frame, so it starts exactly where it
-        // was asked to and the offset is zero. Transcode lays down its own GOP
-        // structure via fixed_vod_durations regardless of source keyframes, so
-        // -- unlike the remux/copy branch below -- it needs no keyframe at all,
-        // and indexed_plan's whole-file segment-density check does not apply.
+        // The encoder starts exactly at the request, offset zero, and lays down its
+        // own GOP via fixed_vod_durations, so no keyframe or density check applies.
         result.playback.seek = std::chrono::milliseconds(requested_ms);
         result.playback.seek_offset = {};
         result.segment_durations = fixed_vod_durations(prepared.source_duration_seconds,
@@ -68,9 +65,8 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
                                                prepared.source_duration_seconds,
                                                requested_ms,
                                                prepared.seek_segment_seconds);
-        // The density bounds are whole-file, so a sparser GOP anywhere else can
-        // reject a seek point that would play perfectly well. That is a known
-        // wrong bound on this path rather than a silent decline: name it.
+        // The density bounds are whole-file, so a sparser GOP elsewhere can reject a
+        // playable seek point; name that rather than decline silently.
         if (!indexed) return decline("keyframe-density-bounds");
         result.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
         result.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
@@ -87,8 +83,7 @@ std::optional<HlsVodPlan> reseek_hls_vod(const HlsVodPlan& prepared,
 
 std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stream, bool transcoded) {
     if (transcoded) {
-        // The libx264 transcode: High profile, level chosen by the encoder
-        // for the resolution; 4.1 covers everything up to 1080p30/720p60.
+        // libx264 output: High profile; level 4.1 covers up to 1080p30/720p60.
         if (codec == "h264") return "avc1.640029";
         if (codec == "aac") return "mp4a.40.2";
     }
@@ -107,8 +102,8 @@ std::string hls_codec_string(std::string_view codec, const MediaStreamInfo* stre
         return "avc1." + profile + constraints + buffer;
     }
     if (codec == "hevc") {
-        // hvc1.P.C.Lxxx.B0: general_profile_idc, compatibility flags, tier
-        // + level. Main = 1 (flags 6), Main 10 = 2 (flags 4).
+        // hvc1.P.C.Lxxx.B0: general_profile_idc, compatibility flags, tier + level.
+        // Main = 1 (flags 6), Main 10 = 2 (flags 4).
         const bool main10 = stream && (stream->bit_depth > 8 ||
                                        stream->profile.find("10") != std::string::npos);
         const int level = stream && stream->level > 0 ? stream->level : 153;
@@ -159,25 +154,13 @@ const char* media_container_name(MediaContainer container) noexcept {
     return container == MediaContainer::mpegts ? "mpegts" : "fmp4";
 }
 
-// AAC defines a standard configuration for 1-6 and 8 channels, and every one
-// of them puts the surround pair at the back rather than the side. A layout
-// outside that set -- 5.1(side), which is what E-AC-3 decodes to, is the
-// common way in -- makes the encoder describe the arrangement in a Program
-// Config Element instead and set channelConfiguration 0.
-//
-// Chrome's MP4 parser refuses that config: the init segment fails to parse,
-// MediaSource ends with a decode error, and every append after it fails, so
-// the whole title is unplayable in any Chromium browser or WebView while
-// Safari and the television's native player are unaffected (measured on
-// Chrome 141, 2026-09-08). Measured against libavcodec on the cluster: "5.1"
-// yields a five-byte config with channelConfiguration 6, "5.1(side)" a
-// 26-byte Program Config Element with channelConfiguration 0.
-//
-// Naming the standard layout costs nothing audible. The resampler maps the
-// source's channels into it, so the channel count is unchanged and only the
-// labelling of the surround pair moves. Seven channels have no standard
-// configuration at all; 7.1 carries all seven and leaves the eighth silent,
-// which loses nothing.
+// AAC's standard configurations (1-6 and 8 channels) put the surround pair at
+// the back. Any other layout (commonly 5.1(side), as E-AC-3 decodes) makes the
+// encoder write a Program Config Element with channelConfiguration 0, which
+// Chrome's MP4 parser refuses, failing the whole title in Chromium. The
+// resampler maps channels into the standard layout, so only the surround
+// labelling moves. Seven channels have no standard configuration: 7.1
+// carries them with the eighth silent.
 const char* aac_standard_channel_layout(int channels) noexcept {
     switch (channels) {
     case 1: return "mono";
@@ -212,22 +195,18 @@ std::string_view media_failure_name(MediaFailure failure) noexcept {
 
 FailureAxes media_failure_axes(MediaFailure failure) noexcept {
     FailureAxes axes;
-    // None of the three is fixable by asking this node for something else:
-    // unreadable bytes, undemuxable bytes and a read that timed out defeat
-    // every instruction equally.
+    // No other instruction to this node can succeed.
     axes.alternative_may_succeed = false;
-    // Nor does any of them say the node is unfit for other work. A file this
-    // node cannot reach or parse is one title's problem; charging the node's
-    // health for it takes a working node out of rotation for everything else.
+    // One title's failure says nothing about the node's fitness for other work.
     axes.node_healthy = true;
     switch (failure) {
     case MediaFailure::unsupported:
-        // The bytes are the problem and every node holds the same bytes.
+        // Every node holds the same bytes.
         axes.scope = FailureScope::content;
         break;
     case MediaFailure::unreadable:
     case MediaFailure::timed_out:
-        // This node's view of the bytes. Another node may hold them fine.
+        // This node's view of the bytes; another node may read them fine.
         axes.scope = FailureScope::node;
         break;
     }

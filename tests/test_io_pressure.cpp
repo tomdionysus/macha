@@ -14,8 +14,7 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// The shipped defaults, so a test that passes here says something about what
-// the nodes actually run.
+// The shipped defaults, so these tests exercise what the nodes run.
 constexpr DiskServiceMonitor::Thresholds defaults{25ms, 120ms, 300, 150, 1000};
 
 DataWorkContext work(FrameType frame_type) {
@@ -24,12 +23,8 @@ DataWorkContext work(FrameType frame_type) {
 }
 
 MACHA_FAST_TEST("io_pressure", test_an_ordinary_large_write_is_not_a_slow_device) {
-    // The bug this model exists to fix, first. A 4 MiB extent write taking
-    // 200 ms is a spinning disk doing its job; under a flat 50 ms threshold it
-    // was "pressure", so every storage node declared itself in trouble nine
-    // seconds after boot and held an operator's import to one lease for an
-    // afternoon. Judged against what an operation of that size should cost, it
-    // is unremarkable.
+    // A 4 MiB write taking 200 ms is judged against what that size should
+    // cost, and is unremarkable.
     DiskServiceMonitor monitor(defaults);
     for (int i = 0; i < 100; ++i)
         monitor.note(200ms, 4 * 1024 * 1024);
@@ -37,8 +32,8 @@ MACHA_FAST_TEST("io_pressure", test_an_ordinary_large_write_is_not_a_slow_device
     // Expected for 4 MiB is 25 + 480 = 505 ms, so 200 ms is comfortably under.
     CHECK(monitor.sample().slowdown_percent < 100);
 
-    // Small operations are judged on their own scale rather than swamped by
-    // the large ones: 4 KiB taking 200 ms is a device in trouble.
+    // Small operations are judged on their own scale: 4 KiB taking 200 ms is
+    // a device in trouble.
     DiskServiceMonitor small(defaults);
     for (int i = 0; i < 40; ++i)
         small.note(200ms, 4096);
@@ -46,9 +41,7 @@ MACHA_FAST_TEST("io_pressure", test_an_ordinary_large_write_is_not_a_slow_device
 }
 
 MACHA_FAST_TEST("io_pressure", test_pressure_onset_and_release_are_each_logged_once) {
-    // 2026-09-23: the only evidence of DATA pressure was the torrent clamp
-    // line, which fired only with a viewer. Each transition is now one line,
-    // and staying in a state says nothing more.
+    // Each transition logs one line; staying in a state logs nothing.
     struct Capture final : Logger {
         std::mutex mutex;
         std::vector<std::string> lines;
@@ -91,12 +84,9 @@ MACHA_FAST_TEST("io_pressure", test_a_device_far_slower_than_it_should_be_is_not
         monitor.note(100ms, 4 * 1024 * 1024);
     CHECK(!monitor.pressured());
 
-    // The 17.7 s extent write that started all of this. Against fifty healthy
-    // samples it moves the moving average from about 19% to 237% -- under the
-    // 300% line, so the average alone would have let it pass. It trips the
-    // single-sample outlier instead, which is why that exists: one operation
-    // 3,505% past its own expectation is a device in trouble now, not a
-    // statistic.
+    // After fifty healthy samples a 17.7 s write lifts the moving average only
+    // to about 237%, under the 300% line; at 3,505% of its own expectation it
+    // trips the single-sample outlier instead.
     monitor.note(17700ms, 4 * 1024 * 1024);
     CHECK(monitor.pressured());
     CHECK(monitor.pressure_onsets() == 1);
@@ -107,7 +97,7 @@ MACHA_FAST_TEST("io_pressure", test_a_device_far_slower_than_it_should_be_is_not
         monitor.note(3000ms, 4 * 1024 * 1024);
     CHECK(monitor.pressured());
 
-    // And recovery needs a run of healthy operations, not one lucky write.
+    // Recovery needs a run of healthy operations, not one.
     monitor.note(100ms, 4 * 1024 * 1024);
     CHECK(monitor.pressured());
     for (int i = 0; i < 80; ++i)
@@ -116,28 +106,20 @@ MACHA_FAST_TEST("io_pressure", test_a_device_far_slower_than_it_should_be_is_not
 }
 
 MACHA_FAST_TEST("io_pressure", test_the_single_sample_trip_scales_with_the_operation) {
-    // The outlier was an absolute 2 s until 0.53.0 and it was the last number
-    // in this model that was a guess about hardware -- an unequal one, because
-    // the same 2 s is 396% of expectation for a 4 MiB write and 8,000% of it
-    // for a 4 KiB read. As a ratio it means the same thing at every size.
-
-    // 2 s moving 32 MiB is 51% of expectation. It is a large operation on a
-    // working device and must not trip anything. The old absolute threshold
-    // tripped on it.
+    // The outlier trip is a ratio of expectation, so it means the same at
+    // every size. 2 s moving 32 MiB is 51% of expectation and must not trip.
     DiskServiceMonitor large(defaults);
     for (int i = 0; i < 10; ++i)
         large.note(2000ms, 32 * 1024 * 1024);
     CHECK(!large.pressured());
 
-    // 2 s for a 4 KiB read is 8,000% and trips on the first sample, as it did
-    // before -- the change costs nothing at the small end.
+    // 2 s for a 4 KiB read is 8,000% and trips on the first sample.
     DiskServiceMonitor tiny(defaults);
     tiny.note(2000ms, 4096);
     CHECK(tiny.pressured());
     CHECK(tiny.pressure_onsets() == 1);
 
-    // And the founding event still trips on its first sample, which is the
-    // whole reason a single-sample trip exists beside the moving average.
+    // A 17.7 s write after a healthy run trips on its first sample.
     DiskServiceMonitor founding(defaults);
     for (int i = 0; i < 50; ++i)
         founding.note(100ms, 4 * 1024 * 1024);
@@ -156,17 +138,8 @@ MACHA_FAST_TEST("io_pressure", test_the_single_sample_trip_scales_with_the_opera
 }
 
 MACHA_TEST("io_pressure", test_a_read_is_measured_with_the_bytes_it_returned) {
-    // The defect this test exists for shipped with the model and survived two
-    // rounds of corrections to it. StoragePool::get() started its timer with
-    // zero bytes because a read's size is only known once it succeeds, and the
-    // note_bytes() call that was supposed to fill it in was never written. So
-    // every read was judged against the fixed 25 ms per-operation overhead
-    // alone, with no per-size allowance at all -- the exact flat threshold the
-    // whole model was built to replace, still live on the read path.
-    //
-    // On 2026-09-22 that made a healthy spinner serving 240 KB reads in 31 ms
-    // score over 1000%, and es-1 entered and left pressure twelve times in
-    // thirty-four minutes with nobody watching anything.
+    // A read's size is known only once it succeeds; StoragePool::get() must
+    // still charge it, or reads are judged on per-operation overhead alone.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -205,21 +178,16 @@ MACHA_TEST("io_pressure", test_a_read_is_measured_with_the_bytes_it_returned) {
     }
 
     const auto after_reads = pool.service_monitor().sample();
-    // The reads must have been charged their real size. Before the fix this
-    // difference was exactly zero however much was read.
+    // The reads were charged their real size.
     CHECK(after_reads.bytes - after_writes.bytes == read_back);
     CHECK(after_reads.operations >= after_writes.operations + ids.size());
-    // And a local temp-dir store serving quarter-megabyte objects is not a
-    // device in trouble. It read as one when the size was dropped.
+    // A temp-dir store serving quarter-megabyte objects is not under pressure.
     CHECK(!pool.service_monitor().pressured());
 }
 
 MACHA_TEST("io_pressure", test_maintenance_reads_are_part_of_the_service_time_they_spend) {
-    // Coverage, and the gap that hid the 2026-09-22 finding. Pool maintenance
-    // reads its backends directly rather than through StoragePool::get(), so
-    // the heaviest reader macha has was invisible to the signal that decides
-    // the device is busy: macha-maint read 51.6 MB/s off a spindle sitting at
-    // 91% utilisation and moved the measured service time not at all.
+    // Maintenance reads backends directly rather than through
+    // StoragePool::get(); the monitor must still see them.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -254,9 +222,7 @@ MACHA_TEST("io_pressure", test_maintenance_reads_are_part_of_the_service_time_th
 }
 
 MACHA_FAST_TEST("io_pressure", test_a_viewer_is_never_refused_because_the_disk_is_slow) {
-    // The rule the whole stage exists for, and the one it would be worst to get
-    // backwards: if the device is slow, the person waiting on it gets all of
-    // it. Pressure may only ever refuse work nobody is waiting for.
+    // Pressure may only refuse work nobody is waiting for.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -265,7 +231,6 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_is_never_refused_because_the_disk_i
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
 
-    // Viewers sail through, repeatedly, while the device is pressured.
     std::vector<DataResourceArbiter::Lease> viewers;
     for (int i = 0; i < 3; ++i) {
         auto lease = arbiter.try_acquire(work(FrameType::foreground), 1024 * 1024);
@@ -278,16 +243,12 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_is_never_refused_because_the_disk_i
     const auto stats = arbiter.stats();
     CHECK(stats.device_pressured);
     CHECK(stats.device_service_us > 50000);
-    // A viewer is never refused, so no viewer ever contributes a refusal.
     CHECK(stats.pressure_refusals == 0);
 }
 
 MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_no_viewer) {
-    // Law 3: "Thou Shalt Not Make The Ingester/Loader Wait, Unless It Would
-    // Make The Viewer Wait." A slow device with nobody reading from it is a
-    // device doing its job, and holding an operator's import back for it is the
-    // violation the law names. It cost a 36 GB import an afternoon at 2 MB/s on
-    // 2026-09-22 with nothing being watched.
+    // Law 3: the loader waits only if it would make a viewer wait. A slow
+    // device with no viewer does not hold the loader back.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -296,7 +257,6 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
 
-    // No viewer anywhere: the loader takes its full concurrency.
     std::vector<DataResourceArbiter::Lease> loaders;
     for (int i = 0; i < 4; ++i) {
         auto lease = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
@@ -305,18 +265,15 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
     }
     CHECK(arbiter.stats().pressure_refusals == 0);
 
-    // Speculative work stands aside regardless -- it sits below the loader and
-    // nobody is waiting for it.
+    // Speculative work, below the loader, still stands aside.
     auto speculative = arbiter.try_acquire(work(FrameType::speculative), 1024 * 1024);
     CHECK(!speculative.has_value());
-    // And that refusal is the mechanism's doing, so it is counted and an
-    // operator can see what the throttle cost rather than infer it.
+    // Refusals are counted so the throttle's cost is visible.
     CHECK(arbiter.stats().pressure_refusals == 1);
 }
 
 MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_device) {
-    // The other half of law 3: once a viewer is in the picture, the loader does
-    // yield, and to a trickle rather than a stop so an import still drains.
+    // With a viewer present the loader yields to a trickle, not a stop.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -335,18 +292,16 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_devi
     CHECK(!second.has_value());
     CHECK(arbiter.stats().pressure_refusals == 1);
 
-    // Bounded, never stopped: releasing the trickle lease lets the next unit of
-    // loader work through, so the import proceeds slowly rather than hanging.
+    // Releasing the trickle lease lets the next unit of loader work through.
     first.reset();
     auto next = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
     CHECK(next.has_value());
 
-    // And the viewer keeps sailing through while all of that happens.
     auto another_viewer = arbiter.try_acquire(work(FrameType::read_ahead), 1024 * 1024);
     CHECK(another_viewer.has_value());
 
-    // Once the viewer is gone and the device is still slow, the loader gets its
-    // concurrency back: nothing is waiting on the disk but the import.
+    // With the viewer gone, the loader gets its concurrency back on the still
+    // slow device.
     viewer.reset();
     another_viewer.reset();
     auto unblocked = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
@@ -354,12 +309,8 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_devi
 }
 
 MACHA_FAST_TEST("io_pressure", test_a_viewer_between_two_extents_is_still_a_viewer) {
-    // "Viewer present" was byte credit held at this instant, and playback does
-    // not hold credit between extents. So every gap in a stream readmitted the
-    // loader at full concurrency onto a slow disk, and the viewer's next read
-    // queued behind the extent write the gap had just let in. The rest of the
-    // system answers this with an activity clock and a quiet window; the
-    // arbiter now reads the same answer.
+    // Playback holds no credit between extents, so viewer presence comes from
+    // the activity signal passed to observe_viewers(), not from held credit.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -370,8 +321,7 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_between_two_extents_is_still_a_view
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
 
-    // Nobody is holding a single byte of viewer credit here -- the viewer is
-    // between extents -- and the loader still yields to its trickle.
+    // No viewer credit is held, yet the loader still yields to its trickle.
     auto first = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
     REQUIRE(first.has_value());
     auto second = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
@@ -381,9 +331,7 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_between_two_extents_is_still_a_view
     auto viewer = arbiter.try_acquire(work(FrameType::foreground), 1024 * 1024);
     CHECK(viewer.has_value());
 
-    // Once the stream really has stopped -- the window lapses and the last
-    // viewer credit goes with it -- the import takes the disk back. Law 3 is
-    // not a licence to throttle for ever.
+    // Once the stream has stopped, the loader takes the disk back.
     watching = false;
     viewer.reset();
     auto resumed = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
@@ -391,12 +339,8 @@ MACHA_FAST_TEST("io_pressure", test_a_viewer_between_two_extents_is_still_a_view
 }
 
 MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured_device) {
-    // Law 4. A gate that can refuse every unit of background work on a device
-    // that is slow *because of* that work has no way back, and the node stays
-    // up and reports itself healthy the whole time. min_background is the
-    // floor that makes recovery possible: with nothing active, one lease is
-    // always admitted, it completes, it feeds the monitor, and the average can
-    // fall. The signal can never starve itself of input.
+    // Law 4. min_background always admits one lease when nothing is active, so
+    // background work keeps feeding the monitor and the average can fall.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -405,15 +349,14 @@ MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured
         monitor.note(30000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
 
-    // Sustained catastrophic overload, a viewer present throughout: the
-    // trickle still turns over, one lease at a time, indefinitely.
+    // Under sustained overload with a viewer present, the trickle still turns
+    // over one lease at a time.
     for (int i = 0; i < 50; ++i) {
         auto lease = arbiter.try_acquire(work(FrameType::loader), 1024 * 1024);
         REQUIRE(lease.has_value());
     }
 
-    // And a device that recovers releases: the state describes now, not what
-    // it once saw.
+    // A recovered device releases pressure.
     for (int i = 0; i < 100; ++i)
         monitor.note(80ms, 4 * 1024 * 1024);
     CHECK(!monitor.pressured());
@@ -426,12 +369,8 @@ MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured
 }
 
 MACHA_FAST_TEST("io_pressure", test_control_cannot_enter_the_data_arbiter_at_all) {
-    // Law 1. Control never queues behind or runs inline with bulk data work,
-    // whatever the DATA devices are doing, and the structural guarantee is that it never
-    // enters this object: the control store is a separate LocalStore on a
-    // separate device, nothing on its path feeds the monitor, and an attempt
-    // to take DATA credit for control work is a programming error rather than
-    // a slow path.
+    // Law 1. Control work never enters the DATA arbiter: constructing a
+    // DataWorkContext for it throws.
     DiskServiceMonitor monitor(defaults);
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -450,9 +389,7 @@ MACHA_FAST_TEST("io_pressure", test_control_cannot_enter_the_data_arbiter_at_all
 }
 
 MACHA_FAST_TEST("io_pressure", test_with_no_device_admission_is_exactly_what_it_was) {
-    // The mechanism is off unless a device is being watched, so nothing that
-    // does not front a store changes behaviour, and
-    // io_pressure_slowdown_percent: 0 restores the previous arbiter exactly.
+    // Without an observed device, pressure never refuses anything.
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
     std::vector<DataResourceArbiter::Lease> loaders;
     for (int i = 0; i < 6; ++i) {

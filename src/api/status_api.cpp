@@ -16,8 +16,8 @@ namespace {
 // later, milder check downgrade it back.
 enum class HealthSeverity { healthy, degraded, recovering, critical };
 
-// Stated once, and carried in the lightweight response so a client learns
-// where the expensive half went from the payload itself.
+// Carried in the lightweight response so a client learns from the payload
+// where the expensive half went.
 constexpr std::string_view diagnostics_path = "/api/v1/status/diagnostics";
 
 std::string_view health_name(HealthSeverity severity) {
@@ -55,9 +55,8 @@ PersistedNodeStatus persisted(const NodeTelemetry& telemetry) {
 }
 
 void merge_membership(PersistedNodeStatus& out, const NodeInfo& member) {
-    // Membership is the authoritative live cluster view. Telemetry may enrich
-    // it, but absence of telemetry must never make a connected node disappear
-    // from Status or make a voter look offline.
+    // Membership is the authoritative live view: missing telemetry must never hide
+    // a connected node or make a voter look offline.
     out.observed_unix_ms = std::max(out.observed_unix_ms, member.seen_unix_ms);
     out.host = member.host;
     out.failure_domain = member.failure_domain;
@@ -133,8 +132,7 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
         status.self_probe_error.empty() ? Json(nullptr) : Json(status.self_probe_error);
     check["checked_at_unix_ms"] = status.checked_unix_ms;
     // A same-node TCP connect is a NAT loopback diagnostic, not proof that an
-    // arbitrary Internet host can reach the advertised endpoint. A future peer
-    // probe can promote this field without changing the status shape.
+    // arbitrary Internet host can reach the advertised endpoint.
     check["externally_verified"] = false;
 
     Json::Object out;
@@ -146,9 +144,8 @@ Json public_connectivity_json(const PublicConnectivityStatus& status) {
     return Json(std::move(out));
 }
 
-// network.inbound_capable / storage.hosts_extents as this node currently
-// resolves them, beside the modes that were configured, and the dial-back
-// evidence the answer rests on.
+// network.inbound_capable / storage.hosts_extents as this node resolves them,
+// beside the configured modes and the dial-back evidence.
 void add_inbound_resolution(Json::Object& connectivity, const InboundResolution& resolution) {
     connectivity["inbound_capable"] = resolution.inbound_capable;
     connectivity["inbound_capable_mode"] = std::string(tristate_name(resolution.inbound_capable_mode));
@@ -182,11 +179,9 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
     return Json(std::move(out));
 }
 
-// A live telemetry sample that is stale (older than the caller's freshness
-// window) must be treated exactly like having no live sample at all for
-// numeric purposes: a sample can be arbitrarily old, and presenting its
-// resource/runtime figures as current would fabricate data. "authoritative"
-// means a genuinely fresh, current measurement exists.
+// A stale live sample (older than the caller's freshness window) counts as no
+// sample for numeric purposes: presenting old figures as current would
+// fabricate data. "authoritative" means a fresh measurement exists.
 struct EffectiveNodeTelemetry {
     bool authoritative{};
     uint64_t storage_capacity{};
@@ -200,10 +195,9 @@ EffectiveNodeTelemetry effective_telemetry(const NodeTelemetry* live, bool stale
                                            const PersistedNodeStatus& durable,
                                            bool telemetry_known) {
     EffectiveNodeTelemetry out;
-    // A fresh (non-stale) sample is only authoritative once the sender itself
-    // reports "ready": a node mid-recovery legitimately publishes fresh
-    // zero-valued capacity/usage, and presenting that as a current
-    // measurement is indistinguishable from a real empty node.
+    // A fresh sample is authoritative only once its sender reports "ready": a
+    // recovering node publishes fresh zero capacity/usage, indistinguishable from
+    // a real empty node.
     out.authoritative = live && !stale && live->phase == NodePhase::ready;
     if (out.authoritative) {
         out.storage_capacity = live->storage_capacity;
@@ -229,14 +223,12 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     Json::Object node;
     node["id"] = to_string(id);
     node["state"] = retired ? "retired" : (online ? "online" : "offline");
-    // The gossiped self-declarations (0.42.0). Membership is the only source:
-    // a node known solely from durable telemetry predates the flags or has
-    // never been heard from, and null says so rather than guessing.
+    // The gossiped self-declarations. Membership is the only source; null when
+    // the node is known only from durable telemetry.
     if (member) {
         node["inbound_capable"] = node_inbound_capable(*member);
         node["hosts_extents"] = node_hosts_extents(*member);
-        // The host/port above are a routing key for a node that cannot be
-        // dialled; say so where an operator would otherwise try to connect.
+        // The host/port above are a routing key for a node that cannot be dialled.
         node["dialable"] = node_inbound_capable(*member);
     } else {
         node["inbound_capable"] = Json(nullptr);
@@ -251,10 +243,9 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     }
     node["telemetry_freshness"] =
         live ? (stale ? "stale" : "live") : (telemetry_known ? "last_known" : "unavailable");
-    // The node's own reported startup phase, using the same vocabulary as
-    // this API's local root.startup.phase. Only trustworthy (fresh and, for
-    // the sender, self-reported ready/recovering/starting) telemetry can
-    // answer this; otherwise it is honestly "unknown" rather than assumed.
+    // The node's own reported startup phase, in the vocabulary of
+    // root.startup.phase. Only fresh telemetry from a ready, recovering or starting
+    // sender answers; otherwise "unknown".
     node["phase"] = (live && !stale) ? std::string(node_phase_name(live->phase)) : "unknown";
     node["observed_at_unix_ms"] =
         live ? live->observed_unix_ms
@@ -272,26 +263,18 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         static_cast<uint64_t>(member ? member->port : (live ? live->port : durable.port));
     node["failure_domain"] =
         member ? member->failure_domain : (live ? live->failure_domain : durable.failure_domain);
-    // Membership and telemetry are two independent sightings of the same
-    // monotonic counter, and either can be the older one: membership carries 0
-    // for a peer whose record predates its first generation notice, while a
-    // stale sample lags a peer that has since advanced. Taking the larger is
-    // therefore the fresher answer, not a guess -- reporting a healthy peer as
-    // generation 0 because membership happened to win is the bug this avoids.
-    // The durable last-known value answers only when neither source has one.
+    // Membership and telemetry independently sight the same monotonic counter and
+    // either may lag (membership carries 0 before a peer's first generation notice;
+    // a stale sample trails), so the larger is the fresher answer. The durable
+    // last-known value answers only when neither has one.
     const uint64_t observed_generation =
         std::max(member ? member->metadata_generation : uint64_t{0},
                  live ? live->metadata_generation : uint64_t{0});
     node["metadata_generation"] =
         observed_generation ? observed_generation : durable.metadata_generation;
 
-    // Where other clients should reach this node's HTTP API - distinct from
-    // host/port above, which is the RPC bind address and not necessarily the
-    // right port (or even protocol) for a REST call. Omitted entirely rather
-    // than reported as empty/0 when unknown, so older or API-less peers in a
-    // mixed cluster are simply not discovered rather than guessed at.
-    // The API endpoint, complete with scheme, distinct from host/port above
-    // which is this node's RPC address and is never proxied.
+    // The HTTP API endpoint, with scheme; distinct from host/port above, the RPC
+    // address. Omitted when unknown, so API-less peers are not guessed at.
     const auto& api_endpoint = live ? live->api_endpoint : durable.api_endpoint;
     if (!api_endpoint.empty()) {
         node["api_endpoint"] = api_endpoint;
@@ -309,23 +292,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         auto cache = telemetry_available
                          ? bytes_pair(effective.cache_used, effective.cache_capacity).asObject()
                          : unavailable_bytes().asObject();
-        // What the cache has DONE, beside how full it is. `used` is a function
-        // of writes alone, so a cache that has never returned a byte reports
-        // the same as one working perfectly -- which is exactly the state this
-        // cluster could not distinguish until 2026-09-21, when answering it
-        // took an hour of manual measurement against a live node.
-        //
-        // Monotonic and diffed by the consumer, which is why they are safe on
-        // this payload while an instantaneous count is not. Deliberately NOT
-        // summed into the cluster rollup: an aggregate hit rate lets two
-        // healthy storage nodes drown a storage-less edge node sitting at
-        // zero, and that node is the one the number exists to expose.
-        // From the LIVE sample only, never the persisted fallback that
-        // `effective` uses for capacity and usage. These are monotonic since
-        // the sending process started, so a durable value republished after a
-        // restart would be a count from a process that no longer exists --
-        // and a consumer diffing two reads would see it go backwards. Absent
-        // is the honest answer when there is no fresh sample.
+        // What the cache has done, beside how full it is: `used` depends on writes
+        // alone, so it cannot show a cache that never returns a byte. Monotonic and
+        // diffed by the consumer. Not summed into the cluster rollup, where healthy
+        // nodes would mask a storage-less edge node at zero. From the live sample only:
+        // a durable value republished after a restart would make a diff go backwards.
         if (live && !stale) {
             cache["hits"] = static_cast<uint64_t>(live->cache_hits);
             cache["misses"] = static_cast<uint64_t>(live->cache_misses);
@@ -345,15 +316,10 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         roles.emplace_back("metadata-replica");
     node["roles"] = std::move(roles);
 
-    // Unlike capacity and usage above, these are measurements of the sending
-    // process itself at a stated instant: an old load average is an old
-    // measurement, not a fabricated one, and `telemetry_freshness` plus
-    // `live_age_ms` already tell the consumer exactly how old. Blanking them
-    // the moment a sample crosses the freshness line (15s at the default
-    // heartbeat) is what leaves an operator with no view of a busy or distant
-    // node at the moment they most want one, so a stale sample keeps them.
-    // Nothing aggregates these across nodes, so a stale figure cannot leak
-    // into a cluster-wide total the way a stale capacity would.
+    // Measurements of the sending process at a stated instant; consumers read
+    // their age from `telemetry_freshness` and `live_age_ms`. A stale sample keeps
+    // them, so a busy or distant node stays visible, and nothing aggregates them
+    // across nodes.
     Json::Object runtime;
     if (live && online) {
         runtime["uptime_ms"] = live->uptime_ms;
@@ -361,15 +327,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         runtime["process_cpu_percent"] =
             static_cast<double>(live->process_cpu_milli_percent) / 1000.0;
         runtime["load1"] = static_cast<double>(live->load1_milli) / 1000.0;
-        // Only when known. load1 and process_cpu_percent are per-core, so a
-        // consumer needs this to compare them across non-uniform nodes -- and
-        // an absent field it can abstain on is safer than a zero it might
-        // divide by.
+        // Only when known. load1 and process_cpu_percent are per-core, so consumers
+        // need this to compare non-uniform nodes; absence is safer than a zero divisor.
         if (live->cpu_cores)
             runtime["cpu_cores"] = static_cast<uint64_t>(live->cpu_cores);
-        // Physical RAM, and only when known. rss_bytes above is this process's
-        // own resident set, which is a different quantity by orders of
-        // magnitude -- a consumer labelling either as "memory" wants this one.
+        // Physical RAM, only when known; rss_bytes above is this process's resident set.
         if (live->memory_total_bytes)
             runtime["memory_total_bytes"] = live->memory_total_bytes;
         runtime["peers_known"] = static_cast<uint64_t>(live->peers_known);
@@ -380,12 +342,10 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
     }
     node["runtime"] = std::move(runtime);
 
-    // The node's own cluster traffic by frame class: totals since its start and
-    // the rate over its last telemetry interval (window_ms, as of the sample's
-    // own time). Only Macha's traffic between nodes; HTTP to clients and
-    // anything else on the link are not in it. Null when the node did not
-    // report it (an older node, or a stale sample); a rate is null on a
-    // node's first sample after start, when it has no interval yet.
+    // The node's own inter-node Macha traffic by frame class: totals since start
+    // and the rate over its last telemetry interval (window_ms, at the sample's
+    // time). Null when not reported (stale sample); a rate is null on a node's
+    // first sample after start.
     if (live && online && !live->traffic.empty()) {
         const bool rated = live->traffic_window_ms > 0;
         Json::Array classes;
@@ -418,17 +378,11 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         node["traffic"] = nullptr;
     }
 
-    // Configuration this node enforces, not a measurement of it -- separate
-    // from `runtime` above for that reason. A client needs these about every
-    // node it might fail over to, not only the one it is playing from, which
-    // is why they ride the payload that already describes every node rather
-    // than a per-endpoint call the client would have to make N times.
-    //
-    // Omitted when the node did not report them: an older node, or one with
-    // streaming disabled. A consumer must read absence as "this node cannot
-    // say" and fall back to its own conservative bound -- never shorten a
-    // budget on the strength of a missing field, and never substitute another
-    // node's figure, which is a fact about that node and not this one.
+    // Configuration this node enforces, not a measurement, hence separate from
+    // `runtime`. Carried for every node so a client can judge failover targets
+    // without N calls. Omitted when not reported (e.g. streaming disabled): read
+    // absence as "cannot say" and use a conservative bound, never another node's
+    // figure.
     Json::Object playback;
     if (live && online) {
         if (live->playback_startup_timeout_ms)
@@ -443,22 +397,17 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_session_idle_ms)
             playback["session_idle_ms"] =
                 static_cast<uint64_t>(live->playback_session_idle_ms);
-        // The limit only; the current count is deliberately not here. This
-        // payload is cached by its consumers, and the count is the most
-        // perishable number the API carries -- it moves whenever anyone on the
-        // account starts or stops anything, from a device neither end can see.
-        // It appears only where it is computed live: the creation payload, the
-        // collection listing, and the refusal.
+        // The limit only: the current count is too perishable for a cached payload.
+        // It appears where computed live: the creation payload, the collection
+        // listing, and the refusal.
         if (live->playback_max_sessions_per_account)
             playback["max_sessions_per_account"] =
                 static_cast<uint64_t>(live->playback_max_sessions_per_account);
         if (live->playback_max_transcodes_per_account)
             playback["max_transcodes_per_account"] =
                 static_cast<uint64_t>(live->playback_max_transcodes_per_account);
-        // The node-wide cap beside the per-account one. 0.48.0 shipped the
-        // second without the first, which left the two 429s asymmetric where
-        // it mattered: a client could say "another screen on this account is
-        // playing" and could not say "this node is full".
+        // The node-wide cap beside the per-account one, so a client can tell "another
+        // screen on this account" from "this node is full".
         if (live->playback_max_sessions)
             playback["max_sessions"] = static_cast<uint64_t>(live->playback_max_sessions);
         // How long this node lets a session hold a transcode entitlement with
@@ -476,8 +425,8 @@ Json node_json(const NodeId& id, const PersistedNodeStatus& durable, const NodeI
         if (live->playback_start_failed_retention_ms)
             playback["start_failed_retention_ms"] =
                 static_cast<uint64_t>(live->playback_start_failed_retention_ms);
-        // What this node has sustained transcoding each kind of source it has
-        // actually transcoded; a kind it has never seen is absent, not guessed.
+        // Sustained transcode rate per source kind this node has transcoded; unseen
+        // kinds are absent.
         if (!live->playback_transcode_rates.empty()) {
             Json::Array rates;
             for (const auto& rate : live->playback_transcode_rates) {
@@ -585,13 +534,10 @@ void ClusterStatusService::stop() {
 }
 
 void ClusterStatusService::persist_local_status() {
-    // Status persistence is deliberately outside namespace metadata. Even a
-    // five-minute observational checkpoint must never serialize a large
-    // namespace, acquire the metadata mutation lock, or enter metadata publication CAS.
-    // Defer the tiny local durable write while viewer-critical work is active.
-    // durable_replace_file() includes the durability barrier we want for the
-    // last-known cache. Keep that I/O well clear of interactive traffic rather
-    // than allowing observational state to introduce an fsync into a busy node.
+    // Status persistence stays outside namespace metadata: an observational
+    // checkpoint must never serialise the namespace, take the metadata mutation
+    // lock or enter publication CAS. The small durable write (with its fsync) is
+    // deferred while viewer-critical work is active.
     constexpr auto idle_before_persist = std::chrono::seconds(30);
     if (node_.activity_idle_for(FrameType::foreground) < idle_before_persist ||
         node_.activity_idle_for(FrameType::read_ahead) < idle_before_persist)
@@ -601,9 +547,8 @@ void ClusterStatusService::persist_local_status() {
 }
 
 void ClusterStatusService::persistence_loop(std::stop_token stop) {
-    // Give startup membership/metadata formation a short head start, then keep one
-    // coalesced durable observation per node. A failed checkpoint is retried; no
-    // historical telemetry backlog is ever replayed into metadata.
+    // After a short startup head start, keep one coalesced durable observation
+    // per node. A failed checkpoint is retried; no telemetry backlog is replayed.
     auto delay = std::chrono::seconds(10);
     while (!stop.stop_requested()) {
         std::unique_lock lock(wait_mutex_);
@@ -636,10 +581,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
     }
 
-    // Current cluster membership is independent of telemetry. These are small,
-    // in-memory snapshots under Membership's short mutex; they do no network or
-    // disk I/O. Telemetry only decorates members after this authoritative view
-    // has been established.
+    // Membership is independent of telemetry: small in-memory snapshots under
+    // Membership's short mutex, no I/O. Telemetry only decorates these members.
     const auto membership = node_.membership().snapshot();
     const auto& membership_all = membership.all;
     const auto& membership_active = membership.active;
@@ -658,17 +601,12 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
 
     std::map<NodeId, PersistedNodeStatus> known;
     if (metadata)
-        known = metadata->node_status; // Read-only compatibility with early SM9 checkpoints.
+        known = metadata->node_status; // Read-only: older checkpoints carry it.
     for (const auto& telemetry : node_.telemetry().persisted())
         known[telemetry.node_id] = persisted(telemetry);
-    // A stale, or fresh-but-still-recovering, live view must not clobber the
-    // durable/last-known record with itself: only a genuinely fresh AND ready
-    // observation should become the new "last known" baseline. Otherwise a
-    // node's numbers would never actually fall back to anything different
-    // once its telemetry goes stale, and a node's own in-progress recovery
-    // (which legitimately reports zero capacity/usage while not yet ready)
-    // would overwrite its last known-good figures with that same zero within
-    // this very call.
+    // Only a fresh and ready observation becomes the new last-known baseline:
+    // otherwise stale figures could never fall back, and a recovering node's
+    // zero capacity/usage would overwrite its last known-good figures.
     for (const auto& [id, view] : live)
         if (view.fresh && view.telemetry.phase == NodePhase::ready)
             known[id] = persisted(view.telemetry);
@@ -681,9 +619,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             telemetry_known.insert(id);
     for (const auto& telemetry : node_.telemetry().persisted())
         telemetry_known.insert(telemetry.node_id);
-    // Mirror the fresh-and-ready gate above: "known" here means a genuinely
-    // trustworthy durable/last-known source exists, not merely that some
-    // telemetry (however stale or still-recovering) was once observed.
+    // Mirrors the fresh-and-ready gate above: "known" means a trustworthy
+    // last-known source exists, not merely that telemetry was once seen.
     for (const auto& [id, view] : live)
         if (view.fresh && view.telemetry.phase == NodePhase::ready)
             telemetry_known.insert(id);
@@ -740,9 +677,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                     identity_reset = &reset;
             }
         }
-        // A reset retires the pre-reset durable identity, but it is only a
-        // freshness boundary: a later directly authenticated observation of
-        // the same identity remains an ordinary live/known node.
+        // A reset retires the pre-reset durable identity only as a freshness
+        // boundary: a later directly authenticated sighting is an ordinary node.
         const bool retired = !online && identity_reset &&
                              observed_unix_ms <= identity_reset->reset_unix_ms;
         const InboundResolution* resolution_for_node =
@@ -755,8 +691,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
             continue;
         }
         ++known_nodes;
-        // A node that hosts no extents has no durable capacity to count, and
-        // must not make the aggregate look short of something it never had.
+        // A node hosting no extents has no durable capacity, so it must not make the
+        // aggregate look short.
         const bool hosting = !member || node_hosts_extents(*member);
         const bool inbound_capable = !member || node_inbound_capable(*member);
         if (!inbound_capable)
@@ -794,12 +730,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
                 online_cache_capacity += effective.cache_capacity;
                 online_cache_used += effective.cache_used;
             }
-            // Self's own readiness is already reported synchronously and
-            // exactly via `readiness` above; this signal exists to surface a
-            // *remote* peer's recovery, which has no other synchronous
-            // source. Self's own published telemetry can briefly lag its own
-            // readiness transition, so including it here would just be a
-            // redundant, racier duplicate of the existing local check.
+            // Self's readiness is reported exactly via `readiness` above, and its own
+            // telemetry can lag it; this signal surfaces remote peers' recovery only.
             if (id != node_.node_id() && current && !stale && current->phase != NodePhase::ready)
                 online_node_recovering = true;
         }
@@ -866,9 +798,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         escalate(health, HealthSeverity::degraded);
         conditions.emplace_back("some known durable capacity is unavailable");
     }
-    // Nodes that accept no inbound connections, and what that does to where
-    // extents can live (0.42.0). The first is information, not a fault; the
-    // other two are the shapes decision 3 of the plan rules out.
+    // Nodes accepting no inbound connections, and the effect on where extents can
+    // live. The first is information; the other two are faults.
     if (inbound_incapable_nodes)
         conditions.emplace_back(std::to_string(inbound_incapable_nodes) + " node" +
                                 (inbound_incapable_nodes == 1 ? " accepts" : "s accept") +
@@ -898,8 +829,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     cluster["metadata_replicas"] = static_cast<uint64_t>(metadata_replicas);
     cluster["metadata_replicas_online"] = static_cast<uint64_t>(active_metadata_replicas);
     cluster["metadata_min_write_replicas"] = static_cast<uint64_t>(metadata_min_write_replicas);
-    // Transitional API aliases for 0.18 clients. They carry the new values and
-    // should not be interpreted as a fixed voter set or majority quorum.
+    // Compatibility aliases carrying the current values; not a fixed voter set or
+    // majority quorum.
     cluster["metadata_voters"] = static_cast<uint64_t>(metadata_replicas);
     cluster["metadata_voters_online"] = static_cast<uint64_t>(active_metadata_replicas);
     cluster["metadata_quorum_required"] = static_cast<uint64_t>(metadata_min_write_replicas);
@@ -944,23 +875,11 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     startup["error"] = readiness.error.empty() ? Json(nullptr) : Json(readiness.error);
 
     Json::Object root;
-    // Which node produced this response. Requested by the operator via the
-    // core client session, 2026-09-21, and it is not decoration: a client
-    // configured with one address polls this and gets a cluster snapshot in
-    // which nothing says which of the nodes[] entries answered it.
-    //
-    // api_endpoint cannot serve the purpose, because it is the node's own
-    // advertised name -- which by definition differs from the address the
-    // client used in precisely the case that matters. Live on this cluster,
-    // http://10.44.1.50:7438 and https://macnessa.macha.network are both
-    // gbni-1 and a client counts them as two nodes: grouping double-counts,
-    // a failover can "move" to the machine it just left, and a node selector
-    // offers the same box twice. Core declined to guess that a LAN address
-    // and a DNS name are one machine, correctly -- guessing would merge two
-    // genuinely different nodes, which is worse than the bug.
-    //
-    // Matches the `id` in nodes[], so a client joins on it and attaches the
-    // node identity to whichever address it actually reached.
+    // Which node produced this response, matching an `id` in nodes[]. A client
+    // joins on it to attach node identity to the address it reached:
+    // api_endpoint is the advertised name, which differs from that address (LAN
+    // IP vs DNS name) exactly when it matters, and guessing would merge distinct
+    // nodes.
     root["node_id"] = to_string(node_.node_id());
     root["cluster"] = std::move(cluster);
     root["startup"] = std::move(startup);
@@ -988,9 +907,8 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         }
     }
     root["subsystems"] = std::move(subsystems);
-    // Every supervised thread by name (0.63.0). A thread that faults is
-    // restarted, escalated or ended according to what it is (supervised.hpp);
-    // until this, one that ended said so once in the journal and nowhere else.
+    // Every supervised thread by name; on a fault each is restarted, escalated or
+    // ended according to its kind (supervised.hpp).
     Json::Array threads;
     for (const auto& status : supervised_thread_statuses()) {
         Json::Object entry;
@@ -1006,20 +924,15 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
         threads.push_back(std::move(entry));
     }
     root["threads"] = std::move(threads);
-    // Named rather than assumed: a client that was reading `diagnostics` off
-    // this response and now finds it absent would otherwise get `undefined`
-    // and no explanation, which is the silent-nothing failure this project has
-    // been bitten by before. The pointer travels with the payload.
+    // Named so a client that finds `diagnostics` absent is told where it went.
     root["diagnostics_endpoint"] = std::string(diagnostics_path);
     root["generated_at_unix_ms"] = unix_ms();
     return http_json(200, Json(std::move(root)).dump());
 }
 
-// Everything above this line is membership, telemetry and readiness the node
-// already holds decoded: a handful of short mutexes, no I/O, no network. What
-// follows is the other kind, and it moved here in 0.39.1 so that polling the
-// first no longer pays for the second. See status_api.hpp for why that
-// distinction is about locks rather than about arithmetic.
+// Everything above is state the node already holds decoded: short mutexes, no
+// I/O, no network. What follows touches most subsystems' locks, so it has its
+// own route (see status_api.hpp).
 HttpResponse ClusterStatusService::diagnostics_response() {
     auto* metadata_manager = metadata_.load(std::memory_order_acquire);
     std::shared_ptr<const MetadataSnapshot> metadata;
@@ -1033,8 +946,8 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     }
     const auto readiness = node_.readiness();
 
-    // Process-lifetime aggregate diagnostics are read directly from local
-    // atomics. They create no sampling loop, persistence work, or gossip load.
+    // Process-lifetime aggregates read from local atomics: no sampling loop,
+    // persistence or gossip.
     Json::Object diagnostics;
     Json::Object metadata_diagnostics;
     metadata_diagnostics["available"] = readiness.metadata_ready;
@@ -1064,9 +977,9 @@ HttpResponse ClusterStatusService::diagnostics_response() {
         metadata_diagnostics["accepted_head_persistence_failures"] =
             values.accepted_head_persistence_failures;
     }
-    // Discipline 4: standing conflicts are visible here and listed/resolved
-    // under /api/v1/manage/metadata/conflicts; superseded/resolved are
-    // process-lifetime counters of conflicts that left the snapshot.
+    // Standing conflicts, listed and resolved under
+    // /api/v1/manage/metadata/conflicts; superseded/resolved are process-lifetime
+    // counters of conflicts that left the snapshot.
     if (metadata) {
         uint64_t namespace_conflicts = 0, catalogue_conflicts = 0;
         for (const auto& [id, conflict] : metadata->conflicts) {
@@ -1146,20 +1059,15 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     data_resource_diagnostics["background_limit"] = data_resource.background_limit;
     data_resource_diagnostics["background_active"] = data_resource.background_active;
     data_resource_diagnostics["peak_background_active"] = data_resource.peak_background_active;
-    // Measured device service time and whether it is currently being defended.
-    // Without these the throttle is invisible: an operator sees a loader that
-    // has slowed down and has no way to tell whether the disk is being
-    // protected or the node is simply unwell. `device_worst_us` is kept because
-    // a healthy-looking mean hides the single 17-second write that actually
-    // breaks a viewer.
+    // Measured device service time and whether it is being defended, so a
+    // throttled loader is distinguishable from an unwell node. `device_worst_us`
+    // shows the single slow write a healthy mean hides.
     data_resource_diagnostics["device_pressured"] = data_resource.device_pressured;
     data_resource_diagnostics["device_service_us"] = data_resource.device_service_us;
     data_resource_diagnostics["device_worst_us"] = data_resource.device_worst_us;
     data_resource_diagnostics["device_slowdown_percent"] = data_resource.device_slowdown_percent;
     data_resource_diagnostics["device_pressure_onsets"] = data_resource.device_pressure_onsets;
-    // Onsets say the device went under; this says what that cost. Both are
-    // needed to answer "is this node being throttled or is it unwell", which
-    // is the question the status page could not answer on 2026-09-22.
+    // Onsets say the device went under; this says what that cost.
     data_resource_diagnostics["pressure_refusals"] = data_resource.pressure_refusals;
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
@@ -1173,9 +1081,8 @@ HttpResponse ClusterStatusService::diagnostics_response() {
         retained_memory.viewer_reserve_bytes;
     retained_memory_diagnostics["loader_reserve_bytes"] =
         retained_memory.loader_reserve_bytes;
-    // The slice only inbound frame reassembly may draw on. Reported because
-    // its exhaustion is what turns a stuck publication into a node whose peer
-    // channels drop, and an operator needs to see the two side by side.
+    // The slice only inbound frame reassembly may draw on: its exhaustion turns a
+    // stuck publication into dropped peer channels.
     retained_memory_diagnostics["reassembly_reserve_bytes"] =
         retained_memory.reassembly_reserve_bytes;
     retained_memory_diagnostics["used_bytes"] = retained_memory.used_bytes;
@@ -1367,7 +1274,7 @@ HttpResponse ClusterStatusService::diagnostics_response() {
                     values->publication_retries_backed_off;
                 filesystem_diagnostics["publications_retrying_persistently"] =
                     values->publications_retrying_persistently;
-                // What recovery resolved instead of refusing (discipline 3).
+                // What recovery resolved instead of refusing.
                 filesystem_diagnostics["journal_recovery_skipped_frames"] =
                     values->journal_recovery_skipped_frames;
                 filesystem_diagnostics["journal_recovery_quarantined_bytes"] =
@@ -1448,15 +1355,11 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     }
     diagnostics["convergence"] = std::move(convergence_diagnostics);
 
-    // What replica repair could not obtain. `unsourceable_objects` climbing
-    // across passes is the closest thing this node has to "there are extents
-    // nothing in the cluster can serve" -- after a node is removed, that is
-    // the question an operator actually has, and nothing answered it before
-    // 0.40.0. A single pass can also miss because a peer was busy or a budget
-    // ran out, so a small non-zero figure that stops growing is ordinary.
-    // `local_unreadable_objects` is the other half: objects this node's own
-    // store listed and then could not read back, which is what a failing disk
-    // looks like from up here.
+    // What replica repair could not obtain. `unsourceable_objects` climbing across
+    // passes means extents nothing in the cluster can serve; a small figure that
+    // stops growing is ordinary (a busy peer, an exhausted budget).
+    // `local_unreadable_objects` counts objects this store listed but could not
+    // read back: a failing disk.
     Json::Object repair_diagnostics;
     repair_diagnostics["available"] = false;
     if (repair_provider) {
@@ -1484,7 +1387,7 @@ HttpResponse ClusterStatusService::diagnostics_response() {
             gates["credit"] = values.gate_credit;
             repair_diagnostics["pass_gates"] = std::move(gates);
             repair_diagnostics["last_credit_bytes"] = values.last_credit_bytes;
-            // The quick second copy of each new object (0.64.1).
+            // The quick second copy of each new object.
             Json::Object prompt;
             prompt["queued"] = values.prompt_queued;
             prompt["copies"] = values.prompt_copies;
@@ -1498,12 +1401,9 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     }
     diagnostics["repair"] = std::move(repair_diagnostics);
 
-    // The HTTP server that is answering this very request. `reactor_stalls`
-    // is the runtime half of the rule that the reactor may not call anything
-    // that sleeps: a non-zero count means something did, and the longest
-    // pass says for how long. Idle keep-alive connections are counted so
-    // that "a client family holding connections" is visible rather than
-    // inferred, which is what the 10 s Status question of 2026-09-13 lacked.
+    // The HTTP server answering this request. `reactor_stalls` counts reactor
+    // passes that slept (the reactor must not), with the longest pass. Idle
+    // keep-alive connections are counted so connection-holding clients are visible.
     Json::Object http_diagnostics;
     http_diagnostics["available"] = false;
     if (http_provider) {
@@ -1543,23 +1443,17 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     }
     diagnostics["http"] = std::move(http_diagnostics);
 
-    // Auth state is local to each node and converges by gossip, so the only
-    // way to see whether it actually has converged is to compare these across
-    // nodes -- table_hash is stable for the same contents, the way
-    // metadata_generation is.
+    // Auth state is per node and converges by gossip; compare these across nodes
+    // to check convergence (table_hash is stable for equal contents).
     Json::Object auth_diagnostics;
-    // An empty table is the upgrade lockout described in NodeRuntime::start.
-    // Surfaced here as well as in the log, because by the time anyone looks
-    // the log line has usually scrolled and Status is what they reach for.
+    // An empty user table means nobody can sign in; surfaced here so it is seen.
     const auto user_count = node_.users().size();
     auth_diagnostics["users"] = static_cast<uint64_t>(user_count);
     auth_diagnostics["accounts_initialised"] = user_count > 0;
     auth_diagnostics["user_tombstones"] = static_cast<uint64_t>(node_.users().tombstones());
     auth_diagnostics["user_table_hash"] = to_string(node_.users().table_hash());
     auth_diagnostics["allow_anonymous"] = node_.config().session.allow_anonymous;
-    // What an unauthenticated visitor may do lives in the anonymous account,
-    // not in config, so report the account's current roles rather than a
-    // setting that no longer decides anything.
+    // What an anonymous visitor may do is the anonymous account's roles.
     Json::Array anonymous_roles;
     if (auto anonymous = node_.users().find_by_username(anonymous_username))
         for (const auto& role : anonymous->roles)
@@ -1574,9 +1468,9 @@ HttpResponse ClusterStatusService::diagnostics_response() {
 }
 
 HttpResponse ClusterStatusService::connectivity_check(const std::optional<NodeId>& only) {
-    // The cluster-wide diagnostic action also refreshes this node's public
-    // endpoint discovery and explicitly runs the self/NAT-loopback probe. The
-    // node-specific action remains the existing peer RPC reachability check.
+    // The cluster-wide action also refreshes this node's public endpoint discovery
+    // and runs the self/NAT-loopback probe; the node-specific action is the peer
+    // RPC reachability check.
     std::optional<PublicConnectivityStatus> public_status;
     if (!only)
         public_status = node_.refresh_public_connectivity(true, true);

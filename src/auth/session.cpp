@@ -19,9 +19,8 @@ constexpr size_t max_user_id_length = 128;
 constexpr size_t token_bytes = 32;
 constexpr size_t id_bytes = 16;
 
-// An anonymous record is identical in both versions; v2 only appends the two
-// user-identity fields, so carries_identity() decides which magic a whole
-// payload needs.
+// v2 only appends the two user-identity fields; an anonymous record is the
+// same in both.
 bool carries_identity(const AuthSession& value) {
     return !value.user_id.empty() || value.credential_generation != 0;
 }
@@ -133,9 +132,8 @@ SessionManager::SessionManager(std::chrono::milliseconds anonymous_ttl, size_t m
             by_token_hash_[key] = Record{std::move(session), Clock::now()};
         }
     } catch (const std::exception& error) {
-        // A session cache is a durability convenience, not authoritative
-        // state -- the cluster is the source of truth. Corruption or an
-        // incompatible file must never prevent the node from starting.
+        // The cluster is authoritative: a corrupt or incompatible cache must
+        // never stop the node starting.
         Log::warn("persisted sessions ignored: " + std::string(error.what()));
     }
 }
@@ -159,9 +157,7 @@ std::optional<AuthSession> SessionManager::find(const Hash256& token_hash) const
 std::optional<MintedSession> SessionManager::create(std::vector<std::string> roles,
                                                     std::string user_id,
                                                     uint64_t credential_generation) {
-    // Hash the token in the exact form it will be presented back (the hex
-    // string), not the pre-hex random bytes -- validate() only ever sees the
-    // former, since that's what actually crosses the wire as the bearer token.
+    // Hash the hex string, the form presented back as the bearer token.
     const auto bearer_token = hex(random_bytes(token_bytes));
     const auto id = hex(random_bytes(id_bytes));
     const auto now = unix_ms();

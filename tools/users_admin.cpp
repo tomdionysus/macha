@@ -9,18 +9,13 @@
 //   macha-users <state_path> <cluster.key> passwd <username>
 //   macha-users <state_path> <cluster.key> delete <username>
 //
-// The password is read from the terminal with echo off, never from argv --
-// argv is visible to every process on the box and lands in shell history.
+// The password is read from the terminal with echo off, never from argv,
+// which every process can see and shell history keeps.
 //
-// The node must be stopped. A running daemon holds the whole table in memory
-// and rewrites this file on its next mutation, so an edit made underneath it
-// would be silently discarded; worse, it would then be replicated away by the
-// daemon's own copy. Create the first admin during a restart window, on one
-// node: it replicates to the others when the node starts.
-//
-// Rejected alternative: letting the first POST /api/v1/users through
-// unauthenticated while the table is empty. Convenient, and a race with anyone
-// who can reach the port in the minutes after an upgrade.
+// The node must be stopped: a running daemon holds the table in memory and
+// would overwrite, then replicate away, an edit made underneath it. A first
+// admin created on one node replicates when that node starts. The API never
+// accepts an unauthenticated first create: that would race anyone reaching the port.
 #include "codec.hpp"
 #include "crypto.hpp"
 #include "durable_file.hpp"
@@ -144,10 +139,8 @@ int main(int argc, char** argv) {
         };
 
         if (command == "init") {
-            // The same call a node founding a new cluster makes, so an
-            // upgraded cluster ends up with exactly the accounts a fresh one
-            // would have rather than an approximation assembled by hand.
-            // Refuses if the table holds anything at all, tombstones included.
+            // The same call that founds a new cluster, so the accounts match a fresh
+            // one. Refuses if the table holds anything, tombstones included.
             UserStore store_view(4096, path, key);
             auto created = create_initial_accounts(store_view, keys, state_path, NodeId{});
             if (!created)
@@ -188,9 +181,8 @@ int main(int argc, char** argv) {
             if (live(username))
                 throw std::runtime_error("user already exists");
 
-            // Built through UserStore so the record is produced by exactly the
-            // code the daemon uses -- KDF parameters, role expansion and the
-            // sealed file layout cannot drift between the two.
+            // Built through UserStore so KDF parameters, role expansion and the sealed
+            // file layout match the daemon's.
             UserStore store_view(4096, path, key);
             auto created = store_view.create(username, prompt_new_password(), roles, NodeId{});
             if (!created)
@@ -203,9 +195,7 @@ int main(int argc, char** argv) {
             auto* user = live(username);
             if (!user)
                 throw std::runtime_error("no such user");
-            // Same rule as the API and the store: anonymous has no password.
-            // Said here too so the operator gets the reason rather than a bare
-            // refusal from two layers down.
+            // Anonymous has no password; checked here so the operator sees why.
             if (user->username == anonymous_username)
                 throw std::runtime_error(
                     "the 'anonymous' account has no password and cannot be given one; "

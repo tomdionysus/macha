@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// In-suite microbenchmarks: the object ledger experiment's T0 baselines for
-// the costs later steps must not raise (the claim walk's per-object cost,
-// has() on the DATA store) and for the cost of T0's own probes. Each prints
-// one line, "BENCH name=<name> ns_per_op=<n> ops=<n>"; run them with
-// `--filter baseline --verbose` to read the figures. They assert only that
-// the operation did what it was timed doing.
+// In-suite microbenchmarks for the claim walk's per-object cost, has() on the
+// DATA store, and the probes' own cost. Each prints one line,
+// "BENCH name=<name> ns_per_op=<n> ops=<n>"; run with
+// `--filter baseline --verbose`. They assert only that the timed operation
+// did its work.
 #include "observation.hpp"
 #include "service/claim_walk.hpp"
 #include "storage/retention.hpp"

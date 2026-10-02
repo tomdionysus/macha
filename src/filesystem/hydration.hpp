@@ -49,8 +49,7 @@ class PlaybackTracker {
 };
 
 struct HydrationHint {
-    // Objects in one run are ordered. The hydrator will never jump over an
-    // unavailable earlier object in order to fetch a later object from that run.
+    // Ordered: the hydrator never skips an unavailable object to fetch a later one.
     std::string run_id;
     std::vector<ObjectId> objects;
     uint32_t priority{};
@@ -72,16 +71,14 @@ class HydrationHintProvider {
     virtual ~HydrationHintProvider() = default;
     virtual std::string_view name() const = 0;
     virtual std::vector<HydrationHint> hints() = 0;
-    // Optional scheduling notification. Hints remain authoritative; this callback
-    // merely wakes an otherwise blocked hydrator when a producer already knows
-    // its hint set changed.
+    // Optional: wakes a blocked hydrator when the hint set changes. Hints stay
+    // authoritative.
     virtual void set_wake_callback(std::function<void()> callback) { (void)callback; }
 };
 
-// Weighted fair scheduler for ordered runs. Overlapping hints for the same run
-// are merged and their priorities reinforce each other. Fair virtual time means
-// a high-priority current file advances faster without starving a lower-priority
-// next-episode/next-film run.
+// Weighted fair scheduler for ordered runs. Hints for the same run merge and
+// their priorities add; virtual time lets a high-priority run advance faster
+// without starving lower-priority ones.
 class HydrationScheduler {
     std::map<std::string, double> virtual_finish_;
 

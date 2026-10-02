@@ -20,10 +20,9 @@ Json parse_body(const HttpRequest& request) {
     return root;
 }
 
-// A password hash, its salt and its KDF parameters never leave the node: the
-// API can create and replace a credential but has no route that reads one
-// back, so a compromised admin token cannot exfiltrate the table for offline
-// cracking.
+// Password hashes, salts and KDF parameters never leave the node: no route
+// reads a credential back, so a compromised admin token cannot exfiltrate the
+// table for offline cracking.
 Json user_json(const UserRecord& user, const UserMutability& mutability) {
     Json::Array roles;
     for (const auto& role : user.roles)
@@ -38,8 +37,7 @@ Json user_json(const UserRecord& user, const UserMutability& mutability) {
     // The record's LWW counter, for If-Match style optimistic concurrency.
     out["version"] = static_cast<uint64_t>(user.version);
 
-    // Stated per field, so a client renders exactly what it is told rather than
-    // reimplementing the rules and drifting from them.
+    // Stated per field so clients render what they are told, not a copy of the rules.
     Json::Object may;
     may["rename"] = mutability.rename;
     may["delete"] = mutability.remove;
@@ -85,26 +83,19 @@ std::string read_password(const Json& body) {
 UserMutability UsersApi::mutability(const UserRecord& user) const {
     UserMutability out;
     const bool reserved = reserved_username(user.username);
-    // root and anonymous are permanent fixtures: root is the way back in when
-    // every other account is locked out, and anonymous is what an
-    // unauthenticated visitor is.
+    // root and anonymous are permanent: root is the way back in when every other
+    // account is locked out; anonymous is the unauthenticated visitor.
     out.rename = !reserved;
     out.remove = !reserved;
     // Roles stay editable on both: anonymous's roles are the only control over
-    // what an unauthenticated television can reach. Passwords are ordinary on
-    // root and refused on anonymous, which has none by construction -- being
-    // able to log in as it would be a way past `allow_anonymous: false`, and
-    // before 0.38.4 any visitor holding an anonymous session could set that
-    // password through /api/v1/users/me and make one.
+    // what an unauthenticated visitor can reach. Passwords are refused on
+    // anonymous: logging in as it would bypass `allow_anonymous: false`.
     out.set_password = user.username != anonymous_username;
     out.set_roles = true;
 
     if (user_has_role(user, role_manage_users) && node_.users().sole_user_manager(user.id)) {
-        // Not "these roles are frozen": this account's roles stay editable, and
-        // only manage_users is pinned to it. Dropping it here would leave a
-        // cluster nobody can administer, and that edit would replicate
-        // perfectly -- there is no undo, because undoing it is the thing that
-        // just became impossible.
+        // Only manage_users is pinned to this account; its other roles stay editable.
+        // Dropping it would replicate a cluster nobody can administer, with no undo.
         out.required_roles.emplace_back(role_manage_users);
         out.remove = false;
         out.last_user_manager = true;
@@ -163,8 +154,7 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
     }
     auto roles = read_roles(body);
     if (self && roles)
-        // Otherwise changing your own password would be a privilege-escalation
-        // route for anyone who can reach /me -- which is everyone.
+        // Otherwise /me, reachable by everyone, would be a privilege-escalation route.
         return http_error(403, "forbidden",
                           "roles can only be changed by an account with manage_users");
     if (password.empty() && !roles)
@@ -191,9 +181,8 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
     node_.propagate_users();
 
     auto payload = user_json(*updated, mutability(*updated));
-    // Changing a password bumps credential_generation, which invalidates every
-    // session minted against the old one -- including the caller's own. Hand
-    // back a fresh session so a person is not logged out by their own change.
+    // A password change bumps credential_generation, invalidating every session
+    // minted against the old one, the caller's included; return a fresh session.
     if (!password.empty() && self) {
         if (auto minted = node_.sessions().create(updated->roles, updated->id,
                                                   updated->credential_generation)) {
@@ -210,15 +199,13 @@ HttpResponse UsersApi::remove(const HttpRequest& request, const std::string& use
     if (request.session && request.session->user_id == user_id)
         return http_error(409, "cannot_delete_self", "you cannot delete your own account");
     auto target = node_.users().find(user_id);
-    // root is the account that can always administer this cluster; it is the
-    // one way back in when every other account has been locked out, misroled
-    // or forgotten. Change its password, do not remove it.
+    // root is the one way back in when every other account is locked out,
+    // misroled or forgotten: change its password, never remove it.
     if (target && reserved_username(target->username))
         return http_error(409, "reserved_user",
                           "the '" + target->username +
                               "' account cannot be removed; change its password instead");
-    // Removing the last account that can manage accounts would replicate
-    // perfectly and leave nobody able to undo it.
+    // Removing the last account manager would replicate, with nobody able to undo it.
     if (target && user_has_role(*target, role_manage_users)) {
         size_t remaining = 0;
         for (const auto& user : node_.users().list())
@@ -247,9 +234,7 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
                 for (const auto& user : node_.users().list())
                     out.push_back(user_json(user, mutability(user)));
                 Json::Object body;
-                // "items" is the envelope every other collection in this API uses;
-                // the earlier "users" key was inherited from the manage endpoints
-                // rather than chosen, and four clients had to work around it.
+                // "items" is the envelope every collection in this API uses.
                 body["items"] = std::move(out);
                 return http_json(200, Json(std::move(body)).dump());
             }
@@ -262,8 +247,7 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
         if (tail.empty() || tail.find('/') != std::string::npos)
             return http_error(404, "not_found", "user route not found");
 
-        // "me" is the caller's own account, and is the only user route a
-        // non-admin can reach (the role gate lets viewers through to it).
+        // The caller's own account: the only user route a non-admin reaches.
         const bool self = tail == "me";
         if (self && request.session->user_id.empty())
             return http_error(404, "no_account",

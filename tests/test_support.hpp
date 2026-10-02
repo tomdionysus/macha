@@ -35,8 +35,8 @@
 
 namespace macha::test_support {
 
-// The catalogue's half of a maintenance inventory, as the pass takes it:
-// the head, the repair, then the read (spec A4).
+// The catalogue's half of a maintenance inventory, taken as the pass takes it:
+// head, repair, then read.
 inline CatalogueMaintenance maintenance_inventory(CatalogueManager& catalogue) {
     const auto head = catalogue.maintenance_head();
     const bool repaired = catalogue.maintenance_repair();
@@ -59,14 +59,8 @@ class TempDir {
         const auto base = std::filesystem::temp_directory_path();
         path_ = base / ("macha-test-" + std::to_string(getpid()) + "-" +
                         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)));
-        // The name is pid-based and a case the runner kills on timeout never
-        // reaches the destructor below, so its directory outlives it; when
-        // the pid is reused, the next case with that pid inherited a state
-        // directory full of some other test's node. That node then
-        // "recovered" foreign state and failed with `local state recovery
-        // failed: trailing input` in a fresh single-node test
-        // (media_playback, 1 in 3,528 case-runs, 2026-09-15; 99 such
-        // leftovers in TMPDIR at the time). A fresh fixture starts empty.
+        // The name is pid-based and a case killed on timeout leaves its
+        // directory behind, so clear any leftover: a fresh fixture starts empty.
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
         std::filesystem::create_directories(path_);
@@ -84,18 +78,15 @@ class TempDir {
 };
 
 inline uint16_t free_port() {
-    // Parallel test cases run in separate processes. Give each case its own
-    // non-overlapping 64-port namespace so closing the probe socket cannot let
-    // another Macha test race in and claim the same port before the server binds.
-    // We still bind-probe every candidate because unrelated host processes may
-    // legitimately occupy a port in the range.
+    // Each case gets its own 64-port block, so no other test can claim a probed
+    // port before the server binds it. Candidates are still bind-probed because
+    // unrelated host processes may hold ports in the range.
     static uint16_t within_case{};
     constexpr uint16_t first = 20000;
     constexpr uint16_t block = 64;
     constexpr uint16_t blocks = 600; // 20000..58399
-    // The runner's per-run salt (test_framework.cpp) keeps two runners on
-    // one machine out of each other's blocks; without it they would share
-    // ports AND the deterministic cluster key, and merge clusters.
+    // The runner's per-run salt keeps two runners on one machine out of each
+    // other's blocks; otherwise they would share ports and cluster key, and merge.
     static const uint64_t runner_salt = [] {
         const char* value = std::getenv("MACHA_TEST_PORT_SALT");
         return value ? std::strtoull(value, nullptr, 10) : 0ULL;
@@ -139,9 +130,8 @@ inline void write_key(const std::filesystem::path& path) {
 inline Config config_for(const std::filesystem::path& path, const std::filesystem::path& key,
                          uint16_t port, std::vector<Endpoint> bootstrap = {},
                          ConfigProfile profile = ConfigProfile::functional) {
-    // Storage backends represent mounted media. Production deliberately does
-    // not create a missing backend path because that could write onto the root
-    // filesystem when a disk failed to mount; tests therefore create it explicitly.
+    // Production never creates a missing backend path (it could be an unmounted
+    // disk), so tests create it.
     std::filesystem::create_directories(path);
 
     Config c;
@@ -152,14 +142,10 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     c.advertise_host = "127.0.0.1";
     c.port = port;
     c.extent_size = 1024 * 1024;
-    // Test state lives under the platform temporary directory. Linux commonly
-    // mounts /tmp as a 2 GiB tmpfs, equal to or slightly smaller than the
-    // production 2 GiB physical reserve after filesystem overhead. Capacity
-    // policy is tested with explicit limits; ordinary functional tests must not
-    // depend on the host's /tmp mount size.
+    // Test state lives in the temporary directory, often a tmpfs no larger than
+    // the production reserve; capacity tests set explicit limits instead.
     c.fuse.spool_reserve_free = 0;
-    // Production retry discipline backs off to 30 s; a test that provokes a
-    // transient failure must not wait that out. Same budget shape, fast.
+    // The production retry policy's shape with short delays.
     c.fuse.publication_retry = RetryPolicy{100, std::chrono::minutes(30),
                                            std::chrono::milliseconds(20),
                                            std::chrono::milliseconds(200)};
@@ -170,23 +156,10 @@ inline Config config_for(const std::filesystem::path& path, const std::filesyste
     c.dead_after = 500ms;
     c.connect_timeout = 500ms;
     c.bootstrap = std::move(bootstrap);
-    // An ordinary test wants no subsystem plugins at all: loading them costs a
-    // dlopen of libtorrent and its dependencies in every one of the several
-    // hundred isolated test processes, and it would test whatever happens to be
-    // installed on the build machine rather than the build under test. A test
-    // that needs the real plugin points plugin_path at this build's
-    // MACHA_TEST_PLUGIN_DIR itself.
-    //
-    // This must be set to an *engaged but empty* path, not left unset. Leaving
-    // it unset does not mean "no plugins": NodeRuntime runs every Config through
-    // normalize_config(), which fills an absent plugin_path with the installed
-    // directory (`src/config_base.cpp:553-554`), so an unset field resolves to
-    // /usr/lib/macha/plugins. That went unnoticed for as long as the installed
-    // build matched the build under test; bumping the version to 0.43.1 on es-1
-    // (2026-09-17) made the suite log `plugin=0.43.0 core=0.43.1 ... refusing to
-    // load (partial deploy?)` and exposed it. An engaged empty path is the only
-    // way to say "builtin subsystems only" -- see Service's
-    // `plugin_path.value_or({})` at `src/service/service.cpp:99`.
+    // No plugins: loading them is costly in every test process and would test
+    // whatever is installed rather than this build. Tests that need one point
+    // plugin_path at MACHA_TEST_PLUGIN_DIR. The path must be engaged but empty:
+    // normalize_config() fills an unset plugin_path with the installed directory.
     c.plugin_path = std::filesystem::path{};
 
     if (profile == ConfigProfile::functional) {
@@ -255,8 +228,8 @@ class TestService {
         try {
             service_->stop();
         } catch (...) {
-            // Destructors must not mask the test result. Explicit stop paths can
-            // still be used by a test which needs to assert shutdown behaviour.
+            // Destructors must not mask the test result; tests that assert
+            // shutdown behaviour call stop() themselves.
         }
     }
 
@@ -273,9 +246,8 @@ class TestService {
         REQUIRE(!service_);
         service_ = std::make_unique<Service>(config_, keys_);
         service_->start();
-        // Ordinary service fixtures preserve the historical fully-ready contract.
-        // Lifecycle tests instantiate Service directly so they can intentionally
-        // observe the early status/control-plane phases.
+        // Return a fully ready service; lifecycle tests that observe the early
+        // phases construct Service directly.
         (void)service_->filesystem();
         return *service_;
     }
@@ -333,9 +305,8 @@ class TestNode {
         return *node_;
     }
 
-    // A guard run before each of this node's metadata commits is
-    // published, as Service's claims barrier is; set by a test that needs to
-    // hold a publication. Not synchronised: set it while no commit runs.
+    // Runs before each of this node's metadata commits is published, as
+    // Service's claims barrier does. Not synchronised: set it while no commit runs.
     void set_publication_guard(std::function<void(const MetadataPublicationContext&)> guard) {
         publication_guard_ = std::move(guard);
     }
@@ -410,17 +381,9 @@ bool wait_until(Fn&& fn, std::chrono::milliseconds timeout = 5s,
     return fn();
 }
 
-// Membership convergence is NOT write readiness, and a test that treats it as
-// such is asserting something the node never promised. A node can see every
-// peer and still be forming its metadata replica set -- the bootstrap
-// checkpoint survey has to finish -- or be sitting read-only behind a
-// write-floor policy mismatch. Either way a mutation is refused, correctly and
-// with a named reason ("metadata replica set forming: waiting for bootstrap
-// checkpoint survey", "metadata commit durability floor unavailable"), and the
-// test fails somewhere unrelated to what it was written to check.
-//
-// The floor itself is what to wait for, and the node already publishes it as
-// MetadataClusterStatus::write_available.
+// Membership convergence is not write readiness: a node that sees every peer
+// may still be forming its metadata replica set or lack its durability floor,
+// and refuse mutations. Wait for MetadataClusterStatus::write_available instead.
 inline bool wait_metadata_writable(Service& service, std::chrono::milliseconds timeout = 10s) {
     return wait_until([&] { return service.metadata_manager().cluster_status().write_available; },
                       timeout);

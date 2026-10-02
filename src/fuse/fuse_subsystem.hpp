@@ -20,8 +20,7 @@ class FuseFrontend;
 class HydrationManager;
 class SubsystemRegistry;
 
-// What a mount driver is given to work with. Every pointer is owned by the
-// FuseSubsystem and outlives the driver's run().
+// Every pointer is owned by the FuseSubsystem and outlives the driver's run().
 struct FuseMountContext {
     FuseFrontend* frontend{};
     FileSystem* filesystem{};
@@ -30,56 +29,41 @@ struct FuseMountContext {
 };
 
 struct FuseMountOutcome {
-    // True only when the mount ended because it was asked to. Anything else
-    // -- the kernel mount disappearing, the event loop returning an error --
-    // is a fault, and the supervisor rebuilds the subsystem.
+    // True only when the mount ended on request; anything else is a fault and
+    // the supervisor rebuilds the subsystem.
     bool clean{};
     std::string error;
 };
 
-// The kernel-facing half of the FUSE subsystem, behind an interface so the
-// rest of it can be exercised without a kernel mount. libfuse is the only
-// native crash surface here and the only part that cannot run in a test
-// process; separating it is also what lets the whole adapter move into
-// libmacha-fuse in Stage B without anything else moving with it. See
-// TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md.
+// The kernel-facing (libfuse) half of the FUSE subsystem, behind an interface
+// so the rest runs without a kernel mount, in tests or a separate library.
 class FuseMountDriver {
   public:
     virtual ~FuseMountDriver() = default;
 
-    // Establish the mount and serve it until `stop` is requested, the mount
-    // is lost, or request_exit() is called. Returns having unmounted.
-    // Throwing is equivalent to returning a non-clean outcome.
+    // Mounts and serves until `stop`, mount loss or request_exit(); returns
+    // unmounted. Throwing equals a non-clean outcome.
     virtual FuseMountOutcome run(const FuseMountContext&, std::stop_token) = 0;
 
-    // Make a run() in progress return. Safe from any thread, and safe to call
-    // when run() has already returned or never started.
+    // Makes a running run() return. Any thread; safe before or after run().
     virtual void request_exit() = 0;
 };
 
 using FuseMountDriverFactory = std::function<std::unique_ptr<FuseMountDriver>()>;
 
-// The libfuse driver registers itself here at static-initialisation time,
-// the same runtime-registration seam macha_core already uses for the FFmpeg
-// media engine. macha_core must not link libfuse: in Stage A the adapter is
-// compiled into the `macha` executable, in Stage B it is inside
-// libmacha-fuse, and in a test process there is no adapter at all. Nothing
-// registered means this build cannot mount, which is a capability that is
-// absent rather than a fault.
+// The libfuse driver registers itself here at static initialisation, so
+// macha_core never links libfuse. Nothing registered means this build cannot
+// mount: an absent capability, not a fault.
 void set_fuse_mount_driver_factory(FuseMountDriverFactory);
 const FuseMountDriverFactory& fuse_mount_driver_factory();
 
-// One supervised FUSE mount: owns the FuseFrontend (whose construction
-// replays the durable journal -- the operation that crash-looped corvus-es-1
-// 49 times before any of this existed) and the mount thread, publishes the
-// frontend for core to find, and reports a lost mount as a subsystem fault
-// instead of taking the process down.
+// One supervised FUSE mount: owns the FuseFrontend (whose construction replays
+// the durable journal) and the mount thread, publishes the frontend, and
+// reports a lost mount as a subsystem fault rather than ending the process.
 class FuseSubsystem final : public Subsystem {
   public:
-    // Throws if the frontend cannot be constructed -- journal replay, spool
-    // access, or the initial namespace never arriving. The supervisor treats
-    // that as an ordinary construction fault: backoff, retry, and eventually
-    // `disabled`, while the rest of the node keeps serving.
+    // Throws if the frontend cannot be built (journal replay, spool access, no
+    // initial namespace): a construction fault the supervisor retries.
     FuseSubsystem(const SubsystemContext&, std::unique_ptr<FuseMountDriver>);
     ~FuseSubsystem() override;
 
@@ -88,8 +72,7 @@ class FuseSubsystem final : public Subsystem {
     void stop() override;
     void attach_fault_sink(FaultSink) override;
 
-    // The frontend this subsystem owns. For tests; core reaches the live one
-    // through SubsystemRegistry::fuse().
+    // For tests; core uses SubsystemRegistry::fuse().
     const std::shared_ptr<FuseFrontend>& frontend() const noexcept { return frontend_; }
 
   private:
@@ -111,9 +94,8 @@ class FuseSubsystem final : public Subsystem {
     std::jthread mount_;
 };
 
-// Subsystem factory for FUSE, with the same contract as a plugin's entry
-// point: no instance means this node is not configured to mount (or this
-// build has no adapter), and throwing means the attempt failed.
+// Plugin entry-point contract: null means not configured to mount or no
+// adapter in this build; throwing means the attempt failed.
 std::unique_ptr<Subsystem> make_fuse_subsystem(const SubsystemContext&);
 
 } // namespace macha

@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The libtorrent-backed download engine, built only into the libmacha-torrent
-// plugin. This file only exists at all in a build where libtorrent was found,
-// so it has no "not built" branches: an installation without the plugin has no
-// torrent capability at runtime, which core reports as `unavailable` rather
-// than compiling in a stub. See
-// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md.
+// The libtorrent download engine, built only into the libmacha-torrent plugin.
 #include "torrent/torrent_manager.hpp"
 
 #include "crypto.hpp"
@@ -52,17 +47,14 @@ bool safe_tracker_url(std::string_view value) {
     return value.starts_with("http://") || value.starts_with("https://") || value.starts_with("udp://");
 }
 
-// An add of a torrent some job already holds. Thrown and caught inside this
-// file only: add() callers see it as a Placement or an RPC reply carrying the
-// code and the holder's id.
+// An add of a torrent some job already holds. Never leaves this file: callers
+// see a Placement or RPC reply with the code and the holder's id.
 struct TorrentAlreadyAdded : std::runtime_error {
     std::string job_id;
     explicit TorrentAlreadyAdded(std::string holder)
         : std::runtime_error("job " + holder + " already holds this torrent"), job_id(std::move(holder)) {}
 };
 
-// Until 0.58.2 a job's info_hash was declared, serialised and persisted, and
-// never set, so every job reported null.
 std::string info_hash_hex(const lt::info_hash_t& hashes) { return torrent_info_hash_hex(hashes); }
 
 std::string sanitize_text(std::string value, size_t limit = 1024) {
@@ -73,14 +65,12 @@ std::string sanitize_text(std::string value, size_t limit = 1024) {
 
 namespace lt = libtorrent;
 
-// Which alert categories the session subscribes to for a given
-// torrent.log_level. error/status/port_mapping/dht are always on: the drain
-// loop reads listen, bootstrap and port-mapping outcomes from them, and a
-// session that reported nothing sat dead for hours once. ALL adds the
-// categories libtorrent itself calls logs, which are opt-in for a reason.
+// The session's alert categories for torrent.log_level. error, status,
+// port_mapping and dht are always on: the drain reads listen, bootstrap and
+// port-mapping outcomes from them. ALL adds libtorrent's log categories.
 lt::alert_category_t alert_mask_for(LogLevel level) {
-    // piece_progress carries piece_finished_alert, which is how the disk
-    // backend learns an extent's pieces have verified and it can publish it.
+    // piece_progress carries piece_finished_alert, which tells the disk
+    // backend an extent's pieces verified.
     auto mask = lt::alert_category::error | lt::alert_category::status |
                 lt::alert_category::port_mapping | lt::alert_category::dht |
                 lt::alert_category::piece_progress;
@@ -98,18 +88,13 @@ lt::session_params make_session_params(const TorrentConfig& config, std::string_
     auto& settings = params.settings;
     settings.set_str(lt::settings_pack::listen_interfaces,
                      torrent_listen_interfaces(config, advertise));
-    // Nothing consumed alerts at all before this, so a session that bound
-    // nothing usable, failed to bootstrap DHT or was refused by every tracker
-    // reported exactly nothing: two torrents sat dead for hours with an empty
-    // error field and one "plugin loaded" line in the journal.
     settings.set_int(lt::settings_pack::alert_mask, alert_mask_for(config.log_level));
     settings.set_int(lt::settings_pack::active_downloads, static_cast<int>(config.max_active));
     settings.set_int(lt::settings_pack::active_limit, static_cast<int>(config.max_active + 4));
     settings.set_int(lt::settings_pack::active_seeds, 0);
     settings.set_bool(lt::settings_pack::enable_dht, config.dht);
     settings.set_bool(lt::settings_pack::enable_lsd, config.lsd);
-    // Stated rather than inherited from libtorrent's defaults. See
-    // TorrentConfig::upnp for why these are separate from network.upnp.
+    // Explicit, not libtorrent's defaults; see TorrentConfig::upnp.
     settings.set_bool(lt::settings_pack::enable_upnp, config.upnp);
     settings.set_bool(lt::settings_pack::enable_natpmp, config.natpmp);
     if (config.max_download_rate)
@@ -124,9 +109,8 @@ lt::session_params make_session_params(const TorrentConfig& config, std::string_
 }
 
 void harden_add_params(lt::add_torrent_params& atp, const TorrentConfig& config) {
-    // A torrent may contain arbitrary HTTP web seeds and DHT bootstrap nodes.
-    // Macha acquisition deliberately accepts peers/trackers only; never turn a
-    // torrent metainfo file into a general-purpose server-side HTTP fetcher.
+    // Peers and trackers only: a torrent's web seeds and DHT nodes would make
+    // its metainfo a server-side HTTP fetcher.
     atp.url_seeds.clear();
     atp.dht_nodes.clear();
     std::erase_if(atp.trackers, [](const std::string& tracker) { return !safe_tracker_url(tracker); });
@@ -134,8 +118,8 @@ void harden_add_params(lt::add_torrent_params& atp, const TorrentConfig& config)
     if (!config.dht) atp.flags |= lt::torrent_flags::disable_dht;
     if (!config.lsd) atp.flags |= lt::torrent_flags::disable_lsd;
     if (!config.pex) atp.flags |= lt::torrent_flags::disable_pex;
-    // In order, so extents complete in order and are published while their
-    // bytes are still in page cache, and so a file is watchable soonest.
+    // Sequential, so extents publish while still in page cache and a file is
+    // watchable soonest.
     atp.flags |= lt::torrent_flags::sequential_download;
 }
 
@@ -159,14 +143,12 @@ TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, Torrent
         [this](std::span<const uint8_t> payload) { return handle_jobs_query(payload); },
         [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
     if (!config_.enabled) return;
-    // The only event that says a failed job's ingest is running again: a
-    // settled manager is otherwise asleep until an API call on a torrent.
+    // The only signal that a failed job's ingest runs again; a settled manager
+    // otherwise sleeps.
     ingest_.set_resume_listener([this](std::string_view) { cv_.notify_all(); });
     std::filesystem::create_directories(state_file_.parent_path());
     impl_ = std::make_unique<Impl>(config_, node_.config().advertise_host, disk_hooks());
-    // Alerts arrive on libtorrent's own thread; this only wakes the worker,
-    // which does the draining. Without it a settled manager blocks on the
-    // condition and never reads the queue.
+    // Called on libtorrent's thread: only wakes the worker, which drains.
     impl_->session.set_alert_notify([this] {
         alerts_pending_.store(true, std::memory_order_release);
         cv_.notify_all();
@@ -175,11 +157,8 @@ TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, Torrent
 }
 
 TorrentManager::~TorrentManager() {
-    // The bridge holds lambdas bound to `this`. As a supervised subsystem
-    // this object is destroyed and reconstructed on fault, not just at
-    // process exit, so leaving them installed would dispatch a peer's survey
-    // into freed memory. Clear before stopping so no new call is admitted
-    // while the worker is winding down.
+    // The bridge's lambdas bind `this`, which is rebuilt on fault: clear them
+    // before stopping so no call reaches freed memory.
     node_.set_torrent_bridge({}, {});
     ingest_.set_resume_listener({});
     stop();
@@ -196,8 +175,7 @@ Bytes TorrentManager::handle_jobs_query(std::span<const uint8_t> request_payload
             if (const auto* id = request.find("job_id"); id && id->isString())
                 job_id = id->asString();
         } catch (const std::exception&) {
-            // Malformed survey request: answer as "list all" rather than fail
-            // the whole peer.
+            // A malformed request lists all rather than failing the peer.
         }
     }
     Json::Array out_jobs;
@@ -208,9 +186,7 @@ Bytes TorrentManager::handle_jobs_query(std::span<const uint8_t> request_payload
     }
     Json::Object out;
     out["jobs"] = std::move(out_jobs);
-    // What this node offers for new jobs (0.64.0): peers build their list of
-    // torrent-capable nodes, and the selector, from this rather than asking.
-    // An older peer ignores the field.
+    // What this node offers for new jobs; peers build their node list from it.
     const auto offered = offer();
     Json::Object node;
     node["accepting"] = offered.accepting;
@@ -235,8 +211,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
             action = act->asString();
     } catch (const std::exception&) {
     }
-    // A node without the plugin cannot parse a .torrent: it asks one that can
-    // for the canonical magnet and info hash (0.64.0).
+    // For a node without the plugin: a .torrent's canonical magnet and info hash.
     if (action == "resolve") {
         Json::Object out;
         try {
@@ -260,8 +235,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
         const auto text = Json(std::move(out)).dump();
         return Bytes(text.begin(), text.end());
     }
-    // A targeted add arrives as an action with no job id: the sender chose this
-    // node, so this is where the job is created.
+    // A targeted add is an action with no job id: the job is created here.
     if (action == "add") {
         std::string uri;
         bool search_result = false;
@@ -312,10 +286,7 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
     return Bytes(text.begin(), text.end());
 }
 
-// A search result's URI may be a provider's .torrent URL, which only
-// add_search_result will fetch. Until 0.58.2 every placement went through
-// add(), magnets only, so a search result backed by a .torrent URL could
-// never be started (409 placement_failed / add_failed).
+// A search result's URI may be a .torrent URL, which only add_search_result fetches.
 TorrentService::Placement TorrentManager::place(std::string_view magnet_or_uri, bool search_result) {
     Placement placement;
     placement.node_id = node_.node_id();
@@ -451,8 +422,7 @@ std::filesystem::path TorrentManager::resume_path(std::string_view id) const {
 
 void TorrentManager::request_resume_save(const lt::torrent_handle& handle) {
     if (!handle.is_valid()) return;
-    // The info dictionary is included so a torrent added by magnet restarts
-    // without fetching its metadata from peers again.
+    // With the info dictionary, so a magnet restarts without refetching metadata.
     handle.save_resume_data(lt::torrent_handle::only_if_modified | lt::torrent_handle::save_info_dict);
 }
 
@@ -484,14 +454,12 @@ void TorrentManager::save_all_resume_data() {
         std::lock_guard lock(mutex_);
         for (const auto& [_, handle] : impl_->handles) {
             if (!handle.is_valid()) continue;
-            // Unconditionally at stop: nothing may be lost to only_if_modified
-            // having answered earlier from a state since changed.
+            // Unconditional at stop, so no change is lost to only_if_modified.
             handle.save_resume_data(lt::torrent_handle::save_info_dict);
             ++outstanding;
         }
     }
-    // Bounded: a stop must not hang on libtorrent. What is not saved is
-    // re-checked at the next start, which is slow but correct.
+    // Bounded so stop never hangs; anything unsaved is re-checked at start.
     const auto deadline = Clock::now() + std::chrono::seconds(10);
     while (outstanding && Clock::now() < deadline) {
         impl_->session.wait_for_alert(std::chrono::milliseconds(200));
@@ -542,8 +510,7 @@ void TorrentManager::restore_jobs() {
             restore.push_back(job);
         }
     }
-    // Oldest first, so of two jobs recorded for one torrent before 0.63.0
-    // refused the second, the first keeps it.
+    // Oldest first: of two jobs recorded for one torrent, the first keeps it.
     std::stable_sort(restore.begin(), restore.end(), [](const TorrentJob& a, const TorrentJob& b) {
         return a.created_unix_ms < b.created_unix_ms;
     });
@@ -565,8 +532,7 @@ void TorrentManager::restore_jobs() {
             }
         }
         try {
-            // Resume data first: it names the pieces already verified, so the
-            // disk backend trusts them instead of re-hashing the payload.
+            // Resume data names the verified pieces, so nothing is re-hashed.
             std::optional<lt::add_torrent_params> resumed;
             if (!job.info_hash.empty()) resumed = load_torrent_resume(resume_path(job.id), job.info_hash);
             lt::add_torrent_params atp;
@@ -579,14 +545,10 @@ void TorrentManager::restore_jobs() {
             }
             atp.save_path = job.save_path.string();
             harden_add_params(atp, config_);
-            // Held from the moment it is added. Paused after add, an
-            // auto-managed torrent was started by libtorrent's queue anyway:
-            // re-checked, downloading and seeding while Macha said paused.
-            // Operator pauses only. A staging_full job is not held here: held,
-            // a magnet never fetches its metadata, its size stays 0, and the
-            // staging check that would release it never runs (Smallville,
-            // gbni-1, 2026-09-25, stuck after 0.61.0). Added normally, the
-            // check holds it again as soon as its size is known.
+            // Held from add for operator pauses: paused after add, libtorrent's
+            // queue would start an auto-managed torrent. Not staging_full jobs:
+            // held, a magnet never learns its size, so the staging check that
+            // would release it never runs; it re-holds once the size is known.
             set_hold_at_add(atp, job.state == TorrentJobState::paused);
             atp.flags |= lt::torrent_flags::duplicate_is_error;
             std::lock_guard lock(mutex_);
@@ -619,16 +581,13 @@ void TorrentManager::parse_add_uri(std::string uri, bool allow_fetch, ParsedAdd&
             throw std::runtime_error("torrent URL returned HTTP " + std::to_string(fetched.status));
         std::vector<char> buffer(fetched.body.begin(), fetched.body.end());
         try {
-            // Use the throwing overload shared by libtorrent 2.0 and 2.1.
-            // Some 2.1 distro builds no longer expose the deprecated
-            // error_code/limits overload used by older builds.
+            // The throwing overload: some 2.1 builds lack the error_code one.
             atp = lt::load_torrent_buffer(lt::span<char const>(buffer.data(), buffer.size()));
         } catch (const std::exception& e) {
             throw std::runtime_error("invalid .torrent file: " + std::string(e.what()));
         }
-        // Do not persist a potentially credential-bearing ephemeral download URL
-        // as the only restart source. Persist a canonical magnet constructed from
-        // the parsed metainfo instead.
+        // Persist a canonical magnet from the metainfo, never the download URL,
+        // which may carry credentials.
         parsed.source_uri = lt::make_magnet_uri(atp);
         if (auto sanitized = sanitize_magnet_uri(parsed.source_uri)) parsed.source_uri = *sanitized;
     } else {
@@ -675,15 +634,14 @@ std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool h
     job.save_path = ingest_.staging().path() / "torrents" / job.id;
     job.source_uri = std::move(parsed.source_uri);
     auto& atp = parsed.params;
-    // Held from the moment it is added when the request is paused: paused
-    // after add, an auto-managed torrent is started by libtorrent's queue.
+    // Held from add when paused: paused after add, libtorrent's queue would
+    // start an auto-managed torrent.
     set_hold_at_add(atp, held);
     atp.save_path = job.save_path.string();
     harden_add_params(atp, config_);
-    // Macha's own check below is the rule; this is its backstop. Without it
-    // libtorrent answers a second add of a torrent with the first one's
-    // handle, and a hash Macha failed to match (a v2-only magnet for a
-    // hybrid torrent) would become two jobs sharing one torrent again.
+    // Backstop to the check below: libtorrent would answer a second add with
+    // the first one's handle, so a hash Macha missed (a v2-only magnet for a
+    // hybrid torrent) would make two jobs share one torrent.
     atp.flags |= lt::torrent_flags::duplicate_is_error;
     const auto wanted = atp.ti ? atp.ti->info_hashes() : atp.info_hashes;
     const auto info_hash = info_hash_hex(wanted);
@@ -726,9 +684,8 @@ std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool h
     try {
         save_state_locked();
     } catch (...) {
-        // The API must not report a failed admission while libtorrent keeps
-        // unacknowledged work running. Roll the live handle and in-memory
-        // record back before propagating the persistence failure.
+        // A failed admission must leave nothing running: roll back the handle
+        // and record before propagating.
         retire_torrent_locked(job.id, true);
         jobs_.erase(job.id);
         std::error_code ec;
@@ -820,9 +777,8 @@ bool TorrentManager::retry(std::string_view id) {
     job.error_code.clear();
     job.updated_unix_ms = unix_ms();
     try {
-        // Persist the wrapper first. If the daemon exits before ingest.resume(),
-        // update_jobs() will observe the still-failed linked ingest after restart
-        // and converge this wrapper back to failed without touching the payload.
+        // Persisted first: a crash before ingest.resume() leaves update_jobs()
+        // to converge this job back to failed without touching the payload.
         save_state_locked();
     } catch (...) {
         job = previous;
@@ -880,9 +836,8 @@ bool TorrentManager::clear(std::string_view id) {
             it->second.state != TorrentJobState::failed)
             return false;
         terminal_job = it->second;
-        // A terminal job needs no torrent, and one that failed in libtorrent
-        // still has one. Until 0.63.0 clear left it in the session and in
-        // impl_->handles while deleting its payload underneath it.
+        // A job failed in libtorrent still has a torrent: retire it before the
+        // payload goes.
         retire_torrent_locked(terminal_job.id, false);
     }
 
@@ -1004,9 +959,8 @@ void TorrentManager::drain_alerts() {
             Log::info("torrent DHT bootstrapped");
             continue;
         }
-        // An alert can outlive its torrent: it may name one retired since it
-        // was queued. Only a handle still held by a job is acted on, and
-        // under the lock that keeps it held.
+        // An alert can outlive its torrent: act only on a handle a job still
+        // holds, under the lock that keeps it held.
         if (const auto* finished = lt::alert_cast<lt::piece_finished_alert>(alert)) {
             std::lock_guard lock(mutex_);
             if (const auto* job = job_of_locked(finished->handle))
@@ -1014,9 +968,8 @@ void TorrentManager::drain_alerts() {
                                                static_cast<int>(finished->piece_index));
             continue;
         }
-        // A check (a resume, or a recheck) reports no per-piece alerts, and
-        // piece alerts can be dropped (below), so at these two points every
-        // piece the torrent holds is reported from its own bitfield.
+        // A check reports no piece alerts and piece alerts can drop, so here
+        // every held piece is reported from the bitfield.
         const lt::torrent_handle* settled = nullptr;
         if (const auto* checked = lt::alert_cast<lt::torrent_checked_alert>(alert))
             settled = &checked->handle;
@@ -1041,29 +994,19 @@ void TorrentManager::drain_alerts() {
             continue;
         }
         if (const auto* unsaved = lt::alert_cast<lt::save_resume_data_failed_alert>(alert)) {
-            // only_if_modified answers "not modified" this way; that is not a
-            // failure worth more than debug.
+            // only_if_modified's "not modified" arrives this way: debug only.
             Log::debug("torrent resume data not saved: " + unsaved->message());
             continue;
         }
-        // libtorrent's alert queue is bounded and drops on overflow. On
-        // 2026-09-24 Trainspotting's publication stopped at 162 of 436
-        // extents with the publisher idle and nothing logged; a lost
-        // piece_finished_alert is the likely cause, and until this line a
-        // drop was invisible below debug.
+        // The alert queue is bounded and drops on overflow; say so.
         if (const auto* dropped = lt::alert_cast<lt::alerts_dropped_alert>(alert)) {
             Log::warn("torrent alert queue overflowed: " + std::to_string(dropped->dropped_alerts.count()) +
                       " alert types lost; verified pieces are also taken from each torrent's own "
                       "bitfield, so extent publication does not depend on them");
             continue;
         }
-        // Having no inbound port is an operational fact, not churn: the node
-        // can still reach peers it dials, but nothing can dial it, so peer
-        // counts stay low and it can never seed. At debug that is invisible in
-        // normal running -- gbni-1 ran for hours with "no router found" and
-        // nothing above debug said so. Once per session, like the bind
-        // warnings above, so a router that simply has no UPnP does not become
-        // a recurring complaint.
+        // No inbound port means no peer can dial in and the node never seeds:
+        // said once per session above debug.
         if (const auto* mapped = lt::alert_cast<lt::portmap_alert>(alert)) {
             if (!logged_portmap_) {
                 logged_portmap_ = true;
@@ -1083,20 +1026,14 @@ void TorrentManager::drain_alerts() {
             }
             continue;
         }
-        // Everything else is libtorrent's own chatter -- tracker churn, DHT
-        // traffic, peer errors -- and goes through torrent.log_level, not the
-        // process level: like the ffmpeg bridge it applies its own threshold
-        // and then emits past the process filter, so a node can run at INFO
-        // and still turn this on, and a node at DEBUG no longer has its
-        // journal eaten by it (gbni-1, 2026-09-23: 99,088 of 99,187 lines).
+        // libtorrent's chatter obeys torrent.log_level, not the process level,
+        // and then emits past the process filter, like the ffmpeg bridge.
         if (alert_log_level_.load(std::memory_order_relaxed) <= LogLevel::debug)
             Log::emit(LogLevel::debug,
                       std::string("torrent alert ") + alert->what() + ": " + alert->message());
     }
 
-    // A session holding only loopback sockets can reach no peer at all. That
-    // is a configuration fault, not a transient, so say it once and plainly
-    // rather than leaving every magnet stuck in `metadata` with no error.
+    // Only loopback sockets reach no peer: a configuration fault, said once.
     if (!warned_loopback_only_ && !routable_listen_endpoints_ && !alerts.empty()) {
         bool any_listen = std::any_of(alerts.begin(), alerts.end(), [](const lt::alert* a) {
             return lt::alert_cast<lt::listen_succeeded_alert>(a) ||
@@ -1154,8 +1091,7 @@ void TorrentManager::refresh_publication_locked(const std::string& id, TorrentJo
 }
 
 bool TorrentManager::publication_settled_locked(const std::string& id, const TorrentJob& job) {
-    // Nothing when the backend is not publishing or does not hold the torrent:
-    // then there is nothing to wait for.
+    // Settled when the backend is not publishing or does not hold the torrent.
     const auto progress = verifications_->publication(job.save_path.string());
     if (!progress || progress->complete()) {
         if (publication_waits_.erase(id) && progress)
@@ -1189,9 +1125,8 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
     hooks.threads = config_.disk_threads;
     NodeRuntime* node = &node_;
     hooks.admit = loader_admission(node_.data_resources());
-    // Stage 2: every verified extent is published into the store the ingest
-    // commits into, at loader class, durably, and recorded in the job's extent
-    // journal; the ingest then commits the file by naming its extents.
+    // Every verified extent is published durably at loader class into the
+    // ingest's store and journalled; the ingest commits files by naming them.
     hooks.extent_size = node_.config().extent_size;
     hooks.verifications = verifications_;
     FileSystem* fs = &ingest_.filesystem();
@@ -1206,9 +1141,7 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
         }
     };
     // The DATA device's monitor hears the torrent's I/O only when staging
-    // lives on a DATA backend's device. On every node today it does
-    // (/mnt/diskB/ingest beside /mnt/diskB), and that is why the monitor's
-    // verdict on 2026-09-23 described the torrent's load and blamed macha's.
+    // shares a DATA backend's device.
     struct stat staging_stat {};
     bool shared = false;
     if (::stat(ingest_.staging().path().c_str(), &staging_stat) == 0) {
@@ -1236,13 +1169,10 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
 void TorrentManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         drain_alerts();
-        // Piece alerts are a hint; the bitfield is the record. Every few
-        // seconds every torrent's held pieces are reported again, so a lost
-        // alert delays an extent's publication by at most this interval.
-        // impl_->handles is only ever read or changed under mutex_, and a
-        // torrent leaves it only through retire_torrent_locked, so every
-        // handle walked here names a torrent still in the session. A walk
-        // that throws anyway fails that one job, never the worker.
+        // Piece alerts are a hint, the bitfield the record: re-reporting held
+        // pieces bounds a lost alert's delay to this interval. impl_->handles
+        // changes only under mutex_ and only via retire_torrent_locked, so
+        // each handle names a live torrent; a throw fails that job only.
         if (impl_ && Clock::now() - last_held_pieces_report_ >= held_pieces_report_interval) {
             last_held_pieces_report_ = Clock::now();
             std::lock_guard lock(mutex_);
@@ -1274,9 +1204,8 @@ void TorrentManager::loop(std::stop_token stop) {
         update_jobs();
         std::unique_lock lock(mutex_);
         if (has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire)) {
-            // libtorrent and linked ingest jobs are external progress sources, so
-            // active jobs still receive a modest status sample cadence. A fully
-            // settled/paused manager blocks until an API operation wakes it.
+            // Active jobs are sampled at a modest cadence; a settled manager
+            // blocks until woken.
             cv_.wait_for(lock, stop, std::chrono::milliseconds(500), [this] {
                 return !has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
             });
@@ -1296,24 +1225,19 @@ void TorrentManager::update_jobs() {
     for (auto& entry : jobs_) {
         const auto& id = entry.first;
         auto& job = entry.second;
-        // One job's fault is that job's, not the worker's (0.63.0).
+        // One job's fault is that job's, not the worker's.
         try {
             const auto before = job;
             [&] {
                 if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed)
                     return;
-                // Until 0.62.0 a failed job was never looked at again, so resuming
-                // its ingest directly left it failed for good, with its staging
-                // reservation held (Rome, gbni-1, 2026-09-25). One whose ingest is
-                // running again falls through to the linked-ingest sync below.
+                // A failed job whose ingest runs again follows it below.
                 if (job.state == TorrentJobState::failed && !linked_ingest_revived(job))
                     return;
 
-                // Macha's explicit pause is operator intent. libtorrent applies
-                // pause asynchronously and status() may briefly report the pre-pause
-                // download state; never let that stale observation resume the job in
-                // Macha. Linked ingest jobs are still sampled because their own state
-                // is authoritative once the torrent payload has been handed over.
+                // A pause stands: libtorrent pauses asynchronously and status()
+                // may briefly show it downloading. A linked ingest is still
+                // sampled, as its state is authoritative after hand-over.
                 if (job.state == TorrentJobState::paused && !job.ingest_job_id)
                     return;
 
@@ -1404,15 +1328,11 @@ void TorrentManager::update_jobs() {
                     }
                 }
 
-                // Do not switch exhaustively on libtorrent's state enum. 2.1 adds
-                // queued_for_checking/allocating in configurations where older builds
-                // do not expose those names, and -Wswitch then turns the otherwise
-                // harmless API difference into a build failure. Unknown/pre-download
-                // states remain queued until they enter one of the stable states below.
+                // No exhaustive switch: libtorrent versions differ in state names
+                // and -Wswitch would fail the build. Unknown states read queued.
                 if (const auto phase = torrent_check_phase(status); phase == TorrentCheckPhase::queued) {
-                    // Waiting for another torrent's check: libtorrent checks one at a
-                    // time. Until 0.61.0 this read as `verifying` with no progress
-                    // and no ETA, indistinguishable from a check that had stalled.
+                    // Waiting for another torrent's check; libtorrent checks one
+                    // at a time.
                     job.state = TorrentJobState::verify_queued;
                     job.eta_seconds.reset();
                     check_samples_.erase(id);
@@ -1455,10 +1375,8 @@ void TorrentManager::update_jobs() {
 
                 if (job.state == TorrentJobState::downloaded) {
                     hold_torrent(hit->second);
-                    // Pretty Woman, 2026-09-24: submitted at download finish with
-                    // publication still 30-odd extents behind, the ingest found an
-                    // incomplete journal and copied the whole film. The torrent is
-                    // kept, paused, until its extents are all published.
+                    // Kept, paused, until every extent is published, or the
+                    // ingest would copy instead of adopting.
                     if (!publication_settled_locked(id, job)) {
                         return;
                     }
@@ -1476,10 +1394,8 @@ void TorrentManager::update_jobs() {
                 }
             }();
             refresh_publication_locked(id, job);
-            // Saved only when the record changed, not on every tick: a tick
-            // that changes nothing is not a write (40 rewrites of jobs.json in
-            // 20 s with nothing downloading, gbni-1, 2026-09-25). Transfer
-            // counters alone are saved at most every progress_save_interval.
+            // Saved when the record changed; transfer counters alone at most
+            // every progress_save_interval.
             const auto change = torrent_job_change(before, job);
             if (change != TorrentJobChange::none) job.updated_unix_ms = unix_ms();
             if (change == TorrentJobChange::record) changed = true;

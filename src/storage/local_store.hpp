@@ -52,10 +52,9 @@ struct LocalStoreDiagnostics {
     uint64_t loose_reaffirmation_full_validations{};
     // Loose objects the start-up presence walk found (0 until it finishes).
     uint64_t presence_index_entries{};
-    // Pack recovery at the last open: tails discarded as torn appends, and
-    // unreadable spans skipped inside a pack (bytes and count). Non-zero
-    // skipped figures mean this backend lost objects it once held; the
-    // cluster repairs them from replicas.
+    // Pack recovery at the last open: torn tails discarded, unreadable spans
+    // skipped. Non-zero skipped figures mean lost objects, repaired from
+    // replicas.
     uint64_t pack_recovery_truncated_tails{};
     uint64_t pack_recovery_skipped_regions{};
     uint64_t pack_recovery_skipped_bytes{};
@@ -105,13 +104,11 @@ class LocalStore final : public ObjectStore {
     LocalStoreMode mode_{LocalStoreMode::authoritative};
     std::atomic<uint64_t> used_{};
     mutable std::mutex m_;
-    // Serialises the append-only pack stream and compaction. It is deliberately
-    // distinct from m_: crypto and pack filesystem I/O must not exclude
-    // unrelated loose-object or index operations.
+    // Serialises the pack stream and compaction; separate from m_ so pack
+    // crypto and I/O do not exclude loose-object or index operations.
     mutable std::mutex pack_io_mutex_;
-    // Physical work for unrelated immutable objects must not serialize behind
-    // the store index/accounting mutex. Weak entries give an exact per-object
-    // single-flight domain and disappear after their last active operation.
+    // Per-object single-flight locks, so physical work on unrelated objects
+    // does not serialise behind m_. Weak entries vanish after last use.
     mutable std::mutex object_mutex_map_mutex_;
     mutable std::map<ObjectId, std::weak_ptr<std::mutex>> object_mutexes_;
     uint64_t reserved_write_bytes_{};
@@ -122,14 +119,11 @@ class LocalStore final : public ObjectStore {
     std::function<void()> before_pack_compaction_for_tests_;
     static constexpr size_t verified_loose_limit = 4096;
     mutable std::map<ObjectId, VerifiedLoose> verified_loose_;
-    // Loose objects present, under m_: published by a put once its file is
-    // installed, filled from the object directory at start, forgotten on
-    // remove. Once warm-up has listed the store it is authoritative and has()
-    // answers from it alone -- no per-object lock, no disk (the object ledger
-    // plan, P). A quantum commit re-claims every extent of its file, and a
-    // cold dentry stat on a disk saturated by the import cost ~5 ms each:
-    // 3,201 extents took 16 s per commit (gbni-1, 2026-09-07). ~40 B per
-    // object; a 200k-object node spends ~8 MB.
+    // Loose objects present, under m_: published when a put installs the
+    // file, filled from the object directory at start, forgotten on remove.
+    // Once warm-up has listed the store, has() answers from it alone, with no
+    // per-object lock and no disk; a cold stat per extent is too slow on a
+    // busy disk. About 40 B per object.
     mutable PresenceIndex presence_;
     mutable std::deque<std::pair<uint64_t, ObjectId>> verified_loose_order_;
     mutable uint64_t verified_loose_sequence_{};
@@ -137,9 +131,8 @@ class LocalStore final : public ObjectStore {
     std::atomic_uint64_t loose_reaffirmation_full_validations_{};
     mutable std::condition_variable accounting_cv_;
     std::jthread scan_thread_;
-    // Fills present_loose_ from the object directory names at start (readdir
-    // only, no stat), so the first claim on each large file after a restart
-    // is not a cold stat per extent (2.6-16 s per quantum commit, 2026-09-07).
+    // Fills presence_ from object directory names at start (readdir only, no
+    // stat).
     std::jthread presence_thread_;
     std::atomic_uint64_t presence_index_entries_{};
     std::atomic_uint64_t pack_recovery_truncated_tails_{};
@@ -148,9 +141,8 @@ class LocalStore final : public ObjectStore {
     std::atomic_bool scan_complete_{};
     std::atomic_bool scan_failed_{};
     std::atomic_bool accounting_trusted_{};
-    // A dirty checkpoint's `used` is carried as an estimate while the
-    // reconciling scan runs, so puts and removes are admitted against it
-    // instead of waiting minutes for the walk (see the constructor).
+    // A dirty checkpoint's `used` is an estimate while the reconciling scan
+    // runs; puts and removes are admitted against it rather than waiting.
     std::atomic_bool accounting_estimate_{};
     int accounting_fd_{-1};
     uint64_t accounting_sequence_{};
@@ -202,15 +194,13 @@ class LocalStore final : public ObjectStore {
     static std::optional<LooseStamp> loose_stamp(const std::filesystem::path&);
     void remember_verified_loose_locked(const ObjectId&, const LooseStamp&) const;
     void forget_verified_loose_locked(const ObjectId&) const;
-    // Removes a zero-byte loose object file and forgets the object. Every
-    // stored object carries a fixed header, so an empty file is never an
-    // object: only a crash (rename durable, data not) or external truncation
-    // leaves one. Caller holds the object's mutex, not m_. True if pruned.
+    // Removes a zero-byte loose file and forgets the object. Every object has
+    // a fixed header, so an empty file is only left by a crash or external
+    // truncation. Caller holds the object's mutex, not m_. True if pruned.
     bool prune_empty_loose(const ObjectId&, const std::filesystem::path&) const;
-    // has() without the device: the answer from the pack index and the
-    // presence index, or none before warm-up. Waits on nothing but m_, which
-    // no one holds across I/O; its body is a no-I/O region, so taking a lock
-    // held across I/O here does not compile under Clang.
+    // has() from the pack and presence indexes, or none before warm-up. Waits
+    // only on m_; its body is a no-I/O region, so taking a lock held across
+    // I/O here does not compile under Clang.
     std::optional<bool> presence_from_index(const ObjectId&) const;
     std::shared_ptr<std::mutex> object_mutex(const ObjectId&) const;
 
@@ -218,8 +208,8 @@ class LocalStore final : public ObjectStore {
     LocalStore(std::filesystem::path, LocalStoreOptions, std::array<uint8_t, 32>,
                LocalStoreMode = LocalStoreMode::authoritative,
                std::shared_ptr<DurabilityDomain> = {});
-    // Compatibility constructor for cache/tests which deliberately want loose
-    // objects. Production StoragePool passes explicit LocalStoreOptions.
+    // Loose objects only, for the cache and tests; StoragePool passes
+    // LocalStoreOptions.
     LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>,
                LocalStoreMode = LocalStoreMode::authoritative,
                std::shared_ptr<DurabilityDomain> = {});
@@ -232,13 +222,11 @@ class LocalStore final : public ObjectStore {
     uint64_t durable_generation() const;
     uint64_t durability_domain_id() const noexcept;
     std::optional<Bytes> get(const ObjectId&) const;
-    // Presence, from the index: true once a put of the object has installed
-    // it, false while a put is still writing it and after a remove. Once
-    // warm-up has listed the store (presence_authoritative()) it waits on
-    // nothing but the store's index mutex and touches no device; before then
-    // a miss is checked on disk under the object's lock, and a zero-byte file
-    // found there is pruned. Never decrypts or verifies content: callers that
-    // need the payload intact use get()/valid().
+    // True once a put has installed the object; false while it is being
+    // written and after a remove. Once presence_authoritative(), waits only on
+    // the index mutex and touches no device; before then a miss is checked on
+    // disk under the object's lock and a zero-byte file is pruned. Never
+    // verifies content: use get()/valid() for that.
     bool has(const ObjectId&) const noexcept override;
     // Whether warm-up has finished and has() answers from the index alone.
     bool presence_authoritative() const {

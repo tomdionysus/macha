@@ -23,8 +23,8 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
     std::vector<ObjectId> data;
     std::vector<ObjectId> control;
     bool complete = true;
-    // The live set destructive GC acts on. Read the namespace in whichever
-    // form it is in: an empty one here means "collect everything".
+    // The live set destructive GC acts on: an empty one means "collect
+    // everything".
     for_each_namespace_entry(*head.snapshot, &nodes, [&](const std::string&, const FsEntry& entry) {
         if (entry.type != EntryType::file)
             return;
@@ -46,10 +46,9 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
                        " error=" + error.what());
         }
     }
-    // The namespace tree itself. A live set that omits it is a live set that
-    // lets the collector delete the namespace, and a partial walk is worse
-    // than none -- so an unreadable node marks the whole set incomplete and
-    // nothing is released against it.
+    // The namespace tree's own nodes: omitting them would let the collector
+    // delete the namespace, so an unreadable node marks the whole set
+    // incomplete and nothing is released against it.
     if (head.snapshot->namespace_root) {
         try {
             collect_namespace_tree_nodes(*head.snapshot->namespace_root, nodes, control);

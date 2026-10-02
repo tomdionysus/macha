@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A subsystem that writes into the store from its own stop(), used by
-// subsystem_supervisor/test_service_stops_plugins_before_the_store. A plugin
-// such as the torrent subsystem publishes into the store right up to the
-// moment it is stopped, so the node must still accept its writes then.
-//
-// The outcome is written to the file named by MACHA_TEST_STOP_WRITE_RESULT:
-// "started" once start() has run, then "ok" or "failed: <why>" from stop().
+// A plugin that writes into the store from stop(): plugins publish up to the
+// moment they stop, so the store must still accept writes then. The outcome
+// goes to the file named by MACHA_TEST_STOP_WRITE_RESULT: "started" after
+// start(), then "ok" or "failed: <why>" from stop().
 #include "filesystem/filesystem.hpp"
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"

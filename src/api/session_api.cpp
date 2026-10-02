@@ -28,15 +28,12 @@ Json session_json(const AuthSession& session, const UserStore& users,
     out["expires_unix_ms"] = static_cast<uint64_t>(session.expires_unix_ms);
     if (!session.user_id.empty()) {
         out["user_id"] = session.user_id;
-        // The name as well as the id: every client needs it on every load to
-        // say who is signed in, and without it each one spends a round trip on
-        // /users/me to learn something this response already knows.
+        // The name too: every client shows who is signed in, and would otherwise
+        // spend a round trip on /users/me.
         if (auto user = users.find(session.user_id))
             out["username"] = user->username;
     }
-    // Stated, not inferred. A client validating a password inline must use the
-    // server's rule rather than a copy of it, or the two drift and it starts
-    // rejecting passwords the server would accept.
+    // Stated, so clients validate passwords by the server's rule, not a copy.
     Json::Object policy;
     policy["min_password_length"] = static_cast<uint64_t>(min_password_length);
     out["password_policy"] = std::move(policy);
@@ -87,19 +84,13 @@ CredentialResult PasswordCredentialValidator::validate(const Json& credentials) 
     if (object.empty()) {
         if (!config_.allow_anonymous)
             return {CredentialOutcome::disabled, {}};
-        // Anonymous is an ordinary account, so an anonymous session is an
-        // ordinary bound session: it carries that account's current roles, and
-        // it is retired by the same credential_generation check as anyone
-        // else's the moment those roles change.
+        // Anonymous is an ordinary account: its session carries that account's
+        // current roles and is retired by the same credential_generation check.
         auto user = users_.find_by_username(anonymous_username);
         if (!user)
             return {CredentialOutcome::disabled, {}};
-        // A roles-less anonymous account is a different state from anonymous
-        // access being switched off, and both are legitimate: the visitor gets
-        // a session that simply carries no capabilities, and every gated route
-        // refuses it. Until 0.38.4 an empty role list was reported as
-        // `disabled`, which told a client "log in" when the truthful answer
-        // was "you are in, and this cluster grants visitors nothing".
+        // A roles-less anonymous account differs from anonymous access being off:
+        // the visitor gets a session with no capabilities, refused by every gated route.
         return {CredentialOutcome::ok,
                 {expand_roles(user->roles), user->id, user->credential_generation}};
     }
@@ -172,9 +163,8 @@ HttpResponse SessionApi::handle(const HttpRequest& request) {
             return http_json(201, session_json(minted->session, node_.users(), minted->bearer_token).dump());
         }
 
-        // Every other route under /api/v1/session operates on "my current
-        // session" -- HttpServer has already authenticated the caller by the
-        // time any non-exempt handler runs.
+        // Every other route under /api/v1/session acts on the caller's current
+        // session; HttpServer has already authenticated it.
         if (!request.session)
             return http_error(401, "unauthorized", "a valid session bearer token is required");
 

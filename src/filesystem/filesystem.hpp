@@ -33,8 +33,8 @@ class FileSystem;
 class PlaybackTracker;
 
 struct MaintenanceObjects {
-    // Sorted/unique compact indexes. A vector is materially smaller than a
-    // tree node per extent on media namespaces containing millions of objects.
+    // Sorted, unique vectors: far smaller than a tree node per extent at
+    // millions of objects.
     std::vector<ObjectId> live;
     std::vector<GarbageRef> garbage;
     uint64_t metadata_generation{};
@@ -182,9 +182,8 @@ class PlaybackTracker;
     size_t rebuild_steps_{};
     bool rebuilding_{};
     bool rebuild_prepared_{};
-    // Canonical committed manifests can be edited as a sparse changed-range
-    // overlay. Unchanged extents remain immutable references and are never
-    // copied into the temporary file merely to discover they are unchanged.
+    // Edit a canonical committed manifest as a sparse changed-range overlay;
+    // unchanged extents stay references and are never copied to the temp file.
     bool sparse_overlay_{};
     std::optional<int64_t> committed_mtime_;
     struct ChangedRange {
@@ -202,8 +201,7 @@ class PlaybackTracker;
         Hash256 hash{};
     };
     std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_;
-    // Trace-only ownership is bounded. A diagnostic mode must never become a
-    // process/file-lifetime recorder for every write in a bulk transfer.
+    // Trace-only; bounded so it never records every write of a bulk transfer.
     std::deque<DiagnosticWriteRange> diagnostic_writes_;
     static constexpr size_t diagnostic_write_limit_ = 4096;
     std::chrono::milliseconds flush();
@@ -230,20 +228,17 @@ class PlaybackTracker;
                 uint64_t publication_pipeline_bytes = 0,
                 DataWorkContext work_context = DataWorkContext{});
     ~WriteHandle();
-    // Prepare any existing generation needed for a write at `offset`. A zero
-    // budget preserves the synchronous API; a non-zero budget is a hard DATA
-    // byte quantum and may return !ready so an outer scheduler can yield.
+    // Prepares any existing generation needed for a write at `offset`. Zero
+    // budget runs to completion; non-zero is a hard DATA byte quantum and may
+    // return !ready so the caller can yield.
     WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget = 0);
     WritePreparation prepare_commit(uint64_t byte_budget = 0);
     size_t write(uint64_t, std::span<const uint8_t>);
     void truncate(uint64_t);
     void commit();
-    // The mtime the next commit publishes for this file. The FUSE frontend
-    // sets it from the inode's current visible mtime so a utimens that was
-    // applied (and published) after the writes -- rsync's order -- is not
-    // overwritten by the asynchronous data publication's own timestamp,
-    // which made every imported file look modified to the next rsync pass
-    // (474 of 3,770 Music files on 2026-09-07).
+    // The mtime the next commit publishes. The FUSE frontend sets the inode's
+    // visible mtime so a utimens after the writes (rsync's order) is not
+    // overwritten by the asynchronous publication's own timestamp.
     void set_committed_mtime(int64_t mtime_ns) {
         std::lock_guard lock(m_);
         committed_mtime_ = mtime_ns;
@@ -268,15 +263,12 @@ class FileSystem {
     PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
-    // Cooperative cancellation for mounted MachaDFS reads/writes during
-    // daemon shutdown. Namespace-only operations are short metadata calls;
-    // extent transfers carry this token into DistributedStore.
+    // Cooperative cancellation of mount I/O at shutdown; extent transfers carry
+    // it into DistributedStore.
     std::atomic_bool io_cancelled_{};
-    // Publication extents use a fixed process-lifetime executor. Launching one
-    // std::async thread per extent caused glibc's per-thread arenas to retain
-    // gigabytes after sustained ingest even though logical DATA admission was
-    // bounded. The queue is bounded to two tasks per worker, matching the
-    // default per-publication pipeline without permitting thread proliferation.
+    // Fixed process-lifetime executor for publication extents: a thread per
+    // extent makes glibc's per-thread arenas retain gigabytes. The queue holds
+    // two tasks per worker, matching the default per-publication pipeline.
     using ExtentTask = std::packaged_task<WriteHandle::StagedExtentResult()>;
     mutable std::mutex extent_tasks_mutex_;
     std::condition_variable_any extent_tasks_cv_;
@@ -287,33 +279,24 @@ class FileSystem {
     std::atomic_uint64_t extent_tasks_peak_queued_{};
     std::atomic_uint64_t extent_tasks_peak_active_{};
     std::atomic_uint64_t extent_tasks_submitted_{};
-    // Counts events that RELEASE MemoryOwner::publication leases: a pipelined
-    // extent retiring into the manifest, and a handle committing. This is what
-    // a writer blocked on retained-memory admission must watch, because it is
-    // the only thing that can end that wait. Counting admitted quanta instead
-    // re-armed every waiter's window whenever a *new* publication was let in,
-    // which on a wedged node happens once per failure -- so the no-progress
-    // deadline could never fire and the pipeline never parked (es-1,
-    // 2026-09-09).
+    // Counts releases of MemoryOwner::publication leases (an extent retiring
+    // into the manifest, a handle committing): the only events that can end a
+    // retained-memory admission wait. Admitted quanta must not count, or a
+    // failing node re-arms every no-progress deadline and never parks.
     std::atomic_uint64_t write_progress_{};
     std::vector<std::jthread> extent_workers_;
     void extent_worker(std::stop_token);
     std::future<WriteHandle::StagedExtentResult> submit_extent_task(
         std::function<WriteHandle::StagedExtentResult()>);
-    // Immutable media ids are used heavily by catalogue/playback resolution.
-    // Cache their namespace lookup by metadata generation so playback startup
-    // does not linearly re-hash every file for every candidate representation.
+    // Namespace lookup cached per metadata generation.
     struct NamespaceIndex {
         uint64_t generation{};
         Hash256 hash{};
         std::shared_ptr<const MetadataSnapshot> snapshot;
-        // Store names/paths only. The immutable snapshot already owns FsEntry
-        // manifests; duplicating every extent into the directory index would make
-        // cache memory proportional to the namespace twice over.
+        // Names/paths only; FsEntry manifests stay owned by the snapshot.
         std::map<std::string, std::vector<std::pair<std::string, std::string>>, std::less<>> children;
-        // macOS can present canonically-equivalent UTF-8 path spellings across
-        // different VFS/FUSE operations. Keep persisted keys byte-preserving and
-        // resolve only the runtime alias back to the actual stored path.
+        // macOS may present canonically-equivalent UTF-8 spellings; stored keys
+        // stay byte-exact and only the runtime alias resolves to them.
         std::map<std::string, std::string, std::less<>> canonical_paths;
         std::set<std::string, std::less<>> ambiguous_canonical_paths;
     };
@@ -326,18 +309,16 @@ class FileSystem {
     std::mutex media_index_mutex_;
     uint64_t media_index_namespace_revision_{};
     bool media_index_valid_{};
-    // Keep the immutable snapshot that owns entries referenced by media_index_.
-    // Existing content-addressed media ids remain valid across unrelated
-    // namespace generations; only a cache miss needs to inspect newer metadata.
+    // Owns the entries media_index_ refers to. Content-addressed media ids stay
+    // valid across generations; only a miss inspects newer metadata.
     std::shared_ptr<const MetadataSnapshot> media_index_snapshot_;
-    // Media ids map to paths only; FsEntry remains owned by media_index_snapshot_.
+    // Media id -> path.
     std::map<std::string, std::string> media_index_;
     std::mutex maintenance_index_mutex_;
     uint64_t maintenance_index_generation_{};
     std::shared_ptr<const MaintenanceObjects> maintenance_index_;
-    // A local snapshot view must never enter MetadataManager's authoritative
-    // read/discovery path. Cache the decoded content-addressed replica record
-    // independently so repeated local consumers only share immutable state.
+    // Decoded local replica record, cached apart from MetadataManager's
+    // authoritative read path, which local snapshot views must never enter.
     std::mutex local_snapshot_mutex_;
     uint64_t local_snapshot_generation_{};
     Hash256 local_snapshot_hash_{};
@@ -363,17 +344,16 @@ class FileSystem {
     void chmod(const std::string&, uint32_t);
     void chown(const std::string&, uint32_t, uint32_t, bool, bool);
     void utimens(const std::string&, int64_t);
-    // `atomic`: apply every operation or none (no committed prefix), so a
-    // caller with an `identity` can treat "identity clock advanced" as "the
-    // whole batch took effect". Without it a failing operation commits the
-    // largest valid prefix and is reported in the result, as before.
+    // `atomic`: all or nothing, so with an `identity` "clock advanced" means
+    // the whole batch applied. Otherwise the largest valid prefix commits and
+    // the failure is reported in the result.
     FilesystemNamespaceBatchResult apply_namespace_batch(
         std::span<const FilesystemNamespaceMutation>,
         std::optional<MetadataMutationIdentity> identity = {}, bool atomic = false);
     void truncate_file(const std::string&, uint64_t);
     std::shared_ptr<ReadHandle> open_read(const std::string&);
-    // Open an already-resolved immutable metadata snapshot. Playback uses this
-    // so a pathname replacement cannot change the bytes underneath a session.
+    // Opens a resolved immutable entry, so a path replacement cannot change
+    // the bytes under a playback session.
     std::shared_ptr<ReadHandle> open_read(const FsEntry&, const std::string& logical_path,
                                           bool track_playback = true,
                                           FrameType frame_type = FrameType::foreground);
@@ -384,13 +364,10 @@ class FileSystem {
                                             DataWorkContext work_context = DataWorkContext{});
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
-    // `stale_basis_is_replayable`: report a basis that no longer matches the
-    // namespace as ESTALE rather than EAGAIN. A publication writer cannot
-    // recover from it -- its captured basis is permanently wrong, so every
-    // retry re-runs the identical doomed comparison -- but the spool still
-    // holds the bytes, so the generation must be replayed from the WAL against
-    // a fresh writer. Foreground handles keep EAGAIN: they stay open, the
-    // content really did change concurrently, and retrying is meaningful.
+    // `stale_basis_is_replayable`: a mismatched basis is ESTALE, not EAGAIN. A
+    // publication writer's basis is then permanently wrong, so the generation
+    // must be replayed from the spool against a fresh writer. Foreground
+    // handles keep EAGAIN, where retrying is meaningful.
     void commit_file(const std::string&, const FsEntry&, uint64_t,
                      const std::vector<ExtentRef>&, FsEntry*,
                      std::optional<int64_t> mtime_override = {},
@@ -410,9 +387,8 @@ class FileSystem {
     }
     uint64_t known_metadata_generation() const noexcept { return n_.known_metadata_generation(); }
     std::vector<ObjectId> live_objects();
-    // Hash only namespace/content identity, deliberately excluding catalogue
-    // metadata. CatalogueScanner uses this after a metadata-generation debounce
-    // so its own catalogue commits cannot cause a rescan loop.
+    // Hashes namespace/content identity, excluding catalogue metadata, so the
+    // catalogue scanner's own commits cannot trigger a rescan loop.
     Hash256 namespace_signature(uint64_t* metadata_generation = nullptr);
     std::optional<Hash256> available_namespace_signature(
         uint64_t* metadata_generation = nullptr) const;
@@ -421,11 +397,8 @@ class FileSystem {
     DistributedStore& store() {
         return s_;
     }
-    // A read-only view of wherever namespace tree nodes live, for the readers
-    // that hold a FileSystem rather than a store: the catalogue scanner and
-    // the media index. Cheap to make -- two references and a mode -- so it is
-    // made at the call site rather than cached, which also keeps it impossible
-    // to accidentally write through.
+    // Read-only view of the namespace tree nodes. Cheap, so made per call
+    // rather than cached, which also prevents writing through it.
     ControlNamespaceNodeStore namespace_nodes() {
         return ControlNamespaceNodeStore::for_reading(n_, s_);
     }
@@ -450,17 +423,16 @@ class FileSystem {
     size_t extent_size() const {
         return n_.config().extent_size;
     }
-    // Shared across every writer in the process, so progress by any of them
-    // re-arms the no-progress window of all of them: memory that one handle
-    // releases is memory another can be admitted against.
+    // Process-wide: memory one writer releases can admit another, so any
+    // writer's progress re-arms every no-progress window.
     const std::atomic_uint64_t& write_progress() const noexcept { return write_progress_; }
     void note_write_progress() noexcept {
         write_progress_.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
-// Stable across namespace renames: identity is derived only from the logical
-// file size and ordered content-addressed extent manifest.
+// Derived only from logical size and the ordered extent manifest, so stable
+// across renames.
 std::string file_media_id(const FsEntry&);
 
 } // namespace macha

@@ -101,10 +101,8 @@ void queue_garbage_batch(MetadataSnapshot& snapshot, std::vector<ObjectId> ids,
     if (ids.empty())
         return;
 
-    // File publication can retire hundreds of extents at once.  Do not perform
-    // one linear scan of the (potentially very large) garbage vector per extent.
-    // Keep the transient index bounded by this file's extent count and scan the
-    // committed garbage set once.
+    // One pass over the (possibly huge) garbage set, not one per extent; the
+    // transient index is bounded by this file's extent count.
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     std::vector<bool> found(ids.size(), false);
@@ -182,9 +180,8 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
     }
 
     auto& x = e_.extents.at(i);
-    // The previous extent is no longer observable once this handle advances.
-    // Release it before reserving the replacement so a two-buffer handoff
-    // cannot consume the viewer headroom indefinitely.
+    // Release the previous extent before reserving the next, so a two-buffer
+    // handoff cannot hold the viewer headroom.
     cached_extent_.reset();
     cached_index_ = static_cast<size_t>(-1);
     auto started = Clock::now();
@@ -267,10 +264,9 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
       publication_pipeline_bytes_(publication_pipeline_bytes),
       logical_(trunc ? 0 : base_.size), staged_(trunc ? 0 : base_.size),
       diagnostic_id_(next_write_handle_diagnostic_id.fetch_add(1, std::memory_order_relaxed)) {
-    // Existing files are append-capable without rematerialising the prefix.
-    // Keep every complete immutable extent by reference.  If EOF lands inside
-    // the final extent, fetch only that tail lazily when the first append
-    // arrives so it can seed the normal sequential extent buffer.
+    // Append without rematerialising: complete extents stay references; a
+    // partial final extent is fetched lazily on the first append to seed the
+    // sequential buffer.
     if (!trunc && base_.size) {
         extents_ = base_.extents;
         const auto extent_size = fs_.extent_size();
@@ -284,8 +280,7 @@ WriteHandle::WriteHandle(FileSystem& f, std::string p, FsEntry b, bool trunc, bo
                     extents_.pop_back();
                     staged_ = tail_offset;
                 } else {
-                    // A non-canonical manifest remains writable through the
-                    // generic staging fallback; do not guess at its tail.
+                    // Non-canonical manifest: use the generic staging path.
                     sequential_ = false;
                 }
             } else {
@@ -310,8 +305,7 @@ void WriteHandle::ensure_buffer_memory() {
     const auto memory_class = filesystem_memory_class(work_context_.frame_type());
     auto& ledger = fs_.node().retained_memory();
 
-    // Without a no-progress budget this is the historical behaviour: wait on
-    // the caller's own deadline, which for publication was no deadline at all.
+    // Without a no-progress budget, wait on the caller's deadline alone.
     const auto* progress = work_context_.progress();
     if (!progress) {
         auto memory = ledger.acquire(memory_class, MemoryOwner::publication, fs_.extent_size(),
@@ -323,15 +317,9 @@ void WriteHandle::ensure_buffer_memory() {
         return;
     }
 
-    // With one, wait in slices and watch the shared counter. Any worker in
-    // this pipeline making progress re-arms the window, so a slow-but-moving
-    // node is never punished for being slow; only a pipeline where nothing at
-    // all advances within the budget fails. That failure is an ordinary EAGAIN,
-    // which the publication retry policy already backs off and eventually
-    // parks -- turning a permanent silent deadlock into visible, bounded,
-    // self-healing failure. Before this, all eight workers held their buffers
-    // and blocked forever, so `parked_publications` stayed 0 on a node that
-    // had published nothing for hours (es-1, 2026-09-09).
+    // With one, wait in slices on the shared progress counter: any progress
+    // re-arms the window, so only a pipeline with no progress for the whole
+    // budget fails, with EAGAIN, which the retry policy backs off and parks.
     constexpr auto slice = std::chrono::milliseconds(500);
     const auto budget = work_context_.no_progress_budget();
     auto seen = progress->load(std::memory_order_relaxed);
@@ -368,9 +356,8 @@ WriteHandle::~WriteHandle() {
         std::lock_guard lock(m_);
         (void)drain_staging_locked();
     } catch (...) {
-        // An abandoned or failed generation has no visible metadata. Joining
-        // its bounded provisional puts is nevertheless required before the
-        // handle releases references captured by those tasks.
+        // Provisional puts must be joined before the handle releases what
+        // those tasks captured, even for a failed generation.
     }
     cleanup();
 }
@@ -503,9 +490,8 @@ void WriteHandle::launch_pending_extent(PendingExtent& pending) {
     const auto offset = pending.offset;
     const auto bytes = pending.payload;
     const auto frame_type = work_context_.frame_type();
-    // The context carries this pipeline's shared progress counter and
-    // no-progress budget, so a put to a silent peer fails within the budget
-    // instead of holding drain_one_extent() forever.
+    // The context carries the progress counter and no-progress budget, so a
+    // put to a silent peer fails rather than holding drain_one_extent().
     const auto context = work_context_;
     pending.result = fs_.submit_extent_task(
         [store, cancelled, cache_put, offset, frame_type, bytes, context] {
@@ -524,10 +510,8 @@ std::chrono::milliseconds WriteHandle::drain_one_extent() {
     if (pending_extents_.empty())
         return {};
     auto& pending = pending_extents_.front();
-    // A failed asynchronous put leaves its payload and exact manifest offset
-    // at the queue head. The next publication attempt relaunches that bounded,
-    // content-addressed operation instead of discarding the complete writer
-    // and replaying every earlier spool byte.
+    // A failed put stays at the queue head with its payload and offset; the
+    // next attempt relaunches just that put rather than replaying the spool.
     if (!pending.result.valid())
         launch_pending_extent(pending);
     auto result = pending.result.get();
@@ -547,16 +531,15 @@ std::chrono::milliseconds WriteHandle::drain_one_extent() {
     }
     pending_extent_bytes_ -= pending.bytes;
     pending_extents_.pop_front();
-    // The lease this extent held is now back in the ledger. That is the event
-    // a writer waiting on admission is waiting for.
+    // The extent's lease is back in the ledger: what admission waiters need.
     fs_.note_write_progress();
     return result.elapsed;
 }
 
 std::chrono::milliseconds WriteHandle::drain_staging_locked() {
     std::chrono::milliseconds elapsed{};
-    // Stop at the first failed offset. Later pipelined futures may finish in
-    // parallel, but cannot enter the manifest ahead of the missing extent.
+    // Stops at the first failure: later extents cannot enter the manifest
+    // ahead of a missing one.
     while (!pending_extents_.empty())
         elapsed += drain_one_extent();
     return elapsed;
@@ -660,9 +643,8 @@ void WriteHandle::begin_sparse_overlay() {
     sequential_ = false;
     rebuild_prepared_ = false;
 
-    // Sequential work may have staged an incomplete new tail before a later
-    // write changed direction. Preserve only that tail as overlay data; full
-    // immutable extents already present in extents_ remain reusable by ID.
+    // Keep a partially staged sequential tail as overlay data; full extents in
+    // extents_ stay reusable by id.
     if (!buffer_.empty()) {
         pwa(temp_, buffer_, staged_);
         note_changed_range(staged_, staged_ + buffer_.size());
@@ -679,10 +661,8 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
         if (temp_ >= 0)
             return {true, 0};
         if (sequential_ && append_tail_) {
-            // Non-sequential fallback needs the old tail as immutable source
-            // data, not as an eagerly fetched append seed. Restore the manifest
-            // reference so its fetch and staging write occur inside this
-            // resumable materialisation budget.
+            // Restore the tail as a manifest reference so its fetch happens
+            // inside the resumable materialisation budget.
             extents_.push_back(*append_tail_);
             staged_ = logical_;
             append_tail_.reset();
@@ -999,10 +979,8 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
     else if (work_context_.frame_type() == FrameType::read_ahead)
         fs_.store().interactive_activity(d.size());
     else if (work_context_.frame_type() == FrameType::loader)
-        // The clock maintenance was missing. An ingest writes here, through a
-        // default DataWorkContext, which is loader-class; until 0.53.0 nothing
-        // recorded that and a node in the middle of a 36 GB import reported
-        // itself idle to its own maintenance scheduler.
+        // Ingest writes here with a default (loader) context; maintenance
+        // scheduling reads this clock.
         fs_.store().loader_activity(d.size());
     const auto total =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
@@ -1089,9 +1067,8 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             Log::trace("WRITE rebuild-begin id=" + std::to_string(diagnostic_id_) +
                    " logical=" + std::to_string(logical_) +
                    " physical=" + std::to_string(fd_size(temp_)));
-            // Preserve the exhaustive diagnostic for synchronous callers. A
-            // bounded loader step emits per-extent diagnostics below instead
-            // of hiding a second whole-file scan inside tracing.
+            // Whole-file diagnostic only for synchronous callers; bounded
+            // steps trace per extent below.
             if (!byte_budget)
                 diagnostic_stage_checkpoint("pre-rebuild");
         }
@@ -1125,9 +1102,8 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             std::min<uint64_t>(bytes.size(), logical_ - rebuild_offset_));
         if (!n || n > remaining_budget)
             break;
-        // Handle-local immutable extents override the committed base, matching
-        // the previous map insertion order without constructing an O(file)
-        // lookup table before the first yield point.
+        // Handle-local extents override the committed base, without building
+        // an O(file) table before the first yield.
         const ExtentRef* candidate =
             candidate_at(rebuild_handle_extents_, rebuild_offset_, n);
         if (!candidate)
@@ -1276,8 +1252,8 @@ WritePreparation WriteHandle::prepare_commit(uint64_t byte_budget) {
         return {true, 0};
     if (materializing_) {
         auto preparation = materialize_step(byte_budget);
-        // Do not combine materialisation and rebuild under one opaque call. The
-        // scheduler sees the exact completed unit before admitting another.
+        // Materialisation and rebuild report separately, so the scheduler sees
+        // each completed unit before admitting another.
         if (preparation.bytes_processed || !preparation.ready)
             return {false, preparation.bytes_processed};
     }
@@ -1335,11 +1311,9 @@ void WriteHandle::commit() {
         std::vector<ObjectId> unsatisfiable;
         if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type(),
                                             &unsatisfiable)) {
-            // The barrier re-derives dead placement tokens itself; what is
-            // left here is an object a peer genuinely no longer holds. Re-put
-            // it from a local copy when there is one, else tell the caller the
-            // generation must be replayed from its own WAL (ESTALE): this
-            // writer cannot recover the bytes. Never retry the same batch.
+            // What remains is an object no peer holds (the barrier handles dead
+            // placement tokens). Re-put from a local copy, else ESTALE: the
+            // generation must be replayed from the WAL. Never retry the batch.
             bool reput_all = !unsatisfiable.empty();
             for (const auto& id : unsatisfiable) {
                 const auto data = fs_.node().local_store().get(id);
@@ -1390,14 +1364,12 @@ void WriteHandle::commit() {
         Bytes{}.swap(buffer_);
         buffer_memory_.reset();
     }
-    // A committed generation is the other way publication-owned memory comes
-    // back: this handle is now retirable and its remaining leases go with it.
+    // A commit also releases publication memory: the handle is retirable.
     fs_.note_write_progress();
 
     if (sparse_overlay_) {
-        // The committed manifest is now the immutable authority. Discard the
-        // process-local overlay and make a still-open handle append-capable
-        // again, just like a freshly opened handle on this generation.
+        // The committed manifest is authoritative: drop the overlay and make
+        // the handle append-capable, as if freshly opened.
         cleanup();
         temp_path_.clear();
         sparse_overlay_ = false;
@@ -1407,9 +1379,8 @@ void WriteHandle::commit() {
         staged_ = logical_;
     }
 
-    // flush() publishes a partial final extent at commit time.  The handle may
-    // remain open and receive more append writes after flush/fsync, so re-arm
-    // that committed tail for the same one-extent lazy seed used at open.
+    // The handle may take more appends after flush/fsync: re-arm the committed
+    // partial tail as the lazy append seed.
     if (sequential_ && temp_ < 0) {
         append_tail_.reset();
         staged_ = logical_;
@@ -1558,8 +1529,6 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
     built->hash = view.hash;
     built->snapshot = std::move(view.snapshot);
     auto index_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
-    // The index is canonical names and a parent-to-children map: stat data
-    // about paths, with no entry body in it at all.
     for_each_namespace_entry(*built->snapshot, &index_nodes,
                              [&](const std::string& path, const FsEntry&) {
         const auto canonical = macos_fuse_composed_name(path);
@@ -1586,8 +1555,7 @@ std::optional<std::string> FileSystem::resolve_existing_path(const std::string& 
     const auto q = normalize_path(p);
     auto index = namespace_index();
     auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
-    // Existence, so nothing is copied and no extent node is fetched. This is
-    // the hottest path in the filesystem: every FUSE lookup passes through it.
+    // Existence only, no copy or extent fetch: every FUSE lookup passes here.
     if (namespace_contains(*index->snapshot, &nodes, q))
         return q;
 
@@ -1619,8 +1587,7 @@ std::string FileSystem::resolve_new_path(const std::string& p) {
 }
 
 void FileSystem::require_parent(const NamespaceWorkingSet& working, const std::string& p) {
-    // Type only, so stat-only: a parent check must not fetch a directory's
-    // extent list, and directories have none anyway.
+    // Stat-only: only the type matters.
     auto parent = working.get(parent_path(p), false);
     if (!parent)
         fail(ENOENT, "parent missing");
@@ -1633,11 +1600,8 @@ FsEntry FileSystem::getattr(const std::string& p) {
     if (!resolved)
         fail(ENOENT, "not found");
     auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
-    // With extents, which preserves exactly what this returned from the map.
-    // Trimming it to a stat-only read is Stage D's business and wants an audit
-    // of what callers do with the entry they get back: a caller that reads
-    // `extents` off a stat-only entry sees an empty list rather than an error,
-    // and that is the class of silence this work exists to remove.
+    // With extents: a caller reading `extents` off a stat-only entry would
+    // silently see an empty list.
     auto found = namespace_entry(*index->snapshot, &nodes, *resolved);
     if (!found)
         fail(ENOENT, "not found");
@@ -1650,7 +1614,7 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
     auto q = *resolved;
     auto index = namespace_index();
     auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
-    // The directory itself is only inspected for its type, so stat-only.
+    // Stat-only: only the type matters.
     auto entry = namespace_entry(*index->snapshot, &nodes, q, false);
     if (!entry)
         fail(ENOENT, "not found");
@@ -1661,17 +1625,9 @@ std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::stri
         return {};
     std::vector<std::pair<std::string, FsEntry>> result;
     result.reserve(children->second.size());
-    // The children come back WITH their extents, and that is not an oversight.
-    // A listing looks like stat data and is not: the manage API computes
-    // file_media_id() over what readdir returns, and file_media_id hashes the
-    // extent list. Handing it a stat-only entry does not fail -- it hashes an
-    // empty list and returns a different id that looks exactly as valid as the
-    // right one, which then fails to match any catalogue binding.
-    //
-    // Found by making exactly that mistake here: the invariants suite caught
-    // it deterministically, three runs out of three. Trimming a listing to
-    // stat data belongs to Stage D, after an audit of what every caller does
-    // with the entries rather than with the names.
+    // Children carry their extents: the manage API computes file_media_id()
+    // over readdir results, and a stat-only entry would silently hash an empty
+    // extent list into a wrong but valid-looking id.
     for (const auto& [name, child_path] : children->second) {
         if (auto child = namespace_entry(*index->snapshot, &nodes, child_path))
             result.emplace_back(name, *child);
@@ -1719,25 +1675,22 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
     case FilesystemNamespaceMutation::Kind::rmdir: {
         if (q == "/")
             fail(EBUSY, "root");
-        // Stat-only: only the type decides whether this is an rmdir at all.
+        // Stat-only: only the type matters.
         auto entry = working.get(q, false);
         if (!entry)
             fail(ENOENT, "missing");
         if (entry->type != EntryType::directory)
             fail(ENOTDIR, "not directory");
-        // Namespace entries are ordered by path, so a directory's children are
-        // the entries immediately after it -- one bounded lookup on a map, and
-        // a descent to the prefix on a tree, rather than a namespace scan per
-        // recovered rmdir.
+        // Entries are path-ordered, so children follow the directory: one
+        // bounded lookup, not a namespace scan.
         if (working.first_path_under(q))
             fail(ENOTEMPTY, "not empty");
         working.erase(q);
         return {};
     }
     case FilesystemNamespaceMutation::Kind::unlink: {
-        // With extents: every extent this file held becomes a retirement
-        // tombstone, and a stat-only read here would retire nothing and leak
-        // every object the file owned.
+        // With extents: each becomes a retirement tombstone; a stat-only read
+        // would leak every object the file owned.
         auto entry = working.get(q);
         if (!entry)
             fail(ENOENT, "missing");
@@ -1761,8 +1714,7 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
             return {};
         if (under(y, x))
             fail(EINVAL, "recursive rename");
-        // Stat-only for the two type checks; the entries that actually move
-        // are read whole below, extents and all.
+        // Stat-only for the type checks; moving entries are read whole below.
         auto src = working.get(x, false);
         if (!src)
             fail(ENOENT, "source missing");
@@ -1787,10 +1739,8 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
             }
             working.erase(y);
         }
-        // A rename moves a subtree, so it is the one operation whose cost is
-        // the subtree rather than the path. The entries come back whole
-        // because they are being re-keyed, not inspected: dropping their
-        // extents here would empty every file the rename touched.
+        // Entries are re-keyed whole; dropping extents here would empty every
+        // file in the subtree.
         for (auto& [path, entry] : working.subtree(x)) {
             const auto target = y + path.substr(x.size());
             working.erase(path);
@@ -1845,9 +1795,9 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
     if (operations.empty())
         throw std::invalid_argument("filesystem namespace batch is empty");
 
-    // Write handles are path-backed: after the transaction, every successful
-    // rename re-points the open handles beneath it (under the registry lock,
-    // which is not held across the mutation itself -- see open_write()).
+    // Write handles are path-backed: after the transaction, each rename
+    // re-points open handles beneath it under the registry lock, which is not
+    // held across the mutation.
     FilesystemNamespaceBatchResult result;
     result.entries.resize(operations.size());
     result.record = m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
@@ -1863,11 +1813,8 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
                     apply_namespace_mutation(working, snapshot, delta, operations[i]);
                 ++result.applied;
             } catch (const FsError& error) {
-                // With no valid prefix there is nothing to publish. Preserve
-                // the old error behaviour and leave the durable queue head in
-                // place. Otherwise commit the largest valid prefix and report
-                // the blocking operation to the caller -- unless the caller
-                // asked for all-or-nothing.
+                // No valid prefix, or all-or-nothing: throw. Otherwise commit
+                // the largest valid prefix and report the failing operation.
                 if (!result.applied || atomic)
                     throw;
                 result.failure_code = error.code();
@@ -1875,20 +1822,17 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
                 break;
             }
         }
-        // Individual filesystem methods previously emitted at most one erase
-        // (rename already canonicalised its subtree). A batch can accumulate
-        // erases in syscall order, while the delta wire format deliberately
-        // requires canonical sorted/unique paths.
+        // A batch accumulates erases in syscall order; the delta wire format
+        // requires sorted, unique paths.
         std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
         delta.erase_entries.erase(
             std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
             delta.erase_entries.end());
     }, 8, identity);
     if (identity && !result.applied) {
-        // mutate_delta() found the identity clock already at or past this
-        // batch: an earlier attempt (or a peer's merge of it) committed the
-        // whole batch. Report it as fully applied; entries are resolved from
-        // the current snapshot by the caller if it needs them.
+        // The identity clock was already past this batch: an earlier attempt
+        // committed it whole. Report fully applied; entries are left to the
+        // caller to resolve.
         result.applied = operations.size();
     }
 
@@ -2066,11 +2010,9 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         }
         return {};
     }
-    // Media ids are content-addressed from the immutable file manifest. Once an
-    // id has been resolved, unrelated namespace generations cannot make that
-    // manifest point at different bytes. Serve cache hits from the snapshot that
-    // built the index; only a miss consults current metadata. This keeps rsync's
-    // mkdir/create/chmod generation churn out of playback negotiation.
+    // Media ids are content-addressed, so a resolved id stays valid across
+    // generations: hits come from the indexing snapshot, and only a miss
+    // consults current metadata, keeping namespace churn out of playback.
     {
         std::lock_guard lock(media_index_mutex_);
         if (media_index_valid_ && media_index_snapshot_) {
@@ -2088,8 +2030,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         -> std::optional<std::pair<std::string, FsEntry>> {
         std::lock_guard lock(media_index_mutex_);
 
-        // Another lookup may have populated this id while the snapshot was
-        // acquired. Prefer that immutable hit first.
+        // Another lookup may have indexed this id meanwhile.
         if (media_index_valid_ && media_index_snapshot_) {
             auto found = media_index_.find(std::string(id));
             if (found != media_index_.end()) {
@@ -2103,9 +2044,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         }
 
         std::map<std::string, std::string> next;
-        // A full pass with extents: file_media_id hashes the extent list, which
-        // is why the plan lists persisting it as Stage D work -- this walk is
-        // the media index rebuild it exists to make cheaper.
+        // Full pass with extents: file_media_id hashes the extent list.
         auto index_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
         for_each_namespace_entry(*view.snapshot, &index_nodes,
                                  [&](const std::string& path, const FsEntry& entry) {
@@ -2132,11 +2071,9 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         return std::pair{found->second, *entry};
     };
 
-    // Playback resolution is a data-plane operation. MetadataManager already
-    // owns a decoded immutable view in normal settled operation; use it before
-    // doing any quorum read. A hit is safe even if the view is slightly old
-    // because media IDs are content-derived. A miss is definitive only when the
-    // available view has caught up with every generation this node knows about.
+    // Try the decoded view before any quorum read. A hit is safe on a stale
+    // view (ids are content-derived); a miss is definitive only once the view
+    // has caught up with every generation this node knows of.
     if (auto available = m_.current()) {
         if (auto found = install_and_lookup(*available))
             return found;
@@ -2144,9 +2081,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
             return {};
     }
 
-    // Only a genuinely stale/missing decoded view may require authoritative
-    // metadata I/O. This preserves correctness for a just-published media ID
-    // without putting routine cold playback behind a multi-second quorum read.
+    // Only a stale or missing view pays for the authoritative read.
     const auto authoritative = m_.converged();
     return install_and_lookup(authoritative);
 }
@@ -2172,12 +2107,9 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
                                                     bool cache_puts, WriteDurability durability,
                                                     uint64_t publication_pipeline_bytes,
                                                     DataWorkContext work_context) {
-    // open_writes_mutex_ serializes path lookup/registration with rename's
-    // handle fix-up so an opening writer cannot miss a rename between
-    // resolving the entry and joining the registry. It is never held across
-    // a metadata mutation (0.32.4): truncation is a cluster round trip and
-    // ran under it, as did every commit, so all publications on a node were
-    // serialized behind one WAN-bound commit at a time.
+    // open_writes_mutex_ serialises lookup/registration with rename's handle
+    // fix-up, so an opening writer cannot miss a rename. Never held across a
+    // metadata mutation, which would serialise every publication on the node.
     if (trunc) {
         auto existing = resolve_existing_path(p);
         if (!existing)
@@ -2263,10 +2195,9 @@ std::vector<WriteHandleDiagnostics> FileSystem::active_write_diagnostics(const s
 void FileSystem::commit_write(WriteHandle& handle, const FsEntry& expected, uint64_t z,
                               const std::vector<ExtentRef>& xs, FsEntry* out,
                               std::optional<int64_t> mtime_override) {
-    // Snapshot the handle's current path under the registry lock and commit
-    // outside it. A rename that lands between the two moves the entry away
-    // from `path`: the mutation then finds no entry ("removed while open"),
-    // the caller retries, and by then rename's fix-up has updated path_.
+    // Path read under the registry lock, commit outside it. A rename in
+    // between fails the commit ("removed while open"); the retry sees the
+    // fixed-up path_.
     std::string path;
     {
         std::lock_guard handles(open_writes_mutex_);
@@ -2284,34 +2215,25 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
     m_.mutate_delta([&](MetadataSnapshot& s, MetadataDelta& delta) {
         auto nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
         NamespaceWorkingSet working(s, delta, &nodes);
-        // With extents: this compares them against the basis the handle opened
-        // with, and retires the ones the new manifest does not keep.
+        // With extents: compared against the basis, and dropped ones retired.
         auto entry = working.get(q);
         if (!entry)
             fail(ENOENT, "removed while open");
         auto& current = *entry;
 
-        // chmod/chown/utimens may legitimately run against an open write handle
-        // (macOS cp does exactly this).  Those operations advance the inode
-        // version but do not change file content, so they must not invalidate
-        // the data writer.  Reject only if the content observed when the handle
-        // opened has actually changed.
+        // chmod/chown/utimens on an open handle (macOS cp) bump the version
+        // without changing content; reject only a content change.
         if (current.version != expected.version &&
             (current.size != expected.size || current.extents != expected.extents)) {
-            // Permanently unrecoverable for this handle: `expected` was
-            // captured when it opened and the entry has moved past it, so
-            // retrying with the same basis fails identically forever. A
-            // publication says so with ESTALE, which drops the writer and
+            // Retrying this basis fails forever; a publication gets ESTALE and
             // replays the generation from the spool against current state.
             if (stale_basis_is_replayable)
                 fail(ESTALE, "publication basis is stale; replay against the current entry");
             fail(EAGAIN, "concurrent file content change");
         }
 
-        // If somebody explicitly changed mtime while this handle was open, keep
-        // that value.  This is required for cp -p / macOS copyfile semantics,
-        // which can set timestamps before the final flush/close.  Otherwise a
-        // successful data write updates mtime normally.
+        // Keep an mtime set explicitly while open (cp -p, macOS copyfile set
+        // it before the final close); otherwise the write updates it.
         const bool explicit_mtime = current.mtime_ns != expected.mtime_ns;
 
         std::set<ObjectId> retained;
@@ -2338,11 +2260,9 @@ void FileSystem::commit_file(const std::string& p, const FsEntry& expected, uint
         current.ctime_ns = now;
         ++current.version;
         committed = current;
-        // record_entry_change decides between an upsert and an append, and the
-        // working set must not overwrite that choice -- an append is what keeps
-        // a growing file's delta proportional to what was added rather than to
-        // the whole extent list. So the delta is written by record_entry_change
-        // and the working set is told only what the map form still needs.
+        // record_entry_change chooses upsert or append (keeping a growing
+        // file's delta proportional to what was added); the working set must
+        // not override it, so only the map form is updated here.
         record_entry_change(delta, q, &previous, committed);
         if (!working.tree_backed())
             s.entries[q] = committed;
@@ -2385,16 +2305,11 @@ std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const 
 
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     auto ns = n_.membership().active();
-    // Only nodes that host extents hold capacity worth counting; an edge
-    // node contributes nothing and must not be an entity in the water-level
-    // calculation (its capacity is 0, but its presence changes the replica
-    // and failure-domain arithmetic).
+    // Edge nodes hold no extents and must not enter the water-level
+    // calculation: their presence would skew replica and failure-domain maths.
     std::erase_if(ns, [](const NodeInfo& node) { return !node_hosts_extents(node); });
-    // In the first seconds after a start the membership view can be empty
-    // or carry peers whose capacity has not been exchanged yet; statfs then
-    // answered 0 blocks and `df` showed a 0-byte filesystem (gbni-2,
-    // 2026-09-07). Fall back to this node's own store so the mount never
-    // reports less than what it can hold by itself.
+    // Membership may be empty or lack capacities just after start; never
+    // report less than this node's own store.
     const auto local_fallback = [&]() -> std::pair<uint64_t, uint64_t> {
         const uint64_t limit = n_.local_store().limit();
         const uint64_t used = std::min(limit, n_.local_store().used());
@@ -2454,11 +2369,9 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
                 live.push_back(extent.id);
         }
     };
-    // The reachability walk, and the one that decides what GC may delete. It
-    // goes through for_each_namespace_entry so that a snapshot whose namespace
-    // is a tree is walked rather than read as empty -- an empty live set here
-    // is not a small mistake, it is every extent in the library looking
-    // unreachable at once.
+    // The reachability walk GC trusts. for_each_namespace_entry walks a
+    // tree-backed namespace; an empty live set would make every extent look
+    // unreachable.
     auto namespace_nodes = ControlNamespaceNodeStore::for_reading(n_, s_);
     size_t walked_entries = 0;
     for_each_namespace_entry(snapshot, &namespace_nodes,
@@ -2467,9 +2380,8 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
                                  add_entry_extents(entry);
                              });
 
-    // Unresolved conflict alternatives are reachability roots just as surely as
-    // the effective namespace. Count their physical extents for diagnostics and
-    // protect their immutable objects from GC until explicit resolution.
+    // Unresolved conflict alternatives are reachability roots until resolved;
+    // their extents are counted and protected from GC.
     for (const auto& [_, conflict] : snapshot.conflicts) {
         if (conflict.kind != MetadataConflictKind::namespace_entry)
             continue;
@@ -2484,9 +2396,8 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     std::sort(live.begin(), live.end());
     live.erase(std::unique(live.begin(), live.end()), live.end());
 
-    // Preserve committed tombstone identity here. Service maintenance combines
-    // filesystem and catalogue liveness before deciding whether a retirement is
-    // a collection candidate; retaining retired_at_ns also makes pruning ABA-safe.
+    // Tombstones keep retired_at_ns: maintenance combines filesystem and
+    // catalogue liveness before collecting, and it makes pruning ABA-safe.
     auto garbage = snapshot.garbage;
     std::sort(garbage.begin(), garbage.end(), [](const GarbageRef& a, const GarbageRef& b) {
         if (a.id != b.id)
@@ -2504,9 +2415,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     built->garbage = std::move(garbage);
     built->metadata_generation = view.generation;
     built->observed_mutations = snapshot.mutation_sequences;
-    // Counted during the walk: a tree-backed snapshot has no map to size, and
-    // an inventory reporting zero entries over a full library would read as a
-    // library that had vanished.
+    // Counted during the walk: a tree-backed snapshot has no map to size.
     built->entries = walked_entries;
     built->extents = extents;
 

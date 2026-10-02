@@ -133,18 +133,16 @@ std::vector<GarbageRef> Maintenance::collect_garbage(const std::vector<GarbageRe
     matured.reserve(garbage.size());
 
     for (const auto& candidate : garbage) {
-        // A zero retirement time denotes a legacy tombstone. It is deliberately
-        // ineligible until maintain_garbage_metadata() stamps it into the new
-        // lifecycle, giving existing stores a fresh full grace period on upgrade.
+        // A zero retirement time marks a legacy tombstone: ineligible until
+        // maintain_garbage_metadata() stamps it, which grants a full grace period.
         if (candidate.retired_at_ns <= 0 || now_ns < candidate.retired_at_ns ||
             now_ns - candidate.retired_at_ns < grace_ns)
             continue;
 
-        // A matured tombstone no longer protects the object from the physical
-        // reachability sweep. Do not delete authoritative bytes here: the sweep
-        // performs an atomic age-check-and-remove, so a recently reaffirmed
-        // identical object survives even if this retirement view is stale. A
-        // cache copy is disposable and can be dropped immediately.
+        // A matured tombstone no longer protects the object from the reachability
+        // sweep. Authoritative bytes are not deleted here: the sweep's atomic
+        // age-check-and-remove spares a recently reaffirmed object even if this view
+        // is stale. A cache copy is disposable and goes now.
         node_.block_cache().remove(candidate.id);
         matured.push_back(candidate);
     }
@@ -177,9 +175,8 @@ void Maintenance::maintain_garbage_metadata(const std::vector<GarbageRef>& erase
             auto expected = stamp_expected.find(current.id);
             if (expected == stamp_expected.end() || expected->second != current)
                 continue;
-            // Legacy tombstones have neither a retirement time nor an ABA token.
-            // Stamping rather than immediately collecting them preserves old
-            // storage safely while allowing them to leave metadata after grace.
+            // Legacy tombstones have no retirement time or ABA token; stamping them
+            // keeps old storage safe while letting them leave metadata after grace.
             current.retired_at_ns = retired;
             current.retirement_id = random_node_id();
             delta.upsert_garbage.push_back(current);
@@ -214,26 +211,21 @@ void Maintenance::run(std::stop_token stop) {
     double network_credit = 0.0;
     double local_credit = 0.0;
     // Replica repair shares time with every higher class by weight, in the
-    // same duty-cycle form the FUSE frontend uses for viewer:loader. Until
-    // 0.59.0 repair was switched off outright while anything was busy (a zero
-    // busy fraction, and a yield on any activity), so a node that was always
-    // ingesting never repaired: gbni-1 was still short of a copy of roughly
-    // 0.9 TB when es-1 went on 2026-09-24, and that data was lost with it.
+    // duty-cycle form the FUSE frontend uses for viewer:loader. It is paced, never
+    // switched off: a node that is always busy must still repair.
     WeightedLoaderService repair_share(policy.foreground_weight, policy.repair_weight,
                                        std::chrono::milliseconds(25));
     double scrub_credit = 0.0;
     ClaimWalk data_claim_walk(RetentionClass::data);
     ClaimWalk control_claim_walk(RetentionClass::control);
-    // Why the destructive DATA sweep did not run, logged at DEBUG only when
-    // the answer changes. Without it "GC is not reclaiming" has no line to
-    // read; the 2026-09-15 artwork leak was diagnosed blind.
+    // Why the destructive DATA sweep did not run, logged at DEBUG when the answer
+    // changes.
     std::string last_gc_skip_reason;
     bool release_horizon_incomplete_logged = false;
 
-    // The decision trace (T1): every gate's verdict and inputs on every pass
-    // that evaluates it, and every action when it happens. A consumer keeps
-    // the settled verdicts; how many passes ran is timing, not a decision.
-    // Nothing is recorded without a hook.
+    // The decision trace: every gate's verdict and inputs on each pass that
+    // evaluates it, and every action as it happens. Pass counts are timing, not
+    // decisions. Nothing is recorded without a hook.
     const auto trace_gate = [&](std::string_view gate, bool open, const std::string& inputs) {
         if (maintenance_trace_)
             maintenance_trace_(gate, (open ? "open " : "shut ") + inputs);
@@ -313,13 +305,8 @@ void Maintenance::run(std::stop_token stop) {
             playback_bytes > 0 || store_.foreground_idle_for() < policy.foreground_quiet;
         const bool interactive_busy =
             interactive_bytes > 0 || store_.interactive_idle_for() < policy.foreground_quiet;
-        // Law 3: the loader outranks background work, so background work has to
-        // be able to see it. Until 0.53.0 this decision was the two viewer
-        // classes alone, and an ingest feeds neither -- so a node importing
-        // 36 GB called itself idle and handed maintenance its idle share of a
-        // disk the import was waiting on (gbni-1, 2026-09-22: sdb at 91%
-        // utilisation, macha-maint reading 51.6 MB/s, the import writing
-        // 2.8 MB/s, and busy_bandwidth_fraction already set to 0.0).
+        // Law 3: the loader outranks background work, so loader activity (an
+        // ingest) counts as busy too.
         const bool loader_busy =
             loader_bytes > 0 || store_.loader_idle_for() < policy.foreground_quiet;
         // Priority law: playback/seek > mounted MachaDFS/useful prefetch >
@@ -327,10 +314,8 @@ void Maintenance::run(std::stop_token stop) {
         // suppress background work, while the transport queues themselves keep
         // playback above mount I/O.
         bool busy = playback_busy || interactive_busy || loader_busy;
-        // A peer's viewers pace repair exactly as this node's own do: repair's
-        // transfers share their links, so it takes its weighted turns while
-        // they play. Paced, never stopped -- a copy not restored now makes a
-        // later viewer wait, and a node is usually serving someone.
+        // A peer's viewers pace repair as this node's own do, since repair shares
+        // their links: paced, never stopped, or a later viewer waits for the copy.
         const bool peer_viewers = node_.peer_viewers_active(
             std::max(node_.config().telemetry_interval * 3, std::chrono::milliseconds(3000)));
         const bool repair_busy = busy || peer_viewers;
@@ -371,10 +356,9 @@ void Maintenance::run(std::stop_token stop) {
         bool gc_due_this_pass = false;
         bool repair_continue = false;
         try {
-            // Remote generation notices wake no kernel/FUSE path and perform no
-            // metadata-replica I/O themselves. The maintenance owner advances the coherent
-            // local metadata snapshot promptly, while settled verification remains
-            // a bounded periodic control-plane task.
+            // Remote generation notices do no kernel/FUSE or replica I/O themselves; this
+            // owner advances the local metadata snapshot promptly, and settled
+            // verification stays a bounded periodic task.
             bool metadata_ready_for_dependants = !metadata_dirty;
             if (metadata_dirty &&
                 (metadata_retry_due == Clock::time_point{} || now >= metadata_retry_due)) {
@@ -423,12 +407,10 @@ void Maintenance::run(std::stop_token stop) {
                                     std::min(policy.no_progress_backoff,
                                              std::max(metadata_retry_backoff * 2,
                                                       maintenance_background_interval(policy)));
-                                // In 0.19, inability to validate/reconcile every active
-                                // metadata head must not stall non-destructive DATA repair.
-                                // A locally committed branch remains a valid source of live
-                                // object reachability while reconciliation is pending.
-                                // Destructive GC below is independently fenced on `stable`,
-                                // so continuing here can only add/repair replicas.
+                                // Failing to reconcile every active head must not
+                                // stall non-destructive DATA repair: a locally
+                                // committed branch is still a valid reachability
+                                // source. Destructive GC is fenced on `stable`.
                                 const auto local = node_.metadata_replica().committed();
                                 if (node_.metadata_replica().recovery_required() ||
                                     local.generation <= 1)
@@ -458,11 +440,9 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // Catalogue GETs are memory-only. Convergence therefore belongs here:
-            // generation notices (or the short validation TTL) trigger a refresh
-            // independently of foreground activity, while the normal settled-state
-            // verification remains an idle/background operation. This keeps remote
-            // catalogue changes live without ever putting metadata-replica I/O on an API thread.
+            // Catalogue GETs are memory-only, so convergence happens here: generation
+            // notices (or the short validation TTL) trigger a refresh regardless of
+            // foreground activity, keeping replica I/O off API threads.
             if (metadata_ready_for_dependants &&
                 (catalogue_dirty || catalogue_.refresh_needed()) &&
                 (catalogue_retry_due == Clock::time_point{} || now >= catalogue_retry_due)) {
@@ -513,12 +493,10 @@ void Maintenance::run(std::stop_token stop) {
                 auto release = ledger_.release();
                 auto objects = builder_.namespace_objects();
                 bool rebuilt_inventory = false;
-                // Rebuilding runs the catalogue's repair (maintenance_objects),
-                // which this pass holds back until metadata is ready. A repair
-                // step alone does not force it early: it works from the last
-                // inventory until then. Repair runs every pass since 0.72.0,
-                // and without this it refreshed the catalogue ahead of the
-                // metadata convergence it depends on.
+                // Rebuilding runs the catalogue's repair (maintenance_objects), held back
+                // until metadata is ready, so the catalogue never refreshes ahead of the
+                // metadata convergence it depends on; a repair-only step uses the last
+                // inventory until then.
                 const bool repair_only = network_due && !garbage_due && !gc_due;
                 if ((!inventory || !inventory->catalogue_complete() ||
                      inventory->generation() != objects->metadata_generation) &&
@@ -545,11 +523,9 @@ void Maintenance::run(std::stop_token stop) {
                             flag("catalogue_complete", inventory->catalogue_complete()));
                     observations().add("maintenance.inventory.live_objects",
                                        inventory->size(RetentionClass::data));
-                    // A newly-derived reachability set is never consumed by a
-                    // destructive sweep in the same pass. Schedule exactly one
-                    // follow-up after the foreground quiet boundary; without
-                    // this deadline an otherwise quiescent service would have
-                    // no reason to wake and consume the safe inventory.
+                    // A newly derived reachability set is never consumed destructively in the
+                    // pass that built it. Schedule one follow-up after the foreground quiet
+                    // boundary, or a quiescent service would never wake to consume it.
                     gc_quiescent_until = clock_->now() + policy.foreground_quiet;
                 }
                 if (rebuilt_inventory && Log::enabled(LogLevel::all)) {
@@ -572,13 +548,8 @@ void Maintenance::run(std::stop_token stop) {
                     // The walk stopped at its per-step bound with claims left;
                     // repair is not quiescent until a walk reaches the end.
                     bool retained_walk_unfinished = false;
-                    // Presence is an index lookup and costs no credit; only a
-                    // missing claimed object, which may be fetched, needs an
-                    // extent of it. Until 0.72.1 every claim examined was
-                    // charged an extent (ensure_local() answers true for
-                    // "already here" as well as "restored") and read back in
-                    // full: on 2026-09-29 that spent all of both nodes' credit
-                    // on objects they held, and repair moved no bytes at all.
+                    // Presence is an index lookup and costs no credit; only a missing claimed
+                    // object, which may be fetched, needs an extent of credit.
                     struct CreditedRestorer final : ClaimRestorer {
                         DistributedStore& store;
                         double& credit;
@@ -753,12 +724,10 @@ void Maintenance::run(std::stop_token stop) {
                     }
                 }
 
-                // The catalogue control live-set is derived from the same immutable
-                // metadata inventory as DATA reachability.  A foreground catalogue
-                // mutation may advance metadata after that inventory was built.  Never
-                // sweep the control store using such a stale set: with a zero/short
-                // grace period it could delete a newly-published manifest or shard
-                // before the next maintenance pass observes the successor generation.
+                // The catalogue control live-set comes from the same inventory as DATA
+                // reachability. A foreground catalogue mutation may advance metadata after
+                // it was built; never sweep the control store with such a stale set, or a
+                // short grace could delete a newly published manifest or shard.
                 const auto current_metadata_view = metadata_.current();
                 const auto release_metadata_view = metadata_.release_head();
 
@@ -820,14 +789,11 @@ void Maintenance::run(std::stop_token stop) {
                         Log::debug("catalogue control GC removed=" + std::to_string(removed));
                 }
 
-                // Physical mark/sweep also catches objects that never acquired a
-                // tombstone at all (for example, a DATA put followed by process
-                // death before metadata commit acceptance). Recent tombstones are protected for
-                // the same grace interval, and legacy tombstones remain protected
-                // until their first 0.10.x maintenance stamp has committed.
-                // Retention claims are checked immediately before every
-                // physical delete, so an inventory that predates a newer
-                // metadata generation remains safe for orphan cleanup.
+                // Physical mark/sweep also catches objects that never got a tombstone (a DATA
+                // put followed by process death before commit acceptance). Recent and legacy
+                // (unstamped) tombstones stay protected for the grace interval. Retention
+                // claims are checked before every physical delete, so an inventory older
+                // than the metadata generation is still safe for orphan cleanup.
                 facts.known_generation = node_.known_metadata_generation();
                 const auto data = data_gate(facts, inventory.get());
                 const std::string& gc_skip_reason = data.reason;
@@ -874,12 +840,10 @@ void Maintenance::run(std::stop_token stop) {
 
                     enter_stage("garbage-collect");
                     const auto gc_stage = Clock::now();
-                    // Tombstones carry their own exact retirement deadline.
-                    // Untombstoned bytes, however, may be the data half of an
-                    // in-flight publication and have no causal marker yet. Give
-                    // that orphan sweep one retry window before it may reclaim;
-                    // a zero tombstone grace must not collapse this write/claim
-                    // safety window to zero.
+                    // Tombstones carry their own retirement deadline. Untombstoned bytes may be
+                    // the data half of an in-flight publication with no causal marker yet, so the
+                    // orphan sweep waits one retry window; a zero tombstone grace must not
+                    // collapse that window.
                     const auto orphan_grace =
                         std::max(policy.garbage_grace, policy.no_progress_backoff);
                     auto gc = node_.local_store().gc_step(
@@ -943,10 +907,9 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // Local maintenance advances persistent filesystem cursors. A scheduler
-            // slice examines at most 64 objects and yields immediately to foreground
-            // work; it never rebuilds a complete object list merely to discover that
-            // placement is already correct.
+            // Local maintenance advances persistent filesystem cursors: a slice examines
+            // at most 64 objects, yields to foreground work, and never rebuilds a full
+            // object list to find placement already correct.
             if (!busy && now >= local_quiescent_until &&
                 local_credit >= node_.config().extent_size) {
                 enter_stage("local-rebalance");
@@ -973,31 +936,22 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // Retention publication appends are deliberately batched but still
-            // safety-critical durable records. Compact them only on the background
-            // owner so foreground metadata latency never pays checkpoint rewrite
-            // cost. Snapshot-before-truncate makes interruption idempotent.
+            // Retention publication appends are batched but safety-critical. Compact them
+            // only here, so foreground metadata never pays the checkpoint rewrite.
+            // Snapshot-before-truncate makes interruption idempotent.
             if (!busy) {
                 enter_stage("retention-compact");
                 (void)ledger_.compact_if_needed(4096);
             }
 
-            // Metadata ancestry is only ever re-rooted once a durable,
-            // cluster-wide proof establishes the exact same accepted-head
-            // hash as every durably-known participant's ancestry floor --
-            // see MetadataManager::attempt_history_checkpoint() and
-            // HistoryCheckpointProof. The prior generation-only status check
-            // allowed a returning accepted branch to outlive the common
-            // ancestor on every replica; this protocol replaces it. A no-op
-            // most ticks: it returns immediately unless local size
-            // thresholds are actually due, and aborts silently -- retrying
-            // next cycle -- unless every participant is currently reachable
-            // and already agrees on a single head.
-            // An accepted head this replica cannot replay locally is excluded
-            // from reads (MetadataReplica cooldown) and re-anchored here from
-            // any peer that can still materialize it -- the live alternative
-            // to the old restart-and-quarantine path. A no-op unless a head
-            // is actually flagged.
+            // Metadata ancestry is re-rooted only once a durable cluster-wide proof shows
+            // every durably-known participant's ancestry floor at the same accepted head
+            // (MetadataManager::attempt_history_checkpoint(), HistoryCheckpointProof).
+            // Usually a no-op: it returns unless size thresholds are due, and aborts,
+            // retrying next cycle, unless every participant is reachable and agrees.
+            // An accepted head this replica cannot replay is excluded from reads
+            // (MetadataReplica cooldown) and re-anchored here from any peer that can
+            // materialize it. A no-op unless a head is flagged.
             try {
                 enter_stage("head-repair");
                 (void)metadata_upkeep_.repair_unreconstructable_heads();
@@ -1016,10 +970,9 @@ void Maintenance::run(std::stop_token stop) {
                 }
             }
 
-            // Packed DATA tombstones are physical dead space. Compact one
-            // victim pack per backend at a time; unlike the old whole-store
-            // rewrite this has a fixed temporary-space envelope and therefore
-            // remains viable on multi-terabyte backends.
+            // Packed DATA tombstones are dead space. Compact one victim pack per backend
+            // at a time, so the temporary-space envelope is fixed even on multi-terabyte
+            // backends.
             if (!busy) {
                 enter_stage("compact-packs");
                 (void)node_.local_store().compact_packs(stop);
@@ -1043,10 +996,8 @@ void Maintenance::run(std::stop_token stop) {
                 if (scrub.yielded) {
                     Log::trace("maintenance: scrub yielded to foreground I/O");
                 } else if (scrub.complete) {
-                    // A proactive scrub is a low-frequency integrity campaign. Once
-                    // the complete physical pass finishes, stay genuinely idle until
-                    // the next scheduled campaign instead of restarting after the
-                    // generic no-progress backoff used by repair/rebalance.
+                    // A proactive scrub is a low-frequency campaign: once a full pass finishes,
+                    // stay idle until the next scheduled one rather than the no-progress backoff.
                     scrub_credit = 0.0;
                     const auto completed = clock_->wall_ms();
                     const auto interval_ms = static_cast<uint64_t>(policy.scrub_interval.count());
@@ -1078,12 +1029,10 @@ void Maintenance::run(std::stop_token stop) {
         }
 
         if (gc_due_this_pass && !busy) {
-            // An immature tombstone is concrete future work, not a reason for a
-            // maintenance cadence. Once a GC pass has evaluated the final
-            // accepted inventory, arm one exact steady-clock wake for its
-            // earliest wall-clock retirement deadline. Without this, the
-            // protected object makes the physical sweep look quiescent and it
-            // can sleep forever unless an unrelated event happens after grace.
+            // An immature tombstone is future work. Once a GC pass has evaluated the
+            // final accepted inventory, arm one exact wake for its earliest retirement
+            // deadline; otherwise the protected object makes the sweep look quiescent and
+            // it could sleep indefinitely.
             const auto grace_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(policy.garbage_grace).count();
             const auto wall_now_ns = clock_->wall_ns();
@@ -1115,12 +1064,10 @@ void Maintenance::run(std::stop_token stop) {
         cpu_reporter.tick();
         auto deadline = Clock::time_point::max();
         const auto now_after_work = clock_->now();
-        // `complete()` can turn an in-flight burst into one pending follow-up
-        // without emitting another external service event. A dirty owner with
-        // no retry delay is therefore runnable now; sleeping until an unrelated
-        // event loses the edge and can strand metadata (and its catalogue
-        // dependent) indefinitely. The same rule applies when catalogue repair
-        // deliberately leaves one more current-state pass to perform.
+        // `complete()` can turn an in-flight burst into one pending follow-up without
+        // another external event, so a dirty owner with no retry delay is runnable
+        // now; sleeping would lose the edge and strand metadata and its catalogue
+        // dependent. Likewise when catalogue repair leaves one more pass to perform.
         if (metadata_dirty)
             deadline =
                 std::min(deadline, metadata_retry_due == Clock::time_point{} ? now_after_work
@@ -1135,11 +1082,9 @@ void Maintenance::run(std::stop_token stop) {
             if (gc_quiescent_until > now_after_work) {
                 deadline = std::min(deadline, gc_quiescent_until);
             } else if (!gc_due_this_pass && !busy) {
-                // Work earlier in this pass (notably metadata reconciliation)
-                // may run across an exact GC deadline. Re-evaluate immediately
-                // instead of discarding that elapsed deadline and sleeping
-                // indefinitely. Once a due pass has evaluated GC, gc_due is
-                // true and normal event-driven quiescence still applies.
+                // Work earlier in this pass may run past an exact GC deadline: re-evaluate
+                // at once rather than sleep indefinitely. Once GC has been evaluated, gc_due
+                // holds and event-driven quiescence applies.
                 deadline = std::min(deadline, now_after_work);
             }
         }
@@ -1161,19 +1106,9 @@ void Maintenance::run(std::stop_token stop) {
         }
 
         if (busy) {
-            // A busy pass suppressed GC, repair and rebalance; it must hand
-            // the decision back once the foreground goes quiet. Until 0.41.1
-            // it armed that wake-up only while the foreground was still
-            // inside its quiet period at the end of the pass. A pass that
-            // started busy and ended after the quiet period had elapsed --
-            // with the GC window already expired, so the GC deadline above
-            // did not apply either -- slept for the next unrelated event
-            // (the scrub deadline: days). Measured on the writer of a
-            // catalogue burst: one maintenance pass in 27 s, `busy=1
-            // gc_quiet_ms=-2 wait_ms=2591999883`, four superseded artwork
-            // objects never reclaimed (2026-09-15, 1-2 in 60 runs). Now the
-            // pass re-evaluates as soon as the quiet period is met, and at
-            // once when it already has.
+            // A busy pass suppressed GC, repair and rebalance; it re-evaluates as soon as
+            // the foreground quiet period is met, or at once if it already has, rather
+            // than sleeping until an unrelated event.
             auto idle = std::min({store_.foreground_idle_for(), store_.interactive_idle_for(),
                                   store_.loader_idle_for()});
             deadline = std::min(deadline, now_after_work + (idle < policy.foreground_quiet
@@ -1214,10 +1149,8 @@ void Maintenance::run(std::stop_token stop) {
         }
         credit_deadline(local_credit, local_quiescent_until);
 
-        // A maintenance action can itself commit metadata (for example,
-        // retiring a matured garbage marker). That commit is a real event and
-        // must not be lost merely because it arrived before this pass reached
-        // the condition-variable wait.
+        // A maintenance action can itself commit metadata (retiring a matured garbage
+        // marker, say); that event must not be lost for arriving before the wait.
         if (port_.event.load(std::memory_order_acquire) != observed_event)
             continue;
 

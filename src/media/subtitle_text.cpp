@@ -6,11 +6,9 @@
 namespace macha {
 
 std::string plain_ass_subtitle_text(std::string text) {
-    // FFmpeg exposes decoded ASS/SSA rectangles as an event payload, not the
-    // full source-file Dialogue line. Its canonical event form is:
-    // ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-    // (eight commas before Text). Treat an optional Dialogue: prefix as input
-    // tolerance, then strip exactly those event fields.
+    // FFmpeg's decoded ASS/SSA rectangle is an event payload, not a Dialogue line:
+    // ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text (eight
+    // commas before Text). Tolerate a Dialogue: prefix, then strip those fields.
     if (text.starts_with("Dialogue:")) {
         text.erase(0, 9);
         while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))

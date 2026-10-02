@@ -20,10 +20,9 @@ enum class FfmpegLogLevel : unsigned char {
 std::string_view ffmpeg_log_level_name(FfmpegLogLevel) noexcept;
 FfmpegLogLevel parse_ffmpeg_log_level(std::string_view);
 
-// Installs Macha's process-wide libav log callback and configures libav's own
-// admission threshold. Messages admitted here bypass Macha's normal log-level
-// filter and are written through the same logger sink with their mapped
-// severity. This keeps Macha and FFmpeg verbosity independently configurable.
+// Installs the process-wide libav log callback and libav's own threshold.
+// Admitted messages bypass Macha's log-level filter and reach the same sink
+// at mapped severity, keeping the two verbosities independent.
 void configure_ffmpeg_logging(FfmpegLogLevel);
 
 } // namespace macha

@@ -65,13 +65,11 @@ std::string lower(std::string value) {
     return value;
 }
 
-// The container vocabulary lives in media_containers.hpp; what remains here
-// is the two shapes playback asks it about -- a probe result and a stream.
 std::string source_container(const MediaProbeResult& probe, std::string_view path) {
     return container_for_format(probe.format, path);
 }
 
-// Content-Type for serving the source unchanged, from the media info.
+// Content-Type for serving the source unchanged.
 std::string source_mime(const MediaProbeResult& probe, std::string_view path) {
     const bool picture = std::any_of(probe.streams.begin(), probe.streams.end(), [](const auto& stream) {
         return stream.type == MediaStreamType::video && !stream.attached_picture;
@@ -90,25 +88,19 @@ struct ByteRange {
     bool partial{};
 };
 
-// A well-formed, coherent instruction this node cannot carry out. The only
-// current case is a stream copy into a container that cannot hold that codec.
-// Distinct from invalid_argument because nothing is malformed: another node on
-// another build may accept the identical request, and a transcode would
-// succeed here. Reaches the client as 422 copy_not_supported with
-// scope=node and alternative_may_succeed=true, so a recovering client asks a
-// neighbour for the copy before giving the copy up.
+// A well-formed instruction this node cannot carry out (a stream copy into a
+// container that cannot hold the codec). Another node may accept it, so it
+// reaches the client as 422 copy_not_supported, scope=node,
+// alternative_may_succeed=true.
 class PlaybackCapabilityError final : public std::invalid_argument {
   public:
     using std::invalid_argument::invalid_argument;
 };
 
-// The instruction leaves a choice open, or names something the media does not
-// have, and the server does not fill the gap. Operator, 2026-09-24: "The
-// server supplies facts, operations, then does what it's told." One candidate
-// is a fact and is used; several with no instruction, or an instruction that
-// matches none or several, is refused with the candidates so the client can
-// choose. Reaches the client as 400 with `choice` naming what is open and
-// `choices` listing the candidates; every node would answer the same.
+// The instruction leaves a choice open or names something the media lacks; the
+// server never fills the gap. One candidate is used; otherwise the request is
+// refused as 400 with `choice` naming what is open and `choices` listing the
+// candidates. Every node would answer the same.
 class PlaybackChoiceError final : public std::invalid_argument {
   public:
     PlaybackChoiceError(std::string code, std::string choice, const std::string& message,
@@ -125,14 +117,9 @@ class PlaybackChoiceError final : public std::invalid_argument {
     Json::Array choices_;
 };
 
-// The account cap refuses differently from every other limit here, and the
-// difference is not cosmetic. A client recovering from a refusal decides
-// whether another node is worth trying; a node-wide or transcode limit is a
-// property of this node, and an account cap is identical on every node in the
-// cluster. Core walks on the former and must not on the latter -- charging
-// every healthy node it passes turns one account at its limit into a cluster
-// core believes is failing. So this carries its own code, and the limit and
-// the current count, rather than sharing the generic resource_limit envelope.
+// An account cap is identical on every node, so unlike node limits a client
+// must not walk the cluster on it. It carries its own code, the limit and the
+// current count rather than the generic resource_limit envelope.
 class AccountSessionLimitError final : public std::runtime_error {
 public:
     AccountSessionLimitError(size_t held, size_t limit)
@@ -162,48 +149,20 @@ private:
     size_t limit_;
 };
 
-// The single parse of a stream URL, used by BOTH the router and the
+// The single parse of a stream URL, used by both the router and the
 // authentication exemption. They must never disagree: a path the exemption
-// calls a stream request but the router sends somewhere else is an
-// authentication bypass, and keeping two spellings of "is this a stream
-// request" is exactly how that happens. The exemption used to be a bare
-// starts_with on the old top-level prefix, which was safe only because the
-// stream lived at a root of its own; nested under the session it is not.
+// treats as a stream but the router sends elsewhere is an authentication bypass.
 struct StreamRoute {
     std::string_view session_id;
     std::string_view stream_path;
 };
 
-// A generation the client asked for is not the one this session is producing.
-// Two different facts share that shape and a client must act differently on
-// each, so they get different statuses.
-//
-// Below the current generation, the generation existed here and was replaced:
-// a seek, a track or quality change, a media switch, or a rebuilding seek.
-// That is 410 -- the object is permanently gone, the node is producing
-// perfectly, and the client must stop retrying and take the new stream.url
-// from the session route. 404 made a routine event (every regenerate makes
-// one) indistinguishable from a segment index that never existed, which a
-// client reasonably retries, and worse, indistinguishable from a node in
-// trouble.
-//
-// Above it, the generation never existed: nothing here has produced that far.
-// That stays 404. Generations only ever increment (one ++ site), so the
-// comparison is the whole test.
-//
-// Held back from 0.47.0 deliberately (operator, 2026-09-20) until
-// macha-client-core shipped tolerance: core maps an unrecognised fragment
-// status to `unknown` and treats `unknown` as evidence against the endpoint,
-// so emitting this early would have charged a healthy node and built a standby
-// that could not help. Core's tolerance maps 410 onto its existing `not-found`
-// kind -- same required action, and an obligation existing hosts already meet
-// -- and ships with the release that moves these routes.
-// The axes matter more than the status here. `request` says do not walk the
-// cluster: no other node has this session, so a walk collects a stale URL's
-// refusal N times and charges N healthy nodes for it. `node_healthy` says this
-// node is fine, which is the correction the status exists to make.
-// `alternative_may_succeed` is the instruction to the client in one field --
-// a different request, the new stream.url, succeeds on this same node.
+// A requested generation that is not the current one. Below current it was
+// replaced (seek, track or quality change, media switch): 410, the client takes
+// the new stream.url from the session. Above current it never existed: 404.
+// Generations only increment, so the comparison is the whole test.
+// Axes: scope=request (no other node has this session, so do not walk),
+// node healthy, and a different request (the new stream.url) succeeds here.
 HttpResponse generation_gone(uint64_t requested, uint64_t current) {
     if (requested < current)
         return http_error(410, "generation_superseded", "stream generation superseded",
@@ -212,12 +171,8 @@ HttpResponse generation_gone(uint64_t requested, uint64_t current) {
     return http_error(404, "not_found", "stream generation not found");
 }
 
-// The stream token is a capability, so comparing it with std::string's == is a
-// secret-dependent branch: it returns at the first differing character. Remote
-// timing exploitation across a network against 256 bits of hex is not a
-// practical attack, which is why this was recorded rather than rushed -- but
-// the compare costs the same either way and there is then no question to
-// answer. Lengths are allowed to differ; a length mismatch is not secret.
+// The stream token is a capability: compare in constant time. A length
+// mismatch is not secret.
 bool stream_token_matches(const std::string& expected, const std::string& provided) {
     return constant_time_equal(
         {reinterpret_cast<const uint8_t*>(expected.data()), expected.size()},
@@ -244,8 +199,8 @@ class ResourceLimitError final : public std::runtime_error {
 class PlaybackStageError final : public std::runtime_error {
     std::string trace_;
     std::string stage_;
-    // Set when the engine said why it could not read the source. The reason
-    // travels out to the client unchanged; the server does not act on it.
+    // The engine's reason it could not read the source; passed to the client
+    // unchanged, never acted on.
     std::optional<MediaFailure> failure_;
 
   public:
@@ -258,7 +213,6 @@ class PlaybackStageError final : public std::runtime_error {
     const std::optional<MediaFailure>& failure() const noexcept { return failure_; }
 };
 
-// Wraps a stage failure, carrying the engine's reason when there is one.
 PlaybackStageError stage_error(std::string trace, std::string stage, const std::exception& error) {
     if (const auto* media = dynamic_cast<const MediaError*>(&error))
         return PlaybackStageError(std::move(trace), std::move(stage), media->what(),
@@ -340,8 +294,7 @@ class MemoryBody final : public HttpBodySource {
         std::copy_n(bytes_->data() + base_ + offset, wanted, destination.data());
         return wanted;
     }
-    // Already in memory for as long as this body lives: the server sends
-    // straight from it.
+    // Resident for the body's lifetime, so the server sends straight from it.
     const uint8_t* resident() const noexcept override { return bytes_->data() + base_; }
 };
 
@@ -367,17 +320,14 @@ HttpResponse ranged_response(const HttpRequest& request, uint64_t size, std::str
 }
 
 struct PlaybackPreferences {
-    // Required. The server performs what it is asked for and never chooses:
-    // "direct" (the source object over byte ranges), "remux" (copy the
-    // streams into an HLS container) or "transcode" (re-encode them).
+    // Required; the server never chooses: "direct" (source over byte ranges),
+    // "remux" (copy into HLS) or "transcode" (re-encode).
     std::string mode;
-    // Per-stream overrides of that shorthand, "copy" or "transcode", so a
-    // client can ask for any mixture (copy the video, re-encode the audio)
-    // without the server inferring anything.
+    // Per-stream overrides of `mode`: "copy" or "transcode".
     std::optional<std::string> video;
     std::optional<std::string> audio;
     // HLS segment container, "fmp4" or "mpegts". Required for remux and
-    // transcode: there are always two, so a default would be a choice.
+    // transcode: a default would be a choice.
     std::string container;
     std::optional<int> max_height;
     std::optional<uint64_t> max_bitrate;
@@ -411,21 +361,11 @@ PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences cur
     if (!value || !value->isObject()) return current;
     if (auto mode = value->find("mode"); mode && mode->isString()) {
         current.mode = lower(mode->asString());
-        // `mode` is the shorthand for the whole transform, so naming it
-        // restates the transform: the per-stream and quality instructions
-        // that belonged to the previous mode do not outlive it. An update
-        // naming both sets both, since these are read after the mode.
-        //
-        // Without this an update naming only `mode` was refused for a
-        // combination the server assembled itself out of the session's
-        // history: a session created as a transcode with the video copied
-        // answered `{"mode":"direct"}` with "direct copies every stream",
-        // against a request the client never made. Because the chooser's
-        // usual answer for this library is transcode-with-the-video-copied,
-        // that was every session, and the Direct and Remux controls failed
-        // for viewers on most of the library (2026-09-08). It is the same
-        // rule the session already applied when asking what a different mode
-        // would do; see without_mode_overrides.
+        // Naming `mode` restates the whole transform: the previous mode's
+        // per-stream and quality instructions do not outlive it, so the server
+        // never refuses a combination it assembled from session history. An
+        // update naming both sets both (these are read after the mode). Same
+        // rule as without_mode_overrides.
         current.video.reset();
         current.audio.reset();
         current.max_height.reset();
@@ -461,8 +401,7 @@ PlaybackPreferences parse_preferences(const Json* value, PlaybackPreferences cur
     return current;
 }
 
-// The streams of a type a plan may use. An attached picture is artwork, not a
-// stream.
+// Streams of a type a plan may use; an attached picture is artwork, not a stream.
 std::vector<const MediaStreamInfo*> streams_of(const MediaProbeResult& probe, MediaStreamType type) {
     std::vector<const MediaStreamInfo*> out;
     for (const auto& stream : probe.streams)
@@ -478,15 +417,11 @@ std::vector<const MediaStreamInfo*> streams_of(const MediaProbeResult& probe, Me
                               message, std::move(choices));
 }
 
-// The stream the instruction names, and only that. An index, or a language
-// matching exactly one stream, is used; a type with exactly one stream is a
-// fact and that stream is used. Several with no instruction, or an
-// instruction matching none or several, is refused with the candidates: the
-// server does not choose, and it never answers a language it does not have
-// with a different one (until 0.58.0 it fell back to the default stream).
-// `none_is_an_answer` is true where no instruction means "none of them":
-// subtitles, and every stream of media served untouched, whose tracks the
-// player chooses for itself.
+// The stream the instruction names: an index, a language matching exactly one
+// stream, or the only stream of the type. Otherwise refused with the
+// candidates; the server never chooses or substitutes another language.
+// `none_is_an_answer`: no instruction means "none" (subtitles, and direct
+// play, where the player picks its own tracks).
 const MediaStreamInfo* chosen_stream(const MediaProbeResult& probe, MediaStreamType type,
                                      const std::optional<int>& index, std::string_view language,
                                      bool none_is_an_answer) {
@@ -522,10 +457,8 @@ const MediaStreamInfo* chosen_stream(const MediaProbeResult& probe, MediaStreamT
                          candidates);
 }
 
-// Execute the client's instruction against the media's facts. The client's
-// advertised capabilities are deliberately not a parameter: the server
-// reports what the media is and performs what it is asked for, it does not
-// choose (operator, 2026-09-07).
+// Executes the client's instruction against the media's facts. Client
+// capabilities are deliberately not a parameter: the server does not choose.
 PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& prefs) {
     if (prefs.mode != "direct" && prefs.mode != "remux" && prefs.mode != "transcode")
         throw std::invalid_argument(
@@ -533,8 +466,7 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
             "reports what the media is and performs what it is asked for, it does not choose");
     if (streams_of(probe, MediaStreamType::video).empty() && streams_of(probe, MediaStreamType::audio).empty())
         throw std::runtime_error("media contains no playable audio or video stream");
-    // Direct serves the file untouched and the player picks its own tracks,
-    // so there is nothing to choose unless the client names a stream.
+    // Direct: the player picks its own tracks unless the client names one.
     const bool untouched = prefs.mode == "direct";
     auto video = chosen_stream(probe, MediaStreamType::video, prefs.video_stream, {}, untouched);
     auto audio = chosen_stream(probe, MediaStreamType::audio, prefs.audio_stream, prefs.audio_language,
@@ -555,9 +487,8 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
     plan.video_codec = video ? lower(video->codec) : std::string{};
     plan.audio_codec = audio ? lower(audio->codec) : std::string{};
 
-    // Direct is the source object itself over byte ranges: no container
-    // change and no re-encode. Asking for one alongside it describes something
-    // direct is not doing, so it is refused rather than quietly ignored.
+    // Direct is the source over byte ranges; a re-encode or quality
+    // instruction alongside it is refused, not ignored.
     if (prefs.mode == "direct") {
         if ((prefs.video && *prefs.video != "copy") || (prefs.audio && *prefs.audio != "copy"))
             throw std::invalid_argument(
@@ -571,8 +502,7 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
         return plan;
     }
 
-    // HLS. The segment container is the client's instruction too, and there
-    // is no default: fMP4 and MPEG-TS are both real options.
+    // HLS: the segment container has no default.
     if (prefs.container.empty())
         throw PlaybackChoiceError("choice_required", "container",
                                   "preferences.container is required for remux and transcode: fmp4 or mpegts",
@@ -581,10 +511,8 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
 
     const auto source_video_codec = video ? lower(video->codec) : std::string{};
     const auto source_audio_codec = audio ? lower(audio->codec) : std::string{};
-    // `mode` is the shorthand: remux copies both streams, transcode
-    // re-encodes both. `preferences.video` / `preferences.audio` override
-    // either one, which is how a client asks for the common mixture (copy
-    // the video, re-encode the audio) without the server inferring anything.
+    // remux copies both streams, transcode re-encodes both;
+    // preferences.video / preferences.audio override either.
     const bool transcode_shorthand = prefs.mode == "transcode";
     bool video_copy = !video || !transcode_shorthand;
     bool audio_copy = !audio || !transcode_shorthand;
@@ -608,12 +536,9 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
         video_copy = false;
     }
 
-    // The mode has to describe what is actually being done. remux repackages
-    // and copies every stream; transcode re-encodes at least one and may copy
-    // the other. A mode that names something it is not doing is refused, not
-    // silently reinterpreted: until 0.32.20 a remux with a re-encoded stream
-    // came back reported as a transcode, and a transcode with both streams
-    // copied came back reported as a remux (2026-09-07).
+    // The mode must describe what is done: remux copies every stream,
+    // transcode re-encodes at least one. A mismatch is refused, not
+    // reinterpreted.
     const bool re_encoding = (video && !video_copy) || (audio && !audio_copy);
     if (prefs.mode == "remux" && re_encoding)
         throw std::invalid_argument(
@@ -624,8 +549,7 @@ PlaybackPlan plan_for(const MediaProbeResult& probe, const PlaybackPreferences& 
             "transcode re-encodes at least one stream: to copy both into a new container, ask "
             "for mode=remux");
 
-    // What the segment container can physically carry. This is a fact about
-    // the media and the muxer, not about the client.
+    // What the segment container can carry: a fact of media and muxer.
     if (video && video_copy && plan.container == MediaContainer::fmp4 &&
         !fmp4_video_copy_supported(source_video_codec))
         throw PlaybackCapabilityError("fragmented MP4 cannot carry a copied " + source_video_codec +
@@ -713,11 +637,8 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
     const bool direct = plan.mode == PlaybackMode::direct;
     Json::Object out{{"format", direct ? std::string(source_format)
                                        : std::string(media_container_name(plan.container))},
-                     // What the client is actually being handed, stated the
-                     // same way the facts endpoint states a source container.
-                     // A client can ask for mpegts; without this it has no way
-                     // to see that it got it, and tonight is the argument
-                     // against reading a request back as evidence (2026-09-07).
+                     // What the client is handed, named as the facts
+                     // endpoint names a source container.
                      {"container", direct ? source_container(probe, source_path)
                                           : std::string(media_container_name(plan.container))}};
 
@@ -745,9 +666,7 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
             if (video->level) value["level"] = video->level;
             if (!video->color_transfer.empty()) value["color_transfer"] = video->color_transfer;
         } else if (plan.video == MediaTransform::transcode) {
-            // What the encoder actually emits, so a client can tell a
-            // downconverted PQ source from a gate that did nothing: 8-bit
-            // 4:2:0 H.264 High with an SDR transfer.
+            // What the encoder emits: 8-bit 4:2:0 H.264 High, SDR transfer.
             value["profile"] = "High";
             value["bit_depth"] = 8;
             value["color_transfer"] = "bt709";
@@ -761,8 +680,7 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
                            {"transform", transform_name(plan.audio)},
                            {"codec", plan.audio_codec}};
         if (plan.audio == MediaTransform::transcode) {
-            // A codec change is not a downmix. The encoder keeps the source's
-            // channel layout, so report it rather than a stereo assumption.
+            // The encoder keeps the source channel layout; no downmix.
             const auto channels = audio->channels > 0 ? audio->channels : 2;
             value["channels"] = channels;
             value["sample_rate"] = audio->sample_rate > 0 ? audio->sample_rate : 48000;
@@ -824,34 +742,28 @@ struct PlaybackManager::Impl {
         std::shared_ptr<SubtitleCache> subtitle_cache{std::make_shared<SubtitleCache>()};
         Clock::time_point touched{Clock::now()};
         Clock::time_point stream_touched{Clock::now()};
-        // Has this session ever served a stream object -- playlist, fragment,
-        // subtitle or direct body? stream_touched cannot answer that: it is
-        // set at construction and reset by every start_pipeline(), so it says
-        // "not recently", never "not ever". Set once and never cleared: a
-        // session that has been used stays used across a seek or a quality
-        // change, and keeps the full session_idle.
+        // Whether any stream object (playlist, fragment, subtitle, direct body)
+        // was ever served. stream_touched is reset by start_pipeline(), so it
+        // cannot say "never". Never cleared: a used session keeps the full
+        // session_idle across seeks and quality changes.
         bool stream_served{false};
         size_t active_stream_requests{};
         std::shared_ptr<LogicalViewerSession> logical_session;
-        // The account this session is held against: what the collection
-        // listing filters on and what the per-account cap counts. Sessions
-        // stopped belonging to a bearer, so the owner has to be recorded
-        // rather than re-derived from whoever is asking.
+        // The owning account: the collection listing filters on it and the
+        // per-account cap counts it. Recorded, not derived from the requester.
         std::string account;
-        // Set on a session created with `start=async`: what its start has
-        // reached. On the placeholder while pending, and on the session that
-        // replaces it once ready.
+        // `start=async` progress: on the placeholder while pending, then on
+        // the session that replaces it.
         std::shared_ptr<StartState> start;
         // A replacement generation an async PATCH is starting while this one
         // keeps serving. Guarded by the Impl mutex.
         std::shared_ptr<PendingReplacement> pending;
     };
 
-    // An async start. The session map holds the admitted placeholder --
-    // counted against every cap, owned, deletable -- while a start worker
-    // builds the real session beside it and swaps it in when its first
-    // fragment exists. GET and long-polls read this, never the half-built
-    // session.
+    // An async start. The session map holds the admitted placeholder (counted
+    // against every cap, owned, deletable) while a worker builds the real
+    // session and swaps it in once its first fragment exists. GET and
+    // long-polls read this, never the half-built session.
     struct StartState {
         std::mutex mutex;
         std::string stage{"planning"};
@@ -897,12 +809,10 @@ struct PlaybackManager::Impl {
     FileSystem& fs;
     CatalogueManager& catalogue;
     StreamingConfig config;
-    // Node-global: a fairness and memory bound across every session, not a
-    // property of any one of them.
+    // Node-global fairness and memory bound across all sessions.
     SegmentHoldArbiter segment_holds{config.max_session_holds, config.max_concurrent_holds};
-    // What a held segment request parks across its deferral: the admitted
-    // hold, released when the request is finally answered or its connection
-    // goes away, whichever comes first.
+    // Parked across a held segment request's deferral; the hold is released
+    // when the request is answered or its connection goes away.
     struct HeldRequest {
         SegmentHoldArbiter::Hold hold;
         explicit HeldRequest(SegmentHoldArbiter::Hold admitted) : hold(std::move(admitted)) {}
@@ -914,9 +824,8 @@ struct PlaybackManager::Impl {
     std::condition_variable_any cleanup_cv;
     uint64_t cleanup_revision{};
     std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
-    // Client keys are advisory local reconciliation handles, never cluster
-    // ownership. Weak values ensure an expired/deleted logical session leaves
-    // no permanent server-side playback state.
+    // Client keys are advisory local handles, never cluster ownership. Weak
+    // values leave no state behind an expired or deleted logical session.
     std::map<std::string, std::weak_ptr<LogicalViewerSession>, std::less<>> logical_sessions;
     // In-flight creations per account, so concurrent creates cannot race past
     // the cap. Guarded by `mutex`, emptied as each create settles.
@@ -942,16 +851,15 @@ struct PlaybackManager::Impl {
     std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache;
     std::deque<std::string> vod_plan_cache_order;
     static constexpr size_t max_vod_plan_cache_entries = 64;
-    // Session/pipeline admission happens before a newly-created pipeline is
-    // visible in `sessions`.  Reserve those slots explicitly so concurrent
-    // POST/PATCH requests cannot all pass the same resource-limit check.
+    // Admission precedes visibility in `sessions`, so slots are reserved
+    // explicitly: concurrent POST/PATCH cannot all pass the same limit check.
     size_t pending_sessions{};
     size_t reserved_video_transcodes{};
     size_t reserved_audio_transcodes{};
     // Transcode entitlements reserved per account and not yet committed.
     std::map<std::string, size_t, std::less<>> reserved_account_transcodes;
-    // Transcoding pipelines running now, as the concurrency a rate
-    // observation was taken at.
+    // Transcoding pipelines running now: the concurrency a rate observation
+    // was taken at.
     std::atomic<uint32_t> running_transcodes{};
     uint64_t idle_pipelines_reclaimed{};
     uint64_t unused_sessions_reclaimed{};
@@ -972,9 +880,8 @@ struct PlaybackManager::Impl {
         return bytes;
     }
 
-    // Precondition: profile_publish_mutex is held. This retry cache is an
-    // optimization, not durable state; a broken metadata publisher must not
-    // turn successful playback probes into an unbounded process-lifetime owner.
+    // Precondition: profile_publish_mutex held. A bounded retry cache, not
+    // durable state: a broken publisher must not make it grow without limit.
     void queue_profile_publication(std::string media_id, MediaProbeResult probe) {
         const auto weight = probe_resident_weight(probe) + media_id.size();
         if (weight > max_pending_profile_publication_bytes)
@@ -1000,9 +907,8 @@ struct PlaybackManager::Impl {
         pending_profile_publication_bytes += weight;
     }
 
-    // Precondition: mutex is held. Immutable identity makes entries valid, but
-    // validity is not ownership: this process cache has a hard count and byte
-    // lifetime independent of catalogue size and is safely repopulated.
+    // Precondition: mutex held. Bounded by count and bytes, independent of
+    // catalogue size; safely repopulated.
     void cache_probe(std::string key, MediaProbeResult probe) {
         const auto weight = probe_resident_weight(probe);
         if (weight > max_probe_cache_bytes)
@@ -1034,8 +940,7 @@ struct PlaybackManager::Impl {
     std::map<std::string, std::shared_ptr<IdempotentCreation>, std::less<>> idempotent_creations;
     // Failed async starts, readable until they expire. Guarded by `mutex`.
     std::map<std::string, FailedStart, std::less<>> failed_starts;
-    // Start workers still running, so stop() can wait for them. Guarded by
-    // `mutex`.
+    // Start workers still running, so stop() can wait for them. Guarded by `mutex`.
     size_t start_workers{};
     std::condition_variable_any start_workers_cv;
 
@@ -1050,42 +955,21 @@ struct PlaybackManager::Impl {
         (void)api;
     }
 
-    // A broken generation, as distinct from one that is merely not ready yet.
-    //
-    // 503, which is also what every intermediary emits when a service is
-    // genuinely down -- and that is deliberate. A dead node and a broken
-    // generation warrant the same conclusion from a client: this node cannot
-    // serve me, go elsewhere. Sharing the status with infrastructure is
-    // therefore harmless here, and it is what lets the hold have a status
-    // nothing else on the path can produce.
+    // A broken generation, not merely an unready one. 503 deliberately shares
+    // infrastructure's "service down" status: either way the client should go
+    // elsewhere, which leaves 500 free for the hold.
     static HttpResponse stream_failed(std::string_view detail) {
         return http_error(503, "stream_failed", detail);
     }
 
-    // The refusal: not absent, just not made yet. Never 404 -- the playlist
-    // promises this object exists, a 404 invites an intermediary to cache the
-    // miss, and some players treat it as terminal.
-    //
-    // 500, which is the wrong status by the letter of the spec and the right
-    // one in practice. A client cannot read our JSON body on a fragment error:
-    // hls.js's XHR loader surfaces only `{code: xhr.status, text:
-    // xhr.statusText}`, the body is absent from the error event, and a header
-    // is reachable only through the raw XMLHttpRequest -- undocumented
-    // coupling that breaks if the default loader changes. So the status is the
-    // discriminator, and a discriminator readable only as a status has to be a
-    // status nothing else on the path can emit. 503 fails that test: every
-    // proxy, tunnel and load balancer emits it when a service is down, so a
-    // client classifying "503 means hold, stay on this node" would read a
-    // genuinely dead node as a healthy one and never fail over -- a silent,
-    // permanent stall. Misreading an infrastructure 500 as a hold costs a
-    // pointless retry instead. The two faults are not symmetric, and this
-    // picks the recoverable one. Both stay 5xx, because a 4xx stops hls.js
-    // retrying at all.
-    //
-    // Retry-After and no-store keep an intermediary from turning a transient
-    // answer into a durable one. hls.js ignores Retry-After on the fragment
-    // path -- it reads that header only in its content-steering loader -- so
-    // it is sent because it is correct, not because anything depends on it.
+    // Not made yet, not absent. Never 404: the playlist promises the object, an
+    // intermediary may cache the miss, and some players treat it as terminal.
+    // 500 because hls.js exposes only the status on a fragment error, so the
+    // status is the discriminator and must be one infrastructure does not emit
+    // for a dead node (503 would make a dead node look like a hold and stall
+    // forever; a proxy's 500 misread as a hold costs only a retry). 5xx, since a
+    // 4xx stops hls.js retrying. Retry-After and no-store stop an intermediary
+    // making the answer durable.
     static HttpResponse segment_not_ready(std::string_view session, uint64_t index,
                                           std::string_view reason) {
         Log::debug("playback stream refused session=" + std::string(session) +
@@ -1098,11 +982,8 @@ struct PlaybackManager::Impl {
     }
 
     std::string public_stream_prefix(const Session& session) const {
-        // The stream is a subresource of the session it belongs to, and the
-        // token sits immediately before the part it authorises: this session,
-        // proven by this token, this generation, this object. The token stays
-        // in the path because it is a capability, not a credential -- media
-        // players fetch segments without application headers.
+        // The token is a capability in the path, before the part it
+        // authorises: media players fetch segments without application headers.
         return "/api/v1/playback/sessions/" + session.id + "/stream/" + session.token;
     }
 
@@ -1146,8 +1027,8 @@ struct PlaybackManager::Impl {
         return to_string(sha256({reinterpret_cast<const uint8_t*>(text.data()), text.size()}));
     }
 
-    // The live pending replacement of a session, dropping one whose failure
-    // has been readable for long enough. Precondition: mutex held.
+    // The live pending replacement, dropping one whose failure has been
+    // readable long enough. Precondition: mutex held.
     std::shared_ptr<PendingReplacement> pending_locked(Session& session) {
         if (session.pending && session.pending->failed_until != Clock::time_point{} &&
             Clock::now() >= session.pending->failed_until)
@@ -1155,8 +1036,8 @@ struct PlaybackManager::Impl {
         return session.pending;
     }
 
-    // Stop a session's pending replacement and wait for its worker, which
-    // rolls its reservation back, so the next admission sees the slot free.
+    // Stops a pending replacement and waits for its worker to roll its
+    // reservation back, so the next admission sees the slot free.
     void cancel_pending(Session& session) {
         std::shared_ptr<PendingReplacement> taken;
         {
@@ -1194,9 +1075,8 @@ struct PlaybackManager::Impl {
         return Json(std::move(out));
     }
 
-    // A session whose async start is not ready: its admitted facts, its start,
-    // and the signed close that works before any stream exists. No stream URL
-    // until it is ready.
+    // A session whose async start is not ready: admitted facts, start progress
+    // and the close URL; no stream URL until ready.
     Json pending_json(const Session& placeholder, StartState& start) const {
         auto payload = session_json(placeholder);
         payload["stream"]["url"] = Json(nullptr);
@@ -1258,9 +1138,8 @@ struct PlaybackManager::Impl {
         }
     }
 
-    // Wait for the candidate's first fragment, publishing the engine's
-    // counters as they move and failing only when nothing has moved for
-    // startup_no_progress.
+    // Waits for the first fragment, publishing engine progress; fails only
+    // when nothing has moved for startup_no_progress.
     void wait_for_first_fragment_async(Session& session, StartState& start, std::string_view trace) {
         auto active = active_engine(session);
         if (!active) throw std::runtime_error("media pipeline did not start");
@@ -1309,9 +1188,9 @@ struct PlaybackManager::Impl {
         }
     }
 
-    // The start worker: plan, start the pipeline, wait on progress, then swap
-    // the built session in for the placeholder -- or record the failure and
-    // release everything at once.
+    // Start worker: plan, start, wait for the first fragment, then swap the
+    // built session in for the placeholder, or record the failure and release
+    // everything.
     void run_start(std::shared_ptr<Session> placeholder, std::shared_ptr<StartState> start,
                    std::string trace) {
         auto candidate = start->candidate;
@@ -1399,8 +1278,8 @@ struct PlaybackManager::Impl {
         start_workers_cv.notify_all();
     }
 
-    // An async PATCH's worker: build the replacement beside the playing
-    // generation and swap it in only when its first fragment exists.
+    // Async PATCH worker: builds the replacement beside the playing generation
+    // and swaps it in once its first fragment exists.
     void run_replacement(std::shared_ptr<Session> old, std::shared_ptr<PendingReplacement> pending,
                          std::string trace) {
         auto start = pending->start;
@@ -1502,17 +1381,11 @@ struct PlaybackManager::Impl {
         const bool pending = start_pending(session);
         auto payload = pending ? pending_json(session, *session.start) : session_json(session);
         payload["trace_id"] = std::move(trace);
-        // What this account may hold here and what it holds now, so a client
-        // can plan against the cap instead of discovering it by refusal at the
-        // worst moment. Counted live, under the lock, at the instant of the
-        // response: this is the most perishable number the API carries -- it
-        // moves whenever anyone on the account starts or stops anything, from
-        // a device neither end can see -- so it is deliberately absent from
-        // /api/v1/playback/status, which clients cache. A count that can only
-        // arrive fresh cannot be read stale.
+        // The account's cap and current holding, counted live under the lock.
+        // Deliberately absent from /api/v1/playback/status, which clients
+        // cache: this number changes whenever any device on the account acts.
         payload["account"] = account_state_json(session.account);
-        // Whether a keyed request created this session or replayed an existing
-        // one: the one fact here the client cannot infer from what it sent.
+        // Whether a keyed request created this session or replayed one.
         if (!idempotency_status.empty())
             payload["idempotency"] = std::string(idempotency_status);
         if (pending) payload["status"] = std::string("playback_starting");
@@ -1531,17 +1404,11 @@ struct PlaybackManager::Impl {
         }
     }
 
-    // THE KEY. Everything account-scoped in this file goes through here: the
-    // cap counts it and the collection listing filters on it.
-    //
-    // Per account, not per viewer, and that is the whole point: the threat is
-    // a rogue client launching a media DoS, and a per-viewer bound is no
-    // defence at all against a client that simply claims more viewers. The
-    // cost of the choice is that it also bounds a household, which is why the
-    // default is generous -- see max_sessions_per_account.
-    //
-    // An anonymous session has no user_id, so it is bounded as itself rather
-    // than joining every other anonymous caller in one bucket.
+    // The key for everything account-scoped: the cap and the collection
+    // listing. Per account, not per viewer, since a rogue client can claim any
+    // number of viewers (hence the generous max_sessions_per_account). An
+    // anonymous session is bounded as itself, not pooled with other anonymous
+    // callers.
     static std::string account_key(const SessionIdentity& identity) {
         if (!identity.user_id.empty())
             return identity.user_id;
@@ -1819,9 +1686,8 @@ struct PlaybackManager::Impl {
                           pending.first + " error=" + e.what());
                 std::unique_lock lock(profile_publish_mutex);
                 queue_profile_publication(pending.first, pending.second);
-                // A catalogue CAS conflict is transient. Preserve the completed
-                // scan and retry from this event-driven worker after a bounded
-                // backoff instead of forcing another foreground probe.
+                // A CAS conflict is transient: keep the completed probe and
+                // retry after a bounded backoff rather than re-probing.
                 profile_publish_cv.wait_for(lock, stop, std::chrono::milliseconds(250),
                                             [] { return false; });
             }
@@ -1829,19 +1695,9 @@ struct PlaybackManager::Impl {
         drain_profile_publications();
     }
 
-    // A queued profile is a container inspection that has already been paid
-    // for -- seconds of it on a large Matroska source, in the foreground, with
-    // a viewer waiting. Until 0.46.1 a stop broke out of the loop above and
-    // left whatever had not been published yet in memory, so every restart
-    // discarded the profiles probed in the moments before it and the next play
-    // of those titles paid for them again from scratch. Publish them on the
-    // way out instead.
-    //
-    // One commit for the whole queue, not one per entry: shutdown must stay
-    // prompt, and put_media_profiles() takes the catalogue mutation lock once.
-    // Failure here is not retried -- shutdown is not the place to fight a
-    // transient CAS conflict -- but it is reported, because a profile lost
-    // this way is silent work the node will repeat.
+    // Publishes queued profiles at shutdown so already-paid probes are not
+    // repeated after restart. One commit for the whole queue keeps shutdown
+    // prompt; failure is logged, not retried.
     void drain_profile_publications() {
         std::map<std::string, MediaProbeResult, std::less<>> pending;
         {
@@ -1910,7 +1766,7 @@ struct PlaybackManager::Impl {
     struct ResourceReservation {
         bool video{};
         bool audio{};
-        // The account's first entitlement for this logical viewer: counted
+        // The account's first entitlement for this logical viewer; counts
         // against max_transcodes_per_account until committed or rolled back.
         std::string account;
         bool account_slot{};
@@ -1955,9 +1811,8 @@ struct PlaybackManager::Impl {
         release_pending_account_locked(account);
     }
 
-    // Live sessions plus this account's in-flight creations. Counting only
-    // live ones would let a burst of concurrent creates walk straight past the
-    // cap, which is exactly the shape a rogue client would use.
+    // Live sessions plus in-flight creations, so a burst of concurrent creates
+    // cannot pass the cap.
     size_t sessions_held_by_locked(std::string_view account) const {
         size_t held = 0;
         for (const auto& [_, session] : sessions)
@@ -1991,8 +1846,7 @@ struct PlaybackManager::Impl {
         if (audio && audio_transcodes_locked(excluding) + reserved_audio_transcodes >=
                          config.max_audio_transcodes)
             throw ResourceLimitError("audio transcode limit reached");
-        // A logical viewer that holds no entitlement yet is a new transcoding
-        // viewer for its account; one already holding video or audio is not.
+        // Only a logical viewer holding no entitlement yet takes an account slot.
         const bool account_slot =
             (video || audio) && !session.logical_session->video_transcode_entitled &&
             !session.logical_session->audio_transcode_entitled;
@@ -2009,12 +1863,9 @@ struct PlaybackManager::Impl {
         return {video, audio, account_slot ? session.account : std::string{}, account_slot};
     }
 
-    // True when no session other than this one shares its logical viewer.
-    // Checked with only `mutex` held, deliberately: asking whether a sibling
-    // still has a running engine would mean taking that sibling's
-    // pipeline_mutex while holding this one's, and the answer is not worth a
-    // lock-ordering hazard in a background loop. Presence is the conservative
-    // proxy -- a sibling that exists keeps the entitlement, even if idle.
+    // True when no other session shares this logical viewer. Presence, not a
+    // running engine, is checked: that avoids taking a sibling's
+    // pipeline_mutex under `mutex`. An idle sibling keeps the entitlement.
     bool sole_session_for_logical_locked(const Session& keep) const {
         for (const auto& [id, other] : sessions) {
             if (other.get() == &keep) continue;
@@ -2029,25 +1880,10 @@ struct PlaybackManager::Impl {
                 session.logical_session->audio_transcode_entitled);
     }
 
-    // Until 2026-09-21 a transcode entitlement was held until the session was
-    // erased, so it outlived its own pipeline by session_idle: thirty minutes
-    // against sixty seconds. On a node admitting one transcode that meant a
-    // single abandoned session denied transcoding to everybody, which is
-    // exactly what three client sessions hit on fi-1 the day 0.48.0 shipped --
-    // 57 session creates, zero DELETEs, and seven refusals in half an hour to
-    // a viewer nobody was competing with.
-    //
-    // It now goes on transcode_entitlement_idle of no stream activity, which
-    // is deliberately not the pipeline's clock: a pipeline is cheap to rebuild
-    // and goes at sixty seconds, while the slot is worth holding a while
-    // longer for a viewer who is merely paused.
-    //
-    // Released per session and never as a node-wide sweep: this clears what
-    // this logical viewer holds and touches no other session and no other
-    // account. The entitlement is reacquired on resume like any other and may
-    // be refused then, which trades a certain half-hour outage for a possible
-    // refusal at the moment someone comes back -- and a refusal at resume is
-    // visible, attributable and recoverable, which the outage was not.
+    // Released after transcode_entitlement_idle without stream activity, so an
+    // abandoned session cannot hold a node's transcode slots for session_idle.
+    // Longer than the pipeline idle: a paused viewer keeps the slot a while.
+    // Per logical viewer only. Reacquired on resume, where it may be refused.
     void release_transcode_entitlements_locked(Session& session) {
         if (!session.logical_session) return;
         const bool held = session.logical_session->video_transcode_entitled ||
@@ -2059,12 +1895,8 @@ struct PlaybackManager::Impl {
                   session.id);
     }
 
-    // A session PATCHed out of transcode no longer needs the slot it was
-    // entitled to. Until 0.60.0 the entitlement stayed until the session went
-    // idle, so a viewer who switched to direct play held the node's only
-    // transcode slot for as long as they watched plus the idle period, and
-    // every other viewer's transcode was refused (fi-1, 2026-09-25 08:57Z).
-    // A sibling on the same logical viewer keeps it, as in the idle release.
+    // A session PATCHed out of transcode releases the entitlement at once,
+    // unless a sibling on the same logical viewer holds it.
     void release_unused_transcode_entitlements_locked(Session& session) {
         if (!session.logical_session || !sole_session_for_logical_locked(session)) return;
         auto& logical = *session.logical_session;
@@ -2118,9 +1950,8 @@ struct PlaybackManager::Impl {
         return plan.video == MediaTransform::transcode || plan.audio == MediaTransform::transcode;
     }
 
-    // A transcode generation that produced at least a minute of media says
-    // what this node sustained for its kind of source; record it as the
-    // generation ends.
+    // As a generation ends, records the rate this node sustained for its kind
+    // of source, if it produced at least a minute of media.
     void record_transcode_rate(const Session& session, MediaEngineSession& active) {
         if (!transcoding(session.plan)) return;
         const auto state = active.segments()->snapshot();
@@ -2148,8 +1979,7 @@ struct PlaybackManager::Impl {
             if (transcoding(session.plan) && running_transcodes.load() > 0) --running_transcodes;
             active->stop();
             // Destroy codec and segment owners before waking the asynchronous
-            // reclaimer. stop_pipeline() is also used by viewer-facing seek
-            // and reconfiguration paths, so it must never trim synchronously.
+            // reclaimer; seek and reconfiguration call this, so never trim here.
             active.reset();
             if (transformed(session.plan))
                 request_heap_reclaim();
@@ -2163,8 +1993,7 @@ struct PlaybackManager::Impl {
         auto started_at = Clock::now();
         const auto deadline = started_at + config.startup_timeout;
         const auto* progress = active->start_progress();
-        // What the pipeline has done so far, so a slow start shows where its
-        // time went: source bytes, transcode pre-roll, media past the origin.
+        // Where a slow start's time went: source bytes, pre-roll, output media.
         const auto progress_text = [&] {
             if (!progress) return std::string{};
             const auto total = progress->preroll_total_us.load(std::memory_order_relaxed);
@@ -2224,10 +2053,8 @@ struct PlaybackManager::Impl {
             << (plan.target_height ? *plan.target_height : -1) << '|'
             << (plan.target_video_bitrate ? *plan.target_video_bitrate : 0) << '|'
             << static_cast<int>(plan.container) << '|'
-            // The seek position is deliberately not part of the key: a cached
-            // plan is re-seeked on a hit (reseek_hls_vod), so a representation
-            // change at a new position no longer re-opens and re-indexes the
-            // container (2026-09-07: three container opens per PATCH).
+            // The seek position is not part of the key: a hit is re-seeked
+            // (reseek_hls_vod) rather than re-indexing the container.
             << config.segment_duration.count() << '|'
             << (session.preferences.mode != "remux" &&
                 false);
@@ -2248,11 +2075,9 @@ struct PlaybackManager::Impl {
             }
             if (cached) {
                 const auto requested_seek = session.plan.seek;
-                // Against the cached plan's honoured REQUEST, not its baseline.
-                // The two differ now that a remux generation begins at the
-                // keyframe before the request, and reusing a cached plan whose
-                // baseline happens to equal this request would publish that
-                // plan's offset for a position it was not measured from.
+                // Compare with the cached plan's requested seek, not its
+                // baseline: a remux generation starts at the keyframe before the
+                // request, so a matching baseline would publish a wrong offset.
                 auto reseeked = requested_seek == cached->playback.seek_requested
                                     ? std::optional<HlsVodPlan>(*cached)
                                     : reseek_hls_vod(*cached, requested_seek);
@@ -2358,12 +2183,8 @@ struct PlaybackManager::Impl {
                                    "/manifest.json";
     }
 
-    // Playback is by media_id and nothing else (operator, 2026-09-24): the
-    // client reads a title's files and their facts from
-    // GET /api/v1/playback/media?item_id=, chooses the file, the mode and the
-    // codecs, and names them here. Until 0.58.0 an item_id alone made the
-    // server rank the item's files direct > remux > transcode and play the
-    // first winner -- a choice that was never the server's.
+    // Playback is by media_id only: the client chooses the file, mode and
+    // codecs from GET /api/v1/playback/media?item_id= and names them here.
     std::shared_ptr<Session> resolve_session(const std::string& media_id, PlaybackPreferences preferences,
                                              std::string_view trace,
                                              std::string existing_id = {}, std::string existing_token = {}) {
@@ -2392,10 +2213,7 @@ struct PlaybackManager::Impl {
     std::shared_ptr<Session> reuse_seek_session(const Session& old,
                                                 std::chrono::milliseconds requested_seek,
                                                 std::string_view trace) {
-        // Every exit from here says why. Across a whole day on es-1 there were
-        // zero `seek fast-path` lines and nothing recorded which precondition
-        // was failing, so the slow path could not be told from a path that was
-        // never attempted.
+        // Every decline is logged with its reason.
         const auto declined = [&](const std::string& reason) {
             observations().add("playback.seek_fastpath.declined");
             Log::info("playback[" + std::string(trace) + "] seek fast-path declined media=" +
@@ -2442,10 +2260,8 @@ struct PlaybackManager::Impl {
         if (subtitle && !webvtt_subtitle_supported(*subtitle))
             throw std::invalid_argument("requested subtitle stream cannot be converted to WebVTT");
 
-        // Subtitle extraction is an independent WebVTT resource. Resolve only
-        // the subtitle selection here: re-running A/V negotiation could choose
-        // a different theoretical mode from the already-prepared live VOD
-        // generation. The active representation is deliberately copied intact.
+        // Subtitles are an independent WebVTT resource: only the subtitle
+        // selection changes; the active A/V generation is copied intact.
         auto session = std::make_shared<Session>();
         session->id = old.id;
         session->token = old.token;
@@ -2462,11 +2278,8 @@ struct PlaybackManager::Impl {
         session->stream_url = old.stream_url;
         session->subtitle_cache = old.subtitle_cache;
         session->logical_session = old.logical_session;
-        // Ownership travels with the session, not with the object. A
-        // replacement that drops it becomes unreachable to the account that
-        // made it -- 404 on its own GET, absent from its own listing -- and,
-        // worse, stops counting against the per-account cap, which turns a
-        // subtitle change into a way to launder sessions past the limit.
+        // Ownership must carry over, or the replacement is invisible to its
+        // account and escapes the per-account cap.
         session->account = old.account;
         if (session->plan.subtitle_stream >= 0) {
             session->subtitle_url = public_stream_prefix(*session) + "/" +
@@ -2481,9 +2294,8 @@ struct PlaybackManager::Impl {
         return session;
     }
 
-    // Whether some explicit instruction built from `preferences` would be
-    // carried out, filling each choice it leaves open with every candidate in
-    // turn. For reporting what the media supports, never for playing it.
+    // Whether some instruction built from `preferences`, trying every candidate
+    // for each open choice, would be carried out. For reporting only.
     bool some_plan_supported(const MediaProbeResult& probe, PlaybackPreferences preferences) const {
         const auto each = [&](MediaStreamType type, const std::optional<int>& named) {
             std::vector<std::optional<int>> out;
@@ -2519,9 +2331,8 @@ struct PlaybackManager::Impl {
                               {"audio_stream", session.plan.audio_stream},
                               {"subtitle_stream", session.plan.subtitle_stream}};
         // What else this media could be asked for. Per-stream transforms and
-        // quality belong to the mode that was asked for, so they are dropped
-        // when asking about a different one: carrying max_height into a remux
-        // probe asks an illegal question and answers "remux is unavailable".
+        // quality belong to the current mode and are dropped when asking about
+        // another (max_height would make every remux probe illegal).
         const auto without_mode_overrides = [](PlaybackPreferences preferences) {
             preferences.video.reset();
             preferences.audio.reset();
@@ -2542,8 +2353,7 @@ struct PlaybackManager::Impl {
             static constexpr std::array<int, 6> candidates{2160, 1440, 1080, 720, 480, 360};
             for (const auto height : candidates) {
                 if (height >= video->height) continue;
-                // A quality change is a re-encode, so the question is only
-                // ever "could this be transcoded to that height".
+                // A quality change is a re-encode.
                 auto preferences = without_mode_overrides(session.preferences);
                 preferences.mode = "transcode";
                 preferences.max_height = height;
@@ -2587,20 +2397,10 @@ struct PlaybackManager::Impl {
                             {"size", session.source.size},
                             {"bitrate", session.probe.bitrate},
                             {"streams", Json(std::move(streams))}};
-        // How far past the fragment it last asked for a client may arrive and
-        // still find media already produced: the producer runs to
-        // highest_requested + max_ahead_segments and then parks, and
-        // segment_hold_window is deliberately the same distance, so a request
-        // inside this window is one production is authorised to reach and a
-        // request outside it is one nothing is working toward.
-        //
-        // Reported as milliseconds rather than as the two knobs it is derived
-        // from. A count and a duration are two numbers the client has to
-        // multiply and then keep in step with ours -- a client that hardcoded
-        // 8 and 4000 silently under-runs on a node configured with 4 -- and
-        // the derived figure stays meaningful if this bound ever stops being
-        // counted in segments. Null for direct play, which has no pipeline and
-        // therefore no frontier.
+        // How far past its last requested fragment a client may ask and find
+        // production authorised: the producer parks at highest_requested +
+        // max_ahead_segments, matching segment_hold_window. Reported in ms so
+        // clients need not know the knobs. Null for direct play.
         const auto look_ahead_ms =
             static_cast<uint64_t>(config.max_ahead_segments) *
             static_cast<uint64_t>(std::max<int64_t>(0, config.segment_duration.count()));
@@ -2609,26 +2409,12 @@ struct PlaybackManager::Impl {
                             {"look_ahead_ms", session.plan.mode == PlaybackMode::direct
                                                   ? Json(nullptr) : Json(look_ahead_ms)},
                             {"subtitle_url", session.subtitle_url.empty() ? Json(nullptr) : Json(session.subtitle_url)}};
-        // How fast this generation is actually producing media, as a pair a
-        // client divides itself. Raw on purpose: a rate computed here is a
-        // rate with our smoothing and our window baked in, and a client
-        // deciding whether to hand over needs to pick those itself. One
-        // response answers it -- no polling, nothing on a viewer's path.
-        //
-        // producing_ms is encoder time with the parked interval removed, so
-        // the ratio is what this node COULD sustain, not what this viewer
-        // happened to ask for. Wall clock would read about 1.0x for anyone
-        // watching at normal speed and would say "cannot outrun realtime"
-        // about a node that comfortably can -- the answer that turns a
-        // workable handover into a stall.
-        //
-        // produced_ms is also the production frontier in media time, which is
-        // the other half of a handover decision: how long a join at position
-        // P must wait is (P - produced_ms) / (rate - 1).
-        //
-        // Absent for direct play, which has no pipeline, and zeroed until the
-        // first fragment lands. A client must treat producing_ms == 0 as "no
-        // reading yet" rather than as an infinite rate.
+        // Production rate as a raw pair the client divides, choosing its own
+        // smoothing. producing_ms excludes parked time, so produced/producing
+        // is what the node could sustain, not the viewer's pace. produced_ms is
+        // also the frontier in media time: a join at P waits
+        // (P - produced_ms) / (rate - 1). Absent for direct play; zero until
+        // the first fragment, so producing_ms == 0 means "no reading yet".
         if (session.plan.mode != PlaybackMode::direct) {
             if (auto active = active_engine(session)) {
                 const auto state = active->segments()->snapshot();
@@ -2644,23 +2430,13 @@ struct PlaybackManager::Impl {
                          {"media_id", session.source.media_id},
                          {"mode", playback_mode_name(session.plan.mode)},
                          {"duration_ms", static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0)},
-                         // The baseline, the offset into it, and the request
-                         // that was honoured. Exactly, in integer
-                         // milliseconds, with no tolerance:
-                         //
+                         // Exactly, in integer ms:
                          //     seek_ms + seek_offset_ms == seek_requested_ms
-                         //
-                         // seek_ms means what it has always meant -- where the
-                         // generation's media begins -- so a client that reads
-                         // only it behaves as before. seek_offset_ms is how far
-                         // into the generation the requested position sits, and
-                         // is zero exactly when the mode could begin there:
-                         // always for transcode and direct, and for remux when
-                         // the request was already a keyframe. seek_requested_ms
-                         // is what lets a client tell a violated invariant from
-                         // an ordinary clamp near the end of a title; those want
-                         // opposite handling, and without it they are the same
-                         // number.
+                         // seek_ms is where the generation's media begins;
+                         // seek_offset_ms is the requested position within it,
+                         // zero unless remux began at an earlier keyframe.
+                         // seek_requested_ms tells a violated invariant from a
+                         // clamp near the end of a title.
                          {"seek_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek.count()))},
                          {"seek_offset_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek_offset.count()))},
                          {"seek_requested_ms", static_cast<uint64_t>(std::max<int64_t>(0, session.plan.seek_requested.count()))},
@@ -2759,9 +2535,8 @@ struct PlaybackManager::Impl {
                 if (it == sessions.end() || it->second != session)
                     return http_error(404, "not_found", "stream not found");
                 session->touched = Clock::now();
-                // Direct Play is a stream object like any other: a single
-                // ranged body can outlive several idle windows without another
-                // request, so this must count as having been used.
+                // One ranged body can outlive several idle windows, so direct
+                // play counts as use.
                 session->stream_served = true;
                 signal_cleanup_locked();
             }
@@ -2786,11 +2561,9 @@ struct PlaybackManager::Impl {
         {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
-            // The session going away entirely is not-found: there is nothing
-            // to ask about any more. The session record being replaced is
-            // supersession by another name -- a subtitle change, a fast-path
-            // seek and a mode change each swap the record wholesale, and the
-            // generation the client holds went with the old one.
+            // A removed session is 404. A replaced record (subtitle change,
+            // fast-path seek, mode change) is supersession of the client's
+            // generation.
             if (it == sessions.end())
                 return http_error(404, "not_found", "stream generation not found");
             if (it->second != session)
@@ -2896,11 +2669,8 @@ struct PlaybackManager::Impl {
         if (!active) return http_error(404, "not_found", "transformed stream is not active");
         auto store = active->segments();
         if (name == "master.m3u8") {
-            // A real master playlist. Until 0.32.12 this URL answered with
-            // the media playlist itself, so no CODECS attribute ever reached
-            // the player and hls.js had to infer the source-buffer codecs
-            // from the init segment -- on an old MSE that dropped the muxed
-            // audio silently (Samsung Tizen 3, 2026-09-07).
+            // A real master playlist carrying CODECS, so players need not infer
+            // source-buffer codecs from the init segment.
             const MediaStreamInfo* video = nullptr;
             const MediaStreamInfo* audio = nullptr;
             for (const auto& stream : session->probe.streams) {
@@ -2917,12 +2687,9 @@ struct PlaybackManager::Impl {
             return response;
         }
         if (name == "media.m3u8") {
-            // No readiness gate. The playlist is complete from the moment the
-            // plan exists, so there is nothing to wait for -- the request that
-            // used to be held here is now the init and segment requests that
-            // follow it, which is the better channel for the wait: a fragment
-            // failure is fragLoadError rather than the levelLoadError a client
-            // weighs as node health.
+            // No readiness gate: the playlist is complete once the plan exists.
+            // Waits happen on fragments, whose failure (fragLoadError) clients
+            // do not weigh as node health the way they weigh levelLoadError.
             auto playlist = store->playlist();
             auto state = store->snapshot();
             Log::debug("playback stream playlist session=" + session->id +
@@ -2939,11 +2706,9 @@ struct PlaybackManager::Impl {
             response.headers["Cache-Control"] = "no-store";
             return response;
         }
-        // A complete VOD playlist promises every fragment before any of them
-        // exists, so a request for one that has not been produced yet is
-        // ordinary rather than erroneous. It is held -- but only as an
-        // explicitly admitted resource, and only for media something is
-        // actually working toward.
+        // The VOD playlist promises every fragment up front, so a request for
+        // an unproduced one is ordinary. It is held, but only when admitted and
+        // only for media production is working toward.
         const auto index = segment_index(name);
         const bool holdable_init =
             name == "init.mp4" && store->container() != MediaContainer::mpegts;
@@ -2952,20 +2717,16 @@ struct PlaybackManager::Impl {
         if (!object && (index || holdable_init)) {
             auto state = store->snapshot();
             if (!state.error.empty()) return stream_failed(state.error);
-            // Never promised: the playlist stops at the plan, and an index past
-            // it is a genuine miss rather than something to wait for.
+            // Past the plan: never promised, a genuine miss.
             if (index && state.planned_segments && *index >= state.planned_segments)
                 return http_error(404, "not_found", "stream object not found");
-            // A request the server parked earlier, woken because something
-            // was published or because its time ran out. It still owns the
-            // hold it was admitted with; nothing is re-admitted.
+            // A resumed request still owns its original hold; nothing is
+            // re-admitted.
             auto held = request.resumed
                             ? std::static_pointer_cast<HeldRequest>(request.resumed_state)
                             : std::shared_ptr<HeldRequest>{};
             if (!held) {
-                // Window. Beyond it nothing is working toward this fragment,
-                // so waiting for it would be waiting on work that has not
-                // been authorised to start.
+                // Beyond the window nothing is working toward this fragment.
                 if (index && *index >= state.segment_count + config.segment_hold_window)
                     return segment_not_ready(session->id, *index, "beyond_hold_window");
                 auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
@@ -2976,17 +2737,14 @@ struct PlaybackManager::Impl {
                                                  ? "session_hold_limit"
                                                  : "hold_budget_exhausted");
                 held = std::make_shared<HeldRequest>(std::move(*hold));
-                // Only now, admitted: noting an index we had declined to
-                // serve would drag the producer's authorised window forward
-                // on behalf of a request we refused.
+                // Noted only once admitted, so a refused request cannot drag
+                // the producer's window forward.
                 if (index) active->note_segment_requested(*index);
             }
-            // The wait itself costs no thread. The request asks the store
-            // for the object and, in the same locked step, subscribes to
-            // the next publication if it is not there; then it hands the
-            // server a deferral and returns. The server re-runs it when the
-            // store fires or the deadline passes. The hold rides along in
-            // the deferral's state and is released with it.
+            // The wait costs no thread: fetch-or-subscribe is one locked step,
+            // then the server is handed a deferral and re-runs the request when
+            // the store fires or the deadline passes. The hold rides in the
+            // deferral's state and is released with it.
             const auto deadline =
                 request.resumed ? request.resume_deadline
                 : config.segment_timeout.count() > 0
@@ -3014,9 +2772,7 @@ struct PlaybackManager::Impl {
         if (!object) {
             auto state = store->snapshot();
             if (!state.error.empty()) return stream_failed(state.error);
-            // The playlist promised this object, so its absence is "not yet",
-            // never "not there". A 404 invites an intermediary to cache the
-            // miss and some players treat it as terminal.
+            // Promised by the playlist: "not yet", never 404.
             if (index || holdable_init)
                 return segment_not_ready(session->id, index.value_or(0), "hold_timed_out");
             return http_error(404, state.finished ? "not_found" : "not_ready",
@@ -3033,18 +2789,15 @@ struct PlaybackManager::Impl {
 
     HttpResponse create(const HttpRequest& request) {
         if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
-        // Unreachable in production -- this route is not in capability_request's
-        // exempt list, so HttpServer has already rejected an unauthenticated
-        // request with 401 -- but cheap to check and matches this project's
-        // fail-loudly style elsewhere.
+        // HttpServer has already refused unauthenticated requests (this route
+        // is not exempt in capability_request); checked anyway.
         if (!request.session) return http_error(401, "unauthorized", "a valid session bearer token is required");
         auto trace = hex_token(4);
         auto request_started = Clock::now();
         Log::info("playback[" + trace + "] session create start");
         Json root = Json::parse(std::string_view(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
         if (!root.isObject()) return http_error(400, "bad_request", "JSON object required");
-        // Playback is by media_id only. A title is not playable as such: its
-        // files are, and choosing one is the client's decision.
+        // Playback is by media_id only: choosing a title's file is the client's.
         if (root.find("item_id"))
             return http_error(400, "item_id_not_accepted",
                               "playback is by media_id: read the title's files from "
@@ -3071,8 +2824,8 @@ struct PlaybackManager::Impl {
             }))
             return http_error(400, "bad_idempotency_key",
                               "idempotency_key must be 1..256 visible ASCII characters");
-        // Opt-in: answer once admitted and report the start's progress,
-        // rather than blocking until the first fragment exists.
+        // Opt-in: answer once admitted and report start progress, rather than
+        // blocking until the first fragment exists.
         bool async_start = false;
         if (auto it = request.query.find("start"); it != request.query.end()) {
             if (it->second != "async") return http_error(400, "bad_start", "start must be async");
@@ -3080,21 +2833,15 @@ struct PlaybackManager::Impl {
         }
 
         std::string fingerprint;
-        // Declared out here because the error path below erases by it.
         std::string idempotency_scope;
         std::shared_ptr<IdempotentCreation> idempotent;
         bool idempotent_owner = false;
         if (!idempotency_key.empty()) {
             fingerprint = creation_fingerprint(media_id, prefs, seek_ms,
                                                request.session->id);
-            // Scoped to the account. The key is client-chosen and often
-            // predictable ("retry-1"), and the map was global: any
-            // authenticated account could occupy another's key and turn that
-            // account's legitimate retry into a 409 idempotency_conflict.
-            // Not a takeover -- the fingerprint carries the auth session id,
-            // so a stolen key conflicts rather than replaying someone else's
-            // session -- but a targeted denial of the retry path, which is
-            // the path a client is on when something has already gone wrong.
+            // Scoped to the account: keys are client-chosen and predictable,
+            // so a shared namespace would let one account turn another's retry
+            // into a 409.
             idempotency_scope = account + '\0' + idempotency_key;
             {
                 std::lock_guard lock(mutex);
@@ -3141,12 +2888,9 @@ struct PlaybackManager::Impl {
                 return creation_response(*existing, trace, "replayed");
             }
         }
-        // A POST to a collection creates a member, every time. There is no
-        // "previous" to supersede: one bearer may hold many sessions now, and
-        // what bounds that is the per-account cap rather than a hidden slot of
-        // one. Each session is its own logical viewer, so two viewers sharing
-        // a login do not share a transcode entitlement -- the cap and the
-        // entitlement share the account key instead.
+        // A POST always creates a member; the per-account cap bounds them.
+        // Each session is its own logical viewer, so viewers sharing a login
+        // do not share a transcode entitlement.
         auto logical_session = std::make_shared<LogicalViewerSession>();
         std::unique_lock logical_operation(logical_session->operation_mutex);
         reserve_session_slot(account);
@@ -3166,9 +2910,8 @@ struct PlaybackManager::Impl {
             if (seek_ms) session->plan.request_seek(std::chrono::milliseconds(*seek_ms));
             if (async_start && transformed(session->plan)) {
                 // Admitted: every refusal decidable now has been made. The
-                // placeholder takes the session's place and slot; the start
-                // runs beside it. Direct play never gets here -- it has no
-                // pipeline to wait for.
+                // placeholder takes the session's place and slot while the
+                // start runs beside it. Direct play has no pipeline to wait for.
                 resource_reservation = reserve_resources(*session);
                 auto start = std::make_shared<StartState>();
                 start->candidate = copy_for_start(*session);
@@ -3237,10 +2980,7 @@ struct PlaybackManager::Impl {
         }
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - request_started).count();
         observations().record("playback.create_us", elapsed_us(request_started));
-        // What was negotiated and from what: the transforms and codecs the
-        // viewer will get, and the capabilities it advertised. A TV that
-        // claimed hevc and got a silent transcode could not be diagnosed
-        // without either (2026-09-07).
+        // The negotiated transforms and codecs, for diagnosis.
         Log::info("playback[" + trace + "] session create complete id=" + session->id +
                   " mode=" + playback_mode_name(session->plan.mode) +
                   " video=" + transform_name(session->plan.video) + "/" + session->plan.video_codec +
@@ -3252,16 +2992,9 @@ struct PlaybackManager::Impl {
         return creation_response(*session, trace, idempotent ? "created" : "");
     }
 
-    // A playback session is now addressable by an id that outlives the request
-    // that made it, several may exist per account, and a listing hands the ids
-    // out. So the control routes have to check who is asking: without this,
-    // any authenticated account that learns an id can read, re-seek or DELETE
-    // another viewer's session mid-film, and the per-account cap means nothing
-    // because a stranger can free your slots. Under one-session-per-bearer the
-    // gap was masked -- an id was only ever known to the client that made it.
-    //
-    // A mismatch answers 404 rather than 403: whether an id exists on this
-    // node is not something one account gets to learn about another.
+    // Control routes check ownership: session ids are listed, so without this
+    // any account could read, seek or DELETE another's session. A mismatch is
+    // 404, not 403, so one account cannot learn another's ids exist.
     bool caller_owns(const Session& session, const HttpRequest& request) const {
         return request.session && session.account == account_key(*request.session);
     }
@@ -3281,13 +3014,8 @@ struct PlaybackManager::Impl {
     HttpResponse list_sessions(const HttpRequest& request) {
         if (!request.session)
             return http_error(401, "unauthorized", "a valid session bearer token is required");
-        // Node-local, by decision rather than omission. A playback session
-        // owns a generation directory, a transcode slot and a live pipeline on
-        // *this* node, so an id only means anything here; a client wanting the
-        // account's sessions cluster-wide asks each node it knows, and thereby
-        // learns which node each one came from. That provenance is what a
-        // client needs to probe, regenerate or release an adopted session, and
-        // per-node listing hands it over for free.
+        // Node-local by design: a session's resources live on this node, and
+        // asking each node gives the client every session's provenance.
         const auto account = account_key(*request.session);
         Json::Array out;
         size_t transcodes = 0;
@@ -3302,11 +3030,7 @@ struct PlaybackManager::Impl {
         Json::Object body;
         const auto held = out.size();
         body["items"] = std::move(out);
-        // The cap is the node's and a client does not get a vote, but it does
-        // get to know. Stating it here means a client can plan against it --
-        // decline to prepare a standby it knows will be refused, and say "at
-        // the session limit" rather than showing a failover that merely
-        // failed -- instead of discovering it by refusal at the worst moment.
+        // The caps, so a client can plan against them rather than meet them.
         Json::Object account_info;
         account_info["sessions"] = static_cast<uint64_t>(held);
         account_info["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
@@ -3322,8 +3046,7 @@ struct PlaybackManager::Impl {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) {
-                // A failed async start stays readable for a while, so a
-                // client polling it learns why rather than finding nothing.
+                // A failed async start stays readable for a while.
                 prune_failed_starts_locked();
                 auto failed = failed_starts.find(id);
                 if (failed != failed_starts.end() && request.session &&
@@ -3470,43 +3193,34 @@ struct PlaybackManager::Impl {
             return http_json(200, session_json(*replacement).dump());
         }
 
-        // A seek-only update does not alter representation, tracks, quality or
-        // codec negotiation. Reuse the prepared VOD random-access plan instead
-        // of resolving, probing and materialising the source index again.
-        // Clients commonly resend their current preferences with a seek.  A
-        // semantically unchanged preference object must not turn a seek into a
-        // fresh probe/VOD-planning pass; that re-opens container metadata and
-        // remote extents precisely when the viewer is waiting for the seek.
+        // A seek with unchanged preferences (clients often resend them) reuses
+        // the prepared VOD plan rather than re-probing and re-indexing the
+        // source while the viewer waits.
         const bool seek_only = seek_ms.has_value() && media_override.empty() &&
                                prefs == old->preferences;
         std::shared_ptr<Session> replacement;
         if (seek_only)
             replacement = reuse_seek_session(*old, std::chrono::milliseconds(*seek_ms), trace);
         else if (seek_ms)
-            // A seek that is not seek-only pays a full probe/VOD-planning pass
-            // while the viewer waits, so say which part of the request made it
-            // one rather than leaving the slow path unexplained.
+            // Say why this seek takes the slow path.
             Log::info("playback[" + trace + "] seek fast-path skipped media=" +
                       old->source.media_id + " requested_ms=" + std::to_string(*seek_ms) +
                       " reason=" + (media_override.empty() ? "preferences-changed"
                                                            : "media-override"));
 
         if (!replacement) {
-            // The file being served unless the client names another.
             replacement = resolve_session(media_override.empty() ? old->source.media_id : media_override,
                                           prefs, trace, old->id, old->token);
             replacement->logical_session = old->logical_session;
-            // Same rule as the subtitle and seek replacements: ownership
-            // travels with the session. A mode change must not hand the
-            // caller back a session it no longer owns.
+            // Ownership carries over, as in the subtitle and seek replacements.
             replacement->account = old->account;
             replacement->generation = old->generation;
             if (seek_ms) replacement->plan.request_seek(std::chrono::milliseconds(*seek_ms));
             if (!async_start || !transformed(replacement->plan)) prepare_transformed_vod(*replacement, trace);
         }
         if (async_start && transformed(replacement->plan)) {
-            // Admitted now; built beside the playing generation, which keeps
-            // serving -- not superseded -- until the replacement is ready.
+            // Built beside the playing generation, which keeps serving until
+            // the replacement is ready.
             auto pending = std::make_shared<PendingReplacement>();
             pending->needs_plan = !replacement->vod_plan;
             pending->reservation = std::make_shared<ResourceReservation>(reserve_resources(*replacement, old->id));
@@ -3543,26 +3257,17 @@ struct PlaybackManager::Impl {
             return http_json(202, payload.dump());
         }
         ResourceReservation resource_reservation;
-        // start_pipeline() below can block for several seconds (up to
-        // streaming.startup_timeout_ms) waiting for the replacement's first
-        // fragment, and stop_pipeline(*old) -- which fully cancels old's
-        // segment store and wakes anything blocked in its wait_object() --
-        // does not run until after that completes. Without this, an
-        // in-flight request for a not-yet-produced segment on the
-        // superseded generation (e.g. client read-ahead) stays parked for
-        // that whole window instead of getting a prompt 404. Mark old as
-        // superseded up front so such requests wake immediately; this is
-        // reversible (unlike stop_pipeline's real cancel()), so on failure
-        // below we clear it and old keeps serving normally as the still-
-        // active session.
+        // start_pipeline() may block up to startup_timeout before
+        // stop_pipeline(*old) runs. Marking old superseded now wakes requests
+        // parked on its unproduced segments at once; unlike stop_pipeline it
+        // is reversible, so on failure old keeps serving.
         auto old_active = active_engine(*old);
         if (old_active) old_active->segments()->mark_superseded(true);
         try {
             resource_reservation = reserve_resources(*replacement, old->id);
             start_pipeline(*replacement, trace);
-            // Keep the replacement reservation until the old physical pipeline
-            // is stopped.  Otherwise a third concurrent request could consume
-            // the apparent free slot during this handover window.
+            // Hold the reservation until old's pipeline stops, so a concurrent
+            // request cannot take the apparently free slot mid-handover.
             stop_pipeline(*old);
             {
                 std::lock_guard lock(mutex);
@@ -3617,14 +3322,10 @@ struct PlaybackManager::Impl {
         return {204, "application/json; charset=utf-8", {}, {}, {}};
     }
 
-    // The page-exit close (0.60.0). A browser tearing down a page cannot
-    // complete a preflighted request, and a cross-origin DELETE carrying an
-    // Authorization header is always preflighted, so a reload left its session
-    // -- and the node's transcode slot -- held until the idle rule. This route
-    // is authorised by the stream token in its path, the same capability that
-    // already grants the stream, so it needs no header and is a CORS simple
-    // request that survives unload (sendBeacon, fetch keepalive). Closing is
-    // idempotent: a session already gone is the outcome the caller wanted.
+    // Page-exit close. An unloading page cannot complete a preflighted
+    // cross-origin DELETE, so this is authorised by the stream token in the
+    // path: a CORS simple request (sendBeacon, fetch keepalive). Idempotent:
+    // a session already gone is success.
     HttpResponse close_by_capability(std::string_view id, std::string_view token) {
         std::shared_ptr<Session> session;
         {
@@ -3639,8 +3340,8 @@ struct PlaybackManager::Impl {
         return {204, "application/json; charset=utf-8", {}, {}, {}};
     }
 
-    // Removes the session the caller has already authorised and releases
-    // everything it holds. False when it was removed meanwhile.
+    // Removes an already-authorised session and releases everything it holds.
+    // False when it was removed meanwhile.
     bool tear_down_session(std::string_view id, std::shared_ptr<Session> session) {
         std::shared_ptr<Session> removed;
         std::unique_lock logical_operation(session->logical_session->operation_mutex);
@@ -3648,9 +3349,8 @@ struct PlaybackManager::Impl {
             std::lock_guard lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return false;
-            // Whatever holds the id now, which may be a recreate of the one
-            // authorised. `session` keeps the locked logical session alive
-            // until the lock above is released.
+            // Whatever holds the id now, possibly a recreate. `session` keeps
+            // the locked logical session alive until the lock is released.
             removed = it->second;
             sessions.erase(it);
             erase_idempotency_for_session_locked(id);
@@ -3658,8 +3358,7 @@ struct PlaybackManager::Impl {
                 logical_sessions.erase(removed->logical_session->client_key);
             signal_cleanup_locked();
         }
-        // A start still running beside a placeholder stops now, freeing its
-        // slot at once rather than when the start would have ended.
+        // A start running beside a placeholder stops now, freeing its slot.
         if (removed->start) {
             removed->start->cancelled.store(true);
             if (removed->start->candidate && removed->start->candidate != removed)
@@ -3711,16 +3410,9 @@ struct PlaybackManager::Impl {
             for (const auto& [_, session] : sessions)
                 active_sessions.push_back(session);
         }
-        // Per-session subtitle-cache and segment-store reads happen with the
-        // global session mutex already released: each only needs that one
-        // session's own lock, and serializing them behind the global mutex
-        // would let contention on any single session's subtitle cache (e.g. a
-        // slow WebVTT extraction, see public_stream_response) stall every
-        // other playback operation -- create/patch/delete/cleanup all take
-        // the same global mutex -- for as long as that one lock is held.
-        // The per-session lock itself is best-effort (try_lock): a session
-        // mid-extraction just contributes stale/zero counts for this status
-        // call rather than making status() block on it too.
+        // Per-session reads happen outside the global mutex, so a slow WebVTT
+        // extraction cannot stall every playback operation. try_lock: a session
+        // mid-extraction contributes zero rather than blocking status().
         for (const auto& session : active_sessions) {
             if (std::unique_lock subtitle_lock(session->subtitle_cache->mutex, std::try_to_lock);
                 subtitle_lock.owns_lock()) {
@@ -3787,19 +3479,16 @@ struct PlaybackManager::Impl {
                          {"media_engine_version", state.version},
                          {"h264_encoder", state.h264_encoder},
                          {"aac_encoder", state.aac_encoder},
-                         // Kept for one release so older diagnostics UIs do not
-                         // mistake the field's disappearance for a parse failure.
+                         // Constant fields older diagnostics UIs still parse.
                          {"ffmpeg_available", false},
                          {"ffprobe_available", false},
                          {"ffmpeg_version", ""}};
         return http_json(200, Json(std::move(out)).dump());
     }
 
-    // GET /api/v1/playback/media?media_id=...  (also accepts item_id)
-    // The server's half of the contract: what the media is, and what can be
-    // done with it, before any instruction is given. No session, no
-    // pipeline, no capability matching -- a client reads these facts and
-    // then tells the server what to do (operator, 2026-09-07).
+    // GET /api/v1/playback/media?media_id= (or item_id=): what the media is
+    // and what can be done with it. No session, no pipeline, no capability
+    // matching; the client reads these facts and then instructs.
     HttpResponse media_facts(const HttpRequest& request) {
         if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
         if (!request.session)
@@ -3822,24 +3511,20 @@ struct PlaybackManager::Impl {
         }
 
         Json::Array reported;
-        // A media this node could not read is a fact too, and a different one
-        // from a media that does not exist. Report both, per media, and let
-        // the client decide whether another node is worth asking.
+        // Unreadable here differs from nonexistent; both are reported per
+        // media so the client can decide whether to ask another node.
         Json::Array unavailable;
         std::string last_error;
         std::string last_reason;
         for (const auto& id : media_ids) {
             try {
                 auto lease = create_source(id);
-                // Each file gets the whole probe allowance: one shared deadline
-                // let a slow first file push the rest into `unavailable`.
+                // Each file gets the whole probe allowance, so a slow file
+                // cannot push the rest into `unavailable`.
                 auto probe = probe_source(lease, "facts", Clock::now() + config.probe_timeout);
-                // What this media supports, as facts about the media and the
-                // muxers, not about any client: direct is always the bytes; a
-                // copy into a container depends on what that container can
-                // carry, and that is a fact about each stream, so it is stated
-                // on each stream rather than for whichever came first; a
-                // transcode depends on the encoders being present.
+                // Facts of media and muxers, not of any client: direct is
+                // always possible, copy_into is per stream, transcode needs the
+                // encoders.
                 Json::Array streams;
                 for (const auto& stream : probe.streams) {
                     auto value = stream_json(stream);
@@ -3898,8 +3583,6 @@ struct PlaybackManager::Impl {
     HttpResponse handle_api(const HttpRequest& request) {
         if (request.path == "/api/v1/playback/status" && request.method == "GET") return status();
         if (request.path == "/api/v1/playback/sessions") {
-            // A POST to a collection creates a member. Every time: a session
-            // is a resource, not a property of the bearer that asked for it.
             if (request.method == "POST") return create(request);
             if (request.method == "GET") return list_sessions(request);
             return http_error(405, "method", "GET or POST required");
@@ -3956,31 +3639,16 @@ struct PlaybackManager::Impl {
                 const auto now = Clock::now();
                 idle_timeout = config.pipeline_idle;
                 unused_idle_timeout = config.session_unused_idle;
-                // Clamped rather than merely read, the same way the unused
-                // clock is: a value at or below pipeline_idle would fire the
-                // instant the engine went, and one at or above session_idle
-                // would never fire at all because the session outlives it.
-                // reconfigure() takes a StreamingConfig from callers that
-                // never passed through config_base's validation.
+                // Clamped to [pipeline_idle, session_idle]: reconfigure() can
+                // receive an unvalidated StreamingConfig.
                 entitlement_idle = std::clamp(config.transcode_entitlement_idle,
                                               config.pipeline_idle, config.session_idle);
                 for (auto it = sessions.begin(); it != sessions.end();) {
-                    // A session that has never served a stream object expires on
-                    // the shorter clock. The transcode entitlement is held by the
-                    // session rather than by the pipeline, so reclaiming the
-                    // engine at pipeline_idle only makes an abandoned session
-                    // cheap -- it goes on holding the slot until the session
-                    // itself is erased, and with max_video_transcodes at 1 that
-                    // closes the node to transcoding for the whole session_idle.
-                    // Both clocks run from `touched`, so a client that is still
-                    // talking to us -- polling the session, PATCHing a plan --
-                    // is never evicted by this; only one that created a session
-                    // and never came back for the media is.
-                    // Clamped, not merely validated: an unused session must
-                    // never outlive a used one, whatever the two knobs say.
-                    // config_base rejects that ordering in a config file, but
-                    // reconfigure() takes a StreamingConfig from callers that
-                    // never went through it.
+                    // A session that never served a stream object expires on
+                    // the shorter session_unused_idle. Both clocks run from
+                    // `touched`, so a client still polling or PATCHing is never
+                    // evicted. Clamped so an unused session never outlives a
+                    // used one, since reconfigure() is unvalidated.
                     const auto idle_budget =
                         it->second->stream_served
                             ? config.session_idle
@@ -4012,21 +3680,9 @@ struct PlaybackManager::Impl {
                                 }
                             }
                         }
-                        // The transcode entitlement is released on its own
-                        // clock, not when the pipeline goes. Both a paused
-                        // viewer and an abandoned one stop requesting media,
-                        // so the pipeline cannot tell them apart at 60 s --
-                        // but by five minutes of no stream activity at all the
-                        // slot is worth more to whoever is waiting for it than
-                        // to a session that may never come back. A session
-                        // that does come back reacquires it and may be
-                        // refused; it keeps its position and its plan either
-                        // way.
-                        //
-                        // Checked every pass rather than once at reclamation,
-                        // because this fires later than that and a session
-                        // sitting idle must still be reconsidered. next_expiry
-                        // carries the wake-up so the loop does not spin.
+                        // The entitlement has its own, longer clock than the
+                        // pipeline. Checked every pass, with next_expiry
+                        // carrying the wake-up so the loop does not spin.
                         if (holds_transcode_entitlement_locked(*it->second)) {
                             const auto entitlement_expires =
                                 it->second->stream_touched + entitlement_idle;
@@ -4182,8 +3838,8 @@ void PlaybackManager::request_stop() {
 
 void PlaybackManager::reconfigure(StreamingConfig config) {
     std::lock_guard lock(impl_->mutex);
-    // Backend, probe, buffering and temp-path changes require a service restart.
-    // Policy limits and playback timing apply to subsequent sessions immediately.
+    // Policy limits and timing apply at once; backend, probe, buffering and
+    // temp-path changes need a restart.
     impl_->config.max_sessions = config.max_sessions;
     impl_->config.max_sessions_per_account = config.max_sessions_per_account;
     impl_->config.max_transcodes_per_account = config.max_transcodes_per_account;
@@ -4213,8 +3869,7 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
     } catch (const JsonError& e) {
         return http_error(400, "bad_json", e.what());
     } catch (const PlaybackChoiceError& e) {
-        // The instruction leaves open, or names wrongly, something the client
-        // has to choose. Every node would say the same, so do not walk.
+        // Every node would say the same, so do not walk.
         Json::Object error{{"code", e.code()},
                            {"message", std::string(e.what())},
                            {"choice", e.choice()},
@@ -4227,20 +3882,15 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         root["error"] = std::move(error);
         return http_json(400, Json(std::move(root)).dump());
     } catch (const PlaybackCapabilityError& e) {
-        // Well-formed, coherent, and this node cannot do it: 422 rather than
-        // 400, because nothing about the request is malformed. Another node on
-        // another build may accept the same instruction, so the client should
-        // ask one before giving up the copy -- and a different instruction
-        // (a transcode) would succeed here.
+        // 422, not 400: nothing is malformed. Another node may accept it, and
+        // a transcode would succeed here.
         FailureAxes axes;
         axes.scope = FailureScope::node;
         axes.node_healthy = true;
         axes.alternative_may_succeed = true;
         return http_error(422, "copy_not_supported", e.what(), {}, axes);
     } catch (const std::invalid_argument& e) {
-        // The request itself is wrong and every node would refuse it the same
-        // way, so walking the cluster collects N copies of the caller's own
-        // bug. Nothing else here could succeed either.
+        // Every node would refuse it the same way: do not walk.
         FailureAxes axes;
         axes.scope = FailureScope::request;
         axes.node_healthy = true;
@@ -4249,17 +3899,9 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
     } catch (const std::out_of_range& e) {
         return http_error(404, "not_found", e.what());
     } catch (const AccountSessionLimitError& e) {
-        // Distinct from resource_limit on purpose. A node-wide or transcode
-        // limit is this node's property and a client is right to try another;
-        // an account cap is identical on every node in the cluster, so a
-        // client that walks collects N identical refusals and charges N
-        // healthy nodes on the way through. scope=request is what says "do not
-        // walk" to a client that reads the axes rather than our error codes:
-        // every node would refuse this the same way. It is the closest honest
-        // value -- the request is not malformed, but the remedy is the
-        // caller's, not another node's. A fourth `account` scope has been
-        // proposed; it cannot ship before clients tolerate an unknown scope,
-        // or the tolerance creates the condemnation it exists to prevent.
+        // Not resource_limit: an account cap is identical on every node, so
+        // scope=request tells the client not to walk. The remedy is the
+        // caller's, not another node's.
         Json::Object error{{"code", std::string("account_session_limit")},
                            {"message", std::string(e.what())},
                            {"scope", std::string("request")},
@@ -4271,10 +3913,8 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         root["error"] = std::move(error);
         return http_json(429, Json(std::move(root)).dump());
     } catch (const AccountTranscodeLimitError& e) {
-        // Like account_session_limit, the same on every node, so a client
-        // must not walk: scope=request. Unlike it, the same request without a
-        // transcode (remux or direct) needs no entitlement and may succeed
-        // here, so alternative_may_succeed is true.
+        // Same on every node: scope=request. Remux or direct needs no
+        // entitlement and may succeed here.
         Json::Object error{{"code", std::string("account_transcode_limit")},
                            {"message", std::string(e.what())},
                            {"scope", std::string("request")},
@@ -4286,25 +3926,10 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         root["error"] = std::move(error);
         return http_json(429, Json(std::move(root)).dump());
     } catch (const ResourceLimitError& e) {
-        // Node-scoped: this node is full, another may not be. It carried no
-        // axes at all until 2026-09-21, which left the one refusal a client
-        // can actually act on as the one saying least -- the account cap
-        // beside it states scope, health and its own limit.
-        //
-        // The axes differ by path, and the difference is real rather than
-        // cosmetic. On create no session exists yet, so trying another node
-        // costs nothing and is right: scope=node, walk.
-        //
-        // On update the session already exists HERE and is still serving its
-        // current generation. Walking means abandoning something that works to
-        // rebuild it elsewhere -- a failover, not a retry -- and the client
-        // cannot take the session with it, because a session is a resource of
-        // the node producing it. So the update refusal says do not walk, the
-        // same way the account cap does and for the same reason: the remedy is
-        // the caller's, not another node's. Here the remedy is a different
-        // instruction against this node -- remux instead of transcode, a lower
-        // height -- which is what alternative_may_succeed is for. The viewer's
-        // current playback is untouched either way.
+        // This node is full. On create nothing exists yet, so scope=node:
+        // walk. On update the session lives here and is still serving, so
+        // scope=request: the remedy is a different instruction on this node
+        // (remux, a lower height), not another node.
         const bool updating = request.method == "PATCH";
         FailureAxes axes;
         axes.scope = updating ? FailureScope::request : FailureScope::node;
@@ -4316,24 +3941,15 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
         Log::warn("playback[" + e.trace() + "] request failed stage=" + e.stage() +
                   " method=" + request.method + " path=" + request.path +
                   " elapsed_ms=" + std::to_string(elapsed) + " error=" + e.what());
-        // One envelope for every error this API returns: error.code is a
-        // snake_case token a client may branch on, error.message is for a
-        // human. Everything else about the failure hangs off the same object.
-        // This path used to emit `error` as a bare string with message, trace
-        // and stage as siblings, which is why clients grew parsers for
-        // several shapes.
+        // The common error envelope: error.code to branch on, error.message
+        // for a human, everything else on the same object.
         Json::Object error{{"code", "playback_" + e.stage() + "_failed"},
                            {"message", std::string(e.what())},
                            {"trace", e.trace()},
                            {"stage", e.stage()}};
-        // When the engine said why, say why. A source this node could not read
-        // is a different situation for the client than one it could not parse,
-        // and only the client can decide what to do about either.
         int status = 503;
-        // A per-title fault leaves the node fit for every other title, so the
-        // default here says so rather than letting a client charge the node's
-        // health for one bad file. Scope is left unstated when the engine did
-        // not say why: a guess is worse than a gap the client knows to handle.
+        // A per-title fault leaves the node healthy. Without the engine's
+        // reason, scope is left unstated rather than guessed.
         FailureAxes axes;
         axes.node_healthy = true;
         if (e.failure()) {
@@ -4357,9 +3973,8 @@ HttpResponse PlaybackManager::handle(const HttpRequest& request) {
 }
 
 bool PlaybackManager::capability_request(const HttpRequest& request) const {
-    // The stream subresource authorises itself with the session token in its
-    // path, so it is exempt from the bearer every other route requires. Same
-    // parse the router uses, deliberately: see parse_stream_route.
+    // The stream subresource is authorised by the token in its path, so it is
+    // exempt from the bearer. Same parse as the router: see parse_stream_route.
     return parse_stream_route(request.path).has_value();
 }
 

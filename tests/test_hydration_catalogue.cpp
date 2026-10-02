@@ -672,10 +672,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
              MovieRegression{"/Movies/2003.Kill.Bill-.Volume.1.1920x802.BDRip.x264.DTS-HD.MA.mkv", "Kill Bill Volume 1", 2003},
              MovieRegression{"/Movies/Soldier - Sci-fi 1998 Eng Rus Comm Multi Subs 720p [H264-mp4].mp4", "Soldier", 1998},
              // A number the calendar has not reached is title text, not a
-             // release year. Found live on 2026-09-09: this file was unmatched
-             // because "2049" was read as the year, the search title was
-             // truncated to "Blade Runner", and the only candidate TMDB
-             // returned -- the 1982 film -- was then rejected on the mismatch.
+             // release year.
              MovieRegression{"/Movies/Blade Runner 2049.HDRip.XviD.AC3-EVO.avi", "Blade Runner 2049", 0},
              MovieRegression{"/Movies/Death Race 2050 1080p BluRay x265.mkv", "Death Race 2050", 0},
          }) {
@@ -1607,9 +1604,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     cancel_config.movies.roots = {"/Movies"};
     CatalogueScanner cancel_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                     cancel_config, std::move(blocking_http));
-    // Scanner startup is intentionally idle on an already-operated library.
-    // Explicitly request the pass whose in-flight provider request this test
-    // exercises, rather than depending on the old startup-rescan behaviour.
+    // Scanner startup is idle on an already-operated library, so request the
+    // pass whose in-flight provider request this test exercises.
     cancel_scanner.request_rescan();
     cancel_scanner.start();
     REQUIRE(wait_until([&] { return blocking_http_ptr->entered(); }, 1s));
@@ -1984,11 +1980,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_scanner_restart_does_not_rescan
     REQUIRE(writer->write(0, bytes) == bytes.size());
     writer->commit();
 
-    // Simulate an upgrade from the pre-scanner.state queue implementation. The
-    // durable hint-state file remains even when every historical ephemeral hint
-    // has been discarded. Restart/coordinator election must seed scanner.state
-    // from the current immutable namespace and wait for the normal safety
-    // interval; it must not interpret process start as a reason to walk /Movies.
+    // A durable hint-state file with no hints and no scanner.state. Coordinator
+    // election must seed scanner.state from the current immutable namespace and
+    // wait for the normal safety interval, not walk /Movies at process start.
     std::filesystem::create_directories(config.state_path / "catalogue");
     {
         std::ofstream out(config.state_path / "catalogue" / "hints.json");
@@ -2407,9 +2401,9 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
     CHECK(status_body.find("build_available")->asBool() == false);
     CHECK(status_body.find("enabled")->asBool() == false);
 
-    // 0.64.0: the job routes answer on every node from the cluster view, so a
-    // node without the plugin lists the cluster's jobs (none here) instead of
-    // 503, and refuses only what it cannot do itself: run a torrent.
+    // The job routes answer on every node from the cluster view: a node
+    // without the plugin lists the cluster's jobs (none here) and refuses only
+    // what it cannot do itself, run a torrent.
     const auto call = [&](std::string method, std::string path, std::string body = {}) {
         HttpRequest request;
         request.method = std::move(method);
@@ -2553,11 +2547,9 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_job_is_saved_only_when_its
 }
 
 MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_search_results_can_be_placed) {
-    // 0.58.2. info_hash was persisted and serialised but never set, so every
-    // job reported null; a job saved without one is backfilled from its magnet
-    // on load. And a search result's URI now reaches add_search_result, which
-    // may fetch a provider's .torrent URL; until now every placement went
-    // through add(), magnets only, and such a result could never be started.
+    // A job saved without an info_hash is backfilled from its magnet on load.
+    // A search result may be a provider's .torrent URL; a plain placement
+    // requires a magnet.
     TestNode fixture("torrent-identity");
     fixture.prepare();
     const auto state_path = fixture.config().state_path;
@@ -2731,13 +2723,9 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     torrent_config.pex = false;
     torrent_config.lsd = false;
 
-    // The download engine is a plugin as of 0.28.0, so this loads the real
-    // libmacha-torrent.so through the real entry symbol rather than linking
-    // TorrentManager into the test binary. The Subsystem is driven directly
-    // instead of through a SubsystemSupervisor because this case depends on
-    // acting on state restored from jobs.json *before* the polling worker
-    // starts, which a supervisor (which starts it immediately) would not
-    // allow.
+    // Drive the Subsystem directly, not through a SubsystemSupervisor: this
+    // case acts on state restored from jobs.json before the polling worker
+    // starts, and a supervisor starts it immediately.
     Config plugin_config = fixture.node().config();
     plugin_config.torrent = torrent_config;
     plugin_config.state_path = state_path;
@@ -2762,7 +2750,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
                                    fixture.config().state_path);
     AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
     // The jobs restored from jobs.json become cluster requests this node has
-    // already claimed (0.64.0), on the coordinator's first pass.
+    // already claimed, on the coordinator's first pass.
     coordinator.pass_now();
     REQUIRE(coordinator.request("torrent-retry").has_value());
     CHECK(coordinator.request("torrent-retry")->phase == TorrentPhase::failed);
@@ -2805,11 +2793,8 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
 }
 
 MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resumed_directly) {
-    // Rome, gbni-1, 2026-09-25: the torrent's ingest was resumed through the
-    // ingest's own route rather than by retrying the torrent. The ingest ran;
-    // the torrent job stayed failed, because a failed job was never looked at
-    // again, and its staging reservation was never released. It must follow
-    // the ingest back without anybody touching the torrent.
+    // A failed torrent whose ingest is resumed through the ingest's own route
+    // follows the ingest back, without anybody touching the torrent.
     TestNode fixture("torrent-follows-ingest");
     fixture.prepare();
     write_torrent_recovery_state(fixture);
@@ -2861,7 +2846,7 @@ MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resum
     REQUIRE(acquisition.handle(resume).status == 200);
 
     // The ingest is queued (its workers are not running here); the torrent
-    // job mirrors it as importing, with the old failure cleared.
+    // job mirrors it as importing, with its failure cleared.
     REQUIRE(wait_until([&] {
         return torrents.job("torrent-retry")->state == TorrentJobState::importing;
     }, 5s));
@@ -2936,11 +2921,8 @@ struct TorrentPluginFixture {
 } // namespace
 
 MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second_add_names_it) {
-    // 0.63.0. libtorrent keys a torrent by its info hash and answered a second
-    // add with the first one's handle, so two jobs owned one torrent; on
-    // gbni-1 on 2026-09-26 cancelling one removed the other's torrent and
-    // deleted its payload, and the worker died on the stale handle. A second
-    // add is now refused with the holder's id.
+    // libtorrent keys a torrent by its info hash, so one job holds it and a
+    // second add is refused with the holder's id.
     TorrentPluginFixture f("torrent-one-job-per-hash");
     auto& torrents = f.torrents();
     f.plugin->subsystem().start();
@@ -2959,7 +2941,7 @@ MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second
     ClusterJobView cluster_jobs(f.fixture.node(), *f.ingest, f.registry);
     TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, cluster_jobs, f.state_path);
     AcquisitionApi acquisition(*f.ingest, f.registry, search, cluster_jobs, coordinator);
-    // Through the API the duplicate key is the cluster's requests (0.64.0).
+    // Through the API the duplicate key is the cluster's requests.
     const std::string api_magnet = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777&dn=Twice";
     HttpRequest add;
     add.method = "POST";
@@ -2996,12 +2978,9 @@ MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second
 }
 
 MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore_as_one) {
-    // The 2026-09-26 incident, from the state it left: two jobs recorded for
-    // one torrent. Restored, both were handed the same libtorrent torrent;
-    // cancelling the first removed it, the second's handle went stale, and
-    // the next held-pieces pass threw and ended the worker. The later job is
-    // now failed at restore with duplicate_torrent and holds nothing, and the
-    // worker outlives the cancel.
+    // Two jobs recorded for one torrent: the later one fails at restore with
+    // duplicate_torrent and holds nothing, and the worker outlives cancelling
+    // the first.
     const std::string hash = "5555555555555555555555555555555555555555";
     TorrentPluginFixture f("torrent-duplicate-restore", [&](TorrentPluginFixture& seeded) {
         std::filesystem::create_directories(seeded.state_path / "torrent");
@@ -3043,7 +3022,7 @@ MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore
     CHECK(first->state != TorrentJobState::failed);
 
     REQUIRE(torrents.cancel("dup-first"));
-    // Past the held-pieces interval (10 s), where the stale handle threw.
+    // Past the held-pieces interval (10 s), so that pass runs after the cancel.
     std::this_thread::sleep_for(11s);
     CHECK(torrent_thread_faults() == faults_before);
     // The worker is still inside its loop, and a new job is still taken.
@@ -3054,7 +3033,7 @@ MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore
 }
 
 MACHA_TEST("hydration_catalogue", test_a_cluster_torrent_is_claimed_and_driven_by_its_owner) {
-    // 0.64.0. An add is a request in metadata; the one torrent-capable node
+    // An add is a request in metadata; the one torrent-capable node
     // claims it, runs it under the request's id, applies the operator's
     // intent to it, and lets it go when it is cleared.
     TorrentPluginFixture f("torrent-coordinator-owner");
@@ -3100,7 +3079,7 @@ MACHA_TEST("hydration_catalogue", test_a_cluster_torrent_is_claimed_and_driven_b
 }
 
 MACHA_TEST("hydration_catalogue", test_a_completed_torrent_is_removed_after_its_delay) {
-    // Removal after completion (0.64.0): off unless asked; with a delay of 0
+    // Removal after completion is off unless asked; with a delay of 0
     // the owner removes the torrent job and the request at its next pass.
     const std::string hash(40, '9');
     TorrentPluginFixture f("torrent-remove-after", [&](TorrentPluginFixture& seeded) {
@@ -3271,14 +3250,9 @@ MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_cl
 }
 
 MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_while_worker_finishes) {
-    // A job the worker is still inside process_job() for can reach a terminal
-    // state (cancel() writes it directly, regardless of whether the worker
-    // has noticed yet) and be clear()-ed by a client while the worker is
-    // still mid-copy. The worker's own per-iteration control checks used to
-    // read state via jobs_[job.id], which default-constructs and re-inserts
-    // a fresh "queued" job if clear() already erased it -- silently
-    // resurrecting a job the operator just removed. Those checks now use
-    // find() and treat "already gone" the same as cancelled.
+    // A job can be cancelled and cleared while the worker is still mid-copy in
+    // process_job(). The worker's per-iteration control checks must treat an
+    // erased job as cancelled, never re-insert it.
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3322,18 +3296,15 @@ MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_whi
         return true;
     }, 10s));
 
-    // cancel() writes the terminal state into the map immediately, without
-    // waiting for the worker to notice -- exactly the window that used to
-    // let clear() erase the job out from under a still-running worker. The
-    // worker's partial stays its own until it lets go: clear() must not
-    // remove it underneath the copy, which failed the cancelled job instead.
+    // cancel() writes the terminal state immediately, so clear() erases the job
+    // while the worker is still running. The partial stays the worker's until
+    // it lets go: clear() must not remove it underneath the copy.
     REQUIRE(ingest.cancel(job_id));
     REQUIRE(ingest.clear(job_id));
     CHECK(!ingest.job(job_id).has_value());
 
-    // Give the worker's still-in-flight process_job() every chance to finish
-    // its current chunk, hit one of the per-iteration control checks, and
-    // (pre-fix) resurrect the job. It must stay gone.
+    // Let the in-flight process_job() finish its chunk and reach a control
+    // check; the job must stay gone.
     std::this_thread::sleep_for(200ms);
     CHECK(!ingest.job(job_id).has_value());
     REQUIRE(wait_until([&] { return !ingest.job(job_id).has_value(); }, 2s));
@@ -3443,10 +3414,8 @@ Bytes read_whole(FileSystem& fs, const std::string& path, uint64_t size) {
 } // namespace
 
 MACHA_TEST("hydration_catalogue", test_two_files_of_one_job_never_share_a_destination) {
-    // Rome, 2026-09-25: each season's Extras held a "Menu Art.mkv". The
-    // planner checked only the filesystem for a collision, so both were given
-    // /Movies/Menu Art/Menu Art.mkv; the first imported and the second failed
-    // destination_conflict on every retry. Each file now gets its own path.
+    // Two same-named files in one job, neither yet in the filesystem, must be
+    // planned to distinct destinations.
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3485,10 +3454,9 @@ MACHA_TEST("hydration_catalogue", test_two_files_of_one_job_never_share_a_destin
 }
 
 MACHA_TEST("hydration_catalogue", test_ingest_commits_published_torrent_extents_without_copying) {
-    // Stage 2 of the torrent disk backend: a torrent publishes each extent as
-    // its pieces verify and records it in the job's extent journal. The ingest
-    // then commits the file by naming those extents -- the committed manifest
-    // is exactly the journal's -- instead of copying the bytes a second time.
+    // A torrent publishes each extent as its pieces verify and records it in
+    // the job's extent journal. The ingest commits the file by naming those
+    // extents -- the manifest is exactly the journal's -- without copying.
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3558,16 +3526,9 @@ MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_
 }
 
 MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_configured_bound) {
-    // Ingest was strictly serial: one worker thread taking one job at a time
-    // (loop() -> process_job() synchronously), so a single job that could not
-    // finish held every other job at "queued". That is how a metadata stall on
-    // es-1 (2026-09-10) surfaced -- six torrent imports all reading "queued"
-    // with nothing visibly running. The pool is now bounded by
-    // ingest.max_concurrent_jobs.
-    //
-    // peak_active_jobs() is a monotonic high-water mark recorded by the workers
-    // at claim time, so this proves real overlap without a poller having to
-    // catch the moment -- which is what would have made it load-sensitive.
+    // Jobs run concurrently, bounded by ingest.max_concurrent_jobs.
+    // peak_active_jobs() is a monotonic high-water mark recorded at claim time,
+    // so it proves real overlap without a poller having to catch the moment.
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3585,9 +3546,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_c
     ingest_config.enabled = true;
     ingest_config.staging_path = fixture.path() / "staging";
     ingest_config.source_roots = roots;
-    // Small chunks so each copy takes many real iterations, widening the
-    // window in which jobs genuinely overlap -- but a large checkpoint, so
-    // that costs loop iterations rather than a metadata commit per chunk.
+    // Small chunks widen the window in which jobs overlap; a large checkpoint
+    // avoids a metadata commit per chunk.
     ingest_config.copy_chunk_bytes = 4096;
     ingest_config.checkpoint_bytes = 1024 * 1024;
     ingest_config.max_concurrent_jobs = bound;
@@ -3601,11 +3561,9 @@ MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_c
     CHECK(ingest.active_jobs() == 0);
     ingest.start();
 
-    // Wait for the overlap rather than sampling for it after the fact: on a
-    // loaded machine the workers start staggered, and asserting at the end
-    // measures whether the last job happened to still be running, not whether
-    // the pool is concurrent. The high-water mark is monotonic, so waiting on
-    // it is exact -- it only ever reports overlap that genuinely happened.
+    // Wait for the overlap rather than sampling at the end, where staggered
+    // workers on a loaded machine would decide the result. The high-water mark
+    // only ever reports overlap that happened.
     REQUIRE(wait_until([&] { return ingest.peak_active_jobs() >= 2; }, 60s));
 
     REQUIRE(wait_until([&] { return all_imports_copied(ingest, ids); }, 60s));
@@ -3618,11 +3576,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_c
 }
 
 MACHA_TEST("hydration_catalogue", test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool) {
-    // The pool made job ownership a set rather than one active_job_id_, and
-    // cancel() decides whether cleanup is its own responsibility or the owning
-    // worker's by consulting exactly that. Prove the control surface the API
-    // exposes -- show/pause/resume/cancel/clear -- still behaves per job while
-    // several jobs are in flight, and that pausing one does not stall the rest.
+    // show/pause/resume/cancel/clear act per job while several jobs are in
+    // flight, and pausing one does not stall the rest.
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3893,9 +3848,8 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     std::this_thread::sleep_for(c2.metadata_cache + 20ms);
     REQUIRE(n2.known_metadata_generation() < next.generation);
 
-    // Expiry must force a real metadata read, discover the newer committed head and
-    // replace the decoded snapshot. cached_snapshot_view() must not ignore
-    // cache_until_ and this remained stale indefinitely without a notice.
+    // Expiry must force a real metadata read, discover the newer committed head
+    // and replace the decoded snapshot, even with no generation notice.
     auto refreshed = metadata2.snapshot_view();
     CHECK(refreshed.generation == next.generation);
     CHECK(n2.known_metadata_generation() >= next.generation);
@@ -4103,10 +4057,10 @@ MACHA_TEST("hydration_catalogue", test_a_media_index_is_stored_live_and_served_i
 }
 
 MACHA_TEST("hydration_catalogue", test_item_edits_validate_parents_and_keep_files_unless_named) {
-    // The metadata editor's edits (proposal G): a whole PUT that leaves out
-    // media_ids must not unbind the item's files; PATCH changes only what it
-    // names; parents are checked; a bad body is a 400, not a 503; and a hand
-    // edit is locked against the scanner unless it says otherwise.
+    // A whole PUT that leaves out media_ids must not unbind the item's files;
+    // PATCH changes only what it names; parents are checked; a bad body is a
+    // 400; and a hand edit is locked against the scanner unless it says
+    // otherwise.
     TestService fixture("catalogue-item-edits");
     auto& config = fixture.config();
     config.replication = 1;
@@ -4177,15 +4131,13 @@ MACHA_TEST("hydration_catalogue", test_item_edits_validate_parents_and_keep_file
     CHECK(error_of(wrong).find("parent_kind")->asString() == "show");
     CHECK(!service.catalogue().get("episode:edit-test").has_value());
 
-    // The right parent is accepted.
     CHECK(call("PUT", "season%3Aedit-test",
                R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})").status == 201);
 }
 
 MACHA_TEST("hydration_catalogue", test_search_filters_by_kind_and_parent_before_its_limit) {
-    // The metadata editor's search (proposal F, backlog item 9): `kind` may
-    // repeat, `parent` keeps one item's children, both filter before `limit`,
-    // and an unknown kind is a 400.
+    // `kind` may repeat, `parent` keeps one item's children, both filter
+    // before `limit`, and an unknown kind is a 400.
     TestService fixture("catalogue-search-filters");
     auto& config = fixture.config();
     config.replication = 1;
@@ -4412,12 +4364,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_stable_so_it_can
         return json.find("artwork")->asArray().front().find("url")->asString();
     };
 
-    // The whole point: a browser keys its cache on the full URL, so two reads
-    // of the same artwork must produce byte-identical URLs or the 24 hour
-    // immutable header on the artwork response can never be consulted. Before
-    // 0.40.0 the expiry was minted from the instant of signing, so these
-    // differed at millisecond granularity and every poster was re-fetched on
-    // every page load.
+    // A browser keys its cache on the full URL, so two reads of the same
+    // artwork must produce byte-identical URLs or the immutable cache header
+    // on the artwork response is never consulted.
     const auto first = artwork_url();
     std::this_thread::sleep_for(5ms);
     const auto second = artwork_url();
@@ -4495,8 +4444,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_stable_so_it_can
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_lasts_thirty_days_by_default) {
-    // At 24 h every artwork URL changed at UTC midnight and every browser
-    // downloaded every poster again the next day (2026-09-24, web client).
     CHECK(Config{}.catalogue.api.artwork_capability_ttl == std::chrono::hours(24 * 30));
 }
 
@@ -4649,7 +4596,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
 
     filesystem.mkdir("/Music", 0755, getuid(), getgid());
 
-    // Simulate namespace keys written by a previous version/client in D form.
+    // Namespace keys persisted in NFD form.
     // The runtime alias index must resolve NFC callbacks to the exact persisted
     // spelling instead of rewriting the metadata representation.
     const std::string nfd_dir = "/Music/Cafe\xcc\x81 del Mar";
@@ -5027,12 +4974,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         config->maintenance.garbage_grace = 0ms;
         config->maintenance.foreground_quiet = 10ms;
         config->maintenance.no_progress_backoff = 500ms;
-        // This case verifies metadata-burst coalescing and catalogue GC, not
-        // failure detection.  The generic 500 ms test deadline can expire when
-        // the process is descheduled under the parallel suite, causing a false
-        // topology edge (and correctly fencing destructive GC).  Keep liveness
-        // comfortably above scheduler jitter while retaining the short test
-        // heartbeat and all existing behavioural deadlines.
+        // This case tests burst coalescing and GC, not failure detection: keep
+        // liveness above scheduler jitter so a descheduled process cannot
+        // cause a false topology edge, which would fence destructive GC.
         config->dead_after = 5s;
         config->catalogue.scanner.enabled = false;
         config->catalogue.api.enabled = false;
@@ -5110,13 +5054,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             return false;
         }
     }, 10s));
-    // The baseline has to be the snapshot that actually satisfied quiescence,
-    // not a second one taken afterwards: between the predicate returning true
-    // and a separate sample, another convergence run can be scheduled, and the
-    // baseline then reads runs_scheduled=5 runs_completed=4. Every delta
-    // computed from it is off by one, and the end-of-test assertion
-    // `completed_delta == scheduled_delta` fails for a run that behaved
-    // perfectly (observed 1 in 60, 2026-09-15).
+    // The baseline must be the snapshot that satisfied quiescence: a second
+    // sample can catch a newly scheduled run and put every delta off by one.
     ConvergenceDemandDiagnostics convergence_before{};
     REQUIRE(wait_until([&] {
         const auto d = s1.metadata_convergence_diagnostics();
@@ -5154,26 +5093,16 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     REQUIRE(wait_until([&] {
         return s1.node().known_metadata_generation() >= final_generation;
     }, 5s));
-    // Deliberately NOT "no catalogue repair happened yet". Gating
-    // `metadata-repair-begin` stops this node's repair pass; it does not stop
-    // its committed generation from advancing, because publish_commit stores
-    // and accepts commits on replicas directly. s1 therefore legitimately
-    // moves forward under the gate and Service::loop repairs the catalogue
-    // for the generation it now has. Measured: `repairs_before=3
-    // gated_repairs=4 s1_committed=12 s1_known=13 final_generation=13`
-    // (2026-09-15) -- one repair, not a storm. The coalescing claim is
-    // asserted at the end of the test over the whole window, gate included,
-    // which is where it belongs.
+    // Not "no catalogue repair yet": the gate stops s1's repair pass, not its
+    // committed generation, because publish_commit accepts commits on replicas
+    // directly, so Service::loop may repair under the gate. Coalescing is
+    // asserted at the end over the whole window, gate included.
     const auto gated_repairs = catalogue_repairs.load(std::memory_order_acquire);
 
-    // Capture the convergence state at the first catalogue repair AFTER the
-    // gate opens: that is the repair which processes the accumulated burst,
-    // and the only one the run-count assertions below are about. Latching it
-    // from before the burst instead (as this did until 2026-09-15) could
-    // claim the capture on a repair for the single pre-burst upsert, giving
-    // `repair_scheduled=7 before_scheduled=6 repair_requested=10
-    // before_requested=9` -- one run and one demand event, asserted against
-    // as though it were the twenty-event burst. Observed 1 in 60.
+    // Capture the convergence state at the first catalogue repair after the
+    // gate opens: that repair processes the accumulated burst, which the
+    // run-count assertions below are about. Latching earlier could capture a
+    // repair for the single pre-burst upsert instead.
     capture_catalogue_repair.store(true, std::memory_order_release);
     metadata_gate.open();
     const bool final_state_ready = wait_until([&] {
@@ -5269,33 +5198,13 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " repairs_after=" +
             std::to_string(catalogue_repairs.load(std::memory_order_acquire)));
     }
-    // One catalogue repair per convergence run that actually advanced this
-    // node's committed metadata generation -- not one per burst event, which
-    // is the property under test, and not exactly one, which was the old
-    // assertion and is not something the product promises.
-    //
-    // `catalogue_dirty` is set by Service::loop when the local committed
-    // generation moves. The gated owner run and its coalesced follow-up are
-    // both mandatory (see above), so whether the burst's metadata arrives
-    // entirely within the first run or is split across both is a timing
-    // accident: either one or two generation changes, and therefore one or
-    // two repairs. Measured failing that way 2 times in 183 runs on the
-    // macOS laptop (2026-09-15): `before=2 after=4 scheduled_delta=2
-    // requested_delta=20` -- two convergence runs, two repairs, from twenty
-    // demand events. That is coalescing working, and the old assertion
-    // called it a failure.
-    // The subject: nine catalogue mutations, arriving as ~20 convergence
-    // demand events, must not become ~20 catalogue repairs. A quarter of the
-    // demand events is a generous ceiling on "coalesced" and still an order
-    // of magnitude below a per-event storm; observed values are 1-2.
-    //
-    // Not pinned to exactly one, which is what this assertion said until
-    // 2026-09-15 and is not a property the product has: whether the burst's
-    // metadata lands entirely within the gated owner run or is split across
-    // it and its mandatory coalesced follow-up is a timing accident, and each
-    // generation advance correctly dirties the catalogue. Measured failing
-    // that way twice in 183 runs (`before=2 after=4 scheduled_delta=2
-    // requested_delta=20`).
+    // Nine catalogue mutations, arriving as ~20 convergence demand events, must
+    // not become ~20 catalogue repairs. A quarter of the demand events is a
+    // generous ceiling on "coalesced" and still far below a per-event storm.
+    // Not pinned to exactly one: each convergence run that advances the
+    // committed generation correctly dirties the catalogue, and whether the
+    // burst lands in the gated run or is split across it and its follow-up is
+    // a timing accident.
     const auto repairs_after = catalogue_repairs.load(std::memory_order_acquire);
     const auto repairs_delta = repairs_after - repairs_before;
     if (repairs_delta < 1 || repairs_delta * 4 > requested_delta) {
@@ -5318,25 +5227,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     const std::string s2_stage_at_gc_start =
         std::string(s2.maintenance_stage()) + " " + s2.maintenance_sleep_diagnostic();
     if (!wait_until(unreclaimed, 12s)) {
-        // Failing here has to distinguish a slow sweep from a stuck one, or
-        // the next person reads "GC did not finish in 12 s" and calls it a
-        // flake -- which is how this case survived five sightings. Give it a
-        // bounded second chance purely to classify the failure, then say
-        // which objects are left and on which node. Measured twice on
-        // 2026-09-15: all four objects left on s2 (the node that wrote them)
-        // and none on s1, with both catalogues converged at the same
-        // generation and agreeing one artwork is live -- so not a slow sweep
-        // on both nodes, but the writer reclaiming nothing while its peer
-        // reclaimed everything. Four further occurrences in 600 reps all
-        // reported `reclaimed_eventually=no` after 42 s: it is stuck, not
-        // slow. See the P0 item in TODO/ACTIVE.md.
+        // A bounded second chance only classifies the failure as slow or
+        // stuck; it never turns it into a pass.
         const bool eventually = wait_until(unreclaimed, 15s);
         const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - gc_started).count();
-        // Name what is left and where. Without this a failure here says only
-        // "GC did not finish in 12 s", which cannot distinguish a slow sweep
-        // from a genuine leak -- and this case has been waved past as a flake
-        // more than once on exactly that ambiguity.
+        // Name what is left and on which node.
         std::string remaining;
         for (const auto& id : superseded) {
             const bool on1 = s1.node().local_store().has(id);
@@ -5417,9 +5313,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
 } // namespace
 
 MACHA_FAST_TEST("hydration_catalogue", test_a_failed_hint_outlives_the_job_that_raised_it) {
-    // 0.64.0. Clearing Colony deleted S02E13's failed hint, the only record
-    // that the file was never catalogued. A settled outcome goes with its job;
-    // a failure stays.
+    // A settled outcome goes with its job; a failure stays, as the only record
+    // that the file was never catalogued.
     TempDir dir;
     CatalogueHintQueue hints(dir.path());
     const auto failed_id = hints.submit("/TV/Show/S01E01.mkv", "ingest", "job-1", CatalogueHintPriority::ingest);
@@ -5439,9 +5334,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_failed_hint_outlives_the_job_that_
 }
 
 MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_and_is_deleted_later) {
-    // 0.64.0: a clear no longer deletes its payload in the request. The
-    // payload is renamed into staging's trash, still counted, and emptied by
-    // the trash worker.
+    // A discarded payload is renamed into staging's trash, still counted, and
+    // deleted when the trash is emptied.
     TempDir dir;
     IngestConfig config;
     config.staging_path = dir.path() / "staging";
@@ -5464,10 +5358,8 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_a
 }
 
 MACHA_TEST("hydration_catalogue", test_a_hint_newer_than_its_batch_snapshot_is_deferred_not_failed) {
-    // Colony S02E13, gbni-1, 2026-09-27: adopted a second after its batch took
-    // its namespace snapshot, claimed by that batch, judged "namespace path no
-    // longer exists" -- terminal -- and never catalogued. A hint newer than
-    // the snapshot now waits for the next batch.
+    // A hint created after its batch's namespace snapshot is deferred to the
+    // next batch rather than failed as missing.
     TempDir t;
     auto key = t.path() / "cluster.key";
     write_key(key);
@@ -5509,11 +5401,9 @@ MACHA_TEST("hydration_catalogue", test_a_hint_newer_than_its_batch_snapshot_is_d
 }
 
 MACHA_TEST("hydration_catalogue", test_an_import_uses_an_existing_folder_whatever_its_case) {
-    // The Martian, gbni-1, 2026-09-27: a 720p release named in lowercase was
-    // imported into "/Movies/the martian (2015)" beside "/Movies/The Martian
-    // (2015)". Names that differ only by case are one name (and will be on
-    // Windows): the existing folder is reused as spelt, and a file whose name
-    // differs from one already there only by case is a collision.
+    // Import destinations fold case: an existing folder is reused as spelt, and
+    // a file whose name differs from one already there only by case is a
+    // collision.
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;

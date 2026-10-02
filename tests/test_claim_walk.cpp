@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The claim walk on the object ledger contracts (the object ledger plan, T2).
-// RetentionLedger is checked against the RetentionStore it pages; the walk is
-// checked against fakes, step by step, against a reference copy of the walk
-// it replaced (the 0.73 maintenance lambda), over every held pattern and
-// every credit limit that reaches a different decision.
+// RetentionLedger is checked against the RetentionStore it pages; ClaimWalk is
+// checked step by step against a reference walk over fakes, for every held
+// pattern and every credit limit that reaches a different decision.
 #include "crypto.hpp"
 #include "service/claim_walk.hpp"
 #include "ledger/retention_ledger.hpp"
@@ -36,12 +34,9 @@ struct FakeStore final : ObjectStore {
     }
 };
 
-// ---- RetentionLedger over a RetentionStore ---------------------------------
-
-// Every claim count 0..9 (with every third claim released, so the store holds
-// entries the ledger must skip) and every page bound 1..10: paging from the
-// start returns each live claim once, in order, pages never exceed the bound,
-// only the last page is complete, and its cursor is the start again.
+// Claim counts 0..9 (every third released, so the ledger must skip entries) and
+// page bounds 1..10: each live claim comes once, in order, pages stay within
+// the bound, only the last page is complete, and its cursor is the start again.
 MACHA_FAST_TEST("claim_walk", test_retention_ledger_pages_every_live_claim_once) {
     TempDir t;
     auto keyfile = t.path() / "key";
@@ -195,31 +190,25 @@ MACHA_FAST_TEST("claim_walk", test_retention_ledger_forwards_claims_releases_pru
     CHECK(ledger.retained(RetentionClass::control, id_of(3)));
     CHECK(!ledger.retained(RetentionClass::data, id_of(4)));
 
-    // Release against a horizon: a claim it no longer refers to, written
-    // before its clock, is released; one it refers to stays; the other class
-    // is untouched.
+    // A claim the horizon does not refer to, written before its clock, is
+    // released; one it refers to stays; the other class is untouched.
     const ReleaseHorizon release(Hash256{}, {{origin, 10}}, {id_of(2)}, {});
     CHECK(ledger.release_unreferenced(RetentionClass::data, release, 64) == 1);
     CHECK(!ledger.retained(RetentionClass::data, id_of(1)));
     CHECK(ledger.retained(RetentionClass::data, id_of(2)));
     CHECK(ledger.retained(RetentionClass::control, id_of(3)));
 
-    // Prune forgets the released object's tombstone only once the class's
-    // store no longer holds it.
+    // Prune forgets a released object's tombstone only once the class's store no longer holds it.
     data.objects = {id_of(1)};
     CHECK(ledger.prune_unclaimed(RetentionClass::data, 64) == 0);
     data.objects.clear();
     CHECK(ledger.prune_unclaimed(RetentionClass::data, 64) == 1);
-    // Control's store is asked for control: holding id 1 there does not keep
-    // a data tombstone, and nothing of control is released to prune.
+    // Nothing of control was released, and control's store keeps no data tombstone.
     CHECK(ledger.prune_unclaimed(RetentionClass::control, 64) == 0);
 
-    // Compaction past the threshold, and not below it.
     CHECK(!ledger.compact_if_needed(1000000));
     CHECK(ledger.compact_if_needed(1));
 }
-
-// ---- ClaimWalk against the walk it replaced --------------------------------
 
 // Claims in id order; the ledger honours the budget as the contract says.
 struct FakeLedger final : ObjectLedger {
@@ -259,7 +248,7 @@ struct FakeLedger final : ObjectLedger {
 };
 
 // Restores until its credit runs out; `refused` ids are fetched but not
-// restored (and cost nothing, as in maintenance). Records every call.
+// restored and cost nothing. Records every call.
 struct FakeRestorer final : ClaimRestorer {
     size_t credit{};
     std::set<ObjectId> refused;
@@ -277,8 +266,7 @@ struct FakeRestorer final : ClaimRestorer {
     }
 };
 
-// The 0.73 maintenance lambda, with the ledger and restorer in place of the
-// node's stores: next_retained() one claim at a time, 16 per step.
+// The reference walk: next_retained() one claim at a time, 16 per step.
 struct ReferenceWalk {
     std::optional<ObjectId> cursor;
     ClaimWalkStep step(const FakeLedger& ledger, FakeRestorer& restorer) {
@@ -342,7 +330,7 @@ void compare(const FakeLedger& ledger, const std::set<ObjectId>& refused, size_t
 }
 
 // Every held pattern over up to eight claims, credit 0..3 with and without
-// refill, and a refused claim: 9 patterns sizes x 2^n x 8 credit regimes.
+// refill, and a refused claim.
 MACHA_FAST_TEST("claim_walk", test_claim_walk_matches_the_walk_it_replaced_exhaustively) {
     for (size_t n = 0; n <= 8; ++n)
         for (unsigned pattern = 0; pattern < (1U << n); ++pattern) {

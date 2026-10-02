@@ -15,10 +15,9 @@ class CatalogueApi {
     CatalogueHintQueue& hints_;
     std::function<void(const std::vector<std::string>&)> request_media_rescan_;
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles_;
-    // Resolve a media profile now, at foreground priority, and persist it.
-    // A client instructs from these facts, so "no profile yet" is not an
-    // answer: either the stored copy is returned, or it is produced here
-    // (operator, 2026-09-07). Absent only in fixtures without an engine.
+    // Resolves a media profile now, at foreground priority, and persists it:
+    // clients need the facts, so "no profile yet" is never an answer. Absent only
+    // in fixtures without an engine.
     std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile_;
     std::chrono::milliseconds artwork_capability_ttl_;
     // The size of a media id's file, when this node can find it.
@@ -42,11 +41,10 @@ class CatalogueApi {
           artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)),
           keyframe_index_(std::move(keyframe_index)) {}
     HttpResponse handle(const HttpRequest&);
-    // Recognizes a request as a self-authorizing capability URL (currently:
-    // an artwork GET carrying a valid, unexpired signature) so HttpServer can
-    // exempt it from the ordinary bearer-token requirement. The signature
-    // itself is verified here, not merely the URL shape, so an unsigned
-    // request to the same path still falls through to the normal check.
+    // Recognises a self-authorising capability URL (an artwork GET with a valid,
+    // unexpired signature) so HttpServer exempts it from the bearer-token check.
+    // The signature is verified here, so an unsigned request to the same path
+    // falls through to the normal check.
     bool capability_request(const HttpRequest&) const;
 };
 

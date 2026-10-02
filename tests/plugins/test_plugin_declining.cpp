@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A real plugin whose factory declines to produce an instance, the way the
-// torrent plugin does when torrent.enabled is false. That is an operator
-// choice, not a fault: the supervisor must report `unavailable` and stop,
-// never enter the backoff/retry path it uses for a plugin that threw.
+// A plugin whose factory declines to produce an instance (as torrent does when
+// disabled). The supervisor must report `unavailable`, not enter backoff/retry.
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The horizon builder's two builds (the object ledger spec, B4), against fake
-// sources: an in-memory namespace tree and a catalogue given as a function.
-// Each build is compared with the maintenance pass's own build as it stood
-// before the builder existed (src/service/maintenance.cpp at be930c9),
-// copied here as the reference.
+// The horizon builder's two builds against fake sources (an in-memory namespace
+// tree, a catalogue given as a function), each compared with a reference build.
 #include "ledger/node_horizon_builder.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "test_framework.hpp"
@@ -50,9 +47,8 @@ FsEntry directory() {
     return entry;
 }
 
-// Serves every node once, then refuses any node read a second time: the
-// namespace walk reads each node once and succeeds, the tree-node collection
-// that follows it reads them again and fails.
+// Serves each node once, so the namespace walk succeeds and the tree-node
+// collection after it, which reads them again, fails.
 class OnceNodeStore final : public NamespaceNodeStore {
   public:
     explicit OnceNodeStore(const NamespaceNodeStore& inner) : inner_(inner) {}
@@ -68,7 +64,7 @@ class OnceNodeStore final : public NamespaceNodeStore {
     mutable std::set<ObjectId> served_;
 };
 
-// The pass's release build before the builder, verbatim but for its sources.
+// The reference release build the builder must reproduce.
 struct ReferenceRelease {
     std::vector<ObjectId> data, control;
     bool complete{};
@@ -167,8 +163,7 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_cata
            std::vector<ObjectId>{id(1), id(2), id(3)}));
     CHECK((ids_of(inventory->referenced_ids(RetentionClass::control)) ==
            std::vector<ObjectId>{id(6), id(7)}));
-    // A tombstone the catalogue's data revives is stale, as one the namespace
-    // revives is.
+    // A tombstone revived by catalogue data is stale, as one the namespace revives is.
     CHECK(inventory->stale_garbage().size() == 1 && inventory->stale_garbage()[0].id == id(2));
     CHECK(inventory->garbage().size() == 1 && inventory->garbage()[0].id == id(8));
 
@@ -208,8 +203,7 @@ MACHA_FAST_TEST("horizon_builder", test_release_over_a_tree_matches_the_pass_bui
     CHECK(built.complete);
     CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(3), id(4), id(6), id(8), id(10)}));
-    // The control set is both catalogue roots' control objects and every
-    // node of the namespace tree.
+    // Control: both catalogue roots' control objects and every namespace tree node.
     CHECK(built.horizon->referenced(RetentionClass::control, id(9)));
     CHECK(built.horizon->referenced(RetentionClass::control, id(11)));
     CHECK(built.horizon->size(RetentionClass::control) == 2 + nodes.nodes());
@@ -230,7 +224,7 @@ MACHA_FAST_TEST("horizon_builder", test_an_unreadable_catalogue_root_leaves_the_
     check_matches_reference(head, nodes, nodes, catalogue);
     const auto built = build_release(head, nodes, catalogue);
     CHECK(!built.complete);
-    // What could be read is still there: the trace reports its sizes.
+    // What could be read is still in the horizon.
     CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::data)) ==
            std::vector<ObjectId>{id(1), id(8)}));
     CHECK((ids_of(built.horizon->referenced_ids(RetentionClass::control)) ==

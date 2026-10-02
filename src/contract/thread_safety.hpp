@@ -4,10 +4,9 @@
 #include <memory>
 #include <mutex>
 
-// Clang's thread-safety analysis (the object ledger spec, A1 and A2; the
-// plan's L track). The attributes are checked by Clang with -Wthread-safety
-// (warnings are errors) and ignored by GCC. Only annotated code is checked,
-// so adoption proceeds file by file as each is touched.
+// Clang's thread-safety analysis (object ledger spec, A1 and A2): checked by
+// Clang with -Wthread-safety (warnings are errors), ignored by GCC. Only
+// annotated code is checked.
 #if defined(__clang__)
 #define MACHA_THREAD_ANNOTATION(x) __attribute__((x))
 #else
@@ -23,12 +22,10 @@
 namespace macha {
 
 // A role, not a lock: "this code waits on no I/O". An operation declared to
-// wait on nothing holds a NoIoRegion for its body; everything that waits on
-// I/O -- here, taking a lock that a writer holds across its I/O -- is
-// annotated MACHA_EXCLUDES(no_io). Reaching one inside such a region is then
-// "cannot call while 'no_io' is held", a compile error under Clang. One
-// object for the role is enough: the analysis is per function, and no
-// runtime state hangs on it.
+// wait on nothing holds a NoIoRegion for its body; whatever waits on I/O
+// (such as a lock a writer holds across its I/O) is MACHA_EXCLUDES(no_io), so
+// reaching it inside the region is a Clang compile error. One object suffices:
+// the analysis is per function and no runtime state hangs on it.
 class MACHA_CAPABILITY("no-I/O region") NoIo {};
 extern NoIo no_io;
 
@@ -40,9 +37,9 @@ class MACHA_SCOPED_CAPABILITY NoIoRegion {
     NoIoRegion& operator=(const NoIoRegion&) = delete;
 };
 
-// A per-object mutex that a writer holds across its device I/O
-// (LocalStore's object_mutex): waiting for it is waiting on that I/O.
-// Scoped: it keeps the mutex alive and holds it for the guard's lifetime.
+// A per-object mutex a writer holds across its device I/O (LocalStore's
+// object_mutex), so waiting for it is waiting on that I/O. Keeps the mutex
+// alive and held for the guard's lifetime.
 class ObjectLock {
     std::shared_ptr<std::mutex> mutex_;
     std::lock_guard<std::mutex> guard_;

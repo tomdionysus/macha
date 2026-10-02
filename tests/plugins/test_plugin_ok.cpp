@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Minimal real subsystem plugin used only by
-// foundations/test_subsystem_supervisor_loads_and_stops_a_real_plugin. Starts
-// and stops cleanly, proving the real dlopen -> version-check -> construct ->
-// start -> stop path works end to end, not just in-process mocks.
+// Minimal plugin that starts and stops cleanly, exercising the real
+// dlopen -> version check -> construct -> start -> stop path.
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"

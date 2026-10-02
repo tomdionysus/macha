@@ -76,15 +76,14 @@ struct IngestJob {
     std::optional<uint64_t> eta_seconds;
     uint64_t created_unix_ms{};
     uint64_t updated_unix_ms{};
-    // Why the job is blocked or failed: `error_code` is the snake_case code
-    // clients act on (see IngestError), `error` the English message beside it.
+    // Why the job is blocked or failed: the code clients act on, and its
+    // English message.
     std::string error_code;
     std::string error;
     std::vector<IngestFileProgress> files;
 };
 
-// A job failure with its code. Thrown from the import path; process_job
-// records the code beside the message.
+// A job failure with its code, thrown from the import path.
 class IngestError : public std::runtime_error {
   public:
     IngestError(std::string code, const std::string& message)
@@ -95,11 +94,9 @@ class IngestError : public std::runtime_error {
     std::string code_;
 };
 
-// HTTP/RPC-facing JSON shape for an ingest job -- shared by the local HTTP
-// handler (acquisition_api.cpp) and the cluster-wide RPC bridge below, so a
-// remote job renders identically to a local one (plus a "node_id" field the
-// caller tags on afterward). Distinct from job_json()/parse_job() in
-// ingest.cpp, which is the on-disk jobs.json persistence shape.
+// API JSON for an ingest job, shared by the HTTP handler and the cluster RPC
+// so remote and local jobs render alike. The on-disk jobs.json shape is
+// job_json()/parse_job() in ingest.cpp.
 Json optional_u64(const std::optional<uint64_t>&);
 Json catalogue_summary_json(const IngestJob&, const CatalogueHintSummary* detail = nullptr);
 Json ingest_job_json(const IngestJob&, bool include_files,
@@ -117,7 +114,7 @@ struct ClusterIngestJob {
 struct IngestActionResult {
     bool exists{};
     bool changed{};
-    // The job is known to be on a node that could not be reached.
+    // The job's node could not be reached.
     bool unreachable{};
     std::optional<ClusterIngestJob> updated;
 };
@@ -129,8 +126,8 @@ struct StagingStatus {
     uint64_t reserved_bytes{};
     uint64_t accounted_bytes{};
 };
-// Staging capacity as the API and the torrent RPC report it: limit, bytes on
-// disk, bytes reserved by running downloads, their sum, and what is left.
+// Staging limit, bytes on disk, bytes reserved by running downloads, their
+// sum, and what is left.
 Json staging_capacity_json(const StagingStatus&);
 
 class StagingArea {
@@ -151,18 +148,14 @@ class StagingArea {
     uint64_t reservation(std::string_view owner) const;
     StagingStatus status() const;
 
-    // Deletes a payload inside staging without waiting for it (0.64.0): the
-    // directory is renamed into `.trash` beside it, which is instant on one
-    // filesystem, and empty_trash() deletes it later. Until then it still
-    // counts against the staging limit. A clear that deleted a 75 GB payload
-    // in the request took 34 s on a busy DATA disk (gbni-1, 2026-09-27).
-    // Returns false when the path is not inside staging or could not be moved.
+    // Deletes a staging payload without waiting: renames it into `.trash`
+    // (instant on one filesystem) for empty_trash(); until then it counts
+    // against the limit. False when outside staging or not movable.
     bool discard(const std::filesystem::path&);
-    // Deletes everything in `.trash`; what cannot be deleted now stays for
-    // the next call. Returns the number of entries removed.
+    // Deletes what it can of `.trash`; returns the number of entries removed.
     size_t empty_trash();
     std::filesystem::path trash_path() const;
-    // Wakes the thread that calls empty_trash().
+    // Waits for discard() to trash something, the interval, or stop.
     void wait_for_trash(std::stop_token, std::chrono::milliseconds);
 
   private:
@@ -185,27 +178,23 @@ class IngestManager {
     bool resume_locked(std::string_view id);
     std::condition_variable_any cv_;
     std::map<std::string, IngestJob, std::less<>> jobs_;
-    // Jobs currently claimed by a worker. A job is inserted under mutex_ in
-    // the same critical section that selects it, so two workers can never
-    // claim the same job, and cancel() can still tell whether cleanup is its
-    // own responsibility or the owning worker's.
+    // Jobs claimed by a worker, inserted under mutex_ in the section that
+    // selects them: no job is claimed twice, and cancel() knows whether
+    // cleanup is its own or the worker's.
     std::set<std::string, std::less<>> active_job_ids_;
-    // Cleanup a clear() owes a job whose worker was still inside it: its
-    // partials (and, per the clear, its source) are removed by the worker as
-    // it lets go of the job, never underneath it.
+    // Cleanup owed by a clear() of a claimed job: the worker removes its
+    // partials (and, per the clear, its source) as it releases the job.
     struct ClearedWhileActive {
         IngestJob job;
         bool delete_source{};
     };
     std::map<std::string, ClearedWhileActive, std::less<>> cleared_while_active_;
-    // High-water mark of concurrently claimed jobs. Monotonic, so it answers
-    // "did this pool ever actually run jobs in parallel?" without having to
-    // catch the moment in a sample.
+    // High-water mark of concurrently claimed jobs; shows parallelism without
+    // catching it in a sample.
     size_t peak_active_jobs_{};
     std::vector<std::jthread> workers_;
-    // Catalogue completion is observed by polling the hint queue rather than
-    // by callback. That poll owns its own thread so it cannot be starved by
-    // busy import workers -- which is exactly what a single shared worker did.
+    // Polls the hint queue for catalogue completion; its own thread so busy
+    // import workers cannot starve it.
     std::jthread catalogue_worker_;
     std::jthread trash_worker_;
 
@@ -219,12 +208,11 @@ class IngestManager {
     bool plan_job(IngestJob&, std::stop_token);
     bool import_job(IngestJob&, std::stop_token);
     // Gives every unfinished file of a planned job a destination no other
-    // file of the job uses. Jobs planned before 0.58.3 could give two source
-    // files one destination; this resolves them on resume.
+    // file of the job uses.
     void resolve_duplicate_destinations(IngestJob&);
     bool copy_file(IngestJob&, IngestFileProgress&, std::stop_token);
-    // A torrent-sourced file whose every extent the torrent's disk backend has
-    // already published: its manifest, from the job's TorrentExtentJournal.
+    // The manifest of a torrent-sourced file whose every extent the torrent
+    // disk backend has published, from the job's TorrentExtentJournal.
     std::optional<std::vector<ExtentRef>> published_extents(const IngestJob&,
                                                             const IngestFileProgress&);
     std::mutex extent_journals_mutex_;
@@ -244,9 +232,8 @@ class IngestManager {
     void set_blocked(IngestJob&, std::string code, std::string message);
     void cleanup_partials(const IngestJob&);
 
-    // NodeRuntime::set_ingest_bridge() handler bodies: this node's own jobs
-    // only. Every node's view of the cluster (ClusterJobView) is built from
-    // these replies.
+    // NodeRuntime::set_ingest_bridge() handlers: this node's own jobs only;
+    // ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
 
@@ -272,11 +259,9 @@ class IngestManager {
     std::optional<IngestJob> job(std::string_view id) const;
     bool pause(std::string_view id);
     bool resume(std::string_view id);
-    // Told the id of every job resume() brings back, by whichever path: the
-    // API, a peer's action or a torrent retry. The torrent manager needs it:
-    // a torrent job that failed with its ingest must follow the ingest back,
-    // and nothing else would wake it (0.62.0). Called without the ingest lock
-    // held; set once, cleared before the listener goes away.
+    // Told the id of every job resume() brings back, by any path, so a torrent
+    // job that failed with its ingest follows it back. Called without the
+    // ingest lock; set once, cleared before the listener goes away.
     void set_resume_listener(std::function<void(std::string_view)>);
     bool cancel(std::string_view id);
     bool clear(std::string_view id);
@@ -285,8 +270,8 @@ class IngestManager {
     bool delete_external_source_on_clear() const;
     bool delete_owned_source_on_cancel() const;
     StagingArea& staging() noexcept { return staging_; }
-    // The torrent disk backend publishes extents through the same store the
-    // ingest commits into.
+    // The store the ingest commits into; the torrent disk backend publishes
+    // extents through it.
     FileSystem& filesystem() noexcept { return fs_; }
     const StagingArea& staging() const noexcept { return staging_; }
     size_t max_concurrent_jobs() const noexcept { return config_.max_concurrent_jobs; }

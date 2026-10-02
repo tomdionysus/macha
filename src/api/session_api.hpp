@@ -41,16 +41,14 @@ class CredentialValidator {
 
 // Empty credentials mint an anonymous session carrying
 // SessionConfig::anonymous_roles; a {username, password} pair is checked
-// against the node's own replica of the cluster user table. Both paths are
-// local: no RPC, no metadata, no catalogue -- a node that is temporarily alone
-// still authenticates every user it knows about.
+// against this node's replica of the user table. Both paths are local, so a
+// node that is alone still authenticates every user it knows.
 class PasswordCredentialValidator final : public CredentialValidator {
     const UserStore& users_;
     SessionConfig config_;
 
-    // Local brakes on an unauthenticated endpoint that runs a deliberately
-    // expensive KDF. Neither is cluster state: they protect this node's CPU,
-    // and replicating them would be both pointless and a channel of its own.
+    // Local brakes on an unauthenticated endpoint running an expensive KDF. They
+    // protect this node's CPU and are deliberately not cluster state.
     mutable std::mutex mutex_;
     mutable size_t in_flight_{};
     struct Failures {
@@ -67,9 +65,9 @@ class PasswordCredentialValidator final : public CredentialValidator {
     CredentialResult validate(const Json& credentials) const override;
 };
 
-// REST surface for the cluster session/auth subsystem: mint, introspect, and
-// revoke the caller's own bearer-token-backed session. This is the only
-// endpoint reachable without an existing session (see capability_request).
+// REST surface for the session/auth subsystem: mint, introspect and revoke
+// the caller's own session. The only endpoint reachable without a session
+// (see capability_request).
 class SessionApi {
     SessionManager& sessions_;
     NodeRuntime& node_;

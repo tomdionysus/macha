@@ -26,9 +26,8 @@ struct ReplicaTransferStats {
     uint64_t selections{};
 };
 
-// Shared read-source policy for foreground extent retrieval and speculative
-// cache hydration. It contains no network code: callers supply candidate
-// replicas, reserve the chosen source, then report completion.
+// Read-source policy for foreground extent fetches and speculative hydration.
+// No network code: callers supply candidates, call started(), then finished().
 class ReplicaSelector {
     struct State {
         size_t foreground_in_flight{};
@@ -47,9 +46,8 @@ class ReplicaSelector {
     static double score(const State&, ReplicaWorkClass);
 
   public:
-    // Returns all candidates ordered from most to least suitable. With no
-    // observations, stripe spreads equal candidates deterministically. Once
-    // observations exist, faster and less-loaded peers receive more work.
+    // All candidates, most suitable first. `stripe` rotates equal-scored
+    // candidates deterministically.
     std::vector<NodeInfo> order(const std::vector<NodeInfo>& candidates,
                                 size_t stripe, ReplicaWorkClass work) const;
 

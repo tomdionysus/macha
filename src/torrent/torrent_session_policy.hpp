@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// How Macha holds, releases and resumes a torrent in libtorrent's session.
-// Kept apart from TorrentManager so the plugin test binary can drive it
-// against real sessions.
+// How Macha holds, releases and resumes a torrent in libtorrent's session;
+// apart from TorrentManager so plugin tests can drive real sessions.
 #pragma once
 
 #include <libtorrent/add_torrent_params.hpp>
@@ -17,17 +16,13 @@
 
 namespace macha {
 
-// A held torrent is paused *and* not auto-managed. libtorrent's queue manager
-// resumes an auto-managed torrent regardless of pause(): measured on fi-1 on
-// 2026-09-25, a torrent paused straight after add was running, fully
-// re-checked and seeding three seconds later. Until 0.61.0 every Macha pause
-// -- operator, staging_full, restore -- was that plain pause().
+// A held torrent is paused *and* not auto-managed: libtorrent's queue resumes
+// an auto-managed torrent regardless of pause().
 void hold_torrent(libtorrent::torrent_handle&);
 void release_torrent(libtorrent::torrent_handle&);
 void hold_at_add(libtorrent::add_torrent_params&);
-// Sets both flags from Macha's intent, whatever the params carried. Resume
-// data restores the flags it was saved with, so a torrent saved while held
-// came back held even once its job no longer was (Smallville, 0.62.1).
+// Sets both flags from Macha's intent, overriding the flags resume data
+// restores.
 void set_hold_at_add(libtorrent::add_torrent_params&, bool held);
 
 // A torrent's identity as lowercase hex: its v1 SHA-1 when it has one,
@@ -36,16 +31,12 @@ std::string torrent_info_hash_hex(const libtorrent::info_hash_t&);
 
 enum class TorrentCheckPhase { none, queued, checking };
 
-// libtorrent checks one torrent at a time. One waiting its turn reports
-// checking_files like the one being checked, but paused (it is auto-managed
-// and the queue has not started it); only the unpaused one is reading.
+// libtorrent checks one torrent at a time; one awaiting its turn also reports
+// checking_files, but paused.
 TorrentCheckPhase torrent_check_phase(const libtorrent::torrent_status&);
 
-// Resume data, so a restart trusts the pieces already verified instead of
-// re-hashing every staged byte (gbni-1, 2026-09-25: an hour at the disk's
-// full 90 MB/s after each restart, with every other torrent queued behind).
-// A file that is missing, unreadable, or for a different torrent yields
-// nothing and the caller falls back to the magnet.
+// Resume data, so a restart trusts verified pieces instead of re-hashing. A
+// missing, unreadable or foreign file yields nothing; the caller uses the magnet.
 std::optional<libtorrent::add_torrent_params>
 load_torrent_resume(const std::filesystem::path&, std::string_view expected_info_hash_hex);
 void store_torrent_resume(const std::filesystem::path&, const libtorrent::add_torrent_params&);

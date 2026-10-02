@@ -26,9 +26,8 @@ MACHA_TEST("invariants", test_convergence_demand_coalesces_burst_and_keeps_same_
     REQUIRE(first.has_value());
     CHECK(first->generation == 10);
 
-    // Model notices arriving while the convergence owner is gated in its
-    // current run. They advance the high-water state without scheduling one
-    // maintenance run per intermediate generation.
+    // Notices arriving during a run advance the high-water mark without
+    // scheduling a run per intermediate generation.
     for (uint64_t generation = 11; generation <= 210; ++generation)
         demand.request(generation);
     demand.request(210); // same-generation sibling/topology change
@@ -50,8 +49,8 @@ MACHA_TEST("invariants", test_convergence_demand_coalesces_burst_and_keeps_same_
     CHECK(settled.completed_epoch == settled.requested_epoch);
     CHECK(!settled.scheduled);
 
-    // Generation alone is not the identity: a sibling notice at the already
-    // processed generation must still create a new edge.
+    // A sibling notice at an already processed generation still schedules a
+    // run: generation alone is not the identity.
     demand.request(210);
     auto sibling = demand.begin();
     REQUIRE(sibling.has_value());
@@ -847,9 +846,8 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
     CHECK(metadata.identity_resets.at(key).stale_node_id == stale.id);
     CHECK(metadata.identity_resets.at(key).reason == "test endpoint reassignment");
 
-    // The generic management action also supports clearing by IP alone when
-    // the stale NodeId is no longer known. Port 0 is the durable wildcard for
-    // every advertised endpoint on the host.
+    // A reset by IP alone needs no NodeId; port 0 covers every endpoint on the
+    // host.
     auto second_port = replacement;
     second_port.id = random_node_id();
     second_port.port = 57402;
@@ -939,9 +937,8 @@ MACHA_TEST("invariants", test_manage_identity_reset_breaks_metadata_unavailable_
     reset.body.assign(body.begin(), body.end());
     const auto response = manage.handle(reset);
 
-    // The operational recovery succeeds before its cluster-metadata audit.
-    // HTTP 202 communicates that the durable local tombstone was accepted and
-    // all cluster propagation/auditing is asynchronous.
+    // 202: the local tombstone is durable; cluster propagation and audit are
+    // asynchronous, so the reset succeeds without writable metadata.
     REQUIRE(response.status == 202);
     const auto value = Json::parse(std::string(
         reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -988,8 +985,7 @@ MACHA_TEST("invariants", test_manage_identity_reset_does_not_wait_for_metadata_a
     stale.seen_unix_ms = unix_ms();
     service.node().membership().observe(stale, true);
 
-    // Hold the metadata mutation owner exactly where the deployed request
-    // spent 34.7 seconds. Reset admission must remain independent of it.
+    // Hold a metadata mutation open; reset admission must not wait for it.
     TestGate mutation_gate;
     std::jthread blocker([&] {
         service.metadata_manager().mutate_delta(
@@ -1024,8 +1020,8 @@ MACHA_TEST("invariants", test_manage_identity_reset_does_not_wait_for_metadata_a
     }));
 }
 
-// 0.42.1: a client probing an address must be able to tell "something
-// answered" from "Macha answered", including while the node is still starting.
+// A probe can tell "something answered" from "Macha answered", even while the
+// node is starting.
 MACHA_TEST("invariants", test_health_identifies_itself_unauthenticated_in_every_state) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("health-identity");
@@ -1046,9 +1042,7 @@ MACHA_TEST("invariants", test_health_identifies_itself_unauthenticated_in_every_
     } release{control_gate};
     REQUIRE(control_gate.wait_for_entries(1));
 
-    // Still starting: 503, and it still says what it is. This is the state a
-    // probe is most likely to meet and the one whose body a caller is most
-    // tempted not to parse.
+    // Still starting: 503, and the body still identifies Macha.
     {
         const auto response = raw_http_get(port, "/api/v1/health");
         CHECK(response.find("HTTP/1.1 503") != std::string::npos);
@@ -1063,18 +1057,14 @@ MACHA_TEST("invariants", test_health_identifies_itself_unauthenticated_in_every_
         return raw_http_get(port, "/api/v1/health").find("HTTP/1.1 200") != std::string::npos;
     }, 20s));
 
-    // Serving: 200, the same marker, and no bearer token anywhere above -- the
-    // probe runs before any session exists.
+    // Serving: 200 and the same marker, still without a bearer token.
     const auto response = raw_http_get(port, "/api/v1/health");
     CHECK(response.find("\"service\":\"macha\"") != std::string::npos);
     CHECK(response.find("\"status\":\"ok\"") != std::string::npos);
     CHECK(response.find("\"version\":\"") != std::string::npos);
-    // The cluster's shape is still not here, and test_users pins that from the
-    // other end: what a node is may be answered without a token, what the
-    // cluster looks like may not.
+    // Cluster shape needs a token; only the node's identity is public.
     CHECK(response.find("capacity") == std::string::npos);
-    // Same-origin is the intended case, but the probe must work cross-origin
-    // too, and a negative must be an HTTP answer rather than an opaque failure.
+    // The probe works cross-origin too.
     CHECK(response.find("Access-Control-Allow-Origin: *") != std::string::npos);
 
     service.stop();
@@ -1257,9 +1247,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
     const auto ping = peer.call(recovering_endpoint, MessageType::ping);
     CHECK(ping.message.type == MessageType::ok);
 
-    // Let the peer directly gossip with the still-recovering node so it
-    // publishes -- and the peer observes -- fresh telemetry that truthfully
-    // reflects its real, non-ready phase rather than nothing at all.
+    // Wait until the peer holds fresh telemetry reporting the non-ready phase.
     REQUIRE(wait_until(
         [&] {
             const auto views = peer.telemetry().views(std::chrono::milliseconds(60000));
@@ -1285,12 +1273,9 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
         if (value.find("id")->asString() != to_string(recovering.node_id()))
             continue;
         found = true;
-        // Still control-plane reachable -- genuinely true, not a lie.
         CHECK(value.find("state")->asString() == "online");
         CHECK(value.find("phase")->asString() == "recovering");
-        // This is the exact "green with fabricated numbers" incident: a
-        // fresh-but-not-yet-ready sample's zero capacity/usage must not be
-        // presented as an authoritative current measurement.
+        // A not-yet-ready sample's zero capacity/usage is not a measurement.
         CHECK(!value.find("storage")->find("available")->asBool());
     }
     CHECK(found);
@@ -1310,12 +1295,8 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
     recovering.stop();
 }
 
-// Status is polled; diagnostics are read when something is wrong. Serving both
-// from one route meant every poll walked most of the node's subsystems -- the
-// RPC client and server, the storage pool, the retained memory ledger, the FUSE
-// frontend -- each under its own lock, and some of those locks are held by
-// exactly the busy paths that make an operator reach for Status. The split is
-// about what a poll touches, not about bytes; the bytes are just how it shows.
+// Status is polled; diagnostics walk the subsystems under their own locks, so
+// they live on a separate route that a poll never touches.
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
     NodeRuntime node(cluster.node_config("status-split"), cluster.keys());
@@ -1335,12 +1316,9 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     auto light = get("/api/v1/status");
     REQUIRE(light.status == 200);
     auto root = body_of(light);
-    // Everything an operator or a client needs to render health and choose a
-    // node stays on the polled route.
     for (const auto* key : {"cluster", "nodes", "startup", "subsystems", "threads", "connectivity"})
         CHECK(root.find(key) != nullptr);
-    // A supervised thread's fault is on the polled route (0.63.0); before it,
-    // a thread that ended said so once in the journal and nowhere else.
+    // A supervised thread's fault is reported on the polled route.
     std::thread([] {
         run_supervised_once("test-status-thread-fault", [] { throw std::runtime_error("boom"); });
     }).join();
@@ -1356,13 +1334,9 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
         CHECK(listed->find("last_fault")->asString() == "boom");
         CHECK(!listed->find("last_fault_unix_ms")->isNull());
     }
-    // The response says which node produced it, and the value joins to an
-    // entry in nodes[]. Without this a client configured with one address gets
-    // a cluster snapshot in which nothing identifies the node that answered,
-    // so a machine reached by two addresses -- a LAN address and a DNS name --
-    // is counted as two nodes. api_endpoint cannot serve the purpose: it is
-    // the node's own advertised name, which differs from the address the
-    // client used in exactly the case that matters.
+    // node_id names the answering node and joins to an entry in nodes[], so a
+    // node reached by two addresses is not counted twice. api_endpoint cannot
+    // do this: it may differ from the address the client used.
     REQUIRE(root.find("node_id") != nullptr);
     const auto answering = root.find("node_id")->asString();
     CHECK(!answering.empty());
@@ -1391,14 +1365,9 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
         CHECK(diagnostics->find(section) != nullptr);
     CHECK(heavy_root.find("generated_at_unix_ms") != nullptr);
 
-    // The load-bearing assertion, and it is about what the polled route does
-    // rather than how big it is: not one diagnostics section is reachable
-    // through it, so not one of their locks is taken to answer a poll. A size
-    // comparison would say less and would depend on how much of this fixture
-    // had finished recovering.
-    // Named by a field each section alone owns, not by the section name: the
-    // light view legitimately says "metadata_generation" and "startup.metadata"
-    // and would match a bare "metadata".
+    // No diagnostics section is reachable through the polled route. Matched by
+    // a field each section alone owns: the light view legitimately contains
+    // "metadata_generation", which a bare "metadata" would match.
     const std::string light_text(reinterpret_cast<const char*>(light.body.data()),
                                  light.body.size());
     for (const auto* owned : {"retained_memory", "rpc_server", "rpc_transport", "data_resources",
@@ -1407,7 +1376,7 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
                               "data_publication_quanta"})
         CHECK(light_text.find(owned) == std::string::npos);
 
-    // The new route must not be swallowed by the per-node prefix beside it.
+    // The per-node prefix still routes alongside the diagnostics route.
     CHECK(get("/api/v1/status/nodes").status == 200);
     CHECK(get("/api/v1/status/nodes/not-a-node-id").status == 400);
 }
@@ -1422,8 +1391,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     auto& node = fixture.start();
     auto& metadata = fixture.metadata();
 
-    // Establish the coherent local metadata view without a Service maintenance
-    // thread. This keeps the availability state deterministic for this test.
+    // Establish the local metadata view without a maintenance thread, so the
+    // availability state is deterministic.
     const auto local_snapshot = metadata.snapshot();
     REQUIRE(local_snapshot.metadata_voters.empty());
 
@@ -1438,10 +1407,9 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer.seen_unix_ms = unix_ms();
     node.membership().observe(peer, true);
 
-    // Deliberately do not create a telemetry observation for the peer. Cluster
-    // membership alone must make it visible and online in Status. Replica-set
-    // validation is convergence telemetry in 0.19; it must not demote write
-    // capability while the configured durability floor is reachable.
+    // No telemetry for the peer: membership alone makes it visible and online.
+    // A pending replica-set validation does not demote write capability while
+    // the durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
     ClusterStatusService status(node);
     status.attach_metadata(metadata);
@@ -1521,9 +1489,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
         CHECK(value.find("telemetry_freshness")->asString() == "unavailable");
         CHECK(value.find("host")->asString() == peer.host);
         CHECK(value.find("port")->asUInt64() == peer.port);
-        // No telemetry has been observed for this peer yet (membership alone
-        // makes it visible), so its advertised API address is genuinely
-        // unknown and must be omitted rather than guessed at.
+        // Without telemetry the advertised API address is unknown: omitted.
         CHECK(value.find("api_endpoint") == nullptr);
         const auto* storage = value.find("storage");
         REQUIRE(storage != nullptr);
@@ -1544,9 +1510,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(cluster->find("storage_online")->find("used_bytes")->isNull());
     CHECK(cluster->find("storage_online")->find("free_bytes")->isNull());
 
-    // A real zero is different from a missing observation. Once coherent peer
-    // telemetry exists, zero used bytes and zero cache bytes remain numeric and
-    // the API explicitly marks both measurements available.
+    // A measured zero differs from a missing observation: with telemetry, zero
+    // usage stays numeric and is marked available.
     NodeTelemetry peer_telemetry;
     peer_telemetry.node_id = peer.id;
     peer_telemetry.boot_id = random_node_id();
@@ -1579,8 +1544,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
             continue;
         found = true;
         CHECK(value.find("telemetry_freshness")->asString() == "live");
-        // Now that this peer has gossiped telemetry, its advertised API
-        // address (distinct from host/port, its RPC bind address) is known.
+        // With telemetry the advertised API address (not the RPC host/port)
+        // is known.
         CHECK(value.find("api_endpoint")->asString() == "http://10.44.1.51:7438");
         // The operator's display name travels beside host, never in place of it.
         CHECK(value.find("node_name")->asString() == "Corvus Test Peer");
@@ -1627,11 +1592,8 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(cluster->find("metadata_write_available")->asBool());
 }
 
-// Self's own advertised API endpoint: distinct from `connectivity.advertised`
-// (that node's own RPC-port UPnP/external-IP connectivity) and computed
-// straight from config rather than gossiped, so it needs its own coverage of
-// the default-to-bound-address and explicit-override paths, plus the
-// no-catalogue-API case.
+// Self's advertised API endpoint is computed from config, not gossiped, and is
+// distinct from `connectivity.advertised` (the RPC endpoint).
 MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
     {
         TestNode fixture("status-api-endpoint-default");
@@ -1640,9 +1602,8 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         config.metadata_min_write_replicas = 1;
         config.hydration.enabled = false;
         config.catalogue.scanner.enabled = false;
-        // A wildcard API bind, as every real deployed node uses: the default
-        // must resolve to the node's real advertised RPC host, never to this
-        // undialable "0.0.0.0" listen address.
+        // A wildcard API bind: the default must use the advertised RPC host,
+        // never the undialable listen address.
         config.advertise_host = "10.44.1.60";
         config.catalogue.api.enabled = true;
         config.catalogue.api.listen = "0.0.0.0";
@@ -1662,9 +1623,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         REQUIRE(nodes != nullptr);
         REQUIRE(nodes->asArray().size() == 1);
         const auto& self_node = nodes->asArray().front();
-        // No advertised override configured: the endpoint defaults to the
-        // resolved RPC advertise host (never the wildcard listen address
-        // above) and the bound port, over plain http. Always well-defined.
+        // No override: the advertise host and the bound port, over http.
         CHECK(self_node.find("api_endpoint")->asString() == "http://10.44.1.60:19991");
     }
     {
@@ -1693,10 +1652,8 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         REQUIRE(nodes != nullptr);
         REQUIRE(nodes->asArray().size() == 1);
         const auto& self_node = nodes->asArray().front();
-        // Advertised override present: takes priority over the bound
-        // listen/port, and carries a scheme the bind cannot supply. This is
-        // the TLS-offload shape -- the node serves plain http on 19992 while
-        // clients are told https on 443.
+        // The override wins and carries its own scheme (TLS offload: the node
+        // serves http on 19992, clients are told https on 443).
         CHECK(self_node.find("api_endpoint")->asString() ==
               "https://media-node-2.example.net:443");
     }
@@ -1723,7 +1680,6 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         REQUIRE(nodes != nullptr);
         REQUIRE(nodes->asArray().size() == 1);
         const auto& self_node = nodes->asArray().front();
-        // No catalogue API runs on this node: nothing to advertise.
         CHECK(self_node.find("api_endpoint") == nullptr);
     }
 }
@@ -1735,10 +1691,8 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
-    // This test needs telemetry to go stale (>5s, the status API's hardcoded
-    // freshness floor) while the peer remains membership-online, so its
-    // dead_after must outlast that wait -- unlike most tests here it is not
-    // tuned small.
+    // The peer must stay membership-online past the 5 s telemetry freshness
+    // floor, so dead_after is not tuned small here.
     config.dead_after = 60s;
     auto& node = fixture.start();
     auto& metadata = fixture.metadata();
@@ -1800,10 +1754,8 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     REQUIRE(fresh_peer->find("runtime")->find("rss_bytes") != nullptr);
     CHECK(fresh_peer->find("runtime")->find("rss_bytes")->asUInt64() == peer_telemetry.rss_bytes);
 
-    // The Status API's telemetry freshness floor is a hardcoded 5s minimum
-    // (ClusterStatusService::status_response's fresh_for), independent of any
-    // configured heartbeat, and TelemetryStore has no clock-injection seam.
-    // This genuinely waits for the sample to age past it.
+    // The freshness floor is a fixed 5 s (status_response's fresh_for) and
+    // TelemetryStore has no injectable clock, so this really waits it out.
     std::this_thread::sleep_for(5200ms);
 
     auto stale_response = status.handle(request);
@@ -1812,26 +1764,19 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
         reinterpret_cast<const char*>(stale_response.body.data()), stale_response.body.size()));
     const auto* stale_peer = find_peer(stale_root);
     REQUIRE(stale_peer != nullptr);
-    // Still control-plane reachable via membership -- that part isn't a lie.
     CHECK(stale_peer->find("state")->asString() == "online");
     CHECK(stale_peer->find("telemetry_freshness")->asString() == "stale");
-    // But a stale sample's resource figures must not be presented as current:
-    // this is the exact "makes up numbers" complaint being fixed. Capacity and
-    // usage are also what a consumer sums across nodes, so a stale one would
-    // leak into a cluster-wide total.
+    // Stale resource figures are withheld: consumers sum them across nodes.
     CHECK(!stale_peer->find("storage")->find("available")->asBool());
     CHECK(stale_peer->find("storage")->find("used_bytes")->isNull());
-    // The runtime figures are the other half of that split and survive: they
-    // measure the sending process at a stated instant, nothing aggregates
-    // them, and the entry says how old they are. Withholding them left the UI
-    // with no view at all of any node whose sample had aged past 15s.
+    // Runtime figures survive: nothing aggregates them and the entry states
+    // their age.
     REQUIRE(stale_peer->find("runtime")->find("rss_bytes") != nullptr);
     CHECK(stale_peer->find("runtime")->find("rss_bytes")->asUInt64() == peer_telemetry.rss_bytes);
     CHECK(stale_peer->find("runtime")->find("uptime_ms")->asUInt64() == peer_telemetry.uptime_ms);
     CHECK(stale_peer->find("live_age_ms")->asUInt64() >= 5000);
 
-    // The aggregate must also stop treating this node's stale numbers as
-    // authoritative, rather than silently freezing the old "available" flag.
+    // The cluster aggregate does not count the stale figures either.
     const auto* cluster = stale_root.find("cluster");
     REQUIRE(cluster != nullptr);
     CHECK(!cluster->find("storage_online")->find("available")->asBool());
@@ -1848,8 +1793,7 @@ MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresh
     auto& metadata = fixture.metadata();
     metadata.snapshot();
 
-    // A membership record that predates the peer's first generation notice:
-    // control-plane reachable, carrying nothing about metadata yet.
+    // A membership record with no metadata generation yet.
     NodeInfo peer;
     peer.id = random_node_id();
     peer.host = "10.44.1.202";
@@ -1889,8 +1833,7 @@ MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresh
         if (value.find("id")->asString() == to_string(peer.id))
             entry = &value;
     REQUIRE(entry != nullptr);
-    // Membership winning unconditionally reported a healthy peer as
-    // generation 0 while holding a sample that said 25723.
+    // The fresher telemetry generation wins over the membership record's.
     CHECK(entry->find("metadata_generation")->asUInt64() == 25723);
 }
 
@@ -1942,8 +1885,8 @@ MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster
     CHECK(root.find("nodes")->asArray().front().find("id")->asString() ==
           to_string(node.node_id()));
 
-    // The durable record remains explicitly queryable for audit, but is no
-    // longer presented as a failed member of the operational cluster.
+    // The retired record stays queryable for audit, but is not counted as a
+    // failed cluster member.
     HttpRequest detail_request;
     detail_request.method = "GET";
     detail_request.path = "/api/v1/status/nodes/" + to_string(stale_id);
@@ -2060,9 +2003,7 @@ MACHA_TEST("invariants", test_status_marks_stopped_peer_offline_within_dead_afte
                 return node.find("state")->asString();
         return "missing";
     };
-    // Establish a real online-to-offline transition rather than a
-    // coincidental default, since no existing test drives a peer offline and
-    // checks the Status endpoint itself.
+    // Observe online first, so "offline" is a real transition, not a default.
     REQUIRE(second_state() == "online");
 
     second.stop();
@@ -2140,7 +2081,7 @@ MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace
 
     // The descriptor opened before replacement still denotes the original file.
     CHECK(fuse_read(frontend, replaced_handle.inode, old_bytes.size()) == old_bytes);
-    // POSIX unlink removes the pathname immediately even though the open inode lives on.
+    // Unlink removes the pathname at once; the open inode lives on.
     CHECK(!stale_name.has_value());
     CHECK(fuse_read(frontend, unlinked_handle.inode, old_bytes.size()) == old_bytes);
 
@@ -2163,9 +2104,8 @@ MACHA_TEST("invariants", test_dirty_open_inode_never_writes_remote_replacement) 
     const auto old = frontend.open("/victim.bin", true, true, false, false);
     REQUIRE(frontend.write(old.inode, 0, dirty) == dirty.size());
 
-    // Stand in for a second node atomically renaming a different inode over the
-    // dirty pathname. The old open descriptor remains valid locally, but it no
-    // longer owns /victim.bin and must never publish through that name.
+    // Another node renames a different inode over the dirty path. The open
+    // descriptor stays valid but must never publish through that name.
     fs.rename("/incoming.bin", "/victim.bin");
     const auto current = frontend.inode_for_path("/victim.bin");
     REQUIRE(current.has_value());
@@ -2316,9 +2256,8 @@ MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_g
     item.media_ids = {file_media_id(file)};
     (void)catalogue.upsert(item);
 
-    // Capture the exact immutable generation a complete scanner pass enumerates.
-    // The production scanner calls catalogue_snapshot_files() with this snapshot
-    // and derives its destructive-reconciliation signature from the same object.
+    // The scanner enumerates one immutable snapshot with
+    // catalogue_snapshot_files() and takes its reconciliation signature from it.
     const auto scanned = fs.local_snapshot_view();
     const auto scanned_signature = metadata_namespace_signature(*scanned.snapshot);
     REQUIRE(scanned.snapshot->entries.contains("/Movies/A/live.mkv"));
@@ -2334,29 +2273,22 @@ MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_g
     for (const auto& [_, entry] : discovered)
         active.insert(file_media_id(entry));
 
-    // Reproduce the historical failure deterministically: the immutable object
-    // moves after the scan snapshot has been captured. A snapshot-pinned scan
-    // still sees that object's media id, so complete reconciliation must not
-    // infer absence merely because the live path now belongs to a later
-    // namespace generation.
+    // The object moves after the snapshot is captured. The pinned scan still
+    // sees its media id, so reconciliation must not infer absence.
     fs.rename("/Movies/A/live.mkv", "/Movies/B/live.mkv");
     const auto moved = fs.local_snapshot_view();
     CHECK(!moved.snapshot->entries.contains("/Movies/A/live.mkv"));
     REQUIRE(moved.snapshot->entries.contains("/Movies/B/live.mkv"));
     CHECK(metadata_namespace_signature(*moved.snapshot) != scanned_signature);
 
-    // No catalogue mutation is required here: the immutable media id is still
-    // active in the captured generation. In particular, a namespace conflict is
-    // not itself required when reconciliation is a no-op.
+    // A no-op reconciliation succeeds despite the changed signature.
     catalogue.reconcile_scanner({}, active, true, scanned_signature);
     auto after_move = catalogue.get(item.id);
     REQUIRE(after_move.has_value());
     CHECK(after_move->media_ids == std::vector<std::string>{file_media_id(file)});
 
-    // Now make the stale scan genuinely destructive relative to current state.
-    // A new immutable object replaces the moved file and becomes the catalogue
-    // binding. Reusing the old scan's active set would prune that live binding,
-    // so the old namespace signature must fence the commit.
+    // A new object replaces the file and becomes the binding. The stale scan's
+    // active set would prune it, so the old signature must fence the commit.
     const Bytes replacement = pattern(1234, 19);
     fs.unlink("/Movies/B/live.mkv");
     write_file(fs, "/Movies/B/live.mkv", replacement);
@@ -2444,10 +2376,8 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
     const std::vector<StorageBackendConfig> backends{{a, 64ULL * 1024 * 1024},
                                                      {b, 64ULL * 1024 * 1024}};
 
-    // Establish the 0.18 backend identity/format boundary while the stores are
-    // empty, then seed the corruption scenario through loose LocalStore objects.
-    // Reopening the pool must therefore exercise valid 0.18 media, not bypass
-    // genesis protection with an unversioned pre-populated directory.
+    // Initialise backend identity while the stores are empty, then seed objects
+    // through LocalStore, so reopening the pool sees validly formatted media.
     {
         StoragePool initialise(pool_state, pool_node, backends, keys.storage);
         REQUIRE(wait_until([&] { return initialise.online_backends() == 2; }));
@@ -2479,9 +2409,8 @@ MACHA_TEST("invariants", test_rebalance_never_deletes_last_valid_copy_for_corrup
             break;
     }
 
-    // Rebalance may converge back to one physical copy, but it must not remove
-    // the last previously-valid copy until the repaired preferred replica has
-    // itself passed strong validation.
+    // Rebalance must not remove the last valid copy until the repaired
+    // preferred replica has passed strong validation.
     CHECK(std::filesystem::exists(object_path(secondary, id)) || pool.valid(id));
     bool readable = false;
     try {
@@ -2524,8 +2453,7 @@ MACHA_TEST("invariants", test_rpc_pre_auth_admission_is_bounded) {
     std::this_thread::sleep_for(100ms);
     const auto after = thread_count();
 
-    // Unauthenticated sockets must consume bounded resources; one blocking
-    // jthread per pre-auth peer is the failure this regression exposes.
+    // Unauthenticated sockets cost bounded resources, not a thread each.
     CHECK(after <= before + 8);
 
     for (auto fd : sockets)
@@ -2557,10 +2485,9 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
     REQUIRE(store.put(object_id(strict_b), strict_b));
     track_fsync = false;
 
-    // Strict puts now use exactly the same write/rename/generation path as WAL-
-    // backed publication. The first authoritative mutation marks accounting
-    // DIRTY once; each strict caller requests physical durability through its
-    // domain generation. There are no per-object or directory fsyncs.
+    // Strict puts share publication's write/rename/generation path: one fsync
+    // marks accounting DIRTY, then durability comes from domain syncfs, with
+    // no per-object or directory fsyncs.
     CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 2);
 
@@ -2601,9 +2528,8 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
     const auto art_a = catalogue.stage_artwork_deferred("poster", "image/jpeg", a, batch);
     const auto art_b = catalogue.stage_artwork_deferred("backdrop", "image/jpeg", b, batch);
 
-    // Both objects use the same physical durability domain. The later
-    // generation cumulatively covers the earlier one, so the batch retains a
-    // one-entry non-dominated frontier rather than one record per object.
+    // Same durability domain: the later generation covers the earlier, so the
+    // batch keeps a one-entry frontier, not one record per object.
     REQUIRE(batch.requirements.size() == 1);
     for (const auto& requirement : batch.requirements) {
         REQUIRE(requirement.replicas.size() == 1);
@@ -2647,8 +2573,8 @@ MACHA_TEST("invariants", test_durability_batch_retains_exact_nondominated_fronti
 
     batch.add(requirement(object_a, 10, 1));
     batch.add(requirement(object_b, 1, 10));
-    // Neither alternative dominates the other: retaining both is required to
-    // preserve the original per-object quorum formula.
+    // Neither alternative dominates, so both are kept to preserve the
+    // per-object quorum formula.
     REQUIRE(batch.requirements.size() == 2);
 
     batch.add(requirement(object_c, 11, 11));
@@ -2688,10 +2614,9 @@ MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped)
     store.durability_barrier(*gc);
     track_fsync = false;
 
-    // Capacity accounting is derived state. It is made crash-detectably DIRTY
-    // once before the first mutation and is not toggled CLEAN/DIRTY around each
-    // publication generation. Clean teardown checkpoints it after a final
-    // domain barrier outside this measured scope.
+    // Accounting is marked DIRTY once before the first mutation, not toggled
+    // per generation; the clean checkpoint happens at teardown, outside this
+    // measured scope.
     CHECK(fsync_calls.load(std::memory_order_relaxed) == 1);
     CHECK(syncfs_calls.load(std::memory_order_relaxed) == 2);
 #else
@@ -2700,11 +2625,8 @@ MACHA_TEST("invariants", test_accounting_dirty_marker_is_process_session_scoped)
 }
 
 MACHA_TEST("invariants", test_clean_accounting_checkpoint_is_trusted_with_packs) {
-    // Until 0.32.3 the presence of any pack forced a full walk of the object
-    // tree on every start, with every put waiting for it (a write outage of
-    // minutes after each restart on the production nodes). A clean checkpoint
-    // is trustworthy with packs: "dirty" is persisted before the first
-    // mutation of a session, so a torn pack tail can only sit behind a dirty
+    // A clean checkpoint is trusted with packs: "dirty" is persisted before a
+    // session's first mutation, so a torn pack tail only sits behind a dirty
     // checkpoint.
     TempDir t;
     const auto keyfile = t.path() / "cluster.key";
@@ -2799,8 +2721,7 @@ MACHA_TEST("invariants", test_unclean_accounting_recovery_establishes_durable_ba
             const auto generation = store.put_deferred(object_id(b), b);
             if (!generation.has_value())
                 _exit(21);
-            // Deliberately bypass LocalStore destruction/clean accounting. This
-            // models an unclean process exit while the OS itself keeps running.
+            // Skip LocalStore teardown: an unclean process exit, OS still up.
             _exit(0);
         } catch (...) {
             _exit(22);
@@ -3134,24 +3055,18 @@ MACHA_TEST("invariants", test_persistent_cache_is_explicitly_ephemeral) {
 
     CHECK(cache.blocks() == 2);
 
-    // The cache reports what it has DONE, not only how full it is. Before
-    // 2026-09-21 `blocks()` was the entire observable surface and it is a
-    // function of writes alone, so a cache that had never returned a byte
-    // reported identically to one working perfectly -- on telemetry, on the
-    // status API and in the logs alike.
+    // The cache reports hits, misses and evictions, not only occupancy.
     {
         const auto before = cache.stats();
         CHECK(before.entries == 2);
         // Three puts into a two-block cache: one eviction.
         CHECK(before.evictions == 1);
 
-        // A miss for something never stored.
         CHECK(!cache.get(object_id(pattern(1024, 99))));
         CHECK(cache.stats().misses == before.misses + 1);
         CHECK(cache.stats().hits == before.hits);
 
-        // And a hit for something still resident. `c` was the last put, so it
-        // survived the eviction that took `a`.
+        // `c` was the last put, so it survived the eviction that took `a`.
         REQUIRE(cache.get(object_id(c)));
         CHECK(cache.stats().hits == before.hits + 1);
         CHECK(cache.stats().misses == before.misses + 1);
@@ -3423,15 +3338,14 @@ MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
     NodeInfo client_info{random_node_id(), "127.0.0.1", "client", free_port()};
     SecureChannel channel(fd, keys, client_info, 64 * 1024);
     (void)channel.client_handshake(TransportLane::control);
-    // The receiver rejects the frame on its header and closes the session
-    // with the rest unread, so the remainder of this send may meet a closed
-    // socket: that is the rejection, seen from this side.
+    // The receiver rejects the frame on its header and closes the session, so
+    // the rest of this send may fail: that is the rejection, seen from here.
     try {
         channel.send_fragment(1, FrameType::foreground, MessageType::get_object, true, true, {});
     } catch (const std::runtime_error&) {
     }
 
-    // The session ends without a reply; once it has, nothing can be dispatched.
+    // The session ends without a reply; after that nothing can be dispatched.
     timeval timeout{5, 0};
     REQUIRE(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
     uint8_t byte = 0;
@@ -3440,8 +3354,8 @@ MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
     CHECK(received <= 0);
     CHECK(!timed_out);
 
-    // Object traffic on a negotiated CONTROL channel must be rejected before
-    // dispatch; sender-side lane selection alone is not protocol enforcement.
+    // The receiver, not the sender's lane choice, enforces that object traffic
+    // never dispatches on a CONTROL channel.
     CHECK(!object_dispatched.load());
 
     channel.shutdown();
@@ -3568,8 +3482,8 @@ MACHA_TEST("invariants", test_http_keep_alive_idle_timeout_closes_connection) {
     auto response = raw_http_exchange(fd, request);
     CHECK(response.headers["connection"] == "keep-alive");
 
-    // Do not send another request. A silent keep-alive connection must not
-    // pin its worker past the configured idle allowance.
+    // Send nothing more: a silent keep-alive connection is closed after the
+    // idle allowance.
     std::this_thread::sleep_for(400ms);
     char probe;
     CHECK(::recv(fd, &probe, 1, 0) == 0);
@@ -3611,13 +3525,8 @@ MACHA_TEST("invariants", test_http_keep_alive_max_requests_forces_close) {
 }
 
 MACHA_TEST("invariants", test_http_idle_keep_alive_connection_costs_no_worker) {
-    // Until 0.43.0 this case asserted the opposite: with one worker, a
-    // second connection's request could only be served if the first, idle,
-    // kept-alive connection was shed ("Connection: close" under backlog),
-    // because the idle connection was pinning the worker. An idle
-    // connection is now an fd on the reactor and nothing else, so the
-    // second request is served at once and the first connection keeps its
-    // keep-alive: there is no backlog to shed for.
+    // An idle connection is only an fd on the reactor: with one worker, a
+    // second connection is served at once and the first keeps its keep-alive.
     CatalogueApiConfig config;
     config.enabled = true;
     config.listen = "127.0.0.1";
@@ -3638,8 +3547,6 @@ MACHA_TEST("invariants", test_http_idle_keep_alive_connection_costs_no_worker) {
     auto first = raw_http_exchange(first_fd, request);
     CHECK(first.headers["connection"] == "keep-alive");
 
-    // The first connection sits idle. The second is answered without the
-    // first having to give anything up.
     const int second_fd = connect_idle(config.port);
     REQUIRE(setsockopt(second_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
     const auto started = Clock::now();
@@ -3670,31 +3577,20 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.catalogue_root = missing_root; });
 
     const auto maintenance = maintenance_inventory(catalogue);
-    // Even when the current immutable catalogue cannot yet be fetched/decoded,
-    // its metadata-referenced root is unconditionally live and GC must fail closed.
+    // A catalogue root that cannot be fetched is still live; GC fails closed.
     CHECK(maintenance.control_live.contains(missing_root));
     CHECK(!maintenance.complete);
 }
 
 MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
-    // A client has to bound its own attempt against the node it is actually
-    // talking to, and against nodes it has never used, because those are the
-    // ones a failover will pick. Measured on 2026-09-18: a client budget of
-    // 12 s against this server's 15 s startup entitlement abandoned a node
-    // three seconds inside its own bound, threw away an 11.7 s transcode that
-    // was about to succeed, and started the identical encode on the other
-    // node. The client was guessing because nothing reported the figure.
-    //
-    // These are self-reported facts relayed like load1 and cpu_cores, not a
-    // cluster-wide value any node is entitled to compute: each node states its
-    // own, and a client composes them across the candidates it might use.
+    // Each node reports its own playback budgets, as it does load1 and
+    // cpu_cores, so a client can bound attempts against any candidate node.
     TestCluster cluster;
 
     auto streaming_config = cluster.node_config("streamer");
     streaming_config.catalogue.api.enabled = true; // streaming rides the HTTP API
     streaming_config.streaming.enabled = true;
-    // Deliberately not the defaults, so the assertion cannot pass by
-    // coincidence against 15000 and 6000.
+    // Not the defaults, so the assertion cannot pass by coincidence.
     streaming_config.streaming.startup_timeout = 9000ms;
     streaming_config.streaming.segment_timeout = 3000ms;
     NodeRuntime streamer(streaming_config, cluster.keys());
@@ -3730,10 +3626,8 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
     CHECK(playback->find("startup_timeout_ms")->asInt64() == 9000);
     CHECK(playback->find("segment_timeout_ms")->asInt64() == 3000);
 
-    // A node that serves no playback reports no budget rather than a figure it
-    // would not honour. Absent must read as "this node cannot say": a client
-    // that saw a zero here and took it literally would abandon every attempt
-    // immediately, which is the same class of failure as the guess above.
+    // A node serving no playback omits the budget rather than reporting a
+    // zero a client might act on.
     auto quiet_config = cluster.node_config("quiet");
     REQUIRE(!quiet_config.streaming.enabled);
     NodeRuntime quiet(quiet_config, cluster.keys());

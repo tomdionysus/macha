@@ -35,8 +35,7 @@ constexpr size_t provider_cache_max_entries = 256;
 constexpr size_t provider_cache_max_bytes = 8ULL * 1024 * 1024;
 
 size_t provider_cache_weight(const Json& value) {
-    // Parsed DOM nodes cost more than their serialized text. The factor is an
-    // intentionally conservative ownership estimate, not allocator accounting.
+    // A conservative estimate of parsed DOM cost over its text, not accounting.
     return sizeof(Json) + value.dump().size() * 2;
 }
 
@@ -72,9 +71,8 @@ void provider_cache_store(Map& cache, size_t& owned_bytes, std::string key, Valu
                        provider_cache_weight(victim->second);
         cache.erase(victim);
     }
-    // Several provider maps share one owner budget. If another map owns the
-    // remaining budget this cache cannot evict it; simply decline this optional
-    // entry rather than exceed the provider lifetime bound.
+    // Provider maps share one budget this cache cannot evict from others: when
+    // it is spent, decline the optional entry.
     if (owned_bytes > provider_cache_max_bytes - weight)
         return;
     cache.emplace(std::move(key), std::move(stored));
@@ -220,10 +218,8 @@ std::string normalized(std::string_view value) {
 }
 
 std::string comparable_title(std::string_view value) {
-    // Matching is deliberately more forgiving than parsing. Filenames and
-    // providers disagree routinely on punctuation, apostrophes, ampersands,
-    // sequel numerals and abbreviations; none of those differences should
-    // force the parser to invent display punctuation that was not present.
+    // Matching forgives what parsing keeps: filenames and providers differ on
+    // punctuation, apostrophes, ampersands, sequel numerals and abbreviations.
     static constexpr std::pair<std::string_view, std::string_view> aliases[] = {
         {"zero", "0"}, {"one", "1"}, {"two", "2"}, {"three", "3"},
         {"four", "4"}, {"five", "5"}, {"six", "6"}, {"seven", "7"},
@@ -246,8 +242,7 @@ std::string comparable_title(std::string_view value) {
         if (c == '&') {
             prepared += " and ";
         } else if (c == '\'') {
-            // Elide possessive punctuation so "Knight's" and "Knights"
-            // compare equally without changing the displayed/local title.
+            // "Knight's" compares equal to "Knights".
             continue;
         } else if (c == 0xe2 && i + 2 < value.size() &&
                    static_cast<unsigned char>(value[i + 1]) == 0x80 &&
@@ -327,12 +322,8 @@ std::optional<MusicMetadataReadResult> read_music_metadata_probe(FileSystem& fs,
     return result;
 }
 
-// A four-digit number is only a release year if it could actually be one.
-// "Blade Runner 2049" is the canonical counter-example: the number is part of
-// the name, and reading it as the year both truncated the search title to
-// "Blade Runner" and then rejected the only candidate TMDB returned -- the
-// 1982 film -- on the year mismatch, so the file sat unmatched (2026-09-09).
-// Nothing on disk can carry a release year past next year.
+// No release year is later than next year, so "Blade Runner 2049" keeps its
+// number as title.
 int32_t plausible_year_ceiling() {
     const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm parts{};
@@ -352,9 +343,7 @@ std::optional<int32_t> year_from(std::string_view text) {
         const bool numeric_right = pos + len < owned.size() &&
                                    std::isdigit(static_cast<unsigned char>(owned[pos + len]));
         if (numeric_left || numeric_right) continue;
-        // Dimensions such as 1920x816 are not release years. This is the main
-        // reason leading-year names such as 1994.Pulp.Fiction.1920x816 were
-        // previously parsed as a 1920 release.
+        // Dimensions such as 1920x816 are not years.
         if (pos + len < owned.size() && (owned[pos + len] == 'x' || owned[pos + len] == 'X') &&
             pos + len + 1 < owned.size() &&
             std::isdigit(static_cast<unsigned char>(owned[pos + len + 1])))
@@ -374,10 +363,8 @@ std::string strip_release_noise(std::string value) {
     std::smatch match;
     if (std::regex_search(value, match, technical))
         value.resize(static_cast<size_t>(match.position()));
-    // Trailing brackets are ambiguous: release/site tags such as [rartv],
-    // [EZTVx.to] and [i_c] are noise, but human episode qualifiers such as
-    // [Pilot] are semantic title text. Only remove brackets that look like
-    // distribution/source tags rather than every trailing bracketed phrase.
+    // Remove trailing brackets only when they look like release/site tags
+    // ([rartv], [EZTVx.to]); [Pilot] is title text.
     static const std::regex site_tag(R"([ ._-]*\[([^\]]+)\]\s*$)", std::regex::icase);
     std::smatch site_match;
     if (std::regex_search(value, site_match, site_tag)) {
@@ -413,10 +400,8 @@ std::string remove_year_token(std::string value, int32_t year) {
 std::string clean_series_name(std::string value) {
     value = strip_release_noise(std::move(value));
 
-    // Collection directories frequently append several structural descriptors,
-    // e.g. "Season 1-4 S01-S04" or "Complete Series". Remove the first strong
-    // bundle marker and everything after it; those tokens describe the layout,
-    // not the provider series title.
+    // Cut from the first bundle marker ("Season 1-4 S01-S04", "Complete
+    // Series"): it describes the layout, not the series title.
     static const std::regex bundle_suffix(
         R"((?:[ ._\-]+)(?:(?:season|seasons|series)[ ._\-]*[0-9]{1,2}[ ._\-]*-[ ._\-]*[0-9]{1,2}|s[0-9]{1,2}[ ._\-]*-[ ._\-]*s?[0-9]{1,2}|complete(?:[ ._\-]+series)?)(?:[ ._\-].*)?$)",
         std::regex::icase);
@@ -431,10 +416,8 @@ std::string clean_series_name(std::string value) {
 }
 
 std::string clean_episode_title(std::string value) {
-    // Scene names often encode a possessive apostrophe as a dot because dots
-    // are also word separators (for example "Tasty.Tudi.s"). Recover that
-    // punctuation before generic release-noise/title cleanup destroys the
-    // distinction between a possessive and a standalone letter S.
+    // Recover a possessive written as a dot ("Tasty.Tudi.s") before cleanup
+    // makes it a standalone S.
     for (size_t i = 1; i + 1 < value.size(); ++i) {
         if (value[i] != '.' || (value[i + 1] != 's' && value[i + 1] != 'S')) continue;
         if (!std::isalnum(static_cast<unsigned char>(value[i - 1]))) continue;
@@ -476,15 +459,12 @@ std::string movie_title_before_year(std::string value, const std::optional<int32
     }
     value = strip_release_noise(std::move(value));
 
-    // Zero-padded collection ordinals are common release prefixes, while a
-    // genuine title such as "12 Monkeys" must remain intact.
+    // Strip zero-padded collection ordinals; "12 Monkeys" stays intact.
     static const std::regex ordinal(R"(^\s*0[0-9]{1,2}[ ._-]+)");
     value = std::regex_replace(value, ordinal, "");
 
-    // A small but useful release-name convention: numbered collection entries
-    // sometimes append a principal actor after " - ". Limit this heuristic to
-    // titles whose pre-credit portion itself ends in a digit so ordinary
-    // hyphenated titles ("Star Wars - A New Hope") are not damaged.
+    // Numbered collection entries may append an actor after " - "; only cut
+    // when the part before ends in a digit, sparing "Star Wars - A New Hope".
     static const std::regex numbered_credit(
         R"(^(.+[0-9])\s+-\s+[A-Za-z][A-Za-z' .-]*$)", std::regex::icase);
     std::smatch match;
@@ -583,9 +563,7 @@ std::vector<YearPosition> year_positions(std::string_view text) {
             std::isdigit(static_cast<unsigned char>(owned[pos + len + 1])))
             continue;
         const auto value = std::stoi((*it).str());
-        // Same plausibility rule as year_from(): a number the calendar has not
-        // reached is part of the title. This generator scans independently of
-        // that one, so the clamp has to be stated in both places.
+        // The same year ceiling as year_from().
         if (value > ceiling) continue;
         out.push_back({value, pos, len});
     }
@@ -662,10 +640,8 @@ class SemanticMovieCandidateGenerator final : public MediaProbeCandidateGenerato
             }
         }
 
-        // Release names occasionally append commentary/language/genre metadata
-        // after a human-readable " - ". Preserve the ordinary full-title
-        // hypothesis, but add a stronger split candidate when the right side
-        // contains a release year and obvious distribution metadata.
+        // Keep the full title, but add a stronger candidate split at " - " when
+        // the right side has a year and distribution metadata.
         const auto split = core.find(" - ");
         if (split != std::string::npos) {
             const auto left = clean_title(strip_collection_ordinal(core.substr(0, split)));
@@ -885,9 +861,7 @@ class StructuredMusicCandidateGenerator final : public MediaProbeCandidateGenera
                 }
             }
         } else if (parts.size() >= 3 && probe.artist.empty()) {
-            // Generic probe_media_path() has no configured root. Preserve the
-            // long-standing Artist/Album/File and Artist/Album/Disc/File
-            // fallbacks for tests and direct callers.
+            // No configured root: fall back to Artist/Album[/Disc]/File.
             static const std::regex disc_dir(R"(^(?:cd|disc|disk)\s*([0-9]{1,2})$)",
                                              std::regex::icase);
             std::smatch disc_match;
@@ -1181,9 +1155,8 @@ const Json* best_result(const Json& root, std::string_view title, std::string_vi
             auto found_year = json_year(candidate.find(date_key));
             if (found_year && *found_year == *year) {
                 score += 45;
-                // Exact-year agreement on a highly ranked result is useful
-                // evidence for aliases/translations whose canonical provider
-                // title has little lexical overlap with the release filename.
+                // Exact-year agreement on a high-ranked result supports aliases
+                // and translations whose titles share little with the filename.
                 if (rank == 0) score += 30;
             } else if (allow_adjacent_year && found_year &&
                        std::abs(*found_year - *year) == 1) {
@@ -1224,8 +1197,7 @@ std::string discogs_artist_name(const Json& release) {
     for (const auto& artist : artists->asArray()) {
         if (!artist.isObject()) continue;
         auto name = json_string(artist.find("name"));
-        // Discogs appends numeric disambiguators such as "Artist (2)". They
-        // identify the database entity, not the display credit.
+        // Drop Discogs disambiguators such as "Artist (2)".
         static const std::regex suffix(R"(\s+\([0-9]+\)$)");
         name = std::regex_replace(name, suffix, "");
         if (name.empty()) continue;
@@ -1404,9 +1376,7 @@ std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&
 }
 
 FrameType catalogue_media_profile_frame_type() noexcept {
-    // Media profiles are optional catalogue enrichment. Generating one is
-    // never part of playback admission and must yield to both viewer and
-    // user-requested loader traffic.
+    // Optional enrichment: yields to viewer and loader traffic.
     return FrameType::speculative;
 }
 
@@ -1451,8 +1421,7 @@ RemoteHttpResponse CurlHttpClient::get(std::string_view url, const std::vector<s
         auto* appended = curl_slist_append(header_guard.get(), header.c_str());
         if (!appended)
             throw std::bad_alloc();
-        // curl_slist_append returns the (possibly new) list head while retaining
-        // ownership of the existing chain. Transfer that one owner atomically.
+        // curl_slist_append returns the possibly new head owning the chain.
         (void)header_guard.release();
         header_guard.reset(appended);
     }
@@ -1514,10 +1483,8 @@ std::optional<Json> TmdbProvider::find_show(const MediaProbe& probe) {
     const auto key = normalized(probe.series) + "|" + (probe.year ? std::to_string(*probe.year) : "");
     if (auto it = show_cache_.find(key); it != show_cache_.end()) return it->second;
     std::vector<std::pair<std::string, std::string>> q{{"query", probe.series}, {"language", config_.language}};
-    // Do not use TMDB's exact first_air_date_year filter here. Local TV
-    // libraries often name a series after a pilot/miniseries/production year,
-    // while TMDB dates the regular series one year later. Score the year
-    // locally instead so +/-1 remains viable evidence rather than a hard miss.
+    // No first_air_date_year filter: libraries often use a pilot or production
+    // year one off TMDB's, so the year is scored locally and +/-1 still counts.
     auto root = api("/search/tv", q);
     const auto* result = best_result(root, probe.series, "name", probe.year,
                                      "first_air_date", true);
@@ -1646,11 +1613,8 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
     int32_t resolved_season_number = *probe.season;
     auto season_json = load_season(resolved_season_number);
 
-    // A common legacy/library convention keeps a pilot/miniseries under the
-    // parent show's Specials folder even where TMDB models that exact-year
-    // programme as its own one-season show. If the exact-year show has no
-    // season zero, try the same episode number in season one before discarding
-    // an otherwise strong series/year identity.
+    // Libraries file a pilot under Specials where TMDB may model it as its own
+    // one-season show: with no season zero, try the episode in season one.
     if (!season_json && resolved_season_number == 0 && probe.year &&
         json_year(show_json->find("first_air_date")) == probe.year &&
         comparable_title(json_string(show_json->find("name"))) == comparable_title(probe.series)) {
@@ -1674,10 +1638,9 @@ std::optional<ProviderMatch> TmdbProvider::lookup(const MediaProbe& probe) {
         if (!remote_title.empty()) episode_title_score = title_similarity(probe.title, remote_title);
     }
 
-    // Episode numbers are the primary identity once series + year are known.
-    // For yearless fallbacks the title remains the independent corroborator;
-    // if numbering differs (notably specials under alternate ordering schemes),
-    // remap by a strong title match within the already-resolved TMDB season.
+    // Episode numbers identify once series and year are known. Without a year
+    // the title corroborates; differing numbering is remapped by a strong title
+    // match within the resolved season.
     const bool weak_episode_title = episode_json && !probe.title.empty() && episode_title_score < 75;
     if (!episode_json || weak_episode_title) {
         if (const auto* by_title = title_episode(*season_json, probe.title)) {
@@ -1938,14 +1901,9 @@ std::optional<Json> MusicBrainzProvider::find_release(const MediaProbe& probe) {
     return detail;
 }
 
-// Filenames decorate a track title with things the provider's canonical title
-// does not carry: "(feat. X)", "(Live)", "(Radio Edit)", "(Spotify Bonus
-// Tracks)". Searching for the decorated string returns nothing at all, which
-// is how 61 music files -- every one of them "no metadata provider match after
-// 4 candidates" -- reached 2026-09-09 unmatched with obvious candidates. The
-// decorated form is still tried first, because a remix or live version is a
-// genuinely distinct recording and matching it exactly is better than matching
-// the studio cut.
+// Filename decorations the provider title lacks ("(feat. X)", "(Live)",
+// "(Radio Edit)"), which make a search find nothing. The decorated form is
+// tried first: a live or remix version is a distinct recording.
 std::string music_title_without_decorations(const std::string& title) {
     static const std::regex decoration(
         R"(\s*[(\[]\s*(?:feat\.?|ft\.?|featuring|with)\b[^)\]]*[)\]]|)"
@@ -1964,9 +1922,8 @@ std::string music_title_without_decorations(const std::string& title) {
     return stripped;
 }
 
-// MusicBrainz credits a guest as part of the artist ("Avicii feat. Sandro
-// Cavazza") where the path carries only the primary artist ("Avicii"). Compare
-// on the primary so the credit style does not decide the match.
+// MusicBrainz credits guests in the artist ("Avicii feat. Sandro Cavazza");
+// compare on the primary artist the path carries.
 std::string primary_artist_credit(const std::string& credit) {
     static const std::regex secondary(R"(\s+(?:feat\.?|ft\.?|featuring|with|&|vs\.?|x)\s+.*$)",
                                       std::regex::icase);
@@ -1994,8 +1951,7 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
         };
         auto search = search_for(probe.title);
         auto recordings = search.find("recordings");
-        // The decorated title is the precise hypothesis; the undecorated one is
-        // the fallback, tried only when the precise search finds nothing at all.
+        // The undecorated title is tried only when the decorated finds nothing.
         if ((!recordings || !recordings->isArray() || recordings->asArray().empty()) &&
             !undecorated.empty() && normalized(undecorated) != normalized(probe.title)) {
             search = search_for(undecorated);
@@ -2011,8 +1967,7 @@ std::optional<Json> MusicBrainzProvider::find_recording(const MediaProbe& probe)
             int score = 0;
             const auto candidate_title = normalized(json_string(candidate.find("title")));
             if (candidate_title == normalized(probe.title)) score += 100;
-            // An undecorated agreement is real evidence but weaker than an
-            // exact one, so an exact match still wins when both are present.
+            // Weaker evidence than an exact match, which wins when both exist.
             else if (!undecorated.empty() && candidate_title == normalized(undecorated)) score += 85;
             const auto credit = artist_credit_name(candidate.find("artist-credit"));
             if (normalized(credit) == normalized(probe.artist)) score += 80;
@@ -2301,8 +2256,7 @@ Json DiscogsProvider::api(std::string_view path,
     if (unavailable_until_ > now)
         throw ProviderTemporarilyUnavailable("discogs", "Discogs circuit open");
 
-    // Authenticated Discogs clients are limited to 60 requests/minute. Pace
-    // locally as well as obeying Macha's global per-scan HTTP budget.
+    // Discogs allows 60 requests/minute; paced here as well as by the scan budget.
     if (last_request_ != std::chrono::steady_clock::time_point{}) {
         const auto due = last_request_ + std::chrono::seconds(1);
         while (std::chrono::steady_clock::now() < due) {
@@ -2371,7 +2325,7 @@ std::optional<Json> DiscogsProvider::find_release(const MediaProbe& probe) {
             query.emplace_back("track", probe.title);
         else if (!probe.album.empty())
             query.emplace_back("release_title", probe.album);
-        // Keep album/year as local scoring evidence for recording-first lookup;
+        // Album and year score locally in a recording-first lookup;
         // hard provider filters would discard compilation and reissue matches.
 
         auto root = api("/database/search", query);
@@ -2737,19 +2691,14 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     std::set<std::string> wanted(media_ids.begin(), media_ids.end());
     std::vector<CatalogueHintSubmission> submissions;
 
-    // Metadata clear already knows exactly which immutable media identities
-    // became unbound. Resolve those identities against the already-decoded
-    // namespace and enqueue only the affected paths; never turn a one-item
-    // mutation into a forced full-library rescan.
+    // Enqueue only the paths of the unbound media ids, never a full rescan.
     std::optional<MetadataSnapshotView> available = fs_.available_snapshot_view();
     std::optional<MetadataSnapshot> local;
     const MetadataSnapshot* snapshot = nullptr;
     if (available) {
         snapshot = available->snapshot.get();
     } else {
-        // This is host-local durable metadata only, not a replica-validating read. It is a
-        // best-effort rematch accelerator; the ordinary namespace/safety scan
-        // remains the correctness fallback if the local replica is stale.
+        // Local metadata only, best effort: the safety scan corrects a stale replica.
         try {
             local = fs_.local_snapshot();
             snapshot = &*local;
@@ -2809,11 +2758,9 @@ size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& 
         auto* provider = provider_for_path(path, root);
         if (!provider || !provider->accepts_path(path)) return;
 
-        // An explicit immutable-profile request is a single background job,
-        // not permission to reopen the same terminal catalogue hint forever.
-        // Report an existing live job as pending; a terminal result returns
-        // zero so playback can use its media-engine fallback. A changed
-        // immutable identity is a different origin and is queued normally.
+        // One background job per media id: a live job counts as pending; a
+        // terminal one returns zero so playback uses its engine fallback. A
+        // changed media id is a new origin.
         if (auto it = existing_by_path.find(path); it != existing_by_path.end()) {
             const auto& hint = it->second;
             const bool same_profile_request = std::any_of(
@@ -2870,23 +2817,19 @@ std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
     std::string_view root, const MetadataSnapshot& namespace_snapshot,
     const NamespaceNodeStore* namespace_nodes, std::stop_token stop) {
     const auto normalized = normalize_path(std::string(root));
-    // The root is checked for its type only, so a stat-only read.
+    // A stat-only read: only the root's type is checked.
     const auto root_entry = namespace_entry(namespace_snapshot, namespace_nodes, normalized, false);
     if (!root_entry)
         throw FsError(ENOENT, "missing");
     if (root_entry->type != EntryType::directory)
         throw FsError(ENOTDIR, "catalogue root is not a directory");
 
-    // A destructive discovery pass must describe one immutable namespace
-    // generation. Enumerating the snapshot directly is both cheaper than a
-    // sequence of readdir() calls and prevents a mutation between directories
-    // from manufacturing an absence that never existed in any generation.
+    // A destructive pass reads one namespace generation, so a mutation between
+    // directories cannot fake an absence.
     std::vector<std::pair<std::string, FsEntry>> out;
     const auto prefix = normalized == "/" ? std::string("/") : normalized + "/";
-    // A prefix query, which on a tree descends to the subtree rather than
-    // reading the library and discarding most of it. The entries come back
-    // whole: the scanner computes file_media_id over them, which hashes the
-    // extent list.
+    // A prefix query descends only the subtree. Entries are whole, as
+    // file_media_id hashes the extent list.
     for_each_namespace_entry_with_prefix(namespace_snapshot, namespace_nodes, prefix,
                                         [&](const std::string& path, const FsEntry& entry) {
         if (stop.stop_requested())
@@ -2898,8 +2841,8 @@ std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
 }
 
 namespace {
-// Whether a word of `relative` -- a run of ASCII letters and digits -- equals
-// one of `terms`, ignoring case.
+// Whether a word (ASCII alphanumeric run) of `relative` equals one of `terms`,
+// ignoring case.
 bool path_has_ignored_term(std::string_view relative, const std::vector<std::string>& terms) {
     if (terms.empty()) return false;
     const auto equal_ignoring_case = [](std::string_view word, std::string_view term) {
@@ -3163,8 +3106,8 @@ std::string_view scan_provider_for(const ProviderRef& ref) {
     return "music";
 }
 
-// The artwork roles a reference offers: a movie or show has posters and
-// backdrops, a season posters, an episode stills, a release covers.
+// Artwork roles per reference: movie or show poster and backdrop, season
+// poster, episode still, release cover.
 std::vector<std::string_view> artwork_roles_for(const ProviderRef& ref,
                                                 const ProviderRefNumbers& numbers) {
     if (ref.kind == "movie") return {"poster", "backdrop"};
@@ -3320,17 +3263,14 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     }
 
-    // The batch owns one immutable namespace snapshot. Do not call
-    // FileSystem::getattr() here: that path may acquire authoritative metadata
-    // and previously rebuilt/read metadata separately for every hint.
+    // The batch's snapshot, not getattr(), which may read authoritative
+    // metadata per hint.
     const auto path = normalize_path(hint.path);
     auto scan_nodes = fs_.namespace_nodes();
     auto found_entry = namespace_entry(namespace_snapshot, &scan_nodes, path);
     if (!found_entry) {
-        // The batch's snapshot is older than this hint: the file may simply
-        // not be in it yet. Until 0.64.0 this was a terminal path_missing --
-        // Colony S02E13, gbni-1, 2026-09-27, adopted a second after its
-        // batch took the snapshot and never catalogued. Look again next batch.
+        // A hint newer than the snapshot may name a file not in it yet: look
+        // again next batch.
         if (hint.created_unix_ms >= snapshot_taken_unix_ms) {
             hints_.defer(hint.id, "path_not_yet_visible",
                          "the file is newer than the namespace snapshot this batch read",
@@ -3347,11 +3287,9 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     }
     if (entry.size == 0) {
-        // A zero-length committed file can be a transient namespace shell while
-        // durable FUSE data is still being published. It has no meaningful
-        // immutable media identity yet, so do not negative-cache it as a
-        // provider miss. A later namespace generation/source_ref will reopen
-        // the hint as soon as committed content becomes visible.
+        // A zero-length file may be a shell whose FUSE data is still being
+        // published: no media id yet, so not a provider miss. Its content
+        // reopens the hint.
         hints_.defer(hint.id, "content_not_committed", "namespace media file has no committed content yet",
                      unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         return {};
@@ -3369,10 +3307,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         hint.origins.begin(), hint.origins.end(),
         [](const auto& origin) { return origin.source == "manual"; });
 
-    // Exact media identity is content-derived from the immutable extent manifest.
-    // If this object is already bound, a passive scanner/ingest retry has no new
-    // information to discover. Do not reopen/decrypt it merely to rediscover the
-    // same embedded tags. Manual rescans deliberately retain the full probe path.
+    // The media id derives from the extent manifest: an already bound file has
+    // nothing new for a passive retry to find. Manual rescans probe fully.
     if (!existing_ids.empty() && !manual_refresh) {
         return PreparedHintMatch{hint.id, std::string(provider->name()), media_id,
                                  std::move(existing_ids), {},
@@ -3387,8 +3323,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     }
 
-    // A manual refresh of an already-bound immutable file may still merge newly
-    // supported embedded artwork, but it never needs an online metadata lookup.
+    // A manual refresh of a bound file may merge embedded artwork; it never
+    // needs an online lookup.
     std::optional<CatalogueItem> artwork_target;
     if (!existing_ids.empty()) {
         for (const auto& [id, item] : existing->items) {
@@ -3437,13 +3373,9 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         return {};
     }
 
-    // One scheduling turn evaluates one metadata hypothesis. Some provider
-    // lookups legitimately require several HTTP requests (for example a
-    // MusicBrainz search followed by release detail), so fairness must be at
-    // the candidate-hypothesis boundary rather than at the HTTP-request
-    // boundary. Persisting the cursor lets the queue yield to another root and
-    // resume the next fallback without repeating earlier hypotheses after a
-    // restart.
+    // One scheduling turn evaluates one candidate, which may take several
+    // requests. The persisted cursor lets the queue yield to another root and
+    // resume after a restart without repeating candidates.
     const auto& candidate = probed.candidates[hint.candidate_cursor];
     std::optional<ProviderMatch> selected_match;
     const MediaProbeCandidate* selected_candidate = nullptr;
@@ -3458,11 +3390,8 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                      unix_ms() + static_cast<uint64_t>(config.provider_batch_delay.count()));
         return {};
     } catch (const ProviderTemporarilyUnavailable& e) {
-        // Temporary availability is provider state, not per-media state. The
-        // old code deferred only this hint; the next hint for the same scan
-        // provider was immediately claimed, reprobed locally and then discovered
-        // the exact same already-open provider circuit. A large library therefore
-        // turned one remote outage into continuous local media probing.
+        // An outage is provider state: defer every hint of the provider, or each
+        // would be probed locally only to meet the same open circuit.
         const auto retry_delay = std::max(config.provider_batch_delay, e.retry_after());
         const auto retry_at = unix_ms() + static_cast<uint64_t>(retry_delay.count());
         const auto deferred = hints_.defer_matching(
@@ -3562,9 +3491,8 @@ CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
     prepared.reserve(max_hints);
     DistributedStore::DurabilityBatch artwork_batch;
 
-    // Acquire one coherent decoded namespace view lazily for the complete
-    // batch. An empty queue therefore causes no metadata work at all. Normally
-    // this is a pure cache read; a cold-start batch may populate it once.
+    // One namespace view per batch, taken lazily: an empty queue does no
+    // metadata work. Normally a cache read.
     std::optional<MetadataSnapshotView> namespace_view;
     uint64_t namespace_view_taken_unix_ms = 0;
 
@@ -3770,25 +3698,17 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
         if (!file.provider->accepts_path(file.path)) continue;
-        // Zero-length files do not yet have a meaningful immutable media
-        // identity. During durable FUSE recovery they are commonly committed
-        // namespace shells whose data/extents will appear in a later metadata
-        // generation. Do not queue them and, critically, do not collapse every
-        // such path onto the shared empty-file hash in active_media_ids.
+        // Zero-length files have no media id yet (often shells awaiting FUSE
+        // data); never put the shared empty-file hash in active_media_ids.
         if (file.entry.size == 0) continue;
 
-        // Discovery answers only "which immutable media objects exist?". The
-        // media id is available directly from FsEntry; opening every file here
-        // duplicates the expensive libav/tag probe that the hint consumer must
-        // perform for genuinely unbound media. On an old library that turned one
-        // repair pass into two complete media reads per item.
+        // Discovery takes the media id from FsEntry and never opens the file;
+        // probing is the hint consumer's.
         const auto media_id = file_media_id(file.entry);
         active_media_ids.insert(media_id);
 
-        // An exact bound media id is already known. Byte changes produce a new
-        // id and therefore queue normal enrichment. Manual rescans intentionally
-        // queue bound objects so newly-supported embedded metadata/artwork can be
-        // revisited on demand.
+        // Bound ids are skipped; changed bytes give a new id. Manual rescans
+        // queue bound objects too.
         if (!bound.contains(media_id) || force)
             submissions.push_back({file.path, std::string(hint_source),
                                    unique_source_ref ? scan_ref : media_id,
@@ -3816,8 +3736,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
 
     const auto ids = hints_.submit_many(std::move(submissions));
     if (stop.stop_requested()) return 0;
-    // Discovery is the only destructive catalogue source. Hint processing is
-    // additive and cannot infer absence from a single path.
+    // Discovery is the only destructive source; hint processing is additive.
     catalogue_.reconcile_scanner(
         {}, active_media_ids, complete_scan,
         complete_scan ? std::optional<Hash256>(metadata_namespace_signature(namespace_snapshot))
@@ -3835,13 +3754,8 @@ void CatalogueScanner::loop(std::stop_token stop) {
     const auto persisted = load_scanner_state(node_.config().state_path);
     std::optional<Hash256> scanned_namespace = persisted.namespace_signature;
     bool scanner_state_reconciled = !persisted.namespace_signature || persisted.reconciled;
-    // Migration from pre-scanner.state releases: the durable hint-state file is
-    // created only once catalogue work has been admitted. It remains present
-    // even if all ephemeral successful hints have since been discarded, making
-    // it a better "this library has already been through scanner operation"
-    // marker than the current in-memory hint count. Migration seeds the current
-    // identity without scanning immediately, but marks it unverified so one full
-    // reconciliation is still performed at the ordinary safety deadline.
+    // Without scanner.state, an existing hints.json shows the library has been
+    // scanned: seed the current signature unverified rather than scan at once.
     const bool prior_scan_evidence = std::filesystem::exists(
         node_.config().state_path / "catalogue" / "hints.json");
     std::optional<std::chrono::steady_clock::time_point> mutation_due;
@@ -3864,9 +3778,8 @@ void CatalogueScanner::loop(std::stop_token stop) {
         if (auto available = fs_.available_namespace_signature(&generation);
             available && generation >= node_.known_metadata_generation())
             return {*available, generation};
-        // MetadataManager owns convergence. Only if its decoded immutable view
-        // is absent/stale do we fall back to the strong snapshot path. Settled
-        // periodic safety checks therefore remain local.
+        // MetadataManager owns convergence; the strong snapshot path is only
+        // for an absent or stale view.
         auto signature = fs_.namespace_signature(&generation);
         return {signature, generation};
     };
@@ -3876,23 +3789,15 @@ void CatalogueScanner::loop(std::stop_token stop) {
         { std::lock_guard lock(config_mutex_); config = config_; }
         const auto now = std::chrono::steady_clock::now();
 
-        // On restart, compare the last successfully reconciled namespace
-        // identity against MetadataManager's already-decoded view. Coordinator
-        // election itself is not evidence of a namespace mutation and must not
-        // launch a full discovery pass. For the one-time migration from older
-        // state (no scanner.state), an existing durable hint-state file is
-        // sufficient evidence that this library has already been operated by
-        // the scanner: seed the current signature as unverified and schedule one
-        // full reconciliation at the normal safety interval instead of reopening
-        // the entire historical result set immediately.
+        // On start, compare the last reconciled namespace signature with the
+        // decoded view; becoming coordinator is no reason for a full pass.
+        // Without scanner.state but with hints.json, seed it unverified and
+        // reconcile at the safety interval.
         if (!initial_signature_checked) {
             uint64_t available_generation = 0;
             if (auto current = fs_.available_namespace_signature(&available_generation);
                 current && available_generation >= node_.known_metadata_generation()) {
-                // Do not seed/reconcile scanner state from a decoded snapshot
-                // that is already known to be stale. Metadata convergence owns
-                // fetching/decoding the advertised generation; this loop will
-                // observe the immutable view cheaply once it catches up.
+                // Never from a view known stale; metadata convergence catches up.
                 initial_signature_checked = true;
                 observed_generation = std::max(observed_generation, available_generation);
                 if (scanned_namespace) {
@@ -3915,11 +3820,8 @@ void CatalogueScanner::loop(std::stop_token stop) {
             }
         }
 
-        // Every node may consume its own persistent hints. This makes an ingest
-        // performed on a non-coordinator responsive without requiring catalogue
-        // hint RPC forwarding; catalogue CAS/retry semantics resolve concurrent
-        // additive updates. Only the namespace-wide destructive reconciliation
-        // pass remains coordinator-owned.
+        // Every node consumes its own hints; catalogue CAS resolves concurrent
+        // additive updates. Only destructive reconciliation is the coordinator's.
         if (config.enabled && now >= next_hint_batch) {
             auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
             if (!budget_http) throw std::runtime_error("catalogue provider HTTP budget unavailable");
@@ -3928,13 +3830,8 @@ void CatalogueScanner::loop(std::stop_token stop) {
                 provider_budget_open = true;
             }
 
-            // A large old library may legitimately have hundreds of unbound
-            // items requiring one real libav/tag/provider repair each. That work
-            // is necessary, but it is background work: one expensive item must
-            // not monopolise a core continuously. Measure this thread's actual
-            // CPU for one scheduling unit and pace subsequent work to the same
-            // CPU target used by the maintenance subsystem. Blocking network/I/O
-            // time already counts as quiet time and therefore is not penalised.
+            // Background work: measure this thread's CPU per batch and pace to
+            // the maintenance CPU target. Blocking I/O counts as quiet time.
             const auto work_started = Clock::now();
             const auto cpu_started = thread_cpu_time_ns();
             constexpr size_t background_hint_batch = 32;
@@ -3979,8 +3876,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
 
         const bool is_coordinator = coordinator();
         if (is_coordinator && !was_coordinator && !scanned_namespace && !prior_scan_evidence) {
-            // A genuinely fresh scanner still needs an initial discovery. A
-            // normal coordinator hand-off does not.
+            // A fresh scanner needs an initial discovery; a hand-off does not.
             mutation_due = now;
             if (!mutation_first_seen) mutation_first_seen = now;
         }
@@ -4055,15 +3951,11 @@ void CatalogueScanner::loop(std::stop_token stop) {
                                        std::string(e.what()));
                         }
                     }
-                    // Newly discovered low-priority hints should be eligible
-                    // immediately after the reconciliation pass.
+                    // Newly discovered hints are eligible at once.
                     next_hint_batch = std::min(next_hint_batch, std::chrono::steady_clock::now());
                 } else {
-                    // A periodic safety pass first verifies the authoritative
-                    // namespace identity. If it is byte-for-byte the same as the
-                    // last successful reconciliation, walking every catalogue
-                    // root cannot discover anything new. Advance the persisted
-                    // safety deadline without reopening historical hints.
+                    // An unchanged namespace signature since the last
+                    // reconciliation has nothing new: just advance the deadline.
                     mutation_due.reset();
                     mutation_first_seen.reset();
                     scanned_namespace = before;
@@ -4091,9 +3983,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
 
         const auto log_now = std::chrono::steady_clock::now();
         if (log_now >= next_backlog_log && Log::enabled(LogLevel::debug)) {
-            // next_hint_batch==max is the worker's established no-pending-work
-            // state. Do not even walk the terminal hint map merely to suppress a
-            // zero-backlog line every 30 seconds.
+            // next_hint_batch==max means no pending work: skip the summary walk.
             if (next_hint_batch != Clock::time_point::max()) {
                 const auto backlog = hints_.summary();
                 if (backlog.pending != 0) {
@@ -4110,17 +4000,13 @@ void CatalogueScanner::loop(std::stop_token stop) {
             next_backlog_log = log_now + std::chrono::seconds(30);
         }
 
-        // Hint submission is event-driven. Keep a one-second ceiling only for
-        // cheap coordinator/metadata-generation observation; do not linearly
-        // scan the persisted negative-result map ten times per second while idle.
+        // Hints are event-driven; the one-second ceiling only observes the
+        // coordinator and metadata generation.
         const auto sleep_from = std::chrono::steady_clock::now();
         auto wake_at = sleep_from + std::chrono::seconds(1);
         if (config.enabled) {
-            // Hint work is node-local and may wake every scanner. Periodic and
-            // namespace-mutation reconciliation are coordinator-owned; an
-            // overdue coordinator deadline on a non-coordinator must not turn
-            // its idle loop into a zero-timeout spin. The one-second ceiling
-            // remains the bounded coordinator/membership observation interval.
+            // Reconciliation is the coordinator's: an overdue deadline must not
+            // spin a non-coordinator's idle loop.
             wake_at = std::min(wake_at, next_hint_batch);
             if (is_coordinator) {
                 wake_at = std::min(wake_at, next_periodic);

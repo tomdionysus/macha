@@ -6,9 +6,7 @@
 
 namespace macha {
 
-// Matches AV_NOPTS_VALUE without making timestamp repair depend on libav
-// headers. media_engine.cpp converts AVPacket timestamps directly because
-// FFmpeg uses INT64_MIN for the same sentinel.
+// Equals AV_NOPTS_VALUE (INT64_MIN) without depending on libav headers.
 inline constexpr int64_t kNoMediaTimestamp = std::numeric_limits<int64_t>::min();
 
 struct MediaPacketTimestamps {
@@ -31,22 +29,17 @@ struct MediaTimestampRepairState {
     }
 };
 
-// Repair one stream-copy packet after its timestamps have been rescaled to the
-// muxer's output timebase. MP4 requires defined, strictly increasing DTS.
-// Some demuxers can produce missing/equal timestamps around a backward seek,
-// and timestamp rescaling itself can collapse adjacent source ticks. A repair
-// is carried forward as a timeline shift so later packets keep their spacing
-// instead of being repeatedly squeezed forward one tick at a time. PTS before
-// DTS is observed but preserved: signed composition offsets are valid in MP4
-// when the muxer uses version-1 CTTS entries.
+// Repair one stream-copy packet after rescaling to the muxer timebase: MP4
+// needs defined, strictly increasing DTS, which backward seeks and rescaling
+// can break. A repair carries forward as a timeline shift so later packets
+// keep their spacing. PTS before DTS is kept: version-1 CTTS allows signed
+// composition offsets.
 void normalize_media_timestamps(MediaTimestampRepairState& state,
                                 MediaPacketTimestamps& packet);
 
-// Encoders require presentation timestamps to be strictly increasing in
-// display order. Demuxer best-effort timestamps can still collapse or move
-// backwards after rescaling to the encoder timebase, especially around seek
-// boundaries in imperfect files. Preserve AV_NOPTS_VALUE and otherwise nudge
-// only anomalous values forward by the minimum amount required.
+// Encoders need strictly increasing PTS, which rescaled best-effort timestamps
+// can violate around seeks in imperfect files. Keeps AV_NOPTS_VALUE; nudges
+// only anomalous values forward by the minimum.
 int64_t normalize_encoder_pts(int64_t& last_pts, int64_t pts);
 
 } // namespace macha

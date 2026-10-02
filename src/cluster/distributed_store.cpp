@@ -46,9 +46,8 @@ DistributedStore::ObjectData take_object_reply_payload(RpcMessage message,
     if (message.type != MessageType::object_reply)
         throw std::runtime_error("remote object reply has the wrong message type");
 
-    // The stable wire representation is ObjectId + length + bytes. Validate it
-    // in place, then slide the bytes over the small prefix and retain the same
-    // allocation. Reader::bytes() would allocate and copy the complete extent.
+    // Wire form: ObjectId + length + bytes. Validate in place, then slide the
+    // bytes over the prefix to keep the allocation (Reader::bytes() would copy).
     Reader reader(message.payload);
     const ObjectId returned{reader.fixed<32>()};
     const auto size = reader.u32();
@@ -94,9 +93,8 @@ void DistributedStore::DurabilityBatch::add(DurabilityRequirement next) {
     };
 
     // Durability generations are cumulative within an exact
-    // node/epoch/domain/backend incarnation. Keep only the non-dominated
-    // frontier for each replica set: the normal sequential publication case
-    // therefore retains one compact requirement instead of one per extent.
+    // node/epoch/domain/backend incarnation, so keep only the non-dominated
+    // frontier per replica set: sequential publication keeps one requirement.
     for (const auto& existing : requirements)
         if (dominates(existing, next))
             return;
@@ -111,11 +109,9 @@ void DistributedStore::note_foreground(uint64_t bytes) {
 
 void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
     auto seconds = std::chrono::duration<double>(duration).count();
-    // Background credit is spent an extent at a time, so the estimate has to
-    // say what an extent costs. A transfer under half an extent is mostly one
-    // round trip and the far end's write, not bandwidth: on 2026-09-29
-    // gbni-1's repair pushed 16-100 KB objects to fi-1 and estimated ~20 KB/s
-    // on a path that moves 1.3 MB/s, so its credit, and repair, crawled.
+    // Background credit is spent an extent at a time, so the estimate must
+    // reflect an extent's cost. A transfer under half an extent is dominated
+    // by round trip and remote write, not bandwidth, and would understate it.
     if (!bytes || seconds <= 0.0 || bytes < n_.config().extent_size / 2)
         return;
     double sample = static_cast<double>(bytes) / seconds;
@@ -129,12 +125,11 @@ std::chrono::milliseconds DistributedStore::foreground_idle_for() const {
 }
 
 std::vector<NodeInfo> DistributedStore::hosting_nodes() const {
-    // The one choke point for DATA placement (0.42.0): owners, should_own,
-    // retention candidates, repair, prompt replication and rebalance all go
-    // through ranked(), so filtering here is what keeps an edge node -- or a
-    // node that turned out to accept no inbound connections -- out of every
-    // owner set and every fallback order. Every peer gossips the same bits,
-    // so every peer computes the same answer.
+    // The one choke point for DATA placement: owners, should_own, retention
+    // candidates, repair, prompt replication and rebalance all use ranked(),
+    // so filtering here keeps edge and inbound-incapable nodes out of every
+    // owner set and fallback order. All peers gossip the same bits, so all
+    // compute the same answer.
     auto active = n_.membership().active();
     std::erase_if(active, [](const NodeInfo& node) { return !node_hosts_extents(node); });
     return active;
@@ -229,12 +224,9 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     auto nodes = ranked(id);
     if (nodes.empty())
         return false;
-    // The writer keeps a copy of what it writes: the local store is the
-    // first replica tried, then placement order. Until 0.32.13 the order was
-    // placement alone, so an offsite writer's first (and, at a floor of 1,
-    // only) copy could be an upload across the WAN, its own viewers read
-    // it back across the WAN, and its publication rate was the link's
-    // (es-1, 2026-09-07). Repair still converges the copies onto the
+    // The local store is the first replica tried, then placement order, so an
+    // offsite writer's first copy, its viewers' reads and its publication
+    // rate do not depend on the WAN. Repair converges copies onto the
     // placement owners afterwards.
     if (auto self = std::find_if(nodes.begin(), nodes.end(),
                                  [&](const NodeInfo& node) { return node.id == n_.node_id(); });
@@ -243,9 +235,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     }
     const size_t target = std::min(n_.config().replication, nodes.size());
     const size_t floor = n_.config().min_write_replicas;
-    // 0.18 makes foreground durability explicit: min_write_replicas is the
-    // publication contract. Desired replication is convergence work performed
-    // by repair, not a latency/quorum rule that changes with current membership.
+    // min_write_replicas is the publication contract; further replication is
+    // repair's convergence work, not a quorum rule tied to membership.
     const size_t need = floor;
     if (nodes.size() < floor)
         return false;
@@ -370,15 +361,12 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     if (success >= need)
         return finish(true, need);
 
-    // No-progress budget (only when the caller's context carries one). A put
-    // is not failed for being slow: any completion, any fallback launch, any
-    // pending transfer still moving bytes, or progress anywhere else in the
-    // pipeline (the shared counter) re-arms the window. Only a put where
-    // nothing at all advances for the whole budget fails -- and it fails
-    // retryably, so publication backs off and eventually parks instead of
-    // sitting in drain_one_extent() forever. Before this, a spilled put stayed
-    // "unfinished" and kept the exit test below from ever firing, so a silent
-    // peer with no replacement replica was an infinite 1 ms spin.
+    // No-progress budget (only when the caller's context carries one). A slow
+    // put is not failed: any completion, fallback launch, pending transfer
+    // moving bytes, or progress elsewhere in the pipeline (the shared counter)
+    // re-arms the window. Only a put where nothing advances for the whole
+    // budget fails, retryably, so publication backs off and parks instead of
+    // spinning on a silent peer.
     const auto budget = work ? work->no_progress_budget() : std::chrono::milliseconds{};
     const auto* shared_progress = work ? work->progress() : nullptr;
     uint64_t seen = shared_progress ? shared_progress->load(std::memory_order_relaxed) : 0;
@@ -519,10 +507,10 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
     if (batch.empty())
         return true;
 
-    // Coalesce by exact process-epoch-bound physical placement. Requests which
-    // share a filesystem domain still reach the same DurabilityDomain and are
-    // group-committed there; the backend incarnation remains part of the token
-    // so a reopened/replaced backend cannot satisfy an old placement.
+    // Coalesce by exact process-epoch-bound physical placement. Requests that
+    // share a filesystem domain are still group-committed there; the backend
+    // incarnation is part of the token so a reopened or replaced backend
+    // cannot satisfy an old placement.
     using ReplicaKey = std::tuple<NodeId, NodeId, uint64_t, uint64_t>;
     std::map<ReplicaKey, uint64_t> wanted_map;
     for (const auto& requirement : batch.requirements) {
@@ -549,15 +537,12 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
     };
     std::vector<PendingBarrier> pending;
 
-    // Why each replica did or did not count, for the failure line below. A
-    // bare "required=1 durable=0" spun gbni-1 for half an hour on 2026-09-06
-    // with nothing saying which peer, or whether it was the epoch, the
-    // barrier, or the transport that said no.
+    // Why each replica did or did not count (peer, epoch, barrier or
+    // transport), for the failure line below.
     std::map<ReplicaKey, std::string> outcome;
 
-    // Launch remote waits before blocking on the local domain. This aligns the
-    // batch windows across replicas, so a publication does not unnecessarily
-    // serialize one physical durability cut per node.
+    // Launch remote waits before blocking on the local domain, aligning batch
+    // windows so a publication does not serialise one durability cut per node.
     for (const auto& replica : wanted) {
         if (replica.id == n_.node_id())
             continue;
@@ -577,8 +562,8 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                                            payload.data(), frame_type));
             pending.push_back(std::move(item));
         } catch (const std::exception& error) {
-            // Still transient -- a request that was never sent is "ask again" --
-            // but say why, so "could not send" and "did not try" stay distinct.
+            // Still transient (an unsent request is "ask again"), but the
+            // reason keeps "could not send" distinct from "did not try".
             outcome[key] = std::string("remote-launch-failed: ") + error.what();
         } catch (...) {
             outcome[key] = "remote-launch-failed: unknown";
@@ -635,12 +620,10 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
             outcome[key] = peers.contains(replica.id) ? "remote-not-sent" : "peer-unknown";
     }
 
-    // Discipline 1 of the self-healing plan: a refusal because a peer's
-    // process or backend incarnation changed means "your token is dead", not
-    // "your bytes are gone". Ask again with the object ids; the peer answers
-    // from its disk with fresh tokens, and the batch is re-stamped in place so
-    // the next barrier is ordinary. Restarting es-1 on 2026-09-06 otherwise
-    // left gbni-1 asking the same dead question about a 13.9 GB file forever.
+    // A refusal because a peer's process or backend incarnation changed means
+    // "your token is dead", not "your bytes are gone" (discipline 1). Ask
+    // again with the object ids; the peer answers from disk with fresh tokens
+    // and the batch is re-stamped in place, so the next barrier is ordinary.
     const auto key_of = [](const DurableReplica& replica) {
         return ReplicaKey{replica.id, replica.epoch, replica.domain, replica.backend_instance};
     };
@@ -671,7 +654,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                 }
             }
         }
-        // Remote: one probe per peer carrying every id that named a dead token.
+        // Remote: one probe per peer with every id that named a dead token.
         std::map<NodeId, std::vector<ObjectId>> probe_ids;
         std::map<NodeId, DurableReplica> probe_token;
         for (const auto& requirement : batch.requirements) {
@@ -752,12 +735,10 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
                   " peers=" + std::to_string(probe_ids.size()));
     }
 
-    // A requirement is reported as unsatisfiable -- "re-put this object" --
-    // only when every replica that failed did so definitively (the peer says
-    // it no longer holds the object, or is unknown). A transport failure, a
-    // peer mid-restart, or a pre-0.29 peer that cannot be probed is "ask
-    // again", never "re-send": on the first live run a Broken pipe at the
-    // instant of a restart re-put extents the peer still had.
+    // Unsatisfiable ("re-put this object") only when every failed replica
+    // failed definitively (the peer no longer holds the object, or is
+    // unknown). A transport failure or a peer mid-restart is "ask again",
+    // never "re-send".
     const auto definitive = [](const std::string& text) {
         return text.starts_with("remote-refused: epoch changed; object absent") ||
                text == "peer-unknown" || text == "local-epoch-changed" ||
@@ -806,9 +787,9 @@ RpcReply DistributedStore::bounded_control_call(const NodeInfo& target, MessageT
     auto request = n_.call_async(target, type, payload, frame_type);
     const auto deadline = std::max(n_.config().dead_after, n_.config().connect_timeout);
     if (request.wait_for(deadline) != std::future_status::ready) {
-        // Fast health probes can continue to succeed while an ordinary control
-        // worker is wedged. Abort this exact route so a retention-before-commit
-        // barrier is bounded and its pending promise/queue ownership is released.
+        // Fast health probes can succeed while a control worker is wedged.
+        // Abort this exact route so a retention-before-commit barrier is
+        // bounded and releases its pending promise and queue ownership.
         request.abort();
         throw std::runtime_error("control RPC deadline exceeded peer=" + target.host +
                                  " message=" + std::to_string(static_cast<unsigned>(type)));
@@ -826,19 +807,11 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (target.id == n_.node_id()) {
         for (const auto& id : ids) {
-            // A retention claim says "this node holds the object". Until
-            // 0.32.3 it re-read, decrypted and hashed every extent here (the
-            // full valid() path) inside the metadata mutation: minutes per
-            // publication on a busy node, with the store mutex held for the
-            // duration so every HTTP request -- status and playback included
-            // -- queued behind it (es-1, 2026-09-07: 16 HTTP workers blocked
-            // in LocalStore::has, status unavailable for 40 s+). Presence in
-            // the index is the same contract discipline 1 wrote down for
-            // durability ("present after a restart is durable"): the bytes
-            // were verified when this node put them, and the scrub, not the
-            // retention claim, is where later corruption is found. (No DATA
-            // admission for an index lookup; the remote handler matches
-            // since 0.32.7.)
+            // A retention claim says "this node holds the object": index
+            // presence, not a read-decrypt-hash, which inside the metadata
+            // mutation would hold the store mutex and stall every HTTP request.
+            // The bytes were verified when put; scrub finds later corruption.
+            // No DATA admission for an index lookup; the remote handler matches.
             const bool present = object_class == RetentionClass::data
                                      ? n_.local_store().has(id)
                                      : n_.control_store().has(id);
@@ -878,11 +851,10 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     if (!floor)
         return false;
 
-    // Plan claims first, then persist one RetainBatch per selected node. This
-    // keeps metadata-only touches of multi-extent files from degenerating into
-    // one fsync/RPC per object while preserving a per-object DATA durability
-    // floor. Fallback single-object claims below handle a node disappearing
-    // between planning and batch persistence.
+    // Plan claims first, then persist one RetainBatch per selected node, so a
+    // multi-extent file is not one fsync/RPC per object; the per-object DATA
+    // floor still holds. Single-object fallback claims below cover a node
+    // vanishing between planning and persistence.
     const auto started = Clock::now();
     std::map<NodeId, NodeInfo> node_info;
     std::map<NodeId, std::vector<ObjectId>> batches;
@@ -890,9 +862,8 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     for (const auto& id : ids)
         candidates_by_object.emplace(id, ranked(id));
 
-    // Batched, concurrent candidate-presence scan (the O(N) serial
-    // has_on()-per-candidate loop this exists to remove). Preference order and
-    // the per-object floor requirement are identical to the serial form.
+    // Batched, concurrent candidate-presence scan; same preference order and
+    // per-object floor as a serial has_on() walk.
     auto selected_by_object = select_present_batched(candidates_by_object, floor);
     const auto scan_ms = elapsed_ms(started);
 
@@ -902,10 +873,8 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
             short_ids.push_back(id);
     const auto short_count = short_ids.size();
     size_t fallback_claims = 0;
-    // Where the writer's retention barrier spends its time, when it is slow
-    // enough to matter (1-15 s per quantum commit on the live cluster,
-    // 2026-09-07): the presence scan, re-replication of short objects, the
-    // per-node claims, per-object fallbacks.
+    // Where a slow retention barrier spends its time: presence scan,
+    // re-replication of short objects, per-node claims, per-object fallbacks.
     const auto report = [&](bool ok) {
         static auto& barrier = observations().histogram("claim.data_barrier_us");
         static auto& barrier_ids = observations().counter("claim.data_barrier.ids");
@@ -925,11 +894,10 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     };
 
     if (!short_ids.empty()) {
-        // A metadata-only mutation may be the first operation on an object
-        // after its old placement disappeared. Re-establish the ordinary DATA
-        // durability floor before creating the new causal claim. This only
-        // touches objects the batched scan above already found short, so it
-        // stays a rare, per-object serial path rather than the common one.
+        // A metadata-only mutation may be the first touch after an object's
+        // old placement disappeared: re-establish the DATA durability floor
+        // before the new claim. Only objects the scan found short take this
+        // rare serial path.
         std::map<ObjectId, std::vector<NodeInfo>> rescan_candidates;
         for (const auto& id : short_ids) {
             auto data = get(id, 0, FrameType::speculative);
@@ -961,10 +929,9 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
         }
     }
 
-    // One claim RPC per selected node, in parallel: the claims are
-    // independent, and serially each one cost a full round trip (60-200 ms
-    // to the remote and the wireless nodes on the live cluster) inside the
-    // writer's metadata mutation, for every quantum commit.
+    // One claim RPC per selected node, in parallel: claims are independent,
+    // and each serial round trip would land inside the writer's metadata
+    // mutation for every quantum commit.
     std::map<ObjectId, std::set<NodeId>> claimed;
     {
         std::vector<std::pair<NodeId, std::future<bool>>> claims;
@@ -1047,35 +1014,20 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     if (active.size() < required)
         return false;
     // Local first, then the nearest measured peer: this runs inside the
-    // writer's metadata mutation, and NodeId order sent gbni-1's every
-    // catalogue claim across the WAN (2026-09-07).
+    // writer's metadata mutation.
     active = order_commit_replicas(active, n_.node_id(), [&](const NodeId& peer) {
         return n_.peer_latency(peer);
     });
 
-    // A retention claim asserts this node holds every object, and the peer
-    // copies are derived from ours, so local presence is a precondition
-    // whatever any peer turns out to need.
+    // A retention claim asserts this node holds every object and peer copies
+    // derive from ours, so local presence is a precondition.
     for (const auto& id : ids)
         if (!ensure_control_local(id))
             return false;
 
-    // Ask the peer what it is missing before sending it anything.
-    //
-    // Until 0.53.1 this uploaded the whole referenced control graph to every
-    // candidate on every commit, with no presence check anywhere on the path.
-    // That was tolerable while a graph was 65 catalogue shards. Once the
-    // namespace became tree-backed a commit referenced its whole spine, and
-    // the cost stopped scaling with what changed and started scaling with how
-    // large the library had grown: measured on gbni-1 on 2026-09-22, three
-    // minutes of importing produced 25 commits, pushed 5,469 control objects
-    // to peers, and grew the control store by *zero* objects. Every byte of it
-    // was an object both ends already had. It is the same defect 0.51.0 fixed
-    // on the replication path -- "a node already present is not
-    // re-replicated" -- which was never applied here.
-    //
-    // A peer too old to answer, or one that fails the probe, falls back to
-    // being sent everything, which is exactly what it got before.
+    // Ask the peer what it is missing before sending anything, so a commit's
+    // cost scales with what changed, not with the namespace's size. A peer
+    // that cannot answer is sent everything.
     auto missing_on = [&](const NodeInfo& target) {
         std::vector<ObjectId> missing;
         constexpr size_t probe_batch = 4096;
@@ -1107,37 +1059,19 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         return missing;
     };
 
-    // Store the graph on one candidate with the puts pipelined rather than one
-    // round trip after another, which cost 65 x 65 ms = 4.2 s per mutation on
-    // the live cluster (`control_ms=4247 control_objects=65`).
-    //
-    // Pipelined, but bounded. Until 0.53.1 this fired the entire graph at once,
-    // which was correct while a graph was 65 catalogue shards and became a
-    // cluster-wide failure when the namespace went tree-backed and a commit
-    // started touching 838 control objects: the puts overran the connection's
-    // outbound queue, the catch below cancelled the whole batch, and every
-    // peer was skipped in turn. gbni-1 then had retained=1 against required=2
-    // and killed the operator's ingest job -- on every commit over the line,
-    // for hours, while reporting a dead network link (2026-09-22).
-    //
-    // Bound it by what the connection will actually hold, not by a number of
-    // our own choosing. A put occupies a writer queue slot until it is sent
-    // and a pending-reply slot until it is answered, so the binding limit is
-    // the smaller of the two. A quarter of it, because this graph is one
-    // caller among heartbeats, metadata commits and status traffic on the same
-    // lane, and taking more than a share of a shared budget is precisely how
-    // this broke. That still pipelines ~64 deep -- about thirteen round trips
-    // for a graph of 838 against the fifty it would take serially -- and it no
-    // longer has any relationship to how large the namespace has grown.
+    // Puts to a candidate are pipelined, bounded by what the connection holds:
+    // a put occupies a writer queue slot until sent and a pending-reply slot
+    // until answered, so the limit is the smaller of the two. A quarter of it,
+    // because this graph shares the lane with heartbeats, commits and status
+    // traffic; taking more than a share of a shared budget overruns it.
     const size_t connection_budget =
         std::min(max_pending_rpc_requests, max_peer_outbound_messages);
     const size_t put_window = std::max<size_t>(1, connection_budget / 4);
     auto put_graph_on = [&](const NodeInfo& target) {
         if (target.id == n_.node_id()) {
-            // Local puts are reaffirmations as well as writes: LocalStore::put
-            // refreshes an existing object's physical age, which is what keeps
-            // reachability GC from racing a commit that reuses an old orphan.
-            // So the local candidate is not presence-filtered.
+            // Not presence-filtered: LocalStore::put refreshes an existing
+            // object's physical age, so reachability GC cannot race a commit
+            // that reuses an old orphan.
             for (const auto& id : ids) {
                 auto bytes = n_.control_store().get(id);
                 if (!bytes || !n_.control_store().put(id, *bytes))
@@ -1175,10 +1109,7 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         for (const auto& id : missing) {
             if (in_flight.size() >= put_window)
                 drain();
-            // Read the bytes only for what is actually being sent. The old
-            // form materialised every referenced object up front, so a commit
-            // decrypted its whole spine out of the control store to discover
-            // the peer wanted none of it.
+            // Read bytes only for what is sent.
             auto bytes = n_.control_store().get(id);
             if (!bytes) {
                 for (auto& [rpc, _] : in_flight)
@@ -1206,9 +1137,8 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         return ok;
     };
 
-    // Critical-path CONTROL publication scales with the configured metadata
-    // write floor, not cluster membership. Background control repair may later
-    // fan the immutable graph out to every node.
+    // Critical-path CONTROL publication scales with the metadata write floor,
+    // not membership; background control repair may fan out later.
     size_t retained_count = 0;
     size_t tried = 0;
     for (const auto& candidate : active) {
@@ -1237,7 +1167,6 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
 
 DistributedStore::DistributedStore(NodeRuntime& n, DistributedStoreOptions options)
     : n_(n), repair_trace_(std::move(options.repair_trace)) {
-    // Keep where the push pass has reached, and resume from it.
     if (options.repair_position) {
         repair_position_path_ = std::move(*options.repair_position);
         std::ifstream in(repair_position_path_);
@@ -1263,7 +1192,7 @@ void DistributedStore::save_repair_position(bool force) {
         repair_position_saved_ = repair_push_settled_;
         repair_position_saved_at_ = now;
     } catch (const std::exception& error) {
-        // A lost position costs a restart one pass of re-checking, nothing more.
+        // A lost position costs one pass of re-checking after a restart.
         Log::debug("repair position not saved: " + std::string(error.what()));
     }
 }
@@ -1299,17 +1228,12 @@ void DistributedStore::queue_prompt_replication(const ObjectId& id) {
 }
 
 void DistributedStore::prompt_replication_loop(std::stop_token stop) {
-    // One object at a time: the local copy is read and pushed to the first
-    // placement owner that lacks it, as speculative DATA work (behind viewers
-    // and loaders in the arbiter, and counted against the background effort
-    // ceiling). Reaching `replication` beyond the second copy stays with the
-    // repair pass; this loop exists to close the single-copy window quickly.
-    //
-    // It is a shortcut, not the guarantee: repair is. So it only sends where
-    // there is room, and gives up on an object after a few refusals rather
-    // than resending it for ever (0.64.1: every new object went to fi-1,
-    // whose backend had 81 bytes free, and each refused 4 MB put was resent
-    // every 30 s -- about 2 MB/s into a congested link, counted nowhere).
+    // One object at a time: the local copy is pushed to the first placement
+    // owner that lacks it, as speculative DATA work (behind viewers and
+    // loaders, counted against the background ceiling). Copies beyond the
+    // second are repair's; this loop only closes the single-copy window.
+    // Repair is the guarantee, so this sends only where there is room and
+    // gives up on an object after a few refusals.
     struct Retry {
         ObjectId id;
         Clock::time_point due;
@@ -1376,8 +1300,7 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                     if (++holders >= 2) break;
                     continue;
                 }
-                // Room as the node itself gossips it. Sending a full node the
-                // object only to have it refused wastes the link both ways.
+                // Room as the node gossips it; a refused put wastes the link.
                 if (node.capacity && node.used + room_needed > node.capacity) {
                     skipped_full = true;
                     continue;
@@ -1480,10 +1403,9 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
         }
         while (rpc.wait_for(std::chrono::milliseconds(25)) != std::future_status::ready) {
             if (read_aborted(deadline, cancelled, abort)) {
-                // A shared fetch may have acquired other waiters after this
-                // caller became its leader.  Cancellation can abort the wire
-                // RPC only while nobody else depends on it; otherwise finish
-                // the shared transfer and let the cancelled caller discard it.
+                // Cancellation aborts the RPC only while no other waiter
+                // depends on the shared fetch; otherwise the cancelled caller
+                // discards the result.
                 const bool may_cancel = !shared ||
                     shared->waiters.load(std::memory_order_relaxed) == 0;
                 if (!may_cancel)
@@ -1521,11 +1443,10 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
                              bool foreground, bool opportunistic_persist,
                              Clock::time_point deadline, std::atomic_bool* cancelled,
                              const std::function<bool()>& abort) {
-    // A hard wall-clock deadline belongs to one caller, not to an ObjectId-wide
-    // shared fetch. Probe reads therefore use a private transfer so expiry can
-    // abort the underlying RPC. Cancellation-only playback reads retain normal
-    // shared-fetch deduplication/promotion; a stopped caller may abandon its wait
-    // but does not cancel an ObjectId transfer other readers may still need.
+    // A wall-clock deadline belongs to one caller, so deadline reads use a
+    // private transfer whose expiry can abort the RPC. Cancellation-only
+    // reads share and dedupe; a stopped caller abandons its wait but does
+    // not cancel a transfer others may need.
     if (deadline != Clock::time_point{}) {
         auto try_private = [&](std::vector<NodeInfo> candidates) -> ObjectData {
             std::erase_if(candidates, [&](const NodeInfo& node) { return node.id == n_.node_id(); });
@@ -1635,10 +1556,9 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         bool account_foreground = false;
         bool queue_persist = false;
         {
-            // Keep the fetch-table lock until the shared result is published.
-            // A caller that found this transfer before completion is therefore
-            // guaranteed to become a waiter; a caller arriving afterwards can
-            // start a new fetch only after this network transfer is complete.
+            // Hold the fetch-table lock until the result is published: an
+            // earlier caller is guaranteed to be a waiter, a later one starts a
+            // new fetch only after this transfer completes.
             std::lock_guard fetch_lock(fetch_mutex_);
             std::lock_guard shared_lock(shared->mutex);
             const bool has_waiters = shared->waiters.load(std::memory_order_relaxed) != 0;
@@ -1705,10 +1625,8 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
                 std::lock_guard lock(shared->mutex);
                 transfer_type = shared->frame_type;
             }
-            // A shared transfer belongs to the ObjectId, not to whichever
-            // caller happened to become its leader.  A cancelled leader may
-            // abort the wire RPC while it has no other waiters; once another
-            // reader has joined, the shared transfer is allowed to complete.
+            // The transfer belongs to the ObjectId, not its leader: a cancelled
+            // leader may abort the RPC only while no other reader has joined.
             auto data = get_from(target, id, transfer_type, shared, {}, cancelled, abort);
             {
                 std::lock_guard lock(shared->mutex);
@@ -1732,8 +1650,8 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         if (auto data = try_candidates(std::move(preferred)))
             return finish(std::move(data));
 
-        // Objects may deliberately live on fallback nodes when a preferred owner is
-        // full, and may temporarily remain on old owners during membership changes.
+        // Objects may live on fallback nodes when an owner is full, and on old
+        // owners during membership changes.
         auto fallback = ranked(id);
         std::erase_if(fallback,
                       [&](const NodeInfo& node) { return preferred_ids.contains(node.id); });
@@ -1768,9 +1686,8 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
                              Clock::time_point deadline, std::atomic_bool* cancelled) {
     const bool foreground = frame_type == FrameType::foreground;
     const bool interactive = frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
-    // Record foreground demand before touching local/cache/network storage.
-    // Completion-time accounting alone is too late to suppress lower-priority
-    // publication when the very first playback read is the one being delayed.
+    // Record foreground demand before any storage access, so the first
+    // playback read already suppresses lower-priority publication.
     if (foreground)
         note_foreground(0);
     auto started = Clock::now();
@@ -1869,10 +1786,9 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
     const std::map<NodeId, std::vector<ObjectId>>& ids_by_node, FrameType frame_type) {
     std::map<NodeId, std::map<ObjectId, bool>> results;
 
-    // Local node: cheap presence check, no RPC, no chunking/concurrency needed.
-    // No DATA admission either: an index lookup owns no buffer, and taking a
-    // 4 MB loader lease per id (thousands per quantum commit) queued the
-    // writer's retention barrier behind its own publications.
+    // Local node: index lookup, no RPC. No DATA admission: it owns no buffer,
+    // and a loader lease per id would queue the retention barrier behind the
+    // writer's own publications.
     if (auto self = ids_by_node.find(n_.node_id()); self != ids_by_node.end()) {
         auto& out = results[n_.node_id()];
         for (const auto& id : self->second)
@@ -2117,9 +2033,8 @@ std::map<ObjectId, std::vector<NodeInfo>> DistributedStore::select_present_batch
 
 bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
     if (target.id == n_.node_id()) {
-        // Presence-only: this is a candidate-selection probe, not the retention
-        // commit. A full decrypt here is exactly the scaling cliff this exists
-        // to remove. No DATA admission for an index lookup.
+        // Presence-only candidate probe, not the retention commit; no decrypt
+        // and no DATA admission for an index lookup.
         return n_.local_store().has(id);
     }
     Writer writer;
@@ -2156,9 +2071,8 @@ size_t DistributedStore::replicate_control(const ObjectId& id,
     writer.bytes(data);
     const auto payload = writer.take();
 
-    // Every active node is a metadata/control replica in 0.19. Publication
-    // policy decides how many durable acknowledgements are required; there is
-    // no privileged metadata replica subset.
+    // Every active node is a metadata/control replica; publication policy
+    // decides how many durable acknowledgements are required.
     for (const auto& target : n_.membership().active()) {
         try {
             if (target.id == n_.node_id()) {
@@ -2244,11 +2158,8 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
 }
 
 bool DistributedStore::ensure_control_local(const ObjectId& id) {
-    // No DATA credit: the control store is not on the DATA device, and no
-    // other control-store access takes one. This took a 4 MiB speculative
-    // credit to check an 18 KB object, and when the wait was abandoned under
-    // DATA pressure the commit that asked failed with it
-    // (TODO/archive/2026-09-23-torrent-writes-starve-publication-incident.md).
+    // No DATA credit: the control store is not on the DATA device, and DATA
+    // pressure must not fail a commit's control-object check.
     if (n_.control_store().valid(id))
         return true;
 
@@ -2256,10 +2167,9 @@ bool DistributedStore::ensure_control_local(const ObjectId& id) {
     writer.fixed(id.bytes);
     const auto payload = writer.take();
 
-    // Control objects are metadata-replica data rather than DHT DATA
-    // replicas. Search every currently active peer and keep the transfer on the
-    // CONTROL transport while using speculative worker priority so it cannot
-    // block health/quorum traffic or require a DATA session to exist.
+    // Control objects are metadata-replica data, not DHT replicas: ask every
+    // active peer over CONTROL at speculative priority, so the search cannot
+    // block health/quorum traffic or need a DATA session.
     size_t asked = 0;
     std::string last_failure = "no active peer";
     for (const auto& target : n_.membership().active()) {
@@ -2338,10 +2248,8 @@ uint64_t DistributedStore::repair_once(uint64_t byte_budget,
 }
 
 namespace {
-// One line a minute at most, per kind. A cluster that has genuinely lost a
-// node can be missing a great many objects at once, and a warning per object
-// would bury the journal exactly when someone needs to read it. The cumulative
-// counter in Status is the measure; the log line is the prompt to go and look.
+// At most one warning a minute per kind: a lost node can leave many objects
+// missing at once. Status's cumulative counter is the measure.
 constexpr auto repair_warning_interval = std::chrono::minutes(1);
 constexpr size_t repair_sample_size = 32;
 } // namespace
@@ -2424,11 +2332,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     auto& transferred = result.bytes_transferred;
     size_t operations = 0;
 
-    // Repair is deliberately cursor-based. The old implementation rebuilt a
-    // complete vector of every locally stored object and copied the complete
-    // live-object set on every scheduler slice, then usually examined only a
-    // handful of objects before the RPC operation budget was exhausted. On a
-    // media-sized store that made idle repair itself an O(store) hot loop.
+    // Cursor-based: never materialises the store's object list or copies the
+    // live set per slice, which would make idle repair O(store).
     const std::optional<const ObjectId*> live_identity =
         live ? std::optional<const ObjectId*>(live->data()) : std::nullopt;
     const bool generation_changed =
@@ -2440,13 +2345,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         repair_push_probed_.clear();
         repair_push_cursor_exhausted_ = false;
     };
-    // A new live set does not restart the pass. Until 0.73.1 every metadata
-    // commit sent both cursors back to the beginning, so on a cluster that
-    // commits all the time a pass kept re-checking the same leading objects
-    // -- under have_valid_objects, a full read each on the peer -- and seldom
-    // reached the rest. Positions are kept; a pass the live set changed under
-    // is followed by another at once, which covers anything that became live
-    // behind a cursor.
+    // A new live set does not restart the pass: positions are kept, and a
+    // pass the live set changed under is followed at once by another, which
+    // covers anything that became live behind a cursor.
     if (generation_changed &&
         (repair_push_settled_ || repair_pull_after_ || !repair_push_window_.empty()))
         repair_pass_spans_change_ = true;
@@ -2482,30 +2383,26 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         return true;
     };
 
-    // Limit cheap local/live-set examinations independently of remote RPCs. A
-    // settled object may require no network operation at all; without a scan
-    // budget a single maintenance tick could still walk millions of objects.
+    // Bound local/live-set examinations separately from remote operations: a
+    // settled object needs no RPC, so the RPC budget alone would not bound a tick.
     const size_t scan_budget = operation_budget
                                    ? std::clamp<size_t>(operation_budget * 4, 16, 64)
                                    : std::numeric_limits<size_t>::max();
     size_t scanned_total = 0;
 
-    // A peer whose advertised free space cannot take an extent is not probed
-    // or sent one. Until 0.62.1 every live object cost a WAN probe and a
-    // refused 4 MB put to fi-1, whose 10G store was full: that spent repair's
-    // whole operation budget, so the pull never reached the extents this node
-    // lacked. The copy stays under-replicated, which placement already reports.
+    // A peer whose advertised free space cannot take an extent is neither
+    // probed nor sent one, so a full peer cannot spend the whole operation
+    // budget. The copy stays under-replicated, which placement reports.
     const auto has_room = [&](const NodeInfo& peer) {
         return peer.id == n_.node_id() || !peer.capacity ||
                peer.used + n_.config().extent_size <= peer.capacity;
     };
 
-    // Push existing local replicas toward the current deterministic owner set.
+    // Push local replicas toward the current owner set.
     if (!repair_push_complete_) {
-        // After a restart, resume where the saved pass had reached: skip that
-        // many objects by index, which costs no reads. The order is the
-        // store's own and can shift, so the pass counts as spanning a change
-        // and another follows it.
+        // After a restart, skip the saved number of objects by index (no
+        // reads). The store's order can shift, so the pass counts as spanning
+        // a change and another follows.
         if (repair_push_resume_) {
             uint64_t skipped = 0;
             while (skipped < *repair_push_resume_) {
@@ -2522,7 +2419,6 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_pass_spans_change_ = true;
             repair_push_resume_.reset();
         }
-        // Take the next objects off the cursor into the window.
         while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_) {
             bool pass_complete = false;
             auto next = n_.local_store().next_object(repair_push_cursor_, pass_complete);
@@ -2536,10 +2432,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         if (repair_push_window_.empty() && repair_push_cursor_exhausted_)
             repair_push_complete_ = true;
 
-        // One presence round for everything in the window not yet probed,
-        // up to have_valid_objects_max objects a request and every request
-        // in flight at once. Until 0.73.0 each probe was its own ~90 ms WAN
-        // round trip and a step checked at most 16.
+        // One presence round for every unprobed object in the window,
+        // have_valid_objects_max per request, all requests concurrent.
         std::map<NodeId, NodeInfo> probe_nodes;
         std::map<NodeId, std::vector<ObjectId>> probe_ids;
         for (const auto& id : repair_push_window_) {
@@ -2577,15 +2471,10 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 repair_push_probed_.insert(id);
         }
 
-        // Sends go out in batches, all of a batch in flight at once, and
-        // each object settles when its own sends answer. Until 0.73.1 one
-        // push was in flight at a time: each waited for the far end's
-        // durable write and a WAN round trip, about 0.35 s an object, so
-        // gbni-1 moved ~500 KB/s of mostly small objects to fi-1 with full
-        // credit and an idle link (2026-09-29). A batch holds at most
-        // repair_sends_in_flight objects and two extents of payload (one
-        // larger object alone), so what a viewer arriving mid-batch waits
-        // behind stays bounded.
+        // Sends go out in batches, all of a batch in flight at once; each
+        // object settles when its own sends answer. A batch holds at most
+        // repair_sends_in_flight objects and two extents of payload (or one
+        // larger object), bounding what an arriving viewer waits behind.
         struct Send {
             ObjectId id;
             NodeInfo peer;
@@ -2626,8 +2515,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     break;
                 Plan plan;
                 plan.id = id;
-                // Physical cursors can see stale/non-live local objects.
-                // Garbage is handled separately; replica repair skips them.
+                // The physical cursor also sees non-live objects; GC handles them.
                 if (live && !std::binary_search(live->begin(), live->end(), id)) {
                     plan.live = false;
                     plans.push_back(std::move(plan));
@@ -2647,10 +2535,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                         continue;
                     bool present = false;
                     if (peer.id == n_.node_id()) {
-                        // Presence, from the index. Until 0.62.0 this read,
-                        // decrypted and hashed the whole extent; a corrupt
-                        // local copy is found by scrub and by reads, and is
-                        // removed there, and repair then sees it absent.
+                        // Index presence: corrupt local copies are found and
+                        // removed by scrub and reads, after which repair sees
+                        // them absent.
                         present = n_.local_store().has(id);
                     } else if (auto found = repair_push_presence_.find({peer.id, id});
                                found != repair_push_presence_.end()) {
@@ -2688,8 +2575,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                             plan.keepers.insert(peer.id);
                         continue;
                     }
-                    // Credit pays for the bytes this transfer puts on the
-                    // wire, never for finding out which bytes are needed.
+                    // Credit pays for bytes put on the wire, never for finding
+                    // out which are needed.
                     if (transferred + batch_bytes + object_bytes + source->size() > byte_budget) {
                         result.credit_limited = true;
                         stop = true;
@@ -2716,8 +2603,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 plans.push_back(std::move(plan));
             }
 
-            // Every send of the batch goes out before any answer is awaited.
-            // Each completes and is kept even if repair's turn ends meanwhile.
+            // All sends go out before any answer is awaited; each completes and
+            // is kept even if repair's turn ends meanwhile.
             const auto dispatched = Clock::now();
             for (auto& send : sends) {
                 Writer writer;
@@ -2784,9 +2671,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             repair_push_complete_ = true;
     }
 
-    // Pull objects this node should own. Iterate the immutable ordered live set
-    // directly using upper_bound() rather than copying N object IDs into a new
-    // vector on every bounded repair slice.
+    // Pull objects this node should own, walking the ordered live set in place
+    // with upper_bound().
     if (!repair_pull_complete_ && live && !live->empty() && !result.credit_limited) {
         auto it = repair_pull_after_
                       ? std::upper_bound(live->begin(), live->end(), *repair_pull_after_)
@@ -2798,10 +2684,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             const ObjectId id = *it;
             bool local_valid = false;
             if (should_own(id)) {
-                // An index lookup, as in the push above: a pass that read
-                // every extent it already held could never reach the ones it
-                // lacks (gbni-1, 2026-09-25: years to cover its store). Scrub
-                // and the read path own corruption.
+                // Index lookup, as in the push: reading every held extent would
+                // never reach the missing ones. Scrub and reads own corruption.
                 local_valid = n_.local_store().has(id);
             }
             if (!should_own(id) || local_valid) {
@@ -2812,10 +2696,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 continue;
             }
 
-            // Playback may already have fetched this exact object into the
-            // persistent non-DHT cache. Promote that copy locally before doing
-            // any network I/O, so playback-assisted convergence never requires
-            // a second download.
+            // Promote a copy playback already cached before any network I/O,
+            // so convergence never downloads twice.
             if (auto cached = n_.block_cache().get(id)) {
                 auto resource = n_.data_resources().acquire(
                     DataWorkContext(FrameType::speculative, cached->size()), cached->size());
@@ -2837,9 +2719,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
             if (!reserve_operation())
                 break;
-            // The fetch runs to completion and is kept: until 0.59.0 a yield
-            // during it abandoned the transfer, or discarded the bytes once
-            // they had arrived, so a node that was never quiet never pulled.
+            // The fetch runs to completion and is kept even if repair yields,
+            // so a node that is never quiet still pulls.
             auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr);
             if (data) {
                 auto resource = n_.data_resources().acquire(
@@ -2851,12 +2732,9 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     transferred += data->bytes.size();
                 trace_repair("pull " + to_string(id) + " fetched");
             } else {
-                // This node should own it, does not have it, the block cache
-                // did not have it, and no peer answered with it. After a node
-                // leaves the cluster this is how a genuinely unavailable
-                // extent presents itself -- and it presented itself silently
-                // until 0.40.0. A transient peer or RPC failure lands here
-                // too, so this counts rather than concludes.
+                // Should own it, not here, not cached, and no peer supplied it:
+                // possibly an unavailable extent, or a transient peer/RPC
+                // failure, so this counts rather than concludes.
                 note_repair_unsourceable(id);
                 ++result.pull_unsourceable;
                 trace_repair("pull " + to_string(id) + " unsourceable");
@@ -2879,9 +2757,8 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
     repair_bytes_total_.fetch_add(result.bytes_transferred, std::memory_order_relaxed);
     repair_push_phase_complete_.store(repair_push_complete_, std::memory_order_relaxed);
     if (repair_push_complete_ && repair_pull_complete_) {
-        // A pass the live set changed under may have gone past objects before
-        // they became live: another starts at once rather than repair being
-        // called settled.
+        // A pass the live set changed under may have passed objects before
+        // they became live: run another rather than report settled.
         result.complete = !repair_pass_spans_change_;
         repair_pass_spans_change_ = false;
         repair_passes_completed_.fetch_add(1, std::memory_order_relaxed);

@@ -101,9 +101,7 @@ std::span<const uint8_t> Reader::view_bytes(size_t maximum) {
 }
 
 std::string Reader::string(size_t maximum) {
-    // One copy, into the string that owns it. This went through an
-    // intermediate Bytes until 0.48.0, so every decoded name -- and a metadata
-    // snapshot is thousands of them -- was copied twice.
+    // Decodes straight into the owning string: one copy.
     auto value = view_bytes(maximum);
     return {reinterpret_cast<const char*>(value.data()), value.size()};
 }

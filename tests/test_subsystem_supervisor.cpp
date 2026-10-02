@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Fault-injection UAT for SubsystemSupervisor (see
-// TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 0): these load
-// real .so/.dylib plugins via the real dlopen path, not in-process mocks.
-// The core claim under test is that a subsystem plugin whose construction or
-// start() throws -- the exact failure mode that crash-looped corvus-es-1 49
-// times -- degrades to a per-subsystem faulted/disabled state instead of
-// taking this test process down. Each MACHA_TEST case already runs in its
-// own isolated child process, so if the supervisor ever let such an
-// exception escape, that would show up as this test process crashing, not as
-// an ordinary CHECK failure.
+// Fault injection for SubsystemSupervisor over real plugins loaded by dlopen. A
+// plugin whose construction or start() throws degrades to a per-subsystem
+// faulted/disabled state; an escaped exception would crash the case's process.
 #include "subsystem/subsystem_supervisor.hpp"
 #include "test_backend_support.hpp" // ConcurrentCapturingLogger
 
@@ -54,9 +47,7 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_loads_and_stops_a_r
     CHECK(statuses[0].name == "test_plugin_ok");
     CHECK(statuses[0].restart_count == 0);
 
-    // A successful load must say so at INFO, naming the file it came from:
-    // it is the only evidence an operator has that a deployed plugin was
-    // actually picked up (Status needs an authenticated API call).
+    // A successful load is logged at INFO, naming the file it came from.
     bool announced = false;
     for (const auto& [level, message] : capture->records()) {
         if (level != LogLevel::info) continue;
@@ -76,8 +67,7 @@ MACHA_TEST("subsystem_supervisor",
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_FAULTING, dir.path());
 
-    // Fast, deterministic retry policy -- production defaults would make
-    // this test wait tens of seconds for the same outcome.
+    // A fast retry policy; production defaults would take tens of seconds.
     SubsystemRetryPolicy policy;
     policy.max_failures_in_window = 2;
     policy.failure_window = 60s;
@@ -87,8 +77,7 @@ MACHA_TEST("subsystem_supervisor",
     SubsystemSupervisor supervisor(dir.path(), policy);
     supervisor.start(SubsystemContext{});
 
-    // The whole point: this must be reached without the test process
-    // crashing, even though the plugin's start() always throws.
+    // Reached without crashing, though the plugin's start() always throws.
     REQUIRE(wait_until([&] {
         auto statuses = supervisor.statuses();
         return statuses.size() == 1 && statuses[0].state == SubsystemState::disabled;
@@ -108,10 +97,8 @@ MACHA_TEST("subsystem_supervisor",
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_DECLINING, dir.path());
 
-    // A factory that returns no instance means "this node is configured not
-    // to run this capability" (torrent.enabled: false, say). It must settle
-    // on unavailable and stay there -- not `faulted`, and above all not enter
-    // the retry loop, which would reconstruct nothing forever.
+    // A factory that returns no instance means the capability is configured
+    // off: it settles on `unavailable`, not `faulted`, and is never retried.
     SubsystemRetryPolicy policy;
     policy.max_failures_in_window = 2;
     policy.initial_backoff = 5ms;
@@ -135,8 +122,7 @@ MACHA_TEST("subsystem_supervisor",
     CHECK(statuses[0].restart_count == 0);
     CHECK(statuses[0].last_fault.empty());
 
-    // Declining is also announced: silence here would leave an operator
-    // unable to tell "plugin present but switched off" from "plugin missing".
+    // Declining is logged too, distinguishing "switched off" from "missing".
     bool announced = false;
     for (const auto& [level, message] : capture->records())
         if (level == LogLevel::info && message.find("test_plugin_declining") != std::string::npos &&
@@ -155,8 +141,7 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_refuses_a_mismatche
     SubsystemSupervisor supervisor(dir.path());
     supervisor.start(SubsystemContext{});
 
-    // Refused at discovery time, before any lifecycle thread or retry --
-    // never given a chance to run at all.
+    // Refused at discovery, before any lifecycle thread or retry.
     auto statuses = supervisor.statuses();
     REQUIRE(statuses.size() == 1);
     CHECK(statuses[0].name == "test_plugin_mismatched_abi");
@@ -174,10 +159,7 @@ MACHA_TEST("subsystem_supervisor",
     SubsystemSupervisor supervisor(dir.path());
     supervisor.start(SubsystemContext{});
 
-    // Not reported as a subsystem at all -- a shared library that doesn't
-    // export the entry symbol was never a macha plugin, so it must not
-    // pollute Status with a fake "disabled" entry (see /usr/bin/ld.so on a
-    // real Linux install, where plugin_path defaults to a shared bindir).
+    // A shared library without the entry symbol is not a plugin and gets no Status entry.
     CHECK(supervisor.statuses().empty());
 
     supervisor.stop();
@@ -200,21 +182,14 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_missing_directory_l
     supervisor.stop();
 }
 
-// ---- Faults discovered after a successful start -----------------------------
-//
-// The half Phase 1 left open (subsystem_supervisor.hpp): until
-// Subsystem::attach_fault_sink existed the supervisor parked until asked to
-// stop, so a subsystem whose own threads died after start() stayed `running`
-// forever. A lost FUSE mount is exactly that shape, which is why it is
-// designed against a real subsystem now rather than guessed at.
+// Faults a running subsystem reports through its fault sink after start().
 
 MACHA_TEST("subsystem_supervisor",
           test_subsystem_supervisor_rebuilds_a_subsystem_that_faults_after_starting) {
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_FAULTING_AFTER_START, dir.path());
 
-    // Room for several restarts before the budget is spent, so the cycle
-    // under test is observable rather than racing straight to `disabled`.
+    // Room for several restarts, so the cycle is observable before `disabled`.
     SubsystemRetryPolicy policy;
     policy.max_failures_in_window = 20;
     policy.failure_window = 60s;
@@ -224,13 +199,13 @@ MACHA_TEST("subsystem_supervisor",
     SubsystemSupervisor supervisor(dir.path(), policy);
     supervisor.start(SubsystemContext{});
 
-    // It reaches `running` on its own merits -- the fault comes later.
+    // It reaches `running` first; the fault comes later.
     REQUIRE(wait_until([&] {
         auto statuses = supervisor.statuses();
         return statuses.size() == 1 && statuses[0].state == SubsystemState::running;
     }, 5s));
 
-    // ... and is then rebuilt, with the subsystem's own reason recorded.
+    // Then it is rebuilt, with the subsystem's own reason recorded.
     REQUIRE(wait_until([&] {
         auto statuses = supervisor.statuses();
         return statuses.size() == 1 && statuses[0].restart_count >= 1;
@@ -255,10 +230,8 @@ MACHA_TEST("subsystem_supervisor",
     TempDir dir;
     copy_plugin(MACHA_TEST_PLUGIN_FAULTING_AFTER_START, dir.path());
 
-    // A mount that comes up and immediately dies must not remount forever.
-    // RetryState::succeeded() deliberately keeps the failure window, so a
-    // clean start between faults resets the backoff without resetting the
-    // budget -- which is what makes this terminate at all.
+    // A subsystem that starts and immediately faults must not restart forever:
+    // a clean start resets the backoff but keeps the failure window.
     SubsystemRetryPolicy policy;
     policy.max_failures_in_window = 3;
     policy.failure_window = 60s;
@@ -278,7 +251,7 @@ MACHA_TEST("subsystem_supervisor",
     CHECK(statuses[0].restart_count > policy.max_failures_in_window);
     CHECK(statuses[0].last_fault.find("lost its work") != std::string::npos);
 
-    // Terminal: an operator has to act, and nothing retries behind them.
+    // Terminal: nothing retries.
     const auto settled = statuses[0].restart_count;
     std::this_thread::sleep_for(100ms);
     CHECK(supervisor.statuses()[0].state == SubsystemState::disabled);
@@ -287,12 +260,8 @@ MACHA_TEST("subsystem_supervisor",
     supervisor.stop();
 }
 
-// ---- Builtins ---------------------------------------------------------------
-
 MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_supervises_a_builtin) {
-    // A subsystem linked into this binary gets the identical lifecycle to a
-    // plugin: same retry/disable policy, same Status entry. This is what lets
-    // FUSE move behind the supervisor before its adapter becomes a .so.
+    // A builtin gets the same lifecycle as a plugin: retry/disable policy and Status entry.
     TempDir dir; // no plugins in it, and no plugin directory is fine too.
 
     SubsystemRetryPolicy policy;
@@ -331,10 +300,8 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_supervises_a_builti
 }
 
 MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_retries_a_builtin_that_cannot_start) {
-    // The es-1 shape, with no plugin file involved: a constructor that throws
-    // must fault this subsystem and nothing else. Reaching the end of this
-    // case at all is the assertion -- an escaped exception would take the
-    // whole test process down, not fail a CHECK.
+    // A builtin whose constructor throws faults that subsystem only; an
+    // escaped exception would crash the process rather than fail a CHECK.
     SubsystemRetryPolicy policy;
     policy.max_failures_in_window = 2;
     policy.failure_window = 60s;
@@ -374,12 +341,8 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_reports_a_declining
 }
 
 MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_stops_while_a_factory_is_blocked) {
-    // A subsystem may legitimately block for a long time while being built:
-    // FuseFrontend waits for this node's first namespace before it can build
-    // its inode table, and a node whose metadata replica never arrives would
-    // otherwise wait forever. The supervisor hands each attempt its own
-    // lifecycle-thread stop token through SubsystemContext, so stopping does
-    // not mean waiting out something that may never happen.
+    // A factory may block indefinitely (FuseFrontend waits for the first
+    // namespace); SubsystemContext::startup_stop lets stop() cancel it.
     std::atomic_bool entered{};
     std::atomic_bool cancelled{};
 
@@ -387,8 +350,7 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_stops_while_a_facto
     supervisor.add_builtin("blocking", [&](const SubsystemContext& context)
                                            -> std::unique_ptr<Subsystem> {
         entered.store(true);
-        // Exactly what a bounded, cancellable wait looks like from inside a
-        // factory: poll the token and give up when it is requested.
+        // A cancellable wait: poll the token and give up when it is requested.
         while (!context.startup_stop.stop_requested())
             std::this_thread::sleep_for(1ms);
         cancelled.store(true);
@@ -407,9 +369,7 @@ MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_stops_while_a_facto
 }
 
 MACHA_TEST("subsystem_supervisor", test_service_stops_plugins_before_the_store) {
-    // A plugin writes into the store until the moment it is stopped: the
-    // torrent subsystem publishes each verified extent as it goes. The node
-    // must still take those writes while plugins stop, so Service::stop stops
+    // Plugins write into the store until they stop, so Service::stop stops
     // every plugin before it withdraws DATA admission and outbound RPC.
     TempDir plugins;
     copy_plugin(MACHA_TEST_PLUGIN_WRITES_ON_STOP, plugins.path());

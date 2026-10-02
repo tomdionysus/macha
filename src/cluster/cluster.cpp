@@ -17,20 +17,14 @@
 
 namespace macha {
 namespace {
-// How long to wait before re-attempting a gossip broadcast that did not reach
-// every peer. Long enough that repair traffic cannot become a load source of
-// its own, short enough that a rejoining node converges promptly.
+// Retry delay for a gossip broadcast that missed a peer: long enough not to
+// become a load source, short enough for a rejoining node to converge promptly.
 constexpr auto gossip_retry_floor = std::chrono::seconds(1);
-// Re-announce this often even when nothing has changed and every peer is
-// believed told. broadcast_best_effort() reports how many frames it QUEUED,
-// not how many were delivered and applied, so "reached >= peers" can mark a
-// peer told that never received anything -- a peer whose inbound route is not
-// usable yet, which is precisely the state a peer is in while it restarts.
-// Without this, such a peer waits for the next change to the table or to the
-// membership set, which may never come: observed live on 2026-09-12, where an
-// upgraded node sat with an empty user table refusing every request until the
-// sender happened to restart. Announcing on change is an optimisation; this is
-// the guarantee underneath it.
+// Re-announce this often even when nothing changed and every peer is
+// believed told: broadcast_best_effort() counts frames QUEUED, not applied,
+// so a peer whose inbound route is not yet usable (as while it restarts) can
+// be marked told without receiving anything. Announcing on change is the
+// optimisation; this is the guarantee.
 constexpr auto gossip_reannounce_interval = std::chrono::seconds(30);
 } // namespace
 
@@ -69,8 +63,8 @@ RpcMessage error_reply(const std::string& text) {
     return {MessageType::error, writer.take()};
 }
 
-// storage.hosts_extents resolved against what the node knows about itself:
-// `auto` is "yes if I have somewhere to put them and peers can fetch them".
+// storage.hosts_extents resolved: `auto` is "yes if I have somewhere to put
+// them and peers can fetch them".
 bool resolve_hosts_extents(const Config& config, bool inbound_capable) {
     switch (config.hosts_extents) {
     case Tristate::yes:
@@ -90,9 +84,9 @@ std::filesystem::path inbound_resolution_path(const Config& config) {
 }
 
 // The starting answer to "can peers connect to me?". A configured value is
-// final; `auto` starts from the persisted resolution when there is one (so a
-// restart does not look like a join/leave to placement) and otherwise
-// behaves as capable -- dial and accept -- until a dial-back says otherwise.
+// final; `auto` starts from the persisted resolution (so a restart does not
+// look like a join/leave to placement), else behaves as capable until a
+// dial-back says otherwise.
 InboundResolution initial_inbound_resolution(const Config& config) {
     InboundResolution out;
     out.inbound_capable_mode = config.inbound_capable;
@@ -124,7 +118,7 @@ InboundResolution initial_inbound_resolution(const Config& config) {
                 out.source = "persisted";
             }
         } catch (const std::exception& error) {
-            // Persisted evidence is a convenience; the probe will decide again.
+            // Persisted evidence is a convenience; the probe decides again.
             Log::warn("inbound resolution ignored: " + std::string(error.what()));
             out.inbound_capable = true;
             out.source = "default";
@@ -204,10 +198,9 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
             throw std::runtime_error(
                 "incompatible Macha storage layout; 0.18 requires a fresh namespace");
     } else {
-        // 0.18 intentionally has no live migration path. Refuse to reinterpret an
-        // older namespace/backend layout as the new storage contract. StorageLock
-        // has already created .macha.lock, which is the only allowed pre-existing
-        // entry for a fresh state directory.
+        // No migration path: an older namespace/backend layout is refused, not
+        // reinterpreted. .macha.lock (from StorageLock) is the only entry a
+        // fresh state directory may hold.
         for (const auto& entry : std::filesystem::directory_iterator(state)) {
             if (entry.path().filename() == ".macha.lock")
                 continue;
@@ -271,13 +264,11 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
               while (current < generation &&
                      !remote_metadata_generation_.compare_exchange_weak(current, generation)) {
               }
-              // An explicit metadata notice is emitted only when a peer's
-              // accepted-head set changes. Equal generation can therefore be
-              // new sibling/topology information even though it does not raise
-              // the numeric high-water mark. Ignore only a notice made stale by
-              // a strictly newer generation already observed. Ordinary equal-
-              // generation membership heartbeats use the separate membership
-              // observer above and remain non-events.
+              // A notice is sent only when a peer's accepted-head set changes,
+              // so an equal generation can still carry new sibling/topology
+              // information. Ignore only a notice made stale by a strictly
+              // newer generation. Equal-generation heartbeats go through the
+              // membership observer above and are non-events.
               if (current <= generation) {
                   remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
                   signal_service_event(ServiceEvent::metadata);
@@ -314,9 +305,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
     activity_clock_ = activity_clock ? std::move(activity_clock) : [] { return Clock::now(); };
     server_.attach_client(client_);
-    // While this node accepts no inbound connections it keeps both lanes
-    // dialled to every capable peer itself (see RpcClient::open_requested_lanes);
-    // membership is what says who those peers are.
+    // While inbound-incapable, this node keeps both lanes dialled to every
+    // capable peer (RpcClient::open_requested_lanes); membership names them.
     client_.set_maintained_peers([this] {
         std::vector<NodeInfo> out;
         for (auto& node : members_.active())
@@ -324,14 +314,14 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
                 out.push_back(std::move(node));
         return out;
     });
-    // The roster may already name peers that cannot be dialled; the transport
-    // must know before the first exchange, not after the first refused dial.
+    // The transport must know non-dialable peers before the first exchange,
+    // not after the first refused dial.
     for (const auto& node : members_.all())
         if (node.id != id_)
             client_.note_peer(node);
-    // Membership loads locally durable identity-reset tombstones before the
-    // transport exists. Seed the other operational consumers now so stale
-    // routes and telemetry are fenced before the control plane starts.
+    // Membership loaded durable identity-reset tombstones before the
+    // transport existed; seed the other consumers so stale routes and
+    // telemetry are fenced before the control plane starts.
     for (const auto& reset : members_.identity_resets())
         apply_identity_reset(reset);
 }
@@ -346,11 +336,8 @@ void NodeRuntime::mark_ready(ReadyBit bit) {
     if (all_local_state_ready() && !ready_unix_ms_.load(std::memory_order_relaxed))
         ready_unix_ms_.store(unix_ms(), std::memory_order_release);
     readiness_cv_.notify_all();
-    // Telemetry's reported phase must not lag actual readiness by up to the
-    // ordinary 5s sampling interval: a peer (or this node's own first sample,
-    // published as soon as the control plane starts) would otherwise keep
-    // reporting "recovering" for that whole window after actually becoming
-    // ready.
+    // Publish the phase now rather than up to a sampling interval later, so
+    // peers do not keep seeing "recovering" after the node is ready.
     signal_telemetry_refresh();
 }
 
@@ -463,9 +450,7 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
         const auto used = local->used();
         const auto capacity = local->limit();
         local_ = std::move(local);
-        // DATA admission now has a device to consult. Zero target means the
-        // mechanism is off and admission behaves exactly as it did before it
-        // existed.
+        // Device-pressure admission; a zero target disables it.
         if (cfg_.io_pressure_slowdown_percent) {
             local_->configure_service_monitor(DiskServiceMonitor::Thresholds{
                 std::chrono::milliseconds(cfg_.io_pressure_overhead_ms),
@@ -474,14 +459,9 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
                 cfg_.io_pressure_outlier_percent});
             data_resources_.observe_device(&local_->service_monitor(),
                                           cfg_.io_pressure_min_background);
-            // Law 3's second clause, read the way the rest of the system reads
-            // it. "A viewer is present" was byte credit held at this instant,
-            // which playback does not hold between extents, so every gap in a
-            // stream readmitted the loader at full concurrency onto a disk the
-            // next viewer read was about to want. maintenance.foreground_quiet
-            // is the window everything else already uses for this question.
-            // Set only alongside the monitor, so a disabled gate leaves
-            // admission byte-for-byte what it was.
+            // Law 3: viewer presence uses maintenance.foreground_quiet, the
+            // window the rest of the system uses, since playback holds no byte
+            // credit between extents. Set only with the monitor.
             const auto viewer_window = cfg_.maintenance.foreground_quiet;
             data_resources_.observe_viewers(
                 [this, viewer_window] { return viewer_recently_active(viewer_window); });
@@ -498,9 +478,8 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
         telemetry_storage_used_.store(used, std::memory_order_relaxed);
         telemetry_storage_capacity_.store(capacity, std::memory_order_relaxed);
         mark_ready(ready_data_storage);
-        // An edge node runs an empty pool rather than no pool: every caller
-        // of local_store() sees "not present" / "no space" and needs no
-        // special case. Say so, or capacity=0 reads like a missing disk.
+        // An edge node runs an empty pool, so local_store() callers need no
+        // special case. Said explicitly, or capacity=0 reads like a missing disk.
         Log::info("node data storage ready used=" + std::to_string(used) +
                   " capacity=" + std::to_string(capacity) +
                   (cfg_.storage_backends.empty() ? " (hosts no extents)" : ""));
@@ -568,9 +547,8 @@ void NodeRuntime::recover_state(std::stop_token stop) {
 }
 
 void NodeRuntime::start() {
-    // The one shape that is not legal at all (a cluster nobody could ever
-    // connect to) is refused here, before anything listens or is marked
-    // started, rather than left to half-work.
+    // A cluster nobody could ever connect to is refused before anything
+    // listens or is marked started.
     refuse_impossible_cluster();
     if (started_.exchange(true))
         return;
@@ -591,27 +569,20 @@ void NodeRuntime::start() {
     if (startup_stage_hook_)
         startup_stage_hook_("control-plane");
 
-    // Bring the control plane online before any potentially expensive local
-    // backend recovery. Peers can authenticate this node immediately and Status
-    // can distinguish reachability from readiness.
+    // Control plane before any expensive backend recovery: peers can
+    // authenticate this node at once and Status can tell reachability from
+    // readiness.
     server_.start();
     mark_ready(ready_control_plane);
     Log::info("node " + to_string(id_).substr(0, 12) + " listening on " +
               std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain +
               " state=recovering");
 
-    // A node with no configured bootstrap peers is founding the cluster rather
-    // than joining one -- the same test MetadataReplica uses to decide whether
-    // its genesis record is authority (see the accept_pristine_genesis_authority
-    // argument below). That is the one moment an account can be created without
-    // an account already existing to authorise it, so it is the only moment
-    // this is allowed to happen.
-    // An existing cluster upgrading into the accounts system reaches here with
-    // an empty table and bootstrap peers configured, so the branch below does
-    // not fire and nothing can authenticate: no anonymous account means the
-    // session mint refuses, and every other route needs a session. That is a
-    // total outage whose symptom (403 everywhere) says nothing about its
-    // cause, so it must announce itself rather than be discovered.
+    // A node with no bootstrap peers founds the cluster (the same test
+    // MetadataReplica uses for genesis authority, see below): the only moment
+    // an account may be created without one to authorise it.
+    // A joining node with bootstrap peers and an empty user table cannot
+    // authenticate anything (403 everywhere), so it says so loudly.
     if (!cfg_.bootstrap.empty() && users_.all().empty()) {
         Log::warn("accounts: this node holds no user accounts, so nothing can sign in and "
                   "every API route will refuse with 403");
@@ -623,9 +594,7 @@ void NodeRuntime::start() {
 
     if (cfg_.bootstrap.empty()) {
         if (auto initial = create_initial_accounts(users_, keys_, cfg_.state_path, id_)) {
-            // The password is in the file, not in this line: a log is shipped,
-            // rotated and read by more people than a 0600 file in the state
-            // directory is.
+            // The password is in the 0600 file, never in a log line.
             Log::warn("accounts: created the '" + initial->root.username + "' and '" +
                       initial->anonymous.username + "' accounts for this new cluster");
             Log::warn("accounts: the generated " + initial->root.username + " password is in " +
@@ -661,8 +630,7 @@ void NodeRuntime::refuse_impossible_cluster() const {
         throw std::runtime_error(
             "network.inbound_capable is false and no bootstrap peers are configured: a founding "
             "node must accept inbound connections, or nothing could ever join this cluster");
-    // Only a bootstrap peer this node has met before can be known to be
-    // incapable; an unknown one is given the benefit of the doubt.
+    // Only a bootstrap peer met before can be known to be incapable.
     const auto known = members_.all();
     for (const auto& endpoint : cfg_.bootstrap) {
         const auto found =
@@ -722,8 +690,8 @@ void NodeRuntime::apply_inbound_resolution(bool inbound_capable, std::string sou
     }
     if (!changed)
         return;
-    // The flags travel with every handshake and members reply from here on;
-    // placement moves exactly as it would for a join or a leave.
+    // The flags travel with every handshake and members reply; placement
+    // moves as for a join or leave.
     if (members_.set_flags(inbound_capable, hosts)) {
         server_.set_local(members_.self());
         signal_service_event(ServiceEvent::topology);
@@ -745,12 +713,10 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
     if (cfg_.inbound_capable != Tristate::automatic)
         return;
 
-    // `auto` resolution. Evidence is a peer that could be asked (a CONTROL
-    // session exists) reporting whether a fresh TCP connection to our
-    // advertised endpoint completed a handshake. The resolution is sticky:
-    // capable -> incapable needs two consecutive failures, incapable ->
-    // capable needs one success (someone demonstrably connected). A peer
-    // that could not be asked at all is no evidence either way.
+    // `auto` resolution. Evidence is a peer reachable over CONTROL reporting
+    // whether a fresh connection to our advertised endpoint completed a
+    // handshake. Sticky: capable -> incapable needs two consecutive failures,
+    // incapable -> capable one success. An unaskable peer is no evidence.
     auto next_probe = Clock::now();
     uint64_t wake_seen = connectivity_wake_.load(std::memory_order_acquire);
     while (!stop.stop_requested()) {
@@ -828,7 +794,7 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
             apply_inbound_resolution(true, "probe:" + to_string(peer->id));
             next_probe = Clock::now() + cfg_.inbound_reprobe_while_capable;
         } else if (currently_capable && failures < 2) {
-            // One failure is not a verdict; confirm it on the next round.
+            // One failure is not a verdict; confirm on the next round.
             next_probe = Clock::now() + cfg_.heartbeat;
         } else {
             apply_inbound_resolution(false, "probe:" + to_string(peer->id));
@@ -839,11 +805,9 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
 
 void NodeRuntime::request_stop() {
     data_resources_.stop();
-    // The viewer-presence callback reads this node's activity clocks, which
-    // are declared after the arbiter and so are destroyed before it. Drop it
-    // on the way down rather than leaving a window in which a late admission
-    // attempt could read them. Law 4 is about what a node can be left holding,
-    // and a dangling read during shutdown is exactly that shape.
+    // The viewer-presence callback reads activity clocks declared after the
+    // arbiter, so destroyed first: drop it so no late admission reads them
+    // (law 4).
     data_resources_.observe_viewers({});
     retained_memory_.stop();
     if (storage_recovery_.joinable())
@@ -1086,13 +1050,10 @@ std::chrono::milliseconds NodeRuntime::activity_idle_for(FrameType type) const {
 }
 
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {
-    // Accepted-head topology can change without increasing the maximum metadata
-    // generation (for example, a concurrent same-generation sibling arriving
-    // over RPC).  MetadataManager caches key off this epoch as well as the
-    // generation, so advance it for local acceptance changes before broadcasting
-    // the notice.  Otherwise a node can keep serving its pre-sibling snapshot
-    // until the cache TTL expires even though the sibling is already durably
-    // accepted locally.
+    // The accepted-head set can change without a higher generation (a
+    // concurrent same-generation sibling). MetadataManager caches key off
+    // this epoch too, so advance it before broadcasting, or a node serves its
+    // pre-sibling snapshot until the cache TTL expires.
     metadata_announcements_.fetch_add(1, std::memory_order_relaxed);
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
     signal_service_event(ServiceEvent::metadata);
@@ -1108,12 +1069,10 @@ bool NodeRuntime::store_metadata_commit(const MetadataHistoryEntry& entry) {
 }
 
 bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
-    // A protocol-20 node accepts only branches whose *resulting* cluster policy
-    // matches its configured policy. The certificate's own `required` value may
-    // be stronger during a safe policy transition (for example W=3 -> W=2), so
-    // comparing it directly with the local configuration would incorrectly
-    // reject the transition. MetadataReplica validates the certificate against
-    // the commit and its parent policies.
+    // Accept only branches whose resulting cluster policy matches the
+    // configured one. The certificate's own `required` may be stronger during
+    // a safe transition (e.g. W=3 -> W=2), so it is not compared directly;
+    // MetadataReplica validates it against the commit and parent policies.
     if (acceptance.required) {
         auto materialized = metadata_replica().materialized(acceptance.hash);
         if (!materialized)
@@ -1128,17 +1087,15 @@ bool NodeRuntime::accept_metadata_commit(const MetadataAcceptance& acceptance) {
         return false;
     const auto after = metadata_replica().committed();
     members_.metadata_generation(std::max(after.generation, acceptance.generation));
-    // Whether the head set changed is decided under the replica lock. Comparing
-    // copies taken around the call instead counts a concurrent acceptance that
-    // lands between them, so a repeated, no-op certificate racing a real commit
-    // announced that commit a second time.
+    // Decided under the replica lock: comparing copies taken around the call
+    // would count a concurrent acceptance and announce a commit twice.
     if (!heads_changed)
         return true;
     if (after.hash != before.hash)
         block_cache().remember_metadata(after);
-    // A same-generation sibling may not change the materialised preferred head,
-    // but peers still need an ordinary metadata wake-up so foreground cache
-    // validation and background reconciliation notice the changed head set.
+    // A same-generation sibling may leave the preferred head unchanged, but
+    // peers still need a wake-up so cache validation and reconciliation see
+    // the new head set.
     announce_metadata_generation(std::max(after.generation, acceptance.generation));
     return true;
 }
@@ -1158,15 +1115,14 @@ bool NodeRuntime::commit_history_checkpoint(const Hash256& floor_hash, const Has
 RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                                const RpcMessage& request) {
     try {
-        // Health/control must never depend on storage I/O. Capacity is refreshed
-        // by the node maintenance loop and after successful mutations below.
+        // Health/control never depends on storage I/O; capacity is refreshed
+        // by maintenance and after successful mutations.
         switch (request.type) {
         case MessageType::ping:
             return {MessageType::ok, {}};
         case MessageType::dial_request: {
-            // A peer that cannot dial us wants a lane it does not have. The
-            // handshake behind `peer` is what authenticates the request; the
-            // health thread does the dialling, under its ordinary backoff.
+            // A non-dialable peer wants a lane. The handshake behind `peer`
+            // authenticates it; the health thread dials under its backoff.
             Reader reader(request.payload);
             const auto lane = static_cast<TransportLane>(reader.u8());
             reader.finish();
@@ -1178,10 +1134,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             return {MessageType::ok, {}};
         }
         case MessageType::dial_back_probe: {
-            // "Can you connect to me at this address?" Answered with one fresh
-            // TCP connection and a handshake that must authenticate as the
-            // asker, never with an existing route. Rate limited per peer so
-            // the probe cannot be used to make this node hammer an address.
+            // "Can you connect to me at this address?" Answered with a fresh
+            // connection whose handshake must authenticate as the asker, never
+            // an existing route. Rate limited per peer, so it cannot be used
+            // to make this node hammer an address.
             Reader reader(request.payload);
             Endpoint target;
             target.host = reader.string(4096);
@@ -1221,8 +1177,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                     for (auto& value : decode_telemetry_set(request.payload))
                         telemetry_.observe(std::move(value));
                 } catch (const DecodeError&) {
-                    // Accept the short-lived request/reply form emitted by the
-                    // first 0.18.2 build during a rolling patch update.
+                    // Also accept telemetry sent as a request.
                     telemetry_.observe(decode_node_telemetry(request.payload), true);
                 }
             }
@@ -1257,12 +1212,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
             if (!resource)
                 return error_reply("DATA resource admission busy or stopping");
-            // This single-object probe is shared by repair/rebalance placement
-            // logic that has no separate re-verification step before trusting
-            // "yes, already present". Authenticate/decrypt/hash here so a
-            // corrupt remote replica is never counted as healthy placement.
-            // (The batched have_objects below and retain_objects are
-            // presence checks since 0.32.7; see the note there.)
+            // Repair/rebalance trust this "present" without re-verifying, so
+            // authenticate, decrypt and hash: a corrupt replica never counts as
+            // healthy placement. (have_objects and retain_objects check presence.)
             writer.u8(local_store().valid(id));
             return {MessageType::bool_reply, writer.take()};
         }
@@ -1279,15 +1231,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 ids.push_back(id);
             }
             reader.finish();
-            // Unlike have_object above, this batched form is used exclusively
-            // by retain_data()'s candidate-selection scan (DistributedStore::
-            // select_present_batched), never by repair/rebalance. A "present"
-            // answer here only makes a node a *candidate*; retain_objects
-            // then persists the claim against index presence (0.32.7), the
-            // same contract as the local claim path: a claim is not a
-            // re-read, the scrub is. One admission charge for the whole batch, not one per
-            // id, since this no longer does per-object I/O worth separately
-            // metering against the DATA budget ordinary reads/writes consume.
+            // Used only by retain_data()'s candidate scan
+            // (select_present_batched), never by repair. "Present" only makes
+            // a node a candidate; retain_objects then claims on index
+            // presence. One admission for the whole batch: no per-object I/O.
             auto resource = data_resources_.try_acquire(
                 DataWorkContext(frame_type, cfg_.extent_size), cfg_.extent_size);
             if (!resource)
@@ -1311,9 +1258,8 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 ids.push_back(id);
             }
             reader.finish();
-            // Repair trusts a "present" answer as a healthy copy, so each id
-            // is checked as have_object checks one: read, decrypt, hash. One
-            // DATA admission per id, since each is an extent read.
+            // Repair trusts "present" as a healthy copy, so each id is read,
+            // decrypted and hashed like have_object; one DATA admission per id.
             Writer writer;
             writer.u32(count);
             for (const auto& id : ids) {
@@ -1326,12 +1272,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             return {MessageType::have_valid_objects_reply, writer.take()};
         }
         case MessageType::have_control_objects: {
-            // The CONTROL counterpart, and deliberately not a variant of the
-            // case above: it answers from control_store(), and it takes no
-            // DATA admission at all. Law 1 -- control never queues behind or
-            // runs inline with bulk data work, whatever the DATA devices are
-            // doing, and an index lookup on the control device has no business waiting
-            // on the DATA arbiter.
+            // The CONTROL counterpart: answers from control_store() and takes
+            // no DATA admission. Law 1: control never queues behind or runs
+            // inline with bulk data work.
             Reader reader(request.payload);
             const auto count = reader.u32();
             if (!count || count > 200000)
@@ -1399,10 +1342,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 if (!generation)
                     return error_reply("storage limit reached");
                 members_.storage(local_store().used(), local_store().limit());
-                // Bind provisional placement to this exact process lifetime and
-                // exact node-wide mutation generation. A later barrier for an
-                // already-covered generation is a no-op even when unrelated
-                // newer writes are currently dirty on this node.
+                // Bind provisional placement to this process lifetime and
+                // node-wide mutation generation. A later barrier for a covered
+                // generation is a no-op even with newer writes dirty here.
                 Writer reply;
                 reply.fixed(durability_epoch_.bytes);
                 reply.u64(generation->domain);
@@ -1430,7 +1372,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             const auto domain = reader.u64();
             const auto required_generation = reader.u64();
             const auto backend_instance = reader.u64();
-            // 0.29: an optional trailing id list turns a refusal into a probe.
+            // An optional trailing id list turns a refusal into a probe.
             std::vector<ObjectId> probe_ids;
             if (reader.remaining()) {
                 const auto count = reader.u32();
@@ -1442,13 +1384,10 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             }
             reader.finish();
             if (expected_epoch != durability_epoch_) {
-                // The requester holds a placement token from a previous
-                // incarnation of this process. Nothing can make that token
-                // true again -- but the *objects* may well be on disk, and
-                // that is the fact the requester actually needs. With ids,
-                // answer from the disk and hand out fresh tokens (discipline
-                // 1 of the self-healing plan: re-derive, don't assert).
-                // Without ids (a pre-0.29 requester), refuse as before.
+                // The requester's placement token is from a previous process
+                // incarnation and cannot become true again, but the objects may
+                // be on disk. With ids, answer from disk with fresh tokens
+                // (discipline 1: re-derive, don't assert); without, refuse.
                 if (probe_ids.empty()) {
                     Log::debug("object durability barrier refused: epoch changed expected=" +
                                to_string(expected_epoch).substr(0, 8) +
@@ -1510,17 +1449,11 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 ids.push_back(id);
             }
             reader.finish();
-            // A retention claim says "this node holds the object". Until
-            // 0.32.7 this handler re-read, decrypted and hashed every id in
-            // the batch (valid()), serially, inside the writer's metadata
-            // mutation: a quantum commit re-claims every extent of its file,
-            // so a replica re-read gigabytes per 32 MB quantum (gbni-2:
-            // 12.1 s per batch; es-1 with its disk saturated: the 195-284 s
-            // mutations of 2026-09-07). The local side of retain_on() moved
-            // to index presence in 0.32.3 for the same reason; the bytes were
-            // verified when this node put them, every read authenticates
-            // them again, and the scrub campaign is where later corruption is
-            // found. No DATA admission either: there is no read buffer.
+            // A retention claim says "this node holds the object": index
+            // presence, not a re-read, since a quantum commit re-claims every
+            // extent of its file inside the writer's metadata mutation. The
+            // bytes were verified when put and on every read; scrub finds later
+            // corruption. No DATA admission: there is no read buffer.
             for (const auto& id : ids) {
                 const bool present = object_class == RetentionClass::data
                                          ? local_store().has(id)
@@ -1567,10 +1500,9 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                     encode_metadata_history_entry(*entry)};
         }
         case MessageType::get_metadata_history_record: {
-            // Live repair of a peer's unreconstructable accepted head: serve the
-            // record materialized here as a full body, whatever frame shape this
-            // replica happens to store it in. See MetadataManager::
-            // repair_unreconstructable_heads().
+            // Repair of a peer's unreconstructable accepted head: serve the
+            // record as a full body, whatever frame shape is stored (see
+            // MetadataManager::repair_unreconstructable_heads()).
             Reader reader(request.payload);
             Hash256 hash;
             hash.bytes = reader.fixed<32>();
@@ -1713,9 +1645,8 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
     reader.finish();
     remote_metadata_generation_.store(newest_metadata);
 
-    // Membership exchange is a heartbeat. Repeated identical gossip must not
-    // wake event-driven maintenance (and, in particular, must not perpetually
-    // restart its GC quiet window). Wake only for scheduler-relevant state:
+    // Membership exchange is a heartbeat: identical gossip must not wake
+    // maintenance (or keep restarting its GC quiet window). Wake only for
     // roster/endpoint changes, an active-set transition, or newer metadata.
     auto active_ids = [](const std::vector<NodeInfo>& nodes) {
         std::vector<NodeId> ids;
@@ -1750,9 +1681,8 @@ PublicConnectivityStatus NodeRuntime::refresh_public_connectivity(bool probe, bo
 }
 
 void NodeRuntime::refresh_telemetry() {
-    // Telemetry is valid during recovery. Unready local planes report zero
-    // online capacity/usage rather than making the node disappear from the
-    // cluster while recovery is in progress.
+    // Telemetry runs during recovery: unready planes report zero capacity and
+    // usage rather than the node vanishing from the cluster.
     auto info = members_.self();
     info.used = telemetry_storage_used_.load(std::memory_order_relaxed);
     info.capacity = telemetry_storage_capacity_.load(std::memory_order_relaxed);
@@ -1774,32 +1704,21 @@ void NodeRuntime::refresh_telemetry() {
     const auto peers_known = telemetry_peers_known_.load(std::memory_order_relaxed);
     const auto peers_active = telemetry_peers_active_.load(std::memory_order_relaxed);
 
-    // Mirror the local root.startup.phase vocabulary (see
-    // ClusterStatusService::status_response) so a peer observing this node's
-    // telemetry can tell a genuinely current measurement (ready) from one
-    // whose zeroed capacity/usage above is only a recovery artefact, rather
-    // than treating every fresh sample as authoritative. A failed node is
-    // reported as "recovering" here: telemetry has no separate wire state for
-    // it, and a caller can always query this node's own Status root for the
-    // precise "failed" detail.
+    // Same vocabulary as root.startup.phase (ClusterStatusService), so a peer
+    // can tell a real measurement (ready) from recovery-zeroed capacity. A
+    // failed node reports "recovering": there is no wire state for it, and
+    // its own Status root has the detail.
     const auto local_readiness = readiness();
     const auto phase = local_readiness.failed         ? NodePhase::recovering
                         : local_readiness.local_state_ready ? NodePhase::ready
                         : local_readiness.control_plane_online ? NodePhase::recovering
                                                                 : NodePhase::starting;
 
-    // Advertised API endpoint for clients (Status nodes[].api_endpoint);
-    // empty when this node runs no catalogue API, letting a consumer treat it
-    // as unreported rather than guess. A configured endpoint is used as
-    // given -- it describes the outer address, which behind a TLS-terminating
-    // proxy differs from the bind in both scheme and port.
-    //
-    // The default is built from `info.host` -- this node's already-resolved
-    // RPC advertise address -- rather than catalogue.api.listen: the API, like
-    // RPC, conventionally binds a wildcard (0.0.0.0), which is not itself
-    // dialable, so falling back to the raw listen address would readvertise
-    // that wildcard instead of a real endpoint. A bare IPv6 literal is
-    // bracketed, since an unbracketed one cannot be parsed back out of a URL.
+    // Client API endpoint (Status nodes[].api_endpoint); empty when no
+    // catalogue API runs. A configured endpoint is used as given: behind a TLS
+    // proxy the outer scheme and port differ from the bind. The default uses
+    // the resolved RPC advertise host, not catalogue.api.listen, which is
+    // usually an undialable wildcard. IPv6 literals are bracketed for the URL.
     std::string api_endpoint;
     if (cfg_.catalogue.api.enabled) {
         if (!cfg_.catalogue.api.advertised_endpoint.empty()) {
@@ -1812,10 +1731,8 @@ void NodeRuntime::refresh_telemetry() {
         }
     }
 
-    // The playback budgets this node enforces, so a client can bound its own
-    // attempt against them instead of guessing. A node that serves no playback
-    // reports none rather than a figure it would not honour: zero reads as
-    // "cannot say", which is the honest answer from a node with streaming off.
+    // The playback budgets this node enforces. A node serving no playback
+    // reports zeros ("cannot say") rather than figures it would not honour.
     PlaybackBudgets playback;
     if (cfg_.streaming.enabled) {
         playback.startup_timeout_ms =
@@ -1856,16 +1773,11 @@ void NodeRuntime::signal_telemetry_refresh() {
 
 void NodeRuntime::telemetry_loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-telemetry", std::chrono::seconds(5), true);
-    // `network.telemetry_interval_ms`, 10s by default. A floor keeps a
-    // mis-set value from turning this into a spin loop.
+    // `network.telemetry_interval_ms`, floored so a mis-set value cannot spin.
     const auto interval = std::max(cfg_.telemetry_interval, std::chrono::milliseconds(250));
-    // The wait below returns early whenever telemetry demand changes, and
-    // demand is bumped on every peer observation and every readiness
-    // transition -- a reconnecting or flapping peer can raise that rate
-    // arbitrarily. Local sampling is cheap and still runs on every wake, so a
-    // phase change is published promptly, but the network broadcast keeps its
-    // own floor: however often this loop is woken, it cannot gossip more than
-    // once a second, and never faster than the configured cadence itself.
+    // Wakes follow telemetry demand, which peer churn can raise arbitrarily.
+    // Local sampling runs on every wake so phase changes publish promptly, but
+    // broadcast is limited to once a second and never faster than the cadence.
     const auto min_gossip_interval = std::min(interval, std::chrono::milliseconds(1000));
     auto last_gossip = Clock::time_point{};
     const auto gossip_ttl = std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
@@ -1874,24 +1786,16 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         const auto demand = telemetry_demand_.load(std::memory_order_acquire);
         try {
             refresh_telemetry();
-            // Sampling is always local. Gossip used to be suppressed whenever
-            // the node had recent foreground/read-ahead work and then admitted
-            // only onto an idle writer, which inverted what an operator needs:
-            // a node went invisible exactly while it was busy or in trouble,
-            // and on 2026-09-09 every WAN pair in the cluster reported peers
-            // with an empty runtime block and a ~5 minute old sample. Removing
-            // those two gates is what makes it timely; the frame class stays
-            // SPECULATIVE deliberately, so gossip keeps out of the control
-            // memory reserve and off the two control workers, and still cannot
-            // delay operational RPC. A telemetry set is ~200 bytes per entry,
-            // capped at 64 entries, so sending it every tick is cheap.
+            // Gossip is not suppressed by foreground work or a busy writer: a
+            // node must stay visible while busy or in trouble. SPECULATIVE
+            // keeps it out of the control memory reserve and off the control
+            // workers, so it cannot delay operational RPC. A set is ~200
+            // bytes per entry, at most 64 entries, so every tick is cheap.
             if (const auto now = Clock::now(); now - last_gossip >= min_gossip_interval) {
                 last_gossip = now;
                 auto values = telemetry_.recent(gossip_ttl, 64);
                 if (!values.empty()) {
-                    // Still a no-dial notification: it rides established routes
-                    // and never blocks. What it no longer does is give up the
-                    // moment the writer has anything else in flight.
+                    // A no-dial notification on established routes; never blocks.
                     (void)client_.broadcast_best_effort(
                         {MessageType::telemetry, encode_telemetry_set(values)},
                         FrameType::speculative);
@@ -1900,19 +1804,14 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         } catch (const std::exception& error) {
             Log::debug("telemetry refresh skipped: " + std::string(error.what()));
         }
-        // Session mutations are already pushed synchronously to every reachable
-        // peer (propagate_session), so this is only the self-healing backstop
-        // for a peer that was briefly unreachable at mutation time, piggybacked
-        // on the existing periodic gossip tick rather than a dedicated thread.
+        // Sessions are pushed on mutation (propagate_session); this is the
+        // backstop for a peer unreachable at the time, on the existing tick.
         try {
             sessions_.prune_expired(unix_ms());
             auto values = sessions_.recent(gossip_ttl, 64);
             if (!values.empty()) {
-                // Same rule as the user table below, and for the same reason:
-                // a peer admits every notification through its bounded server
-                // request queue, so re-sending an unchanged set every tick
-                // spends real RPC admission on every peer forever. Sessions do
-                // change often, but between mints this is still silent.
+                // As for the user table: each notification costs every peer a
+                // bounded queue admission, so an unchanged set is not resent.
                 auto payload = encode_sessions(values);
                 const auto digest = sha256(payload);
                 std::set<NodeId> peers;
@@ -1926,20 +1825,17 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
                 if (sessions_due && now >= gossip_sessions_retry_after_) {
                     const auto reached = client_.broadcast_best_effort(
                         {MessageType::session_sync, std::move(payload)}, FrameType::control);
-                    // Record having announced this only once it actually went
-                    // to everyone. A best-effort notify queues nothing when the
-                    // writer is busy or a peer is not usable yet -- which is
-                    // exactly the case at the moment a peer rejoins -- and
-                    // recording it anyway would retire the retry before it ran.
+                    // Record it only once it reached everyone: a best-effort
+                    // notify queues nothing for a busy or not-yet-usable peer
+                    // (as when a peer rejoins), and recording anyway would
+                    // retire the retry before it ran.
                     if (reached >= peers.size()) {
                         gossiped_sessions_ = digest;
                         gossiped_session_peers_ = std::move(peers);
                         gossiped_sessions_at_ = now;
                     } else {
-                        // Retry, but on a floor rather than on every tick. An
-                        // unreached peer is usually a busy writer, and hammering
-                        // a busy node with repair traffic is how this became a
-                        // problem in the first place.
+                        // Retry on a floor, not every tick: an unreached peer
+                        // is usually busy, and gossip must not add load to it.
                         gossip_sessions_retry_after_ = Clock::now() + gossip_retry_floor;
                     }
                 }
@@ -1947,10 +1843,8 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         } catch (const std::exception& error) {
             Log::debug("session gossip skipped: " + std::string(error.what()));
         }
-        // The user table rides the same tick. Unlike sessions this is the
-        // whole table including tombstones, so a node that missed a deletion
-        // while it was down learns the tombstone rather than resurrecting the
-        // account from its own stale replica.
+        // The whole user table, tombstones included, so a node that missed a
+        // deletion learns the tombstone rather than resurrecting the account.
         gossip_users_if_changed();
         handled_demand = demand;
         cpu_reporter.tick();
@@ -1963,8 +1857,7 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
 
 bool NodeRuntime::apply_identity_reset(const IdentityAssociationReset& reset) {
     const bool changed = members_.apply_identity_reset(reset);
-    // Keep all consumers idempotently aligned even if one of them learned the
-    // tombstone first through a different path.
+    // Idempotent: align every consumer even if one learned the tombstone first.
     telemetry_.apply_identity_reset(reset);
     client_.invalidate_identity_association(reset);
     if (changed) {
@@ -2002,13 +1895,9 @@ bool NodeRuntime::apply_session(const AuthSession& session) {
 
 void NodeRuntime::propagate_session(const AuthSession& session) {
     (void)apply_session(session);
-    // Notify, never call. The serial call() this replaced ran to
-    // control_no_progress_deadline (30 s) against every peer that membership
-    // still called active, so one unreachable-but-not-yet-dead peer stalled
-    // every login by that long -- exactly when metadata is degraded and peers
-    // are unreachable is exactly when you need to log in. The local merge has
-    // already happened above and the gossip tick is the documented backstop,
-    // so there was never anything to wait for.
+    // Notify, never call: a synchronous call would stall every login on an
+    // unreachable-but-not-dead peer, exactly when logging in matters. The
+    // local merge is done and the gossip tick is the backstop.
     try {
         (void)client_.broadcast_best_effort({MessageType::session_sync, encode_sessions({session})},
                                             FrameType::control);
@@ -2022,25 +1911,18 @@ bool NodeRuntime::apply_user(const UserRecord& user) {
 }
 
 void NodeRuntime::gossip_users_if_changed() {
-    // Every inbound notification is admitted through the peer's bounded server
-    // request queue (RpcServer::enqueue_notification), so unconditional
-    // periodic gossip spends a real RPC admission slot on every peer, every
-    // tick, forever -- and spends most on a busy node, which is where it can
-    // least be afforded. A table that has not changed must therefore cost
-    // nothing at all.
-    //
-    // Two things make a broadcast worth spending: the table changed here, or a
-    // peer appeared that may have missed the change that produced it. The
-    // second is what makes a node that was down converge: it joins, the active
-    // count rises, and the whole table (tombstones included) goes out once.
+    // Every notification costs each peer an admission slot in its bounded
+    // request queue, most on a busy node, so an unchanged table sends
+    // nothing. A broadcast goes out when the table changed here or a peer
+    // appeared that may have missed it (how a node that was down converges:
+    // the whole table, tombstones included, goes out once).
     try {
         const auto table = users_.table_hash();
         std::set<NodeId> peers;
         for (const auto& peer : members_.active())
             if (peer.id != id_)
                 peers.insert(peer.id);
-        // Nothing changed here, nobody new has arrived, and the periodic
-        // re-announce is not due: say nothing at all.
+        // Unchanged, nobody new, re-announce not due: send nothing.
         const auto now = Clock::now();
         if (table == gossiped_user_table_ && peers == gossiped_user_peers_ &&
             now - gossiped_users_at_ < gossip_reannounce_interval)
@@ -2053,9 +1935,8 @@ void NodeRuntime::gossip_users_if_changed() {
             return;
         const auto reached = client_.broadcast_best_effort(
             {MessageType::user_sync, encode_users(values)}, FrameType::control);
-        // As with sessions: commit only when it reached everyone, so a peer
-        // that was not yet usable is retried on the next tick instead of being
-        // marked told. This is what makes a node that was down converge.
+        // Commit only when it reached everyone, so a not-yet-usable peer is
+        // retried next tick rather than marked told.
         if (reached >= peers.size()) {
             gossiped_user_table_ = table;
             gossiped_user_peers_ = std::move(peers);
@@ -2069,9 +1950,8 @@ void NodeRuntime::gossip_users_if_changed() {
 }
 
 void NodeRuntime::propagate_users() {
-    // Always the full table, never a window: a peer that was offline longer
-    // than the gossip TTL must still converge, and at tens of records this is
-    // smaller than the telemetry set already broadcast on the same tick.
+    // Always the full table: a peer offline longer than the gossip TTL must
+    // still converge, and at tens of records it is smaller than the telemetry set.
     try {
         auto values = users_.all();
         if (values.empty())
@@ -2091,9 +1971,8 @@ void NodeRuntime::exchange(const Endpoint& endpoint) {
 }
 
 void NodeRuntime::exchange(const NodeInfo& node) {
-    // Once membership has authenticated a NodeId, preserve that identity when
-    // selecting the route. This lets RpcClient reuse an inbound canonical route
-    // immediately instead of treating an advertised endpoint as a fresh dial.
+    // Preserve the authenticated NodeId when selecting the route, so an
+    // inbound canonical route is reused rather than a fresh dial made.
     auto reply = call(node, MessageType::members);
     if (reply.message.type != MessageType::members_reply)
         throw std::runtime_error("membership rejected");
@@ -2103,8 +1982,8 @@ void NodeRuntime::exchange(const NodeInfo& node) {
 void NodeRuntime::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-node", std::chrono::seconds(5), true);
     while (!stop.stop_requested()) {
-        // Local readiness is orthogonal to membership. Refresh whichever local
-        // planes are available, then perform membership exchange regardless.
+        // Readiness is orthogonal to membership: refresh available local
+        // planes, then exchange regardless.
         if (ready(ready_data_storage) && local_) {
             const auto refresh_started = Clock::now();
             local_->refresh();
@@ -2130,8 +2009,7 @@ void NodeRuntime::loop(std::stop_token stop) {
                                      std::memory_order_relaxed);
         uint32_t active_peers = 1;
         // A peer that accepts no inbound connections is exchanged with only
-        // over the session it opened to us; when there is none there is
-        // nothing to dial and nothing to log about it.
+        // over its session to us; without one there is nothing to dial or log.
         const auto unreachable_by_design = [&](const NodeInfo& node) {
             return !node_inbound_capable(node) &&
                    !client_.has_route(node.id, TransportLane::control);
@@ -2186,18 +2064,15 @@ void NodeRuntime::enqueue_fetched(const ObjectId& id, std::span<const uint8_t> d
     auto memory = retained_memory_.try_acquire(MemoryClass::speculative,
                                                MemoryOwner::object_payload, data.size());
     if (!memory) {
-        // Dropping is the design (see below), but a dropped opportunity has
-        // to be visible: a cache that "did not fill" with nothing in the log
-        // is indistinguishable from a cache that is broken.
+        // Log the drop, so an unfilled cache is distinguishable from a broken one.
         Log::debug("opportunistic persistence skipped object=" + to_string(id) +
                    " reason=retained_memory bytes=" + std::to_string(data.size()) +
                    " cache=" + (cache ? "1" : "0") + " promote=" + (promote ? "1" : "0"));
         return;
     }
 
-    // Do not let opportunistic persistence become back-pressure on playback.
-    // If the bounded memory queue is full we simply drop this opportunity; the
-    // normal repair loop will converge authoritative replicas later.
+    // Opportunistic persistence must not back-pressure playback: when the
+    // bounded queue is full the copy is dropped and repair converges later.
     constexpr size_t max_queued_bytes = 256ULL * 1024 * 1024;
     std::lock_guard lock(local_copy_mutex_);
     if (data.size() > max_queued_bytes || local_copy_bytes_ + data.size() > max_queued_bytes) {
@@ -2262,11 +2137,9 @@ void NodeRuntime::local_writer_loop(std::stop_token stop) {
                 Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
                            " reason=cache_put_failed");
         }
-        // With a persistent cache, foreground fetches are made durable on the
-        // cache device first and authoritative HDD promotion is left to idle
-        // maintenance. If the cache write fails (or cache is disabled), retain
-        // the already-fetched bytes by promoting here rather than forcing a
-        // second network transfer later.
+        // With a persistent cache, foreground fetches land on the cache device
+        // and HDD promotion is left to idle maintenance. If the cache write
+        // fails (or there is no cache), promote here rather than fetch again.
         if (job.promote && (!job.cache || !cached) && ready(ready_data_storage) && local_) {
             (void)local_->put(job.id, job.data);
             members_.storage(local_->used(), local_->limit());
@@ -2282,9 +2155,8 @@ void NodeRuntime::reconfigure_local(const Config& config) {
     local_->reconfigure(updated.storage_backends);
     local_->refresh();
     cache_->reconfigure(updated.cache);
-    // These fields are node-local policy only and are not consumed by the
-    // long-lived networking/metadata threads, so keep the public snapshot in
-    // sync with a successful live reload without changing cluster policy.
+    // Node-local policy, unused by the long-lived network/metadata threads:
+    // keep the snapshot in sync with a live reload without changing cluster policy.
     cfg_.storage_backends = updated.storage_backends;
     cfg_.cache = updated.cache;
     cfg_.hydration = updated.hydration;

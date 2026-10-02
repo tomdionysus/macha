@@ -18,7 +18,7 @@ namespace {
 std::atomic<WaitGuard::Mode> guard_mode{WaitGuard::Mode::record};
 std::atomic<uint64_t> guard_violations{};
 
-// Operations already reported, so a hot path reached from control logs once.
+// Operations already reported: a hot path reached from control logs once.
 std::mutex reported_mutex;
 std::set<std::string, std::less<>> reported;
 

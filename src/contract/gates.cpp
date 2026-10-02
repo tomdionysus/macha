@@ -17,8 +17,8 @@ bool destructive_gc_enabled(const PassFacts& facts) {
     return stable(facts) && facts.release_view && facts.retention_baseline_complete;
 }
 
-// Before the first inventory the pass has always treated the catalogue as
-// complete and the generation as zero.
+// Before the first inventory the catalogue counts as complete and the
+// generation as zero.
 bool catalogue_complete(const InventoryHorizon* inventory) {
     return !inventory || inventory->catalogue_complete();
 }

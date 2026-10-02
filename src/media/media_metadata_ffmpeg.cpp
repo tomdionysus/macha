@@ -25,8 +25,8 @@ namespace {
 struct AvioContextDeleter {
     void operator()(AVIOContext* value) const noexcept {
         if (!value) return;
-        // avio_alloc_context() does not assume ownership of the caller's
-        // av_malloc() buffer. Release both parts as one scoped allocation.
+        // avio_alloc_context() does not own the av_malloc() buffer; release both as
+        // one scoped allocation.
         av_freep(&value->buffer);
         avio_context_free(&value);
     }
@@ -280,9 +280,7 @@ std::optional<MediaProbe> embedded_music_metadata_from_host_impl(const std::file
     return probe;
 }
 
-// Registers this FFmpeg-backed implementation into macha_core's provider slot
-// (see media_metadata_registry.cpp) as soon as this translation unit is
-// linked into an executable, before main() runs.
+// Registers this provider into macha_core's slot before main().
 struct EmbeddedMusicMetadataRegistration {
     EmbeddedMusicMetadataRegistration() {
         set_embedded_music_metadata_provider(

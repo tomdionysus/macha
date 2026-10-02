@@ -42,8 +42,8 @@ std::optional<StagingStatus> parse_staging(const Json* value) {
     return out;
 }
 
-// A peer that answers the torrent query at all runs torrents; one without the
-// plugin answers with this error (NodeRuntime::handle_request).
+// The error a peer without the torrent plugin answers with
+// (NodeRuntime::handle_request).
 bool says_no_torrents(const std::string& error) {
     return error.find("torrents not available") != std::string::npos;
 }
@@ -94,8 +94,7 @@ void ClusterJobView::refresh_now() {
     for (const auto& peer : node_.membership().active())
         if (peer.id != self) peers.push_back(peer);
     {
-        // A node that left membership keeps its last jobs, marked unreachable:
-        // shown stale is better than silently gone.
+        // A node that left membership keeps its last jobs, marked unreachable.
         std::lock_guard lock(mutex_);
         for (auto& [id, peer] : peers_)
             if (std::none_of(peers.begin(), peers.end(), [&](const NodeInfo& p) { return p.id == id; }))
@@ -124,8 +123,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
                 if (const auto* v = node->find("active_jobs")) fresh.offer.active_jobs = v->asUInt64();
                 fresh.staging = parse_staging(node->find("staging"));
             } else {
-                // A pre-0.64.0 peer: it runs torrents but says nothing of its
-                // room. Offer it, and let the add answer for itself.
+                // No capacity reported: offer it and let the add answer.
                 fresh.offer.accepting = true;
             }
         } else if (reply.message.type == MessageType::error && says_no_torrents(error_text(reply))) {
@@ -178,8 +176,6 @@ std::optional<NodeInfo> ClusterJobView::active_peer(const NodeId& id) const {
         if (peer.id == id) return peer;
     return std::nullopt;
 }
-
-// ---- torrents ---------------------------------------------------------------
 
 ClusterJobView::TorrentListing ClusterJobView::torrent_jobs() const {
     TorrentListing out;
@@ -292,8 +288,6 @@ std::optional<std::chrono::milliseconds> ClusterJobView::default_remove_after() 
     if (value < 0) return std::nullopt;
     return std::chrono::milliseconds(value);
 }
-
-// ---- ingest -----------------------------------------------------------------
 
 ClusterJobView::IngestListing ClusterJobView::ingest_jobs() const {
     IngestListing out;

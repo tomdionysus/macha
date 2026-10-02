@@ -272,17 +272,14 @@ struct FuseFrontend::State {
         uint64_t size{};
         int64_t mtime_ns{};
         int64_t ctime_ns{};
-        // New journal records carry one SHA-256 per bounded spool chunk. Empty
-        // means a legacy pre-checksum record and remains replay-compatible.
+        // One SHA-256 per spool_checksum_chunk_size chunk; empty means an
+        // unchecksummed record, which still replays.
         std::vector<Hash256> spool_hashes;
-        // Conservative heap ownership reserved before this durable operation
-        // is accepted. Copies in DataSnapshot do not own a second reservation;
-        // the estimate already includes both live representations and vector
-        // allocation slack.
+        // Heap reserved before the op is accepted. DataSnapshot copies own no
+        // second reservation: the estimate covers both copies and slack.
         uint64_t metadata_charge{};
-        // Shared by the authoritative history, durability ticket and any
-        // publication snapshot. Process ownership is released only after the
-        // final representation disappears.
+        // Shared by history, durability ticket and publication snapshot;
+        // released when the last of them goes.
         std::shared_ptr<RetainedMemoryLedger::Lease> process_memory;
     };
 
@@ -294,19 +291,17 @@ struct FuseFrontend::State {
         std::filesystem::path spool_path;
     };
 
-    // Runtime read index for the durable append-only DataOp journal. Ranges are
-    // non-overlapping and contain only the newest visible source for an
-    // interval. The journal remains the recovery/publication authority; reads
-    // must not copy and replay that whole history for every kernel request.
+    // Read index over data_ops: non-overlapping ranges, each holding the newest
+    // source for its interval, so reads need not replay the history. The
+    // journal stays the recovery/publication authority.
     struct DataOverlayRange {
         uint64_t end{};
         uint64_t spool_offset{};
         bool zero{};
     };
 
-    // Durable input remains in the spool while this process-lifetime cursor
-    // retains provisional writer state between fair scheduling quanta. A crash
-    // simply discards the cursor and replays the same journal generation.
+    // In-memory cursor holding writer state between scheduling quanta; input
+    // stays in the spool, so a crash just replays the same journal generation.
     struct DataPublication {
         DataSnapshot snapshot;
         bool recovered{};
@@ -315,10 +310,8 @@ struct FuseFrontend::State {
         uint64_t operation_offset{};
         uint64_t publication_bytes{};
         uint64_t spool_bytes_read{};
-        // Spool bytes replayed into the provisional distributed writer since
-        // its last successfully drained quantum. These bytes earn bounded
-        // bootstrap admission credit only after drain_staging() proves that
-        // the corresponding DATA work is no longer merely buffered locally.
+        // Spool bytes replayed since the last drained quantum; they earn
+        // bootstrap admission credit only once drain_staging() succeeds.
         uint64_t unreported_spool_progress{};
         std::shared_ptr<WriteHandle> writer;
         ScopedFd replay_spool;
@@ -334,15 +327,12 @@ struct FuseFrontend::State {
         uint64_t namespace_sequence{};
         uint64_t next_data_sequence{1};
         uint64_t requested_data_sequence{};
-        // Highest write/truncate sequence whose spool bytes and journal record
-        // have completed the local durability barrier. data_ops may also contain
-        // newer POSIX-buffered writes which are visible through this node but
-        // are not eligible for distributed publication yet.
+        // Highest data sequence past the local durability barrier. data_ops may
+        // hold newer buffered writes: visible locally, not yet publishable.
         uint64_t durable_data_sequence{};
         uint64_t published_data_sequence{};
-        // Highest data sequence reconstructed from the durable journal at
-        // startup. Publications which still include this prefix are recovery
-        // work and use the separate recovery concurrency budget.
+        // Highest data sequence recovered from the journal at startup;
+        // publications covering it use the recovery concurrency budget.
         uint64_t recovery_data_sequence{};
         uint64_t requested_namespace_sequence{};
         std::vector<DataOp> data_ops;
@@ -350,27 +340,22 @@ struct FuseFrontend::State {
         int spool_fd{-1};
         std::filesystem::path spool_path;
         uint64_t spool_end{};
-        // Recovery-local validation failure. The durable journal remains the
-        // authority for which generation is pending, but a missing/truncated
-        // spool invalidates only this inode's dirty generation rather than the
-        // complete mounted MachaDFS namespace.
+        // A missing or truncated spool found at recovery; invalidates only this
+        // inode's dirty generation, not the mount.
         std::optional<std::string> recovery_spool_error;
-        // Writes admitted to the local spool can wait together for one durable
-        // payload+journal barrier. admitted_size reserves O_APPEND offsets while
-        // those writes are not yet visible to readers.
+        // Admitted writes share one payload+journal barrier; admitted_size
+        // reserves O_APPEND offsets until they become visible.
         uint64_t admitted_size{};
         size_t durability_pending{};
         std::condition_variable_any durability_cv;
         size_t open_handles{};
         size_t writable_handles{};
-        // Number of durable namespace operations which refer to this inode and
-        // have not yet reached their journal `done` record. This is an owning
-        // reference even while the operation moves between queued, inflight and
-        // unconfirmed states; moving an operation never changes the count.
+        // Owning count of namespace ops referring to this inode that have not
+        // reached `done`; moving an op between queues leaves it unchanged.
         std::atomic_size_t namespace_references{};
         bool data_queued{};
-        // Reserves the single queue-enqueue owner across the deliberate
-        // inode-lock -> queue-lock handoff in request_data_publication().
+        // Single enqueue owner across the inode-lock -> queue-lock handoff in
+        // request_data_publication().
         bool data_enqueue_pending{};
         bool data_running{};
         bool data_deferred{};
@@ -383,10 +368,9 @@ struct FuseFrontend::State {
         uint64_t accounted_publication_operation_bytes{};
         uint64_t accounted_operation_metadata_bytes{};
         std::optional<int> backend_error;
-        // Discipline 2: retry state for this inode's data publication and,
-        // once the budget is spent, why it is parked. Parked is not poisoned:
-        // reads and new writes keep working; only publication waits for an
-        // operator (retry resets the budget, abandon retires the spool).
+        // Discipline 2: publication retry state, and why it is parked once the
+        // budget is spent. Parked blocks only publication; reads and writes
+        // continue. Retry resets the budget, abandon retires the spool.
         RetryState publication_retry;
         struct Parked {
             int error_code{};
@@ -511,15 +495,12 @@ struct FuseFrontend::State {
         int64_t mtime_ns{};
         int64_t ctime_ns{};
         std::vector<uint64_t> affected;
-        // Namespace identities displaced by this operation (e.g. rename-over).
-        // They remain valid for already-open handles but no longer own a published path.
+        // Inodes displaced by this op (e.g. rename-over): still valid for open
+        // handles, but own no published path.
         std::vector<uint64_t> removed;
-        // Local metadata generation observed once the backend had durably
-        // applied this op (in-memory only). A decoded view at or past it
-        // contains the effect or whatever legitimately superseded it, so it is
-        // the confirmation criterion; checking that the *effect* is still
-        // visible wedged gbni-1's mount for two hours on 2026-09-06 when a
-        // later change overwrote it.
+        // Metadata generation seen once the backend durably applied this op
+        // (in-memory only). A view at or past it holds the effect or whatever
+        // superseded it, so confirmation tests the generation, not the effect.
         uint64_t published_generation{};
     };
 
@@ -532,9 +513,9 @@ struct FuseFrontend::State {
         data_published = 6,
         data_done = 7,
         data_abandoned = 8,
-        // A mixed namespace batch about to be published as one atomic
-        // metadata mutation, identified in the snapshot's mutation-sequence
-        // clock under this node's FUSE origin key by its first op sequence.
+        // Namespace batch about to publish as one atomic mutation, keyed in
+        // the mutation-sequence clock by this node's FUSE origin and its
+        // first op sequence.
         namespace_batch = 9,
     };
 
@@ -553,7 +534,7 @@ struct FuseFrontend::State {
         std::map<uint64_t, NamespaceOp> namespace_ops;
         std::set<uint64_t> namespace_published;
         std::set<uint64_t> namespace_done;
-        // first op sequence -> op count, for batches journaled before publish.
+        // First op sequence -> op count.
         std::map<uint64_t, uint32_t> namespace_batches;
         std::map<uint64_t, std::vector<DataOp>> data_ops;
         std::map<uint64_t, std::pair<uint64_t, FsEntry>> data_published;
@@ -562,9 +543,8 @@ struct FuseFrontend::State {
         uint64_t max_inode{};
         uint64_t max_namespace_sequence{};
         size_t pending_operations{};
-        // Discipline 3 bookkeeping: frames the loader could not fit into the
-        // state so far (skipped, never fatal) and completions that arrived
-        // without the redundant published proof (legitimate; counted only).
+        // Discipline 3: frames that did not fit the state (skipped, never
+        // fatal), and legitimate `done` records lacking a `published` record.
         size_t skipped_frames{};
         size_t done_without_published{};
     };
@@ -602,18 +582,16 @@ struct FuseFrontend::State {
     std::filesystem::path spool_dir;
     std::filesystem::path journal_path;
     std::filesystem::path journal_dir;
-    // Admission serialises the descriptor+operation pair against journal
-    // compaction. Without it, the last completing operation could reset the
-    // journal after an inode descriptor was observed as present but before the
-    // new operation record was appended.
+    // Serialises the descriptor+operation append against compaction, so a reset
+    // cannot fall between seeing a descriptor present and appending the op.
     std::mutex journal_admission_mutex;
     std::mutex journal_mutex;
     int journal_fd{-1};
     bool journal_poisoned{};
     std::atomic_uint64_t journal_epoch{1};
     std::atomic_size_t durable_pending_operations{};
-    // Descriptor admission may precede the group-committed data-op frame. Keep
-    // journal compaction from dropping that descriptor in the gap.
+    // Keeps compaction from dropping a descriptor admitted ahead of its
+    // group-committed data-op frame.
     std::atomic_size_t journal_inflight_admissions{};
 
     std::mutex durability_mutex;
@@ -625,25 +603,21 @@ struct FuseFrontend::State {
     std::atomic_uint64_t durability_batches{};
     std::atomic_uint64_t durability_writes{};
     std::atomic_uint64_t retained_durability_tickets{};
-    // Aggregate authoritative bytes currently held in inode-*.spool files.
-    // This is reserved before pwrite and released only after successful spool
-    // retirement, so concurrent hot inodes cannot bypass the configured cap.
+    // Bytes held in inode-*.spool files: reserved before pwrite, released only
+    // on retirement, so concurrent inodes cannot exceed the cap.
     std::atomic_uint64_t spool_bytes{};
-    // Spool admission is event-driven backpressure. Below half capacity writes
-    // burst at local disk speed. Above it, completed distributed publications
-    // establish the sustainable rate and admission is paced progressively down
-    // to that rate by 90% occupancy. At the hard bound writers sleep until a
-    // real publication/retirement event creates room; saturation is not ENOSPC.
+    // Spool admission backpressure: below half capacity writes run at disk
+    // speed; above it they are paced down to the measured publication rate by
+    // 90%; at the hard bound writers sleep until retirement frees room
+    // (never ENOSPC).
     std::mutex spool_admission_mutex;
     std::condition_variable_any spool_admission_cv;
     Clock::time_point next_spool_admission{};
     double spool_publish_rate_bytes_per_second{};
     SpoolRetirementRateEstimator spool_retirement_rate;
-    // Before the first whole-file retirement there is no sustainable-rate
-    // sample. Successful bounded publication quanta grant one-for-one write
-    // credit so admission follows real forward progress instead of sleeping
-    // indefinitely at the soft threshold. The credit is capped by the entire
-    // soft-to-hard headroom and can never bypass max_spool_bytes.
+    // Until the first retirement gives a rate sample, each drained publication
+    // quantum grants equal write credit, capped at the soft-to-hard headroom;
+    // it never bypasses max_spool_bytes.
     uint64_t spool_progress_credit_bytes{};
     uint64_t spool_admission_revision{};
     std::atomic_bool spool_drain_requested{};
@@ -670,11 +644,9 @@ struct FuseFrontend::State {
     bool namespace_inflight{};
     uint64_t namespace_inflight_sequence{};
     size_t namespace_inflight_operations{};
-    // Operator escape hatch for a namespace op stuck on a non-retryable
-    // backend error (see the namespace_loop() comment on why this is never
-    // automatic): the worker records what it is currently wedged on here,
-    // and an operator can explicitly name that exact sequence number to
-    // abandon it and let the queue proceed. Guarded by namespace_queue_mutex.
+    // The namespace op the worker is stuck on with a non-retryable error; an
+    // operator may name its sequence to abandon it (never automatic, see
+    // namespace_loop()). Guarded by namespace_queue_mutex.
     std::optional<NamespaceOp> namespace_blocked_op;
     int namespace_blocked_error_code{};
     std::string namespace_blocked_error_message;
@@ -683,9 +655,7 @@ struct FuseFrontend::State {
     std::jthread namespace_worker;
     struct DataQueueItem {
         std::shared_ptr<Inode> inode;
-        // Provenance only. Journal-restored spool remains user-requested loader
-        // work; this flag controls replay validation/cache behaviour, not its
-        // scheduler priority.
+        // Journal-restored; affects replay validation and caching, not priority.
         bool recovered{};
     };
 
@@ -695,27 +665,20 @@ struct FuseFrontend::State {
     std::vector<std::jthread> data_workers;
     std::atomic_size_t active_data{};
     std::atomic_size_t active_recovery_data{};
-    // Protected by data_queue_mutex. Each active worker reserves exactly one
-    // configured logical byte quantum, bounding aggregate publication work.
+    // Guarded by data_queue_mutex; each active worker reserves one quantum.
     uint64_t publication_inflight_bytes{};
     std::atomic_uint64_t publication_inflight_bytes_diagnostic{};
-    // Number of writable FUSE handles currently open. This is operational state,
-    // not a viewer signal: bulk loaders may keep writers open continuously and
-    // must not thereby collapse publication to a single worker.
+    // Open writable handles. Not a viewer signal: loaders keep writers open
+    // and must not collapse publication to one worker.
     std::atomic_size_t open_writers{};
-    // Inodes currently holding a provisional publication writer, and therefore
-    // holding that writer's retained-memory extent leases. Maintained under the
-    // inode mutex by set_data_publication_locked(), which is the only place
-    // Inode::data_publication changes, and bounded by
-    // config.publication_max_open_writers so the ledger cannot deadlock against
-    // itself.
+    // Inodes holding a provisional publication writer (and its extent leases).
+    // Changed only by set_data_publication_locked(); bounded by
+    // config.publication_max_open_writers so the ledger cannot self-deadlock.
     std::atomic_size_t open_publications{};
     std::atomic_size_t peak_open_publications{};
-    // Slots taken by workers that selected an inode with no publication and
-    // have not opened its publication yet. Guarded by data_queue_mutex. The
-    // cap counts them with the open ones: a cap read at selection and taken
-    // at creation, under different locks, let every worker in between open
-    // one (2026-10-02: peak above the cap about one run in 200).
+    // Writer slots reserved at selection but not yet opened; guarded by
+    // data_queue_mutex. Counted against the cap with open_publications so
+    // selection and creation under different locks cannot overshoot it.
     size_t reserved_publications{};
 
     std::array<BrokerQueue, 6> broker;
@@ -746,8 +709,7 @@ struct FuseFrontend::State {
 
     std::mutex refresh_mutex;
     std::atomic_uint64_t refreshed_namespace_revision{};
-    // Last available revision for which a deferred adoption was logged, so a
-    // mount that keeps declining the same view says so once, not per request.
+    // Last revision whose deferred adoption was logged; logs once per view.
     std::atomic_uint64_t namespace_refresh_deferred_logged_revision{};
 
     std::atomic_uint64_t timed_out_requests{};
@@ -767,10 +729,9 @@ struct FuseFrontend::State {
     std::atomic_uint64_t data_publication_peak_pipeline_extents{};
     std::atomic_uint64_t data_closed_priority_selections{};
     std::atomic_uint64_t data_retirement_priority_selections{};
-    // Queue selections made while the open-writer bound was in effect, i.e.
-    // where an inode that already holds a writer was preferred over starting a
-    // new one. Non-zero with completions moving is the bound doing its job;
-    // non-zero with completions at zero means the open set itself is stuck.
+    // Selections that preferred an inode already holding a writer because the
+    // open-writer cap was reached. Rising with no completions means the open
+    // set is stuck.
     std::atomic_uint64_t data_publication_selections_under_writer_cap{};
     std::atomic_uint64_t data_publication_bytes_read{};
     std::atomic_uint64_t data_publication_bytes_committed{};
@@ -796,9 +757,8 @@ struct FuseFrontend::State {
     std::atomic_uint64_t operation_metadata_waits{};
     std::atomic_uint64_t backend_failures{};
     std::atomic_bool publication_failure_injected_for_tests{};
-    // Monotonic diagnostic counters. They deliberately count durable frontend
-    // work rather than infer it from queue depth, so batching and crash-replay
-    // tests can assert amplification without timing-sensitive observation.
+    // Monotonic counts of durable work (not queue depth), so tests can assert
+    // batching and replay amplification without timing.
     std::atomic_uint64_t namespace_operations_admitted{};
     std::atomic_uint64_t namespace_operations_recovered{};
     std::atomic_uint64_t namespace_publication_attempts{};
@@ -808,12 +768,10 @@ struct FuseFrontend::State {
     std::atomic_uint64_t namespace_operations_confirmed{};
     std::atomic_uint64_t parked_publications{};
     std::atomic_uint64_t publication_retries_backed_off{};
-    // Inodes whose current failure run crossed the escalation threshold. A
-    // file retrying tens of times is an operator-visible event, not a DEBUG
-    // line: on 2026-09-10 one inode failed 68 consecutive times on gbni-1
-    // with nothing above DEBUG and every aggregate reading healthy.
+    // Inodes whose current failure run crossed the escalation threshold; a
+    // persistently retrying file is operator-visible, not a DEBUG line.
     std::atomic_uint64_t publications_retrying_persistently{};
-    // Write admission waited (backpressure) instead of failing; slices counted.
+    // Admission wait slices (backpressure, not failure).
     std::atomic_uint64_t write_admission_waits{};
     std::atomic_uint64_t process_memory_admission_waits{};
     // Discipline 3: recovery resolves instead of refusing; these say how often.
@@ -821,8 +779,8 @@ struct FuseFrontend::State {
     std::atomic_uint64_t journal_recovery_quarantined_bytes{};
     std::atomic_uint64_t recovery_dropped_operations{};
     std::atomic_uint64_t publications_abandoned{};
-    // Earliest time a backed-off inode becomes due again (steady-clock ns
-    // since epoch; 0 = none). The data loop sleeps to it when idle.
+    // Earliest backed-off inode due time (steady-clock ns; 0 = none); the idle
+    // data loop sleeps to it.
     std::atomic<int64_t> deferred_retry_due_ns{0};
     std::atomic_uint64_t journal_append_batches{};
     std::atomic_uint64_t journal_records_appended{};
@@ -836,17 +794,14 @@ struct FuseFrontend::State {
           journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
           journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
                                                          : journal_path.parent_path()) {
-        // Unit/in-process callers may construct a frontend from an unvalidated
-        // FuseConfig. Preserve the same adaptive default used by Config
-        // validation rather than silently falling back to serial publication.
+        // An unvalidated FuseConfig gets the same defaults Config validation
+        // applies; zero would mean serial publication.
         if (!config.publication_pipeline_bytes)
             config.publication_pipeline_bytes =
                 std::min<uint64_t>(config.publication_quantum_bytes,
                                    static_cast<uint64_t>(fs.extent_size()) * 2);
-        // Same for the open-writer bound, and for the same reason: an
-        // unbounded one can consume the whole durable-lower budget in partial
-        // extent buffers and deadlock the ledger against itself. Derive it from
-        // the node's loader reserve exactly as validation does.
+        // Unbounded open writers could fill the durable-lower budget with
+        // partial extents and deadlock the ledger.
         if (!config.publication_max_open_writers) {
             const auto per_writer =
                 static_cast<uint64_t>(fs.extent_size()) + config.publication_pipeline_bytes;
@@ -870,10 +825,8 @@ struct FuseFrontend::State {
     }
 
     static uint64_t operation_metadata_charge(size_t checksum_count) {
-        // Both the authoritative history and one publication snapshot may be
-        // live. std::vector may retain up to roughly twice its element count in
-        // each representation, so four times the logical element+checksum size
-        // is a conservative portable admission charge.
+        // History plus one publication snapshot, each with up to 2x vector
+        // capacity slack.
         constexpr uint64_t copies_with_capacity_slack = 4;
         const auto hashes = static_cast<uint64_t>(checksum_count) * sizeof(Hash256);
         if (hashes > std::numeric_limits<uint64_t>::max() / copies_with_capacity_slack -
@@ -896,14 +849,10 @@ struct FuseFrontend::State {
         operation_metadata_cv.notify_all();
     }
 
-    // Admission waits are backpressure, not errors. Until 0.32.1 each of the
-    // three waits below gave up at the request deadline and returned EAGAIN
-    // to the kernel; a blocking write(2) then failed in the application
-    // (rsync: "write failed ... Resource temporarily unavailable", the
-    // full-library import on gbni-1 died at 30 %, 2026-09-07) although the
-    // budget would have been released a moment later by publication
-    // completing. A writer waits, in slices so stop is noticed, until the
-    // budget admits it; the request's own deadline starts after admission.
+    // Admission waits are backpressure, not errors: a writer waits in slices
+    // (so stop is noticed) until admitted, never returning EAGAIN, which a
+    // blocking write(2) would surface to the application. The request
+    // deadline starts after admission.
     static constexpr auto admission_slice = std::chrono::milliseconds(200);
     static constexpr auto admission_notice = std::chrono::seconds(5);
 
@@ -968,11 +917,8 @@ struct FuseFrontend::State {
         accounted = current;
     }
 
-    // The only place Inode::data_publication changes, so open_publications
-    // cannot drift from it. An open publication owns a provisional WriteHandle
-    // holding retained-memory extent leases across yields and retryable
-    // failures; the scheduler bounds how many may exist at once, and a bound is
-    // only as good as its count. Caller holds inode.mutex.
+    // Sole mutator of Inode::data_publication, keeping open_publications exact.
+    // Caller holds inode.mutex.
     void set_data_publication_locked(Inode& inode, std::shared_ptr<DataPublication> publication) {
         const bool was_open = inode.data_publication != nullptr;
         const bool now_open = publication != nullptr;
@@ -1027,9 +973,8 @@ struct FuseFrontend::State {
             release_operation_metadata(inode.accounted_operation_metadata_bytes -
                                        metadata_memory);
         else if (metadata_memory > inode.accounted_operation_metadata_bytes) {
-            // Recovery reconstructs already-acknowledged ownership before
-            // admission begins. It may exceed a newly lowered limit, but then
-            // blocks new work until normal publication drains it.
+            // Recovery restores acknowledged ownership unconditionally; above
+            // a lowered limit it blocks new work until publication drains it.
             const auto added = metadata_memory - inode.accounted_operation_metadata_bytes;
             std::lock_guard metadata_lock(operation_metadata_mutex);
             operation_metadata_bytes += added;
@@ -1070,10 +1015,7 @@ struct FuseFrontend::State {
             (void)write_request_cv.wait_for(lock, admission_slice);
             note_admission_wait("write byte", since, bytes);
         }
-        // Stop can release an earlier request's lease and wake this waiter at
-        // the same time. Capacity becoming available does not authorize a new
-        // owner after shutdown has begun; close that final admission race
-        // before accounting or copying the request payload.
+        // Stop may free capacity and wake this waiter; admit nothing after stop.
         if (stopping.load())
             throw FsError(EINTR, "FUSE write admission stopping");
         pending_write_request_bytes += bytes;
@@ -1159,14 +1101,9 @@ struct FuseFrontend::State {
             bool progress_admitted = false;
             Clock::time_point wake_at = Clock::time_point::max();
             if (capacity_available && !rate_admitted && bytes <= spool_progress_credit_bytes) {
-                // Pace from successfully drained bounded publication work
-                // (quanta), whether or not a whole-file retirement sample
-                // exists. Until 0.32.5 the credit was consulted only before
-                // the first sample: while a multi-GB file published quantum
-                // by quantum nothing *retired*, the last small sample stood
-                // (46 KB/s on es-1, 2026-09-07) and the importer was paced to
-                // it -- 0.3 MB/s on a link and disk good for 8 -- although
-                // the spool was draining 32 MB at a time.
+                // Drained quanta admit writes even when a retirement sample
+                // exists: a large file publishing quantum by quantum retires
+                // nothing, so a stale small sample would otherwise set the pace.
                 rate_admitted = true;
                 progress_admitted = true;
             } else if (capacity_available && !rate_admitted &&
@@ -1177,9 +1114,7 @@ struct FuseFrontend::State {
                 const auto pressure_span = full_rate_at - throttle_start;
                 const auto pressure_bytes =
                     std::min(current - throttle_start, pressure_span);
-                // Begin at up to 8x measured drain speed, then converge smoothly
-                // to 1x as occupancy approaches 90%. This lets a fresh copy burst
-                // while ensuring a saturated spool cannot grow faster than drain.
+                // From up to 8x the drain rate, converging to 1x at 90% occupancy.
                 const double pressure = std::max(
                     0.125, static_cast<double>(pressure_bytes) /
                                static_cast<double>(std::max<uint64_t>(1, pressure_span)));
@@ -1196,9 +1131,8 @@ struct FuseFrontend::State {
             }
 
             if (capacity_available && rate_admitted) {
-                // The logical reservation is made under the admission mutex;
-                // physical free-space validation is immediately adjacent so a
-                // failed check cannot leave invisible reserved capacity.
+                // Physical check precedes the reservation so a failure reserves
+                // nothing.
                 check_spool_physical_space(bytes);
                 if (progress_admitted)
                     spool_progress_credit_bytes -= bytes;
@@ -1218,17 +1152,15 @@ struct FuseFrontend::State {
                 spool_throttle_waits.fetch_add(1, std::memory_order_relaxed);
             }
             const auto revision = spool_admission_revision;
-            // One transition into drain demand owns the inode sweep. Further
-            // writes while pressure remains asserted are notified at their
-            // durability-batch boundary; rescanning every inode for every
-            // blocked write caused the loaded rsync request storm.
+            // Only the transition into drain demand sweeps inodes; later
+            // writes are notified at their durability-batch boundary rather
+            // than rescanning every inode per blocked write.
             if (!spool_drain_requested.exchange(true, std::memory_order_acq_rel)) {
                 spool_pressure_publication_sweeps.fetch_add(1, std::memory_order_relaxed);
                 lock.unlock();
                 request_spool_pressure_publications();
                 lock.lock();
-                // The publication request itself may have raced a release or
-                // rate sample. Re-evaluate before sleeping.
+                // A release or rate sample may have raced the sweep.
                 if (spool_admission_revision != revision)
                     continue;
             }
@@ -1380,15 +1312,10 @@ struct FuseFrontend::State {
 
     static bool namespace_batch_compatible(std::span<const NamespaceOp> current,
                                            const NamespaceOp& candidate) {
-        // 0.32.2: any run of operations batches. The batch is published as one
-        // atomic metadata mutation carrying an identity in the snapshot's
-        // mutation-sequence clock (journal_namespace_batch + fuse_namespace_origin),
-        // so after a crash the question "did this batch take effect?" is
-        // answered by the clock, never by re-deriving each op's effect from
-        // the final snapshot -- the reason renames and mixed kinds were kept
-        // singleton before. rsync's create / utimens / rename per file made
-        // that one metadata commit per op (~3/s cluster-wide) and every data
-        // publication waited behind the op naming its file (2026-09-07).
+        // Any run of ops batches: a batch publishes as one atomic mutation
+        // identified in the mutation-sequence clock (journal_namespace_batch +
+        // fuse_namespace_origin), so crash recovery asks the clock whether it
+        // took effect rather than re-deriving each op's effect.
         (void)current;
         (void)candidate;
         return true;
@@ -1418,9 +1345,8 @@ struct FuseFrontend::State {
                 return canonical_path(op.from) == canonical_path(candidate.from);
             });
         }
-        // Rename and mixed semantic groups remain singleton for now. Their
-        // intermediate effects cannot always be proven from the final snapshot
-        // after a crash without adding a journal batch-identity record.
+        // Rename and mixed kinds stay singleton: their effects cannot be
+        // proven from the final snapshot without a batch identity.
         return false;
     }
 
@@ -1628,9 +1554,8 @@ struct FuseFrontend::State {
             journal_records_appended.fetch_add(payloads.size(), std::memory_order_relaxed);
             journal_durability_barriers.fetch_add(1, std::memory_order_relaxed);
         } catch (...) {
-            // A durability batch is all-or-nothing from recovery's point of
-            // view. Do not leave earlier records from a failed batch in front
-            // of later successful records.
+            // A batch is all-or-nothing to recovery: roll back partial records,
+            // or poison the journal if that fails.
             bool rolled_back = false;
             if (::ftruncate(journal_fd, start) == 0) {
                 try {
@@ -1800,9 +1725,8 @@ struct FuseFrontend::State {
             durable_pending_operations.fetch_sub(retired, std::memory_order_relaxed);
         if (previous < retired)
             throw std::logic_error("FUSE journal data completion underflow");
-        // Data bytes are cleaned up after this durable completion marker. Do
-        // not compact the journal until that cleanup has succeeded; otherwise
-        // a crash could leave a non-empty spool with no durable explanation.
+        // The caller compacts only after spool cleanup succeeds, so no spool
+        // is ever left without a journal record explaining it.
         return previous == retired;
     }
 
@@ -1866,9 +1790,8 @@ struct FuseFrontend::State {
             recovery.max_inode = std::max(recovery.max_inode, inode.id);
             recovery.max_namespace_sequence =
                 std::max(recovery.max_namespace_sequence, inode.namespace_sequence);
-            // A descriptor is re-journaled when recovery changes an inode's
-            // paths (path-collision loser) — the newest one describes the
-            // inode. Formerly "duplicate descriptor" was fatal.
+            // Recovery re-journals a descriptor when it changes an inode's
+            // paths (path-collision loser); the newest wins.
             recovery.inodes.insert_or_assign(inode.id, std::move(inode));
             break;
         }
@@ -1908,11 +1831,8 @@ struct FuseFrontend::State {
         }
         case JournalRecord::namespace_done: {
             const auto sequence = reader.u64();
-            // Normally done implies published -- but an operator can abandon
-            // an operation wedged on a non-retryable backend error (see
-            // skip_blocked_namespace_operation()), which retires it as done
-            // without ever publishing it. Only require that the sequence is a
-            // known op and not already retired.
+            // Done need not follow published: an operator abandon
+            // (skip_blocked_namespace_operation()) retires an op unpublished.
             if (!recovery.namespace_ops.contains(sequence) ||
                 !recovery.namespace_done.insert(sequence).second)
                 throw DecodeError("invalid FUSE namespace completion marker");
@@ -1936,12 +1856,10 @@ struct FuseFrontend::State {
             const auto inode = reader.u64();
             const auto sequence = reader.u64();
 
-            // A durable data_done is the retirement watermark. Runtime emits it
-            // only after the target generation has been committed and observed,
-            // and spool reclamation is ordered after this marker. Recovery may
-            // therefore trust it even when the older, redundant data_published
-            // proof is missing, but only when the journal itself contains the
-            // exact ordered data operation being retired.
+            // data_done is the retirement watermark, written only after the
+            // generation is committed and observed, and before spool
+            // reclamation. It is trusted without data_published, but only if
+            // the journal holds the exact op it retires.
             auto operations = recovery.data_ops.find(inode);
             const bool has_operation =
                 operations != recovery.data_ops.end() &&
@@ -1956,9 +1874,8 @@ struct FuseFrontend::State {
 
             auto published = recovery.data_published.find(inode);
             if (published == recovery.data_published.end() || published->second.first < sequence) {
-                // Legitimate (see above) and, on a journal that has not reset
-                // for days, repeated on every boot: one DEBUG line each and a
-                // count in the recovery summary, not twenty WARNs per start.
+                // Legitimate and repeated every boot until the journal resets:
+                // DEBUG plus a count in the recovery summary.
                 ++recovery.done_without_published;
                 Log::debug("FUSE journal recovery accepted data completion without published "
                            "prefix inode=" +
@@ -2035,13 +1952,10 @@ struct FuseFrontend::State {
             JournalRecovery recovery;
             uint64_t position = journal_magic.size();
             uint64_t last_good = position;
-            // Discipline 3: a frame that cannot be fitted into the state so
-            // far is skipped and counted, never fatal. Every such throw in
-            // parse_journal_record() names a deterministic situation (a
-            // duplicated marker, a marker whose operation was dropped, a
-            // record type this build does not know) whose resolution is
-            // "ignore this frame"; refusing to start instead put the node in
-            // a systemd restart loop with a journal that would never change.
+            // Discipline 3: a frame that does not fit the state so far is
+            // skipped and counted, never fatal. Each parse_journal_record()
+            // throw is deterministic (duplicate marker, marker for a dropped
+            // op, unknown record type), so refusing to start would only loop.
             std::map<std::string, std::pair<size_t, uint64_t>> skipped_reasons;
             std::optional<uint64_t> corrupt_at;
             while (position < file_size) {
@@ -2069,12 +1983,9 @@ struct FuseFrontend::State {
                 if (sha256(payload) != expected) {
                     if (position + frame_size == file_size)
                         break;
-                    // Durable middle-of-journal corruption. Nothing after it
-                    // can be trusted to be what the writer meant, but nothing
-                    // before it is in doubt either: quarantine the tail for
-                    // diagnosis and start from the good prefix. Spool bytes
-                    // whose operations were in the tail are preserved as
-                    // orphans by validate_recovery_spools().
+                    // Mid-journal corruption: quarantine the tail and start
+                    // from the good prefix. Spool bytes whose ops were in the
+                    // tail become orphans in validate_recovery_spools().
                     corrupt_at = position;
                     break;
                 }
@@ -2194,16 +2105,13 @@ struct FuseFrontend::State {
                 std::lock_guard inode_lock(inode->mutex);
                 if (inode->backend_error)
                     throw FsError(*inode->backend_error, "FUSE inode publication error");
-                // replay_data advances this only after WriteHandle::commit() has
-                // made every referenced extent durable to the configured data
-                // policy and committed the resulting file metadata. Local
-                // snapshot confirmation/overlay retirement may lag, but cluster
-                // durability has already been achieved at this watermark.
+                // Advanced only after WriteHandle::commit(): cluster-durable at
+                // this watermark even if local confirmation lags.
                 if (inode->published_data_sequence >= target)
                     return;
             }
-            // Read under data_queue_mutex, which interrupt_waits() holds to set
-            // it, so the notify that follows cannot be missed.
+            // interrupt_waits() sets this under data_queue_mutex, so no missed
+            // notify.
             if (waits_interrupted.load(std::memory_order_acquire))
                 throw FsError(EIO, "FUSE frontend stopping; the data is journalled and "
                                    "publishes after the restart");
@@ -2219,8 +2127,7 @@ struct FuseFrontend::State {
     void enqueue_durability(const std::shared_ptr<DurabilityTicket>& ticket) {
         {
             std::lock_guard lock(durability_mutex);
-            // Queue even after a concurrent poison transition: the coordinator
-            // owns failure accounting for admitted descriptors and inode state.
+            // Queue even if poisoned: the coordinator owns failure accounting.
             durability_queue.push_back(ticket);
             retained_durability_tickets.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2239,11 +2146,9 @@ struct FuseFrontend::State {
     }
 
     static void close_idle_spool_locked(Inode& inode) {
-        // The retained descriptor exists only to bridge write admission to the
-        // local payload+journal durability barrier. Distributed publication and
-        // overlay reads reopen spool_path independently, so keeping one fd per
-        // dirty inode until publication completes turns a publication backlog
-        // into an unbounded process-wide descriptor population.
+        // The fd only bridges admission to the durability barrier; publication
+        // and reads reopen spool_path, so holding it would make a backlog cost
+        // one fd per dirty inode.
         if (inode.durability_pending || inode.spool_fd < 0)
             return;
         ::close(inode.spool_fd);
@@ -2282,11 +2187,8 @@ struct FuseFrontend::State {
             auto inode = ticket->inode;
             {
                 std::lock_guard lock(inode->mutex);
-                // write() made the operation immediately visible before it
-                // returned. The durability worker only advances the publication
-                // watermark after payload -> journal ordering is on stable
-                // storage. A single worker consumes tickets FIFO, so per-inode
-                // sequences become durable in admission order.
+                // One FIFO worker, so per-inode sequences become durable in
+                // admission order.
                 inode->durable_data_sequence =
                     std::max(inode->durable_data_sequence, ticket->op.sequence);
                 if (inode->durability_pending)
@@ -2298,9 +2200,7 @@ struct FuseFrontend::State {
             }
             inode->durability_cv.notify_all();
         }
-        // A metadata-bound writer may have asked for publication before this
-        // batch became durable. Durability advancement is a real progress
-        // event: wake it to re-evaluate and enqueue the new durable prefix.
+        // Wake metadata-bound writers to enqueue the new durable prefix.
         operation_metadata_cv.notify_all();
     }
 
@@ -2314,12 +2214,8 @@ struct FuseFrontend::State {
                 if (durability_queue.empty() && stop.stop_requested())
                     break;
 
-                // POSIX write() acknowledgement is decoupled from stable
-                // storage, so even one sequential writer can place several
-                // operations in this queue before the barrier runs. Give those
-                // admissions a very small coalescing window and amortise the
-                // spool+journal fsync pair across the batch. close/release and
-                // fsync explicitly wait for the resulting durability watermark.
+                // Brief coalescing window to amortise the spool+journal fsync
+                // pair; close/release and fsync wait for the watermark.
                 if (!stop.stop_requested())
                     durability_cv.wait_for(lock, std::chrono::milliseconds(25),
                                            [&] { return stop.stop_requested(); });
@@ -2349,11 +2245,8 @@ struct FuseFrontend::State {
                 for (auto fd : spool_fds)
                     fsync_fd(fd, "FUSE local spool group sync failed");
 
-                // Payload durability always precedes descriptor durability.
-                // A process/power failure before this point may lose an
-                // acknowledged-but-not-synchronised write (normal POSIX write
-                // semantics), but recovery can never observe a durable data-op
-                // descriptor whose spool bytes were not made durable first.
+                // Payload is durable before its descriptor, so recovery never
+                // sees a data-op whose spool bytes were not synced.
                 journal_data_batch(batch);
                 finish_durability_batch(batch);
                 if (spool_under_pressure() ||
@@ -2415,27 +2308,21 @@ struct FuseFrontend::State {
             throw FsError(ENOTDIR, "parent not directory");
     }
 
-    // Both read the namespace in whichever form the snapshot carries it, so
-    // they need somewhere to fetch tree nodes from. They stay static -- these
-    // are pure questions about a snapshot -- and the store is handed in.
+    // Pure questions about a snapshot; `nodes` supplies tree nodes.
     static bool snapshot_has_path(const MetadataSnapshot& snapshot,
                                   const NamespaceNodeStore& nodes, std::string_view path) {
         return namespace_contains(snapshot, &nodes, normalize_path(std::string(path)));
     }
 
-    // `with_extents` false is for the callers that compare stat fields only.
-    // It matters on a tree -- it is the difference between reading a path and
-    // reading a path plus a film's extent spine -- and it matters on a map
-    // too, where it avoids copying that spine out of it.
+    // `with_extents` false for stat-only callers: skips reading or copying the
+    // extent list.
     static std::optional<FsEntry> snapshot_entry(const MetadataSnapshot& snapshot,
                                                  const NamespaceNodeStore& nodes,
                                                  std::string_view path, bool with_extents = true) {
         return namespace_entry(snapshot, &nodes, normalize_path(std::string(path)), with_extents);
     }
 
-    // Every question here is about stat fields -- type, mode, uid, gid, mtime --
-    // so every read is stat-only and no extent list is fetched or copied to
-    // answer "did my mkdir land".
+    // Stat fields only, so every read skips extents.
     static bool namespace_effect_confirmed(const NamespaceOp& op, const MetadataSnapshot& snapshot,
                                            const NamespaceNodeStore& nodes) {
         switch (op.kind) {
@@ -2472,12 +2359,9 @@ struct FuseFrontend::State {
         return false;
     }
 
-    // A published op is retired once a decoded view at or past the generation
-    // it was committed in is available: that view holds the effect or whatever
-    // legitimately superseded it, and either way adopting it cannot resurrect
-    // an unlink/rename or hide a mkdir/create. Effect visibility stays as the
-    // fast path for a view that lags the commit (e.g. after a reconciliation
-    // survey failed and the mutation returned without refreshing the cache).
+    // Confirmed once a view at or past the op's commit generation exists (it
+    // holds the effect or its successor); effect visibility also confirms a
+    // view that lags the commit.
     static bool namespace_op_confirmed(const NamespaceOp& op, const MetadataSnapshotView& view,
                                        const NamespaceNodeStore& nodes) {
         if (op.published_generation && view.generation >= op.published_generation)
@@ -2519,10 +2403,8 @@ struct FuseFrontend::State {
         }
     }
 
-    // namespace_mutex and inode.mutex together define the inode ownership
-    // boundary. All callers enter here without either lock. A shared_ptr held by
-    // a completing callback may extend object lifetime beyond table removal,
-    // but no new lookup can acquire a detached, fully quiescent inode.
+    // Call holding neither namespace_mutex nor inode.mutex. A shared_ptr may
+    // outlive table removal, but no new lookup can reach a reclaimed inode.
     void reclaim_inode_if_quiescent(uint64_t id) {
         std::lock_guard namespace_lock(namespace_mutex);
         auto found = inodes.find(id);
@@ -2546,8 +2428,7 @@ struct FuseFrontend::State {
             !no_data_owner || !no_spool_owner)
             return;
 
-        // A path edge is itself an owner. published_path is the ordinary proof,
-        // but verify the reverse index as a defensive invariant before erase.
+        // A path edge is an owner; check the index as well as published_path.
         if (std::any_of(paths.begin(), paths.end(), [&](const auto& item) {
                 return item.second.get() == inode.get();
             }))
@@ -2558,9 +2439,8 @@ struct FuseFrontend::State {
         reclaimed_inode_count.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Precondition: namespace_mutex is held. The operation is already durable,
-    // so these references must be installed before its affected path edges can
-    // cease to own an inode.
+    // Caller holds namespace_mutex. Install before the op's path edges stop
+    // owning their inodes.
     void retain_namespace_references_locked(const NamespaceOp& op) {
         for (auto id : namespace_operation_inodes(op)) {
             auto found = inodes.find(id);
@@ -2603,9 +2483,8 @@ struct FuseFrontend::State {
                 continue;
             switch (op.kind) {
             case NamespaceOp::Kind::rename:
-                // The locally acknowledged view has already removed the old
-                // subtree and, for rename-over, displaced the destination.
-                // A stale decoded backend snapshot must not resurrect either.
+                // Locally the source subtree and any displaced destination are
+                // gone; a stale snapshot must not resurrect either.
                 if (under_path(key, op.from) || under_path(key, op.to))
                     return true;
                 break;
@@ -2664,17 +2543,14 @@ struct FuseFrontend::State {
     }
 
     void enqueue_namespace(NamespaceOp operation) {
-        // Every caller holds namespace_mutex across durable journal admission,
-        // optimistic namespace mutation and this enqueue. Install the durable
-        // operation's ownership before publishing it to the worker queue.
+        // Caller holds namespace_mutex across journal admission, local mutation
+        // and this enqueue.
         retain_namespace_references_locked(operation);
         {
             std::lock_guard lock(namespace_queue_mutex);
-            // Admission capacity was checked while namespace_apply_mutex was
-            // held. Do not re-check after the durable/local mutation: the worker
-            // can transiently count one operation as both inflight and awaiting
-            // metadata confirmation, and rejecting here would leave an accepted
-            // durable operation absent from the in-memory queue until restart.
+            // Capacity was checked at admission. Never reject here: the op is
+            // already durable, and the worker may transiently count one op
+            // twice (inflight and unconfirmed).
             namespace_queue.push_back(std::move(operation));
         }
         namespace_cv.notify_one();
@@ -2693,8 +2569,8 @@ struct FuseFrontend::State {
             auto end = ::lseek(fd, 0, SEEK_END);
             if (end < 0)
                 throw FsError(errno, "cannot seek FUSE spool");
-            // If the spool inode itself is new, make the directory entry durable
-            // before any journal record is allowed to refer to it.
+            // A new spool's directory entry is durable before any journal
+            // record refers to it.
             if (!existed) {
                 fsync_fd(fd, "cannot sync new FUSE spool");
                 sync_directory(spool_dir);
@@ -2720,13 +2596,9 @@ struct FuseFrontend::State {
             return true;
         }
 
-        // data_done/data_abandoned is durable before retirement reaches here.
-        // The spool is therefore no longer part of the crash-recovery source of
-        // truth and can be unlinked immediately. We deliberately do not fsync
-        // the directory: if the unlink itself is lost in a crash, startup sees
-        // an already-completed journal generation and removes the harmless stale
-        // spool then. This avoids both an unnecessary retirement barrier and an
-        // unbounded population of zero-length spool inodes during long uptimes.
+        // data_done/data_abandoned is already durable, so unlink without a
+        // directory fsync: a lost unlink leaves a stale spool that startup
+        // removes.
         if (inode.spool_fd >= 0) {
             ::close(inode.spool_fd);
             inode.spool_fd = -1;
@@ -2749,19 +2621,16 @@ struct FuseFrontend::State {
         bool enqueue = false;
         {
             std::lock_guard inode_lock(inode->mutex);
-            // A terminal backend error poisons this inode until an explicit
-            // namespace operation or operator recovery clears it. Re-admitting
-            // the same durable generation cannot change that result and turns
-            // one bad inode into an unbounded worker/logging loop.
+            // A terminal backend error holds until a namespace op or operator
+            // clears it; re-admitting the same generation would only loop.
             if (inode->backend_error || inode->data_ops.empty() ||
                 inode->durable_data_sequence <= inode->published_data_sequence)
                 return;
             const bool watermark_advanced =
                 inode->durable_data_sequence > inode->requested_data_sequence ||
                 inode->namespace_sequence > inode->requested_namespace_sequence;
-            // flush/release and sustained pressure can report the same durable
-            // prefix repeatedly. If an owner already exists, that duplicate is
-            // not a publication request and must not touch the shared queue.
+            // A repeat of the same prefix with an existing owner is not a
+            // request and must not touch the shared queue.
             if (!watermark_advanced &&
                 (inode->unconfirmed_data_entry || inode->data_enqueue_pending ||
                  inode->data_queued || inode->data_running || inode->data_deferred)) {
@@ -2770,16 +2639,13 @@ struct FuseFrontend::State {
                 return;
             }
             data_publication_requests.fetch_add(1, std::memory_order_relaxed);
-            // Never expose acknowledged-but-not-yet-durable local writes to the
-            // distributed publication path. They remain a node-local overlay
-            // until the durability worker advances this watermark.
+            // Only the durable prefix is publishable; later writes stay local.
             inode->requested_data_sequence =
                 std::max(inode->requested_data_sequence, inode->durable_data_sequence);
             inode->requested_namespace_sequence =
                 std::max(inode->requested_namespace_sequence, inode->namespace_sequence);
-            // Only one committed-but-not-yet-observed data generation may be in
-            // flight for an inode. Keeping later writes in the durable overlay
-            // prevents an older available metadata view from becoming the base.
+            // At most one committed-but-unobserved generation per inode, so an
+            // older metadata view never becomes the base.
             if (inode->unconfirmed_data_entry) {
                 inode->data_deferred = true;
                 ++merged_publications;
@@ -2837,8 +2703,7 @@ struct FuseFrontend::State {
             request_data_publication(inode);
     }
 
-    // Records when the earliest backed-off inode becomes due; the idle data
-    // loop sleeps to it and re-admits (see data_loop()).
+    // The idle data loop sleeps to the earliest due time and re-admits.
     void note_deferred_due(Clock::time_point due) {
         const auto ns = static_cast<int64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(due.time_since_epoch()).count());
@@ -2873,7 +2738,6 @@ struct FuseFrontend::State {
                 if (!inode->data_deferred || inode->data_enqueue_pending || inode->data_queued ||
                     inode->data_running || inode->unconfirmed_data_entry)
                     continue;
-                // Backed off: stays deferred until its due time.
                 if (!inode->publication_retry.due(now)) {
                     const auto due = inode->publication_retry.due_at();
                     if (!earliest_due || due < *earliest_due)
@@ -2914,9 +2778,9 @@ struct FuseFrontend::State {
         return fs.apply_namespace_batch(mutations, identity, atomic);
     }
 
-    // The FUSE namespace loop's idempotency key: a NodeId-shaped origin derived
-    // from this node's id, whose clock in MetadataSnapshot::mutation_sequences
-    // is advanced to a batch's first op sequence when that batch commits.
+    // Idempotency key derived from this node's id; its clock in
+    // MetadataSnapshot::mutation_sequences advances to a batch's first op
+    // sequence when the batch commits.
     NodeId fuse_namespace_origin{};
 
     static NodeId derive_fuse_namespace_origin(const NodeId& node) {
@@ -3019,9 +2883,8 @@ struct FuseFrontend::State {
             std::shared_ptr<const MetadataSnapshot> published_snapshot;
             RetryState retry;
             bool budget_reported = false;
-            // Every batch is published under its identity (see
-            // namespace_batch_compatible); a batch a refused op turns back
-            // into a singleton falls back to per-op effect semantics.
+            // Batches publish under their identity; one reduced to a singleton
+            // by a refused op uses per-op effect checks.
             bool identity_batch = true;
             bool batch_journaled = false;
             while (!published_prefix && !stop.stop_requested() && !stopping.load()) {
@@ -3036,11 +2899,8 @@ struct FuseFrontend::State {
                     }
                 }
                 if (skip_requested) {
-                    // An operator has explicitly abandoned this operation after
-                    // it wedged on a non-retryable backend error. Retire it
-                    // without claiming its effect was achieved -- the affected
-                    // inodes keep their recorded backend_error -- and let the
-                    // rest of the batch (and queue) proceed.
+                    // Operator abandon: retire without claiming the effect
+                    // (inodes keep backend_error) and continue the batch.
                     const NamespaceOp abandoned = batch.front();
                     const std::array<NamespaceOp, 1> abandoned_span{abandoned};
                     journal_namespace_done(abandoned_span);
@@ -3055,22 +2915,17 @@ struct FuseFrontend::State {
                     continue;
                 }
                 try {
-                    // FUSE namespace publication is loader/convenience work.
-                    // Its batches are explicitly bounded and execute away from
-                    // viewer/control RPC lanes; viewer activity is priority,
-                    // not a reason to stop namespace convergence indefinitely.
-
-                    // A crash may leave an accepted effect without its local
-                    // marker. An identity batch asks the snapshot's clock
-                    // whether the whole batch committed; a singleton falls back
-                    // to the per-op effect check (still valid for one op).
+                    // Loader-class work, bounded and off the viewer/control
+                    // lanes; viewer activity never halts it.
+                    //
+                    // A crash may leave an effect without its local marker: an
+                    // identity batch asks the snapshot clock, a singleton
+                    // checks the effect.
                     auto before = fs.local_snapshot_view();
                     const MetadataMutationIdentity identity{fuse_namespace_origin,
                                                             batch.front().sequence};
-                    // The clock answers for a whole identity batch; otherwise
-                    // a leading run of already-achieved ops is retired without
-                    // a commit (retiring on visible effect never re-applies
-                    // anything, so it is safe for every kind).
+                    // Otherwise retire a leading run of ops whose effect is
+                    // already visible; safe for every kind as nothing re-applies.
                     if (identity_batch && fuse_namespace_clock(*before.snapshot) >= identity.sequence)
                         published_prefix = batch.size();
                     while (published_prefix < batch.size() &&
@@ -3083,9 +2938,8 @@ struct FuseFrontend::State {
                         namespace_publication_attempts.fetch_add(1, std::memory_order_relaxed);
                         const auto remaining =
                             std::span<const NamespaceOp>(batch).subspan(published_prefix);
-                        // A single op keeps the old per-op semantics (safe:
-                        // nothing intermediate to lose); two or more go as one
-                        // atomic mutation under the batch identity.
+                        // Two or more ops go as one atomic mutation under the
+                        // batch identity; a single op needs no identity.
                         const bool atomic = identity_batch && remaining.size() > 1;
                         FilesystemNamespaceBatchResult result;
                         try {
@@ -3107,11 +2961,9 @@ struct FuseFrontend::State {
                             finish_weighted_loader_service();
                         } catch (const FsError& error) {
                             if (atomic && !retryable_backend_error(error)) {
-                                // One op in the batch is refused (ENOENT,
-                                // EEXIST, ...): nothing was committed. Publish
-                                // the head of the remainder alone the old way
-                                // so the exact culprit is reported, and requeue
-                                // the rest in order.
+                                // An op was refused and nothing committed:
+                                // publish the head alone to name the culprit,
+                                // and requeue the rest in order.
                                 {
                                     std::lock_guard lock(namespace_queue_mutex);
                                     for (size_t i = batch.size(); i-- > published_prefix + 1;)
@@ -3189,20 +3041,14 @@ struct FuseFrontend::State {
                         Log::debug("FUSE async namespace publication retry seq=" +
                                    std::to_string(batch.front().sequence) + " error=" + e.what());
                     }
-                    // Never retire or skip an acknowledged durable namespace op
-                    // automatically -- a non-retryable backend error has no
-                    // automatic conflict resolver today, so preserve ordering
-                    // and keep retrying at a bounded cadence rather than
-                    // claiming convergence. An operator who has independently
-                    // confirmed it is safe may explicitly abandon it via
-                    // skip_blocked_namespace_operation(), handled at the top
-                    // of this loop.
+                    // A durable namespace op is never skipped automatically:
+                    // there is no conflict resolver, so keep order and retry;
+                    // only an operator may abandon it
+                    // (skip_blocked_namespace_operation()).
                     //
-                    // Discipline 2: the cadence is the shared RetryPolicy. A
-                    // retryable error that outlives its budget is surfaced as
-                    // blocked (same operator surface as a non-retryable one)
-                    // but keeps trying at the ceiling, so a cause that clears
-                    // still resolves it without anyone acting.
+                    // Discipline 2: cadence is the shared RetryPolicy. A
+                    // retryable error past its budget is reported blocked but
+                    // keeps retrying at the ceiling, so it can still clear.
                     auto delay = retry.failed(config.namespace_retry);
                     if (!delay) {
                         delay = config.namespace_retry.max_backoff;
@@ -3268,8 +3114,7 @@ struct FuseFrontend::State {
                                " error=" + prefix_failure_message);
                 }
             } else if (!stopping.load()) {
-                // Stop-requested workers leave the durable operation pending for
-                // startup replay. It was popped from RAM only for this worker.
+                // When stopping, the durable ops are left for startup replay.
                 std::lock_guard lock(namespace_queue_mutex);
                 for (auto i = batch.rbegin(); i != batch.rend(); ++i)
                     namespace_queue.push_front(*i);
@@ -3295,11 +3140,8 @@ struct FuseFrontend::State {
         if (inode->unconfirmed_data_entry)
             return snapshot;
         snapshot.target_sequence = inode->requested_data_sequence;
-        // Namespace mutations accepted after flush/release still order the
-        // eventual data publication. Waiting through the inode's latest local
-        // namespace sequence means a queued rename/unlink cannot leave a data
-        // writer committing through a path which the frontend has already
-        // superseded.
+        // Wait through the latest namespace sequence so the writer never
+        // commits through a path a queued rename/unlink has superseded.
         snapshot.required_namespace_sequence =
             std::max(inode->requested_namespace_sequence, inode->namespace_sequence);
         snapshot.published_path = inode->published_path;
@@ -3356,10 +3198,8 @@ struct FuseFrontend::State {
         size_t retired = 0;
         {
             std::lock_guard lock(inode->mutex);
-            // Do not discard a file while newly accepted writes are still on
-            // their way to the local spool+journal barrier. Once that admission
-            // settles, retrying this publication can abandon the complete dirty
-            // generation atomically.
+            // Wait for pending writes to reach the barrier, then a retry
+            // abandons the whole dirty generation.
             if (inode->durability_pending)
                 throw FsError(EAGAIN, "FUSE spool corruption raced pending write durability");
             target = inode->durable_data_sequence;
@@ -3370,8 +3210,7 @@ struct FuseFrontend::State {
         if (!retired)
             return;
 
-        // Abandonment is itself journaled before the spool is reclaimed. A
-        // crash at any later point therefore cannot resurrect corrupt bytes.
+        // Journaled before reclaiming the spool, so a crash cannot resurrect it.
         const bool journal_idle = journal_data_abandoned(inode->id, target, retired);
         bool spool_clean = true;
         {
@@ -3387,9 +3226,7 @@ struct FuseFrontend::State {
             inode->recovery_data_sequence = inode->published_data_sequence;
             inode->unconfirmed_data_sequence = 0;
             inode->unconfirmed_data_entry.reset();
-            // Preserve the last published generation. Only the dirty overlay is
-            // dropped; immutable extents already referenced by metadata are
-            // never touched by spool corruption handling.
+            // Drop only the dirty overlay; the published generation stands.
             inode->visible.size = inode->base.size;
             inode->visible.mtime_ns = inode->base.mtime_ns;
             inode->visible.ctime_ns = inode->base.ctime_ns;
@@ -3405,16 +3242,10 @@ struct FuseFrontend::State {
         data_cv.notify_all();
     }
 
-    // ENOENT from a data publication is either a race with a namespace
-    // mutation the backend applied a moment before this inode learned its
-    // new published_path, or a file genuinely gone from the accepted
-    // namespace (removed cluster-side while this node was down). Re-derive
-    // which from the truth, not from the inode's own bookkeeping: retry while
-    // any namespace work is still moving or the path is present in the
-    // decoded view; otherwise it is terminal. Poisoning the inode in the
-    // first case failed one test run in four on 2026-09-06; retrying in the
-    // second would be the unbounded recovery loop the terminal path exists
-    // to prevent.
+    // ENOENT on publication is either a race with a namespace mutation not yet
+    // reflected in published_path, or the file is gone cluster-side. Retry
+    // while namespace work is moving or the path is in the decoded view;
+    // otherwise it is terminal.
     bool publication_path_may_still_appear(const std::shared_ptr<Inode>& inode) {
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
@@ -3452,8 +3283,7 @@ struct FuseFrontend::State {
         }
 
         if (!publication->initialized) {
-            // Order the cursor only behind namespace mutations which are still
-            // unpublished. Later quanta retain the already-open writer.
+            // Wait only for unpublished namespace mutations it depends on.
             {
                 std::unique_lock namespace_lock(namespace_queue_mutex);
                 namespace_cv.wait(namespace_lock, [&] {
@@ -3513,11 +3343,9 @@ struct FuseFrontend::State {
             }
             note_spool_publication_started();
             data_publications_started.fetch_add(1, std::memory_order_relaxed);
-            // The durable spool+journal is the WAL for this publication. New
-            // extents may therefore be staged provisionally and group-synced
-            // once, immediately before metadata publication. Crash-recovery
-            // replay deliberately bypasses cache admission so a large backlog
-            // cannot evict the useful working set merely by being replayed.
+            // The spool+journal is the WAL, so extents are staged provisionally
+            // and group-synced once before metadata publication. Recovery
+            // replay bypasses the cache so a backlog cannot evict the working set.
             try {
                 publication->writer = fs.open_write(
                     *snapshot.published_path, false,
@@ -3535,12 +3363,8 @@ struct FuseFrontend::State {
             publication->initialized = true;
         }
 
-        // Opening a cold distributed writer can involve metadata discovery and
-        // staging setup. That is prerequisite latency, not loader service: if
-        // it consumes the whole duty-cycle slice, charging it here causes the
-        // publisher to yield with zero useful progress and then amplifies the
-        // delay by the viewer:loader cooldown ratio. Start the weighted burst
-        // only once the resumable publication is ready to do bounded work.
+        // Writer setup is not charged as loader service; otherwise it could
+        // spend the slice and yield with no progress.
         weighted_loader.service_started(Clock::now(), viewer_active());
 
         uint64_t served = 0;
@@ -3556,10 +3380,8 @@ struct FuseFrontend::State {
                 }
             };
             const auto yield_quantum = [&] {
-                // A quantum owns its aggregate byte reservation until every
-                // provisional extent it admitted has retired. This also makes
-                // the per-file pipeline the hard upper bound on loader I/O
-                // which can remain ahead of newly arrived viewer demand.
+                // A quantum holds its byte reservation until its provisional
+                // extents retire, bounding loader I/O ahead of viewer demand.
                 publication->writer->drain_staging();
                 note_spool_publication_progress(publication->unreported_spool_progress);
                 publication->unreported_spool_progress = 0;
@@ -3574,9 +3396,7 @@ struct FuseFrontend::State {
                 }
                 const auto& op = snapshot.operations[publication->operation_index];
                 if (op.kind == DataOp::Kind::truncate) {
-                    // Metadata-only operations still consume a bounded service
-                    // unit so a pathological truncate stream cannot bypass the
-                    // byte quantum and monopolise a worker.
+                    // Charged one chunk so truncate streams respect the quantum.
                     if (served > config.publication_quantum_bytes - chunk_size) {
                         return yield_quantum();
                     }
@@ -3588,20 +3408,16 @@ struct FuseFrontend::State {
                 }
                 while (publication->operation_offset < op.length &&
                        served < config.publication_quantum_bytes) {
-                    // Only the locally durable prefix reaches this path. The
-                    // write bytes and operation descriptor have completed the
-                    // spool -> journal durability barrier, so distributed
-                    // publication may yield to viewer playback between bounded
-                    // replay chunks without endangering recoverable input.
+                    // Input is already durable, so yielding between chunks is
+                    // safe.
                     if (weighted_loader_should_yield()) {
                         return yield_quantum();
                     }
                     const auto write_offset = op.offset + publication->operation_offset;
                     const auto remaining_quantum = config.publication_quantum_bytes - served;
-                    // A conflicting/overlapping write can require the old
-                    // generation to be staged first. Advance that hidden DATA
-                    // work under the same byte grant before consuming more WAL
-                    // input, and retain both cursors across a clean yield.
+                    // An overlapping write may first need the old generation
+                    // staged; do that under the same grant, keeping both
+                    // cursors across a yield.
                     if (remaining_quantum < fs.extent_size())
                         return yield_quantum();
                     const auto preparation = publication->writer->prepare_write(
@@ -3664,9 +3480,8 @@ struct FuseFrontend::State {
             }
             if (weighted_loader_should_yield())
                 return yield_quantum();
-            // Rebuild hashes canonical extent boundaries. Start it with a fresh
-            // extent-aligned grant rather than letting arbitrary WAL write
-            // lengths fragment the rebuilt manifest.
+            // Commit preparation starts on a fresh grant so arbitrary write
+            // lengths do not fragment the rebuilt manifest.
             if (served)
                 return yield_quantum();
             const auto remaining_quantum = config.publication_quantum_bytes - served;
@@ -3678,9 +3493,7 @@ struct FuseFrontend::State {
             if (!commit_preparation.ready || served >= config.publication_quantum_bytes)
                 return yield_quantum();
             {
-                // Publish the mtime this node currently shows, which includes
-                // any utimens applied after these writes (rsync sets times
-                // after the last write); see WriteHandle::set_committed_mtime.
+                // Publish the visible mtime, including any later utimens.
                 std::lock_guard lock(inode->mutex);
                 publication->writer->set_committed_mtime(inode->visible.mtime_ns);
             }
@@ -3704,18 +3517,15 @@ struct FuseFrontend::State {
                 completed_diagnostics.new_extent_puts + completed_diagnostics.rebuild_put_extents,
                 std::memory_order_relaxed);
         } catch (const FsError& e) {
-            // Only ENOENT is re-derived here; an EAGAIN keeps its own message
-            // (spool throttle, memory admission, ...) so the retry line says
-            // what actually blocked.
+            // Only ENOENT is re-derived; other errors keep their own message.
             if (e.code() == ENOENT && publication_path_may_still_appear(inode))
                 throw FsError(EAGAIN, "FUSE namespace advanced during data publication");
             throw;
         }
         auto committed = publication->writer->committed_entry();
 
-        // Record that the backend accepted this exact file generation before
-        // changing the in-memory publication watermark. A crash after the
-        // backend commit but before this marker simply replays idempotently.
+        // Journaled before the in-memory watermark moves; a crash before it
+        // replays idempotently.
         journal_data_published(inode->id, snapshot.target_sequence, committed);
         {
             std::lock_guard lock(inode->mutex);
@@ -3727,18 +3537,16 @@ struct FuseFrontend::State {
             inode->unconfirmed_data_entry = committed;
         }
 
-        // Retire the durable overlay only after MetadataManager's decoded view
-        // demonstrates the committed content. If propagation lags, a later
-        // namespace-facing request will perform the same confirmation.
+        // The overlay retires only once the decoded view shows the commit; if
+        // it lags, a later request confirms.
         if (auto available = fs.available_snapshot_view())
             (void)confirm_data_from_snapshot(inode, *available->snapshot);
         return true;
     }
 
     bool data_global_slot_available() {
-        // Viewer demand receives the dominant configured service share, but is
-        // not an exclusion gate. Bounded loader bursts remain runnable after a
-        // proportional cooldown and borrow all capacity when viewing is idle.
+        // Viewers get the dominant share, not exclusion: loader bursts run
+        // after a proportional cooldown and take all capacity when idle.
         if (!weighted_loader.can_start(Clock::now(), viewer_active()))
             return false;
         return active_data.load(std::memory_order_relaxed) < config.commit_workers &&
@@ -3750,25 +3558,18 @@ struct FuseFrontend::State {
         if (!data_global_slot_available())
             return data_queue.end();
 
-        // Past the open-writer bound, only inodes which already hold a writer
-        // are admissible: they can finish with the leases they have, where a
-        // new one would have to take more from a ledger that is already
-        // committed to the open set. This turns the scheduler depth-first over
-        // the open set exactly when breadth would deadlock it, and is the whole
-        // reason a publication waiting on retained memory is now guaranteed to
-        // be waiting for control/viewer work rather than for another
-        // publication (es-1, 2026-09-09).
+        // At the open-writer cap only inodes already holding a writer are
+        // admissible: they finish on their existing leases. Depth-first here
+        // means a publication waiting on retained memory waits on control or
+        // viewer work, never on another publication.
         const bool bounded = writer_cap_reached();
         const auto admissible = [bounded](const Inode& inode) {
             return !bounded || inode.data_publication != nullptr;
         };
 
-        // Closed loader files win first so a multi-gigabyte open import cannot
-        // hide complete files from the authoritative namespace and catalogue.
-        // Journal provenance is deliberately irrelevant: a restart does not
-        // demote user-requested ingest to background recovery.
-        // Inspect the current handle state rather than freezing it at enqueue:
-        // release() can close an inode while it is already waiting here.
+        // Closed files first, so a large open import cannot hide complete
+        // files; recovery provenance does not demote them. Handle state is
+        // read now, since release() may close an already-queued inode.
         auto loader = std::find_if(data_queue.begin(), data_queue.end(), [&](const DataQueueItem& item) {
             std::lock_guard inode_lock(item.inode->mutex);
             return item.inode->writable_handles == 0 && admissible(*item.inode);
@@ -3848,8 +3649,7 @@ struct FuseFrontend::State {
         if (loader != data_queue.end())
             return loader;
 
-        // Open loader files, including journal-restored files that an rsync has
-        // resumed, use otherwise idle capacity behind the viewer gate.
+        // Then files still open for writing.
         if (!bounded)
             return data_queue.begin();
         return std::find_if(data_queue.begin(), data_queue.end(),
@@ -3867,14 +3667,13 @@ struct FuseFrontend::State {
         while (!stop.stop_requested() && !stopping.load()) {
             std::shared_ptr<Inode> inode;
             bool recovered = false;
-            // This turn holds a reserved publication slot until it opens the
-            // publication or ends.
+            // Held until this turn opens the publication or ends.
             bool reserved = false;
             {
                 std::unique_lock lock(data_queue_mutex);
                 while (!stop.stop_requested() && !stopping.load()) {
-                    // Backed-off inodes are not in the queue at all, so their
-                    // due time is a clock deadline nothing will notify.
+                    // Backed-off inodes are off the queue; nothing notifies
+                    // their due time.
                     const auto due_ns = deferred_retry_due_ns.load(std::memory_order_acquire);
                     std::optional<Clock::time_point> due;
                     if (due_ns)
@@ -3887,8 +3686,6 @@ struct FuseFrontend::State {
                         continue;
                     }
                     if (data_queue.empty()) {
-                        // Sleep to the earliest due time and re-admit;
-                        // otherwise wait for new work.
                         const auto arrived = [&] {
                             return stopping.load() || !data_queue.empty() ||
                                    deferred_retry_due_ns.load(std::memory_order_acquire) != due_ns;
@@ -3902,17 +3699,11 @@ struct FuseFrontend::State {
                     if (runnable_data_available_locked())
                         break;
 
-                    // Cooldown expiry and viewer-idle expiry are deadline
-                    // transitions. Sleep directly to the earliest of those and
-                    // the deferred due time; active publication completion and
-                    // new queue work notify data_cv.
-                    //
-                    // The due time matters here and not only on an empty queue:
-                    // with a bounded open-writer count the queue can be full of
-                    // inodes that are not admissible while the only inodes that
-                    // could release a writer are backed off, and then no notify
-                    // is coming. Before the bound, a non-empty queue always had
-                    // a running worker to notify it.
+                    // Sleep to the earliest of cooldown expiry, viewer-idle
+                    // expiry and the deferred due time; other events notify.
+                    // The due time matters with a non-empty queue too: at the
+                    // writer cap every queued inode may be inadmissible while
+                    // the writers that could free a slot are backed off.
                     auto wake_at = due;
                     if (viewer_active()) {
                         const auto now = Clock::now();
@@ -4027,7 +3818,6 @@ struct FuseFrontend::State {
                         set_data_publication_locked(*inode, created);
                         refresh_retained_owners_locked(*inode);
                     }
-                    // The reserved slot is now an open publication.
                     if (reserved) {
                         std::lock_guard queue_lock(data_queue_mutex);
                         --reserved_publications;
@@ -4040,23 +3830,15 @@ struct FuseFrontend::State {
                     data_publication_yields.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
                 ++backend_failures;
-                // ESTALE: the backend lost an extent's only durable copy and
-                // the writer holds no bytes to re-put. The spool does; drop
-                // the provisional writer and its cursor so the next attempt
-                // replays this generation from the WAL.
+                // ESTALE: the backend lost an extent the writer cannot re-put;
+                // drop the writer so the next attempt replays from the spool.
                 const auto* fs_error = dynamic_cast<const FsError*>(&e);
                 const int code = fs_error ? fs_error->code() : EIO;
                 const bool replay = fs_error && code == ESTALE;
                 retry = replay || retryable_backend_error(e);
-                // Discipline 3: ENOENT that survived
-                // publication_path_may_still_appear() means the file is no
-                // longer in the accepted namespace — these bytes have no
-                // destination and never will. Poisoning the inode "until an
-                // operator acts" left gbni-1 (inode 922, 183 MB) and es-1
-                // (inode 2333, 6 GB) re-raising the same failure on every
-                // boot for days while the journal could never reset. The
-                // deterministic resolution is the one a corrupt spool gets:
-                // journal the abandonment, retire the spool, move on.
+                // Discipline 3: a terminal ENOENT means the bytes have no
+                // destination; abandon them as for a corrupt spool rather than
+                // poison the inode and keep the journal from resetting.
                 bool abandoned = false;
                 if (!retry && fs_error && code == ENOENT) {
                     try {
@@ -4077,8 +3859,7 @@ struct FuseFrontend::State {
                                   " unpublished_bytes=" + std::to_string(bytes) +
                                   " reason=file is no longer in the namespace");
                     } catch (const FsError&) {
-                        // Newly accepted writes are still reaching the spool;
-                        // abandonment is retried once they have settled.
+                        // Writes still reaching the spool; retry later.
                         retry = true;
                     }
                 }
@@ -4090,12 +3871,9 @@ struct FuseFrontend::State {
                     set_data_publication_locked(*inode, nullptr);
                 }
                 if (abandoned) {
-                    // Resolved above; nothing pending remains on this inode.
                 } else if (retry) {
-                    // Discipline 2: a retry is backed off per inode and
-                    // budgeted; past the budget the file is parked for an
-                    // operator instead of retrying forever (a doomed inode
-                    // ran at ~35/s for hours on 2026-09-06).
+                    // Discipline 2: per-inode backoff and budget; past the
+                    // budget the file is parked for an operator.
                     std::optional<std::chrono::milliseconds> delay;
                     std::string path;
                     size_t attempts = 0;
@@ -4121,9 +3899,7 @@ struct FuseFrontend::State {
                     if (delay) {
                         publication_retries_backed_off.fetch_add(1, std::memory_order_relaxed);
                         note_deferred_due(Clock::now() + *delay);
-                        // Escalate a long failure run out of DEBUG: once at the
-                        // threshold, then periodically, so a file stuck short of
-                        // its budget is visible without flooding the journal.
+                        // Warn at the threshold, then periodically.
                         constexpr size_t escalate_at = 10;
                         constexpr size_t repeat_every = 20;
                         const bool crossed = consecutive == escalate_at;
@@ -4153,8 +3929,7 @@ struct FuseFrontend::State {
                                   "; retry or abandon via manage/filesystem/parked-publications");
                     }
                 } else {
-                    // A terminal failure poisons the inode until an operator
-                    // acts; that is never a debug-level event.
+                    // Terminal: poisons the inode until an operator acts.
                     Log::warn(line);
                 }
                 bool parked_now = false;
@@ -4176,11 +3951,9 @@ struct FuseFrontend::State {
             {
                 std::lock_guard lock(inode->mutex);
                 inode->data_running = false;
-                // Clean yields and retryable failures retain the provisional
-                // writer and exact spool/materialisation/rebuild cursor. The
-                // writer keeps a failed pipelined extent at its queue head, so
-                // retry cannot create a manifest hole or repeat earlier WAL
-                // input. Completion and terminal errors discard the cursor.
+                // Yields and retryable failures keep the writer and cursor (a
+                // failed extent stays at the queue head, so retry leaves no
+                // hole); completion and terminal errors discard them.
                 if (completed)
                     inode->publication_retry.succeeded();
                 if (completed || inode->backend_error || inode->parked)
@@ -4189,10 +3962,7 @@ struct FuseFrontend::State {
                 const bool still_requested =
                     inode->requested_data_sequence > inode->published_data_sequence;
                 if (inode->backend_error || inode->parked) {
-                    // Terminal failures remain visible on the affected inode,
-                    // but are not runnable work. In particular, do not let
-                    // admit_deferred() immediately feed a poisoned recovered
-                    // inode back to this loop.
+                    // Not runnable; admit_deferred() must not requeue it.
                     inode->data_deferred = false;
                 } else if ((!completed || retry || still_requested) &&
                            !inode->unconfirmed_data_entry) {
@@ -4201,7 +3971,6 @@ struct FuseFrontend::State {
             }
             {
                 std::lock_guard lock(data_queue_mutex);
-                // A turn that never opened its publication gives the slot back.
                 if (reserved)
                     --reserved_publications;
                 publication_inflight_bytes -= config.publication_quantum_bytes;
@@ -4278,16 +4047,11 @@ struct FuseFrontend::State {
     }
 
     void reconcile_recovery(JournalRecovery& recovery, const MetadataSnapshot& snapshot) {
-        // A backend mutation may have committed immediately before the process
-        // stopped, after its durable "published" marker but before the local
-        // journal could retire it. The marker is written only after the
-        // backend reported the mutation durable at the metadata write floor,
-        // which always includes this node's own replica -- so the effect is in
-        // local history whether or not the current head still shows it. An op
-        // whose effect has since been overwritten (a peer's write, a
-        // reconciliation, a later local op) must be retired here too: parking
-        // it as "unconfirmed" left refresh_namespace_if_stale() refusing every
-        // newer view, and the mount fell two hours behind its own replica.
+        // A "published" marker means the backend made the mutation durable at
+        // the write floor, which includes this node's replica; so retire it
+        // even if a later change has overwritten its effect. Leaving it
+        // unconfirmed would make refresh_namespace_if_stale() refuse every
+        // newer view.
         std::vector<NamespaceOp> confirmed_namespace;
         for (const auto& [sequence, op] : recovery.namespace_ops) {
             if (recovery.namespace_done.contains(sequence) ||
@@ -4347,10 +4111,8 @@ struct FuseFrontend::State {
                 ++inode.visible.version;
                 break;
             case NamespaceOp::Kind::utimens:
-                // Pending data operations were applied first; a utimens only
-                // wins over them if it was admitted after the last write
-                // (rsync's order: write, close, set times). Otherwise the
-                // later write's own timestamp is the truth.
+                // Data ops were applied first; utimens wins only if admitted
+                // after the last write.
                 if (op.ctime_ns >= inode.visible.ctime_ns) {
                     inode.visible.mtime_ns = op.mtime_ns;
                     inode.visible.ctime_ns = op.ctime_ns;
@@ -4473,8 +4235,7 @@ struct FuseFrontend::State {
         if (size > required)
             quarantine_spool_tail(inode->spool_path, required, size);
         recover_spool_bytes(required);
-        // Recovery validates durable spool state but does not retain one file
-        // descriptor per dirty inode. Replay/read paths open the spool lazily.
+        // No fd retained; replay and reads open the spool lazily.
         inode->spool_fd = -1;
         inode->spool_end = required;
     }
@@ -4537,9 +4298,7 @@ struct FuseFrontend::State {
             if (recovery.data_history_inodes.contains(id)) {
                 if (pending_data_count(recovery, id) > 0)
                     continue;
-                // A crash may occur after the durable data_done record but
-                // before the best-effort spool unlink reaches stable storage.
-                // The done watermark proves these bytes are no longer recovery data.
+                // Retired by data_done; its unlink was lost in a crash.
                 std::filesystem::remove(entry.path(), ec);
                 if (ec)
                     throw std::runtime_error("cannot remove retired FUSE spool: " + ec.message());
@@ -4565,15 +4324,10 @@ struct FuseFrontend::State {
             sync_directory(spool_dir);
     }
 
-    // Bounded and cancellable, because this runs inside the FuseFrontend
-    // constructor and therefore inside a supervised lifecycle thread. An
-    // unbounded wait here is what let a node whose replica never became
-    // available hang indefinitely with one debug line to show for it; a wait
-    // that cannot be cancelled would hold Service::stop() for as long.
-    //
-    // Both exits are exceptions rather than a sentinel: to the supervisor a
-    // frontend that could not be constructed is an ordinary construction
-    // fault, retried with backoff and eventually surfaced as `disabled`.
+    // Bounded and cancellable: it runs in the constructor on a supervised
+    // lifecycle thread and must not hold Service::stop(). Both exits throw, so
+    // the supervisor treats them as a construction fault (backoff, then
+    // `disabled`).
     MetadataSnapshotView wait_for_initial_namespace() {
         bool announced = false;
         const auto started = Clock::now();
@@ -4620,12 +4374,9 @@ struct FuseFrontend::State {
                 needed.insert(inode);
         }
 
-        // Discipline 3: an operation whose inode was never described cannot
-        // be replayed, and the journal is durable, so refusing to start here
-        // refused forever. Retire those operations now with journaled
-        // markers (so the next boot does not see them again), count them,
-        // and leave any spool bytes for validate_recovery_spools() to
-        // preserve as an orphan — never replayed, never silently lost.
+        // Discipline 3: ops on an undescribed inode cannot replay. Retire them
+        // with journaled markers and count them; validate_recovery_spools()
+        // keeps any spool bytes as an orphan.
         {
             std::vector<uint64_t> undescribed;
             for (auto id : needed)
@@ -4672,8 +4423,7 @@ struct FuseFrontend::State {
                           std::to_string(id) + " operations=" + std::to_string(dropped) +
                           "; any spool bytes are preserved as an orphan");
             }
-            // The dropped namespace operations may have been the only thing
-            // naming other inodes; recompute what is still needed.
+            // Dropped ops may have been all that named other inodes.
             if (!undescribed.empty()) {
                 std::set<uint64_t> still_needed;
                 for (const auto& [sequence, op] : recovery.namespace_ops) {
@@ -4711,9 +4461,7 @@ struct FuseFrontend::State {
 
         auto recovery_nodes = fs.namespace_nodes();
         std::lock_guard lock(namespace_mutex);
-        // A full pass, with extents: an inode's base entry is what reads and
-        // writes are served against, so this is one of the few walks that
-        // genuinely wants the whole entry.
+        // With extents: the base entry serves reads and writes.
         for_each_namespace_entry(snapshot, &recovery_nodes,
                                  [&](const std::string& path, const FsEntry& entry) {
             const auto key = canonical_path(path);
@@ -4769,11 +4517,8 @@ struct FuseFrontend::State {
                 }
             }
             apply_pending_data_metadata(*inode, inode->data_ops);
-            // After the data ops: a utimens admitted after the last write
-            // (rsync) must be what this node shows and what publication
-            // commits; applying it first and letting the write's timestamp
-            // overwrite it is why 474 imported files carried the wrong mtime
-            // on 2026-09-07 and would have been re-copied by the next pass.
+            // After the data ops, so a utimens admitted after the last write
+            // sets the mtime shown and published.
             apply_pending_namespace_metadata(*inode, id, recovery);
             rebuild_data_overlay_locked(*inode);
             refresh_retained_owners_locked(*inode);
@@ -4799,17 +4544,11 @@ struct FuseFrontend::State {
                 const auto key = canonical_path(inode->current_path);
                 auto existing = paths.find(key);
                 if (existing != paths.end() && existing->second->id != inode->id) {
-                    // Two inodes resolve to one path. Throwing here made the
-                    // process exit and systemd restart it every 7 s, forever,
-                    // on gbni-1 (2026-09-06, /TV/Big.Mistakes.S01E01…mkv):
-                    // the journal is durable, so the collision is
-                    // deterministic and the node can never come back. Resolve
-                    // it the way a live rename-over would: a journaled inode
-                    // outranks one seeded from the snapshot, and between two
-                    // journaled ones the later namespace sequence owns the
-                    // path. The loser keeps its data (detached, like any
-                    // displaced inode) and is re-journaled without the path so
-                    // the next recovery is clean.
+                    // Two inodes on one path: resolve as a rename-over would.
+                    // A journaled inode beats a snapshot-seeded one; between
+                    // journaled ones the later namespace sequence wins. The
+                    // loser keeps its data, detached, and is re-journaled
+                    // without the path. Deterministic, never fatal.
                     auto holder = existing->second;
                     const bool holder_journaled = recovery.inodes.contains(holder->id);
                     const bool inode_wins =
@@ -4829,17 +4568,14 @@ struct FuseFrontend::State {
                         loser->current_path.clear();
                         loser->published_path.reset();
                         if (recovery.inodes.contains(loser->id)) {
-                            // The loser was stamped with the current epoch
-                            // above, which made this re-journal a no-op in
-                            // 0.28.3 and the collision a fixture of every
-                            // boot. Force the descriptor out.
+                            // It carries the current epoch, which would make
+                            // journal_inode_locked() a no-op; force it.
                             loser->journal_epoch = std::numeric_limits<uint64_t>::max();
                             std::lock_guard admission(journal_admission_mutex);
                             journal_inode_locked(loser);
                         }
                     }
-                    // Whichever lost is still registered below by id -- its
-                    // data ops may reference it -- just without a path.
+                    // The loser stays registered by id, without a path.
                     paths[key] = winner;
                 } else {
                     paths[key] = inode;
@@ -4852,10 +4588,9 @@ struct FuseFrontend::State {
         if (!paths.contains(canonical_path("/")))
             throw std::runtime_error("FUSE frontend cannot initialise without namespace root");
 
-        // Batches journaled before publish whose identity the accepted
-        // snapshot's clock already covers committed atomically: their ops are
-        // published even if the crash lost the per-op markers. Never re-apply
-        // them (a create + rename re-applied would overwrite the final file).
+        // A journaled batch covered by the snapshot clock committed atomically
+        // even if per-op markers were lost; never re-apply it (create + rename
+        // re-applied would overwrite the final file).
         const auto fuse_clock = fuse_namespace_clock(snapshot);
         const auto committed_in_batch = [&](uint64_t sequence) {
             auto batch = recovery.namespace_batches.upper_bound(sequence);
@@ -4889,8 +4624,8 @@ struct FuseFrontend::State {
             Log::info("FUSE journal recovery: " + std::to_string(recovered_by_identity) +
                       " namespace operations confirmed committed by batch identity clock=" +
                       std::to_string(fuse_clock));
-        // A journal wiped while metadata kept the clock would otherwise make
-        // every new batch look already committed.
+        // Else a lost journal with a surviving clock would make every new
+        // batch look already committed.
         next_namespace_sequence = std::max<uint64_t>(next_namespace_sequence, fuse_clock + 1);
         namespace_operations_recovered.fetch_add(recovered_namespace_operations,
                                                  std::memory_order_relaxed);
@@ -4968,10 +4703,8 @@ struct FuseFrontend::State {
         bool spool_clean = true;
         bool journal_idle = false;
         {
-            // Serialise observation, durable retirement and in-memory retirement
-            // on the inode. replay_data() may race a namespace-facing refresh;
-            // without this lock spanning journal_data_done(), both observers
-            // could retire the same durable operation prefix.
+            // Held across journal_data_done() so concurrent confirmers cannot
+            // both retire the same prefix.
             std::lock_guard lock(inode->mutex);
             if (!inode->unconfirmed_data_entry || !inode->unconfirmed_data_sequence)
                 return false;
@@ -5053,10 +4786,8 @@ struct FuseFrontend::State {
         if (available_revision <= current_revision && !pending_confirmation)
             return;
 
-        // Every reason a newer decoded view is *not* adopted says so, once per
-        // revision. Without this a mount that has quietly stopped adopting is
-        // indistinguishable from an idle cluster (gbni-1, 2026-09-06: the
-        // manager's view held six directories the mount never showed).
+        // Log why a newer view is not adopted, once per revision, so a stalled
+        // mount is distinguishable from an idle cluster.
         auto deferred = [&](const std::string& reason, uint64_t view_revision = 0) {
             if (available_revision <= current_revision)
                 return;
@@ -5069,17 +4800,13 @@ struct FuseFrontend::State {
                        " refreshed_revision=" + std::to_string(current_revision));
         };
 
-        // A metadata-generation notice is only evidence that a newer snapshot
-        // exists somewhere in the cluster. It is not permission for a kernel
-        // getattr/readdir to perform metadata-replica I/O. Adopt only an immutable snapshot
-        // which MetadataManager has already obtained and decoded; metadata repair
-        // is responsible for making newer generations locally available.
+        // Adopt only a snapshot MetadataManager has already decoded; kernel
+        // requests never do metadata-replica I/O.
         std::lock_guard refresh_lock(refresh_mutex);
         {
             std::lock_guard queue_lock(namespace_queue_mutex);
-            // Local FUSE namespace operations are already reflected optimistically
-            // in paths/inodes. Do not race a backend publication with a snapshot
-            // adoption; a subsequent namespace-facing request will retry.
+            // Local ops are already applied optimistically; do not race their
+            // publication. A later request retries.
             if (namespace_inflight || !namespace_queue.empty()) {
                 deferred("namespace-queue");
                 return;
@@ -5094,10 +4821,8 @@ struct FuseFrontend::State {
         const auto& view = *available;
         const auto& snapshot = *view.snapshot;
 
-        // A backend publication is not retired merely because its RPC returned.
-        // First observe the effect in MetadataManager's immutable decoded view.
-        // This prevents a concurrently available older view from resurrecting a
-        // rename/unlink or hiding a locally acknowledged mkdir/create.
+        // Publications retire only once observed in the decoded view, so an
+        // older view cannot resurrect a rename/unlink or hide a mkdir/create.
         confirm_namespace_from_snapshot(view);
         confirm_data_from_snapshot(snapshot);
         if (have_unconfirmed_namespace()) {
@@ -5111,17 +4836,13 @@ struct FuseFrontend::State {
 
         std::vector<uint64_t> detached;
         size_t adopted_new = 0;
-        // Counted during the walk rather than read off the map: a tree-backed
-        // snapshot has no map to take a size from, and a log line that says
-        // "entries=0" about a full library is worse than no log line.
+        // Counted during the walk; a tree-backed snapshot has no size.
         size_t walked = 0;
         {
             std::lock_guard lock(namespace_mutex);
             {
-            // Close the admission race between the earlier queue check and
-            // taking namespace_mutex. Admissions publish their queue entry
-            // before releasing namespace_mutex, so observing a non-empty queue
-            // here means this snapshot predates accepted local state.
+            // Admissions enqueue before releasing namespace_mutex, so a
+            // non-empty queue here means the snapshot predates local state.
             std::lock_guard queue_lock(namespace_queue_mutex);
             if (namespace_inflight || !namespace_queue.empty() || !namespace_unconfirmed.empty()) {
                 deferred("queue-race", view.namespace_revision);
@@ -5152,14 +4873,11 @@ struct FuseFrontend::State {
             auto inode = found->second;
             std::lock_guard inode_lock(inode->mutex);
             const bool content_changed = !same_file_content(inode->base, entry);
-            // Metadata snapshots do not carry a stable distributed inode id.
-            // A dirty/open inode whose name now denotes replacement content
-            // must be detached from that pathname before any queued publication
-            // can run; otherwise old writes can be committed into the new file.
-            // For a read-only descriptor, a non-advancing entry version plus
-            // changed content is the replacement/rename-over signature produced
-            // by current filesystem metadata. Advancing versions remain ordinary
-            // in-place content changes and stay attached to the same open inode.
+            // Snapshots carry no stable inode id. A dirty or open inode whose
+            // path now holds replacement content is detached, so old writes
+            // cannot commit into the new file. For an open read-only inode,
+            // changed content without a version advance marks replacement; an
+            // advancing version is an in-place change.
             const bool replaced_open_inode =
                 content_changed &&
                 (!inode->data_ops.empty() || inode->durability_pending ||
@@ -5194,14 +4912,12 @@ struct FuseFrontend::State {
             }
             auto inode = it->second;
             std::lock_guard inode_lock(inode->mutex);
-            // Remote unlink has the same POSIX name semantics as a local unlink:
-            // remove the directory edge immediately. Open handles and dirty
-            // state retain the detached inode object, but never ownership of the
-            // old pathname and therefore cannot resurrect it on publication.
+            // Remote unlink, POSIX semantics: the name goes now; open or dirty
+            // state keeps the inode but cannot resurrect the path.
             inode->published_path.reset();
             it = paths.erase(it);
             const auto detached_id = inode->id;
-            // Defer reclamation until namespace_mutex is released below.
+            // Reclaimed after namespace_mutex is released.
             detached.push_back(detached_id);
             }
             refreshed_namespace_revision.store(view.namespace_revision,
@@ -5221,14 +4937,13 @@ struct FuseFrontend::State {
         auto recovery = load_journal();
         initialise_namespace(std::move(recovery));
 
-        // Local write durability is independent of distributed publication. It
-        // must be available before broker write workers can accept callbacks.
+        // Must run before broker workers accept writes.
         durability_worker = std::jthread([this](std::stop_token stop) {
             run_supervised_loop("fuse-durability", stop, [this, stop] { durability_loop(stop); });
         });
 
-        // Guarantee at least one independent worker for each operation class,
-        // then distribute the remaining budget toward reads/writes/lookups.
+        // One worker per operation class, the rest weighted to reads, writes
+        // and lookups.
         const std::array<size_t, 12> preference{2, 3, 2, 3, 2, 0, 2, 3, 0, 1, 4, 5};
         size_t workers = 0;
         for (size_t i = 0; i < broker.size() && workers < config.request_workers; ++i, ++workers)
@@ -5250,8 +4965,7 @@ struct FuseFrontend::State {
             data_workers.emplace_back([this](std::stop_token stop) {
                 run_supervised_loop("fuse-data", stop, [this, stop] { data_loop(stop); });
             });
-        // The bound and its worst-case memory cost, so an operator can compare
-        // it against runtime.loader_memory_reserve_bytes without arithmetic.
+        // For comparison with runtime.loader_memory_reserve_bytes.
         if (config.publication_max_open_writers) {
             const auto per_writer =
                 static_cast<uint64_t>(fs.extent_size()) + config.publication_pipeline_bytes;
@@ -5264,9 +4978,8 @@ struct FuseFrontend::State {
                       "admission can deadlock against itself under a wide backlog");
         }
 
-        // Recovery is reconstructed before worker startup so kernel-visible state
-        // is complete before the frontend is exposed. Resume asynchronous
-        // convergence only after all workers are available.
+        // Recovered state is complete before workers start; publication
+        // resumes once they all run.
         resume_recovered_data();
         namespace_cv.notify_all();
     }
@@ -5309,9 +5022,8 @@ struct FuseFrontend::State {
                     worker.join();
         }
 
-        // Broker writers wait for their durability tickets. Keep the durability
-        // coordinator alive until all broker workers have returned, then drain
-        // any final admitted batch before stopping it.
+        // Last, since broker writers wait on durability tickets; it drains the
+        // final batch.
         if (durability_worker.joinable()) {
             durability_worker.request_stop();
             durability_cv.notify_all();
@@ -5472,8 +5184,7 @@ void FuseFrontend::mkdir(std::string_view path, uint32_t mode, uint32_t uid, uin
                 op.ctime_ns = now;
                 op.affected = {inode->id};
 
-                // Descriptor + operation are fsynced before the optimistic namespace
-                // becomes visible to the kernel and before success can be returned.
+                // Journaled before the change becomes visible or succeeds.
                 {
                     std::lock_guard journal_admission(state_->journal_admission_mutex);
                     state_->journal_inode_locked(inode);
@@ -5650,10 +5361,7 @@ void FuseFrontend::rename(std::string_view from, std::string_view to, bool norep
                 for (const auto& inode : journal_inodes)
                     inode_locks.emplace_back(inode->mutex);
 
-                // Inode locks always precede journal admission throughout the
-                // frontend. Keeping that order here avoids a rename/write
-                // deadlock while still preventing journal compaction between
-                // the descriptor set and the rename operation record.
+                // Lock order: inode locks before journal_admission_mutex.
                 std::lock_guard journal_admission(state_->journal_admission_mutex);
                 for (const auto& inode : affected_inodes) {
                     state_->journal_inode_locked(inode);
@@ -5666,8 +5374,7 @@ void FuseFrontend::rename(std::string_view from, std::string_view to, bool norep
                 state_->journal_namespace_operation(op);
             }
 
-            // Only after the complete operation is durable do we expose the
-            // optimistic rename in the local inode/path overlay.
+            // Exposed locally only once durable.
             if (displaced_inode) {
                 std::lock_guard inode_lock(displaced_inode->mutex);
                 displaced_inode->current_path.clear();
@@ -6079,9 +5786,8 @@ size_t FuseFrontend::read_impl(uint64_t inode_id,
                 throw FsError(EIO, "short FUSE spool read");
         }
 
-        // Immediate kernel demand becomes a high-priority hint in the existing
-        // cache architecture. The foreground read above still has its own hard
-        // deadline; the hint is useful for read-ahead and retries.
+        // Kernel demand also becomes a high-priority cache hint, for read-ahead
+        // and retries.
         if (base_snapshot && !base_snapshot->extents.empty()) {
             const auto& base = *base_snapshot;
             size_t first = base.extents.size();
@@ -6152,12 +5858,10 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
             auto metadata_admission = state_->reserve_operation_metadata(
                 metadata_charge, deadline, [&] { state_->request_data_publication(inode); });
 
-            // Admission may wait for distributed publication to create spool
-            // capacity. Never hold an inode mutex across that wait: durability
-            // and publication both need the inode in order to make progress.
+            // May wait on publication: never hold inode.mutex here, as
+            // durability and publication need it to progress.
             state_->reserve_spool_bytes(static_cast<uint64_t>(owned.size()));
-            // The waits above are backpressure; the request's own time budget
-            // covers the local work that follows them.
+            // The request's time budget starts after admission.
             deadline = Clock::now() + timeout_for(FuseOperationClass::write);
             check_deadline(deadline, cancelled);
             bool reservation_transferred = false;
@@ -6196,10 +5900,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                         std::span<const uint8_t>{owned.data() + checksum_offset, checksum_size}));
                 }
 
-                // Do all potentially-allocating overlay preparation before reserving
-                // disk bytes. Once the reservation exists, every failure path below
-                // can roll back the tail exactly while this inode lock excludes later
-                // reservations.
+                // Allocate before taking spool bytes, so every later failure can
+                // roll the tail back exactly under this inode lock.
                 State::DataOp overlay_op = ticket->op;
                 inode->data_ops.reserve(inode->data_ops.size() + 1);
                 bool admission_active = false;
@@ -6207,9 +5909,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                 try {
                     fd = state_->ensure_spool_locked(inode);
 
-                    // Keep the inode descriptor alive across the asynchronous gap between
-                    // payload admission and the group-committed data-op frame. The
-                    // admission count prevents journal compaction in that gap.
+                    // The in-flight count keeps compaction from dropping this
+                    // descriptor before the group-committed data-op frame.
                     {
                         std::lock_guard journal_admission(state_->journal_admission_mutex);
                         state_->journal_inode_locked(inode);
@@ -6220,9 +5921,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                     if (pwrite_exact(fd, owned, spool_offset) != owned.size())
                         throw FsError(errno ? errno : EIO, "short FUSE spool write");
 
-                    // Queue first. The durability worker cannot observe this ticket until
-                    // the inode mutex is released, and every remaining mutation is
-                    // non-throwing after the reservations above.
+                    // The worker cannot see the ticket until inode.mutex is
+                    // released, and nothing below throws.
                     state_->enqueue_durability(ticket);
                     queued = true;
                     reservation_transferred = true;
@@ -6232,13 +5932,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                         std::max<uint64_t>(inode->admitted_size, target + owned.size());
                     inode->next_data_sequence = seq + 1;
 
-                    // POSIX write() makes accepted bytes immediately visible to this
-                    // node, but does not imply stable storage. Keep the operation in the
-                    // local overlay now; the durability worker advances
-                    // durable_data_sequence only after spool fsync -> journal append ->
-                    // journal fsync. Distributed publication is clamped to that durable
-                    // prefix, so relaxing write acknowledgement cannot expose an
-                    // unstable generation to other nodes or the metadata write floor.
+                    // Visible locally now; publication is clamped to the
+                    // durable prefix, so nothing unstable leaves this node.
                     State::apply_data_overlay_locked(*inode, overlay_op);
                     inode->data_ops.push_back(std::move(overlay_op));
                     inode->accounted_operation_metadata_bytes += metadata_charge;
@@ -6258,8 +5953,6 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                             state_->journal_inflight_admissions.store(0, std::memory_order_relaxed);
                     }
                     if (!queued && fd >= 0) {
-                        // No later reservation can exist while this inode lock is held,
-                        // so the failed, unacknowledged tail can be removed exactly.
                         if (::ftruncate(fd, static_cast<off_t>(spool_offset)) == 0) {
                             try {
                                 fsync_fd(fd, "cannot sync rolled-back FUSE spool");
@@ -6277,10 +5970,8 @@ size_t FuseFrontend::write(uint64_t inode_id, uint64_t offset, std::span<const u
                 throw;
             }
 
-            // Normal POSIX semantics: successful write() means the bytes have been
-            // accepted by this filesystem instance, not that they have reached
-            // stable storage. release()/close waits for local spool+journal
-            // durability; fsync additionally waits for distributed publication.
+            // POSIX: accepted, not yet stable. release() waits for local
+            // durability; fsync() also for distributed publication.
             return owned.size();
         });
 }
@@ -6344,9 +6035,8 @@ void FuseFrontend::flush(uint64_t inode_id) {
              [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
                  check_deadline(deadline, cancelled);
                  auto inode = state_->resolve_inode(inode_id);
-                 // POSIX flush is not a stable-storage barrier. Opportunistically publish
-                 // whatever prefix has already completed local durability and return;
-                 // release() is the close-time local durability boundary.
+                 // Not a durability barrier: request publication of the durable
+                 // prefix and return.
                  state_->request_data_publication(inode);
                  check_deadline(deadline, cancelled);
              });
@@ -6357,18 +6047,12 @@ void FuseFrontend::fsync(uint64_t inode_id) {
              [this, inode_id](Clock::time_point deadline, std::atomic_bool& cancelled) {
                  auto inode = state_->resolve_inode(inode_id);
 
-                 // First make every accepted local write recoverable. The durability
-                 // worker enforces payload fsync -> journal append -> journal fsync, so no
-                 // extra per-fd fsync is required here once the watermark is reached.
                  state_->wait_for_inode_durability(inode, deadline, cancelled);
                  const auto target = state_->durable_sequence(inode);
                  check_deadline(deadline, cancelled);
 
-                 // Macha's fsync is deliberately stronger than merely syncing the local
-                 // staging file: require the durable prefix to finish its normal
-                 // DistributedStore + metadata commit before returning. This does not
-                 // weaken or bypass metadata publication policy; it waits for the existing
-                 // publication machinery to satisfy it.
+                 // Stronger than a local sync: waits for the durable prefix to be
+                 // published (data and metadata committed).
                  state_->request_data_publication(inode);
                  state_->wait_for_inode_publication(inode, target, deadline, cancelled);
              });
@@ -6381,9 +6065,7 @@ void FuseFrontend::release(uint64_t inode_id, bool writable) {
                  auto inode = state_->resolve_inode(inode_id);
                  if (writable)
                      state_->wait_for_inode_durability(inode, deadline, cancelled);
-                 // flush()/fsync() are already write-handle-only in the adapter. Keep
-                 // release symmetric: closing a read-only descriptor must not publish
-                 // dirty data belonging to another writer on the same inode.
+                 // A read-only close must not publish another writer's data.
                  if (writable)
                      state_->request_data_publication(inode);
                  bool closed = false;
@@ -6450,20 +6132,11 @@ FuseFrontendStatus FuseFrontend::status() const {
         std::lock_guard lock(state_->namespace_queue_mutex);
         out.pending_namespace = state_->namespace_pending_locked();
     }
-    // The data pipeline is one cycle -- deferred -> queued -> active ->
-    // deferred -- and a publication moves between those places under
-    // data_queue_mutex (dequeue, re-admission, enqueue). Sampling the three
-    // counts at different times let an inode step out of the place already
-    // counted and into one not yet counted, so wait_for_idle() saw idle from
-    // a mount that was about to re-admit work (0.41.0, "wait_for_idle race").
-    // Every count is taken under data_queue_mutex, in one sample. The inode
-    // list is copied out first, admit_deferred()'s pattern, so the queue mutex
-    // is never taken under namespace_mutex.
-    //
-    // Deferred-but-not-admitted work is pending; active work is reported
-    // separately and deliberately not double-counted in pending_data. An
-    // enqueue that has been decided but not yet queued (data_enqueue_pending)
-    // is pending too: it is requested work that is in neither place yet.
+    // Publications cycle deferred -> queued -> active under data_queue_mutex,
+    // so all counts are one sample under it, or an inode could be missed
+    // between places. The inode list is copied first so data_queue_mutex is
+    // never taken under namespace_mutex. pending_data counts deferred,
+    // unconfirmed and enqueue-pending inodes, not active ones.
     std::vector<decltype(state_->inodes.begin()->second)> candidates;
     {
         std::lock_guard lock(state_->namespace_mutex);
@@ -6679,8 +6352,7 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
 void FuseFrontend::set_viewer_active_for_tests(std::optional<bool> active) {
     state_->viewer_active_override.store(active ? (*active ? 1 : 0) : -1,
                                          std::memory_order_release);
-    // A loop held by a viewer can be asleep with no timed wake; it must see
-    // the change now, not at its next unrelated notification.
+    // A data loop may be sleeping with no timed wake; wake it now.
     {
         std::lock_guard lock(state_->data_queue_mutex);
     }

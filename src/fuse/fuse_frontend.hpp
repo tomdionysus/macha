@@ -64,10 +64,9 @@ class SpoolRetirementRateEstimator {
     }
 };
 
-// Event-driven duty-cycle gate for loader publication while genuine viewer
-// traffic is active. A bounded loader burst is followed by a proportional
-// cooldown. The ratio is relative active time, not a static bandwidth cap;
-// when viewer traffic is absent the loader is always admitted.
+// Duty-cycle gate for loader publication while viewers are active: a bounded
+// loader burst earns a cooldown proportional to viewer:loader weight (relative
+// active time, not a bandwidth cap). With no viewer the loader is always admitted.
 class WeightedLoaderService {
   public:
     using Clock = std::chrono::steady_clock;
@@ -123,9 +122,8 @@ class WeightedLoaderService {
         }
     }
 
-    // A cold loader may be admitted before its distributed writer is ready.
-    // Account it as active immediately, but begin its proportional service
-    // slice only when it can perform useful bounded work.
+    // A loader admitted before its writer is ready counts as active at once but
+    // starts its service slice only here, when it can do useful work.
     void service_started(TimePoint now, bool viewer_active) {
         std::lock_guard lock(mutex_);
         if (!viewer_active) {
@@ -148,9 +146,8 @@ class WeightedLoaderService {
         }
         if (!loader_weight_)
             return true;
-        // Viewer arrival during an unrestricted loader quantum yields at the
-        // next bounded chunk. Its pipeline drain is accounted as the first
-        // contended loader burst before the proportional cooldown.
+        // A viewer arriving mid-quantum yields at the next chunk; the pipeline
+        // drain counts as the first contended burst before the cooldown.
         if (!burst_started_) {
             burst_started_ = now;
             slice_deadline_ = now;
@@ -261,12 +258,9 @@ struct FuseFrontendStatus {
     uint64_t peak_open_publications{};
     uint64_t publication_max_open_writers{};
     uint64_t data_publication_selections_under_writer_cap{};
-    // Events that RELEASED publication-owned retained memory: a pipelined
-    // extent retiring into the manifest, and a handle committing. This is the
-    // counter a writer blocked on admission watches, and the one to read when
-    // asking "is this pipeline moving at all". Deliberately not the admitted-
-    // quantum count: quanta rise on a wedged node too, because a failure frees
-    // a slot that admits the next file.
+    // Events that released publication-owned retained memory (an extent
+    // retiring into the manifest, a handle committing): the measure of whether
+    // the pipeline is moving. Quanta are not, since a failure also frees a slot.
     uint64_t data_publication_progress_events{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
@@ -319,18 +313,16 @@ struct FuseFrontendStatus {
     uint64_t extent_executor_peak_queued{};
     uint64_t extent_executor_peak_active{};
     uint64_t extent_executor_submitted{};
-    // Inode ownership is explicit: the table owns namespace-visible inodes and
-    // detached inodes only while a handle, durable namespace operation, data
-    // operation, publication or recovery activity still refers to them.
+    // The table owns namespace-visible inodes, and detached ones only while a
+    // handle, operation, publication or recovery still refers to them.
     uint64_t inode_count{};
     uint64_t detached_inode_count{};
     uint64_t peak_inode_count{};
     uint64_t reclaimed_inode_count{};
 };
 
-// Lock-free, process-lifetime operational totals suitable for Status. This is
-// deliberately separate from FuseFrontendStatus: obtaining queue state may
-// inspect live inode state, while observational diagnostics must stay O(1).
+// Lock-free process-lifetime totals for Status. Separate from
+// FuseFrontendStatus, which may inspect live inode state; this stays O(1).
 struct FuseFrontendDiagnostics {
     uint64_t timed_out_requests{};
     uint64_t merged_publications{};
@@ -350,24 +342,17 @@ struct FuseFrontendDiagnostics {
     uint64_t data_publication_peak_pipeline_extents{};
     uint64_t data_closed_priority_selections{};
     uint64_t data_retirement_priority_selections{};
-    // Inodes holding a provisional publication writer, its high-water mark, the
-    // bound on it, and how many queue selections happened while that bound was
-    // in effect. Each open writer holds up to one extent buffer plus the
-    // pipeline in retained memory, so peak_open_publications x (extent_size +
-    // pipeline limit) is publication's worst-case claim on the ledger.
-    // Selections under the bound rising while completions move is the bound
-    // working; rising while completions stay at zero means the open set itself
-    // is stuck.
+    // Inodes holding a provisional publication writer, its peak, its bound, and
+    // queue selections made under the bound. Each writer retains up to one
+    // extent plus the pipeline, so peak x (extent_size + pipeline limit) is the
+    // worst-case ledger claim. Selections rising with completions at zero means
+    // the open set is stuck.
     uint64_t open_publications{};
     uint64_t peak_open_publications{};
     uint64_t publication_max_open_writers{};
     uint64_t data_publication_selections_under_writer_cap{};
-    // Events that RELEASED publication-owned retained memory: a pipelined
-    // extent retiring into the manifest, and a handle committing. This is the
-    // counter a writer blocked on admission watches, and the one to read when
-    // asking "is this pipeline moving at all". Deliberately not the admitted-
-    // quantum count: quanta rise on a wedged node too, because a failure frees
-    // a slot that admits the next file.
+    // Events that released publication-owned retained memory; see
+    // FuseFrontendStatus::data_publication_progress_events.
     uint64_t data_publication_progress_events{};
     uint64_t data_publication_bytes_read{};
     uint64_t data_publication_bytes_committed{};
@@ -423,23 +408,20 @@ struct FuseFrontendDiagnostics {
     uint64_t inode_count{};
     uint64_t peak_inode_count{};
     uint64_t reclaimed_inode_count{};
-    // Namespace revision the mount last adopted versus the newest one the
-    // MetadataManager has decoded. refreshed < available means the mount is
-    // showing an older namespace than this node already holds.
+    // Namespace revision the mount last adopted versus the newest decoded;
+    // refreshed < available means the mount shows a stale namespace.
     uint64_t namespace_refreshed_revision{};
     uint64_t namespace_available_revision{};
-    // Files parked after exhausting their publication retry budget; details
-    // via FuseFrontend::parked_publications().
+    // Details via FuseFrontend::parked_publications().
     uint64_t parked_publications{};
     uint64_t publication_retries_backed_off{};
-    // Failure runs that crossed the escalation threshold and were reported at
-    // WARN. Non-zero means a file is failing repeatedly but has not (yet)
-    // exhausted its budget -- the state that used to be invisible.
+    // Failure runs past the escalation threshold (reported at WARN) whose
+    // retry budget is not yet exhausted.
     uint64_t publications_retrying_persistently{};
-    // Discipline 3: what recovery resolved rather than refused. Frames the
-    // journal loader skipped, bytes quarantined after mid-journal corruption,
-    // operations dropped for an inode with no descriptor, and publications
-    // abandoned because their file left the namespace.
+    // Discipline 3, what recovery resolved rather than refused: journal frames
+    // skipped, bytes quarantined after mid-journal corruption, operations
+    // dropped for an inode with no descriptor, publications abandoned because
+    // their file left the namespace.
     uint64_t journal_recovery_skipped_frames{};
     uint64_t journal_recovery_quarantined_bytes{};
     uint64_t recovery_dropped_operations{};
@@ -453,10 +435,8 @@ struct FuseDirtyRange {
 };
 
 // A durable namespace operation stuck on a non-retryable backend error. The
-// worker never abandons one of these automatically (see fuse_frontend.cpp's
-// namespace_loop() for why); an operator who has independently confirmed it
-// is safe to drop can do so explicitly via
-// FuseFrontend::skip_blocked_namespace_operation(sequence).
+// worker never drops one itself (see namespace_loop()); only
+// FuseFrontend::skip_blocked_namespace_operation() does.
 struct BlockedNamespaceOperation {
     uint64_t sequence{};
     std::string kind;
@@ -467,10 +447,9 @@ struct BlockedNamespaceOperation {
     std::chrono::milliseconds blocked_for{};
 };
 
-// A file whose data publication exhausted its retry budget (config
-// fuse.publication_retry). The bytes stay in the durable spool; nothing is
-// lost and nothing retries until an operator either retries it (the budget
-// is reset) or abandons the generation (the spool is retired).
+// A file whose data publication exhausted fuse.publication_retry. Its bytes
+// stay in the durable spool until it is retried (budget reset) or abandoned
+// (spool retired).
 struct ParkedPublication {
     uint64_t inode{};
     std::string path;
@@ -483,18 +462,13 @@ struct ParkedPublication {
 };
 
 // Bounded local frontend for the kernel-facing filesystem. FUSE callbacks enter
-// this object, never MetadataManager/DistributedStore directly. Distributed
-// namespace/data publication is queued behind the local inode/namespace state.
+// here, never MetadataManager/DistributedStore directly; distributed namespace
+// and data publication queue behind the local inode/namespace state.
 //
-// FUSE traffic is loader traffic, deliberately. Reads through the mount open
-// with FrameType::loader and never advance the foreground clock that gates
-// loader publication under governing law 2 -- a mount is a convenience and an
-// import path, not a viewer, and the viewer priority it would claim belongs to
-// real playback. The foreground clock is driven by the HTTP playback path via
-// FileSystem::note_foreground_activity(), which is what the publication
-// scheduler here reads back through fs.foreground_idle_for(). This class had a
-// note_viewer_activity() hook for the opposite policy until 0.40.0; nothing in
-// the kernel adapter ever called it, and the operator confirmed that was right.
+// FUSE traffic is loader traffic: mount reads use FrameType::loader and never
+// advance the foreground clock that gates loader publication (law 2). Only HTTP
+// playback drives that clock (FileSystem::note_foreground_activity()); the
+// publication scheduler reads it via fs.foreground_idle_for().
 class FuseFrontend final : public HydrationHintProvider {
     struct State;
     std::unique_ptr<State> state_;
@@ -522,12 +496,9 @@ class FuseFrontend final : public HydrationHintProvider {
         auto task = [promise, cancelled, request_state, complete_once_started,
                      fn = std::forward<Fn>(fn)](Clock::time_point task_deadline,
                                                 std::atomic_bool& task_cancelled) mutable {
-            // A mutating FUSE request may be rejected while it is still queued,
-            // but once it starts it must have exactly one observable outcome.
-            // Returning ETIMEDOUT while a pwrite/truncate/namespace mutation is
-            // already executing leaves the kernel unable to know whether the
-            // mutation happened. Read-only requests remain cooperatively
-            // cancellable after they begin.
+            // A mutation may time out only while queued; once started it has
+            // exactly one observable outcome, else the kernel cannot know
+            // whether it happened. Reads stay cancellable after they begin.
             if (Clock::now() >= task_deadline) {
                 auto expected = FuseRequestState::queued;
                 if (request_state->compare_exchange_strong(expected, FuseRequestState::cancelled,
@@ -586,8 +557,7 @@ class FuseFrontend final : public HydrationHintProvider {
                 throw FsError(ETIMEDOUT, "FUSE request deadline exceeded");
             }
 
-            // A mutation has already started. Wait for its actual result rather
-            // than manufacture a timeout while its side effects continue.
+            // A started mutation: wait for its real result.
             future.wait();
         }
         if constexpr (std::is_void_v<Result>) {
@@ -601,12 +571,9 @@ class FuseFrontend final : public HydrationHintProvider {
     void note_timeout();
 
   public:
-    // The stop token cancels the one part of construction that can wait
-    // indefinitely: the initial namespace. A supervised frontend is built
-    // on a lifecycle thread that must be joinable on shutdown, so a node
-    // whose metadata replica never arrives has to be able to give up
-    // rather than hold Service::stop() forever. Default-constructed (no
-    // associated stop state) for the in-process callers that have none.
+    // The stop token cancels the wait for the initial namespace, the one
+    // unbounded wait in construction, so Service::stop() can join the
+    // lifecycle thread if the metadata replica never arrives.
     FuseFrontend(FileSystem&, FuseConfig, std::stop_token = {});
     ~FuseFrontend() override;
     FuseFrontend(const FuseFrontend&) = delete;
@@ -650,31 +617,21 @@ class FuseFrontend final : public HydrationHintProvider {
     std::vector<FuseDirtyRange> dirty_ranges(uint64_t inode) const;
     FuseFrontendStatus status() const;
     FuseFrontendDiagnostics diagnostics() const noexcept;
-    // The namespace operation the publication worker is currently wedged on,
-    // if any (see BlockedNamespaceOperation).
     std::optional<BlockedNamespaceOperation> blocked_namespace_operation() const;
-    // Operator escape hatch: abandon the operation the worker is currently
-    // blocked on. The caller must name the exact sequence number (from
-    // blocked_namespace_operation()) to guard against skipping the wrong one
-    // if it changed between query and action. Returns false if there is no
-    // matching blocked operation right now.
+    // Abandons the blocked operation only if its sequence still matches;
+    // false if no such operation is blocked.
     bool skip_blocked_namespace_operation(uint64_t sequence);
-    // Files whose data publication is parked after exhausting its retry
-    // budget (see ParkedPublication), and the two operator actions on them.
     std::vector<ParkedPublication> parked_publications() const;
     bool retry_parked_publication(uint64_t inode);
     bool abandon_parked_publication(uint64_t inode);
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::seconds(10));
-    // Ends every wait on a publication with EIO, before the mount is torn
-    // down: an fsync waiting for its data to reach the cluster cannot finish
-    // while the node is stopping (the store's writes are cancelled), and the
-    // mount cannot exit with that request outstanding. The data is already
-    // durable in the local journal; recovery publishes it after the restart.
+    // Fails every publication wait with EIO before unmount: a stopping node's
+    // store writes are cancelled, so an fsync could never finish. The data is
+    // durable in the local journal and recovery publishes it after restart.
     void interrupt_waits();
     void stop();
-    // Tests only: whether a viewer is active is decided by this rather than by
-    // the foreground clock, so a test can hold loader publication and release
-    // it at a point of its choosing. nullopt returns the decision to the clock.
+    // Tests only: overrides the foreground clock's viewer-active decision;
+    // nullopt restores it.
     void set_viewer_active_for_tests(std::optional<bool> active);
 };
 

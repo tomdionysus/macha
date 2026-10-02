@@ -176,13 +176,11 @@ std::optional<PackHeader> decode_pack_header(std::span<const uint8_t> bytes) {
     }
 }
 
-// The first offset at or after `from` holding a header that decodes, or
-// nothing if the rest of the file has none. Recovery asks this when it meets
-// an undecodable header: a torn append leaves nothing decodable behind it,
-// whereas mid-pack damage (bit rot, an external edit) leaves the records after
-// it intact. Payloads are AES-GCM ciphertext, so a magic match followed by a
-// valid SHA-256 inside one is not a realistic false positive. Reads the
-// remainder of one pack in bounded chunks; hashes only where the magic matches.
+// First offset at or after `from` holding a decodable header, or nothing.
+// Distinguishes a torn append (nothing decodable after) from mid-pack damage
+// (later records intact). Payloads are AES-GCM ciphertext, so a magic match
+// plus valid SHA-256 inside one is not a realistic false positive. Reads in
+// bounded chunks; hashes only where the magic matches.
 std::optional<uint64_t> find_next_pack_header(int fd, uint64_t from, uint64_t file_size) {
     constexpr size_t chunk = 1024 * 1024;
     static_assert(chunk > 2 * pack_header_size);
@@ -366,17 +364,12 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
     if (accounting_fd_ < 0)
         throw std::runtime_error("cannot open accounting state: " + std::string(strerror(errno)));
 
-    // Packed indexes are deliberately derived from the authoritative append-only
-    // records at every start. A *clean* accounting checkpoint is trustworthy
-    // with packs too: ensure_accounting_dirty() persists "dirty" before the
-    // first mutation of a session, so a torn pack tail can only exist behind
-    // a dirty checkpoint. Until 0.32.3 any pack forced a full walk of the
-    // object tree on every start (4 min on gbni-1, 25+ min on es-1 under
-    // import load) with every put waiting for it -- a write outage after
-    // each restart. A dirty checkpoint is carried as an estimate while the
-    // walk reconciles; puts are admitted against it (the configured
-    // reserve_free headroom covers the bounded error) and the walk's total
-    // replaces it when done.
+    // Pack indexes are rebuilt from the append-only records at every start. A
+    // clean checkpoint is trusted with packs too: ensure_accounting_dirty()
+    // persists "dirty" before a session's first mutation, so a torn pack tail
+    // only exists behind a dirty checkpoint. A dirty checkpoint is carried as
+    // an estimate while the walk reconciles; puts are admitted against it
+    // (reserve_free covers the bounded error) and the walk's total replaces it.
     bool clean = false;
     const bool restored = restore_accounting(&clean);
     if (restored && clean) {
@@ -669,9 +662,8 @@ bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
         header = encode_pack_header(h);
         total = header.size() + payload.size();
 
-        // The pack stream has its own physical single-writer domain. m_ stays
-        // available throughout encryption and disk I/O, so unrelated viewer
-        // reads and loose-object work are not trapped behind a loader append.
+        // The pack stream has its own single-writer lock; m_ stays free during
+        // encryption and I/O so unrelated reads are not trapped behind an append.
         pack_io_lock = std::unique_lock(pack_io_mutex_);
         select_active_pack_locked(total);
         target = active_pack_;
@@ -730,10 +722,9 @@ std::optional<Bytes> LocalStore::get_packed_locked(
     const auto before_read = before_packed_read_for_tests_;
     ++active_pack_readers_[entry.file];
 
-    // A lightweight logical reader lease pins the indexed pack against
-    // compaction before any filesystem call. This leaves even open(2) outside
-    // the global index lock; compaction switches the index and event-waits for
-    // old readers before unlinking the victim.
+    // A reader lease pins the indexed pack against compaction before any
+    // filesystem call, keeping even open(2) outside m_; compaction switches the
+    // index and waits for old readers before unlinking the victim.
     lock.unlock();
     int fd = -1;
     auto release_reader = [&] {
@@ -825,17 +816,12 @@ void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
             }
             auto header = decode_pack_header(*bytes);
             if (!header) {
-                // Two shapes reach here. A power loss between write() and the
-                // domain's syncfs can leave the file extended by a header whose
-                // block never held one (zero-filled or partial): nothing was
-                // acknowledged past this point and nothing decodable follows,
-                // so the tail is discarded like the other two torn shapes. If a
-                // decodable record does follow, the damage is inside the pack;
-                // the unreadable span is skipped and left as dead bytes for
-                // compaction, and the objects it held are repaired from
-                // replicas. Neither shape takes the backend offline: until
-                // 0.38.3 both threw, and one such header at a pack tail cost
-                // gbni-1 its whole 8 TB backend (2026-09-12).
+                // An undecodable header with nothing decodable after it is a
+                // torn tail (power loss before syncfs; nothing acknowledged)
+                // and is discarded. If a decodable record follows, the damage
+                // is inside the pack: the span is skipped as dead bytes and its
+                // objects repaired from replicas. Neither takes the backend
+                // offline.
                 const bool zero_header = std::all_of(bytes->begin(), bytes->end(),
                                                      [](uint8_t b) { return b == 0; });
                 const auto next = find_next_pack_header(fd, offset + 1, file_size);
@@ -919,9 +905,8 @@ void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
 bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> data,
                                   StoreWriteDurability durability, uint64_t* deferred_generation,
                                   std::unique_lock<std::mutex>& lock) {
-    // Encryption and physical I/O are object-scoped work. Reserve capacity and
-    // make crash accounting dirty under the short store lock, then let unrelated
-    // object reads/writes proceed while this object is sealed and installed.
+    // Reserve capacity and mark accounting dirty under m_, then seal and
+    // install under the object's lock only.
     constexpr uint64_t loose_header_size = M.size() + sizeof(uint64_t) + 12 + 16;
     const uint64_t need = loose_header_size + data.size();
     if (!physical_space_available_locked(need)) return false;
@@ -1534,9 +1519,8 @@ bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
     if (enumerate_error)
         throw std::runtime_error("cannot enumerate source packs: " + enumerate_error.message());
 
-    // The cached counter is only an admission hint. Derive the authoritative
-    // value from the current index/files before selecting a victim so recovery
-    // from an interrupted previous compaction cannot leave dead bytes hidden.
+    // The cached counter is only an admission hint; recompute from the index
+    // so an interrupted compaction cannot leave dead bytes hidden.
     auto victim = std::max_element(packs.begin(), packs.end(), [](const PackUsage& a,
                                                                   const PackUsage& b) {
         if (a.dead != b.dead)
@@ -1549,9 +1533,8 @@ bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
         return true;
     }
 
-    // One maintenance invocation rewrites at most one source pack. Temporary
-    // space is therefore bounded by that pack's live bytes rather than the live
-    // size of the entire DATA store.
+    // At most one source pack per call, so temporary space is bounded by that
+    // pack's live bytes.
     std::error_code space_error;
     const auto space = std::filesystem::space(root_, space_error);
     if (space_error)

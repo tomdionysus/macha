@@ -53,8 +53,8 @@ FsEntry make_directory(uint64_t seed) {
     return entry;
 }
 
-// A namespace with the shape a media library actually has: deeply nested,
-// unbalanced, a few very large files and a long tail of small ones.
+// A media library's shape: deeply nested, unbalanced, a few very large files
+// and a long tail of small ones.
 std::map<std::string, FsEntry> library(size_t shows, size_t episodes_per_show) {
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
@@ -65,8 +65,7 @@ std::map<std::string, FsEntry> library(size_t shows, size_t episodes_per_show) {
         for (size_t e = 0; e < episodes_per_show; ++e) {
             const auto season = show + "/Season " + std::to_string(e % 4 + 1);
             entries[season] = make_directory(200 + s * 10 + e);
-            // Every 16th episode is a feature-length file with enough extents
-            // to force an external list.
+            // Every 16th episode has enough extents to force an external list.
             const size_t extents = (s * episodes_per_show + e) % 16 == 0 ? 600 : 3;
             entries[season + "/Episode " + std::to_string(e) + ".mkv"] =
                 make_file(1000 + s * 100 + e, extents);
@@ -78,8 +77,7 @@ std::map<std::string, FsEntry> library(size_t shows, size_t episodes_per_show) {
 MACHA_TEST("namespace_tree", test_the_tree_round_trips_every_namespace_it_is_given) {
     MemoryNamespaceNodeStore store;
 
-    // The empty namespace is a tree like any other, so a fresh cluster is not a
-    // special case at the call site.
+    // The empty namespace is a tree like any other.
     const auto empty_root = build_namespace_tree({}, store);
     CHECK(read_namespace_tree(empty_root, store).empty());
 
@@ -89,19 +87,15 @@ MACHA_TEST("namespace_tree", test_the_tree_round_trips_every_namespace_it_is_giv
     REQUIRE(read_back.size() == entries.size());
     CHECK(read_back == entries);
 
-    // Including the entries whose extent lists were externalised: a 600-extent
-    // file has to come back with all 600, in order.
+    // Externalised extent lists come back whole and in order.
     const auto& original = entries.at("/TV/Show 0/Season 1/Episode 0.mkv");
     REQUIRE(original.extents.size() == 600);
     CHECK(read_back.at("/TV/Show 0/Season 1/Episode 0.mkv").extents == original.extents);
 }
 
 MACHA_TEST("namespace_tree", test_the_root_is_a_function_of_the_entry_set_and_nothing_else) {
-    // History independence. Once metadata_namespace_signature and cache_record's
-    // entries-comparison witness become root comparisons, two nodes that
-    // reconcile independently to the same namespace must produce the same root
-    // or they will report divergence that does not exist. A tree whose shape
-    // depended on the order of insertions and deletions could not do that.
+    // History independence: nodes reaching the same namespace by different
+    // insertions and deletions must produce the same root.
     const auto entries = library(8, 7);
 
     MemoryNamespaceNodeStore direct;
@@ -117,16 +111,12 @@ MACHA_TEST("namespace_tree", test_the_root_is_a_function_of_the_entry_set_and_no
 
     CHECK(direct_root == detour_root);
 
-    // And a different store, built from scratch, agrees: the root addresses
-    // content, not a particular replica's history.
+    // A different store, built from scratch, agrees.
     MemoryNamespaceNodeStore elsewhere;
     CHECK(build_namespace_tree(detour, elsewhere) == direct_root);
 }
 
 MACHA_TEST("namespace_tree", test_changing_one_file_rewrites_a_path_to_the_root_and_not_the_library) {
-    // This is the measurement Stage B exists to produce. Today a single file
-    // write re-serialises and re-hashes the whole namespace; the question is
-    // what it costs against a tree.
     auto entries = library(40, 12);
     MemoryNamespaceNodeStore store;
     const auto before_root = build_namespace_tree(entries, store);
@@ -144,26 +134,20 @@ MACHA_TEST("namespace_tree", test_changing_one_file_rewrites_a_path_to_the_root_
     const auto rewritten = store.written().size();
     REQUIRE(rewritten > 0);
 
-    // The whole point: the cost of a write is the depth of the tree, not the
-    // size of the library. Ten nodes against a library of hundreds is the
-    // claim; the exact figure varies with the boundary hashes, so assert the
-    // order of magnitude rather than a number that would pin the hash function.
+    // A write costs the tree's depth, not the library's size; the exact count
+    // depends on boundary hashes, so assert the order of magnitude.
     CHECK(rewritten <= 12);
     CHECK(rewritten * 20 < whole_library_nodes);
     CHECK(whole_library_bytes > 0);
 
-    // And the value that changed is what comes back.
+    // The changed value is what comes back.
     const auto read_back = read_namespace_tree(after_root, store);
     CHECK(read_back.at("/TV/Show 17/Season 2/Episode 5.mkv").mtime_ns == entry.mtime_ns);
 }
 
 MACHA_TEST("namespace_tree", test_appending_an_extent_does_not_rewrite_the_extent_list) {
-    // Extent chunk boundaries are decided by each extent's own content address
-    // rather than by position, so appending cannot move the boundaries of the
-    // extents already written. Without that, every write to a large file would
-    // rewrite its whole extent list -- which is the pathology
-    // record_entry_change already goes out of its way to avoid at the delta
-    // level (src/metadata/metadata.cpp:483-501).
+    // Extent chunk boundaries follow each extent's content address, not its
+    // position, so an append cannot move the boundaries already written.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     entries["/film.mkv"] = make_file(7, 4000);
@@ -184,10 +168,8 @@ MACHA_TEST("namespace_tree", test_appending_an_extent_does_not_rewrite_the_exten
     const auto root = build_namespace_tree(entries, store);
     const auto rewritten = store.written().size();
 
-    // Measured: 4,000 extents is 15 nodes, and the append rewrites 3 of them --
-    // the tail chunk the new extent joined, the extent spine above it, and the
-    // leaf carrying the entry. Bounded by the depth of the file's extent tree,
-    // not by how many extents it has.
+    // The append rewrites the tail chunk, the spine above it and the entry's
+    // leaf: bounded by the extent tree's depth, not its size.
     CHECK(rewritten <= 5);
     CHECK(rewritten < whole_file_nodes / 3);
     CHECK(read_namespace_tree(root, store).at("/film.mkv").extents == film.extents);
@@ -204,8 +186,7 @@ MACHA_TEST("namespace_tree", test_a_lookup_reads_a_path_to_the_root_rather_than_
         CHECK(*found == entry);
     }
 
-    // Absent paths, including ones that sort before everything, between two
-    // leaves, and after everything.
+    // Absent paths sorting before everything, between leaves, and after everything.
     CHECK(!namespace_tree_lookup(root, "", store).has_value());
     CHECK(!namespace_tree_lookup(root, "/AAA", store).has_value());
     CHECK(!namespace_tree_lookup(root, "/TV/Show 3/Season 1/Episode 999.mkv", store).has_value());
@@ -213,11 +194,8 @@ MACHA_TEST("namespace_tree", test_a_lookup_reads_a_path_to_the_root_rather_than_
 }
 
 MACHA_TEST("namespace_tree", test_a_leaf_stays_small_however_many_extents_a_file_has) {
-    // The residency claim. A leaf holds stat data and, past a threshold, a
-    // reference -- so a film with thousands of extents does not put hundreds of
-    // kilobytes inside the node a path lookup has to read. Without this, Stage D
-    // (demand-loaded extents) would need another format change rather than a
-    // change of when a node is fetched.
+    // A leaf holds stat data and, past a threshold, a reference to the extent
+    // list, so a lookup never reads a film's extents inline.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     entries["/small.mkv"] = make_file(1, 4);
@@ -231,39 +209,19 @@ MACHA_TEST("namespace_tree", test_a_leaf_stays_small_however_many_extents_a_file
     CHECK(stats.extents == 12504);
     REQUIRE(stats.extent_nodes > 0);
 
-    // 12,500 extents is 612 KB at the 49 bytes each costs in the snapshot
-    // today. No node in the tree comes close to that.
+    // 12,500 extents inline would be hundreds of kilobytes.
     CHECK(stats.largest_node_bytes < 64 * 1024);
 
-    // The small file's extents stayed inline, so an ordinary file is still one
-    // node rather than two.
+    // A small file's extents stay inline: one node, not two.
     const auto read_back = read_namespace_tree(root, store);
     CHECK(read_back.at("/small.mkv").extents.size() == 4);
     CHECK(read_back.at("/huge.mkv").extents.size() == 12500);
 }
 
 MACHA_TEST("namespace_tree", test_a_corrupt_node_is_refused_rather_than_trusted) {
-    // The acceptance the plan owed Stage B, in the shape of the FUSE journal
-    // fuzz: corrupt any byte of any node and the reader must refuse it, not
-    // trust it. Nodes come from the content-addressed control store, so a
-    // corrupt or forged one is the input this decoder actually has to survive
-    // once SM14 makes it reachable from a record.
-    //
-    // A defect was found while writing this, and honesty about which found it
-    // matters: reading the decoder did, not this test. The external-extent
-    // branch read a uint64 count from the node and reserved against it, capped
-    // at 10,000,000 -- 560 MB at the 56 bytes an ExtentRef occupies, sized
-    // from an unvalidated integer. Every other reserve in that file is bounded
-    // by `reader.remaining()`; that one could not be, because the extents live
-    // in other nodes. It is now not reserved at all.
-    //
-    // This test would probably NOT have caught it. Corrupting that count makes
-    // the old code allocate half a gigabyte and carry on succeeding, which
-    // looks identical to passing. A fuzz case catches crashes, hangs and
-    // accepted garbage; it does not catch "worked, expensively". Worth knowing
-    // before anyone treats a green fuzz run as evidence that a decoder is
-    // safe against forged sizes -- for that, read every reserve and ask what
-    // bounds it.
+    // Nodes come from the control store, so a corrupt or forged one must be
+    // refused, not trusted. This catches crashes, hangs and accepted garbage,
+    // not an oversized allocation that still succeeds.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     entries["/a.mkv"] = make_file(1, 3);
@@ -276,9 +234,8 @@ MACHA_TEST("namespace_tree", test_a_corrupt_node_is_refused_rather_than_trusted)
     const auto clean = read_namespace_tree(root, store);
     REQUIRE(clean.size() == entries.size());
 
-    // Every node, every byte position, one bit flipped. The reader may throw,
-    // may return something smaller, may refuse the lookup -- what it must not
-    // do is crash, hang, or size an allocation from the damaged bytes.
+    // One bit flipped at every byte of every node: the reader may throw, return
+    // less or refuse the lookup, but must not crash or hang.
     size_t nodes_tried = 0;
     size_t refused = 0;
     size_t survived = 0;
@@ -293,9 +250,7 @@ MACHA_TEST("namespace_tree", test_a_corrupt_node_is_refused_rather_than_trusted)
             for (const auto& other : store.written()) {
                 auto bytes = store.get(other);
                 REQUIRE(bytes);
-                // Re-store under the ORIGINAL id, so the corruption is
-                // reachable rather than simply becoming a different node that
-                // nothing points at.
+                // Re-store under the original id, so the corruption is reachable.
                 broken.put_at(other, other == id ? damaged : *bytes);
             }
             try {
@@ -316,14 +271,9 @@ MACHA_TEST("namespace_tree", test_a_corrupt_node_is_refused_rather_than_trusted)
 }
 
 MACHA_TEST("namespace_tree", test_a_stat_only_lookup_fetches_no_extent_nodes) {
-    // The claim the whole structure rests on, made provable by counting reads
-    // rather than asserted in a comment: a getattr fetches the path from the
-    // root to one leaf and nothing else. Not the namespace, and not a single
-    // extent node -- neither the target's nor those of the entries the leaf
-    // scan walks past on the way to it.
-    //
-    // A library of films, so every entry has an external extent spine and any
-    // accidental extent fetch shows up immediately.
+    // A getattr reads the root-to-leaf path and nothing else: no extent node,
+    // the target's or a neighbour's. Every entry has an external spine, so any
+    // extent fetch shows up in the read count.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     for (int i = 0; i < 200; ++i)
@@ -335,22 +285,16 @@ MACHA_TEST("namespace_tree", test_a_stat_only_lookup_fetches_no_extent_nodes) {
     REQUIRE(shape.extent_nodes > 0);
     REQUIRE(shape.depth >= 2);
 
-    // Stat only.
     store.forget_reads();
     const auto stat = namespace_tree_lookup(root, "/film137.mkv", store, false);
     const auto stat_reads = store.reads();
     REQUIRE(stat);
     CHECK(stat->size == entries.at("/film137.mkv").size);
-    // The stat answer carries no extents, by construction.
     CHECK(stat->extents.empty());
-    // One node per level and no more. Depth is small and bounded by log n,
-    // which is the entire point -- the library has 201 entries and thousands
-    // of extents behind them.
+    // One node per level and no more.
     CHECK(stat_reads <= shape.depth);
 
-    // The same lookup asking for extents pays for them, which is how we know
-    // the first one was actually avoiding work rather than the tree being
-    // empty of extent nodes.
+    // Asking for extents pays for them, so the stat-only lookup avoided real work.
     store.forget_reads();
     const auto full = namespace_tree_lookup(root, "/film137.mkv", store, true);
     const auto full_reads = store.reads();
@@ -358,17 +302,14 @@ MACHA_TEST("namespace_tree", test_a_stat_only_lookup_fetches_no_extent_nodes) {
     CHECK(full->extents.size() == 400);
     CHECK(full_reads > stat_reads);
 
-    // And a stat for a path that is not there is equally cheap: it settles on
-    // the leaf without descending into anything.
+    // A stat for an absent path is equally cheap.
     store.forget_reads();
     CHECK(!namespace_tree_lookup(root, "/absent.mkv", store, false));
     CHECK(store.reads() <= shape.depth);
 }
 
-// A snapshot with every field SM14 has to carry populated, so a round trip
-// proves the format preserves the record and not merely the namespace. The
-// entries are the caller's; everything else here is cluster state that must
-// survive the re-rooting untouched.
+// A snapshot with every SM14 field populated, so a round trip proves the whole
+// record survives, not merely the namespace.
 MetadataSnapshot populated_snapshot(std::map<std::string, FsEntry> entries) {
     MetadataSnapshot snapshot;
     snapshot.entries = std::move(entries);
@@ -423,8 +364,6 @@ MetadataSnapshot populated_snapshot(std::map<std::string, FsEntry> entries) {
 }
 
 MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead_of_carrying_it) {
-    // The Stage B deliverable: the record shape. Everything before this built
-    // a tree nothing could reach; this is the encoding that reaches it.
     const auto entries = library(20, 10);
     const auto snapshot = populated_snapshot(entries);
     const auto sm13 = encode_snapshot(snapshot);
@@ -435,27 +374,18 @@ MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead
     CHECK(detached.entries.empty());
     const auto sm14 = encode_snapshot_v14(detached);
 
-    // The number this stage exists for. The SM13 payload is the library; the
-    // SM14 payload is the cluster's own state plus a 32-byte pointer at it.
-    // Measured on this fixture: 434,731 bytes against 590, for 302 entries.
-    // The ratio is asserted rather than either size, because the ratio is the
-    // claim and it has no ceiling -- es-1's real head is 22,525,100 SM13 bytes
-    // against the same ~590.
+    // SM13 carries the library; SM14 carries cluster state plus a 32-byte root.
     CHECK(sm14.size() < 1024);
     CHECK(sm13.size() > 100 * sm14.size());
 
-    // Read it back with no store in sight -- which is the point: decoding a
-    // record no longer materialises a namespace.
+    // Decoding needs no store: a record does not materialise its namespace.
     const auto decoded = decode_snapshot(sm14);
     REQUIRE(decoded.namespace_root.has_value());
     CHECK(*decoded.namespace_root == *detached.namespace_root);
     CHECK(decoded.entries.empty());
 
-    // Nothing else moved. Re-encoding the reattached snapshot as SM13 has to
-    // reproduce the original payload byte for byte, which covers every field
-    // individually without listing them: garbage, node status, identity
-    // resets, merge parents, the write floor, the participant roster, the
-    // branch floor and the retention baseline.
+    // Re-encoding the reattached snapshot as SM13 reproduces the original
+    // payload byte for byte, covering every other field.
     const auto reattached = attach_namespace(decoded, store);
     CHECK(reattached.entries == entries);
     CHECK(!reattached.namespace_root.has_value());
@@ -463,10 +393,7 @@ MACHA_TEST("namespace_tree", test_an_sm14_record_points_at_the_namespace_instead
 }
 
 MACHA_TEST("namespace_tree", test_the_record_stops_growing_with_the_library) {
-    // Stated as a property rather than a measurement, because it is the whole
-    // claim: a commit's cost has to stop being a function of how much media
-    // the cluster holds. Two libraries an order of magnitude apart, one
-    // payload size.
+    // Two libraries an order of magnitude apart encode to one payload size.
     MemoryNamespaceNodeStore small_store, large_store;
     const auto small = encode_snapshot_v14(
         detach_namespace(populated_snapshot(library(2, 4)), small_store));
@@ -474,8 +401,7 @@ MACHA_TEST("namespace_tree", test_the_record_stops_growing_with_the_library) {
         detach_namespace(populated_snapshot(library(40, 20)), large_store));
 
     CHECK(small.size() == large.size());
-    // And the two are the same record apart from where they point, so the
-    // difference between them is exactly one content address.
+    // They differ only in the root's content address.
     size_t differing = 0;
     for (size_t i = 0; i < small.size(); ++i)
         if (small[i] != large[i])
@@ -484,10 +410,7 @@ MACHA_TEST("namespace_tree", test_the_record_stops_growing_with_the_library) {
 }
 
 MACHA_TEST("namespace_tree", test_a_snapshot_never_carries_its_namespace_in_two_places) {
-    // A record with both forms populated would let them disagree, and no
-    // reader would have a rule for which one is the namespace. Every path into
-    // that state is closed, and the closure is what stops a half-migrated
-    // snapshot publishing an empty library under a valid-looking hash.
+    // A record never holds both a map and a root, which could disagree.
     MemoryNamespaceNodeStore store;
     const auto snapshot = populated_snapshot(library(2, 2));
     const auto detached = detach_namespace(snapshot, store);
@@ -527,9 +450,8 @@ MACHA_TEST("namespace_tree", test_a_snapshot_never_carries_its_namespace_in_two_
     }
     CHECK(refused);
 
-    // A namespace with no root directory is not a filesystem. SM13's decoder
-    // checks that on every read; SM14's cannot, because it has no store, so
-    // the check moved to the reader that does.
+    // A namespace with no root directory is refused; for SM14 the reader with
+    // the store checks it, since the decoder has none.
     std::map<std::string, FsEntry> rootless;
     rootless["/a.mkv"] = make_file(1, 2);
     MemoryNamespaceNodeStore rootless_store;
@@ -544,9 +466,7 @@ MACHA_TEST("namespace_tree", test_a_snapshot_never_carries_its_namespace_in_two_
 }
 
 MACHA_TEST("namespace_tree", test_a_stat_against_a_decoded_record_never_materialises_the_namespace) {
-    // The two halves joined: a record off the wire, and a getattr answered
-    // from it without the library ever existing as a map. This is what Stage C
-    // converts the FUSE path to, and it is already true here.
+    // A getattr answered from a decoded record without materialising the map.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     for (int i = 0; i < 200; ++i)
@@ -567,10 +487,8 @@ MACHA_TEST("namespace_tree", test_a_stat_against_a_decoded_record_never_material
 }
 
 MACHA_TEST("namespace_tree", test_a_damaged_record_is_refused_rather_than_trusted) {
-    // The record is the one part of this that arrives from the network, so its
-    // decoder gets the same treatment the node decoder got: flip a bit at
-    // every position and require refusal or coping, never a crash, a hang or
-    // an allocation sized from the damaged bytes.
+    // The record arrives from the network: a bit flipped at every position must
+    // be refused or survived, never crash or hang.
     MemoryNamespaceNodeStore store;
     const auto payload = encode_snapshot_v14(detach_namespace(populated_snapshot(library(2, 2)), store));
 
@@ -581,33 +499,25 @@ MACHA_TEST("namespace_tree", test_a_damaged_record_is_refused_rather_than_truste
         try {
             const auto decoded = decode_snapshot(damaged);
             ++accepted;
-            // Anything that decodes is still a record that points somewhere
-            // rather than one that carries a namespace; a flipped byte must
-            // never produce entries out of nothing.
+            // Anything that decodes still points at a root and carries no entries.
             CHECK(decoded.entries.empty());
             CHECK(decoded.namespace_root.has_value());
         } catch (const std::exception&) {
             ++refused;
         }
     }
-    // A flip in the root address or a node id decodes cleanly and addresses
-    // something that is not there -- that is the content-addressing doing its
-    // job one layer down, not a decoder failure. What matters is that the
-    // structural fields are checked, and they are.
+    // A flip in an address decodes cleanly (the missing node is caught a layer
+    // down); structural fields are checked.
     CHECK(refused > 0);
     CHECK(refused + accepted == payload.size());
 }
 
 MACHA_TEST("namespace_tree", test_a_snapshot_handed_to_a_reader_names_its_namespace_once) {
-    // The invariant the view boundary keeps. A snapshot with both a root and a
-    // map would let the two disagree and let every reader choose which one to
-    // believe; the encoders refuse to write that state and the manager refuses
-    // to hand it out.
+    // A snapshot handed to a reader has a root or a map, never both.
     MemoryNamespaceNodeStore store;
     const auto snapshot = populated_snapshot(library(2, 2));
 
-    // Either form alone is fine, including the empty namespace: a cluster with
-    // no files is not the same thing as a namespace that is somewhere else.
+    // Either form alone is fine, including the empty namespace.
     require_coherent_namespace(snapshot);
     require_coherent_namespace(MetadataSnapshot{});
     const auto detached = detach_namespace(snapshot, store);
@@ -627,10 +537,7 @@ MACHA_TEST("namespace_tree", test_a_snapshot_handed_to_a_reader_names_its_namesp
 }
 
 MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_form) {
-    // What the converted reachability sites depend on: the primitives give the
-    // same answer whichever form the namespace is in, so a reader that uses
-    // them works before and after the cutover and cannot be quietly wrong on
-    // one side of it.
+    // The primitives give the same answer whichever form the namespace is in.
     const auto entries = library(6, 5);
     const auto attached = populated_snapshot(entries);
     MemoryNamespaceNodeStore store;
@@ -652,8 +559,7 @@ MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_for
                              [&](const std::string& path, const FsEntry&) { order.push_back(path); });
     CHECK(std::is_sorted(order.begin(), order.end()));
 
-    // And the point lookup agrees with both, including for a path that is not
-    // there.
+    // The point lookup agrees in both forms, including for an absent path.
     for (const auto& [path, entry] : entries) {
         const auto by_map = namespace_entry(attached, nullptr, path);
         const auto by_tree = namespace_entry(detached, &store, path);
@@ -667,10 +573,8 @@ MACHA_TEST("namespace_tree", test_a_reader_sees_the_same_namespace_in_either_for
 }
 
 MACHA_TEST("namespace_tree", test_a_detached_namespace_without_a_store_refuses_rather_than_reporting_empty) {
-    // The failure mode the primitives exist to remove. Before them, a
-    // reachability walk over a detached snapshot visited nothing and reported
-    // success, which reads as "no object in this library is live" -- the exact
-    // input destructive GC wants. It must be an error, and a named one.
+    // A walk over a detached snapshot with no store must fail with a named
+    // error, not report an empty (all-dead) library.
     MemoryNamespaceNodeStore store;
     const auto detached = detach_namespace(populated_snapshot(library(2, 2)), store);
 
@@ -695,17 +599,9 @@ MACHA_TEST("namespace_tree", test_a_detached_namespace_without_a_store_refuses_r
 }
 
 MACHA_TEST("namespace_tree", test_an_incremental_update_produces_the_tree_a_rebuild_would) {
-    // The property the commit path rests on, asserted rather than argued: an
-    // update applied to an existing root produces the SAME root a full build
-    // over the resulting namespace produces. Not an equivalent tree -- the
-    // same 32 bytes. Two nodes that reach one namespace by different routes
-    // must agree, or the root comparison that replaces
-    // metadata_namespace_signature reports divergence that does not exist.
-    //
-    // Random change sets rather than chosen ones, because the cases that break
-    // this are the ones nobody thinks to write: a delete that empties a leaf,
-    // an insert that lands on a boundary key and splits one, a run long enough
-    // for the count cap to decide where the split goes.
+    // An update to an existing root produces the same root as a full build of
+    // the result. Random change sets reach leaf-emptying deletes, boundary
+    // inserts and count-cap splits.
     auto entries = library(8, 6);
     MemoryNamespaceNodeStore store;
     auto root = build_namespace_tree(entries, store);
@@ -729,8 +625,7 @@ MACHA_TEST("namespace_tree", test_an_incremental_update_produces_the_tree_a_rebu
                     continue;
                 changes[it->first] = std::nullopt;
             } else if (pick == 1 && !entries.empty()) {
-                // Change a value in place: the common case, and the one that
-                // must rewrite exactly one leaf.
+                // Change a value in place.
                 auto it = entries.begin();
                 std::advance(it, static_cast<ptrdiff_t>(next() % entries.size()));
                 auto updated = it->second;
@@ -762,13 +657,12 @@ MACHA_TEST("namespace_tree", test_an_incremental_update_produces_the_tree_a_rebu
             break;
     }
 
-    // And the namespace really is what the changes said it should be.
+    // The namespace is what the changes said it should be.
     CHECK(read_namespace_tree(root, store) == entries);
 }
 
 MACHA_TEST("namespace_tree", test_a_write_rewrites_a_path_rather_than_the_library) {
-    // What the update costs, measured. One ordinary write -- an mtime and a
-    // size on one file -- against a library of 302 entries.
+    // One ordinary write (mtime and size on one file) against a large library.
     auto entries = library(120, 20);
     MemoryNamespaceNodeStore store;
     auto root = build_namespace_tree(entries, store);
@@ -782,23 +676,14 @@ MACHA_TEST("namespace_tree", test_a_write_rewrites_a_path_rather_than_the_librar
     root = update_namespace_tree(root, store, {{"/TV/Show 7/Season 2/Episode 5.mkv", changed}});
     const auto written = store.written().size();
 
-    // Measured: **3 new nodes out of 102** (96 leaves, 6 branches) on a
-    // 2,520-entry library -- the leaf holding the key and the two branches
-    // above it, which is exactly the path from the root.
-    //
-    // The spine is recomputed over the whole leaf sequence rather than
-    // spliced, and it costs nothing to do so: an unchanged branch node
-    // re-encodes to the same bytes and therefore the same content address, so
-    // it is not a new node and nothing replicates it. What the recompute costs
-    // is local reads and CPU over the branch nodes, not write amplification,
-    // and that is the distinction that decides whether local splicing is worth
-    // writing.
+    // New nodes are exactly the path from the root. The spine is recomputed,
+    // not spliced, but unchanged branches re-encode to the same address, so
+    // they are not new nodes.
     CHECK(written == shape.depth);
     CHECK(written < shape.leaves);
     CHECK(read_namespace_tree(root, store).at("/TV/Show 7/Season 2/Episode 5.mkv") == changed);
 
-    // Nothing else moved: every other entry is still the entry it was, and the
-    // unchanged leaves kept their content addresses.
+    // Every other entry is unchanged, and unchanged leaves keep their addresses.
     auto after = read_namespace_tree(root, store);
     CHECK(after.size() == entries.size());
     entries["/TV/Show 7/Season 2/Episode 5.mkv"] = changed;
@@ -806,20 +691,15 @@ MACHA_TEST("namespace_tree", test_a_write_rewrites_a_path_rather_than_the_librar
 }
 
 MACHA_TEST("namespace_tree", test_a_delta_applied_to_the_tree_lands_where_the_map_lands) {
-    // The commit path's half of the property: the delta a mutation already
-    // carries, applied to the tree, produces the root a build over the map
-    // with the same delta applied produces. The two applications cannot
-    // disagree about order, about an append's base, or about a path erased and
-    // re-created in one delta, because this test would catch it.
+    // A mutation's delta applied to the tree gives the root a build over the
+    // map with the same delta gives.
     auto entries = library(10, 6);
     MemoryNamespaceNodeStore store;
     auto root = build_namespace_tree(entries, store);
     MetadataSnapshot mapped;
     mapped.entries = entries;
 
-    // A file with an external extent spine, found rather than assumed: the
-    // fixture gives every sixteenth entry 600 extents and which path that is
-    // depends on the library's shape.
+    // Find a file with an external extent spine.
     std::string appended;
     for (const auto& [path, entry] : entries)
         if (entry.extents.size() == 600) {
@@ -855,10 +735,7 @@ MACHA_TEST("namespace_tree", test_a_delta_applied_to_the_tree_lands_where_the_ma
     CHECK(read_namespace_tree(updated, store) == mapped.entries);
     CHECK(read_namespace_tree(updated, store).at(appended).extents.size() == 602);
 
-    // A delta whose append base does not match what is there is refused, not
-    // applied to whatever happens to be at the path -- the same refusal the
-    // map path makes, because a delta against a different namespace is not a
-    // delta this tree can take.
+    // A delta whose append base does not match is refused, as the map path refuses it.
     MetadataDelta wrong;
     MetadataDelta::EntryAppend mismatched = append;
     mismatched.base_extents = 599;
@@ -873,10 +750,7 @@ MACHA_TEST("namespace_tree", test_a_delta_applied_to_the_tree_lands_where_the_ma
 }
 
 MACHA_TEST("namespace_tree", test_history_replay_applies_a_delta_to_the_tree_not_the_map) {
-    // A record whose history cannot be replayed is the 2026-09-06 outage
-    // shape: durably written, hash-verified, and unreadable the moment it
-    // leaves the materialisation cache. So replay over a tree-backed namespace
-    // has to work before anything may author one.
+    // History replay over a tree-backed namespace applies the delta to the tree.
     auto entries = library(6, 4);
     MemoryNamespaceNodeStore store;
     MetadataSnapshot mapped = populated_snapshot(entries);
@@ -889,9 +763,8 @@ MACHA_TEST("namespace_tree", test_history_replay_applies_a_delta_to_the_tree_not
     delta.upsert_entries["/TV/Show 0/Season 1/late.mkv"] = make_file(31337, 5);
     delta.erase_entries.push_back("/TV/Show 4/Season 2/Episode 1.mkv");
 
-    // Without an applier there is no node store, and the delta is refused
-    // rather than applied to an empty map while the root goes on addressing
-    // the namespace as it was.
+    // Without an applier (no node store) the delta is refused, not applied to
+    // an empty map.
     bool refused = false;
     try {
         auto victim = tree_backed;
@@ -907,25 +780,21 @@ MACHA_TEST("namespace_tree", test_history_replay_applies_a_delta_to_the_tree_not
                                   });
     apply_metadata_delta_in_place(mapped, delta);
 
-    // The replayed record is still tree-backed, carries no map, and addresses
-    // exactly the namespace the map form reached.
+    // The replayed record stays tree-backed and matches the map form's namespace.
     REQUIRE(tree_backed.namespace_root.has_value());
     CHECK(tree_backed.entries.empty());
     MemoryNamespaceNodeStore fresh;
     CHECK(*tree_backed.namespace_root == build_namespace_tree(mapped.entries, fresh));
     CHECK(read_namespace_tree(*tree_backed.namespace_root, store) == mapped.entries);
 
-    // And the non-entry fields moved exactly as they do in the map form, so
-    // replay is not quietly special-casing a tree-backed record.
+    // Non-entry fields move exactly as in the map form.
     CHECK(tree_backed.mutation_sequences == mapped.mutation_sequences);
     CHECK(tree_backed.garbage == mapped.garbage);
 }
 
 MACHA_TEST("namespace_tree", test_a_stat_only_read_costs_no_extents_in_either_form) {
-    // FUSE path resolution is the hottest read in the filesystem and it asks
-    // only whether a key exists. Before the primitives it was a map lookup
-    // that copied nothing; it must not become one that copies a film's extent
-    // list, and on a tree it must not fetch one either.
+    // Path resolution, the hottest read, must neither copy (map) nor fetch
+    // (tree) a file's extent list.
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
     entries["/film.mkv"] = make_file(1, 12500);
@@ -942,9 +811,7 @@ MACHA_TEST("namespace_tree", test_a_stat_only_read_costs_no_extents_in_either_fo
     const auto contains_reads = store.reads();
     CHECK(!namespace_contains(detached, &store, "/missing.mkv"));
 
-    // A stat-only entry read carries no extents, from the map as well as from
-    // the tree: a caller that asked not to pay for them is not handed a copy
-    // of 12,500 of them because this snapshot happens to be a map.
+    // A stat-only read carries no extents from either form.
     const auto stat_from_map = namespace_entry(attached, nullptr, "/film.mkv", false);
     REQUIRE(stat_from_map.has_value());
     CHECK(stat_from_map->extents.empty());
@@ -956,8 +823,7 @@ MACHA_TEST("namespace_tree", test_a_stat_only_read_costs_no_extents_in_either_fo
     CHECK(stat_from_tree->extents.empty());
     CHECK(store.reads() == contains_reads);
 
-    // And asking for extents costs more than not asking, which is how we know
-    // the cheap path was avoiding work rather than there being none to do.
+    // Asking for extents costs more, so the stat-only path avoided real work.
     store.forget_reads();
     const auto full = namespace_entry(detached, &store, "/film.mkv", true);
     REQUIRE(full.has_value());
@@ -966,10 +832,8 @@ MACHA_TEST("namespace_tree", test_a_stat_only_read_costs_no_extents_in_either_fo
 }
 
 MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the_library) {
-    // A directory listing and the catalogue's root scan are prefix queries.
-    // The tree is keyed by path precisely so they can descend to the prefix
-    // instead of reading everything and discarding most of it -- that is the
-    // reason the design rejected hashing keys the way the catalogue shards do.
+    // The tree is keyed by path so prefix queries descend to the prefix
+    // instead of reading everything.
     const auto entries = library(30, 8);
     const auto attached = populated_snapshot(entries);
     MemoryNamespaceNodeStore store;
@@ -998,9 +862,7 @@ MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the
     CHECK(from_map == expected);
     CHECK(from_tree == expected);
 
-    // And it cost a fraction of the library. The comparison is against the
-    // full walk on the same tree, so it measures descending rather than
-    // hardware.
+    // It reads a fraction of what a full walk of the same tree reads.
     store.forget_reads();
     size_t walked = 0;
     for_each_namespace_entry(detached, &store,
@@ -1009,8 +871,7 @@ MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the
     CHECK(walked == entries.size());
     CHECK(prefix_reads * 4 < full_reads);
 
-    // An empty prefix is every entry, and a prefix nothing matches costs
-    // almost nothing rather than a full walk.
+    // An empty prefix is every entry; an unmatched prefix costs almost nothing.
     size_t all = 0;
     for_each_namespace_entry_with_prefix(detached, &store, "",
                                          [&](const std::string&, const FsEntry&) { ++all; });
@@ -1025,15 +886,8 @@ MACHA_TEST("namespace_tree", test_a_prefix_scan_descends_rather_than_walking_the
 }
 
 MACHA_TEST("namespace_tree", test_every_tree_node_is_reachable_for_the_collector) {
-    // Found on the live cluster on 2026-09-22, six hours after the cutover:
-    // the control-store live set was built from catalogue roots alone, so
-    // every node holding the namespace was, to garbage collection, an
-    // unreferenced object waiting out its grace. A 30-day grace set as a
-    // migration safety net was the only thing between the cluster and
-    // collecting the nodes that say where every file lives.
-    //
-    // So: the collector's set is exactly the set of nodes the build wrote --
-    // branches, leaves, and every extent spine node -- not one fewer.
+    // The collector's set is exactly the nodes the build wrote: branches,
+    // leaves and every extent spine node.
     const auto entries = library(12, 8);
     MemoryNamespaceNodeStore store;
     const auto root = build_namespace_tree(entries, store);
@@ -1053,14 +907,9 @@ MACHA_TEST("namespace_tree", test_every_tree_node_is_reachable_for_the_collector
 }
 
 MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_prunes_the_rest) {
-    // What retention claims need per commit: everything the new root reaches
-    // that the old root did not, found by a parallel walk that never reads a
-    // subtree both sides share. Over-collecting is allowed -- a changed leaf
-    // brings all its spines -- under-collecting is the failure that loses a
-    // file, so the assertion is a superset check against what was actually
-    // written, plus a bound that proves the pruning works.
-    // Large enough that pruning is what decides the count: on a hundred-entry
-    // library one changed leaf and its spines is most of the tree.
+    // A commit claims everything the new root reaches that the old did not,
+    // by a parallel walk that skips shared subtrees. Over-claiming is allowed,
+    // under-claiming is not. The library is large enough for pruning to matter.
     auto entries = library(60, 20);
     MemoryNamespaceNodeStore store;
     const auto before = build_namespace_tree(entries, store);
@@ -1081,11 +930,11 @@ MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_pr
 
     // Every node the commit wrote is claimed.
     CHECK(std::includes(claimed.begin(), claimed.end(), written.begin(), written.end()));
-    // And the walk pruned: it claimed far fewer nodes than the tree holds.
+    // The walk pruned: far fewer nodes than the tree holds.
     const auto total = before_shape.leaves + before_shape.branches + before_shape.extent_nodes;
     CHECK(claimed.size() * 4 < total);
 
-    // No `before` at all is the migration case, and then everything is new.
+    // With no `before`, everything is new.
     std::vector<ObjectId> everything;
     collect_namespace_tree_changes(std::nullopt, after, store, everything);
     std::sort(everything.begin(), everything.end());
@@ -1096,8 +945,7 @@ MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_pr
     all.erase(std::unique(all.begin(), all.end()), all.end());
     CHECK(everything == all);
 
-    // An unreadable node fails the walk rather than returning a short list --
-    // a partial live set is what lets the collector delete the namespace.
+    // An unreadable node fails the walk rather than returning a short list.
     MemoryNamespaceNodeStore damaged;
     for (const auto& id : store.written())
         if (auto bytes = store.get(id))

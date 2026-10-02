@@ -3,11 +3,9 @@
 
 namespace macha::miniupnpc_compat {
 
-// MINIUPNPC_API_VERSION 18 changed UPNP_GetValidIGD() to distinguish a
-// connected IGD with a private/reserved WAN address. The documented ABI values
-// are stable, but miniupnpc 2.2.8/API 18 shipped before the corresponding
-// UPNP_CONNECTED_IGD and UPNP_PRIVATEIP_IGD macros were added. Do not make API
-// 18 support depend on those later header aliases.
+// UPNP_GetValidIGD() status values. From API 18 it reports a connected IGD
+// with a private WAN address separately; the values are spelled out because
+// miniupnpc 2.2.8 (API 18) lacks the UPNP_CONNECTED_IGD/UPNP_PRIVATEIP_IGD macros.
 inline constexpr int connected_igd = 1;
 inline constexpr int private_wan_igd = 2;
 

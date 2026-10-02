@@ -10,23 +10,12 @@
 
 namespace macha {
 
-// Admission for a held media request.
-//
-// A hold is an explicitly admitted resource: acquired before waiting, released
-// after, and never an implicit consequence of a thread happening to block.
-// That distinction is what let the wait change underneath it. Until 0.43.0
-// HttpServer ran a fixed worker pool shared by every route, a held request
-// occupied one worker for the whole of its wait, and this budget existed to
-// keep one deeply prefetching player from taking all sixteen and silencing
-// Status. The server now parks a held request as a continuation
-// (HttpDeferral) that costs an fd and a small struct; the policy here is
-// exactly what it was, and the budget is a fairness and memory bound across
-// sessions rather than a thread-protection one. Nothing here assumes a hold
-// costs a thread, and nothing should.
+// Admission for a held media request: acquired before waiting, released after.
+// A held request is parked as an HttpDeferral (an fd and a small struct), so
+// the limits bound fairness and memory across sessions, not threads.
 class SegmentHoldArbiter {
   public:
-    // Why a request was refused, so the refusal can say which limit it met
-    // rather than only that it met one.
+    // Which limit a refused request met.
     enum class Refusal { session_limit, budget_exhausted };
 
     class Hold {
@@ -56,9 +45,7 @@ class SegmentHoldArbiter {
         }
         ~Hold() { reset(); }
 
-        // Releasing is explicit and idempotent. A hold that is never released
-        // is a leaked worker, so this runs from the destructor as well --
-        // including when the wait ends by exception.
+        // Idempotent; also runs from the destructor, so an exception releases it.
         void reset() {
             if (owner_) owner_->release(session_);
             owner_ = nullptr;
@@ -75,18 +62,15 @@ class SegmentHoldArbiter {
         max_total_ = max_concurrent_holds;
     }
 
-    // Never waits. A refusal is immediate by construction: the point of the
-    // limits is that a request the node cannot afford to hold is answered now,
-    // rather than queued behind the ones it is already holding.
+    // Never waits: a request the node cannot afford to hold is refused now,
+    // not queued behind the ones already held.
     std::optional<Hold> try_acquire(std::string_view session, Refusal* why = nullptr) {
         std::lock_guard lock(mutex_);
         std::string key(session);
         auto it = per_session_.find(key);
         const size_t held = it == per_session_.end() ? 0 : it->second;
-        // Per-session first, so a single deeply prefetching player is refused
-        // for exceeding its own share rather than reported as having exhausted
-        // the node -- the 0.32.14 scenario, where a native player queued thirty
-        // requests and waited on the encoder for each of them in turn.
+        // Per-session first, so a deeply prefetching player is refused for
+        // exceeding its own share rather than reported as exhausting the node.
         if (max_session_ == 0 || held >= max_session_) {
             if (why) *why = Refusal::session_limit;
             return std::nullopt;

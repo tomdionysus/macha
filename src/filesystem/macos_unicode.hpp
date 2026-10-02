@@ -6,13 +6,11 @@
 
 namespace macha {
 
-// macFUSE expects names returned from readdir() in Unicode Normalization Form D.
-// This is an adapter/presentation rule only: Macha's persisted namespace strings
-// remain byte-for-byte unchanged for compatibility with existing stores.
+// macFUSE expects readdir() names in NFD. Presentation only: persisted
+// namespace strings are never rewritten.
 std::string macos_fuse_decomposed_name(std::string_view name);
 
-// Canonical lookup form used only for runtime path equivalence on macOS.
-// Persisted namespace strings are never rewritten by this helper.
+// Canonical form for runtime path equivalence on macOS; never persisted.
 std::string macos_fuse_composed_name(std::string_view name);
 
 } // namespace macha

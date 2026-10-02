@@ -319,9 +319,7 @@ MACHA_TEST("filesystem_fuse", test_publication_buffer_admission_fails_only_witho
     REQUIRE(hog.has_value());
 
     // A pipeline where nothing completes fails within the budget rather than
-    // waiting forever. Before this the wait had no deadline at all, so eight
-    // blocked workers held their buffers indefinitely and the failure never
-    // reached the retry-and-park discipline that exists for it.
+    // waiting forever, so the failure reaches retry-and-park.
     std::atomic_uint64_t stalled_progress{0};
     auto stalled = service.filesystem().open_write(
         "/stalled.bin", false, false, WriteDurability::publication_generation, 0,
@@ -606,8 +604,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_overwrite_materialization_yields_between
     CHECK(status.data_publication_completed_source_bytes_read == config.extent_size + 1);
     CHECK(status.data_publication_completed_reused_extents == 3);
     CHECK(status.data_publication_completed_put_extents == 1);
-    // WAL replay yields before extent-aligned rebuild. The four rebuild
-    // checkpoints remain bounded, but whole-file materialisation is gone.
+    // WAL replay yields before the extent-aligned rebuild, which yields at four
+    // bounded checkpoints; the file is never materialised whole.
     CHECK(status.data_publication_yields >= 5);
     auto reader = service.filesystem().open_read("/overwrite.bin");
     Bytes output(contents.size());
@@ -734,9 +732,7 @@ MACHA_TEST("filesystem_fuse", test_fresh_and_resumed_write_exactness) {
     CHECK(read_exact("/fresh.bin", fresh.size()) == fresh);
 
     // --append/--append-verify style resume: an existing committed prefix is
-    // reopened without truncation and writing resumes exactly at EOF.  This is
-    // the case that can otherwise retain a bad prefix or corrupt rematerialised
-    // data without being noticed until rsync's final verification pass.
+    // reopened without truncation and writing resumes exactly at EOF.
     auto resumed = pattern(6 * config.extent_size + 654321);
     const size_t prefix = 2 * config.extent_size + 77777;
     service.filesystem().create_file("/resumed.bin", 0644, getuid(), getgid());
@@ -944,10 +940,9 @@ MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_f
     s1.start();
     REQUIRE(s1.node().wait_local_state_ready(5s));
 
-    // This is deliberately available before the configured metadata write
-    // floor can form. It reflects only the local replica and must not enter the
-    // authoritative MetadataManager path (which would throw MetadataNotReady
-    // and perform discovery/history work).
+    // Available before the metadata write floor forms: it reflects only the
+    // local replica and must not enter MetadataManager, which would throw
+    // MetadataNotReady.
     CHECK(!s1.metadata_manager().available_snapshot_view().has_value());
     const auto local_record = s1.node().metadata_replica().current();
     const auto first_local = s1.filesystem().local_snapshot_view();
@@ -998,10 +993,9 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     c1.heartbeat = c2.heartbeat = 50ms;
     c1.dead_after = c2.dead_after = 500ms;
     c1.maintenance.no_progress_backoff = c2.maintenance.no_progress_backoff = 30s;
-    // This test observes event-driven parking, not credit accrual.  Make the
-    // final bounded startup slice immediately affordable even when parallel
-    // sanitizers inflate process CPU accounting; otherwise a legitimate
-    // one-shot credit deadline can land inside the purported quiet window.
+    // This tests event-driven parking, not credit accrual: make the final
+    // startup slice immediately affordable so no credit deadline lands inside
+    // the quiet window, however CPU accounting is inflated.
     c1.maintenance.initial_bandwidth = c2.maintenance.initial_bandwidth = 1024ULL * 1024 * 1024;
     c1.maintenance.cpu_target = c2.maintenance.cpu_target = 1.0;
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
@@ -1128,11 +1122,9 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         std::this_thread::sleep_for(std::chrono::nanoseconds(before_deadline_ns - 50'000'000));
     CHECK(service.node().local_store().has(retired_ids.back()));
     const auto before_grace = service.metadata_convergence_diagnostics();
-    // This check has failed twice in full macOS suite runs and never in
-    // isolation (TODO/ACTIVE.md, known-bad rates). The bare expression said
-    // nothing about which way it was wrong, so say it: an extra run means a
-    // metadata or topology event arrived after the follow-up began, a missing
-    // one means the unlinks coalesced differently.
+    // On mismatch, report the direction: an extra run means a metadata or
+    // topology event arrived after the follow-up began; a missing one means the
+    // unlinks coalesced differently.
     if (before_grace.runs_scheduled != before.runs_scheduled + 2 ||
         before_grace.runs_completed != before.runs_completed + 2) {
         std::cerr << "convergence before grace: runs_scheduled " << before.runs_scheduled
@@ -1253,16 +1245,15 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
         frontend->release(inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
-        // Write publication is interactive I/O, not playback. If the backend
-        // writer marks its own replay chunks as foreground, the publication
-        // quiet policy self-throttles by one full quiet interval per chunk.
+        // Publication replay must not mark its own chunks as foreground, or the
+        // quiet policy would throttle it by one quiet interval per chunk.
         CHECK(service.filesystem().foreground_idle_for() >= 1h);
         CHECK(frontend->status().pending_data == 0);
         auto entry = service.filesystem().getattr("/movie.bin");
         CHECK(entry.size == expected.size());
 
-        // The mount is an ingest/convenience interface. Even a read-only FUSE
-        // handle uses loader traffic and must not refresh either viewer clock.
+        // Even a read-only FUSE handle is loader traffic and must not refresh
+        // either viewer clock.
         auto fuse_reader = frontend->open("/movie.bin", true, false, false, false);
         Bytes fuse_probe(4096);
         const auto foreground_before = service.filesystem().foreground_idle_for();
@@ -1282,9 +1273,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
         }
         CHECK(actual == expected);
 
-        // FUSE write-back publication uses the ordinary extent writer and, when
-        // requested, also promotes each immutable extent into Macha's existing
-        // persistent block cache rather than maintaining a second FUSE cache.
+        // Publication uses the ordinary extent writer and, when requested,
+        // promotes each immutable extent into the persistent block cache.
         REQUIRE(!entry.extents.empty());
         for (const auto& extent : entry.extents)
             if (!extent.hole)
@@ -1390,8 +1380,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_threshold_bootstraps_from_partial_
     // Cross the 50% soft threshold before any whole-file retirement can
     // establish a rate. A seven-quantum open file leaves enough work after the
     // first drained quantum to demonstrate that admission does not depend on
-    // whole-file retirement. Viewer/loader duty cycling is covered separately;
-    // this regression isolates the spool progress-credit contract.
+    // whole-file retirement. This isolates the spool progress-credit contract.
     const auto initial = pattern(7 * 1024 * 1024, 61);
     REQUIRE(frontend->write(first.inode, 0, initial) == initial.size());
 
@@ -1532,9 +1521,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_orphan_quarantine_is_byte_bounded_on_rec
     config.metadata_min_write_replicas = 1;
     config.fuse.max_orphan_bytes = 1024;
 
-    // Establish/version the service state before introducing deliberately
-    // unreferenced recovery artifacts.  Pre-populating state_path before
-    // Service startup correctly trips the legacy/unversioned-state guard.
+    // Start the service before planting unreferenced recovery artifacts:
+    // populating state_path first trips the unversioned-state guard.
     auto& service = fixture.start();
     const auto spool_dir = config.state_path / "fuse-spool";
     std::filesystem::create_directories(spool_dir);
@@ -1622,8 +1610,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_w
     config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     config.fuse.commit_workers = 4;
-    // This legacy setting previously collapsed every continuously open loader
-    // workload to one publisher. It must no longer classify writers as viewers.
+    // Must not classify open loader writers as viewers or cap them at one publisher.
     config.fuse.foreground_commit_workers = 1;
     config.fuse.publication_quiet = 500ms;
 
@@ -1904,12 +1891,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_lo
     frontend->stop();
 }
 
-// An fsync waits for its data to be published to the cluster, with no
-// deadline once it has started. On a stopping node the publication can never
-// finish, and the mount cannot exit while the fsync is outstanding: the stop
-// waited until systemd killed the process (2 of 6 restarts in T0's top-up,
-// reproduced 2026-10-01). interrupt_waits() ends the wait with EIO first; the
-// data is already journalled and publishes after the restart.
+// An fsync waits, with no deadline, for its data to be published. On a
+// stopping node that can never finish and the mount cannot exit while the fsync
+// is outstanding, so interrupt_waits() ends the wait with EIO; the data is
+// already journalled and publishes after the restart.
 MACHA_TEST("filesystem_fuse", test_an_fsync_waiting_for_publication_ends_when_waits_are_interrupted) {
     TestService fixture("fuse-fsync-interrupted");
     auto& config = fixture.config();
@@ -2089,15 +2074,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bou
     frontend->stop();
 }
 
-// A publication writer is retained across clean yields, and it keeps a
-// retained-memory extent lease while it waits. Publication scheduling is
-// breadth-first, so the number of writers holding partial state is the width of
-// the backlog unless something bounds it: on es-1 that reached 123 leases, the
-// entire durable-lower budget, after which every writer needed one more extent
-// and none could release one (2026-09-09). Here the backlog is deliberately
-// wider than the ledger can hold writers for. With the bound, publication goes
-// depth-first over the open set and every file completes; without it, the
-// pipeline can consume the whole budget in partial buffers.
+// A publication writer keeps a retained-memory extent lease across clean
+// yields, and scheduling is breadth-first, so unbounded open writers would fill
+// the durable-lower budget with partial buffers and none could finish. The
+// backlog here is wider than the ledger can hold writers for; the open-writer
+// bound makes publication depth-first over the open set and every file completes.
 MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_completes) {
     TestService fixture("fuse-publication-backlog-width");
     auto& config = fixture.config();
@@ -2123,10 +2104,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_co
     // arrives at the scheduler at once instead of draining as it is written.
     config.fuse.publication_quiet = 500ms;
     config.fuse.suspend_loader_for_tests = true;
-    // Worst case 4 x (1M buffer + 1M pipeline) = 8M, the loader reserve. The
-    // service normalises its own copy of the config; this frontend is
-    // constructed from the fixture's, where State's constructor derives the
-    // same value. Pin it so the test states what it is testing.
+    // Worst case 4 x (1M buffer + 1M pipeline) = 8M, the loader reserve. Pinned
+    // explicitly because this frontend is built from the fixture's config, not
+    // the service's normalised copy.
     config.fuse.publication_max_open_writers = 4;
 
     auto& service = fixture.start();
@@ -2151,17 +2131,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_co
     CHECK(status.data_publications_started == files);
     CHECK(status.data_publications_completed == files);
     CHECK(diagnostics.parked_publications == 0);
-    // The invariant itself: never more writers open than the ledger was sized
-    // for. Without the bound this reaches the width of the backlog.
+    // Never more writers open than the ledger was sized for.
     CHECK(diagnostics.peak_open_publications <= config.fuse.publication_max_open_writers);
-    // And the bound must actually have bitten; otherwise this passes for the
-    // wrong reason and stops guarding anything.
+    // The bound must actually have bitten, or this passes for the wrong reason.
     CHECK(diagnostics.data_publication_selections_under_writer_cap > 0);
     CHECK(diagnostics.open_publications == 0);
-    // Nothing failed. Unbounded, the same backlog opens 20 writers, fills the
-    // durable-lower budget with partial buffers and only escapes through the
-    // no-progress deadline: 18 retryable failures and four times the wall clock
-    // when this was measured.
     CHECK(diagnostics.backend_failures == 0);
     for (size_t i = 0; i < files; ++i)
         CHECK(service.filesystem().getattr("/backlog-" + std::to_string(i) + ".bin").size ==
@@ -2172,14 +2146,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_co
     frontend->stop();
 }
 
-// The no-progress deadline is only meaningful if it watches something that
-// actually releases retained memory. Watching admitted quanta instead re-armed
-// every blocked writer's window whenever a *new* publication was let in -- and
-// on a wedged node a failure frees a slot, which admits the next file, so the
-// window was re-armed once per failure and the deadline serialised into one
-// failure per budget instead of failing every stuck worker (es-1, 2026-09-09).
-// Quanta and progress events must therefore not be the same number: a
-// publication yields far more often than it retires an extent.
+// The no-progress deadline must watch events that release retained memory
+// (retired extents, commits), not admitted quanta: admitting a new publication
+// must not re-arm every blocked writer's window. A publication yields far more
+// often than it retires an extent, so the two counters differ.
 MACHA_TEST("filesystem_fuse", test_publication_progress_counts_releases_not_admissions) {
     TestService fixture("fuse-publication-progress-counter");
     auto& config = fixture.config();
@@ -2207,8 +2177,6 @@ MACHA_TEST("filesystem_fuse", test_publication_progress_counts_releases_not_admi
     const auto diagnostics = frontend->diagnostics();
     CHECK(diagnostics.data_publications_completed == 1);
     CHECK(diagnostics.data_publication_progress_events > 0);
-    // The distinguishing property. If the deadline watched admitted quanta
-    // these would be the same counter and this would be an equality.
     CHECK(diagnostics.data_publication_quanta > diagnostics.data_publication_progress_events);
     CHECK(service.filesystem().getattr("/progress-counter.bin").size == contents.size());
     frontend->stop();
@@ -2256,18 +2224,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_
 }
 
 MACHA_TEST("filesystem_fuse", test_publication_with_a_stale_basis_asks_for_replay_not_retry) {
-    // A write handle captures the entry it opened against. If the entry then
-    // moves past it, commit_file's content-change guard rejects the commit --
-    // and for a publication that rejection is permanent, because the retry
-    // keeps the same writer and re-runs the identical comparison. On
-    // 2026-09-10 gbni-1 failed one inode 68 times that way (rsync
-    // --append-verify appending to a file whose publication was in flight),
-    // retrying forever because EAGAIN reads as transient.
-    //
-    // A publication now reports ESTALE, which the frontend already handles by
-    // dropping the writer and replaying the generation from the spool against
-    // current state. Foreground handles keep EAGAIN: they stay open and the
-    // content genuinely did change under them, so retrying is meaningful.
+    // A write handle captures the entry it opened against; if the entry moves
+    // past it, commit_file's content-change guard rejects the commit. An
+    // in-place retry of a publication would repeat the same comparison forever,
+    // so a publication reports ESTALE and the frontend replays the generation
+    // from the spool. Foreground handles get EAGAIN: retrying is meaningful.
     TestService fixture("stale-basis");
     auto& config = fixture.config();
     config.replication = 1;
@@ -2300,18 +2261,13 @@ MACHA_TEST("filesystem_fuse", test_publication_with_a_stale_basis_asks_for_repla
         return 0;
     };
 
-    // The publication asks to be replayed rather than retried in place.
     CHECK(stale_commit_code(WriteDurability::publication_generation) == ESTALE);
-    // The foreground contract is unchanged.
     CHECK(stale_commit_code(WriteDurability::immediate) == EAGAIN);
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_publication_failing_repeatedly_is_reported_before_it_parks) {
-    // A file failing tens of times used to be invisible: DEBUG-only lines, and
-    // every aggregate -- health, parked_publications, conditions -- reading
-    // clean. That is how 68 consecutive failures on gbni-1 went unnoticed
-    // until an operator went looking. A long failure run is now escalated to
-    // WARN and counted, before and independently of parking.
+    // A long failure run is escalated to WARN and counted, before and
+    // independently of parking.
     TestService fixture("fuse-publication-escalation");
     auto& config = fixture.config();
     config.replication = 2;
@@ -2342,12 +2298,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failing_repeatedly_is_report
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_publication_backs_off_then_parks_for_operator) {
-    // Discipline 2 of the self-healing plan. A publication that keeps failing
-    // retryably must not retry forever at a fixed interval (a doomed inode ran
-    // at ~35/s for hours on 2026-09-06): it backs off, and past its budget it
-    // is parked -- visible, actionable, and not poisoning the inode. Here the
-    // write floor can never be met (two replicas required, one node), so
-    // every attempt fails with a retryable error.
+    // A publication that keeps failing retryably backs off, and past its budget
+    // it is parked: visible, actionable, and not poisoning the inode. The write
+    // floor can never be met here (two replicas, one node), so every attempt fails.
     TestService fixture("fuse-publication-park");
     auto& config = fixture.config();
     config.replication = 2;
@@ -2455,12 +2408,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmit
 }
 
 MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_keeps_the_node_up) {
-    // 2026-09-28, gbni-1 on 0.65.0: removing empty directories from the FUSE
-    // mount with `find -depth -type d -empty -delete` took the node down after
-    // 45 removals in 11 s -- SIGSEGV in malloc, heap already corrupt, while
-    // the media-information service walked the namespace in prune(). Every
-    // removal is a metadata change and every metadata change asks for a prune.
-    // A library-shaped tree is built and emptied the same way.
+    // A burst of empty-directory removals, as `find -depth -type d -empty
+    // -delete` issues, with concurrent readers. Every removal is a metadata
+    // change and every metadata change asks the media-information service to prune.
     TestService fixture("fuse-empty-directory-burst");
     auto& config = fixture.config();
     config.replication = 1;
@@ -2487,17 +2437,14 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
     }
     REQUIRE(frontend->wait_for_idle(60s));
 
-    // A mounted filesystem is served by several threads at once: while one
-    // request removes a directory, the kernel is statting and listing its
-    // neighbours on others. Readers here do the same throughout.
+    // As on a real mount, other threads stat and list neighbours during removals.
     std::mutex unexpected_mutex;
     std::vector<std::string> unexpected;
     const auto note_unexpected = [&](std::string what) {
         std::lock_guard lock(unexpected_mutex);
         unexpected.push_back(std::move(what));
     };
-    // jthreads, so that a failure on the removing thread below stops and joins
-    // them on the way out rather than destroying joinable threads.
+    // jthreads, so a failure below stops and joins them on the way out.
     std::vector<std::jthread> readers;
     for (int r = 0; r < 4; ++r) {
         readers.emplace_back([&, r](std::stop_token stop) {
@@ -2509,7 +2456,6 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
                             (void)frontend->getattr(path);
                             (void)frontend->readdir(path);
                         } catch (const FsError& error) {
-                            // The path went while it was being read: ENOENT.
                             if (error.code() != ENOENT)
                                 note_unexpected(path + ": FsError " + std::to_string(error.code()) +
                                                 " " + error.what());
@@ -2569,9 +2515,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
 
-        // Hold asynchronous convergence behind a viewer-critical quiet window.
-        // The namespace and bytes below are nevertheless successful FUSE
-        // operations and therefore must be reconstructable from local state.
+        // Publication is held behind a quiet window, yet the operations below
+        // succeeded and must be reconstructable from local state.
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/TV", 0755, getuid(), getgid());
         frontend->mkdir("/TV/Buffy", 0755, getuid(), getgid());
@@ -2680,9 +2625,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
         frontend->stop();
     }
 
-    // First recovery remains publication-blocked: these assertions are about
-    // reconstruction from committed metadata plus the durable local journal,
-    // not about work which happened to converge quickly in the background.
+    // First recovery stays publication-blocked, so these assertions see only
+    // reconstruction from committed metadata plus the local journal.
     {
         auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         CHECK(!recovered->inode_for_path(old_path).has_value());
@@ -2698,8 +2642,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
         recovered->stop();
     }
 
-    // A second restart removes the artificial quiet window and verifies that
-    // the recovered operation order can converge to the ordinary filesystem.
+    // Without the quiet window, the recovered operations converge to the filesystem.
     auto replay_config = config.fuse;
     replay_config.publication_quiet = 0ms;
     {
@@ -2781,8 +2724,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_a
     CHECK(service.filesystem().local_committed_metadata_generation() ==
           generation_before + expected_batches);
     // Each publication durably journals its batch identity, then all
-    // individual published markers, then all individual done markers. The
-    // journal format remains replay-compatible.
+    // individual published markers, then all individual done markers.
     CHECK(status.journal_append_batches == expected_batches * 3);
     CHECK(status.journal_records_appended == operations * 2 + expected_batches);
     CHECK(status.journal_durability_barriers == expected_batches * 3);
@@ -2988,10 +2930,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
-    // 0.32.2: the identity batch [1,2,3] is refused atomically at op two
-    // (one uncommitted attempt, one identity record), so op one is published
-    // alone; then [2,3]: op two is already achieved, op three commits on its
-    // own. Two commits, as before.
+    // The identity batch [1,2,3] is refused atomically at op two (one
+    // uncommitted attempt, one identity record), so op one is published alone;
+    // then in [2,3] op two is already achieved and op three commits: two commits.
     CHECK(status.namespace_operations_recovered == 3);
     CHECK(status.namespace_publication_attempts == 3);
     CHECK(status.namespace_publication_batches == 2);
@@ -3008,10 +2949,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
 
 MACHA_TEST("filesystem_fuse",
           test_fuse_namespace_operator_skip_unwedges_a_non_retryable_backend_error) {
-    // A queued mkdir whose path is concurrently occupied by a conflicting
-    // FILE entry can never be reconciled as "already achieved" (type
-    // mismatch), so it hits a genuine, permanent EEXIST on every replay --
-    // exactly the wedge this fix adds an escape hatch for.
+    // A queued mkdir whose path is concurrently occupied by a file can never
+    // be reconciled as already achieved, so it fails with EEXIST on every
+    // replay until the operator skips it.
     TestService fixture("fuse-namespace-operator-skip");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3070,12 +3010,9 @@ MACHA_TEST("filesystem_fuse",
 
 MACHA_TEST("filesystem_fuse",
           test_fuse_journal_replays_operator_skipped_op_without_a_published_marker) {
-    // skip_blocked_namespace_operation() journals a namespace_done marker for
-    // an operation that was never published (that is the whole point -- it
-    // never succeeded). A crash immediately after or a later restart must
-    // replay that "done without published" marker cleanly rather than
-    // treating it as corrupt journal state: a node that abandoned a wedged
-    // operation once must not crash-loop on every subsequent startup.
+    // skip_blocked_namespace_operation() journals namespace_done for an
+    // operation that was never published. A restart must replay that marker
+    // cleanly rather than treat it as corrupt journal state.
     TestService fixture("fuse-skip-then-restart");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3084,13 +3021,8 @@ MACHA_TEST("filesystem_fuse",
     config.fuse.suspend_loader_for_tests = true;
     auto& service = fixture.start();
 
-    // A second, never-skipped wedge queued behind the first keeps the journal
-    // from fully quiescing/compacting once the first is resolved -- matching
-    // the real incident, where other unresolved queue state meant the
-    // abandoned op's journal record was still there to replay on the next
-    // restart. Without this, the journal ends up fully "done" and the
-    // specific bug (replaying a lone namespace_done with no namespace_published)
-    // never gets exercised.
+    // A second wedge queued behind the first stops the journal compacting once
+    // the first is skipped, so the lone namespace_done is still there to replay.
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
@@ -3113,9 +3045,7 @@ MACHA_TEST("filesystem_fuse",
         REQUIRE(blocked->path == "/wedge");
         skipped_sequence = blocked->sequence;
         REQUIRE(recovered->skip_blocked_namespace_operation(skipped_sequence));
-        // The second wedge (/wedge2) is deliberately left unresolved: wait
-        // for it to become the new blocked op rather than for full idle,
-        // which this queue can never reach.
+        // /wedge2 stays unresolved, so wait for it to block; idle is unreachable.
         REQUIRE(wait_until([&] {
             auto next = recovered->blocked_namespace_operation();
             return next && next->path == "/wedge2";
@@ -3123,9 +3053,8 @@ MACHA_TEST("filesystem_fuse",
         recovered->stop();
     }
 
-    // This is the exact scenario that used to crash-loop: a fresh restart
-    // replaying a journal that contains a namespace_done record for the
-    // skipped sequence with no namespace_published ever recorded for it.
+    // Restart replays namespace_done for the skipped sequence with no
+    // namespace_published recorded for it.
     auto restarted = std::make_shared<FuseFrontend>(service.filesystem(), replay);
     service.registry().publish_fuse(restarted);
     REQUIRE(wait_until([&] {
@@ -3185,9 +3114,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_checksum_invalid_c
     config.metadata_min_write_replicas = 1;
     config.fuse.commit_workers = 1;
     config.fuse.foreground_commit_workers = 1;
-    // This test needs publication deferred long enough to leave a durable
-    // namespace record in the journal; it does not test a 30-second quiet
-    // policy. One second gives the same state with a bounded worst-case delay.
+    // Long enough to leave a durable namespace record in the journal.
     config.fuse.publication_quiet = 1s;
     config.fuse.suspend_loader_for_tests = true;
 
@@ -3479,18 +3406,13 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_ne
 
     auto& service = fixture.start();
 
-    // Create the paths through FUSE first and let their namespace operations
-    // fully settle. The subsequent journal therefore contains inode descriptors
-    // with historical namespace sequence numbers but no unpublished namespace
-    // work -- the shape seen after a long-running copy is restarted.
+    // Create the paths through FUSE and let their namespace operations settle,
+    // so the journal holds inode descriptors with old namespace sequence numbers
+    // but no unpublished namespace work, as after restarting a long copy.
     constexpr size_t files = 4;
     {
-        // Use a deliberately long quiet window while staging the crash backlog.
-        // A short wall-clock quiet window plus a helper refresh thread is
-        // scheduler-sensitive under a parallel test run: if that helper misses
-        // its timeslice for >publication_quiet, a publisher can legitimately
-        // start before the fixture is stopped. The production behaviour is the
-        // thing under test here, not host scheduler latency.
+        // A long quiet window while staging, so no publisher can start before
+        // the frontend stops, however the host schedules threads.
         auto staging_fuse = config.fuse;
         staging_fuse.publication_quiet = 5s;
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), staging_fuse);
@@ -3501,10 +3423,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_ne
         }
         REQUIRE(frontend->wait_for_idle(10s));
 
-        // Hold the viewer/foreground gate closed while constructing the durable
-        // backlog. The five-second staging quiet window above is comfortably
-        // larger than this bounded fixture, so a single activity sample is a
-        // deterministic gate even under a heavily loaded test runner.
+        // One activity sample holds the foreground gate closed for the whole
+        // staging, since the 5 s quiet window outlasts it.
         auto payload = pattern(4 * config.extent_size);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < files; ++i) {
@@ -3519,19 +3439,16 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_ne
         frontend->stop();
     }
 
-    // Let the real playback gate expire, then deliberately keep only the generic
-    // read-ahead/interactive activity clock hot. Recovery must ignore that clock:
-    // its own object writes use the same accounting and would otherwise throttle
-    // themselves. Do not issue any FUSE request after the restarted frontend is
-    // constructed.
+    // Let the playback gate expire but keep the interactive activity clock hot.
+    // Recovery must ignore that clock, since its own object writes feed it. No
+    // FUSE request follows the restart, so recovery must start unprompted.
     REQUIRE(wait_until(
         [&] { return service.filesystem().foreground_idle_for() >= config.fuse.publication_quiet; },
         2s));
     service.filesystem().store().interactive_activity(1);
 
-    // Journal restoration is provenance, not a background scheduling class.
-    // The four user-requested files may use loader capacity beyond the legacy
-    // recovery budget without waiting for a new rsync/getattr to kick them.
+    // Journal restoration is provenance, not a background scheduling class:
+    // recovered files may use loader capacity beyond recovery_commit_workers.
     size_t max_recovery_active = 0;
     {
         auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
@@ -3567,8 +3484,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovered_loader_uses_loader_worker_boun
         service.filesystem().create_file("/recover-" + std::to_string(i) + ".bin", 0644, getuid(),
                                          getgid());
 
-    // Make the first frontend leave a real durable backlog rather than racing
-    // the local object store while the test is constructing it.
+    // Foreground activity holds publication so the first frontend leaves a durable backlog.
     {
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         service.filesystem().store().foreground_activity(1);
@@ -3601,9 +3517,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovered_loader_uses_loader_worker_boun
         recovered->stop();
     }
 
-    // At least one recovered publisher must have been observed unless the
-    // complete 16-MiB backlog drained between constructor return and the first
-    // status sample. Either way, final content proves the recovery path ran.
+    // Recovered loader work uses the loader worker bound, not recovery_commit_workers.
     CHECK(max_recovery_active > drain.recovery_commit_workers);
     CHECK(max_recovery_active <= drain.commit_workers);
     for (size_t i = 0; i < files; ++i) {
@@ -3732,14 +3646,10 @@ MACHA_TEST("filesystem_fuse",
 
 MACHA_TEST("filesystem_fuse",
            test_fuse_recovery_retires_published_namespace_op_whose_effect_was_superseded) {
-    // gbni-1, 2026-09-06: a namespace op published before a restart was
-    // recovered into namespace_unconfirmed, its effect had since been
-    // overwritten, and confirmation-by-visibility could never succeed -- so
-    // refresh_namespace_if_stale() declined every newer view and the mount sat
-    // two hours behind its own replica (six directories the manager listed
-    // that the mount never showed). The published marker means the backend
-    // held the op durable at the write floor; whatever the head shows now is
-    // that effect or its legitimate successor, so recovery must retire it.
+    // A published marker means the backend held the op durable at the write
+    // floor, so whatever the head shows now is its effect or a legitimate
+    // successor. Recovery retires it rather than waiting to see the effect,
+    // which a superseded op never shows, leaving the mount behind its replica.
     TestService fixture("fuse-recovery-superseded-published-op");
     auto& config = fixture.config();
     config.replication = 1;
@@ -3964,8 +3874,8 @@ MACHA_TEST("filesystem_fuse",
     CHECK(std::find(record_types.begin(), record_types.end(), 6) == record_types.end());
     CHECK(std::find(record_types.begin(), record_types.end(), 7) == record_types.end());
 
-    // Model the precise crash state seen in production: the checksum-valid
-    // completion marker survives but its earlier data_published proof does not.
+    // Crash state: the checksum-valid completion marker survives but its
+    // earlier data_published record does not.
     // A newly created inode's first data operation has sequence 1.
     Writer done;
     done.u8(7); // persisted JournalRecord::data_done value
@@ -4001,9 +3911,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_skips_unbacked_data_done
     done.u64(1);
     append_fuse_journal_test_record(journal, done.data());
 
-    // Discipline 3: a completion marker with no operation behind it retires
-    // nothing, so it is skipped and counted; refusing to start over it put
-    // the node in a restart loop it could never leave.
+    // A completion marker with no operation behind it retires nothing, so it
+    // is skipped and counted, and the frontend starts.
     auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
     CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 1);
     recovered->stop();
@@ -4383,9 +4292,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_buffered_writes_batch_until_close_durabi
         auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
         auto handle = frontend->create("/batch.bin", 0644, getuid(), getgid(), true, true, false);
 
-        // Sequential callbacks are the important case: write() no longer waits
-        // for each local fsync pair, so one ordinary writer can build a batch
-        // before close/release establishes the local durability boundary.
+        // write() does not wait for a local fsync pair, so one sequential writer
+        // builds a batch before close/release sets the local durability boundary.
         constexpr size_t writes = 128;
         constexpr size_t chunk_size = 4096;
         std::vector<Bytes> chunks;
@@ -4478,14 +4386,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_c
               config.extent_size);
 
         // ReadHandle caches the whole immutable extent. Removing the backing
-        // object after the first callback makes reuse observable: a second read
-        // through the same open FUSE handle must still be served from that
-        // retained extent, whereas constructing a new ReadHandle per callback
-        // would immediately fail here.
-        // erase_all() is a policy-level delete and correctly refuses to remove
-        // a still-retained live object.  This test needs a simulated physical
-        // loss beneath the manifest, so remove the local copy directly and also
-        // clear any opportunistic block-cache copy.
+        // object makes reuse observable: the same open handle still reads it,
+        // a fresh handle cannot. erase_all() refuses to remove a retained live
+        // object, so simulate physical loss by removing the local and cached copies.
         REQUIRE(service.node().local_store().remove(entry.extents.front().id));
         (void)service.node().block_cache().remove(entry.extents.front().id);
         Bytes second(4096);
@@ -4550,7 +4453,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_dri
     }
 }
 
-// ---- Discipline 3: recovery resolves, it does not refuse ---------------------
+// Recovery resolves bad journal state; it does not refuse to start.
 
 struct JournalFrame {
     size_t offset{};
@@ -4588,12 +4491,8 @@ void restore_directory(const std::filesystem::path& from, const std::filesystem:
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_starts) {
-    // The plan's acceptance for discipline 3: truncate the journal at every
-    // frame boundary, drop any frame, duplicate any frame, corrupt any
-    // frame — and the frontend starts every time. Before 0.31.0 a
-    // duplicated marker, a marker whose operation was dropped, or a
-    // checksum failure before EOF was fatal, and because the journal is
-    // durable, fatal on every restart after that.
+    // Truncate the journal at every frame boundary, or drop, duplicate or
+    // corrupt any frame: the frontend starts every time.
     TestService fixture("fuse-journal-fuzz");
     auto& config = fixture.config();
     config.replication = 1;
@@ -4626,9 +4525,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
 
     const auto spool_dir = config.state_path / "fuse-spool";
     const auto journal = spool_dir / "operations.log";
-    // Add the marker kinds the loader must also tolerate losing/duplicating:
-    // a namespace published marker for the first op and a data completion
-    // for a.bin's first write.
+    // Add marker kinds the loader must also tolerate losing or duplicating.
     {
         Writer done;
         done.u8(7); // JournalRecord::data_done
@@ -4705,7 +4602,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
     }
     CHECK(variants == frames.size() * 4);
 
-    // Sanity: the pristine journal itself still recovers everything.
+    // The pristine journal still recovers everything.
     restore_directory(pristine_spool, spool_dir);
     write_all_bytes(journal, pristine);
     auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
@@ -4715,13 +4612,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
     recovered->stop();
 }
 
-// ---- Namespace batches under an identity (0.32.2) ---------------------------
+// Namespace batches under a batch identity.
 
 MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_into_few_commits) {
-    // rsync writes each file as create-temp / write / utimens / rename. Until
-    // 0.32.2 renames and mixed kinds were singleton batches, so an import of
-    // N files cost ~3N metadata commits (~3/s cluster-wide on 2026-09-07) and
-    // every data publication waited behind the op naming its file.
+    // rsync writes each file as create-temp / write / utimens / rename; mixed
+    // namespace kinds, renames included, batch into a few commits.
     TestService fixture("fuse-namespace-batching");
     auto& config = fixture.config();
     config.replication = 1;
@@ -4750,8 +4645,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_int
         CHECK(frontend->status().namespace_operations_admitted == 1 + files * 3);
         frontend->stop();
     }
-    // Restart with the loader running: the recovered queue (mkdir + 3 ops per
-    // file, all kinds mixed) must publish in a handful of commits.
+    // The recovered queue (mkdir + 3 ops per file) publishes in a handful of commits.
     config.fuse.suspend_loader_for_tests = false;
     config.fuse.publication_quiet = 0ms;
     auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
@@ -4782,10 +4676,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_int
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_utimens_after_write_survives_async_publication) {
-    // rsync: write, close, utimens, rename. The data publication runs later,
-    // asynchronously, and until 0.32.2 committed the write's own timestamp
-    // over the utimens value -- 474 of 3,770 imported Music files then
-    // looked modified to the next rsync pass (2026-09-07).
+    // rsync: write, close, utimens, rename. The asynchronous data publication
+    // that follows must not overwrite the utimens value.
     TestService fixture("fuse-utimens-vs-publication");
     auto& config = fixture.config();
     config.replication = 1;
@@ -4812,12 +4704,11 @@ MACHA_TEST("filesystem_fuse", test_fuse_utimens_after_write_survives_async_publi
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_is_not_reapplied) {
-    // The hazard that kept mixed batches singleton: a batch [create temp,
-    // rename temp -> final] committed, the process died before the per-op
-    // published markers were journaled. Re-deriving effects would see "temp
-    // absent, so create did not happen", re-create an empty temp and rename
-    // it over the real file. The batch identity in the snapshot's clock says
-    // the batch committed; recovery must not touch the file.
+    // A batch [create temp, rename temp -> final] committed but the process
+    // died before the per-op published markers were journaled. Re-deriving
+    // effects would re-create an empty temp and rename it over the real file;
+    // the batch identity in the snapshot's clock says it committed, so
+    // recovery must not touch the file.
     TestService fixture("fuse-namespace-batch-identity");
     auto& config = fixture.config();
     config.replication = 1;
@@ -4859,11 +4750,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_i
             stripped.insert(stripped.end(), frame.begin(), frame.end());
         });
     REQUIRE(scan.discarded_tail == 0);
-    // The journal may have reset to empty once everything retired; in that
-    // case rebuild the scenario from the frames we know were there.
     if (stripped_markers == 0 && kept_batches == 0) {
-        // Nothing left to strip: journal already compacted. Rebuild a
-        // representative journal: create + rename ops, a batch record, no markers.
+        // The journal reset to its header once everything retired.
         REQUIRE(bytes.size() == 8);
     } else {
         REQUIRE(kept_batches >= 1);
@@ -4885,11 +4773,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_i
 }
 
 MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_removed_from_namespace) {
-    // gbni-1 inode 922 (183 MB) and es-1 inode 2333 (6 GB), 2026-09-06: a
-    // recovered publication whose file had left the namespace failed with
-    // ENOENT on every boot, poisoned the inode "until an operator acts",
-    // kept the spool bytes and pinned the journal open. Discipline 3: the
-    // first boot abandons it (journaled), the second boot sees nothing.
+    // A recovered publication whose file has left the namespace is abandoned
+    // (journaled) on the first boot, freeing its spool and the journal; the
+    // second boot sees nothing.
     TestService fixture("fuse-recovery-removed-file");
     auto& config = fixture.config();
     config.replication = 1;

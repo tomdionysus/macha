@@ -11,19 +11,16 @@
 namespace macha {
 namespace {
 
-// Node magics. Every node says what it is, so a fetched object that is not the
-// kind the caller expected is a decode failure rather than a misread.
+// Node magics: a node of the wrong kind is a decode failure, not a misread.
 constexpr std::array<uint8_t, 4> leaf_magic{'M', 'N', 'L', '1'};
 constexpr std::array<uint8_t, 4> branch_magic{'M', 'N', 'B', '1'};
 constexpr std::array<uint8_t, 4> extent_leaf_magic{'M', 'N', 'X', '1'};
 constexpr std::array<uint8_t, 4> extent_branch_magic{'M', 'N', 'Y', '1'};
 
-// How the extents of one entry are carried in its leaf record.
 enum class ExtentForm : uint8_t { none = 0, inlined = 1, external = 2 };
 
-// The boundary decision. Domain-separated and level-separated so the same key
-// does not land on a boundary at every level of the spine at once, which would
-// produce a tower of single-child nodes.
+// Domain- and level-separated so a key is not a boundary at every spine level
+// at once, which would make a tower of single-child nodes.
 uint64_t boundary_hash(std::string_view domain, uint8_t level, std::span<const uint8_t> key) {
     Sha256Hasher hasher;
     hasher.update({reinterpret_cast<const uint8_t*>(domain.data()), domain.size()});
@@ -62,24 +59,21 @@ ExtentRef decode_extent(Reader& reader) {
     return extent;
 }
 
-// The encoded size of one extent, used to bound reservations against what the
-// remaining input could actually contain -- the same discipline 0.43.1 applied
-// to `entry(Reader&)` after 10.4 MB of allocator slack turned up on es-1.
+// Encoded size of one extent; bounds reservations by what the remaining input
+// could actually contain.
 constexpr size_t encoded_extent_bytes = 8 + 8 + 1 + 32;
 
-// A child of a spine node: what it is addressed by, and how many leaves sit
-// underneath it. The count lets a reader size its result and lets a caller
-// range-count a subtree without descending into it.
+// A spine node's child. `items` counts the entries beneath it, so a subtree
+// can be sized without descending.
 struct Child {
     std::string first_key; // empty for an extent spine, which is sequential
     ObjectId id{};
     uint64_t items{};
 };
 
-// Groups a run of children into spine nodes until one node remains. The
-// grouping is decided by hashing each child's key (or, for the keyless extent
-// spine, its content address), so the shape of the spine is a function of the
-// child sequence and nothing else.
+// Groups children into spine nodes until one remains. Grouping hashes each
+// child's key (its content address on the keyless extent spine), so the shape
+// is a function of the child sequence alone.
 ObjectId build_spine(std::vector<Child> children, NamespaceNodeStore& store, bool keyed,
                      size_t target, size_t maximum) {
     if (children.empty())
@@ -109,32 +103,13 @@ ObjectId build_spine(std::vector<Child> children, NamespaceNodeStore& store, boo
             run.clear();
         };
 
-        // `packed` ignores the boundary test and groups purely by the count
-        // cap. It is the fallback for a level where every child happened to
-        // hash as a boundary, which produces one parent per child and no
-        // reduction at all.
-        //
-        // That is not a hypothetical. Measured against es-1's real namespace
-        // on 2026-09-21, the first build threw here with
-        // `level=1 keyed=0 children=2 parents=2 target=256`: an extent
-        // sequence of exactly two chunks whose two content addresses both hit
-        // a 1-in-256 boundary. That is a 1-in-65,536 event per multi-chunk
-        // file, and across 4,808 entries meeting it once is unremarkable. Six
-        // tests on generated namespaces never saw it.
-        //
-        // It would not in fact have looped forever -- each level hashes
-        // different bytes, so the next one reduces with probability
-        // 1 - (1/target)^n -- but "terminates almost surely" is not a
-        // guarantee, and the old code chose to abort rather than rely on it.
-        // Packing by the cap makes progress unconditional: at maximum >= 2,
-        // n children become at most ceil(n/maximum) < n parents for n >= 2.
-        //
-        // **History independence survives**, which is the property this must
-        // not cost. The fallback fires on a condition computed from this
-        // level's children, and those are a pure function of the sorted entry
-        // set; the packing itself is positional over that same sequence.
-        // Nothing here depends on insertion order or on how the namespace was
-        // reached.
+        // `packed` ignores the boundary test and groups by the count cap alone:
+        // the fallback for a level where every child hashed as a boundary and
+        // nothing reduced (e.g. two extent chunks both hitting a 1-in-256
+        // boundary). It makes progress unconditional: at maximum >= 2, n >= 2
+        // children become at most ceil(n/maximum) < n parents. History
+        // independence holds: the trigger and the packing are both functions
+        // of this level's child sequence.
         const auto build_level = [&](bool packed) {
             parents.clear();
             run.clear();
@@ -166,11 +141,9 @@ ObjectId build_spine(std::vector<Child> children, NamespaceNodeStore& store, boo
     return children.front().id;
 }
 
-// Writes one entry's extents as their own sequence of nodes and returns its
-// root. Chunk boundaries are decided by the extent's own content address, which
-// is what makes an append stable: adding an extent cannot move the boundaries
-// of the extents already written, so an append rewrites one chunk and the
-// spine rather than the whole list.
+// Writes one entry's extents as a node sequence and returns its root. Chunk
+// boundaries hash each extent's content address, so an append cannot move
+// existing boundaries and rewrites only the last chunk and the spine.
 ObjectId build_extent_sequence(const std::vector<ExtentRef>& extents, NamespaceNodeStore& store,
                                const NamespaceTreeLimits& limits) {
     std::vector<Child> chunks;
@@ -258,20 +231,10 @@ void encode_leaf_entry(Writer& writer, const std::string& path, const FsEntry& e
     writer.fixed(build_extent_sequence(entry.extents, store, limits).bytes);
 }
 
-// Reads one leaf record. Extents are fetched only when the caller says so, and
-// the decision is made AFTER the key is parsed so that a scan pays nothing for
-// the entries it walks past.
-//
-// `load_all` is for a full materialisation. `load_only_for` is for a lookup:
-// at most one key in the leaf is the one asked for, and the rest are compared
-// and discarded. Both false and empty is a stat-only read, which is every FUSE
-// path lookup and directory listing -- the whole reason the extents are
-// addressed rather than inlined.
-//
-// Until 2026-09-21 the lookup passed `true` unconditionally, so a stat fetched
-// the extent spine of every entry it skipped past on the way to the one it
-// wanted. On a leaf of 32 entries holding films, that is dozens of node reads
-// to answer a getattr that needs none of them.
+// Reads one leaf record. External extents are fetched for every entry when
+// `load_all`, otherwise only for the entry whose key equals `load_only_for`;
+// the decision follows the key parse, so a lookup pays nothing for entries it
+// walks past. `false` and empty is a stat-only read.
 std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const NamespaceNodeStore& store,
                                                   bool load_all,
                                                   std::string_view load_only_for = {}) {
@@ -301,22 +264,9 @@ std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const Namespac
         break;
     }
     case ExtentForm::external: {
-        // The count is a hint from the node and nothing here can check it:
-        // unlike every other reserve in this file, the extents live in OTHER
-        // nodes, so `reader.remaining()` is not a bound on them.
-        //
-        // It used to be reserved directly, capped at 10,000,000 — which is
-        // 560 MB at the 56 bytes an ExtentRef occupies on aarch64, sized from
-        // an unvalidated integer in a node that may be corrupt or forged. That
-        // is exactly the pathology Stage A removed from `entry(Reader&)`, and
-        // a fixed cap is a guess with an expiry date besides: the whole live
-        // cluster holds 445,959 extents, so 10,000,000 was never a bound on
-        // anything real.
-        //
-        // It is simply dropped. `read_extent_sequence` reserves per chunk
-        // against that chunk's own remaining bytes, so growth is already
-        // bounded by data that exists, and the only thing the outer reserve
-        // bought was a few reallocations.
+        // The count is unverifiable here (the extents live in other nodes), so
+        // it is not used to reserve; `read_extent_sequence` reserves per chunk
+        // against bytes that exist.
         (void)reader.u64();
         ObjectId root{reader.fixed<32>()};
         if (load_extents)
@@ -355,19 +305,16 @@ void MemoryNamespaceNodeStore::put_at(const ObjectId& id, Bytes node) {
 }
 
 namespace {
-// Does this key end its leaf? The whole structure rests on this being a
-// function of the key alone: a value change never moves a boundary, and the
-// same key set partitions the same way however it was reached.
+// Whether this key ends its leaf. A function of the key alone, so values never
+// move boundaries and a key set always partitions the same way.
 bool ends_a_leaf(std::string_view path, const NamespaceTreeLimits& limits) {
     return is_boundary(boundary_hash("macha/namespace-tree/entry/v1", 0, key_span(path)),
                        limits.entry_target_fanout);
 }
 
-// Chunks a run of entries into leaves, exactly as a full build does. `open`
-// says the final run did not end on a boundary key and was flushed only
-// because the sequence ran out -- which for an incremental update means the
-// window has not re-synchronised with the global partition yet and must
-// absorb the next leaf.
+// Chunks entries into leaves exactly as a full build does. `open` is set when
+// the final run did not end on a boundary key: an update window has not yet
+// re-synchronised with the global partition and must absorb the next leaf.
 using EntryRef = std::pair<const std::string*, const FsEntry*>;
 
 std::vector<Child> chunk_leaves(const std::vector<EntryRef>& entries, NamespaceNodeStore& store,
@@ -422,8 +369,7 @@ ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, Nam
         ordered.emplace_back(&path, &entry);
     auto leaves = chunk_leaves(ordered, store, limits);
 
-    // An empty namespace is still a tree: one empty leaf, so a root always
-    // exists and `read_namespace_tree` of a fresh cluster is not a special case.
+    // An empty namespace is one empty leaf, so a root always exists.
     if (leaves.empty())
         return empty_leaf(store);
     return build_spine(std::move(leaves), store, true, limits.branch_target_fanout,
@@ -432,10 +378,8 @@ ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, Nam
 
 namespace {
 
-// The leaf sequence of a tree, in order, without decoding a single entry. A
-// branch node carries each child's first key, id and item count, so this costs
-// the branch nodes alone -- 10 of them on es-1's namespace against 169 leaves
-// and 5,101 entries.
+// The tree's leaf sequence in order, without decoding entries. Reads the
+// branch nodes plus each leaf's header and first key.
 void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
                     std::vector<Child>& out) {
     auto encoded = store.get(id);
@@ -445,8 +389,6 @@ void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
     const auto magic = reader.fixed<4>();
     if (magic == leaf_magic) {
         const auto count = reader.u32();
-        // The first key is all the caller needs; the rest of the leaf is not
-        // decoded, and its extents certainly are not fetched.
         std::string first;
         if (count)
             first = reader.string(8192);
@@ -469,7 +411,6 @@ void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
         collect_leaves(child, store, out);
 }
 
-// Every entry of one leaf, extents and all.
 void read_leaf(const ObjectId& id, const NamespaceNodeStore& store,
                std::vector<std::pair<std::string, FsEntry>>& out) {
     auto encoded = store.get(id);
@@ -484,9 +425,9 @@ void read_leaf(const ObjectId& id, const NamespaceNodeStore& store,
     reader.finish();
 }
 
-// The half-open upper bound of the keys that start with `prefix`: the prefix
-// with its last byte incremented, carrying where a byte is 0xFF. An empty
-// result means "no upper bound", which is what an all-0xFF prefix implies.
+// Exclusive upper bound of keys starting with `prefix`: the prefix with its
+// last non-0xFF byte incremented and trailing 0xFF bytes dropped. Empty means
+// unbounded.
 std::string prefix_upper_bound(std::string_view prefix) {
     std::string upper(prefix);
     while (!upper.empty()) {
@@ -531,9 +472,8 @@ void walk_subtree_prefix(const ObjectId& id, const NamespaceNodeStore& store,
     }
     reader.finish();
     for (size_t i = 0; i < children.size(); ++i) {
-        // This child holds the keys from its own first key up to the next
-        // child's. Skip it when that range cannot contain the prefix: entirely
-        // before it, or entirely at or after its upper bound.
+        // A child spans its first key up to the next child's; skip it when
+        // that range lies wholly before the prefix or at/after `upper`.
         const bool last = i + 1 == children.size();
         if (!last && children[i + 1].first <= prefix)
             continue;
@@ -575,10 +515,8 @@ void walk_subtree(const ObjectId& id, const NamespaceNodeStore& store,
         walk_subtree(child, store, visit);
 }
 
-// Visits the entries of the subtree after `after` until `take` says stop;
-// returns whether it stopped. A child holds the keys from its own first key
-// up to the next child's, so a child whose successor starts at or before
-// `after` holds nothing after it and is not read.
+// Feeds entries after `after` to `take` until it returns false; returns whether
+// it stopped. A child whose successor starts at or before `after` is not read.
 bool walk_subtree_after(const ObjectId& id, const NamespaceNodeStore& store,
                         const std::optional<std::string>& after,
                         const std::function<bool(NamespaceItem&&)>& take) {
@@ -627,8 +565,7 @@ Page<NamespaceItem, std::string> namespace_entries(const MetadataSnapshot& snaps
                                                    Cursor<std::string> from, Budget& budget) {
     Page<NamespaceItem, std::string> page;
     page.next = from;
-    // Each entry costs one operation; the walk stops before an entry it
-    // cannot pay for, and before any entry once the budget says stop.
+    // One operation per entry; stops before an entry it cannot pay for.
     const auto take = [&](NamespaceItem&& item) {
         if (const auto stop = budget.must_stop()) {
             page.stopped = *stop;
@@ -692,9 +629,7 @@ std::optional<FsEntry> namespace_entry(const MetadataSnapshot& snapshot,
             return {};
         if (with_extents)
             return found->second;
-        // Stat-only means stat-only in both forms. A caller that asked not to
-        // pay for extents must not be handed a copy of a 12,500-extent list
-        // merely because this snapshot happens to be a map.
+        // Stat-only in both forms: no extent list is handed back.
         FsEntry stat = found->second;
         stat.extents.clear();
         return stat;
@@ -718,17 +653,14 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
     if (changes.empty())
         return root;
 
-    // The leaf sequence, which costs the branch nodes and no entries.
     std::vector<Child> leaves;
     collect_leaves(root, store, leaves);
-    // The empty tree is a single empty leaf; treat it as no leaves at all so
-    // the first write does not have to special-case it.
+    // Treat the empty tree's single empty leaf as no leaves.
     if (leaves.size() == 1 && leaves.front().items == 0)
         leaves.clear();
 
-    // Which leaf owns a key: the last one whose first key is at or before it.
-    // A key below every leaf's first key belongs to the first leaf, because
-    // that is where a full build would have put it.
+    // The owning leaf: the last whose first key is <= key, else the first leaf
+    // (where a full build would put it).
     const auto owner_of = [&](const std::string& key) -> size_t {
         size_t index = 0;
         for (size_t i = 0; i < leaves.size(); ++i) {
@@ -753,12 +685,9 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
         last = 0;
     }
 
-    // Read the window, apply the changes to it, and re-chunk. The window may
-    // have to grow rightwards: a run that did not end on a boundary key has
-    // not re-synchronised with the partition a full build would produce, and
-    // absorbing the next leaf is what restores it. In practice this absorbs
-    // nothing or one leaf; it is bounded by the next boundary key, which is
-    // one in `entry_target_fanout` of them.
+    // Read the window, apply the changes, re-chunk. While the last run is open
+    // (did not end on a boundary key) the window grows right by one leaf until
+    // it re-synchronises with the full-build partition.
     std::vector<std::pair<std::string, FsEntry>> window;
     std::vector<Child> replacement;
     size_t end = last;
@@ -767,9 +696,7 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
         for (size_t i = first; i <= end && i < leaves.size(); ++i)
             read_leaf(leaves[i].id, store, window);
 
-        // Apply. A change to a key inside the window is an upsert or a delete;
-        // a key outside any existing leaf's range lands here too, because
-        // owner_of put it in the leaf a build would have placed it in.
+        // Apply only the changes whose keys fall in the window's key range.
         std::map<std::string, FsEntry> merged;
         for (auto& [path, entry] : window)
             merged.insert_or_assign(std::move(path), std::move(entry));
@@ -793,8 +720,8 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
             ordered.emplace_back(&path, &entry);
         bool open = false;
         replacement = chunk_leaves(ordered, store, limits, &open);
-        // An open tail with nothing left to absorb is the end of the sequence,
-        // where a full build flushes the remainder too.
+        // An open tail with nothing left to absorb is the sequence end, where a
+        // full build flushes too.
         if (!open || end + 1 >= leaves.size())
             break;
         ++end;
@@ -819,17 +746,15 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
                                        const MetadataDelta& delta,
                                        const NamespaceTreeLimits& limits) {
     NamespaceChanges changes;
-    // Order matters and mirrors apply_metadata_delta_in_place exactly: erase,
-    // then upsert, then append. A path that is erased and then upserted in one
-    // delta ends up present, which is what the map path produces.
+    // Erase, upsert, append: the order apply_metadata_delta_in_place uses, so
+    // an erased-then-upserted path ends up present on both paths.
     for (const auto& path : delta.erase_entries)
         changes[normalize_path(path)] = std::nullopt;
     for (const auto& [path, value] : delta.upsert_entries)
         changes[normalize_path(path)] = value;
     for (const auto& [path, append] : delta.append_entries) {
         const auto normalized = normalize_path(path);
-        // The entry being appended to is whatever this delta has already made
-        // it, or what the tree holds. Reading it costs one path from the root.
+        // Append base: this delta's pending value, else the tree's entry.
         std::optional<FsEntry> base;
         if (const auto pending = changes.find(normalized); pending != changes.end())
             base = pending->second;
@@ -845,10 +770,8 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
         changes[normalized] = std::move(base);
     }
     const auto updated = update_namespace_tree(root, store, changes, limits);
-    // The invariant the map form checks after applying a delta, checked where
-    // it can be: a namespace without a root directory is not a filesystem.
-    // This is a stat-only lookup -- one path from the root, no extent node --
-    // so it costs the depth of the tree and not the namespace.
+    // The map form's post-delta invariant: "/" must be a directory. Stat-only,
+    // so it costs the tree's depth.
     const auto root_entry = namespace_tree_lookup(updated, "/", store, false);
     if (!root_entry || root_entry->type != EntryType::directory)
         throw DecodeError("metadata delta lost root");
@@ -880,9 +803,7 @@ void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceN
             visit(path, entry);
         return;
     }
-    // A detached namespace with no store is the silent-empty case this exists
-    // to prevent: iterating `entries` here would visit nothing and report
-    // success. Refuse instead, and name what is missing.
+    // Without a store, iterating `entries` would silently visit nothing.
     if (!store)
         throw DecodeError("namespace is a tree and no node store was supplied");
     walk_namespace_tree(*snapshot.namespace_root, *store, visit);
@@ -904,8 +825,7 @@ std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_v
                                               with_extents ? path : std::string_view{});
                 if (item.first == path)
                     return item.second;
-                // Leaf records are in path order, so a key past the one asked
-                // for settles the question without reading the rest.
+                // Leaf records are path-ordered: a later key means absent.
                 if (item.first > path)
                     return {};
             }
@@ -915,8 +835,8 @@ std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_v
             throw DecodeError("not a namespace tree node");
         (void)reader.u8(); // level
         const auto count = reader.u32();
-        // Descend into the last child whose first key is at or before the path.
-        // A path below the first child's key is not in the tree at all.
+        // Descend into the last child whose first key is <= path; a path below
+        // the first child's key is absent.
         std::optional<ObjectId> next;
         for (uint32_t i = 0; i < count; ++i) {
             auto first_key = reader.string(8192);
@@ -1055,9 +975,7 @@ bool NamespaceWorkingSet::contains(const std::string& path) const {
 
 void NamespaceWorkingSet::put(const std::string& path, const FsEntry& entry) {
     delta_.upsert_entries[path] = entry;
-    // A path created after being erased in the same batch is present, so its
-    // tombstone has to go or the overlay would contradict the delta it is made
-    // of.
+    // Recreating a path erased earlier in the batch drops its tombstone.
     delta_.erase_entries.erase(
         std::remove(delta_.erase_entries.begin(), delta_.erase_entries.end(), path),
         delta_.erase_entries.end());
@@ -1083,8 +1001,7 @@ bool path_under(const std::string& path, const std::string& root) {
 
 std::optional<std::string> NamespaceWorkingSet::first_path_under(
     const std::string& directory) const {
-    // The overlay first: a child created in this batch counts, and a child the
-    // batch erased does not, whatever the namespace underneath still says.
+    // Overlay first: batch-created children count, batch-erased ones do not.
     for (const auto& [path, _] : delta_.upsert_entries)
         if (path != directory && path_under(path, directory))
             return path;
@@ -1137,10 +1054,8 @@ NamespaceMigration plan_namespace_migration(const MetadataRecord& head,
     migration.root = *migrated.namespace_root;
     migration.stats = namespace_tree_stats(migration.root, nodes);
 
-    // Read the tree back out of the store it was just written to and compare
-    // it against the namespace it came from -- paths, stat fields and extents.
-    // This is the whole safety of the operation: everything after it assumes
-    // the tree is the namespace.
+    // Read the tree back and compare paths, stat fields and extents against
+    // the source: everything after this assumes the tree is the namespace.
     const auto read_back = read_namespace_tree(migration.root, nodes);
     if (read_back.size() != source.size())
         throw std::runtime_error("namespace migration verification failed: tree holds " +
@@ -1180,11 +1095,8 @@ MetadataSnapshot attach_namespace(MetadataSnapshot snapshot, const NamespaceNode
     if (!snapshot.entries.empty())
         throw std::runtime_error("snapshot already carries its entries");
     snapshot.entries = read_namespace_tree(*snapshot.namespace_root, store, limits);
-    // The check SM13's decoder makes on every snapshot it reads, made here
-    // instead: a namespace without a root directory is not a filesystem. SM14
-    // cannot make it -- `decode_snapshot` has no node store and materialising
-    // one to run a sanity check is exactly the cost the tree removes -- so it
-    // belongs to whoever does hold the store and does read the tree.
+    // "/" must be a directory. `decode_snapshot` cannot check this for SM14
+    // (it has no node store), so whoever materialises the tree does.
     const auto root = snapshot.entries.find("/");
     if (root == snapshot.entries.end() || root->second.type != EntryType::directory)
         throw DecodeError("missing root");
@@ -1194,10 +1106,8 @@ MetadataSnapshot attach_namespace(MetadataSnapshot snapshot, const NamespaceNode
 
 namespace {
 
-// A branch's children as (first key, id); a leaf's entries as
-// (path, external extent root or none). Both are read without decoding extents
-// or fetching anything beyond the one node, which is what keeps the collectors
-// proportional to the tree's shape rather than its content.
+// One node's structure, read without fetching anything beyond it: a branch's
+// (first key, id) children, or a leaf's (path, external extent root) entries.
 struct NodeShape {
     bool leaf{};
     std::vector<std::pair<std::string, ObjectId>> children;      // branch
@@ -1297,9 +1207,8 @@ void collect_all(const ObjectId& id, const NamespaceNodeStore& store, std::vecto
         collect_all(child, store, out);
 }
 
-// The parallel walk. `before` may be absent, or a node of a different kind
-// when the tree changed shape; either way the subtree under `after` is simply
-// collected in full, which is the safe direction.
+// The parallel walk. If `before` is absent, unreadable or of a different kind,
+// nothing is pruned and the subtree under `after` is collected in full.
 void collect_changed(const ObjectId& after, const std::optional<ObjectId>& before,
                      const NamespaceNodeStore& store, std::vector<ObjectId>& out) {
     if (before && *before == after)
@@ -1307,9 +1216,8 @@ void collect_changed(const ObjectId& after, const std::optional<ObjectId>& befor
     out.push_back(after);
     const auto shape = read_shape(after, store);
     if (shape.leaf) {
-        // A changed leaf: its own extent spines, all of them. Comparing per
-        // path against the old leaf would tighten this; it would not make it
-        // safer.
+        // A changed leaf contributes all its extent spines; per-path
+        // comparison would tighten this but not make it safer.
         for (const auto& [_, extent_root] : shape.entries)
             if (extent_root)
                 collect_extent_spine(*extent_root, store, out);
@@ -1322,17 +1230,15 @@ void collect_changed(const ObjectId& after, const std::optional<ObjectId>& befor
             if (!shape_before.leaf)
                 old = std::move(shape_before);
         } catch (const std::exception&) {
-            // An unreadable old node means nothing can be pruned against it,
-            // not that the walk should fail: over-collect below.
+            // Unreadable old node: prune nothing, over-collect.
         }
     }
     for (size_t i = 0; i < shape.children.size(); ++i) {
         const auto& [key, child] = shape.children[i];
         std::optional<ObjectId> counterpart;
         if (old) {
-            // Shared subtree: same id anywhere on the other side, skip it
-            // unread. Otherwise pair by key so the walk descends into the
-            // subtree most likely to share children with this one.
+            // Skip a child whose id appears on the old side; otherwise pair it
+            // by key with the old child most likely to share descendants.
             bool shared = false;
             for (const auto& [_, old_child] : old->children)
                 if (old_child == child) {

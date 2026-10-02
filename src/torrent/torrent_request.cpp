@@ -30,10 +30,9 @@ std::optional<uint64_t> read_optional_u64(Reader& r) {
     return r.u64();
 }
 
-// The request whose key is greater; on equal keys, the greater request, so
-// the choice never depends on argument order.
-// Returns the address, not a reference: GCC's dangling-reference analysis
-// cannot see that the keys are not what is returned.
+// The request with the greater key, else the greater request, independent of
+// argument order. A pointer, as GCC's dangling-reference check misfires on a
+// reference.
 template <typename Key>
 const TorrentRequest* later(const TorrentRequest& a, Key ka, const TorrentRequest& b, Key kb) {
     if (ka != kb) return ka > kb ? &a : &b;
@@ -162,8 +161,8 @@ TorrentRequest decode_torrent_request(Reader& rd) {
 }
 
 TorrentRequest merge_torrent_request(const TorrentRequest& a, const TorrentRequest& b) {
-    // Immutable fields are the same on both; start from the greater request
-    // so even a disagreement resolves the same way from either side.
+    // Start from the greater request, so even disagreeing immutable fields
+    // resolve the same from either side.
     TorrentRequest out = a >= b ? a : b;
 
     const auto& settings = *later(a, std::tie(a.settings_changed_unix_ms, a.settings_changed_by), b,

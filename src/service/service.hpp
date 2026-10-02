@@ -65,13 +65,9 @@ class Service {
     }
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
-    // Torrent runs as a plugin (Phase 1 of
-    // TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md) and FUSE as a
-    // supervised builtin (Stage A of
-    // TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md). `registry_` is
-    // where each publishes what it provides, and it outlives `subsystems_`
-    // deliberately: declared first, destroyed last, so a subsystem being torn
-    // down can still withdraw itself.
+    // Torrent runs as a plugin and FUSE as a supervised builtin. Each publishes
+    // what it provides in `registry_`, declared first and destroyed last so a
+    // subsystem being torn down can still withdraw itself.
     SubsystemRegistry registry_;
     SessionApi session_api_;
     UsersApi users_api_;
@@ -81,9 +77,9 @@ class Service {
     // diagnostics there, before the pass exists and after it has gone.
     MaintenancePort maintenance_port_;
     MaintenanceStageHook maintenance_stage_hook_;
-    // Everything built once the node's local state has recovered: the
-    // node's composition root (see node_services.hpp). Set once by the
-    // startup thread and published by services_ready_.
+    // The node's composition root (see node_services.hpp), built once local
+    // state has recovered. Set once by the startup thread; published by
+    // services_ready_.
     std::unique_ptr<NodeServices> services_;
 
     std::jthread startup_;
@@ -95,8 +91,8 @@ class Service {
     std::string startup_error_;
     StartupStallHandler startup_stall_handler_;
 
-    // Observation for the object ledger experiment's T0: written to a local
-    // file under the state path, never to Status or any API response.
+    // Observation probes: written to a local file under the state path, never to
+    // Status or any API response.
     std::unique_ptr<ObservationRecorder> observation_recorder_;
     std::atomic_bool observation_stopping_{};
     std::map<std::string, uint64_t> observation_gauges();
@@ -195,10 +191,8 @@ class Service {
     std::shared_ptr<FuseFrontend> fuse() {
         return registry_.fuse();
     }
-    // Where subsystems publish what they provide. Production writes to it
-    // from a Subsystem; a test that drives a FuseFrontend it constructed
-    // itself publishes here to make this Service see it, which is the same
-    // thing FuseSubsystem does.
+    // Where subsystems publish what they provide. A test driving its own
+    // FuseFrontend publishes here, as FuseSubsystem does.
     SubsystemRegistry& registry() noexcept {
         return registry_;
     }

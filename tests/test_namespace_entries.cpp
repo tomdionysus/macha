@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The resumable, budgeted namespace walk (the object ledger spec, B2:
-// `entries(view, cursor, budget)`; T4c). Its acceptance: it visits exactly
-// the set and order of the callback walk, across budget boundaries, on every
-// shape of tree, and on a map-backed snapshot.
+// The resumable, budgeted namespace walk `entries(view, cursor, budget)` visits
+// exactly the set and order of the callback walk, across budget boundaries, on
+// every shape of tree and on a map-backed snapshot.
 #include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "test_support.hpp"
@@ -31,8 +30,7 @@ FsEntry file_entry(uint64_t n) {
     return entry;
 }
 
-// A namespace of `count` paths in a few directories, so keys share
-// prefixes as real ones do.
+// `count` paths in a few directories, so keys share prefixes as real ones do.
 std::map<std::string, FsEntry> namespace_of(size_t count) {
     std::map<std::string, FsEntry> out;
     for (size_t i = 0; i < count; ++i)
@@ -100,8 +98,7 @@ MACHA_FAST_TEST("namespace_entries", test_pages_visit_what_the_callback_walk_vis
         for (size_t bound : {1U, 2U, 3U, 5U, 8U, 64U, 1000U}) {
             size_t pages = 0;
             CHECK(by_pages(tree, &store, bound, pages) == expected);
-            // The page that takes the last entry is complete: the walk finds
-            // the end without another operation, so there is no empty page.
+            // The page that takes the last entry is complete; there is no empty final page.
             CHECK(pages == std::max<size_t>(1, (count + bound - 1) / bound));
             CHECK(by_pages(map, nullptr, bound, pages) == expected);
         }
@@ -115,8 +112,8 @@ MACHA_FAST_TEST("namespace_entries", test_a_resumed_page_reads_only_its_own_path
     const auto all = by_callback(tree, &store);
     const size_t total_nodes = store.nodes();
 
-    // Resume just before the last entry: the walk needs one root-to-leaf
-    // path (and its extent nodes), far fewer than the tree's nodes.
+    // Resuming before the last entry reads one root-to-leaf path (and its
+    // extent nodes), far fewer than the tree's nodes.
     store.forget_reads();
     Budget budget;
     budget.operations(10);
@@ -136,8 +133,7 @@ MACHA_FAST_TEST("namespace_entries", test_a_cursor_between_paths_resumes_after_i
     MetadataSnapshot tree;
     tree.namespace_root = build_namespace_tree(map.entries, store, small_limits());
     const auto all = by_callback(map, nullptr);
-    // A path that is not in the namespace: the walk resumes at the first
-    // path after it, from either form.
+    // From a path not in the namespace, the walk resumes at the next one, in either form.
     const std::string between = all[4].first + "~";
     for (const auto* snapshot : {&map, &tree}) {
         Budget budget;
@@ -184,10 +180,8 @@ MACHA_FAST_TEST("namespace_entries", test_a_missing_node_or_store_throws) {
 
 } // namespace
 
-// The contract's `entries` on a running node: the manager pages its own
-// namespace (map-backed on a fresh node, which migrates to a tree only when
-// told; the tree is covered above), equal to the callback walk over the
-// same view.
+// On a running node the manager pages its own (map-backed) namespace, equal to
+// the callback walk over the same view.
 namespace {
 
 MACHA_TEST("namespace_entries", test_the_metadata_view_pages_a_live_namespace) {
@@ -244,8 +238,7 @@ MACHA_FAST_TEST("namespace_entries", test_a_node_that_is_not_a_tree_node_throws)
     CHECK(threw);
 }
 
-// A manager built without a namespace store (as the tests that need none
-// build it) pages a map-backed view from the map.
+// A manager without a namespace store pages a map-backed view from the map.
 MACHA_TEST("namespace_entries", test_a_manager_without_a_store_pages_a_map_backed_view) {
     macha::test_support::TestNode fixture("entries-no-store");
     fixture.prepare();

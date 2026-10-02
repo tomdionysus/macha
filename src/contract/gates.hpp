@@ -6,10 +6,9 @@
 #include <cstdint>
 #include <string>
 
-// The ledger's three destructive gates (the object ledger spec, B3), one per
-// row of the gate table: each is exactly the condition the maintenance pass
-// tests, returning whether it is permitted and why not. A gate reads the
-// inventory's stamp and the facts the pass gives it; it fetches nothing.
+// The ledger's three destructive gates (object ledger spec, B3), one per row
+// of the gate table: whether the maintenance pass may proceed, and why not.
+// A gate reads the inventory's stamp and the pass's facts; it fetches nothing.
 namespace macha {
 
 // What the pass knows when it reaches the gates.
@@ -18,8 +17,8 @@ struct PassFacts {
     bool garbage_due{};
     // Garbage collection is due: no foreground work, past its quiet window.
     bool gc_due{};
-    // Why GC is not due, for its reason: foreground work, or GC finished and
-    // waiting for an event (its quiet window unbounded).
+    // Why GC is not due: foreground work, or GC finished and waiting for an
+    // event (its quiet window unbounded).
     bool busy{};
     bool gc_waiting_for_event{};
     // The inventory was rebuilt in this pass: not yet used destructively.
@@ -51,8 +50,8 @@ GateVerdict tombstone_gate(const PassFacts&, const InventoryHorizon*);
 // inventory, at or past the known generation.
 GateVerdict control_gate(const PassFacts&, const InventoryHorizon*);
 
-// DATA release and sweep: the control gate's conditions, its reason the
-// first that fails in the order the pass has always logged it.
+// DATA release and sweep: the control gate's conditions; the reason is the
+// first that fails, in the pass's log order.
 GateVerdict data_gate(const PassFacts&, const InventoryHorizon*);
 
 } // namespace macha

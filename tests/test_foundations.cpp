@@ -29,8 +29,8 @@ MACHA_FAST_TEST("foundations", test_spool_retirement_rate_is_aggregate) {
     CHECK(first->elapsed == 10s);
     CHECK(static_cast<uint64_t>(first->bytes_per_second) == 10);
 
-    // A concurrent completion shares the same wall-clock denominator. The old
-    // per-file EMA would still report 10 B/s here; aggregate retirement is 20.
+    // A concurrent completion shares the same wall-clock denominator, so the
+    // aggregate rate doubles.
     auto concurrent = rate.retire(100, start + 10s);
     REQUIRE(concurrent.has_value());
     CHECK(concurrent->bytes == 200);
@@ -63,22 +63,19 @@ MACHA_FAST_TEST("foundations", test_weighted_loader_service_is_work_conserving_a
     CHECK(!service.can_start(start + 499ms, true));
     CHECK(service.can_start(start + 500ms, true));
 
-    // Viewer absence immediately lends the entire resource to the loader,
-    // regardless of an outstanding contended cooldown.
+    // With no viewer the loader may start despite an outstanding cooldown.
     CHECK(service.can_start(start + 100ms, false));
 
-    // A viewer arriving during an unrestricted loader quantum causes a bounded
-    // yield, then a finite proportional cooldown rather than indefinite arrest.
+    // A viewer arriving mid-quantum forces a yield, then a finite proportional
+    // cooldown.
     service.started(start + 1s, false);
     CHECK(service.should_yield(start + 1010ms, true));
     CHECK(service.finished(start + 1020ms, true) == 190ms);
     CHECK(!service.can_start(start + 1209ms, true));
     CHECK(service.can_start(start + 1210ms, true));
 
-    // Cold writer setup is admitted and tracked as active, but it is not
-    // charged as loader service. Otherwise a slow disk/network setup would
-    // consume the slice before producing a byte and its latency would then be
-    // multiplied by the viewer:loader cooldown ratio.
+    // Cold writer setup is active but not charged as service: a slow setup
+    // would otherwise spend the slice and be multiplied by the cooldown ratio.
     WeightedLoaderService cold_service(95, 5, 25ms);
     cold_service.started(start, true, false);
     cold_service.service_started(start + 10s, true);
@@ -131,16 +128,14 @@ MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
     });
     CHECK(blocked_speculative.wait_for(20ms) == std::future_status::timeout);
 
-    // Lower-class saturation cannot consume the reserved byte. A viewer which
-    // arrives later starts immediately without cancelling the bounded loader
-    // work already in flight.
+    // Lower-class saturation cannot consume the reserved byte; a late viewer
+    // starts at once without cancelling loader work in flight.
     auto viewer = resources.acquire(DataWorkContext(FrameType::foreground, 1), 1);
     REQUIRE(viewer.has_value());
     CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
     viewer.reset();
 
-    // A bounded deadline terminates through the condition-variable deadline;
-    // there is no periodic admission poll.
+    // A deadline ends the wait via the condition variable, not a poll.
     auto expired = resources.acquire(
         DataWorkContext(FrameType::loader, 1, DataWorkContext::Clock::now() + 20ms), 1);
     CHECK(!expired.has_value());
@@ -271,12 +266,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     REQUIRE(recovering_set.size() == 1);
     CHECK(recovering_set.front().phase == NodePhase::recovering);
 
-    // The framing, which stopped being positional in 0.48.0. Every field is
-    // tagged and length-delimited inside a length-delimited record, so none of
-    // the assertions below need to know where anything sits -- which is the
-    // point. The tests they replace computed byte offsets backwards from the
-    // end of the record and had to be recomputed by hand every time a field
-    // was added.
+    // Every field is tagged and length-delimited inside a length-delimited
+    // record, so the assertions below need no byte offsets.
     auto full = encode_node_telemetry(telemetry);
 
     // A field this build does not know is skipped by its own length, and
@@ -294,7 +285,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     // The record body is everything after the magic and the record length.
     Bytes body(full.begin() + set_magic.size() + 4, full.end());
     Bytes unknown_field;
-    put_u16(unknown_field, 4242);    // an id from a later version
+    put_u16(unknown_field, 4242);    // an unknown id
     put_u16(unknown_field, 5);       // ... carrying five bytes
     unknown_field.insert(unknown_field.end(), 5, 0xEE);
     Bytes with_unknown(body);
@@ -307,14 +298,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
                                with_unknown.end());
     CHECK(decode_node_telemetry(record_with_unknown) == telemetry);
 
-    // THE CASE THE POSITIONAL FORMAT COULD NOT SURVIVE. A set whose first
-    // record carries a field this build has never heard of: the record after
-    // it must still decode exactly. Positionally that was impossible -- an
-    // older reader consumed the fields it knew, stopped short of the rest, and
-    // began the next record part-way through the previous one, so every record
-    // after the first was garbage. With up to 64 records on the gossip path,
-    // one added field cost a mixed-version cluster every multi-node set it
-    // exchanged.
+    // In a set whose first record carries an unknown field, the following
+    // record still decodes exactly.
     NodeTelemetry second = telemetry;
     second.node_id = random_node_id();
     second.sequence = 11;
@@ -335,9 +320,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(mixed.front() == telemetry);
     CHECK(mixed.back() == second);
 
-    // A record missing a field keeps that field's default, which a consumer
-    // reads as "this node did not say" -- never as a figure of zero it may act
-    // on. Built by dropping every playback field from the body.
+    // A missing field decodes as its default ("not reported"). Built by
+    // dropping every playback field from the body.
     Bytes trimmed;
     {
         Reader scan(body);
@@ -368,10 +352,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(silent.memory_total_bytes == telemetry.memory_total_bytes);
     CHECK(silent.sequence == telemetry.sequence);
 
-    // A sparse node -- streaming off, no cache, no extents -- writes a much
-    // smaller record than a busy one, because a default-valued field is simply
-    // left out. fi-1 is exactly this shape: a full metadata replica hosting no
-    // extents at all.
+    // Default-valued fields are omitted, so a sparse node's record is much
+    // smaller than a busy one's.
     NodeTelemetry sparse;
     sparse.node_id = telemetry.node_id;
     sparse.boot_id = telemetry.boot_id;
@@ -382,9 +364,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     CHECK(sparse_encoded.size() * 2 < full.size());
     CHECK(decode_node_telemetry(sparse_encoded) == sparse);
 
-    // A record that promises more bytes than it carries is damaged, and is
-    // refused rather than read as a shorter record from an older node. The
-    // positional format could not tell those two apart at all.
+    // A record that promises more bytes than it carries is refused as damaged.
     auto damaged = full;
     damaged.resize(damaged.size() - 4);
     bool damaged_rejected = false;
@@ -395,8 +375,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     }
     CHECK(damaged_rejected);
 
-    // A known field arriving at the wrong width is corruption, not a version
-    // difference, and must not be read as a number of some other size.
+    // A known field at the wrong width is refused as corruption.
     Bytes narrow;
     {
         Reader scan(body);
@@ -428,9 +407,7 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
     }
     CHECK(width_rejected);
 
-    // A record carrying no phase at all decodes as NodeTelemetry's default
-    // rather than failing or picking a different one -- absence is silence,
-    // and silence has a defined meaning for every field.
+    // A record with no phase decodes as NodeTelemetry's default phase.
     Bytes no_phase;
     {
         Reader scan(body);
@@ -464,9 +441,8 @@ MACHA_FAST_TEST("foundations", test_codec_and_crypto) {
         aes_gcm_open(keys.storage, sealed.nonce, sealed.tag, sealed.ciphertext, keys.cluster_id);
     CHECK(opened == plain);
 
-    // Regression: authenticated empty frames must not accidentally inherit the
-    // AAD byte count as ciphertext length. Persistent framed connections depend on
-    // precise framing across consecutive requests.
+    // An empty plaintext with AAD seals to an empty ciphertext, not one sized
+    // by the AAD.
     Bytes empty;
     Bytes aad{1, 2, 3, 4, 5};
     auto empty_sealed = aes_gcm_seal(keys.auth, empty, aad);
@@ -521,9 +497,8 @@ MACHA_FAST_TEST("foundations", test_membership_identity_reset_tombstone) {
     membership.observe(stale, false);
     CHECK(membership.all().size() == 1);
 
-    // A tombstone is a freshness boundary, not a permanent NodeId ban. A
-    // directly authenticated post-reset observation can establish the same
-    // association again when that really is the node at the endpoint.
+    // A tombstone is a freshness boundary, not a NodeId ban: a direct
+    // post-reset observation re-establishes the association.
     stale.seen_unix_ms = reset.reset_unix_ms + 1;
     membership.observe(stale, true);
     REQUIRE(membership.all().size() == 2);
@@ -535,8 +510,7 @@ MACHA_FAST_TEST("foundations", test_membership_identity_reset_tombstone) {
     REQUIRE(membership.apply_identity_reset(reset2));
     CHECK(membership.all().size() == 1);
 
-    // The endpoint itself is not blacklisted: a freshly authenticated
-    // replacement NodeId is valid.
+    // The endpoint is not blacklisted: a freshly authenticated NodeId is valid.
     auto replacement = stale;
     replacement.id = random_node_id();
     replacement.seen_unix_ms = reset2.reset_unix_ms + 1;
@@ -587,8 +561,8 @@ MACHA_FAST_TEST("foundations", test_membership_identity_reset_is_durable_without
         CHECK(recovered.identity_resets().front() == reset);
         CHECK(recovered.all().size() == 1);
 
-        // Restart cannot restore the invalidated roster entry, and old gossip
-        // remains fenced without requiring a readable metadata snapshot.
+        // Restart does not restore the invalidated entry, and old gossip stays
+        // fenced without a metadata snapshot.
         recovered.observe(stale, false);
         CHECK(recovered.all().size() == 1);
 
@@ -597,8 +571,8 @@ MACHA_FAST_TEST("foundations", test_membership_identity_reset_is_durable_without
         REQUIRE(recovered.all().size() == 2);
     }
 
-    // A genuinely fresh, directly authenticated association survives another
-    // restart; the persisted observation time distinguishes it from stale data.
+    // A fresh direct association survives restart; the persisted observation
+    // time distinguishes it from stale data.
     Membership recovered_fresh(self, 30s, roster);
     const auto fresh_members = recovered_fresh.all();
     REQUIRE(fresh_members.size() == 2);
@@ -625,8 +599,7 @@ MACHA_FAST_TEST("foundations", test_membership_persists_gc_fence_and_requires_di
         Membership membership(self, 40ms, roster);
         CHECK(membership.all_known_reachable());
 
-        // Gossip may teach us that a node exists, but it is deliberately not
-        // proof that the node is reachable for destructive GC.
+        // Gossip proves a node exists, not that it is reachable for GC.
         membership.observe(peer, false);
         REQUIRE(membership.all().size() == 2);
         CHECK(!membership.all_known_reachable());
@@ -636,9 +609,8 @@ MACHA_FAST_TEST("foundations", test_membership_persists_gc_fence_and_requires_di
         REQUIRE(std::filesystem::exists(roster));
     }
 
-    // A recovering isolated node must remember the peer before it has had a
-    // chance to rediscover the cluster. Persisted members therefore restart as
-    // GC fences until this process directly authenticates them again.
+    // Persisted members restart as GC fences until directly authenticated
+    // again, so an isolated node remembers peers it has not yet rediscovered.
     {
         Membership recovered(self, 40ms, roster);
         REQUIRE(recovered.all().size() == 2);
@@ -727,14 +699,14 @@ MACHA_FAST_TEST("foundations", test_membership_ip_identity_reset_without_node_id
     CHECK(std::any_of(after.begin(), after.end(),
                       [&](const NodeInfo& node) { return node.id == other.id; }));
 
-    // Gossip containing a pre-reset observation cannot reintroduce either old
-    // association, even when the administrator did not know their NodeIds.
+    // Pre-reset gossip cannot reintroduce either association, though the
+    // reset named no NodeId.
     membership.observe(first, false);
     membership.observe(second, false);
     CHECK(membership.all().size() == 2);
 
-    // The IP is not blacklisted. Fresh authentication may establish a new
-    // identity, and subsequent gossip carrying a post-reset observation is valid.
+    // The IP is not blacklisted: a freshly authenticated identity, and later
+    // post-reset gossip about it, are accepted.
     auto replacement = first;
     replacement.id = random_node_id();
     replacement.seen_unix_ms = reset.reset_unix_ms + 1;
@@ -895,10 +867,8 @@ MACHA_TEST("foundations", test_thread_cpu_reporter_debug_escalation) {
     });
     CHECK(high != records.end());
 
-    // The final high-CPU reporting interval can contain a short unreported
-    // busy tail before the sleep starts. Give the reporter more than one idle
-    // interval so the assertion does not depend on exactly where that final
-    // sampling boundary landed.
+    // The last high-CPU interval may hold an unreported busy tail; allow more
+    // than one idle interval so the result does not depend on sample boundaries.
     bool recovered = false;
     for (int attempt = 0; attempt < 4 && !recovered; ++attempt) {
         std::this_thread::sleep_for(35ms);
@@ -1056,13 +1026,11 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
     std::vector<NodeInfo> asymmetric{make_node(1, 10 * TiB), make_node(2, 10 * TiB),
                                      make_node(3, 8 * GiB)};
 
-    // With three nodes and R=2, all physical capacity can participate: the two
-    // 10 TiB nodes are in almost every shard and the 8 GiB node owns only its
-    // proportional share. This is ~10 TiB logical, not 8 GiB.
+    // Three nodes, R=2: the 8 GiB node owns only its proportional share, so
+    // logical capacity is ~10 TiB, not 8 GiB.
     CHECK(placement_logical_capacity(asymmetric, 2) == 10 * TiB + 4 * GiB);
 
-    // With only 10 TiB + 8 GiB and R=2 every logical byte needs both nodes, so
-    // the small node correctly caps the namespace at 8 GiB.
+    // Two nodes, R=2: every byte needs both, so the small node caps it.
     std::vector<NodeInfo> two_nodes{asymmetric[0], asymmetric[2]};
     CHECK(placement_logical_capacity(two_nodes, 2) == 8 * GiB);
 
@@ -1081,10 +1049,8 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
                            [&](const auto& node) { return node.id == id; });
     };
 
-    // Exact 32-bit quota arithmetic: the 8 GiB node receives 3,354,133 of
-    // 4,294,967,296 shards. With these stable node IDs its interval is the tail
-    // of the systematic sample space, so the ownership boundary is exact. This
-    // replaces the old exhaustive 65,536-shard walk.
+    // The 8 GiB node's quota is 3,354,133 of 2^32 shards; with these node IDs
+    // its interval is the tail of the shard space, so the boundary is exact.
     constexpr uint64_t small_quota = 3'354'133;
     const auto first_small = static_cast<uint32_t>(placement_shards - small_quota);
     auto just_before = capacity_placement_nodes(shard_id(first_small - 1), asymmetric, 2);
@@ -1099,10 +1065,8 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
     CHECK(preferred_contains(at_end, asymmetric[2].id, 2));
     CHECK(at_boundary[0].id != at_boundary[1].id);
 
-    // R=1 is weighted rendezvous over the stable shard space. Adding a backend
-    // or node may steal shards, but must never make two unchanged owners trade
-    // shards with each other. Sample deterministically across the 32-bit space;
-    // iterating all 2^32 virtual shards is neither necessary nor desirable.
+    // R=1 is weighted rendezvous: a new node may take shards, but unchanged
+    // owners never trade with each other. Sampled deterministically over 2^32.
     std::vector<NodeInfo> before{make_node(10, 10 * TiB), make_node(20, 10 * TiB)};
     auto after = before;
     after.push_back(make_node(30, 10 * TiB));
@@ -1121,8 +1085,8 @@ MACHA_FAST_TEST("foundations", test_capacity_placement) {
     CHECK(moved_to_new > placement_samples / 4);
     CHECK(moved_to_new < placement_samples * 2 / 5);
 
-    // Failure-domain diversity remains a stronger constraint than raw node
-    // capacity when enough domains exist. One replica must fit in site-b.
+    // Failure-domain diversity outranks raw capacity: one replica must be in
+    // site-b.
     std::vector<NodeInfo> domains{make_node(1, 10 * TiB, "site-a"),
                                   make_node(2, 10 * TiB, "site-a"),
                                   make_node(3, 8 * GiB, "site-b")};
@@ -1139,8 +1103,8 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_he
     REQUIRE(speculative.has_value());
     CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
 
-    // Speculative ownership cannot consume the loader floor. Viewer and
-    // control reservations remain independently usable at full lower load.
+    // Speculative use cannot consume the loader floor; viewer and control
+    // reserves stay usable at full lower load.
     auto loader = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 10);
     auto viewer = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment, 30);
     auto control = ledger.try_acquire(MemoryClass::control, MemoryOwner::rpc_frame, 10);
@@ -1160,40 +1124,27 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_preserves_priority_he
 }
 
 MACHA_FAST_TEST("foundations", test_retained_memory_ledger_never_starves_rpc_reassembly) {
-    // The es-1 livelock of 2026-09-08, in miniature. Publication holds its
-    // retained bytes until a peer confirms the write, and that confirmation
-    // arrives as an RPC message which must first be reassembled into this same
-    // ledger. While reassembly was charged against the durable-lower budget,
-    // publication could fill that budget and then be unable to confirm
-    // anything -- reassembly refused, MessageAssembler throwing, the peer
-    // channel dropping, so nothing was released and the node could not drain
-    // itself even across a restart.
+    // Publication holds its bytes until a peer confirms the write, and the
+    // confirmation must be reassembled into this same ledger. A full
+    // durable-lower budget must therefore never block reassembly.
     RetainedMemoryLedger ledger(100, 10, 30, 10);
 
-    // Fill the durable-lower budget exactly, as a publication backlog does.
     auto publication = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60);
     REQUIRE(publication.has_value());
 
-    // Durable lower-priority work is now correctly refused: this is the state
-    // the node was wedged in, and it must stay refused or the test proves
-    // nothing.
+    // The durable-lower budget is full: ordinary lower work is refused.
     CHECK(!ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 1).has_value());
     CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
 
-    // But reassembly still gets in, because it is the path that releases the
-    // very bytes publication is holding.
+    // Reassembly is still admitted: it is what releases publication's bytes.
     auto reassembly = ledger.try_acquire(MemoryClass::loader, MemoryOwner::rpc_frame, 10);
     REQUIRE(reassembly.has_value());
 
-    // The exemption is from the durable-lower budget only, not from the
-    // ledger. Control and viewer reserves still bound it: 60 + 10 held, and
-    // non-control capacity is 90, so 30 more must not be admitted.
+    // The exemption covers the durable-lower budget only: 60 + 10 held of 90
+    // non-control capacity, so 30 more is refused, as is exceeding the total.
     CHECK(!ledger.try_acquire(MemoryClass::loader, MemoryOwner::rpc_frame, 30).has_value());
-    // Nor may it exceed total capacity.
     CHECK(!ledger.try_acquire(MemoryClass::control, MemoryOwner::rpc_frame, 40).has_value());
 
-    // Confirmation completes, publication releases, and the budget is usable
-    // again -- the loop closes instead of wedging.
     reassembly.reset();
     publication.reset();
     CHECK(ledger.stats().used_bytes == 0);
@@ -1201,17 +1152,13 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_never_starves_rpc_rea
 }
 
 MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounded_not_absolute) {
-    // Reserve of 5 bytes inside a 100-byte ledger, so the bound is testable.
+    // A 5-byte reassembly reserve, so the bound is testable.
     RetainedMemoryLedger ledger(100, 10, 30, 10, 5);
 
-    // Publication holds the durable-lower budget, as a wedged node's does.
     auto publication = ledger.try_acquire(MemoryClass::loader, MemoryOwner::publication, 60);
     REQUIRE(publication.has_value());
 
-    // A permanently queued waiter is the normal state of that node, and it is
-    // the case the 2026-09-09 first attempt missed: the exemption sat below
-    // the waiter gates, so every data-lane frame was refused before it was
-    // reached and the node re-entered the identical livelock.
+    // A queued lower-class waiter must not shut reassembly out of the reserve.
     std::atomic_bool started{false};
     std::atomic_bool finished{false};
     std::jthread waiter([&] {
@@ -1227,11 +1174,8 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
         std::this_thread::sleep_for(1ms);
     CHECK(ledger.stats().waits[2] > 0);
 
-    // Governing law 2 first: a queued VIEWER outranks reassembly, always. The
-    // reserve sits below the control/viewer waiter gate precisely so that a
-    // frame can never be admitted ahead of playback, and a viewer cannot be
-    // the party publication is deadlocked against in any case -- the viewer
-    // reserve is headroom loader and speculative work can never consume.
+    // A queued viewer always outranks reassembly: the reserve sits below the
+    // control/viewer waiter gate.
     std::atomic_bool viewer_cancel{false};
     std::atomic_bool viewer_started{false};
     std::jthread viewer([&] {
@@ -1247,28 +1191,22 @@ MACHA_FAST_TEST("foundations", test_retained_memory_reassembly_reserve_is_bounde
     viewer.join();
 
     {
-        // Inside the reserve, reassembly is admitted despite that waiter: this
-        // is the confirmation path, and refusing it is what wedges the ledger.
-        // Scoped so the lease is released by its destructor -- an explicit
-        // reset() here trips a -Wmaybe-uninitialized false positive on GCC.
+        // Inside the reserve, reassembly is admitted despite the lower waiter.
+        // Scoped so the destructor releases the lease: an explicit reset()
+        // here trips a GCC -Wmaybe-uninitialized false positive.
         auto inside = ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 4);
         REQUIRE(inside.has_value());
 
-        // Beyond the reserve it defers like anything else. Absolute priority
-        // here simply inverts the deadlock -- a node receiving from two peers
-        // starves its own publication -- so the guarantee must be bounded.
+        // Beyond the reserve it defers; unbounded priority would starve the
+        // node's own publication.
         CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::rpc_frame, 4)
                    .has_value());
-        // And an ordinary speculative admission is still deferred, so the
-        // reserve is specific to reassembly rather than a hole in the waiter
-        // discipline.
+        // The reserve is for reassembly only; other speculative work defers.
         CHECK(!ledger.try_acquire(MemoryClass::speculative, MemoryOwner::cache, 1).has_value());
     }
     waiter.join();
     CHECK(finished.load());
 
-    // Once the frame is reassembled the confirmation completes, publication
-    // releases, and the ledger is usable again.
     publication.reset();
     CHECK(ledger.stats().used_bytes == 0);
 }
@@ -1310,13 +1248,9 @@ MACHA_FAST_TEST("foundations", test_retained_memory_ledger_restores_durable_over
 } // namespace
 
 MACHA_TEST("foundations", test_every_subsystem_thread_is_run_supervised) {
-    // An exception escaping a std::jthread/std::thread lambda does not reach
-    // any caller's try/catch -- it calls std::terminate() and aborts the
-    // whole process. run_supervised() is the one place that boundary is
-    // guarded (see src/supervised.hpp). This scans every .cpp under src/ for a raw
-    // thread/worker-pool construction site and fails if run_supervised does
-    // not appear within the next couple of lines, so a new thread can't be
-    // added later that silently bypasses the guard.
+    // An exception escaping a thread body calls std::terminate(); run_supervised
+    // (src/supervised.hpp) guards that boundary. Every thread construction site
+    // under src/ must name run_supervised within the next two lines.
     const std::regex site_pattern(R"(std::jthread\(\[|emplace_back\([^)]*stop_token)");
     const std::filesystem::path src_dir = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "src";
     std::vector<std::string> unguarded;
@@ -1376,9 +1310,7 @@ MACHA_FAST_TEST("foundations", test_supervised_restart_delay_doubles_to_its_ceil
 }
 
 MACHA_TEST("foundations", test_a_supervised_loop_that_throws_runs_again) {
-    // gbni-1, 2026-09-26: the torrent worker threw once on a stale handle and
-    // ended, logged once, and nothing ran it again for a day. A service loop
-    // that faults is run again, and the fault is on record.
+    // A faulting service loop is run again, and the fault is recorded.
     std::atomic<int> runs{0};
     std::jthread thread([&](std::stop_token stop) {
         run_supervised_loop("test-loop-restarts", stop, [&] {
@@ -1471,11 +1403,8 @@ Config minimal_valid_config() {
 } // namespace
 
 MACHA_TEST("foundations", test_normalize_config_defaults_plugin_path_to_the_build_default) {
-    // The default is a compile-time constant (this build's private plugin
-    // directory under CMAKE_INSTALL_PREFIX, see MACHA_PLUGIN_INSTALL_DIR in
-    // CMakeLists.txt) -- deliberately not derived from the running
-    // executable's own location, which is bindir, not a place private
-    // libraries/plugins belong.
+    // The default is the compile-time MACHA_PLUGIN_INSTALL_DIR, not derived
+    // from the executable's location (bindir).
     auto normalized = normalize_config(minimal_valid_config());
     if (kDefaultPluginDir.empty()) {
         CHECK(!normalized.plugin_path.has_value());
@@ -1486,11 +1415,8 @@ MACHA_TEST("foundations", test_normalize_config_defaults_plugin_path_to_the_buil
 }
 
 MACHA_TEST("foundations", test_publication_open_writer_bound_fits_the_loader_reserve) {
-    // The bound exists so every writer that may be open at once can hold its
-    // worst case -- one filling extent buffer plus its pipeline -- inside the
-    // loader's guaranteed share of the retained-memory ledger. Unbounded, the
-    // number of writers holding partial state is the width of the publication
-    // backlog, and they deadlock against each other (es-1, 2026-09-09).
+    // Every writer open at once must fit its worst case (one extent buffer plus
+    // its pipeline) inside the loader reserve, or writers deadlock each other.
     auto config = minimal_valid_config();
     config.extent_size = 4 * 1024 * 1024;
     config.fuse.commit_workers = 8;
@@ -1499,9 +1425,7 @@ MACHA_TEST("foundations", test_publication_open_writer_bound_fits_the_loader_res
     const auto per_writer =
         static_cast<uint64_t>(normalized.extent_size) + normalized.fuse.publication_pipeline_bytes;
     CHECK(per_writer == 12ULL * 1024 * 1024); // 4M buffer + two 4M pipeline extents
-    // 64M / 12M is 5, but never fewer than one writer per commit worker: a
-    // worker with no admissible inode is worse than a slightly overcommitted
-    // reserve, and the no-progress deadline still bounds the wait.
+    // 64M / 12M is 5, but never fewer than one writer per commit worker.
     CHECK(normalized.fuse.publication_max_open_writers == 8);
 
     // With enough reserve the ledger, not the worker count, sets the bound.
@@ -1515,13 +1439,8 @@ MACHA_TEST("foundations", test_publication_open_writer_bound_fits_the_loader_res
 }
 
 MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorrent_enumeration) {
-    // libtorrent's default listen_interfaces is expanded by its own device
-    // enumeration. On these nodes that binds eth0 and loopback and never
-    // wlan0, so gbni-2 -- whose eth0 is NO-CARRIER and whose only live link is
-    // wireless -- ran a session bound to 127.0.0.1 and ::1 alone. Two magnets
-    // sat in `metadata` for hours with 0 peers, an empty error field, and one
-    // "plugin loaded" line in the journal. The advertised address is correct
-    // whichever device carries it.
+    // libtorrent's own device enumeration can miss the live link; the
+    // advertised address is correct whichever device carries it.
     TorrentConfig config;
     config.listen_port = 6881;
 
@@ -1532,32 +1451,22 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
     CHECK(torrent_listen_interfaces(config, "fd0e:9c96:30a3::bb4") ==
           "[fd0e:9c96:30a3::bb4]:6881");
 
-    // No usable advertised address: fall back to libtorrent's own default
-    // rather than inventing a binding.
+    // No usable advertised address: bind every interface.
     CHECK(torrent_listen_interfaces(config, "") == "0.0.0.0:6881,[::]:6881");
     CHECK(torrent_listen_interfaces(config, "0.0.0.0") == "0.0.0.0:6881,[::]:6881");
 
-    // The port is honoured in every branch.
     config.listen_port = 51413;
     CHECK(torrent_listen_interfaces(config, "10.44.1.51") == "10.44.1.51:51413");
     CHECK(torrent_listen_interfaces(config, "") == "0.0.0.0:51413,[::]:51413");
 
-    // An explicit operator value always wins, including a device name, which
-    // is the escape hatch when the advertised address is not what should carry
-    // peer traffic.
+    // An explicit operator value, including a device name, always wins.
     config.listen_interfaces = "wlan0:6881";
     CHECK(torrent_listen_interfaces(config, "10.44.1.51") == "wlan0:6881");
     CHECK(torrent_listen_interfaces(config, "") == "wlan0:6881");
 
-    // A DNS-name advertise must NOT be handed to libtorrent. listen_interfaces
-    // takes an IP literal or a device name, so a hostname matches no device
-    // and binds nothing at all -- silently. Worse, the name usually resolves
-    // to a public address the node does not hold, because it is behind NAT.
-    //
-    // Observed live on 2026-09-12: all three nodes moved to public DNS
-    // advertise values, every one of them bound nothing on 6881, and torrents
-    // sat in dl-metadata for ever with no error anywhere. Binding every
-    // interface is the only honest answer.
+    // A hostname advertise binds every interface: listen_interfaces takes an
+    // IP literal or device name, so a hostname would silently bind nothing,
+    // and it may resolve to a NATed address the node does not hold.
     config.listen_interfaces.clear();
     config.listen_port = 6881;
     for (const auto* name : {"inverbeg.macha.network", "macnessa.macha.network",
@@ -1565,8 +1474,7 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
         CHECK(torrent_listen_interfaces(config, name) == "0.0.0.0:6881,[::]:6881");
     }
 
-    // Addresses are still used, so a node that advertises one keeps the
-    // specific binding 0.37.2 introduced for it.
+    // An advertised address still gets a specific binding.
     CHECK(torrent_listen_interfaces(config, "192.168.1.50") == "192.168.1.50:6881");
     CHECK(torrent_listen_interfaces(config, "::1") == "[::1]:6881");
 
@@ -1575,25 +1483,20 @@ MACHA_TEST("foundations", test_torrent_binds_the_advertised_address_not_libtorre
     CHECK(torrent_listen_interfaces(config, "10.44.1.256") == "0.0.0.0:6881,[::]:6881");
     CHECK(torrent_listen_interfaces(config, "10.44.1.51.") == "0.0.0.0:6881,[::]:6881");
 
-    // And the operator override still wins over all of it.
+    // The operator override still wins.
     config.listen_interfaces = "0.0.0.0:6881,[::]:6881";
     CHECK(torrent_listen_interfaces(config, "inverbeg.macha.network") ==
           "0.0.0.0:6881,[::]:6881");
 }
 
 MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_its_ceiling) {
-    // The density rule ("more than N failures inside the window") cannot fire
-    // once backoff caps: a window only ever holds failure_window/max_backoff
-    // attempts. The shipped publication policy was 30 min / 30 s = 60 possible
-    // attempts against a threshold of 100, so a permanently failing file
-    // retried forever. On 2026-09-10 gbni-1 did exactly that -- 68 consecutive
-    // failures of one inode, every aggregate reading healthy, parked = 0.
-    // RetryState::failed() takes `now`, so this drives simulated time and needs
-    // no sleeps.
+    // Once backoff caps, a window holds at most failure_window/max_backoff
+    // attempts (30 min / 30 s = 60 < 100), so the density rule alone never
+    // parks; max_failing_duration must. failed() takes `now`: simulated time.
     using Clock = RetryState::Clock;
     const auto start = Clock::now();
     RetryPolicy shipped{100, 30min, 250ms, 30s};
-    shipped.max_failing_duration = {}; // the pre-fix behaviour
+    shipped.max_failing_duration = {}; // no duration backstop
 
     RetryState never_parks;
     bool parked = false;
@@ -1603,8 +1506,7 @@ MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_it
     CHECK(never_parks.failures_in_window() <= 61); // the arithmetic ceiling
     CHECK(never_parks.consecutive_failures() == 400);
 
-    // With the duration backstop the same policy parks, and only once the
-    // backstop is genuinely exceeded -- not before.
+    // With the backstop the same policy parks, exactly once it is exceeded.
     RetryPolicy fixed = shipped;
     fixed.max_failing_duration = 1h;
     RetryState bounded;
@@ -1620,8 +1522,8 @@ MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_it
     CHECK((*parked_at - 1) * 30s > 1h);
     CHECK((*parked_at - 2) * 30s <= 1h);
 
-    // The backstop measures the current unbroken run, not the whole history:
-    // an item that keeps recovering must never park on age alone.
+    // The backstop measures the current unbroken run, so an item that keeps
+    // recovering never parks on age alone.
     RetryState flapping;
     for (int i = 1; i <= 400; ++i) {
         REQUIRE(flapping.failed(fixed, start + i * 30s).has_value());
@@ -1629,9 +1531,7 @@ MACHA_TEST("foundations", test_retry_budget_is_reachable_once_backoff_reaches_it
     }
     CHECK(flapping.consecutive_failures() == 0);
 
-    // ...but genuine flapping still parks on density, which is what that rule
-    // is for: 101 failures inside the window, sparse enough runs that the
-    // backstop never applies.
+    // Dense flapping still parks on the density rule.
     RetryPolicy dense{5, 10min, 1ms, 10ms};
     dense.max_failing_duration = 1h;
     RetryState flapping_hard;
@@ -1660,8 +1560,7 @@ MACHA_TEST("foundations", test_fuse_mountpoint_preflight_counts_stray_entries) {
     // Missing directory: created, empty, nothing stray.
     CHECK(guard_covered_mountpoint(covered, false).stray_entries == 0);
     CHECK(std::filesystem::is_directory(covered));
-    // Files written to the host directory while no mount covered it are
-    // reported, so an operator learns that the mount is hiding them.
+    // Entries in the host directory, which the mount would hide, are counted.
     std::ofstream(covered / "stray.mkv") << "not in macha";
     std::filesystem::create_directory(covered / "Movies");
     CHECK(guard_covered_mountpoint(covered, false).stray_entries == 2);
@@ -1687,7 +1586,7 @@ MACHA_TEST("foundations", test_fuse_mountpoint_preflight_refuses_unrelated_files
 #endif
 }
 
-// 0.42.0: nodes that accept no inbound connections, and edge nodes.
+// Nodes that accept no inbound connections, and edge nodes.
 
 MACHA_FAST_TEST("foundations", test_node_info_flags_travel_on_the_wire_and_in_the_roster) {
     NodeInfo node;
@@ -1696,7 +1595,7 @@ MACHA_FAST_TEST("foundations", test_node_info_flags_travel_on_the_wire_and_in_th
     node.port = 7437;
     node.failure_domain = "cgnat-site";
     node.seen_unix_ms = unix_ms();
-    CHECK(node_inbound_capable(node)); // the pre-0.42 default: dialable, hosting
+    CHECK(node_inbound_capable(node)); // default: dialable, hosting
     CHECK(node_hosts_extents(node));
 
     node.flags = node_flags_for(false, true);
@@ -1709,8 +1608,8 @@ MACHA_FAST_TEST("foundations", test_node_info_flags_travel_on_the_wire_and_in_th
     CHECK(node_hosts_extents(decoded));
     CHECK(decoded.flags == node.flags);
 
-    // The roster persists the flags (v3), so a restarting node knows which
-    // peers it must not dial before it has heard from anyone.
+    // The roster persists the flags, so a restarting node knows which peers
+    // not to dial before it hears from anyone.
     TempDir t;
     const auto roster = t.path() / "membership" / "known-nodes.bin";
     NodeInfo self;
@@ -1772,20 +1671,19 @@ MACHA_FAST_TEST("foundations", test_gc_fence_excludes_pairs_that_can_never_dial_
     capable.port = 7437;
     capable.seen_unix_ms = unix_ms();
 
-    // Two nodes that both accept no inbound connections can never
-    // authenticate each other directly: not a fault, not a fence.
+    // Two non-dialable nodes can never authenticate each other: not a fence.
     Membership membership(self, 40ms, {});
     membership.observe(incapable, false);
     CHECK(membership.all_known_reachable());
 
-    // A capable peer known only from gossip still fences, exactly as before.
+    // A capable peer known only from gossip still fences.
     membership.observe(capable, false);
     CHECK(!membership.all_known_reachable());
     membership.observe(capable, true);
     CHECK(membership.all_known_reachable());
 
-    // From a capable node's point of view an incapable peer is an ordinary
-    // fence: it can be authenticated directly over the session it opened.
+    // To a capable node an incapable peer is an ordinary fence: it can be
+    // authenticated over the session it opened.
     NodeInfo capable_self = self;
     capable_self.flags = node_flags_for(true, true);
     Membership from_capable(capable_self, 40ms, {});

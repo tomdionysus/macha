@@ -24,19 +24,16 @@ struct HttpRequest {
     std::map<std::string, std::string, std::less<>> query;
     std::map<std::string, std::string, std::less<>> headers;
     Bytes body;
-    // Set by HttpServer once the bearer token has been validated against the
-    // cluster session store. Absent for exempt routes (session creation,
-    // signed streaming/asset capability URLs).
+    // Set once the bearer token validates against the cluster session store.
+    // Absent for exempt routes (session creation, signed capability URLs).
     std::optional<SessionIdentity> session;
-    // Set when the request is being run again after the handler deferred it
-    // (see HttpDeferral): the state the handler parked, and the deadline it
-    // named, so it can tell "woken because the thing arrived" from "woken
-    // because time ran out" without keeping any state of its own.
+    // Set when re-run after a deferral (see HttpDeferral): the parked state and
+    // its deadline, so the handler can tell arrival from timeout statelessly.
     bool resumed{};
     std::shared_ptr<void> resumed_state{};
     Clock::time_point resume_deadline{};
-    // Every value of each query parameter, in order, for parameters that may
-    // repeat (`kind=movie&kind=show`); `query` keeps the last of each.
+    // Every value of each repeatable query parameter, in order; `query` keeps
+    // the last.
     std::map<std::string, std::vector<std::string>, std::less<>> query_all{};
 };
 
@@ -44,22 +41,18 @@ class HttpBodySource {
   public:
     virtual ~HttpBodySource() = default;
     virtual uint64_t size() const = 0;
-    // Runs on a compute-pool thread, never on the reactor: it may block on a
-    // disk or a remote replica.
+    // Runs on a compute-pool thread, never the reactor: it may block.
     virtual size_t read(uint64_t offset, std::span<uint8_t> destination) = 0;
-    // The whole body [0, size()), when it is already in memory for the life
-    // of this source. The reactor sends straight from it, with no copy and
-    // no pool hop, which is the hot path for a transcoded fragment. Null
-    // means read() has to be asked.
+    // The whole body [0, size()) when it stays in memory for this source's life;
+    // the reactor sends straight from it with no copy or pool hop. Null means use
+    // read().
     virtual const uint8_t* resident() const noexcept {
         return nullptr;
     }
 };
 
-// A one-shot wake for a deferred request. Whoever produces the awaited thing
-// calls fire(); the server calls arm() with what to do when that happens.
-// Either order works: firing before arming wakes the request the moment it
-// is armed, so a producer racing the handler cannot lose the wakeup.
+// One-shot wake for a deferred request: the producer calls fire(), the server
+// arm(). Either order works, so a racing producer cannot lose the wakeup.
 class HttpWaker {
     std::mutex mutex_;
     bool fired_{};
@@ -70,10 +63,9 @@ class HttpWaker {
     void arm(std::function<void()> wake);
 };
 
-// What a handler returns instead of blocking: "not yet, wake me on this,
-// give up at that time, and hand me this back". The server parks the
-// connection, costs no thread for the wait, and re-runs the handler with
-// HttpRequest::resumed set when the waker fires or the deadline passes.
+// Returned instead of blocking: wake on this, give up at that deadline, hand
+// back this state. The connection parks threadless and the handler re-runs
+// with HttpRequest::resumed set.
 struct HttpDeferral {
     std::shared_ptr<HttpWaker> waker{};
     Clock::time_point deadline{};
@@ -102,75 +94,47 @@ struct HttpResponse {
 };
 
 HttpResponse http_json(int status, std::string value);
-// Every JSON object response carries a snake_case `status` code at its top
-// level, success included (operator rule, 2026-09-24): the code is primary, and
-// normal flow has no message. A handler that states its own `status` keeps it;
-// otherwise a success is stamped "ok" and an error "error" (http_error sets the
-// specific code itself). Streams, deferrals, 204/304 and non-object bodies are
-// left alone. Applied once, on the lane worker, before compression.
+// Stamp a snake_case top-level `status` on every JSON object response: a
+// handler's own is kept, else "ok" for success and "error" for errors.
+// Streams, deferrals, 204/304 and non-object bodies are untouched. Applied once
+// on the lane worker, before compression.
 void http_stamp_status(HttpResponse&);
-// Whether a JSON object's top level has `key`, by a single linear scan that
-// builds nothing: catalogue bodies run to megabytes on a Raspberry Pi.
+// Single linear scan that builds nothing: catalogue bodies reach megabytes.
 bool http_json_object_has_key(std::string_view json, std::string_view key);
 HttpResponse http_error(int status, std::string_view code, std::string_view message);
-// Same, plus a machine-readable reason the client can act on. Used where the
-// server states why it could not answer and leaves the decision to the client.
+// Plus a machine-readable reason the client can act on.
 HttpResponse http_error(int status, std::string_view code, std::string_view message,
                         std::string_view reason);
 
-// What a failure is a property of. A client recovering from one has to decide
-// whether another node is worth trying, and the answer follows from this
-// without it needing a table of our error codes:
-//
-//   content  the bytes are the problem, and every node holds the same bytes.
-//            Asking a neighbour spends the viewer's time to be told the same
-//            thing. Do not walk.
-//   node     this node's view or capability. Another node may well differ --
-//            a missing extent, a slow mount, a build without an encoder.
-//            Walk.
-//   request  the request itself is wrong, and every node would refuse it
-//            identically. Walk collects N copies of the caller's own bug, so
-//            do not; fix the request.
-//
-// The third value is not decoration. Without it a malformed request has to be
-// labelled content (which says a client bug is a property of the viewer's
-// film) or node (which sends the client round the whole cluster collecting
-// its own mistake).
-// `cluster` (0.64.0): the fault is cluster-wide -- every node would answer
-// the same, so walking to another node gains nothing.
+// What a failure is a property of, so a client can decide whether another
+// node is worth trying:
+//   content  the bytes; every node holds the same bytes. Do not walk.
+//   node     this node's view or capability (missing extent, slow mount,
+//            build without an encoder). Walk.
+//   request  the request is wrong; every node refuses it. Fix the request.
+//   cluster  cluster-wide; every node answers the same. Do not walk.
 enum class FailureScope { content, node, request, cluster };
 const char* failure_scope_name(FailureScope) noexcept;
 
-// The axes a client needs from a failure, stated rather than inferred.
-//
-// Every field is optional and an omitted one means "this server does not say",
-// never a default -- the same rule as the per-node playback budgets, where
-// absence means the node cannot answer and a client must keep its own
-// fallback. A `false` we did not mean is worse than a gap the client knows to
-// handle, so say nothing rather than guess.
+// The axes a client needs from a failure. An omitted field means "not said",
+// never a default: an unintended `false` is worse than a known gap.
 struct FailureAxes {
     std::optional<FailureScope> scope;
-    // Whether this says anything about the node's fitness for other work.
-    // A per-title fault leaves the node perfectly healthy, so a 5xx with
-    // node_healthy true is honest rather than contradictory: one title failed,
-    // the node did not. Charging a node's health for a per-title fault takes a
-    // working node out of rotation for every other title.
+    // Whether the node is fit for other work. A per-title fault leaves it healthy,
+    // so a 5xx with node_healthy true is consistent.
     std::optional<bool> node_healthy;
-    // Whether a DIFFERENT instruction could succeed on this same node. It is
-    // permission, not instruction: the client decides whether it has anything
-    // to give up. "Same instruction, just wait" is not this -- that is 429
-    // with Retry-After.
+    // Whether a different instruction could succeed on this node: permission,
+    // not instruction. "Same instruction, wait" is 429 with Retry-After instead.
     std::optional<bool> alternative_may_succeed;
 };
 
-// As above, with the axes attached. `reason` may be empty to omit it.
+// With the axes attached. An empty `reason` is omitted.
 HttpResponse http_error(int status, std::string_view code, std::string_view message,
                         std::string_view reason, const FailureAxes& axes);
 std::string http_url_decode(std::string_view value);
 
-// Runs a handler the way HttpServer does, deferrals included: a handler that
-// defers is waited for (on the caller's thread) and re-run, until it answers.
-// For callers that drive a handler directly rather than over a socket.
+// Runs a handler as HttpServer does, waiting out deferrals on the caller's
+// thread and re-running until it answers.
 HttpResponse http_resolve(const std::function<HttpResponse(const HttpRequest&)>& handler,
                           HttpRequest request);
 
@@ -196,19 +160,16 @@ struct HttpServerDiagnostics {
     uint64_t requests_deferred{};
     uint64_t requests_overloaded{};
     uint64_t slow_requests{};
-    // Bodies gzipped on the way out, and the bytes that saved on the wire.
+    // Gzipped responses, and bytes saved on the wire.
     uint64_t responses_compressed{};
     uint64_t compression_bytes_saved{};
     Lane control{};
     Lane data{};
 };
 
-// One reactor thread owns every socket and never waits on anything but
-// poll(); a bounded compute pool in two lanes runs handlers and body reads;
-// a handler that has to wait on the media pipeline defers instead of
-// blocking. See TODO/archive/2026-09-15-http-server-reactor-plan.md for why each
-// part is where it is, and in particular for the rule the reactor lives by:
-// it may not call anything that sleeps.
+// One reactor thread owns every socket and waits only in poll(); it never
+// calls anything that sleeps. A bounded two-lane compute pool runs handlers
+// and body reads; a handler waiting on the media pipeline defers.
 class HttpServer {
   public:
     using SessionAuthenticator = std::function<std::optional<SessionIdentity>(std::string_view)>;
@@ -220,10 +181,8 @@ class HttpServer {
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    // Paths served on the control lane rather than the data lane: a path is
-    // a control route when it equals a prefix or begins with it plus '/'.
-    // Pure string matching, so the reactor can decide it without calling
-    // into the application. Set before start().
+    // Control-lane routes: a path equal to a prefix or beginning with it plus
+    // '/'. Pure string matching, so the reactor decides it. Set before start().
     void set_control_prefixes(std::vector<std::string> prefixes);
     // Test-only: called once per reactor pass, inside the measured region.
     void set_reactor_pass_hook(std::function<void()> hook);

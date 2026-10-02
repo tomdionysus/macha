@@ -7,10 +7,9 @@
 
 #include <cstdint>
 
-// The ledger's predicate queries (the object ledger spec, B3): what later
-// stages ask of one DATA object, from four facts. Implemented and tested at
-// stage 0, called by nothing: routing repair or GC through them would change
-// what they visit and in what order.
+// The ledger's predicate queries (object ledger spec, B3): what is asked of
+// one DATA object, from four facts. Repair and GC do not route through them:
+// that would change what they visit and in what order.
 namespace macha {
 
 class ObjectLedger;
@@ -65,14 +64,11 @@ class Placement {
     virtual bool owns(const ObjectId&) const = 0;
 };
 
-// The DATA ids satisfying `predicate`, in id order, from the set it is
-// defined over: the inventory's referenced ids for every predicate but
-// `releasable`, which pages the ledger's DATA claims and reads the release
-// horizon. One budget operation per id examined; the page resumes after its
-// cursor. With no horizon published there is nothing to examine and the
-// page is complete. `garbage` is not queryable at stage 0 (it needs a walk
-// of what the store holds, which B1 adds later) and throws
-// std::invalid_argument.
+// The DATA ids satisfying `predicate`, in id order, from the inventory's
+// referenced ids; `releasable` instead pages the ledger's DATA claims against
+// the release horizon. One budget operation per id examined. With no horizon
+// published the page is empty and complete. `garbage` throws
+// std::invalid_argument: it needs a walk of what the store holds.
 Page<ObjectId, ObjectId> query(Predicate, const ObjectLedger&, const Placement&,
                                Cursor<ObjectId> from, Budget&);
 

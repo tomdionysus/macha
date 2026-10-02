@@ -169,11 +169,10 @@ class FakeMediaEngine : public MediaEngine {
         Bytes segment{'s', 'e', 'g', 'm', 'e', 'n', 't'};
         REQUIRE(store->publish_init(std::move(init)));
         REQUIRE(store->publish_segment(std::move(segment), 4.0));
-        // The fake models a sequential VOD producer: the complete immutable
-        // playlist is available from the prepared duration plan, while only
-        // the first fragment needs to exist at startup. Do not mark the store
-        // finished after one fragment when the plan advertises more fragments;
-        // MediaSegmentStore correctly treats that as a truncated pipeline.
+        // A sequential VOD producer: the playlist comes from the duration plan
+        // and only the first fragment exists at startup. Not marked finished:
+        // MediaSegmentStore would treat one fragment of a longer plan as a
+        // truncated pipeline.
         return std::make_unique<FakeMediaEngineSession>(std::move(store));
     }
     std::string extract_webvtt_segment(const MediaSource&, int,
@@ -478,27 +477,19 @@ inline std::string raw_http_post(uint16_t port, std::string_view path, std::stri
     return response;
 }
 
-// Every non-exempt API route now requires a live session bearer token (see
-// SessionApi / HttpServer's SessionAuthenticator). Mint one directly against
-// the node under test rather than through HTTP, so callers exercising an
-// unrelated route don't also need to drive session creation by hand.
+// Every non-exempt API route requires a live session bearer token; mint one
+// directly against the node so tests of other routes need not drive session
+// creation over HTTP.
 inline std::map<std::string, std::string> bearer_header(Service& service) {
-    // Mint what a real caller gets rather than a hand-rolled role set: a token
-    // built here without the roles a route needs would be refused by the gate,
-    // and every test using it would be asserting against a 403 instead of
-    // against the handler it meant to exercise.
+    // All roles, so no test asserts against a 403 instead of its handler.
     auto minted = service.node().sessions().create(all_roles());
     REQUIRE(minted.has_value());
     return {{"Authorization", "Bearer " + minted->bearer_token}};
 }
 
-// The expensive half of Status moved to its own route in 0.39.1, so polling
-// /api/v1/status no longer walks every subsystem's counters under every
-// subsystem's lock. A test asserting on a diagnostics field fetches it from
-// here; one asserting on health, nodes or startup keeps using /api/v1/status.
-// Returns the whole response rather than the `diagnostics` sub-object, so the
-// caller owns what its pointers point into -- the same shape every other Status
-// assertion here uses.
+// Diagnostics fields live on /api/v1/status/diagnostics, not /api/v1/status.
+// Returns the whole response, not the `diagnostics` sub-object, so the caller
+// owns what its pointers point into.
 inline Json status_diagnostics_response(uint16_t port, Service& service) {
     const auto response = raw_http_get(port, "/api/v1/status/diagnostics", bearer_header(service));
     REQUIRE(response.find("HTTP/1.1 200") != std::string::npos);
@@ -528,9 +519,7 @@ inline void raw_http_send(int fd, std::string_view request) {
 
 // Reads exactly one response: the header a byte at a time up to its blank
 // line, then exactly Content-Length bytes, so a pipelined response behind it
-// stays in the socket for the next call. Reading the header in blocks took
-// the next response's bytes into this one's body whenever both had arrived
-// (about 1 in 200 on fi-1; 20/20 with both queued).
+// stays in the socket for the next call.
 inline RawHttpResponse raw_http_read_response(int fd) {
     std::string input;
     std::array<char, 8192> buffer{};

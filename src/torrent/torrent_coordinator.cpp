@@ -16,8 +16,7 @@
 namespace macha {
 namespace {
 
-// Thrown inside a metadata mutation that finds, on the current snapshot, that
-// it has nothing to do.
+// Thrown inside a metadata mutation that finds nothing to do.
 struct Unchanged {};
 
 void put(MetadataSnapshot& snapshot, MetadataDelta& delta, const TorrentRequest& request) {
@@ -184,17 +183,11 @@ void TorrentCoordinator::loop(std::stop_token stop) {
     }
 }
 
-// What the API lists from: the snapshot this node already holds, in memory.
-// An HTTP read never waits on a peer (law 1). Until 0.73.1 the listing went
-// through current_view(), whose refresh surveys the peers' accepted heads
-// whenever any peer has announced a generation; with torrents committing
-// progress on both nodes that was nearly every request, and
-// GET /api/v1/torrents/jobs took 0.6-1.7 s on fi-1 (2026-09-29).
-// This node's own commit is installed in memory before the commit returns,
-// so an add is listed at once. The exception is a commit that lands while
-// another node's concurrent commit leaves more than one accepted head: it
-// appears after the next background convergence. A node that has no
-// snapshot yet establishes one first.
+// What the API lists from: the in-memory snapshot, so an HTTP read never waits
+// on a peer (law 1). Own commits are installed before they return, so an add
+// lists at once, unless a concurrent commit elsewhere leaves several accepted
+// heads: then it appears after the next convergence. With no snapshot yet,
+// one is established first.
 std::optional<MetadataSnapshotView> TorrentCoordinator::served_view() const {
     if (auto view = metadata_.current())
         return view;
@@ -211,9 +204,8 @@ std::optional<MetadataSnapshotView> TorrentCoordinator::current_view() const {
     }
 }
 
-// The availability flag is computed by the node's metadata refresh; until it
-// has been computed once there is no answer, and the write itself is tried
-// (its failure is still a 503).
+// Computed by the metadata refresh; before its first answer the write is
+// tried (failure is still a 503).
 bool TorrentCoordinator::write_available() const {
     const auto status = metadata_.status();
     return status.observed_unix_ms == 0 || status.write_available;
@@ -222,8 +214,6 @@ bool TorrentCoordinator::write_available() const {
 std::optional<std::chrono::milliseconds> TorrentCoordinator::default_remove_after() const {
     return view_.default_remove_after();
 }
-
-// ---- API ----------------------------------------------------------------------
 
 TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool search_result, std::optional<NodeId> pin,
                                                    std::optional<std::optional<uint64_t>> remove_after,
@@ -252,8 +242,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
         }
     }
 
-    // The canonical magnet and info hash. Core reads a magnet itself; a
-    // .torrent needs a node that runs the plugin.
+    // Core reads a magnet itself; a .torrent needs a node running the plugin.
     std::string magnet, info_hash, name;
     if (auto sanitized = sanitize_magnet_uri(uri); sanitized && !search_result) {
         magnet = *sanitized;
@@ -665,7 +654,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::patch(std::string_view id,
     return out;
 }
 
-// ---- intents: actions applied by the owner while metadata is unwritable ------
+// Intents: actions the owner applies while metadata is unwritable.
 
 TorrentCoordinator::Outcome TorrentCoordinator::apply_intent_locally(const std::string& id, TorrentDesired desired,
                                                                     uint64_t changed_unix_ms) {
@@ -844,8 +833,6 @@ TorrentCoordinator::resolve_remote(std::string_view uri, bool search_result, std
     return std::nullopt;
 }
 
-// ---- the scheduler --------------------------------------------------------------
-
 void TorrentCoordinator::pass_now() {
     std::lock_guard serial(pass_mutex_);
     try {
@@ -890,8 +877,8 @@ void TorrentCoordinator::pass() {
 
     std::vector<TorrentRequest> updates;
 
-    // Jobs this node held before torrents were cluster-wide become requests
-    // it has already claimed, once each.
+    // A local job no request holds becomes a request this node has already
+    // claimed, once each.
     if (local) {
         std::set<std::string> held_hashes;
         for (const auto& [_, r] : requests)

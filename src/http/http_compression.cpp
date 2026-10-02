@@ -27,9 +27,8 @@ bool equal_ignoring_case(std::string_view a, std::string_view b) {
            });
 }
 
-// The quality of one Accept-Encoding entry. Absent means 1 (accepted); the
-// only value that matters to us is whether it is zero, which is how a client
-// refuses an encoding it would otherwise be offered.
+// Quality of one Accept-Encoding entry; absent means 1. Only zero (a refusal)
+// matters.
 bool quality_is_zero(std::string_view parameters) {
     while (!parameters.empty()) {
         auto semicolon = parameters.find(';');
@@ -42,8 +41,8 @@ bool quality_is_zero(std::string_view parameters) {
         if (!equal_ignoring_case(trim(parameter.substr(0, equals)), "q"))
             continue;
         const auto value = trim(parameter.substr(equals + 1));
-        // "0", "0.", "0.0", "0.000" are all a refusal; anything else is not.
-        // Parsed by hand rather than with a locale-sensitive float conversion.
+        // "0", "0.", "0.000" are refusals. Parsed by hand to avoid locale-sensitive
+        // float conversion.
         if (value.empty() || value.front() != '0')
             return false;
         return value.find_first_of("123456789") == std::string_view::npos;
@@ -75,9 +74,7 @@ bool client_accepts_gzip(const HttpRequest& request) {
             semicolon == std::string_view::npos ? std::string_view{} : entry.substr(semicolon + 1);
         const bool refused = quality_is_zero(parameters);
 
-        // An explicit entry for gzip is the answer, either way: a client that
-        // names it and then refuses it must not be handed one because of a
-        // wildcard elsewhere in the same header.
+        // An explicit gzip entry decides, whatever a wildcard says.
         if (equal_ignoring_case(token, "gzip") || equal_ignoring_case(token, "x-gzip"))
             return !refused;
         if (token == "*") {
@@ -89,19 +86,17 @@ bool client_accepts_gzip(const HttpRequest& request) {
 }
 
 bool compressible_content_type(std::string_view content_type) {
-    // Compare the media type only: the parameters ("; charset=utf-8") say
-    // nothing about whether the bytes compress.
+    // Media type only; parameters say nothing about compressibility.
     auto semicolon = content_type.find(';');
     const auto type = trim(content_type.substr(0, semicolon));
     if (type.empty())
         return false;
 
-    // Everything under text/ is text, whatever the subtype happens to be.
     if (type.size() > 5 && equal_ignoring_case(type.substr(0, 5), "text/"))
         return true;
 
-    // Structured syntax suffixes: application/vnd.whatever+json is JSON, and
-    // a table of concrete names would never keep up with them.
+    // Structured syntax suffixes (application/vnd.x+json) rather than a table of
+    // names.
     if (type.ends_with("+json") || type.ends_with("+xml") || type.ends_with("+text"))
         return true;
 
@@ -129,16 +124,14 @@ std::optional<Bytes> gzip_compress(std::span<const uint8_t> input, int level) {
         return std::nullopt;
 
     z_stream stream{};
-    // windowBits 15 + 16 selects a gzip wrapper rather than a zlib one, which
-    // is what Content-Encoding: gzip names on the wire.
+    // windowBits 15 + 16 selects the gzip wrapper Content-Encoding: gzip names.
     constexpr int gzip_window_bits = 15 + 16;
     constexpr int default_memory_level = 8;
     if (deflateInit2(&stream, std::clamp(level, 1, 9), Z_DEFLATED, gzip_window_bits,
                      default_memory_level, Z_DEFAULT_STRATEGY) != Z_OK)
         return std::nullopt;
 
-    // deflateBound is the worst case for this input, so one buffer and one
-    // pass is enough and the output is never reallocated mid-compression.
+    // deflateBound is the worst case, so one buffer and one pass suffice.
     Bytes out(deflateBound(&stream, static_cast<uLong>(input.size())));
     stream.next_in = const_cast<Bytef*>(input.data());
     stream.avail_in = static_cast<uInt>(input.size());
@@ -151,9 +144,7 @@ std::optional<Bytes> gzip_compress(std::span<const uint8_t> input, int level) {
     if (result != Z_STREAM_END)
         return std::nullopt;
 
-    // Incompressible input (already-compressed bytes that slipped past the
-    // content-type check, or a pathological small body) costs a gzip header
-    // and gains nothing. Say so and let the caller send the original.
+    // Incompressible input gains nothing over a gzip header; send the original.
     if (produced >= input.size())
         return std::nullopt;
     out.resize(produced);

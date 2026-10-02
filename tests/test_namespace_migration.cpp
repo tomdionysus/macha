@@ -16,9 +16,8 @@ using namespace macha::test_support;
 
 namespace {
 
-// Everything macha-namespace-migrate does to one stopped node, with the same
-// shared plan_namespace_migration underneath, so this exercises the tool's
-// behaviour rather than a second implementation of it.
+// What macha-namespace-migrate does to one stopped node, through the same
+// plan_namespace_migration the tool uses.
 struct MigrationResult {
     Hash256 hash{};
     ObjectId root{};
@@ -33,9 +32,8 @@ MigrationResult migrate_state(const Config& config, const ClusterKeys& keys,
     const auto head = replica.committed();
     REQUIRE(valid_metadata_record(head));
 
-    // An unnormalised config leaves metadata_store.path empty, which means
-    // <state_path>/metadata-objects -- the same resolution normalize_config
-    // does, and the same place the daemon will look for these nodes.
+    // An empty metadata_store.path means <state_path>/metadata-objects, as
+    // normalize_config resolves it.
     const auto object_path = config.metadata_store.path.empty()
                                  ? config.state_path / "metadata-objects"
                                  : config.metadata_store.path;
@@ -52,9 +50,8 @@ MigrationResult migrate_state(const Config& config, const ClusterKeys& keys,
             migration.record.payload.size()};
 }
 
-// A single node is the whole cluster in these tests, so the write floor has to
-// say so. The migration itself is indifferent to the floor -- it is offline and
-// writes locally -- but the service that writes the library beforehand is not.
+// One node is the whole cluster here, so the service writing the library needs
+// a write floor of one.
 void make_solo(Config& config) {
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
@@ -132,12 +129,8 @@ std::vector<uint8_t> read_file(Service& service, const std::string& path, size_t
 }
 
 MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_library) {
-    // The cutover, end to end on one node: a library written the ordinary way,
-    // the node stopped, the namespace re-rooted onto the tree, the node
-    // started again. Afterwards every read must return what it returned
-    // before, and the filesystem must still be writable -- a node that comes
-    // back able to read and not to write is a node that has to be migrated
-    // back under pressure.
+    // End to end on one node: write a library, stop, re-root onto the tree,
+    // restart. Every read must match and the filesystem must stay writable.
     TestCluster cluster;
     auto config = cluster.node_config("migrate-serves");
     make_solo(config);
@@ -147,7 +140,7 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
     NodeId node_id{};
     {
         // Destroyed, not merely stopped: a stopped Service still holds the
-        // storage lock, and the migration opens the same object store.
+        // storage lock the migration needs.
         Service service(config, cluster.keys());
         service.start();
         node_id = service.node().node_id();
@@ -160,15 +153,13 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
         service.stop();
     }
 
-    // The witness is this node, which is the whole cluster here. On a real
-    // cutover the operator names every node.
+    // The sole witness is this node, the whole cluster here.
     const auto migration = migrate_state(config, cluster.keys(), {node_id});
     CHECK(migration.entries == 6); // /, /TV, /TV/Show, two files, /Music
-    // The record stopped carrying the library. Small absolute numbers here --
-    // this is a six-entry namespace -- but the shape is the claim.
+    // The record no longer carries the entry map.
     CHECK(migration.payload_after < migration.payload_before);
 
-    // The head really is tree-backed, with no entry map in it at all.
+    // The head is tree-backed, with no entry map.
     {
         MetadataReplica replica(config.state_path, cluster.keys().storage);
         const auto head = replica.committed();
@@ -179,13 +170,11 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
         CHECK(snapshot.entries.empty());
     }
 
-    // Same state directory, new Service over it: this is the node coming back
-    // after the cutover.
+    // A new Service over the same state directory: the node restarting.
     Service service(config, cluster.keys());
     service.start();
     (void)service.filesystem();
 
-    // Reads first: stat, listing, and the bytes themselves.
     CHECK(service.filesystem().getattr("/TV/Show/one.mkv").size == payload_a.size());
     CHECK(service.filesystem().getattr("/TV/Show").type == EntryType::directory);
     auto listing = service.filesystem().readdir("/TV/Show");
@@ -193,9 +182,8 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
     CHECK(read_file(service, "/TV/Show/one.mkv", payload_a.size()) == payload_a);
     CHECK(read_file(service, "/TV/Show/two.mkv", payload_b.size()) == payload_b);
 
-    // Then writes, which is the half that proves the commit path works against
-    // a tree: a new directory, a new file, an overwrite, a rename and an
-    // unlink, each read back.
+    // Writes prove the commit path against a tree: mkdir, create, overwrite,
+    // rename and unlink, each read back.
     service.filesystem().mkdir("/TV/Show/Season 2", 0755, getuid(), getgid());
     const auto payload_c = pattern(256 * 1024, 42);
     write_file(service, "/TV/Show/Season 2/three.mkv", payload_c);
@@ -223,22 +211,15 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
     service.filesystem().rmdir("/TV/Show/Season 2");
     service.filesystem().rmdir("/Music");
 
-    // And the namespace still reads correctly after all of that, straight from
-    // the tree the commits have been rewriting.
     auto final_listing = service.filesystem().readdir("/TV/Show");
     CHECK(final_listing.size() == 2);
     service.stop();
 }
 
 MACHA_TEST("namespace_migration", test_every_node_computes_the_same_record_from_the_same_head) {
-    // What makes a cluster-wide cutover possible with no coordinator: the
-    // record is a pure function of the head. Every node holding the converged
-    // head computes the same tree, the same root and the same record hash on
-    // its own, so nothing is distributed and there is no half-finished
-    // distribution to recover from. It is also what --expect-hash checks.
-    //
-    // Two independent object stores, the same head, no contact between them --
-    // which is exactly the position two stopped nodes are in.
+    // The record is a pure function of the head, so nodes migrate without a
+    // coordinator; --expect-hash relies on this. Two independent object stores
+    // stand in for two stopped nodes.
     TestCluster cluster;
     auto config = cluster.node_config("migrate-agree");
     make_solo(config);
@@ -272,16 +253,12 @@ MACHA_TEST("namespace_migration", test_every_node_computes_the_same_record_from_
     CHECK(left.root == right.root);
     CHECK(left.record.hash == right.record.hash);
     CHECK(left.record.payload == right.record.payload);
-    // And the same nodes, not merely the same root: every object one wrote,
-    // the other wrote too, which is why a node that was down during the
-    // cutover can be migrated later and still address what its peers address.
+    // The same tree nodes were written, not merely the same root.
     CHECK(left_nodes.written().size() == right_nodes.written().size());
     CHECK(left_nodes.bytes_written() == right_nodes.bytes_written());
 }
 
 MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_root_safely) {
-    // The refusals, because an operator runs this once on a live cluster and
-    // every one of them is cheaper than the recovery it prevents.
     TestCluster cluster;
     auto config = cluster.node_config("migrate-refuses");
     make_solo(config);
@@ -302,8 +279,7 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
                        cluster.keys().storage);
     LocalNamespaceNodeStore nodes(objects);
 
-    // An already-migrated namespace is refused rather than re-rooted again,
-    // which would discard the ancestry of the migration itself.
+    // An already-migrated namespace is refused.
     const auto migration = plan_namespace_migration(head, nodes);
     REQUIRE(replica.install_migrated_head(migration.record, {node_id}, "test"));
     const auto migrated_head = replica.committed();
@@ -315,9 +291,7 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
     }
     CHECK(refused);
 
-    // Fewer witnesses than the write floor is refused: the certificate would
-    // claim a floor it cannot name replicas for, and nothing here may invent
-    // an acknowledgement that has not happened.
+    // Fewer witnesses than the write floor is refused.
     {
         TestCluster floor_cluster;
         auto floor_config = floor_cluster.node_config("migrate-floor");
@@ -339,15 +313,12 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
         LocalNamespaceNodeStore floor_nodes(floor_objects);
         const auto plan = plan_namespace_migration(floor_replica.committed(), floor_nodes);
         CHECK(!floor_replica.install_migrated_head(plan.record, {}, "no witnesses"));
-        // And with the one witness this one-node cluster's floor asks for, it
-        // installs -- so the refusal above is about the count, not about
-        // anything else being wrong.
+        // With the one witness the floor asks for, it installs: the refusal
+        // above is about the count alone.
         CHECK(floor_replica.install_migrated_head(plan.record, {floor_node}, "one witness"));
     }
 
-    // A record that does not verify is refused. Nothing forges one in
-    // practice, so it is forged here: a head whose payload has been altered
-    // fails valid_metadata_record, which is the first thing the plan checks.
+    // A record that fails valid_metadata_record is refused.
     auto tampered = head;
     REQUIRE(!tampered.payload.empty());
     Bytes altered(tampered.payload.begin(), tampered.payload.end());
@@ -363,10 +334,8 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
 }
 
 MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_deleted) {
-    // The operator's way back. The re-root discards ancestry, but by renaming
-    // the files rather than removing them, so a migration that goes wrong on
-    // one node is recoverable from that node's own disk rather than from a
-    // peer that may have been migrated too.
+    // The re-root discards ancestry by renaming the files, not removing them,
+    // so a node can recover from its own disk.
     TestCluster cluster;
     auto config = cluster.node_config("migrate-keeps-state");
     make_solo(config);
@@ -390,8 +359,8 @@ MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_delet
 
     (void)migrate_state(config, cluster.keys(), {node_id});
 
-    // Every file that was there is still there under a .pre-migration. name,
-    // and the live ones have been written fresh.
+    // Ancestry files survive under a .pre-migration. name; the live ones are
+    // written fresh.
     std::set<std::string> preserved;
     for (const auto& item : std::filesystem::directory_iterator(state)) {
         const auto name = item.path().filename().string();
@@ -399,9 +368,8 @@ MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_delet
         if (marker != std::string::npos)
             preserved.insert(name.substr(0, marker));
     }
-    // The seven files the install quarantines. Anything else in there --
-    // the mutation sequence clock, for one -- is not ancestry and legitimately
-    // carries across untouched.
+    // Only ancestry is quarantined; other files, such as the mutation sequence
+    // clock, carry across untouched.
     for (const auto& name : {"checkpoint.meta", "history.log", "current.meta", "committed.meta"})
         if (before.contains(name))
             CHECK(preserved.contains(name));
@@ -410,15 +378,9 @@ MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_delet
 }
 
 MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keeps_the_namespace) {
-    // The failure this test exists for: the three-way merge is path-wise over
-    // three entry maps, and a tree-backed snapshot has an empty one. Merging
-    // two empty maps succeeds, reports no conflicts, and produces an empty
-    // namespace -- a reconciliation that deletes the library and looks like
-    // agreement. This cluster reconciles routinely, so that would have been
-    // found in production within a day.
-    //
-    // What the manager does instead is tested here without a cluster:
-    // materialise both branches, merge them as before, and re-root the result.
+    // The three-way merge works on entry maps, which are empty in tree-backed
+    // snapshots. The manager materialises the branches, merges, and re-roots;
+    // this exercises that sequence without a cluster.
     MemoryNamespaceNodeStore store;
 
     std::map<std::string, FsEntry> base_entries;
@@ -427,7 +389,7 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
     base_entries["/Films/shared.mkv"] = make_file(10, 3);
     auto base = populated_snapshot(base_entries);
 
-    // Two branches: each adds a file the other has not seen.
+    // Each branch adds a file the other has not seen.
     auto left = base;
     left.entries["/Films/left.mkv"] = make_file(20, 4);
     auto right = base;
@@ -441,8 +403,7 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
     CHECK(expected.snapshot.entries.size() == 5);
     CHECK(expected.conflicts_created == 0);
 
-    // Now the same three branches as trees. A merge over them directly is
-    // refused rather than quietly producing nothing.
+    // Merging the tree-backed forms directly is refused, not an empty result.
     const auto base_tree = detach_namespace(base, store);
     const auto left_tree = detach_namespace(left, store);
     const auto right_tree = detach_namespace(right, store);
@@ -454,8 +415,7 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
     }
     CHECK(refused);
 
-    // Materialised, merged, re-rooted: the same namespace, and a root
-    // identical to building the merged namespace from scratch.
+    // Materialised, merged, re-rooted: the root equals one built from scratch.
     auto merged = merge_metadata_snapshots(attach_namespace(base_tree, store),
                                            attach_namespace(left_tree, store),
                                            attach_namespace(right_tree, store), left_head,
@@ -470,14 +430,8 @@ MACHA_TEST("namespace_migration", test_reconciling_two_tree_backed_branches_keep
 }
 
 MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_only_if_it_agrees) {
-    // Three nodes stopped back to back do not land on the same generation:
-    // this cluster commits tens of times a minute from catalogue discovery
-    // alone, so the laggards' own computed records differ in `previous`, in
-    // `generation` and in whatever the last commit carried. What has to match
-    // is the namespace.
-    //
-    // So a node can adopt the record another node computed, but only after
-    // proving that its own namespace produces the root that record names.
+    // Nodes stopped at different generations compute different records; one
+    // may adopt another's record only if its own namespace yields the same root.
     MemoryNamespaceNodeStore leader_store, follower_store, diverged_store;
 
     std::map<std::string, FsEntry> entries;
@@ -485,8 +439,8 @@ MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_
     entries["/Films"] = make_directory(1);
     entries["/Films/a.mkv"] = make_file(10, 3);
 
-    // The leader's head, and a follower a few catalogue commits behind: same
-    // namespace, different generation and catalogue root.
+    // A follower a few catalogue commits behind: same namespace, different
+    // catalogue root.
     auto leader = populated_snapshot(entries);
     leader.catalogue_root = fake_object(77);
     auto follower = populated_snapshot(entries);
@@ -497,13 +451,9 @@ MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_
     REQUIRE(leader_root.has_value());
     REQUIRE(follower_root.has_value());
 
-    // The namespaces agree even though the records do not. That is the whole
-    // basis on which adoption is safe.
     CHECK(*leader_root == *follower_root);
 
-    // A node whose namespace really has diverged computes a different root, so
-    // adoption must be refused there -- that node is missing a namespace
-    // commit, not merely a catalogue one.
+    // A diverged namespace computes a different root, so adoption is refused.
     auto diverged_entries = entries;
     diverged_entries["/Films/b.mkv"] = make_file(11, 2);
     auto diverged = populated_snapshot(diverged_entries);
@@ -513,16 +463,8 @@ MACHA_TEST("namespace_migration", test_a_lagging_node_adopts_the_leaders_record_
 }
 
 MACHA_TEST("namespace_migration", test_a_namespace_change_is_visible_as_a_change) {
-    // Found on the live cluster during the cutover, which is the only reason
-    // there is a test for it. gbni-1 came back on the migrated head, adopted
-    // the namespace once, and then never saw another change: a directory
-    // created on es-1 was in its metadata, at the same root, and invisible on
-    // its mount.
-    //
-    // Both witnesses that answer "has the namespace changed" compared entry
-    // maps, and under SM14 both maps are empty. So every change reported as no
-    // change -- the mount stops seeing remote writes and the catalogue stops
-    // discovering them, silently, for good.
+    // Change detection must compare namespace roots, since tree-backed (SM14)
+    // snapshots have empty entry maps.
     MemoryNamespaceNodeStore store;
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
@@ -533,39 +475,33 @@ MACHA_TEST("namespace_migration", test_a_namespace_change_is_visible_as_a_change
     changed_entries["/Films/new.mkv"] = make_file(5, 2);
     const auto after = populated_snapshot(changed_entries);
 
-    // The map form, which always worked.
+    // Map-backed form.
     CHECK(namespace_differs(before, after));
     CHECK(!namespace_differs(before, before));
     CHECK(metadata_namespace_signature(before) != metadata_namespace_signature(after));
 
-    // The tree form, which did not.
+    // Tree-backed form.
     const auto before_tree = detach_namespace(before, store);
     const auto after_tree = detach_namespace(after, store);
     CHECK(namespace_differs(before_tree, after_tree));
     CHECK(!namespace_differs(before_tree, before_tree));
     CHECK(metadata_namespace_signature(before_tree) != metadata_namespace_signature(after_tree));
 
-    // Two snapshots of the same namespace agree, however they were reached --
-    // which is the property that lets the signature be a root comparison at
-    // all.
+    // The same namespace built in another store agrees.
     MemoryNamespaceNodeStore elsewhere;
     const auto same_elsewhere = detach_namespace(populated_snapshot(entries), elsewhere);
     CHECK(!namespace_differs(before_tree, same_elsewhere));
     CHECK(metadata_namespace_signature(before_tree) ==
           metadata_namespace_signature(same_elsewhere));
 
-    // And a tree-backed namespace never signs as the map-backed one, so a
-    // cutover is a change rather than a silent no-op.
+    // Tree-backed and map-backed forms never sign alike, so a cutover is a
+    // change.
     CHECK(metadata_namespace_signature(before) != metadata_namespace_signature(before_tree));
 }
 
 MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_record) {
-    // The other thing the cutover found in its first minute. A commit publishes
-    // a delta body and the replica only keeps it if replaying it reproduces the
-    // record byte for byte. That replay re-encodes the successor through
-    // encode_snapshot_for_delta, which called the SM13 encoder -- and that
-    // refuses a namespace root. So every delta was rejected and every commit
-    // fell back to a full record: correct, logged, and pointless.
+    // The replica keeps a delta body only if replaying it reproduces the record
+    // byte for byte, so a tree-backed replay must re-encode successfully.
     MemoryNamespaceNodeStore store;
     std::map<std::string, FsEntry> entries;
     entries["/"] = make_directory(0);
@@ -584,12 +520,9 @@ MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_reco
     REQUIRE(successor.namespace_root.has_value());
     CHECK(*successor.namespace_root != *parent.namespace_root);
 
-    // What the replica does to decide whether to keep the delta body: re-encode
-    // the replayed successor and compare it against the record. The re-encode
-    // goes through the delta-versioned encoder, which is internal, so this
-    // asserts the property that made it fail -- a tree-backed snapshot has an
-    // SM14 encoding and no SM13 one, so any path that reaches for
-    // encode_snapshot on it throws rather than returning bytes.
+    // The delta-versioned encoder is internal, so this asserts its premise: a
+    // tree-backed snapshot has an SM14 encoding and encode_snapshot (SM13)
+    // throws on it.
     CHECK(!encode_snapshot_v14(successor).empty());
     bool sm13_refused = false;
     try {
@@ -599,8 +532,7 @@ MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_reco
     }
     CHECK(sm13_refused);
 
-    // And the payload a replay produces is the payload a commit would: the
-    // record is a function of the namespace, so the delta body reconstructs.
+    // A replay produces the payload a commit would.
     auto committed = parent;
     committed.namespace_root = apply_delta_to_namespace_tree(*parent.namespace_root, store, delta);
     CHECK(encode_snapshot_v14(committed) == encode_snapshot_v14(successor));

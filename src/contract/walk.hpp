@@ -10,9 +10,8 @@
 #include <optional>
 #include <vector>
 
-// One cursor, one budget, one page (the object ledger spec, A3): the shape
-// of every bounded walk a contract offers. A walk is
-// (state, cursor, budget) -> (page, next cursor).
+// One cursor, one budget, one page (object ledger spec, A3): every bounded
+// walk is (state, cursor, budget) -> (page, next cursor).
 namespace macha {
 
 // A position the caller owns: the last key handed out, or none for the
@@ -22,7 +21,6 @@ template <class Key> struct Cursor {
     bool operator==(const Cursor&) const = default;
 };
 
-// Why a walk returned.
 enum class Stop : uint8_t {
     end,       // the walk reached the end; the pass is complete
     budget,    // an operation, byte or item bound was spent
@@ -38,18 +36,16 @@ template <class Item, class Key> struct Page {
     bool complete() const noexcept { return stopped == Stop::end; }
 };
 
-// Whoever decides when background work gives way (repair's weighted share,
-// a higher class being active). Injected, so a budget is not a pure value
-// and says so: its answers depend on service-level state.
+// Decides when background work gives way (repair's weighted share, a higher
+// class active). Injected: a budget's answers depend on service-level state.
 class YieldSource {
   public:
     virtual ~YieldSource() = default;
     virtual bool should_yield() const = 0;
 };
 
-// What a walk may spend, and who is spending it. Bounds are optional: an
-// absent bound never stops a walk. The yield source, if any, must outlive
-// the budget. Single owner: one walk spends a budget.
+// What a walk may spend, and who is spending it. An absent bound never stops
+// a walk. The yield source must outlive the budget. Single owner.
 class Budget {
   public:
     using Clock = std::chrono::steady_clock;
@@ -75,9 +71,8 @@ class Budget {
 
     const WorkContext& context() const noexcept { return context_; }
 
-    // Why the walk must stop before its next step, if it must: cancellation
-    // first, then either deadline (the budget's or the context's), then the
-    // yield source. Bounds are checked by take_*.
+    // Why the walk must stop before its next step, if it must: cancellation,
+    // then either deadline, then the yield source. take_* checks the bounds.
     std::optional<Stop> must_stop(Clock::time_point now = Clock::now()) const {
         if (context_.cancelled())
             return Stop::cancelled;

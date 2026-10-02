@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The lifecycle recorder (the object ledger plan, T1): each real node's
-// configuration, templated from /etc/macha/macha.yaml
-// (tests/fixtures/node-configs/), is loaded as the server loads it, run in
-// process through start and stop, and every lifecycle step the Service takes
-// is compared with the order committed in tests/fixtures/lifecycle/. T5 moves
-// the components into a composition root; its derived order must equal this
-// one. MACHA_WRITE_LIFECYCLE_FIXTURES=1 rewrites the files instead.
+// Each real node's configuration (tests/fixtures/node-configs/) is loaded as the
+// server loads it and run in process through start and stop; every lifecycle
+// step the Service takes must match the order in tests/fixtures/lifecycle/.
+// MACHA_WRITE_LIFECYCLE_FIXTURES=1 rewrites those files instead.
 #include "test_backend_support.hpp"
 
 #include <fstream>
@@ -28,8 +25,8 @@ std::string replace_all(std::string text, std::string_view from, const std::stri
     return text;
 }
 
-// The node's configuration with ${ROOT} and the ports filled in,
-// and the files and directories it names that a deployed node already has.
+// The node's configuration with ${ROOT} and the ports filled in, plus the files
+// and directories it names that a deployed node already has.
 Config node_config(std::string_view node, const std::filesystem::path& root) {
     std::ifstream in(fixtures() / "node-configs" / (std::string(node) + ".yaml"));
     REQUIRE(in.is_open());
@@ -54,8 +51,7 @@ Config node_config(std::string_view node, const std::filesystem::path& root) {
     auto config = load_yaml_config(path);
     for (const auto& backend : config.storage_backends)
         std::filesystem::create_directories(backend.path);
-    // No subsystem plugins: this records the build under test, not whatever
-    // is installed on the machine (see config_for in test_support.hpp).
+    // No plugins: record the build under test, not whatever is installed.
     config.plugin_path = std::filesystem::path{};
     return config;
 }

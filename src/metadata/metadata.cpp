@@ -23,10 +23,8 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM10{'D', 'H', 'T', 'M', 'E', 'T', 'B', '0'}, SM11{'D', 'H', 'T', 'M', 'E', 'T', 'B', '1'},
     SM12{'D', 'H', 'T', 'M', 'E', 'T', 'B', '2'}, SM13{'D', 'H', 'T', 'M', 'E', 'T', 'B', '3'},
     SM14{'D', 'H', 'T', 'M', 'E', 'T', 'B', '4'},
-    // 0.64.0: the torrent-request collection. SM15 is the SM13 layout with
-    // every section present, then the requests; SM16 is SM14 then the
-    // requests. Each is written only while the collection is non-empty, so a
-    // cluster that never queues a torrent keeps its exact encodings.
+    // SM15 is SM13 with every section, then torrent requests; SM16 is SM14
+    // then torrent requests. Written only while the collection is non-empty.
     SM15{'D', 'H', 'T', 'M', 'E', 'T', 'B', '5'}, SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
@@ -41,15 +39,14 @@ void saturated_add(uint64_t& total, uint64_t value) {
 }
 
 template <class Map> void account_map_nodes(uint64_t& total, const Map& values) {
-    // Standard tree implementations allocate one node per value. Four pointers
-    // covers parent/children plus allocator/alignment bookkeeping without
-    // pretending that sizeof(map::value_type) describes the allocation.
+    // One node per value; four pointers cover parent/children and allocator
+    // bookkeeping beyond sizeof(value_type).
     saturated_add(total, static_cast<uint64_t>(values.size()) *
                              (sizeof(typename Map::value_type) + 4 * sizeof(void*)));
 }
 
 void account_string(uint64_t& total, const std::string& value) {
-    // capacity() includes any allocator slack which encoded-size multipliers miss.
+    // capacity() includes allocator slack.
     saturated_add(total, static_cast<uint64_t>(value.capacity()) + 1);
 }
 
@@ -149,13 +146,8 @@ FsEntry entry(Reader& r) {
     auto n = r.u32();
     if (n > 10000000)
         throw DecodeError("too many extents");
-    // Geometric growth leaves up to 2x slack in every extent vector, and these
-    // vectors are the whole of a media namespace's residency. Measured on es-1
-    // (2026-09-17, 1.6 TiB library): 610,567 slots for 424,222 extents, 10.4 MB
-    // of pure allocator slack in a 36 MB snapshot -- permanent, because the
-    // decoded head is pinned. `n` is caller-supplied, so bound the reservation
-    // by what the remaining input could actually contain (49 encoded bytes per
-    // extent) rather than trusting the count to size an allocation.
+    // Reserve exactly: push_back growth leaves up to 2x slack, pinned for the
+    // snapshot's life. `n` is untrusted, so bound it by the remaining input.
     constexpr size_t encoded_extent_bytes = 8 + 8 + 1 + 32;
     e.extents.reserve(std::min<size_t>(n, r.remaining() / encoded_extent_bytes));
     for (uint32_t i = 0; i < n; ++i) {
@@ -298,10 +290,8 @@ IdentityAssociationReset decode_identity_reset(Reader& r) {
 }
 
 Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
-    // Exact legacy snapshot representation. This is used only while
-    // replaying DLT1 records from an existing metadata journal: the journal
-    // stores the successor hash, so reconstructing the historical SM7 bytes
-    // is part of on-disk compatibility. Ordinary new snapshots remain SM8.
+    // SM7 bytes for replaying DLT1 journal records, whose successor hashes
+    // were computed over SM7.
     Writer w;
     w.raw(SM7);
     w.u32(s.metadata_voters.size());
@@ -329,9 +319,8 @@ Bytes encode_snapshot_v7(const MetadataSnapshot& s) {
 }
 
 Bytes encode_snapshot_v8(const MetadataSnapshot& s) {
-    // Exact pre-telemetry representation. DLT2 journal successor hashes were
-    // computed over SM8 bytes, so rolling forward an existing journal must
-    // reproduce that encoding rather than silently upgrading it to SM9.
+    // SM8 bytes for replaying DLT2 journal records, whose successor hashes
+    // were computed over SM8.
     Writer w;
     w.raw(SM8);
     w.u32(s.metadata_voters.size());
@@ -378,7 +367,7 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 2:
         return encode_snapshot_v8(snapshot);
     case 3:
-        // Preserve SM9 for historical DLT3 journal successors.
+        // DLT3 successors are SM9.
         if (!snapshot.identity_resets.empty())
             throw DecodeError("DLT3 cannot contain identity resets");
         return encode_snapshot(snapshot);
@@ -388,13 +377,8 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 7:
     case 8:
     case 9:
-        // A tree-backed successor encodes as SM14. Without this every delta
-        // body fails to reconstruct its record -- encode_snapshot refuses a
-        // namespace root -- and every commit falls back to a full record. That
-        // fallback is correct and was observed doing its job on the live
-        // cluster within a minute of the cutover: three consecutive
-        // "local metadata delta rejected; retrying full record" warnings, one
-        // per commit. Correct, and not the point of having deltas.
+        // A tree-backed successor is SM14; encode_snapshot refuses a namespace
+        // root, which would force every commit to a full record.
         return snapshot.namespace_root ? encode_snapshot_v14(snapshot)
                                        : encode_snapshot(snapshot);
     default:
@@ -552,12 +536,9 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
             std::optional<FsEntry> live;
             if (auto found = snapshot.entries.find(conflict.key); found != snapshot.entries.end())
                 live = found->second;
-            // The merge installs the common-ancestor value at the path; while
-            // it is still there nobody has decided. Anything else is a decision.
+            // The merge installs the common ancestor; any other value is a decision.
             superseded = live != conflict.base_entry;
-            // Two alternatives with the same bytes are not a decision anyone
-            // needs to make (a pre-0.32 merge recorded these); settle them
-            // exactly as the merge now does.
+            // Identical alternatives need no decision; settle them as the merge does.
             if (!superseded && conflict.left_entry && conflict.right_entry &&
                 same_content(*conflict.left_entry, *conflict.right_entry)) {
                 snapshot.entries[conflict.key] = (*conflict.left_entry < *conflict.right_entry)
@@ -600,19 +581,14 @@ void decode_torrent_requests(Reader& r, MetadataSnapshot& s) {
 }
 
 Bytes encode_snapshot(const MetadataSnapshot& s) {
-    // SM13 and earlier have nowhere to put a namespace root, and a snapshot
-    // that carries one has its entries in the tree rather than in the map.
-    // Encoding it here would publish an empty namespace under a valid-looking
-    // hash, which is the worst available failure: silent, durable, and
-    // indistinguishable from a library that was deleted. Refuse instead.
+    // SM13 and earlier cannot carry a namespace root; a tree-backed snapshot's
+    // entries live in the tree, so encoding it would publish an empty namespace.
     if (s.namespace_root)
         throw std::runtime_error("namespace root cannot be encoded before SM14");
     Writer w;
-    // SM11 introduced branch topology/conflicts. SM12 additionally persists
-    // the metadata write floor as cluster policy. SM13 adds the durable
-    // branch-capable participant roster and causal GC/branch floor. Legacy
-    // snapshots retain their exact historical encodings until the first
-    // protocol-20 policy transition.
+    // The smallest format that holds the state: SM11 adds branch topology and
+    // conflicts, SM12 the metadata write floor, SM13 the participant roster
+    // and branch floor.
     const bool torrent_state = !s.torrent_requests.empty();
     const bool branch_state = torrent_state || !s.merge_parents.empty() || !s.conflicts.empty();
     const bool policy_state = torrent_state || s.metadata_write_replicas_required != 0;
@@ -701,28 +677,16 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     return w.take();
 }
 Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
-    // The re-rooting, and nothing else: every field SM13 carries is carried
-    // here in the same order, with the inline entry block replaced by the
-    // 32-byte root of the namespace tree. The legacy `metadata_voters` list
-    // survives the change deliberately -- retiring a field and moving the
-    // namespace out of the record are two decisions, and only one of them is
-    // this plan's.
-    //
-    // Every section SM8-SM13 wrote conditionally is unconditional here. Those
-    // conditions exist to reproduce the exact bytes of an older encoder for
-    // journal replay; SM14 has no older self to be byte-compatible with, and a
-    // format whose layout depends on which fields happen to be populated is
-    // the thing that made `encode_snapshot` hard to read.
+    // SM13's fields in the same order, with the inline entry block replaced by
+    // the 32-byte namespace tree root. Every section is unconditional.
     if (!s.namespace_root)
         throw std::runtime_error("SM14 snapshot has no namespace root");
-    // Both forms at once would let the two disagree, and a reader would have
-    // no rule for which one is the namespace. `detach_namespace` clears the
-    // map as it builds the tree.
+    // Entries live in the tree or the map, never both; `detach_namespace`
+    // clears the map as it builds the tree.
     if (!s.entries.empty())
         throw std::runtime_error("SM14 snapshot still inlines its entries");
-    // SM14 is only ever authored above protocol 20, where the write floor is
-    // durably established; zero is a pre-0.19 snapshot that has not been
-    // transitioned and cannot be re-rooted yet.
+    // SM14 requires an established write floor; zero means the snapshot has
+    // not had its policy transition.
     if (!s.metadata_write_replicas_required)
         throw std::runtime_error("SM14 snapshot has no metadata write floor");
     if (s.merge_parents.size() > 64)
@@ -784,11 +748,8 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
 }
 
 namespace {
-// The inverse, and the reason a decoded SM14 snapshot has no entries: this
-// function has no node store and must not acquire one. Materialising the
-// namespace is what the plan exists to stop happening on every decode, so the
-// caller that genuinely needs a map asks `attach_namespace` for it and the
-// rest read one path at a time through `namespace_tree_lookup`.
+// Leaves `entries` empty: decoding has no node store. Callers needing the map
+// use `attach_namespace`; others read paths via `namespace_tree_lookup`.
 MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests) {
     MetadataSnapshot s;
     const auto voters = r.u32();
@@ -820,10 +781,7 @@ MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests) {
     const auto garbage_count = r.u32();
     if (garbage_count > 10000000)
         throw DecodeError("too many garbage records");
-    // A garbage record is 56 encoded bytes, so a count the remaining payload
-    // cannot possibly contain is a damaged or forged one. Reserving against
-    // the count alone is how a corrupt node talks a decoder into a 560 MB
-    // allocation it then fails to fill; bound it by what is actually there.
+    // 56 encoded bytes per record: bound the untrusted count by the input.
     s.garbage.reserve(std::min<size_t>(garbage_count, r.remaining() / 56));
     for (uint32_t i = 0; i < garbage_count; ++i) {
         GarbageRef garbage;
@@ -890,9 +848,7 @@ MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests) {
     if (torrent_requests)
         decode_torrent_requests(r, s);
     r.finish();
-    // No "missing root" check: SM13 proves the namespace is a filesystem by
-    // finding "/" in the map, and there is no map here to look in. The
-    // equivalent proof is a tree read, which belongs to whoever has the store.
+    // No "/" check here: that needs a tree read, which belongs to the store's owner.
     return s;
 }
 } // namespace
@@ -1041,12 +997,9 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
 }
 
 Bytes encode_metadata_delta(const MetadataDelta& delta) {
-    // DLT1-DLT4 are historical replay formats whose successor hashes are tied
-    // to the snapshot encoder current when they were written. Protocol 20 must
-    // never choose one of those formats merely because a mutation happens not
-    // to touch a later snapshot field: doing so can reconstruct an SM8/SM9
-    // successor and silently drop write-floor/governance state. DLT5 always
-    // reconstructs with the current canonical snapshot encoder.
+    // DLT1-DLT4 are replay-only: their successors reconstruct as SM7-SM9 and
+    // would drop write-floor and governance state. DLT5+ reconstruct with the
+    // current snapshot encoder.
     static constexpr std::array<uint8_t, 8> magic_v5{'D', 'H', 'T', 'M', 'D', 'L', 'T', '5'};
     static constexpr std::array<uint8_t, 8> magic_v6{'D', 'H', 'T', 'M', 'D', 'L', 'T', '6'};
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
@@ -1054,15 +1007,13 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
     const bool topology =
         delta.replace_merge_parents.has_value() || delta.replace_conflicts.has_value();
-    // DLT9 is DLT8 plus a trailing torrent-requests section (0.64.0), written
-    // only when a mutation touches a torrent request.
+    // DLT9 is DLT8 plus a trailing torrent-requests section, written only when
+    // a mutation touches a torrent request.
     const bool v9 = !delta.upsert_torrent_requests.empty() || !delta.erase_torrent_requests.empty();
     const bool v8 = v9 || !delta.append_entries.empty();
-    // DLT7 whenever DLT5/6 cannot say it: one topology set without the other,
-    // or a canonical tombstone order. Both sets together still encode as DLT6
-    // so a mixed-version cluster keeps its cheap merges during a rolling
-    // upgrade; a pre-0.32 peer that receives DLT7 rejects it and the sender's
-    // full-record fallback covers the gap.
+    // DLT7 when DLT5/6 cannot express it: one topology set without the other,
+    // or canonical garbage order. Both sets together still encode as DLT6; a
+    // peer that rejects DLT7 is covered by the sender's full-record fallback.
     const bool v7 = v8 || delta.canonical_garbage ||
                     (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
     const bool v6 = !v7 && topology;
@@ -1235,8 +1186,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     }
 
     if (v1) {
-        // DLT1 is retained only for replaying metadata journals written by
-        // legacy nodes. New network mutations are always DLT3.
+        // DLT1: journal replay only.
         auto garbage = r.u32();
         if (garbage > 10000000)
             throw DecodeError("too much metadata delta garbage");
@@ -1394,10 +1344,8 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         return {};
 
     MetadataDelta delta;
-    // Each topology set independently: DLT7 has a presence flag per set, so a
-    // conflict-free merge carries its new merge_parents and nothing of the
-    // standing conflict set. (DLT6 could not say "unchanged" and the encoder
-    // still refuses to emit one set without the other in that format.)
+    // Each topology set independently: DLT7 flags each set's presence, so a
+    // conflict-free merge carries only its merge_parents.
     if (before.merge_parents != after.merge_parents)
         delta.replace_merge_parents = after.merge_parents;
     if (before.conflicts != after.conflicts)
@@ -1435,10 +1383,8 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         }
     }
 
-    // Garbage can contain millions of tombstones on a long-lived media node.
-    // Do not materialise two std::map copies merely to diff them: tree-node
-    // overhead alone can consume gigabytes. Sort compact pointer indexes and
-    // merge them instead. The snapshots remain immutable throughout the diff.
+    // Garbage can hold millions of tombstones: diff sorted pointer indexes
+    // rather than two std::map copies.
     std::vector<const GarbageRef*> before_garbage;
     std::vector<const GarbageRef*> after_garbage;
     before_garbage.reserve(before.garbage.size());
@@ -1457,12 +1403,9 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         if (after_garbage[i - 1]->id == after_garbage[i]->id)
             return {};
 
-    // The DLT5/6 grammar can erase or replace an existing tombstone and append
-    // a new one, but it cannot reorder retained tombstones, while reconciliation
-    // canonicalises its union by ObjectId and historical snapshots carry append
-    // order. DLT7 sorts the vector after applying the edits, so whenever the
-    // target order is canonical the delta is expressible regardless of the
-    // source order; only a non-canonical target still needs the old check.
+    // Deltas can erase, replace and append tombstones but not reorder retained
+    // ones. A canonical (ObjectId-sorted) target uses DLT7's sort-after-apply;
+    // otherwise the target order must be reachable by erase-then-append.
     const auto contains_id = [](const std::vector<const GarbageRef*>& sorted,
                                 const ObjectId& id) {
         const auto found = std::lower_bound(
@@ -1521,9 +1464,8 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         if (it == before.node_status.end() || it->second != status)
             delta.upsert_node_status.emplace(node, status);
     }
-    // Once a snapshot has crossed into SM9, every delta successor must remain
-    // SM9. An unchanged witness makes the wire version explicit without adding
-    // another format flag to MetadataDelta.
+    // A snapshot with node status must keep it in every successor encoding;
+    // an unchanged witness record forces the section onto the wire.
     if (!after.node_status.empty() && delta.upsert_node_status.empty())
         delta.upsert_node_status.emplace(*after.node_status.begin());
 
@@ -1538,10 +1480,8 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
     if (!after.identity_resets.empty() && delta.upsert_identity_resets.empty())
         delta.upsert_identity_resets.emplace(*after.identity_resets.begin());
 
-    // Torrent requests travel whole: a changed one is rewritten, a tombstone
-    // erased after its grace is named. The successor's encoding follows from
-    // its content (SM15/SM16 while any request exists), so no witness is
-    // needed here.
+    // Torrent requests travel whole. No witness is needed: the successor's
+    // encoding follows from whether any request exists.
     for (const auto& [id, request] : after.torrent_requests) {
         auto it = before.torrent_requests.find(id);
         if (it == before.torrent_requests.end() || it->second != request)
@@ -1557,11 +1497,8 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
 void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& delta,
                                    const NamespaceDeltaApplier& namespace_applier) {
     note_startup_progress();
-    // A tree-backed namespace is not edited through the map: the entry edits
-    // below would land in an empty map that nothing reads while the root went
-    // on addressing the namespace as it was, which is a record that looks
-    // applied and is not. The applier does it properly, against the tree; with
-    // no applier this is refused rather than silently misapplied.
+    // A tree-backed namespace is edited through the applier, never the map;
+    // without an applier the delta is refused rather than silently lost.
     if (out.namespace_root) {
         if (!namespace_applier)
             throw DecodeError("cannot apply a metadata delta to a tree-backed namespace without a "
@@ -1574,12 +1511,8 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
             throw DecodeError("metadata delta sequence regressed");
         out.mutation_sequences[node] = sequence;
     }
-    // The entry edits belong to the map form only. A tree-backed snapshot has
-    // had them applied to the tree above, and running them here as well would
-    // leave it carrying both a root and a map -- the state every encoder
-    // refuses, and the one where the two can disagree about what the namespace
-    // is. The erase-root check still runs, because removing "/" is invalid in
-    // either form and the tree applier has no cheaper place to notice it.
+    // Entry edits apply to the map form only (a snapshot must not carry both a
+    // root and a map). Erasing "/" is refused in either form.
     for (const auto& path : delta.erase_entries) {
         auto normalized = normalize_path(path);
         if (normalized == "/")
@@ -1616,15 +1549,11 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
         out.catalogue_root = delta.catalogue_root;
         break;
     }
-    // Tombstone edits are indexed, not scanned. The former per-id
-    // std::erase_if / std::find_if over the whole vector was quadratic, and a
-    // reconciliation delta on a tombstone-heavy namespace (gbni-1, 2026-09-06:
-    // ~270k tombstones, merge deltas carrying 45-65k of them) took minutes per
-    // frame to replay -- longer than the 120 s startup budget, so the node
-    // crash-looped in MetadataReplica::load_heads(). Semantics are unchanged:
-    // every tombstone whose id is erased goes (duplicates included), retained
-    // tombstones keep their order, an upsert replaces the first tombstone with
-    // that id in place, and a new one is appended in delta order.
+    // Indexed, not scanned: per-id scans are quadratic on tombstone-heavy
+    // namespaces and can exceed the startup budget on replay. Every tombstone
+    // with an erased id goes (duplicates included), retained ones keep their
+    // order, an upsert replaces the first with that id in place, and new ones
+    // append in delta order.
     if (!delta.erase_garbage.empty()) {
         const std::set<ObjectId> erased(delta.erase_garbage.begin(), delta.erase_garbage.end());
         std::erase_if(out.garbage,
@@ -1661,9 +1590,7 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
         out.merge_parents = *delta.replace_merge_parents;
     if (delta.replace_conflicts)
         out.conflicts = *delta.replace_conflicts;
-    // The same invariant the map form checks here is checked by the tree
-    // applier, which is the only party that can see inside a tree. Looking for
-    // "/" in an empty map would fail every tree-backed replay.
+    // For a tree-backed namespace the applier checks the root.
     if (!out.namespace_root) {
         auto root = out.entries.find("/");
         if (root == out.entries.end() || root->second.type != EntryType::directory)
@@ -1679,8 +1606,7 @@ MetadataSnapshot apply_metadata_delta(const MetadataSnapshot& before, const Meta
 }
 
 Hash256 metadata_hash(uint64_t g, const Hash256& p, std::span<const uint8_t> d) {
-    // Preserve the exact canonical encoding without allocating a second copy of
-    // the (potentially hundreds-of-megabytes) snapshot payload merely to hash it.
+    // Streams the canonical encoding rather than copying a potentially huge payload.
     Sha256Hasher hash;
     hash_u64(hash, g);
     hash.update(p.bytes);
@@ -1946,17 +1872,9 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     if (right_head < left_head)
         return merge_metadata_snapshots(base, right, left, right_head, left_head);
 
-    // This is a path-wise three-way merge over three materialised namespaces.
-    // A tree-backed snapshot has an empty map, and an empty map here does not
-    // fail -- it merges to an empty namespace with no conflicts, which is a
-    // reconciliation that deletes the library and looks like agreement. Every
-    // caller therefore materialises its inputs first, and a snapshot that
-    // still carries a root has not been through that step.
-    //
-    // Merging tree-native -- comparing subtree roots and descending only where
-    // they differ -- is the obvious next thing and is not written. Until it
-    // is, a merge costs what a merge costs today, which is the one operation
-    // this work has not made cheaper.
+    // Path-wise three-way merge over materialised namespaces. A tree-backed
+    // snapshot's empty map would merge to an empty namespace, so it is refused.
+    // TODO: merge tree-native, descending only where subtree roots differ.
     for (const auto* branch : {&base, &left, &right})
         if (branch->namespace_root)
             throw std::logic_error("metadata merge requires materialised namespaces; a branch is "
@@ -1983,17 +1901,15 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     out.metadata_write_replicas_required =
         scalar_merge(base.metadata_write_replicas_required, left.metadata_write_replicas_required,
                      right.metadata_write_replicas_required, "metadata_write_replicas_required");
-    // Participation is monotonic until an explicit branch-retirement protocol
-    // says otherwise. A merge must therefore preserve every branch-capable node.
-    // Participant rosters are migration bookkeeping only, never branch authority.
+    // Participation is monotonic: a merge preserves every branch-capable node.
+    // The roster is migration bookkeeping, never branch authority.
     out.metadata_participants = base.metadata_participants;
     out.metadata_participants.insert(left.metadata_participants.begin(),
                                      left.metadata_participants.end());
     out.metadata_participants.insert(right.metadata_participants.begin(),
                                      right.metadata_participants.end());
-    // A branch floor is safe only when both branches independently carry the
-    // same advancement. If they differ, fall back to the common-ancestor floor;
-    // maintenance will advance it again after all merged participants converge.
+    // Reset the branch floor; maintenance advances it again once merged
+    // participants converge.
     out.metadata_branch_floor = {};
     out.retention_baseline_complete =
         left.retention_baseline_complete && right.retention_baseline_complete;
@@ -2009,9 +1925,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         }
     }
 
-    // Conflict presence is itself three-way metadata. If one branch explicitly
-    // resolved a base conflict while the other branch left it untouched, honour
-    // the resolution; a later unrelated branch merge must never resurrect it.
+    // Conflict presence merges three-way, so a resolution on one branch is
+    // never resurrected by the other.
     std::set<std::string> conflict_ids;
     for (const auto* source : {&base.conflicts, &left.conflicts, &right.conflicts})
         for (const auto& [id, _] : *source)
@@ -2074,11 +1989,9 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         for (const auto& [path, _] : *entries)
             paths.insert(path);
 
-    // Path-wise three-way merge is insufficient for rename semantics: two
-    // branches can remove the same source and create different destinations,
-    // which would otherwise look like compatible independent creates. Detect
-    // exact-entry moves across paths and force the source plus candidate
-    // destinations into the conflict set when the move/delete intent diverges.
+    // Renames: two branches moving one source to different destinations look
+    // path-wise like independent creates. Detect exact-entry moves and force
+    // the source and destinations into conflict when the intents diverge.
     std::set<std::string> forced_conflict_paths;
     auto moved_destinations = [&](const MetadataSnapshot& branch, const std::string& source,
                                   const FsEntry& entry) {
@@ -2138,12 +2051,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
             continue;
         }
 
-        // Independently creating the same directory, or writing the same
-        // bytes to the same file (two rsync writers publishing duplicate
-        // media, 2026-09-06), is semantically compatible even though
-        // wall-clock ctime/mtime and the version counter differ. Use the
-        // deterministic lesser representation so every reconciler produces
-        // the same commit hash.
+        // Same content with differing times/version is compatible; take the
+        // lesser value so every reconciler produces the same hash.
         if (l && r && same_content(*l, *r)) {
             install_entry(path, (*l < *r) ? l : r);
             continue;
@@ -2154,9 +2063,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         add_namespace_conflict(path, b, l, r);
     }
 
-    // A conflict on a newly-created parent may otherwise leave an auto-merged
-    // descendant without a directory. Preserve the ancestor view for any such
-    // path and record the descendant alternatives as conflicts too.
+    // An auto-merged descendant of a conflicted new parent would be orphaned:
+    // keep its ancestor value and record it as a conflict too.
     for (const auto& path : paths) {
         if (path == "/")
             continue;
@@ -2178,10 +2086,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     if (!out.entries.contains("/") || out.entries.at("/").type != EntryType::directory)
         throw std::runtime_error("metadata reconciliation lost filesystem root");
 
-    // Catalogue roots are immutable. If only one branch changed the root, take
-    // it. If both changed differently, retain the common-ancestor catalogue and
-    // persist both alternatives as a first-class conflict. Catalogue-object
-    // semantic merging can subsequently resolve this without re-querying a provider.
+    // Catalogue roots: take a one-sided change; if both differ, keep the
+    // ancestor and record both alternatives as a conflict.
     if (left.catalogue_root == right.catalogue_root) {
         out.catalogue_root = left.catalogue_root;
     } else if (left.catalogue_root == base.catalogue_root) {
@@ -2203,9 +2109,8 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
             ++result.conflicts_created;
     }
 
-    // Garbage is maintenance state, not user namespace state. Union branch
-    // retirements conservatively; keeping an extra tombstone is safe and lets a
-    // later branch-aware reachability pass decide when physical deletion is valid.
+    // Union garbage: an extra tombstone is safe, and reachability later decides
+    // when physical deletion is valid.
     std::map<ObjectId, GarbageRef> garbage;
     for (const auto* source : {&left.garbage, &right.garbage}) {
         for (const auto& value : *source) {
@@ -2220,8 +2125,7 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     for (const auto& [_, value] : garbage)
         out.garbage.push_back(value);
 
-    // Persisted node observations and identity resets are monotonic operational
-    // metadata and have deterministic joins.
+    // Node status and identity resets are monotonic with deterministic joins.
     out.node_status = base.node_status;
     for (const auto* source : {&left.node_status, &right.node_status}) {
         for (const auto& [node, status] : *source) {
@@ -2243,15 +2147,12 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
                 out.identity_resets[key] = reset;
         }
     }
-    // Torrent requests join per request (torrent_request.hpp): no merge of
-    // them ever becomes an operator conflict.
+    // Torrent requests join per request (torrent_request.hpp); never a conflict.
     out.torrent_requests =
         merge_torrent_requests(base.torrent_requests, left.torrent_requests, right.torrent_requests);
 
-    // A conflict recorded by an earlier merge whose subject one branch has
-    // since rewritten is decided; keeping it (and shipping it in every merge
-    // delta) is habit D. New conflicts from this merge sit at their base
-    // value and are untouched by this.
+    // Drop conflicts whose subject has since been rewritten; new conflicts sit
+    // at their base value and survive.
     result.conflicts_superseded = prune_superseded_conflicts(out);
     out.merge_parents.clear();
     return result;
@@ -2273,8 +2174,7 @@ std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
     };
     const bool left_dominates = dominates(left, right);
     const bool right_dominates = dominates(right, left);
-    // Equal clocks with different state are not safe to choose between, and
-    // concurrent clocks require a conflict-preserving operator workflow.
+    // Equal or concurrent clocks: no safe choice; use the conflict-preserving plan.
     if (left_dominates == right_dominates)
         return {};
 
@@ -2299,11 +2199,8 @@ std::optional<MetadataManualRepairPlan> plan_causally_dominant_metadata_repair(
 std::optional<MetadataConflictPreservingRepairPlan> plan_conflict_preserving_metadata_repair(
     const MetadataRecord& left_record, const MetadataSnapshot& left,
     const MetadataRecord& right_record, const MetadataSnapshot& right) {
-    // Both planners compare entry maps, so a tree-backed branch would compare
-    // as empty and plan a repair against a namespace it never looked at. These
-    // are the operator's split-brain tools and they run once, under pressure,
-    // on a cluster that is already in trouble; refusing is the only acceptable
-    // behaviour until macha-metadata-repair materialises its inputs.
+    // Both planners compare entry maps; a tree-backed branch would compare as
+    // empty, so it is refused.
     if (left.namespace_root || right.namespace_root)
         throw std::logic_error("metadata repair planning requires materialised namespaces; a "
                                "branch is still a tree");
@@ -2355,10 +2252,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
         }
     };
 
-    // If a previous startup already entered recovery, never silently promote
-    // its fallback checkpoint to authoritative merely because this restart can
-    // decrypt it. It remains read-only/stale until replica checkpointing clears
-    // the durable recovery marker.
+    // While the recovery marker exists the fallback checkpoint stays stale,
+    // however readable, until replica checkpointing clears the marker.
     if (std::filesystem::exists(recovery_p_)) {
         recovery_required_ = true;
         try {
@@ -2372,10 +2267,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
                 ensure_history_root(committed_);
                 load_heads();
                 load_checkpoint_proof();
-                // A checkpoint loaded while recovery.required exists may have
-                // originated from the persistent metadata cache. Never manufacture
-                // legacy acceptance for it. Only heads.meta carried from a later
-                // successful peer recovery may provide authority here.
+                // This checkpoint may come from the metadata cache: no legacy
+                // acceptance; only heads.meta from a peer recovery grants authority.
                 refresh_materialized_head_locked();
                 Log::warn("metadata replica still requires replica recovery path=" +
                           checkpoint_p_.parent_path().string() +
@@ -2410,12 +2303,9 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             return;
         }
 
-        // 0.8.x migration. The old format kept a fully materialised current and
-        // committed snapshot. Preserve the committed record as the journal base and
-        // represent a newer accepted-but-not-committed current record as a trusted
-        // full seed entry. After the new files are durable, rename the old files so
-        // accidentally starting a pre-0.9 binary fails instead of silently rolling
-        // the namespace backwards.
+        // current.meta/committed.meta layout: committed becomes the journal
+        // base, a newer current becomes a seed entry, and the old files are
+        // renamed once the new ones are durable.
         auto current = load(p_);
         auto committed = load(committed_p_);
         if (current.has_value() != committed.has_value())
@@ -2490,9 +2380,8 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
     ensure_history_root(seed);
     load_heads();
     load_checkpoint_proof();
-    // The cache seed is deliberately *not* accepted. It is useful material for
-    // read-only diagnosis/reconstruction, but cannot stand in for the durable
-    // acceptance evidence which was lost with the primary metadata state.
+    // The cache seed is not accepted: it cannot stand in for the lost durable
+    // acceptance evidence.
     refresh_materialized_head_locked();
     recovery_required_ = true;
 
@@ -2708,21 +2597,10 @@ void MetadataReplica::load_journal() {
         try {
             plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MJ);
         } catch (const std::exception& error) {
-            // A journal append writes one complete authenticated frame and then
-            // fsyncs it. A host/storage failure can nevertheless leave the file
-            // length extended while the final ciphertext/tag is only partially
-            // durable. No later frame can depend on an unauthenticated final
-            // frame. Preserve those bytes for diagnosis and replay only the
-            // authenticated prefix.
-            //
-            // Discipline 3: the same holds anywhere in the file. The journal
-            // is a CAS chain after the checkpoint, so nothing after a frame
-            // that cannot be authenticated (or, below, that does not fit the
-            // chain) can be applied either; the durable prefix is exactly the
-            // state of a crash before that append. Formerly a middle-frame
-            // failure threw, and the constructor answered by quarantining
-            // *every* metadata file — checkpoint, history, heads — over one
-            // bad frame.
+            // The journal is a CAS chain after the checkpoint: nothing after an
+            // unauthenticated frame (or, below, one that does not fit the chain)
+            // can apply. Replay the prefix, which is the state of a crash before
+            // that append; the tail is quarantined below.
             if (final_frame && std::string_view(error.what()) == "AES-GCM authentication failed")
                 trailing_problem = "final frame failed AES-GCM authentication";
             else
@@ -2740,10 +2618,8 @@ void MetadataReplica::load_journal() {
             auto body = record_reader.bytes();
             record_reader.finish();
 
-            // Compaction writes the new checkpoint before truncating the old
-            // journal. A crash in that small window legitimately leaves journal
-            // frames already represented by the checkpoint; ignore only those
-            // exact/older generations and replay anything newer.
+            // Compaction writes the checkpoint before truncating the journal, so
+            // frames at or below the checkpoint are skipped.
             const bool checkpoint_rollback =
                 kind == JOURNAL_SEED_FULL && record.generation == checkpoint_generation &&
                 record.hash == checkpoint_hash && cur_.hash != checkpoint_hash;
@@ -2790,11 +2666,9 @@ void MetadataReplica::load_journal() {
                     throw std::runtime_error("seed hash invalid");
                 const auto parents = metadata_record_parents(record);
 
-                // A seed is an explicitly journaled replacement of the current
-                // *uncommitted* proposal.  It may roll current back to the
-                // durable head, advance from that head, or install a descendant
-                // whose ancestry was imported into history before the seed.
-                // None of those transitions rewrites committed history.
+                // A seed replaces the uncommitted proposal: it may roll back to
+                // the committed head, advance from it, or install a descendant
+                // whose ancestry is in history. Committed history is never rewritten.
                 if (record.hash == committed_.hash) {
                     cur_ = committed_;
                     pending_history_.reset();
@@ -2832,11 +2706,8 @@ void MetadataReplica::load_journal() {
                 throw std::runtime_error("unknown record type " + std::to_string(kind));
             }
         } catch (const std::exception& error) {
-            // See the authentication comment above: a record that does not
-            // fit the chain ends the replayable prefix; it and everything
-            // after it are quarantined below, and the replica starts from
-            // the state before it. cur_/committed_ are only assigned after a
-            // record validates, so nothing partial is left behind.
+            // Ends the replayable prefix. cur_/committed_ are assigned only
+            // after a record validates, so nothing partial remains.
             trailing_problem = std::string("record does not fit the chain: ") + error.what();
             break;
         }
@@ -2975,9 +2846,7 @@ void MetadataReplica::load_history() {
     size_t skipped = 0;
     std::string first_skipped;
 
-    // Recovery is deliberately streaming: history can span many namespace
-    // generations, so startup RSS is bounded by one history frame rather than
-    // the lifetime size of history.log.
+    // Streaming: startup RSS is bounded by one frame, not history.log's size.
     while (offset + 4 <= file_size) {
         std::array<uint8_t, 4> header_bytes{};
         if (!stream.read(reinterpret_cast<char*>(header_bytes.data()), header_bytes.size())) {
@@ -3012,9 +2881,8 @@ void MetadataReplica::load_history() {
             auto plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MH);
             auto entry_value = decode_metadata_history_entry(plaintext);
 
-            // Cold-start history loading must be O(history bytes), not O(history^2).
-            // Validate each frame locally here; full reconstruction is deferred to
-            // accepted/current heads which can actually become authority.
+            // Linear in history bytes: validate each frame locally; full
+            // reconstruction is deferred to heads that can become authority.
             if (!entry_value.generation || entry_value.hash == Hash256{})
                 throw DecodeError("invalid metadata history identity");
             if (entry_value.body == MetadataHistoryEntry::Body::full) {
@@ -3025,21 +2893,14 @@ void MetadataReplica::load_history() {
                 record.payload = entry_value.payload;
                 if (!valid_metadata_record(record))
                     throw DecodeError("invalid full metadata history record");
-                // Do not rebuild the complete namespace object graph for every
-                // historical checkpoint during cold replay. The encrypted frame
-                // and immutable record hash authenticate the indexed identity;
-                // store/import already validated payload merge parents, and any
-                // accepted/current head is decoded and cross-checked again when
-                // materialized. Re-decoding hundreds of multi-megabyte snapshots
-                // here retained gigabytes in allocator arenas on small nodes.
+                // Not decoded: the authenticated frame and record hash bind the
+                // identity, and heads are decoded and cross-checked when
+                // materialised. Decoding every snapshot here costs gigabytes.
             } else if (entry_value.body == MetadataHistoryEntry::Body::delta) {
                 if (!entry_value.previous_known || entry_value.generation <= 1)
                     throw DecodeError("metadata delta history has no predecessor");
                 auto parent = history_.find(entry_value.previous);
-                // See metadata_delta_succession_valid(): merge commits are
-                // numbered after their newest parent while the primary parent
-                // is selected by hash, so the primary can be many generations
-                // behind. Readers must apply the identical rule.
+                // Same rule as every reader: see metadata_delta_succession_valid().
                 if (parent == history_.end() ||
                     !metadata_delta_succession_valid(parent->second.generation,
                                                      entry_value.generation))
@@ -3051,11 +2912,9 @@ void MetadataReplica::load_history() {
 
             auto index = index_history_entry(entry_value, offset, 4 + length);
             if (auto existing = history_.find(entry_value.hash); existing != history_.end()) {
-                // reanchor_history() appends a full-body frame for a hash that
-                // is already indexed, superseding a frame that could not be
-                // replayed. The hash binds generation/previous/payload, so a
-                // same-identity duplicate is never ambiguous: prefer the
-                // self-contained full body. Anything else is corruption.
+                // reanchor_history() appends a full body for an indexed hash;
+                // the hash binds the identity, so prefer the full body. A
+                // conflicting identity is corruption.
                 if (existing->second.generation != entry_value.generation ||
                     existing->second.previous != entry_value.previous)
                     throw DecodeError("duplicate metadata history record with conflicting identity");
@@ -3069,12 +2928,9 @@ void MetadataReplica::load_history() {
                 trailing_problem = "final frame failed AES-GCM authentication";
                 break;
             }
-            // Discipline 3: history entries are independent, hash-indexed
-            // records; one that cannot be authenticated or decoded is skipped
-            // (anything that depended on it fails its own predecessor check
-            // and is skipped too) and the heads that need it are repaired
-            // live from peers. Formerly fatal, which quarantined every
-            // metadata file over one frame.
+            // Entries are independent and hash-indexed: skip a bad one (its
+            // dependants fail their predecessor check too); heads needing it
+            // are repaired live from peers.
             ++skipped;
             if (skipped == 1)
                 first_skipped = "offset=" + std::to_string(offset) + ": " + error.what();
@@ -3114,10 +2970,7 @@ void MetadataReplica::load_history() {
     }
     history_bytes_ = valid;
 #if defined(__GLIBC__)
-    // Cold replay intentionally owns only the compact history index after this
-    // point. Return transient decrypt/frame arenas to the OS before the node
-    // starts serving; otherwise a multi-gigabyte history scan can leave a small
-    // node with gigabytes of RSS despite zero resident history payload bytes.
+    // Only the index is retained; return the scan's transient arenas to the OS.
     (void)malloc_trim(0);
 #endif
 }
@@ -3144,15 +2997,9 @@ void MetadataReplica::load_heads() {
         for (auto& value : values) {
             auto reconstructed = materialized_locked(value.hash);
             if (!reconstructed) {
-                // Formerly a throw, which sent the constructor down the
-                // recovery-seed path: every metadata file quarantined -- up to
-                // tens of GB of perfectly valid history -- over one head that
-                // could not be replayed locally (2026-09-06). The certificate
-                // is durable evidence that the cluster accepted this head; the
-                // record itself is immutable and any peer that can materialize
-                // it can supply it. Keep the certificate, flag the head so
-                // readers skip it (accepted_heads() cooldown), say exactly
-                // what is wrong, and let MetadataManager::
+                // The certificate is durable evidence of acceptance and any
+                // peer can supply the immutable record: keep it, flag the head
+                // for the accepted_heads() cooldown, and let MetadataManager::
                 // repair_unreconstructable_heads() re-anchor it live.
                 const auto reason = diagnose_unreconstructable_locked(value.hash);
                 Log::error("metadata accepted head is not reconstructible locally; keeping it "
@@ -3164,9 +3011,7 @@ void MetadataReplica::load_heads() {
                 accepted_heads_.emplace(value.hash, std::move(value));
                 continue;
             }
-            // The record hash binds its generation, so a materialized record
-            // disagreeing with its own certificate is a forged/corrupt
-            // certificate, not a missing dependency -- still fatal.
+            // The hash binds the generation: a mismatch is a corrupt certificate.
             if (reconstructed->record.generation != value.generation)
                 throw std::runtime_error("accepted metadata head certificate generation does "
                                          "not match its record");
@@ -3224,17 +3069,13 @@ void MetadataReplica::load_checkpoint_proof() {
         reader.finish();
         auto proof =
             decode_history_checkpoint_proof(aes_gcm_open(key_, nonce, tag, ciphertext, CP));
-        // A proof is only ever trusted once it validates against the current
-        // committed head -- committed_ is already loaded by this point in
-        // construction. A stale/mismatched/merely-acked proof is simply not
-        // kept; it must never be used to justify anything (see the class
-        // comment on HistoryCheckpointProof).
+        // Kept only if committed and matching committed_ (already loaded);
+        // see HistoryCheckpointProof.
         if (proof.status == HistoryCheckpointProof::Status::committed &&
             proof.floor_hash == committed_.hash)
             checkpoint_proof_ = std::move(proof);
     } catch (const std::exception& error) {
-        // A corrupt or unreadable proof file is exactly equivalent to no
-        // proof at all -- never fail startup over it, and never guess.
+        // An unreadable proof is no proof; startup continues.
         Log::warn("metadata checkpoint proof file " + checkpoint_proof_p_.string() +
                   " ignored: " + std::string(error.what()));
     }
@@ -3262,15 +3103,11 @@ bool MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
     std::lock_guard durable_lock(durable_mutation_m_);
     proposal.status = HistoryCheckpointProof::Status::acked;
     std::lock_guard lock(m_);
-    // Refuse to ack a floor this replica has already moved past. This is the
-    // same single-accepted-head invariant compact_history_if_safe() itself
-    // requires before compacting; enforcing it here too closes the window
-    // where a proposer's own survey was already stale by the time this ack
-    // arrives.
+    // Ack only while the floor is the sole accepted head (as
+    // compact_history_if_safe() requires); the proposer's survey may be stale.
     if (accepted_heads_.size() != 1 || !accepted_heads_.contains(proposal.floor_hash))
         return false;
-    // A different (floor_hash, epoch) supersedes whatever was recorded
-    // before -- only ever one proposal in flight is tracked at a time.
+    // One proposal is tracked at a time; a new one supersedes it.
     checkpoint_proof_ = std::move(proposal);
     persist_checkpoint_proof_locked();
     return true;
@@ -3314,34 +3151,20 @@ bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
     if (history_is_ancestor_locked(ancestor, descendant))
         return true;
 
-    // Generation 1 is the deterministic, mutation-free protocol genesis. Old
-    // history compaction may have re-rooted an established head and discarded
-    // the physical edge back to genesis. In accepted-head semantics the exact
-    // canonical genesis is nevertheless always subsumed by any valid
-    // post-genesis record. This lets a pristine replica adopt an established
-    // cluster head without advertising genesis as a rootless sibling, and lets
-    // established replicas ignore a late genesis certificate from a joiner.
+    // Canonical genesis is subsumed by any post-genesis record even when
+    // compaction removed the edge, so a pristine replica can adopt a cluster
+    // head and a joiner's late genesis certificate is ignored.
     const auto genesis = genesis_metadata();
     if (ancestor == genesis.hash) {
         auto materialized = materialized_locked(descendant);
         return materialized && materialized->record.generation > genesis.generation;
     }
 
-    // A history-checkpoint proof this replica itself durably committed is
-    // exactly the same shape of fact as genesis: at the moment it was
-    // recorded, every durably-known cluster participant -- this replica
-    // included -- had proven `ancestor` was the cluster's sole accepted head
-    // (see HistoryCheckpointProof, MetadataManager::attempt_history_checkpoint).
-    // A node that goes offline right after compacting to that floor, while
-    // its peers later compact further still, can no longer physically prove
-    // the edge from its own floor to whatever the cluster's current head has
-    // become -- the connecting entries are gone everywhere. Trust its own
-    // committed floor as a universal ancestor of anything that now
-    // materializes at a later generation, exactly as genesis is trusted.
-    // Deliberately narrower than "any rootless/previous_known=false record":
-    // an ordinary imported full record that merely lacks a cached predecessor
-    // (import_history()) or a legacy migration root (ensure_history_root())
-    // carries no such cluster-wide proof and must never be trusted this way.
+    // A committed checkpoint proof is the same kind of fact: every participant
+    // proved `ancestor` the sole accepted head (see HistoryCheckpointProof).
+    // Peers may since have compacted away the connecting edges, so trust the
+    // floor as an ancestor of any later generation. Other rootless records
+    // (import_history(), ensure_history_root()) carry no such proof.
     if (checkpoint_proof_ && checkpoint_proof_->status == HistoryCheckpointProof::Status::committed &&
         checkpoint_proof_->floor_hash == ancestor) {
         auto materialized = materialized_locked(descendant);
@@ -3354,10 +3177,8 @@ void MetadataReplica::migrate_legacy_head_locked() {
     ensure_history_root(committed_);
     const auto genesis = genesis_metadata();
     if (!accept_pristine_genesis_authority_ && committed_.hash == genesis.hash) {
-        // A node with configured bootstrap peers is a joiner, not a namespace
-        // founder. Keep deterministic genesis only as non-authoritative local
-        // material needed by the codec; never advertise or persist it as an
-        // accepted head. This also cleans state written by older binaries.
+        // A joiner (bootstrap peers configured) never holds genesis as an
+        // accepted head; it stays local, non-authoritative material.
         if (accepted_heads_.erase(genesis.hash))
             persist_heads_locked();
         return;
@@ -3367,10 +3188,8 @@ void MetadataReplica::migrate_legacy_head_locked() {
 
     const auto snapshot = decode_snapshot(committed_.payload);
     if (snapshot.metadata_write_replicas_required != 0) {
-        // A protocol-20 checkpoint without heads.meta is useful recovery material
-        // but is not authority: only an acceptance certificate proves that the
-        // commit reached the cluster write floor. Preserve the checkpoint and
-        // force peer recovery rather than manufacturing a legacy accepted head.
+        // Without a certificate a write-floor checkpoint is not authority:
+        // keep it and force peer recovery rather than invent a legacy head.
         recovery_required_ = true;
         durable_replace_file(
             recovery_p_, "protocol-20 metadata checkpoint has no durable acceptance certificate");
@@ -3378,10 +3197,8 @@ void MetadataReplica::migrate_legacy_head_locked() {
     }
 
     if (!accepted_heads_.empty()) {
-        // New-protocol accepted descendants already subsume the materialised
-        // checkpoint. Conversely, a legacy JOURNAL_COMMIT can be newer than an
-        // older heads.meta if the process crashed between those two durable
-        // writes; in that case preserve the committed linear successor.
+        // Accepted descendants subsume the checkpoint. A JOURNAL_COMMIT newer
+        // than heads.meta (crash between the two writes) replaces them.
         bool committed_is_ancestor = false;
         bool all_heads_are_ancestors = true;
         for (const auto& [head, _] : accepted_heads_) {
@@ -3418,14 +3235,11 @@ bool MetadataReplica::acceptance_matches_record_policy_locked(
     const auto& record = materialized.record;
     const auto& snapshot = *materialized.snapshot;
     if (!snapshot.metadata_write_replicas_required) {
-        // required=0 is the durable legacy authority marker. A pre-0.19
-        // snapshot may still contain metadata_voters; those voters define the
-        // stronger floor required to transition out of legacy authority, but
-        // they were never encoded into the legacy acceptance certificate.
+        // required=0 marks legacy authority; metadata_voters set the floor
+        // for leaving it but are not in the certificate.
         if (acceptance.required != 0 || !acceptance.replicas.empty())
             return false;
-        // Once a branch has crossed into protocol 20 it may not manufacture a
-        // legacy-authority child and thereby discard the accepted write floor.
+        // A child of a write-floor parent may not revert to legacy authority.
         for (const auto& parent_hash : metadata_record_parents(record)) {
             auto parent = materialized_locked(parent_hash);
             if (parent && parent->snapshot->metadata_write_replicas_required)
@@ -3445,10 +3259,7 @@ bool MetadataReplica::acceptance_matches_record_policy_locked(
     for (const auto& parent_hash : metadata_record_parents(record)) {
         auto parent = materialized_locked(parent_hash);
         if (!parent) {
-            // An ordinary same-policy certificate is self-describing enough to
-            // retain branch evidence while ancestry is still being imported. A
-            // stronger transition certificate, however, cannot be validated
-            // without the parent policy which required that stronger floor.
+            // Parent not yet imported: only a same-policy certificate validates.
             if (acceptance.required != current)
                 return false;
             continue;
@@ -3479,12 +3290,8 @@ void MetadataReplica::set_legacy_committed_head_locked(const MetadataRecord& rec
 bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     if (accepted_heads_.empty())
         return false;
-    // See unreconstructable_head_retry_at_'s declaration: bound how often a
-    // still-broken hash re-throws, rather than re-attempting and re-raising on
-    // every single call -- the volume of callers that reach this function
-    // (every one of them, on a cluster with more than one accepted head, on
-    // every read) is exactly what turns one narrow reconstruction failure into
-    // an unbounded tight loop.
+    // Cooldown bounds how often a broken head re-throws; this runs on every
+    // read (see unreconstructable_head_retry_at_).
     const auto now = Clock::now();
     std::erase_if(unreconstructable_head_retry_at_, [&](const auto& item) {
         return !accepted_heads_.contains(item.first);
@@ -3493,7 +3300,7 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     for (const auto& [hash, _] : accepted_heads_) {
         if (auto found = unreconstructable_head_retry_at_.find(hash);
             found != unreconstructable_head_retry_at_.end() && now < found->second)
-            continue; // Confirmed broken recently; skip the attempt entirely.
+            continue;
         auto record = historical_locked(hash);
         if (!record) {
             const auto reason = flag_unreconstructable_locked(hash, now, "materialized head refresh");
@@ -3508,10 +3315,8 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     if (!selected || selected->hash == committed_.hash)
         return false;
 
-    // `committed_` is now only the locally materialised preferred accepted head
-    // used by legacy callers and the fast read cache. Authority lives in the
-    // accepted-head set above. Moving this materialisation never deletes another
-    // accepted branch from history.
+    // `committed_` is only the preferred materialised head; authority is the
+    // accepted-head set, and moving it deletes no branch from history.
     committed_ = *selected;
     cur_ = committed_;
     pending_history_.reset();
@@ -3533,8 +3338,7 @@ void MetadataReplica::ensure_history_root(const MetadataRecord& record) {
     root.generation = record.generation;
     root.previous = record.previous;
     root.hash = record.hash;
-    // An upgraded 0.18 checkpoint has a predecessor hash but not necessarily the
-    // predecessor material. Treat the checkpoint as the local 0.19 history root.
+    // The predecessor material may be absent; the record is a local history root.
     root.previous_known = false;
     root.merge_parents = decode_snapshot(record.payload).merge_parents;
     root.body = MetadataHistoryEntry::Body::full;
@@ -3592,9 +3396,7 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
                 it->second.last_used < victim->second.last_used)
                 victim = it;
         }
-        // Current/committed decoded views are hot. Accepted-head authority is
-        // the durable certificate plus history record, never this reconstructible
-        // optimization, so divergent heads must not multiply permanent RAM.
+        // Only current/committed are pinned; other heads are reconstructible.
         if (victim == materialized_history_.end())
             break;
         materialized_history_bytes_ -= victim->second.bytes;
@@ -3602,9 +3404,7 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
         materialization_cache_evictions_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // A one-off historical snapshot larger than the entire budget remains
-    // usable by its caller but does not become permanent process state. Current
-    // heads stay pinned because they are the active local view.
+    // Over budget and unpinned: return it uncached.
     if (bytes > materialized_history_limit_bytes_ && !incoming_pinned)
         return value;
     materialized_history_.emplace(record.hash,
@@ -3632,9 +3432,8 @@ MetadataReplica::materialized_locked(const Hash256& target) const {
 
     historical_reconstructions_.fetch_add(1, std::memory_order_relaxed);
 
-    // Ownership invariant: history_ owns only lightweight frame indexes; this
-    // reconstruction owns one mutable decoded tree and at most one delta body
-    // at a time. Intermediate full trees and payloads never enter the cache.
+    // history_ holds only frame indexes; this holds one decoded snapshot and one
+    // delta body at a time. Intermediates never enter the cache.
     std::vector<HistoryIndexEntry> deltas;
     std::set<Hash256> seen;
     HistoryIndexEntry cursor = found->second;
@@ -3759,9 +3558,8 @@ bool MetadataReplica::history_is_ancestor_locked(const Hash256& ancestor,
         if (found == history_.end())
             continue;
         const auto& entry_value = found->second;
-        // A compacted full root retains its authenticated direct-parent hash,
-        // even though previous_known=false prevents reconstruction or traversal
-        // beyond that boundary.  The direct edge is still valid ancestry.
+        // A compacted root's direct-parent hash is valid ancestry, though not
+        // traversable when previous_known=false.
         if (entry_value.previous != Hash256{} && entry_value.previous == ancestor)
             return true;
         if (entry_value.previous_known ||
@@ -3795,9 +3593,8 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
              history_.contains(found->second.previous))) {
             pending.push_back(found->second.previous);
         } else if (found->second.previous != Hash256{}) {
-            // Record the authenticated boundary parent as a possible common
-            // ancestor, but do not walk into history deliberately discarded by
-            // compaction.
+            // The boundary parent may be the common ancestor; do not walk
+            // into compacted history.
             const auto parent = history_.find(found->second.previous);
             const uint64_t parent_generation =
                 parent == history_.end() ? 0 : parent->second.generation;
@@ -3836,8 +3633,7 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
              history_.contains(found->second.previous))) {
             pending.push_back(found->second.previous);
         } else if (found->second.previous != Hash256{}) {
-            // As above, the boundary parent participates in ancestry matching
-            // without becoming a traversal edge.
+            // As above: matched, not traversed.
             const auto parent = history_.find(found->second.previous);
             consider(found->second.previous,
                      parent == history_.end() ? 0 : parent->second.generation);
@@ -3957,12 +3753,7 @@ std::string MetadataReplica::diagnose_unreconstructable_locked(const Hash256& ta
             return "delta frame " + describe(*it) + " unreadable: " + error.what();
         }
     }
-    // Everything this function can check has passed. It has NOT replayed the
-    // chain, and the previous wording here said it had: "does not reproduce
-    // the record hash" was a default conclusion that on 2026-09-22 sent an
-    // operator hunting a tree corruption while the real event was a branch
-    // waiting on reconciliation. Say what was checked and no more; the replay
-    // that would settle it is macha-metadata-dump --objects.
+    // The chain was not replayed: report only what was checked.
     return "delta chain from anchor " + describe(cursor) + " over " +
            std::to_string(chain.size()) +
            " frame(s) is structurally sound and every frame is readable; the failure is in "
@@ -3998,10 +3789,9 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
         if (auto existing = history_.find(entry.hash); existing != history_.end()) {
             if (existing->second.generation != entry.generation ||
                 existing->second.previous != entry.previous)
-                return false; // Same hash, different identity: refuse to touch it.
+                return false; // same hash, different identity
             if (materialized_locked(entry.hash)) {
-                // Nothing to repair (a transient failure, or a peer already
-                // re-anchored it); just lift the exclusion.
+                // Already reconstructible: just lift the exclusion.
                 unreconstructable_head_retry_at_.erase(entry.hash);
                 return true;
             }
@@ -4023,12 +3813,9 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
     unreconstructable_head_retry_at_.erase(entry.hash);
 
     if (auto head = accepted_heads_.find(entry.hash); head != accepted_heads_.end()) {
-        // Verify against the record just validated and cached -- not a fresh
-        // reconstruction, which is exactly what was failing a moment ago.
+        // Verify against the record just cached, not a fresh reconstruction.
         if (!acceptance_matches_record_policy_locked(head->second, *value)) {
-            // load_heads() treats this as fatal for a reconstructible head; for
-            // a repaired one the honest outcome is the same as the old
-            // quarantine, narrowed to this one certificate.
+            // Drop only this certificate.
             Log::error("metadata accepted head certificate does not match its repaired record; "
                        "dropping the certificate hash=" +
                        hex(entry.hash.bytes) + " generation=" +
@@ -4043,10 +3830,7 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
               std::to_string(entry.generation) + " bytes=" + std::to_string(frame.size()));
     if (prune_accepted_heads_locked())
         persist_heads_locked();
-    // This head is repaired regardless of whether *another* flagged head
-    // makes the materialized-head refresh throw; that one has its own flag
-    // and cooldown and must not turn a successful durable repair into a
-    // reported failure.
+    // Another flagged head may make the refresh throw; this repair still succeeded.
     try {
         refresh_materialized_head_locked();
     } catch (const std::exception& error) {
@@ -4071,8 +3855,7 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
             return false;
     } else if (entry.previous_known && entry.previous != Hash256{} &&
                !history_contains(entry.previous)) {
-        // Full-record fallback is safe without its ancestry, but it must not
-        // persist a false claim that the predecessor is locally traversable.
+        // A full record stands alone; do not claim an absent predecessor.
         entry.previous_known = false;
     }
 
@@ -4192,8 +3975,7 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
         reconstructed->record.previous != record.previous ||
         reconstructed->record.hash != record.hash ||
         reconstructed->record.payload != record.payload) {
-        // The caller's fallback is a full body, so this is the only trace a
-        // non-reconstructing delta leaves. Say which check it failed.
+        // The caller falls back to a full body; this log is the delta's only trace.
         if (entry_value.body == MetadataHistoryEntry::Body::delta)
             Log::debug("metadata delta body rejected generation=" +
                        std::to_string(record.generation) + " reason=" +
@@ -4248,9 +4030,7 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads
         return false;
     }
 
-    // Populate the target and policy-parent materializations through the
-    // off-lock cache-miss path. The locked validation below then consists of
-    // immutable-history checks and cache hits rather than chain reconstruction.
+    // Warm the cache off-lock so the locked validation below hits it.
     auto prepared = materialized(value.hash);
     if (!prepared || prepared->record.generation != value.generation)
         return false;
@@ -4265,22 +4045,13 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads
     if (!acceptance_matches_record_policy_locked(value, *materialized))
         return false;
 
-    // A materialized-head change requires writing the full committed snapshot
-    // to the checkpoint file (`reset_checkpoint`), potentially hundreds of MB
-    // on a large catalogue. That write must never happen while `m_` is held --
-    // this runs on the metadata RPC path, and every other reader/writer that
-    // only needs `m_` (status, ordinary reads, other accept_commit calls that
-    // don't touch this head) would otherwise stall behind one slow fsync.
-    // `durable_mutation_m_` (already held for this whole call) remains the
-    // serialization boundary against other durable-mutation writers, matching
-    // the same off-lock-write/on-lock-bookkeeping pattern `import_history()`
-    // already uses for `write_history_frame`.
+    // A head change rewrites the checkpoint (possibly hundreds of MB): write it
+    // after releasing `m_`, under `durable_mutation_m_` only, so readers on the
+    // RPC path do not stall behind the fsync.
     std::optional<MetadataRecord> pending_checkpoint;
 
     bool changed = false;
-    // An accepted ancestor remains valid evidence, but it is no longer a head.
-    // If it was already present before ancestry arrived, remove it now instead
-    // of returning early and leaving a non-maximal accepted head behind.
+    // An accepted ancestor is not a head: remove it if already present.
     bool incoming_is_ancestor = false;
     for (const auto& [head, _] : accepted_heads_) {
         if (head != value.hash && accepted_head_is_ancestor_locked(value.hash, head)) {
@@ -4367,16 +4138,9 @@ std::vector<MetadataRecord> MetadataReplica::accepted_heads() const {
         for (const auto& [hash, _] : accepted_heads_)
             hashes.push_back(hash);
     }
-    // See unreconstructable_head_retry_at_'s declaration. This is the hottest
-    // path into that failure mode -- called on essentially every metadata
-    // read/reconciliation attempt across the cluster -- so a broken head here
-    // must degrade to "temporarily excluded from the accepted set" rather than
-    // a hard throw: every caller already treats accepted_heads()'s size (0, 1,
-    // or >1) as the signal for "not ready" / "converged" / "needs
-    // reconciliation," so quietly narrowing the set lets the replica keep
-    // making progress on whichever heads *are* reconstructable -- including
-    // recovering, for callers that require exactly one head, once a broken
-    // second head is excluded -- instead of every caller failing outright.
+    // Hot path: a broken head is excluded for its cooldown rather than thrown
+    // (see unreconstructable_head_retry_at_). Callers read the set's size as
+    // not-ready/converged/needs-reconciliation, so progress continues.
     const auto now = Clock::now();
     std::vector<MetadataRecord> out;
     out.reserve(hashes.size());
@@ -4476,11 +4240,8 @@ MetadataReplica::materialized(const Hash256& hash) const {
             anchor_index = cursor->second;
     }
 
-    // Snapshot decoding, delta application, encoding, and hashing can dominate
-    // recovery time. They deliberately run without the global replica mutex.
-    // Keep exactly one mutable reconstruction. The old implementation retained
-    // every full intermediate snapshot until replay completed, multiplying a
-    // large namespace by the delta-chain length before cache eviction ran.
+    // Decode, apply, encode and hash run without `m_`, holding exactly one
+    // mutable reconstruction.
     MetadataRecord working_record;
     MetadataSnapshot working_snapshot;
     try {
@@ -4528,9 +4289,7 @@ MetadataReplica::materialized(const Hash256& hash) const {
         std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
 
     std::lock_guard lock(m_);
-    // History is append-only except for explicit compaction. Intermediates are
-    // validation work, not useful permanent state; install only the requested
-    // immutable result if its source still exists.
+    // Cache only the requested result, and only if compaction has not removed it.
     if (history_.contains(value->record.hash))
         value = cache_materialization_locked(value->record, value->snapshot,
                                              value->resident_bytes);
@@ -4588,19 +4347,13 @@ bool MetadataReplica::cas(uint64_t generation, const Hash256& hash,
             return false;
         }
 
-        // Multiple coordinators may legitimately race from the same accepted
-        // head. A PREPARE is not authoritative yet, but allowing every caller to
-        // overwrite it creates a symmetric swap: each coordinator can collect a
-        // write-floor of acknowledgements for a proposal that no longer exists by
-        // COMMIT time. Keep the lexicographically lowest direct-child proposal as
-        // the deterministic contender. Other coordinators can help that contender
-        // commit and then retry their own mutation on top of it.
+        // Racing coordinators: if each overwrote the PREPARE, each could collect
+        // acks for a proposal gone by COMMIT time. The lowest-hash direct child
+        // wins; others help it commit, then retry on top.
         const bool competing_direct_child = cur_.generation == generation + 1 &&
                                             cur_.previous == hash && cur_.hash != committed_.hash;
         if (competing_direct_child && pending_recovered_) {
-            // PREPARE state recovered after process restart has no live coordinator
-            // and therefore no authority.  A later proposal based on the durable
-            // committed head may replace it regardless of contender hash.
+            // A PREPARE recovered at restart has no coordinator; any proposal replaces it.
         } else if (competing_direct_child) {
             if (cur_.hash == next.hash) {
                 if (out)
@@ -4618,8 +4371,7 @@ bool MetadataReplica::cas(uint64_t generation, const Hash256& hash,
             return false;
         }
 
-        // The new proposal wins deterministic contention. Journal the rollback
-        // first so crash replay sees the same PREPARE replacement sequence.
+        // Journal the rollback first so replay sees the same replacement.
         append_journal(JOURNAL_SEED_FULL, committed_, committed_.payload);
         cur_ = committed_;
         pending_history_.reset();
@@ -4667,9 +4419,7 @@ bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
         const bool competing_direct_child = cur_.generation == generation + 1 &&
                                             cur_.previous == hash && cur_.hash != committed_.hash;
         if (competing_direct_child && pending_recovered_) {
-            // PREPARE state recovered after process restart has no live coordinator
-            // and therefore no authority.  A later proposal based on the durable
-            // committed head may replace it regardless of contender hash.
+            // A PREPARE recovered at restart has no coordinator; any proposal replaces it.
         } else if (competing_direct_child) {
             if (cur_.hash == next.hash) {
                 if (out)
@@ -4777,35 +4527,13 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     load_heads();
     load_checkpoint_proof();
 
-    // The new record has to be an accepted head, or the node comes back with a
-    // committed record nobody has accepted and refuses to serve: "no accepted
-    // metadata heads available".
-    //
-    // The certificate carries the write floor the record names, witnessed by
-    // the durable participant roster. Both halves are forced, and the second
-    // one is the most uncomfortable line in this change, so it is worth being
-    // exact about what it claims.
-    //
-    // The floor is forced because a protocol-20 record may not be accepted
-    // under legacy authority: a required=0 certificate over a record naming a
-    // floor is refused by acceptance_matches_record_policy_locked, and rightly
-    // -- that would be a branch quietly discarding the floor it inherited.
-    //
-    // The witnesses are forced because encode_metadata_acceptance refuses a
-    // certificate claiming a floor it cannot name enough replicas for. So this
-    // cannot say "valid under this floor, acknowledged by nobody", which is
-    // the literal truth at the moment it is written.
-    //
-    // What it says instead is the operator's assertion, named node by node:
-    // these are the nodes being re-rooted onto this record. That assertion is
-    // the whole premise of the migration -- the record is a pure function of
-    // the converged head, every node computes it independently, and
-    // `--expect-hash` is how a second node proves it computed the same one. If
-    // the operator migrates one node and not the rest, this certificate is
-    // wrong, which is why the witnesses are typed rather than inferred.
-    //
-    // Fewer witnesses than the floor is refused outright: that record could
-    // never be accepted by the cluster it describes.
+    // The record must be an accepted head or the node refuses to serve. The
+    // certificate carries the record's write floor (a required=0 certificate
+    // would be refused by acceptance_matches_record_policy_locked), witnessed
+    // by the operator-named nodes being re-rooted onto this record: the record
+    // is a pure function of the converged head, and `--expect-hash` proves
+    // each node computed the same one. Fewer witnesses than the floor is
+    // refused: the cluster could never accept that record.
     accepted_heads_.clear();
     const auto migrated_snapshot = decode_snapshot(record.payload);
     MetadataAcceptance accepted;
@@ -4832,8 +4560,7 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     persist_heads_locked();
 
     refresh_materialized_head_locked();
-    // Not recovery: the operator has re-rooted this node deliberately and the
-    // record is authoritative from here.
+    // A deliberate re-root, not recovery: the record is authoritative.
     recovery_required_ = false;
     pending_recovered_ = false;
 
@@ -4882,9 +4609,8 @@ bool MetadataReplica::seed(const MetadataRecord& record) {
     if (!fresh && !direct_parent && !known_descendant && !parent_descends_from_committed)
         return false;
 
-    // This is a prepare, not a commit. Replacing an uncommitted local proposal
-    // is safe; the previously committed branch remains durable in history and a
-    // reconciliation record explicitly names that branch as a parent.
+    // A prepare, not a commit: the committed branch stays in history and
+    // reconciliation names it as a parent.
     append_journal(JOURNAL_SEED_FULL, record, record.payload);
     cur_ = record;
     pending_history_ = history_for_current();
@@ -4979,11 +4705,8 @@ bool MetadataReplica::compact_history_if_safe(size_t record_threshold, uint64_t 
         !accepted_heads_.contains(committed_.hash))
         return false;
 
-    // Re-root the sole converged accepted head as a full entry. Its predecessor
-    // and merge-parent hashes remain part of the immutable record/snapshot, but
-    // previous_known=false establishes a deliberate local ancestry floor: an old
-    // branch is no longer reconstructable from this node after the cluster has
-    // proven that every known participant has converged beyond it.
+    // Re-root the sole accepted head as a full entry; previous_known=false sets
+    // the local ancestry floor once every participant has converged past it.
     MetadataHistoryEntry root;
     root.generation = committed_.generation;
     root.previous = committed_.previous;
@@ -5076,15 +4799,10 @@ std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot& snapshot)
 }
 
 Hash256 metadata_namespace_signature(const MetadataSnapshot& snapshot) {
-    // This signature is consulted by catalogue/maintenance paths. Stream the
-    // canonical representation into SHA-256 so a namespace containing millions
-    // of extents never requires a second namespace-sized byte buffer.
+    // Streamed into SHA-256: no namespace-sized buffer.
     Sha256Hasher hash;
-    // A tree already has an identity, and it is a better one: the root is a
-    // hash over exactly this content, computed once when the namespace was
-    // written rather than again on every comparison. Hashing the empty entry
-    // map instead would return the same signature for every tree-backed
-    // namespace in existence, which reads as "the namespace never changes".
+    // A tree's root already hashes this content; the empty entry map would
+    // give every tree-backed namespace the same signature.
     if (snapshot.namespace_root) {
         hash.update(std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>("macha/namespace-signature/tree/v1"), 33));

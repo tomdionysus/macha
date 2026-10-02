@@ -45,9 +45,8 @@ namespace lt = libtorrent;
 
 namespace {
 
-// libtorrent 2.1 turned status_t from an enum into flag bits in
-// lt::disk_status, with success as the empty set. The nodes run 2.0.11 and
-// the developer's machine 2.1, so name the three outcomes once.
+// status_t is an enum in libtorrent 2.0 and flag bits in 2.1 (success the
+// empty set): the three outcomes, named once for both.
 #if LIBTORRENT_VERSION_NUM >= 20100
 const lt::status_t status_ok{};
 const lt::status_t status_fatal = lt::disk_status::fatal_disk_error;
@@ -67,16 +66,14 @@ lt::disk_buffer_holder hold(lt::buffer_allocator_interface& allocator, char* buf
 #endif
 }
 
-// libtorrent's error_code is boost::system::error_code, which Boost 1.83 (the
-// nodes') cannot construct from a std::error_code. Every error here is an
-// errno, so carry the number.
+// Boost 1.83's error_code cannot be built from a std::error_code; every error
+// here is an errno, so carry the number.
 lt::error_code errno_code(int value) {
     return lt::error_code(value, boost::system::generic_category());
 }
 lt::error_code errno_code(const std::error_code& ec) { return errno_code(ec.value()); }
 
-// A cached descriptor per file, bounded: a discography is thousands of files
-// and one torrent must not hold a descriptor for each.
+// A bounded descriptor cache: a torrent may have thousands of files.
 constexpr size_t max_open_files_per_torrent = 64;
 
 using Clock = std::chrono::steady_clock;
@@ -86,9 +83,8 @@ struct OpenFile {
     bool writable{};
 };
 
-// One file-relative extent of the payload, planned when the torrent is added.
-// Everything but the two flags is immutable once planned; the flags are
-// guarded by Storage::publish_mutex.
+// One file-relative extent of the payload, planned at add. Immutable but for
+// the two flags, guarded by Storage::publish_mutex.
 struct PlannedExtent {
     lt::file_index_t file{};
     std::string relative_path;
@@ -102,22 +98,17 @@ struct PlannedExtent {
 };
 
 struct Storage {
-    // libtorrent hands this over by reference and keeps it alive only while
-    // the torrent lives. `owner` is that torrent, held for as long as this
-    // storage exists, exactly as libtorrent's own backend does
-    // (mmap_storage::set_owner). Without it a publication still queued when
-    // the torrent went -- removed at download finish, or freed at session
-    // shutdown -- read a freed file_storage: gbni-1 aborted on every stop and
-    // crashed through the day on 2026-09-24 (core dumps, publisher() ->
-    // file_storage::file_path -> operator new throwing on a garbage length).
+    // A reference libtorrent keeps alive only while the torrent lives. `owner`
+    // holds the torrent for this storage's lifetime, as mmap_storage::set_owner
+    // does, so a publication queued past the torrent's removal or session
+    // shutdown never reads a freed file_storage.
     const lt::file_storage& files;
     std::shared_ptr<void> owner;
     std::string save_path;
-    // Set by remove_torrent. Publications still queued for a removed torrent
-    // are dropped, not retried: nothing will adopt them, and retrying would
-    // keep the torrent alive for ever.
+    // Set by remove_torrent: queued publications are dropped, not retried, as
+    // nothing will adopt them and retries would keep the torrent alive.
     std::atomic_bool removed{false};
-    // Stage 2 (empty when publication is off).
+    // Empty when publication is off.
     std::vector<PlannedExtent> extents;
     std::vector<std::vector<size_t>> piece_extents;
     std::mutex publish_mutex;
@@ -255,8 +246,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             boost::asio::post(ios_, [handler, error] { handler(error); });
             write_drained(size);
         });
-        // True tells libtorrent to stop reading from peers until on_disk():
-        // the network waits for the disk, and the disk waits for admission.
+        // True stops libtorrent reading from peers until on_disk(): the
+        // network waits for the disk, the disk for admission.
         return exceeded;
     }
 
@@ -329,8 +320,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     void async_move_storage(lt::storage_index_t, std::string path, lt::move_flags_t,
                             std::function<void(lt::status_t, const std::string&,
                                                const lt::storage_error&)> handler) override {
-        // macha never moves a torrent: its save path is the job's staging
-        // directory for the job's whole life.
+        // Never moved: the save path is the job's staging directory for life.
         const lt::storage_error error(errno_code(EOPNOTSUPP), lt::operation_t::file_rename);
         boost::asio::post(ios_, [handler = std::move(handler), path = std::move(path), error] {
             handler(status_fatal, path, error);
@@ -350,8 +340,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                            std::function<void(lt::status_t, const lt::storage_error&)> handler)
         override {
         auto storage = at(index);
-        // Copy what is needed now: the resume data is only valid during this
-        // call.
+        // The resume data is valid only during this call.
         std::shared_ptr<lt::typed_bitfield<lt::piece_index_t>> have;
         if (resume && !resume->have_pieces.empty() && !resume->have_pieces.none_set())
             have = std::make_shared<lt::typed_bitfield<lt::piece_index_t>>(resume->have_pieces);
@@ -395,8 +384,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         std::function<void(const lt::storage_error&,
                            lt::aux::vector<lt::download_priority_t, lt::file_index_t>)> handler)
         override {
-        // macha downloads every file of a torrent; priorities are accepted and
-        // echoed, and every piece is written where it belongs.
+        // Every file is downloaded; priorities are only echoed.
         boost::asio::post(ios_, [handler = std::move(handler),
                                  priorities = std::move(priorities)]() mutable {
             handler(lt::storage_error(), std::move(priorities));
@@ -435,8 +423,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     std::atomic<uint64_t> queued_write_bytes_{0};
     std::atomic<uint64_t> queue_limit_{0};
 
-    // Stage 2: publication runs on its own thread, off the I/O strand, so a
-    // slow network put never holds up a torrent's disk writes.
+    // Publication has its own thread, so a slow put never holds up disk writes.
     std::mutex by_path_mutex_;
     std::unordered_map<std::string, std::weak_ptr<Storage>> by_path_;
     struct PublishJob {
@@ -491,8 +478,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         }
     }
 
-    // A piece libtorrent has verified. Every extent whose covering pieces
-    // have now all verified is queued for publication, once.
+    // Queues, once, every extent whose covering pieces have now all verified.
     void piece_verified(const std::string& save_path, int piece) {
         std::shared_ptr<Storage> storage;
         {
@@ -524,8 +510,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         publish_cv_.notify_one();
     }
 
-    // How far a torrent's publication has got; nothing for a torrent this
-    // backend does not hold.
+    // A torrent's publication progress; empty when not held here.
     std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
         std::shared_ptr<Storage> storage;
         {
@@ -556,8 +541,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             publish_queue_.erase(due);
             if (job.storage->removed.load()) continue;
             lock.unlock();
-            // Nothing a publication does may end the process: an exception
-            // here used to escape the thread and call std::terminate.
+            // No exception may escape the thread and terminate the process.
             bool published = false;
             try {
                 published = publish(job);
@@ -592,8 +576,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         } // the read's credit is released before the put, which admits itself
         const auto id = hooks_.publish(bytes, aborting_);
         if (!id) {
-            // Shutting down: the write was cancelled, not failed. The extent is
-            // not journalled, so the torrent publishes it again on resume.
+            // Cancelled at shutdown, not failed: unjournalled, it is published
+            // again on resume.
             if (aborting_.load()) return false;
             Log::warn("torrent extent publication failed path=" + extent.relative_path + " offset=" +
                       std::to_string(extent.offset) + "; retrying");
@@ -616,13 +600,11 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         return true;
     }
 
-    // The one place an extent is read back for publication: stage 2 reads it
-    // from the payload file, which is the assembly area. A staging format of
-    // macha's own would replace this function and nothing else.
+    // The only read-back of an extent for publication, from the payload file.
     bool read_extent(Storage& storage, const PlannedExtent& extent, std::vector<uint8_t>& out,
                      lt::storage_error& error) {
-        // The path planned when the torrent was added, never libtorrent's
-        // file_storage: the publisher must not depend on the torrent's memory.
+        // The planned path, not libtorrent's file_storage: the publisher must
+        // not depend on the torrent's memory.
         const auto path = (std::filesystem::path(storage.save_path) / extent.relative_path).string();
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
@@ -666,10 +648,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         return hooks_.admit(bytes, aborting_);
     }
 
-    // Jobs for one storage run strictly in the order libtorrent issued them,
-    // one at a time. libtorrent may ask for a piece's hash before the writes
-    // of its blocks have completed; running them in order is what makes the
-    // hash read what the writes wrote.
+    // One storage's jobs run one at a time in issue order: a hash may be
+    // requested before its blocks' writes complete, and must read them.
     void enqueue(const std::shared_ptr<Storage>& storage, std::function<void()> job) {
         {
             std::lock_guard lock(mutex_);
@@ -704,9 +684,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         }
     }
 
-    // Queued jobs still run after an abort; each one finds aborting_ set,
-    // skips admission and its I/O, and answers with operation_aborted.
-    // Nothing is marked downloaded unless it hashed, so nothing is lost.
+    // After an abort queued jobs still run, skipping admission and I/O, and
+    // answer operation_aborted; nothing unhashed is marked downloaded.
     void shut_down() {
         aborting_.store(true);
         if (publishing()) {
@@ -776,9 +755,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         return fd;
     }
 
-    // Returns bytes read. Like libtorrent's posix backend: a missing file is
-    // an open error, a read that returns nothing is file_too_short, and a pad
-    // file reads as zeroes.
+    // Returns bytes read. As libtorrent's posix backend: a missing file is an
+    // open error, an empty read file_too_short, a pad file zeroes.
     int read(Storage& storage, lt::piece_index_t piece, int start, char* out, int length,
              lt::storage_error& error) {
         int total = 0;
@@ -845,9 +823,8 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         }
     }
 
-    // With resume data: every piece it claims must still be backed by files
-    // long enough to hold it, or the torrent is re-checked in full. Without
-    // resume data, any existing payload file means a full check.
+    // With resume data, every claimed piece must still fit in its files, or
+    // the torrent is fully re-checked; without, any existing payload file is.
     lt::status_t check(Storage& storage, const lt::typed_bitfield<lt::piece_index_t>* have,
                        lt::storage_error& error) {
         std::error_code ec;
@@ -890,14 +867,12 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                 error = lt::storage_error(errno_code(ec), file, lt::operation_t::file_remove);
             parents.push_back(path.parent_path());
         }
-        // The extent journal describes this payload; without it the record
-        // is stale.
+        // The extent journal describes this payload and goes with it.
         {
             std::error_code ec;
             std::filesystem::remove(TorrentExtentJournal::path_for(storage.save_path), ec);
         }
-        // Prune directories the payload created, deepest first, stopping at
-        // the save path; a directory still holding anything stays.
+        // Prune empty payload directories, deepest first, up to the save path.
         std::sort(parents.begin(), parents.end(), [](const auto& a, const auto& b) {
             return a.native().size() > b.native().size();
         });

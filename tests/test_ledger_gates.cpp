@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The ledger's horizons and destructive gates (the object ledger spec, B3).
-// Primitives: each gate is tested over every combination of the facts it
-// reads against the condition, reason and trace the maintenance pass wrote
-// before the gates existed (src/service/maintenance.cpp at 3c6c1fd), copied
-// here as the reference.
+// The ledger's horizons and destructive gates. Each gate is tested over every
+// combination of the facts it reads against a reference model of the
+// maintenance pass's condition, reason and trace.
 #include "contract/gates.hpp"
 #include "contract/horizon.hpp"
 #include "test_framework.hpp"
@@ -52,7 +50,7 @@ MACHA_FAST_TEST("ledger", test_referenced_sets_are_sorted_unique_and_per_class) 
 
 MACHA_FAST_TEST("ledger", test_inventory_splits_tombstones_by_whether_data_still_refers_to_them) {
     // A tombstone whose id is live data again is stale; one referenced only
-    // as control is not (the pass has always tested the data set alone).
+    // as control is not.
     const InventoryHorizon inventory(
         7, false, {id(2), id(4)}, {id(6)},
         {garbage(4, 10), garbage(1, 0), garbage(6, 30), garbage(2, 40), garbage(1, 50)});
@@ -81,8 +79,8 @@ MACHA_FAST_TEST("ledger", test_release_horizon_carries_its_head_and_clock) {
     CHECK(release.referenced(RetentionClass::control, id(3)));
 }
 
-// The pass's own state before the gates: an inventory or none, its
-// generation, its catalogue completeness (true before the first inventory).
+// The reference model's state: an inventory or none, its generation, its
+// catalogue completeness (true before the first inventory).
 struct Reference {
     bool garbage_due, gc_due, busy, waiting, rebuilt, reachable, metadata_stable, release_view,
         baseline;

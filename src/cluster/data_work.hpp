@@ -18,18 +18,13 @@
 
 namespace macha {
 
-// Immutable provenance and bounds for DATA-plane work: the DATA
-// specialisation of WorkContext. CONTROL deliberately remains outside this
-// pool on its independently reserved transport/executors.
+// Immutable provenance and bounds for DATA-plane work. CONTROL stays outside
+// this pool on its own reserved transport and executors.
 class DataWorkContext : public WorkContext {
     uint64_t quantum_bytes_{};
-    // A no-progress budget, distinct from the absolute deadline above. Work
-    // that legitimately takes a long time must not be cancelled for taking it,
-    // but work that is not moving at all must eventually fail rather than wait
-    // forever: on 2026-09-09 all eight publication workers on es-1 sat in an
-    // unbounded acquire holding 492 MB between them, so nothing failed,
-    // nothing retried and nothing parked. The counter is shared across the
-    // workers of one pipeline, so progress anywhere re-arms the window.
+    // No-progress budget, distinct from the absolute deadline: slow work is
+    // not cancelled, but work not moving at all fails. The counter is shared
+    // by a pipeline's workers, so progress anywhere re-arms the window.
     const std::atomic_uint64_t* progress_{};
     std::chrono::milliseconds no_progress_budget_{};
 
@@ -71,40 +66,25 @@ struct DataResourceStats {
     uint64_t background_limit{};
     uint64_t background_active{};
     uint64_t peak_background_active{};
-    // Device pressure, so an operator can see the reason a loader slowed down
-    // rather than inferring it. Without this the mechanism is invisible and
-    // indistinguishable from the node being mysteriously slow.
+    // Device pressure, so an operator can see why a loader slowed.
     bool device_pressured{};
     uint64_t device_service_us{};
     uint64_t device_worst_us{};
-    // The signal pressure is decided on: actual/expected as a percentage,
-    // where 100 is a device performing exactly as expected for the work it
-    // was given. Reported because a mean latency alone cannot be judged
-    // without knowing the size of the operations behind it.
+    // The pressure signal: actual/expected service time as a percentage
+    // (100 = as expected for the operations' size).
     uint64_t device_slowdown_percent{};
     uint64_t device_pressure_onsets{};
-    // How much work this mechanism actually turned away. Onsets say the device
-    // went under; this says what it cost. Without both, an operator looking at
-    // a slow node cannot tell a loader being deliberately held back from a
-    // node that is simply unwell, which is exactly the question that could not
-    // be answered during the 2026-09-22 incident. The counter existed as a
-    // private member from the day the gate shipped and was never incremented
-    // and never reported.
+    // Work the pressure gate turned away; with the onsets, tells a
+    // deliberately throttled loader from an unwell node.
     uint64_t pressure_refusals{};
 };
 
 // Event-driven byte admission at blocking DATA resource boundaries. Lower
-// classes may borrow all non-reserved capacity, but can never consume the
-// viewer headroom. A waiting viewer also closes lower-class admission until it
-// has acquired its bounded credit. CONTROL does not enter this object.
-//
-// Bytes are not the only contended resource, and on 2026-09-19 they were not
-// the one that broke: every byte budget here was satisfied while a viewer's
-// read sat behind a 17-second extent write on the same spindle. So admission
-// also consults measured device service time, and refuses loader and
-// speculative work while the disk it would use is slow. A viewer is never
-// refused for pressure -- if the device is slow, the person waiting on it gets
-// all of it.
+// classes may borrow all capacity except the viewer reserve, and a waiting
+// viewer closes lower-class admission until it is served. Admission also
+// consults measured device service time and refuses loader and speculative
+// work while the disk is slow; a viewer is never refused for pressure.
+// CONTROL does not enter this object.
 class DataResourceArbiter {
   public:
     using Clock = DataWorkContext::Clock;
@@ -147,36 +127,25 @@ class DataResourceArbiter {
   private:
     uint64_t capacity_bytes_{};
     uint64_t viewer_reserve_bytes_{};
-    // Measured device service time, or null where there is no device to
-    // measure (tests, and any arbiter not fronting a store).
+    // Null where no device is measured (tests).
     const DiskServiceMonitor* service_monitor_{};
     // Law 3: the loader is bounded, never stopped. Under pressure this many
-    // background leases are still admitted, so publication and repair make
-    // progress at a trickle instead of deadlocking behind a disk that is busy
-    // because of them.
+    // background leases are still admitted, so publication and repair keep
+    // trickling rather than deadlocking behind a disk they are loading.
     uint64_t min_background_under_pressure_{1};
     uint64_t pressure_refusals_{};
-    // Law 3 asks whether a viewer is *present*, not whether one happens to be
-    // holding byte credit at this instant. Playback is bursty: between two
-    // extents a viewer holds nothing, so deciding on credit alone readmitted
-    // the loader at full concurrency in every gap and a viewer's next read
-    // queued behind the extent write that gap had just let in. The rest of the
-    // system already answers this question with an activity clock and
-    // maintenance.foreground_quiet; this is how the arbiter reads the same
-    // answer without taking a dependency on the node. Two relaxed atomic loads
-    // and a clock read, called under the arbiter mutex and never re-entering
-    // it. Null where there is no node (tests), which leaves the credit test
-    // below as the whole answer, exactly as it was.
+    // Law 3 asks whether a viewer is present, not whether one holds credit
+    // now: playback is bursty and holds nothing between extents. Reads the
+    // node's activity clock (maintenance.foreground_quiet); called under the
+    // arbiter mutex and must not re-enter it. Null (tests): credit alone decides.
     std::function<bool()> viewer_recently_active_;
-    // Background effort ceiling: how many loader/speculative leases may be
-    // active at once. Each lease is one extent's worth of hashing,
-    // encryption and transfer, so this bounds the CPU that publication and
-    // repair can take between them; viewers are never counted. 0 = no limit.
+    // Maximum concurrent loader/speculative leases (one extent's hashing,
+    // encryption and transfer each), bounding background CPU. Viewers are not
+    // counted. 0 = no limit.
     uint64_t background_concurrency_{};
-    // A wait with no caller deadline fails after this long without a single
-    // release anywhere in the arbiter. Zero waits for ever, which is what this
-    // did unconditionally before -- and which turned a caller holding credit
-    // while acquiring more into a silent permanent hang.
+    // A wait with no caller deadline fails after this long with no release
+    // anywhere in the arbiter, so a caller holding credit while acquiring
+    // more cannot hang silently. Zero waits for ever.
     std::chrono::milliseconds no_progress_deadline_{};
     uint64_t releases_{};
     uint64_t no_progress_failures_{};
@@ -206,10 +175,8 @@ class DataResourceArbiter {
         return frame_type == FrameType::loader;
     }
     uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
-    // `refused_for_pressure`, when given, says whether a false answer was this
-    // mechanism's doing rather than an ordinary byte or concurrency bound. The
-    // callers count it; counting here would re-count every condition-variable
-    // wakeup of a single waiter and produce a number that means nothing.
+    // `refused_for_pressure` reports whether a false answer was the pressure
+    // gate's doing. Callers count it once per waiter, not per wakeup.
     bool available(FrameType frame_type, uint64_t bytes,
                    bool* refused_for_pressure = nullptr) const;
     void release(FrameType frame_type, uint64_t bytes);
@@ -257,19 +224,10 @@ inline bool DataResourceArbiter::available(FrameType frame_type, uint64_t bytes,
         return true;
     if (waiting_viewers_)
         return false;
-    // Law 3: the loader yields only when it would otherwise make a viewer
-    // wait. A slow device with nobody reading from it is a device doing its
-    // job, and holding an operator's import back for it is exactly the
-    // violation the law names -- it cost a 36 GB import an afternoon at 2 MB/s
-    // on 2026-09-22 while nothing was being watched.
-    //
-    // Speculative work has no such protection: it sits below the loader, and
-    // pressure alone is reason enough for it to stand aside.
-    //
-    // Ordered so the viewer-presence question is only asked when the answer can
-    // change anything. The monitor's own cost discipline applies here too: this
-    // runs on the admission path of every extent in the system, and a device
-    // that is coping must not pay a clock read to be told so.
+    // Law 3: the loader yields to pressure only when a viewer is present; a
+    // slow device nobody is reading from must not hold an import back.
+    // Speculative work yields to pressure alone. Viewer presence is checked
+    // only under pressure, keeping the uncontended admission path cheap.
     if (service_monitor_ && service_monitor_->pressured() &&
         lower_active_ >= min_background_under_pressure_) {
         const bool viewer_present = waiting_viewers_ > 0 || used_bytes_ > lower_used_bytes_ ||
@@ -301,8 +259,7 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
     const auto class_capacity = viewer(frame_type)
                                     ? capacity_bytes_
                                     : capacity_bytes_ - viewer_reserve_bytes_;
-    // An operation larger than its entire class budget can never be admitted.
-    // Fail it immediately instead of creating an immortal event-driven waiter.
+    // Larger than the whole class budget: never admissible, fail now.
     if (bytes > class_capacity)
         return {};
     std::unique_lock lock(mutex_);
@@ -318,9 +275,7 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
     while (!wait_predicate()) {
         if (!counted_wait) {
             counted_wait = true;
-            // Once per waiter, not once per wakeup: this counts units of work
-            // the gate turned away, which is what an operator needs beside the
-            // onset count to tell a deliberate throttle from an unwell node.
+            // Once per waiter, not per wakeup: counts work turned away.
             if (refused_for_pressure)
                 ++pressure_refusals_;
             ++waiters;
@@ -336,11 +291,8 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
         } else if (no_progress_deadline_ == std::chrono::milliseconds{}) {
             cv_.wait(lock, wait_predicate);
         } else {
-            // Wait in no-progress windows rather than for ever. Any release
-            // anywhere resets the window, so genuine contention -- where work
-            // is flowing and this waiter simply has not reached the front --
-            // waits as long as it takes. Only a wholly stalled arbiter, where
-            // nothing was released for the entire window, gives up.
+            // Wait in no-progress windows: any release anywhere re-arms the
+            // window, so only a wholly stalled arbiter gives up.
             const auto seen = releases_;
             if (!cv_.wait_for(lock, no_progress_deadline_,
                               [&] { return wait_predicate() || releases_ != seen; })) {

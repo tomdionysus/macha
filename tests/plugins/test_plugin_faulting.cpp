@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A subsystem whose start() always throws, used only by
-// foundations/test_subsystem_supervisor_disables_a_repeatedly_faulting_plugin
-// to prove the exact failure mode that crash-looped corvus-es-1 (a
-// subsystem's construction/start throwing) degrades to a per-subsystem
-// faulted/disabled state instead of taking the whole process down.
+// A plugin whose start() always throws: the supervisor must mark it faulted
+// and disabled without taking the process down.
 #include "subsystem/subsystem.hpp"
 #include "subsystem/subsystem_abi.hpp"
 #include "macha_version.hpp"

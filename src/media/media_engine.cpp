@@ -159,9 +159,8 @@ struct InputIoState {
     uint64_t offset{};
     std::atomic_bool* cancelled{};
     Clock::time_point deadline{};
-    // libav flattens every read failure into AVERROR(EIO), which cannot tell
-    // "this node cannot reach the extents" from "these bytes are not media".
-    // Keep the first underlying failure so the caller can report which it was.
+    // libav flattens read failures into EIO; keep the first underlying failure so
+    // the caller can tell unreachable extents from bytes that are not media.
     std::string read_error;
     MediaStartProgress* progress{};
 };
@@ -315,8 +314,7 @@ class InputContext {
                 if (timed_out())
                     throw MediaError(MediaFailure::timed_out,
                                      "media probe timed out while opening input");
-                // A read that failed underneath is the truth; libav's EIO is
-                // only how that failure reached it.
+                // The underlying read failure is the truth; libav's EIO only carried it.
                 if (!state_.read_error.empty())
                     throw MediaError(MediaFailure::unreadable,
                                      "read media: " + state_.read_error);
@@ -338,7 +336,7 @@ class InputContext {
     InputContext& operator=(const InputContext&) = delete;
 
     AVFormatContext* get() const { return format_; }
-    // Empty unless a read underneath libav failed; see InputIoState.
+    // Empty unless a read underneath libav failed.
     const std::string& read_error() const noexcept { return state_.read_error; }
     bool timed_out() const {
         return state_.deadline != Clock::time_point{} && Clock::now() >= state_.deadline;
@@ -371,11 +369,9 @@ int choose_width(const AVCodecParameters* input, int target_height) {
     return std::max(2, scaled & ~1);
 }
 
-// A transcode generation answers its request only once its first fragment
-// is encoded (wait_for_initial_fragment). The first fragment is short so
-// that wait is short: 2 s of encoding instead of 4 s, on every start and
-// every seek (the segmenter forces a keyframe at each planned cut, so the
-// encoder's 4 s GOP does not constrain it). Later fragments keep the target.
+// A transcode generation answers only once its first fragment is encoded, so
+// that fragment is short. The segmenter forces a keyframe at each planned cut,
+// so the encoder's GOP does not constrain it. Later fragments keep the target.
 constexpr double kStartupFragmentSeconds = 2.0;
 
 std::vector<double> fixed_vod_durations(double duration_seconds, double seek_seconds,
@@ -413,13 +409,10 @@ void materialise_deferred_seek_index(AVFormatContext* format, int video_stream,
                      AVRational{1, 1000}, AV_TIME_BASE_Q);
     const int64_t requested_ts = av_rescale_q(requested_us, AV_TIME_BASE_Q, stream->time_base);
 
-    // FFmpeg's Matroska demuxer deliberately defers Cues parsing until a seek
-    // is requested. avformat_find_stream_info() may therefore leave only the
-    // handful of keyframes encountered during probing in AVStream's index.
-    // Triggering a seek here materialises Cues into the index before the VOD
-    // planner decides whether stream-copy segmentation is safe. This context
-    // is planning-only, so changing its demux position has no playback side
-    // effects.
+    // FFmpeg's Matroska demuxer defers Cues parsing until a seek, so after probing
+    // the index may hold only a few keyframes. Seeking here loads the Cues before
+    // the planner decides whether stream copy is safe; this context is
+    // planning-only, so moving its demux position is harmless.
     const int rc = avformat_seek_file(format, video_stream, std::numeric_limits<int64_t>::min(),
                                       requested_ts, std::numeric_limits<int64_t>::max(),
                                       AVSEEK_FLAG_BACKWARD);
@@ -477,9 +470,7 @@ class FragmentWriter {
     std::deque<double> durations_;
     double fallback_duration_{};
     size_t published_{};
-    // Planned boundaries that produced no fragment. Their media did not
-    // disappear: it is still in the next fragment, so the next published
-    // segment is that long and must say so.
+    // Planned boundaries that produced no fragment; their media is in the next one.
     size_t carried_boundaries_{};
     bool init_published_{};
     // MPEG-TS: no box parsing and no init segment; bytes accumulate into the
@@ -490,10 +481,8 @@ class FragmentWriter {
         target.insert(target.end(), data, data + size);
     }
 
-    // The length to publish for the fragment about to go out: its own planned
-    // segment, plus every planned boundary that produced no fragment of its
-    // own. A playlist that says 10 s for 20 s of media puts every later
-    // segment in the wrong place on the player's timeline.
+    // Duration of the outgoing fragment: its own planned segment plus every
+    // carried boundary. Understating it misplaces every later segment.
     double publish_duration() {
         double total = 0.0;
         for (size_t i = 0; i <= carried_boundaries_; ++i) {
@@ -573,8 +562,6 @@ class FragmentWriter {
 
     bool raw_fragments() const noexcept { return raw_fragments_; }
     size_t published() const noexcept { return published_; }
-    // A planned boundary passed without producing a fragment. Its media joins
-    // the next one, so its length must join it too.
     void carry_boundary() noexcept { ++carried_boundaries_; }
 
     int write(const uint8_t* data, int size) {
@@ -587,8 +574,7 @@ class FragmentWriter {
         return size;
     }
 
-    // MPEG-TS fragment boundary: everything the muxer has written since the
-    // previous cut is one self-contained segment.
+    // MPEG-TS: everything written since the previous cut is one segment.
     void cut() {
         if (!raw_fragments_ || fragment_.empty()) return;
         if (!store_->publish_segment(std::move(fragment_), publish_duration()))
@@ -665,9 +651,8 @@ int output_write(void* opaque, const uint8_t* buffer, int size) {
     }
 }
 
-// Close the current fragment before a keyframe: flush the muxer (an fMP4
-// moof/mdat pair, or the buffered TS packets) and, for MPEG-TS, publish the
-// bytes as one segment.
+// Close the current fragment before a keyframe: flush the muxer (fMP4
+// moof/mdat, or buffered TS packets); for MPEG-TS, publish the bytes.
 void cut_fragment(AVFormatContext* output) {
     av_require(av_write_frame(output, nullptr), "flush VOD fragment");
     avio_flush(output->pb);
@@ -714,22 +699,16 @@ struct StreamPipeline {
     int64_t audio_next_pts{};
     bool audio_pts_initialized{};
 
-    // Stream-copy timestamp repair is performed after rescaling into the
-    // muxer's actual output timebase. That is important: rescaling can itself
-    // collapse two distinct source DTS values into one MP4 tick.
+    // Stream-copy timestamps are repaired after rescaling into the muxer's output
+    // timebase, since rescaling can collapse two source DTS values into one tick.
     MediaTimestampRepairState copy_timestamps;
     bool copy_repair_reported{};
-    // Encoders normally produce valid timestamps, but rescaling into the MP4
-    // stream timebase can collapse adjacent DTS values just as stream-copy
-    // rescaling can. Keep the transformed stream equally strict.
+    // Encoded streams need the same repair: rescaling can collapse adjacent DTS.
     MediaTimestampRepairState encoded_timestamps;
     bool encoded_repair_reported{};
     int64_t last_video_encoder_pts{AV_NOPTS_VALUE};
-    // Set once this pipeline has handed the muxer its first packet. A copied
-    // stream reaches the muxer from the demux loop, which can observe that
-    // directly; a transcoded one arrives from an encoder, so it has to record
-    // it here. Both are needed to know when the delayed moov can be written
-    // (see the early flush in run_pipeline).
+    // Set once this pipeline has muxed its first packet (copied or encoded); the
+    // delayed moov is written once every pipeline has (see run_pipeline).
     bool output_started{};
     MediaStartProgress* progress{};
 
@@ -749,9 +728,8 @@ void open_decoder(StreamPipeline& pipe, size_t thread_limit = 1) {
     if (!pipe.decoder) throw std::bad_alloc();
     av_require(avcodec_parameters_to_context(pipe.decoder, pipe.input_stream->codecpar), "copy decoder parameters");
     pipe.decoder->pkt_timebase = pipe.input_stream->time_base;
-    // Never leave decoder parallelism at libav's codec-dependent automatic
-    // setting. This is viewer work, so use more than one thread by default,
-    // while preserving a hard per-pipeline bound controlled by configuration.
+    // Viewer work: never libav's automatic thread count; more than one thread by
+    // default, bounded per pipeline by configuration.
     pipe.decoder->thread_count = static_cast<int>(thread_limit);
     av_require(avcodec_open2(pipe.decoder, codec, nullptr), "open decoder");
     if (pipe.decoder->thread_count > static_cast<int>(thread_limit))
@@ -792,22 +770,16 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
         enc->rc_buffer_size = std::min<int64_t>(std::numeric_limits<int>::max(), enc->bit_rate * 2);
     }
     if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    // Frame threading across the node's cores. Until 0.32.11 thread_count
-    // was never set and x264 ran `tune=zerolatency`, which turns frame
-    // threading into sliced threading (x264's own note: a large throughput
-    // loss) to save a few frames of latency the viewer never sees behind a
-    // 4 s fragment: full-resolution CRF 20 ran at about real time on the
-    // 4-core nodes, so every representation change cost 5-13 s and a
-    // mid-file seek could not catch up (2026-09-07).
+    // Frame threading across the node's cores. No tune=zerolatency: it switches
+    // x264 to sliced threading, a large throughput loss for latency hidden behind
+    // a fragment anyway.
     const auto hardware_threads = std::max(1U, std::thread::hardware_concurrency());
     enc->thread_count = static_cast<int>(
         encoder_threads ? std::min<size_t>(encoder_threads, 64) : hardware_threads);
     enc->thread_type = FF_THREAD_FRAME;
     if (enc->priv_data) {
-        // This encoder feeds an interactive fragmented stream, not an offline
-        // file: keep the look-ahead short so the first fragment is not held
-        // back for compression efficiency, and no B-frames (max_b_frames=0
-        // above) so decode order is presentation order.
+        // Interactive fragmented stream: short look-ahead so the first fragment is not
+        // held back, and no B-frames so decode order is presentation order.
         if (std::string_view(codec->name) == "libx264") {
             av_require(av_opt_set(enc->priv_data, "preset", "veryfast", 0),
                        "set x264 realtime preset");
@@ -831,16 +803,13 @@ void setup_video_transcode(StreamPipeline& pipe, AVFormatContext* input, AVForma
     pipe.output_stream->sample_aspect_ratio = enc->sample_aspect_ratio;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export video encoder parameters");
     pipe.output_stream->codecpar->codec_tag = 0;
-    // The decoded pixel format is not guaranteed to be known until the first
-    // frame. Create/cache the scaler from actual AVFrame properties later.
+    // The decoded pixel format may be unknown until the first frame; the scaler is
+    // created from actual frame properties.
 }
 
-// The channelConfiguration field of an AAC AudioSpecificConfig: the first
-// five bits are the object type, the next four the sampling frequency index,
-// the next four this. Zero means the layout is carried in a Program Config
-// Element instead, which is the arrangement Chrome refuses. Negative when
-// this output has no global header and the encoder therefore produced no
-// extradata to read.
+// channelConfiguration of an AAC AudioSpecificConfig (bits 9-12, after object
+// type and sampling frequency index). Zero means a Program Config Element,
+// which Chrome refuses. Negative when there is no extradata (no global header).
 int aac_channel_configuration(const AVCodecContext* enc) noexcept {
     if (!enc->extradata || enc->extradata_size < 2) return -1;
     const auto bits = (static_cast<unsigned>(enc->extradata[0]) << 8) |
@@ -856,13 +825,9 @@ void setup_audio_transcode(StreamPipeline& pipe, AVFormatContext* output) {
     const auto bitrate_for = [](int channels) {
         return static_cast<int64_t>(std::clamp(channels, 1, 8)) * 64000;
     };
-    // Keep the source's channel count. AAC carries 5.1 perfectly well, and a
-    // client that asked for a codec change did not ask for a downmix: a 6ch
-    // source arriving as stereo because the container changed is a quality
-    // loss the client never instructed (2026-09-07). Encode into AAC's
-    // standard layout for that many channels, because a non-standard one is
-    // described by a Program Config Element that Chrome will not parse
-    // (2026-09-08); see aac_standard_channel_layout.
+    // Keep the source channel count: a codec change is not a downmix request.
+    // Encode in AAC's standard layout for it, since a non-standard layout needs a
+    // PCE that Chrome will not parse; see aac_standard_channel_layout.
     const auto open_encoder = [&](const char* layout) -> int {
         if (pipe.encoder) avcodec_free_context(&pipe.encoder);
         pipe.encoder = avcodec_alloc_context3(codec);
@@ -875,9 +840,8 @@ void setup_audio_transcode(StreamPipeline& pipe, AVFormatContext* output) {
         enc->bit_rate = bitrate_for(enc->ch_layout.nb_channels);
         if (output->oformat->flags & AVFMT_GLOBALHEADER) enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         if (const int rc = avcodec_open2(enc, codec, nullptr); rc < 0) return rc;
-        // An encoder that opened but described the layout in a Program Config
-        // Element is refused here rather than served to a client that cannot
-        // parse it. Stereo is always a standard configuration.
+        // Refuse an encoder that described the layout in a PCE. Stereo is always
+        // standard.
         if (aac_channel_configuration(enc) == 0) return AVERROR(EINVAL);
         return 0;
     };
@@ -893,9 +857,8 @@ void setup_audio_transcode(StreamPipeline& pipe, AVFormatContext* output) {
     pipe.output_stream->time_base = enc->time_base;
     av_require(avcodec_parameters_from_context(pipe.output_stream->codecpar, enc), "export audio encoder parameters");
     pipe.output_stream->codecpar->codec_tag = 0;
-    // Input sample format/layout may only become authoritative on the first
-    // decoded frame. The resampler is therefore created lazily in
-    // process_audio_frame() from that frame.
+    // Input sample format/layout is authoritative only from the first decoded
+    // frame, so the resampler is created lazily in process_audio_frame().
     pipe.fifo = av_audio_fifo_alloc(enc->sample_fmt, enc->ch_layout.nb_channels,
                                     std::max(1024, enc->frame_size * 2));
     if (!pipe.fifo) throw std::bad_alloc();
@@ -905,9 +868,8 @@ void prepare_copy_packet(StreamPipeline& pipe, AVPacket* packet, int64_t origin)
     if (packet->pts != AV_NOPTS_VALUE) packet->pts -= origin;
     if (packet->dts != AV_NOPTS_VALUE) packet->dts -= origin;
 
-    // The muxer may choose a different stream timebase while writing the
-    // header. Repair only after this rescale so strict DTS monotonicity is
-    // guaranteed in the values av_interleaved_write_frame actually sees.
+    // The muxer may change the stream timebase in write_header; repair after this
+    // rescale so DTS is strictly monotonic as av_interleaved_write_frame sees it.
     av_packet_rescale_ts(packet, pipe.input_stream->time_base,
                          pipe.output_stream->time_base);
 
@@ -951,13 +913,9 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
                   frame->data, frame->linesize);
         frame->pts = source_pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE
                      : av_rescale_q(source_pts, pipe.input_stream->time_base, pipe.encoder->time_base);
-        // best_effort_timestamp is normally monotonic, but malformed files and
-        // timestamp quantisation around seeks can still produce duplicate or
-        // backwards input PTS after rescaling to the encoder timebase. libx264
-        // rejects that assumption loudly and may buffer progress behind it.
-        // Repair before avcodec_send_frame(), rather than only repairing the
-        // encoded packet afterwards, so the encoder itself receives a strict
-        // display-order timeline.
+        // Malformed files and quantisation around seeks can yield duplicate or
+        // backwards PTS in the encoder timebase, which libx264 rejects. Repair before
+        // avcodec_send_frame() so the encoder sees a strict display-order timeline.
         static_assert(AV_NOPTS_VALUE == kNoMediaTimestamp);
         frame->pts = normalize_encoder_pts(pipe.last_video_encoder_pts, frame->pts);
         if (frame->pts != AV_NOPTS_VALUE &&
@@ -975,15 +933,9 @@ void encode_video_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame* 
             auto* writer = static_cast<FragmentWriter*>(output->pb->opaque);
             const auto before = writer ? writer->published() : 0;
             cut_fragment(output);
-            // Exactly the hazard the remux path carries a boundary for
-            // (2026-09-07), in the branch that did not get the fix: the first
-            // flush writes the delayed moov and produces no moof, so this
-            // boundary's media stays buffered and joins the next fragment.
-            // Unsaid, the playlist calls a six-second fragment two seconds
-            // long and every later segment sits four seconds early on the
-            // player's timeline for the rest of the title -- and the plan's
-            // last duration is never consumed, so the session ends reporting
-            // a fragment-count mismatch it did not really have.
+            // The flush that writes the delayed moov produces no moof, so this boundary's
+            // media joins the next fragment; carry its duration or the playlist
+            // misplaces every later segment.
             if (writer && writer->published() == before) writer->carry_boundary();
         }
         av_packet_rescale_ts(encoded, pipe.encoder->time_base, pipe.output_stream->time_base);
@@ -1100,20 +1052,11 @@ void ensure_audio_resampler(StreamPipeline& pipe, const AVFrame* decoded) {
                              pipe.encoder->sample_rate, input_layout.get(), input_format,
                              input_rate, 0, nullptr);
     av_require(rc, "configure audio resampler");
-    // Audio's presentation clock would otherwise be a free-running sample
-    // counter, seeded from the source once (see audio_next_pts below) and
-    // never re-anchored, unlike video which re-anchors to its source PTS
-    // every single frame. Any systematic mismatch between resampled output
-    // sample count and real elapsed source duration -- resampler rounding,
-    // EAC3 frame timing, channel downmix -- would then compound without
-    // bound for the life of the stream. `async=1` enables libswresample's own
-    // built-in correction (the same machinery behind ffmpeg's `-async 1` /
-    // the `aresample` filter's default): fill/trim (inject silence or drop
-    // samples) to track the real PTS fed via swr_next_pts() below. This is
-    // deliberately NOT combined with a `max_soft_comp` stretch/squeeze
-    // (which defaults to 0/disabled and must stay that way) -- a resample-
-    // ratio nudge changes pitch, and any audible pitch shift is a strictly
-    // worse failure mode than a small, silent fill/trim.
+    // Without correction the audio clock is a free-running sample counter seeded
+    // once, so any mismatch between resampled samples and elapsed source time
+    // compounds. async=1 enables libswresample's fill/trim (silence or drop) to
+    // track the PTS fed via swr_next_pts(). Never add max_soft_comp: a ratio
+    // nudge shifts pitch, which is worse than a silent fill/trim.
     av_require(av_opt_set_double(pipe.swr, "async", 1, 0), "enable resampler fill/trim compensation");
     av_require(swr_init(pipe.swr), "open audio resampler");
     pipe.audio_input_rate = input_rate;
@@ -1132,17 +1075,10 @@ void process_audio_frame(StreamPipeline& pipe, AVFormatContext* output, AVFrame*
                                                pipe.encoder->time_base);
         pipe.audio_pts_initialized = true;
     }
-    // Prime libswresample's own fill/trim compensation (enabled via `async=1`
-    // in ensure_audio_resampler) with the real source PTS for this frame, in
-    // the 1/(in_rate*out_rate) unit swr_next_pts requires. That's a unit
-    // fraction (numerator 1) and so cannot be reduced by any GCD of
-    // in_rate/out_rate -- gcd(1, N) is always 1 -- so building it as a single
-    // AVRational{1, in_rate*out_rate} risks overflowing the 32-bit
-    // denominator field for common same-rate audio (e.g. 48kHz -> 48kHz
-    // alone exceeds INT32_MAX). Avoid ever forming that AVRational: rescale
-    // into the safe, small 1/in_rate unit first, then scale up to
-    // 1/(in_rate*out_rate) by an ordinary int64 multiply -- the same pattern
-    // ffmpeg's own af_aresample.c uses.
+    // Feed the source PTS to swr_next_pts in 1/(in_rate*out_rate) units. Forming
+    // that AVRational overflows its 32-bit denominator (48 kHz squared exceeds
+    // INT32_MAX), so rescale to 1/in_rate and multiply by out_rate in int64, as
+    // af_aresample.c does.
     if (source_pts != AV_NOPTS_VALUE) {
         const auto in_rate_samples =
             av_rescale_q(source_pts, pipe.input_stream->time_base, AVRational{1, input_rate});
@@ -1258,11 +1194,9 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
     if (vod_plan.segment_durations.empty())
         throw std::runtime_error("VOD plan contains no media segments");
 
-    // Opening the playback pipeline repeats a small amount of container
-    // inspection because this AVFormatContext owns the decoder/muxer state.
-    // Bound that startup work independently: session creation promises a
-    // finite startup timeout, so stopping a failed generation must not join a
-    // worker that is still blocked in stream discovery.
+    // This context repeats some container inspection because it owns the
+    // decoder/muxer state. Bound it so stopping a failed generation never joins a
+    // worker blocked in stream discovery.
     InputContext input(source, MediaReadPurpose::playback, &cancelled,
                        probe_bytes, analyze_duration, startup_timeout, &progress);
     auto* in = input.get();
@@ -1276,19 +1210,13 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                          "playback pipeline timed out while reading stream information");
     av_require(stream_info_rc, "read stream information");
     if (cancelled.load()) throw std::runtime_error("stream cancelled");
-    // The deadline above is a startup guard only. Once the streams are known,
-    // media reads may legitimately continue for hours and use the normal
-    // playback cancellation path instead.
+    // The deadline guards startup only; playback reads use the cancellation path.
     input.clear_deadline();
 
-    // avformat timestamps are absolute on the input timeline. Keep the public
-    // playback generation relative to zero, including after a seek. A remux
-    // VOD seek is the indexed keyframe at or before the request, so the
-    // backward search below lands exactly on it; a transcode seek is the
-    // request itself and may seek backward for decoder pre-roll, but decoded
-    // frames before zero are discarded and never enter the output timeline.
-    // Either way the generation begins at plan.seek, which is what the session
-    // payload publishes as seek_ms.
+    // Output timestamps are relative to plan.seek (published as seek_ms). A remux
+    // seek is the indexed keyframe at or before the request, so the backward
+    // search lands on it; a transcode seeks back for pre-roll and discards decoded
+    // frames before zero.
     const int64_t input_start_us = in->start_time == AV_NOPTS_VALUE ? 0 : in->start_time;
     const int64_t seek_target_us = input_start_us +
         av_rescale_q(plan.seek.count(), AVRational{1, 1000}, AV_TIME_BASE_Q);
@@ -1301,16 +1229,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         seek_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - seek_started)
                      .count();
     }
-    // Diagnostic: isolates container stream-info re-discovery and the
-    // actual container seek (this pipeline opens its own fresh
-    // InputContext, separate from the one used during VOD planning's
-    // keyframe snap, so a Matroska file's Cues materialisation and any
-    // remote extent fetch for the target region are paid again here even
-    // after landing exactly on a keyframe) from decode work, so a remaining
-    // gap between a seek=0 and a keyframe-snapped seek>0 startup can be
-    // attributed correctly rather than guessed at. A known residual gap
-    // remains after the keyframe-snap and rounding fixes (~1.7s measured on
-    // corvus-gbni-2); this log is left in place to help isolate it later.
+    // Separates stream-info rediscovery and the container seek (paid again here:
+    // this pipeline opens its own InputContext) from decode time in startup.
     Log::debug("media playback pipeline seek timing media=" + source.media_id +
               " seek_target_ms=" + std::to_string(plan.seek.count()) +
               " stream_info_ms=" + std::to_string(stream_info_ms) +
@@ -1372,12 +1292,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
 
         AvDictionaryOwner options;
         if (!mpegts) {
-            // delay_moov: the (E-)AC-3 sample entry carries a dac3/dec3 box
-            // the muxer can only fill from a parsed packet, so writing moov
-            // at header time fails outright for those codecs. Delaying it
-            // until the first packets are seen is what makes an AC-3 or
-            // E-AC-3 stream copyable into fMP4 at all; it still precedes the
-            // first moof, so the init segment is published as before.
+            // delay_moov: the (E-)AC-3 sample entry's dac3/dec3 box can only be filled
+            // from a parsed packet; the moov still precedes the first moof.
             av_require(av_dict_set(options.put(), "movflags",
                                    "frag_custom+empty_moov+default_base_moof+omit_tfhd_offset+negative_cts_offsets+delay_moov",
                                    0),
@@ -1404,16 +1320,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
         auto packet = make_av_packet();
         auto encoded = make_av_packet();
         auto decoded = make_av_frame();
-        // See the early flush below. MPEG-TS has no moov to delay, so there is
-        // nothing to spend; every other output does, and it must be spent
-        // before the first planned boundary rather than on it. This used to be
-        // disabled whenever any stream was transcoded, because the flush was
-        // driven from this demux loop and a transcoded stream's first packet
-        // arrives from an encoder instead -- so on transcode the moov was
-        // written at the first real boundary, consumed it, and merged
-        // fragments 0 and 1 into one double-length fragment. Each pipeline now
-        // records its own first muxed packet (`output_started`), which is true
-        // for both routes, so transcode gets the same early flush remux had.
+        // The delayed moov must be flushed before the first planned boundary, not on
+        // it; MPEG-TS has none. See the early flush below.
         bool moov_flushed = mpegts;
         const auto all_streams_started = [&pipelines] {
             return std::all_of(pipelines.begin(), pipelines.end(),
@@ -1449,11 +1357,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                         if ((packet->flags & AV_PKT_FLAG_KEY) != 0 && cuts.before_keyframe(seconds)) {
                             const auto before = writer.published();
                             cut_fragment(out);
-                            // A flush that writes the delayed moov produces no
-                            // moof: the media buffered up to here stays
-                            // buffered and joins the next fragment. Say so, or
-                            // the playlist places every later segment 10 s
-                            // early on the player's timeline (2026-09-07).
+                            // Writing the delayed moov produces no moof; the buffered media joins the
+                            // next fragment, so carry the boundary.
                             if (writer.published() == before) writer.carry_boundary();
                         }
                     }
@@ -1476,10 +1381,8 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
                         av_require(rc, "receive decoded frame");
                         if (pipe.type == MediaStreamType::video) {
-                            // Timestamps here are relative to the origin, so a
-                            // frame before zero is pre-roll: the first says how
-                            // far back the keyframe was, each later one how far
-                            // through that the decoder is.
+                            // Timestamps are origin-relative, so frames before zero are pre-roll: the
+                            // first gives the keyframe distance, later ones the decoder's progress.
                             const auto frame_pts = decoded->best_effort_timestamp != AV_NOPTS_VALUE
                                                        ? decoded->best_effort_timestamp
                                                        : decoded->pts;
@@ -1501,13 +1404,9 @@ void run_pipeline(const MediaSource& source, const HlsVodPlan& vod_plan,
                     }
                 }
                 if (!moov_flushed && all_streams_started()) {
-                    // Every stream has handed the muxer a packet, so the
-                    // (E-)AC-3 sample entry can be filled and the moov
-                    // written. Spending the flush here costs one fragment
-                    // boundary's worth of nothing; spending it at the first
-                    // real boundary costs that boundary -- which is what made
-                    // a transcode's first fragment twice its planned length
-                    // and left the plan one fragment longer than the output.
+                    // Every stream has muxed a packet, so the (E-)AC-3 sample entry can be filled
+                    // and the moov written now, before any real boundary; spending a real
+                    // boundary on it would double the first fragment.
                     moov_flushed = true;
                     const auto before = writer.published();
                     cut_fragment(out);
@@ -1704,10 +1603,8 @@ class LibavMediaEngine final : public MediaEngine {
             info.sample_rate = par->sample_rate;
             info.bit_depth = par->bits_per_raw_sample;
             if (info.bit_depth <= 0 && par->codec_type == AVMEDIA_TYPE_VIDEO && par->format >= 0) {
-                // Matroska does not carry bits_per_raw_sample for HEVC; the
-                // pixel format does (yuv420p10le -> 10). Without this a
-                // 10-bit source reported no depth and the negotiation gate
-                // rested on the transfer alone (2026-09-07).
+                // Matroska omits bits_per_raw_sample for HEVC; derive depth from the pixel
+                // format (yuv420p10le -> 10).
                 if (const auto* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(par->format));
                     desc && desc->nb_components > 0)
                     info.bit_depth = desc->comp[0].depth;
@@ -1787,8 +1684,7 @@ class LibavMediaEngine final : public MediaEngine {
                 if (type == AVMEDIA_TYPE_VIDEO && !(entry->flags & AVINDEX_KEYFRAME)) continue;
                 const int64_t us = av_rescale_q(entry->timestamp, stream->time_base, AV_TIME_BASE_Q);
                 const int64_t ms = std::max<int64_t>(0, (us - start_us) / 1000);
-                // Every audio sample is a sync point; one a second is enough
-                // to place a byte range and keeps a film's list small.
+                // Every audio sample is a sync point; one per second suffices.
                 if (type == AVMEDIA_TYPE_AUDIO && last_kept_ms && ms < *last_kept_ms + 1000) continue;
                 indexed.entries.emplace_back(ms, static_cast<uint64_t>(entry->pos));
                 last_kept_ms = ms;
@@ -1814,10 +1710,8 @@ class LibavMediaEngine final : public MediaEngine {
         result.source_duration_seconds = source_duration_seconds;
         const double target = std::max(0.001, segment_duration.count() / 1000.0);
         result.seek_segment_seconds = target;
-        // The request the server honours, in integer milliseconds. Every
-        // baseline and offset below is derived from this one value, so the
-        // published invariant is exact rather than approximately reconstructed
-        // from two independent roundings of the same double.
+        // The honoured request in integer ms. Every baseline and offset derives from
+        // it, so the seek invariant is exact.
         const int64_t requested_ms =
             media_vod::clamp_seek_ms(requested.seek.count(), source_duration_seconds);
         const double requested_seek = requested_ms / 1000.0;
@@ -1852,11 +1746,8 @@ class LibavMediaEngine final : public MediaEngine {
                     result.segment_durations = std::move(indexed->segment_durations);
                     result.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
                     result.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
-                    // The shape of the index behind a plan that worked, not
-                    // only behind one that did not. The gaps are the distance
-                    // between *indexed* entries and so an upper bound on the
-                    // true GOP; measured offsets clustering well below them
-                    // say the Cues are sparse rather than the GOP long.
+                    // Index shape behind a working plan. Gaps between indexed entries bound the
+                    // true GOP from above; offsets well below them mean sparse Cues, not a long GOP.
                     Log::debug("media VOD planner accepted remux keyframe index media=" +
                                source.media_id + " entries=" +
                                std::to_string(avformat_index_get_entries_count(stream)) +
@@ -1865,10 +1756,8 @@ class LibavMediaEngine final : public MediaEngine {
                                " seek_offset_ms=" + std::to_string(indexed->seek_offset_ms) +
                                " seek_requested_ms=" + std::to_string(indexed->seek_requested_ms));
                 } else {
-                    // Name the reason: how many entries, and the gaps between
-                    // consecutive keyframes (the tail counts as a gap), so an
-                    // operator can tell a partial index from a long-GOP encode
-                    // without a debugger.
+                    // Name the reason: entry count and keyframe gaps (tail included), to tell a
+                    // partial index from a long-GOP encode.
                     Log::debug("media VOD planner rejected unusable remux keyframe index media=" +
                                source.media_id + " entries=" +
                                std::to_string(avformat_index_get_entries_count(stream)) +
@@ -1894,24 +1783,11 @@ class LibavMediaEngine final : public MediaEngine {
                     segment = gop / fps;
                 }
                 result.seek_segment_seconds = segment;
-                // The encoder can start on any frame, so it does: the seek is
-                // exactly what was asked for and the offset is zero. Until
-                // 2026-09-18 this snapped forward to the nearest keyframe at
-                // or after the target, to spare the decoder the pre-roll of
-                // decoding (not just skipping) every frame from the preceding
-                // keyframe. That pre-roll is still paid -- run_pipeline seeks
-                // back for it and discards decoded frames before the origin --
-                // but it is the price of asking for a non-keyframe and it is
-                // the client's to pay. Snapping put the content between the
-                // request and the keyframe in no generation at all, which no
-                // client could recover; a client that wants the cheap,
-                // exactly-aligned seek asks for a position that already is a
-                // keyframe.
-                //
-                // video_random_access_points is still populated here so
-                // reseek_hls_vod's fast PATCH-seek path reuses this keyframe
-                // list without reopening/reprobing the source, and so the
-                // density diagnostic below can say what the index looked like.
+                // The encoder can start on any frame: the seek is exactly the request, offset
+                // zero. run_pipeline pays the pre-roll from the preceding keyframe; a client
+                // wanting a cheap aligned seek asks for a keyframe position.
+                // video_random_access_points is still collected for reseek_hls_vod's fast
+                // path and the density diagnostic below.
                 materialise_deferred_seek_index(format, result.playback.video_stream, requested_seek);
                 if (input.timed_out())
                     throw MediaError(MediaFailure::timed_out,
@@ -1979,11 +1855,8 @@ class LibavMediaEngine final : public MediaEngine {
                            config_.probe_analyze_duration, config_.probe_timeout);
         auto* format = input.get();
 
-        // The playback session already probed this exact immutable source and
-        // selected a concrete subtitle stream. Avoid a second whole-file stream
-        // analysis for every four-second subtitle segment. Container headers are
-        // normally sufficient; fall back to find_stream_info only when they are
-        // not.
+        // The session already probed this source and chose a subtitle stream; use the
+        // container headers and fall back to find_stream_info only when needed.
         auto stream_ready = [&] {
             return subtitle_stream >= 0 &&
                    subtitle_stream < static_cast<int>(format->nb_streams) &&
@@ -2031,12 +1904,9 @@ class LibavMediaEngine final : public MediaEngine {
             int rc = 0;
             bool past_range = false;
             while (!past_range && (rc = av_read_frame(format, packet.get())) >= 0) {
-                // Keep ordinary A/V packets visible to the demux loop so they
-                // provide a bounded timeline cursor even when there is a long
-                // gap between subtitle cues. Otherwise asking for an empty
-                // four-second subtitle segment could scan forward until the
-                // next subtitle packet many minutes later. A small grace
-                // allows for normal cross-stream interleave/reordering.
+                // A/V packets bound the timeline cursor across long gaps between cues, so an
+                // empty subtitle segment does not scan to the next cue; the grace allows for
+                // interleave.
                 const auto packet_time = packet->dts != AV_NOPTS_VALUE ? packet->dts : packet->pts;
                 if (packet_time != AV_NOPTS_VALUE && packet->stream_index >= 0 &&
                     packet->stream_index < static_cast<int>(format->nb_streams)) {
@@ -2078,10 +1948,8 @@ class LibavMediaEngine final : public MediaEngine {
                 auto end_source = base_ms + subtitle.end_display_time;
                 if (end_source <= begin_source) end_source = begin_source + 2000;
 
-                // Assign each cue to the segment in which it starts. The Web
-                // client keeps the immediately preceding segment mounted, so a
-                // cue is allowed to extend naturally across a segment boundary
-                // without being duplicated in the next segment.
+                // A cue belongs to the segment it starts in. The web client keeps the
+                // preceding segment mounted, so cues may span a boundary without duplication.
                 if (begin_source >= range_end.count()) {
                     past_range = true;
                     break;
@@ -2121,9 +1989,7 @@ std::unique_ptr<MediaEngine> make_libav_media_engine_impl(const StreamingConfig&
     return std::make_unique<LibavMediaEngine>(config);
 }
 
-// Registers this FFmpeg-backed implementation into macha_core's factory slot
-// (see media_engine_common.cpp) as soon as this translation unit is linked
-// into an executable, before main() runs.
+// Registers this engine into macha_core's factory slot before main().
 struct MediaEngineRegistration {
     MediaEngineRegistration() { set_media_engine_factory(make_libav_media_engine_impl); }
 };

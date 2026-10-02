@@ -26,31 +26,32 @@
 #include <memory>
 #include <string_view>
 
-// The node's services: everything built once the node's local state has
-// recovered, as one composition root. The members below are declared in
-// dependency order -- each takes, at construction, references to members
-// declared before it -- so construction follows the graph and destruction
-// reverses it. start() runs in the same order; stop() reverses it, with the
-// one ordering the graph leaves free pinned (see stop()).
+// The node's services, built once local state has recovered: the composition
+// root. Members are declared in dependency order (each takes references to
+// members declared before it), so construction follows the graph and
+// destruction reverses it. start() runs in that order; stop() reverses it,
+// pinning the one ordering the graph leaves free (see stop()).
 //
 // The graph, provider -> dependants:
 //   node, registry, port (outside, outlive this)
-//   playback      -> filesystem, hydration
-//   store         -> metadata, catalogue, filesystem, hydration, ledger, builder, maintenance
-//   metadata      -> catalogue, filesystem, torrent coordinator, manage API, maintenance
-//   catalogue     -> filesystem users (media information, scanner, hydration, APIs,
-//                    playback), builder, maintenance; metadata's publication guard
-//                    calls back into it (wired at construction, used only after)
-//   filesystem    -> media information, scanner, hydration, ingest, APIs, playback,
-//                    subsystems, builder
-//   hints         -> scanner, ingest, catalogue API, manage API
-//   media info    -> scanner, ingest, catalogue API, playback
-//   scanner       -> catalogue API, manage API, playback
-//   hydration     -> subsystems
-//   ingest        -> cluster jobs, acquisition API, subsystems
-//   cluster jobs  -> torrent coordinator, acquisition API
-//   torrent coord -> acquisition API
-//   subsystems    (plugins: torrent, FUSE) need ingest, filesystem, hydration
+//   playback       -> filesystem, hydration
+//   store          -> metadata, catalogue, filesystem, hydration, builder, maintenance
+//   metadata       -> catalogue, filesystem, torrent coordinator, manage API, maintenance
+//   catalogue      -> media info, scanner, hydration, catalogue API, manage API, playback,
+//                     builder, maintenance; metadata's publication guard calls back
+//                     into it (wired at construction, used only after)
+//   filesystem     -> media info, scanner, hydration, ingest, catalogue API, manage API,
+//                     playback, subsystems, builder
+//   hints          -> scanner, ingest, catalogue API, manage API
+//   media engine   -> media info, scanner, playback
+//   media info     -> scanner, ingest, catalogue API, playback
+//   scanner        -> catalogue API, manage API, playback
+//   hydration      -> subsystems
+//   ingest         -> cluster jobs, acquisition API, subsystems
+//   torrent search -> acquisition API
+//   cluster jobs   -> torrent coordinator, acquisition API
+//   torrent coord  -> acquisition API
+//   subsystems     (plugins: torrent, FUSE) need ingest, filesystem, hydration
 //   ledger, builder -> maintenance
 namespace macha {
 

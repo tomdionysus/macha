@@ -9,22 +9,13 @@ namespace {
 
 constexpr double kTimestampEpsilon = 0.0005;
 constexpr double kMinimumDuration = 0.001;
-// A microsecond, in seconds. Keyframe timestamps arrive as doubles rescaled
-// from the container's time base, so an exact millisecond boundary can land a
-// hair either side of itself; this is the slack ceil() is given so that
-// 62.000s rounds to 62000 ms rather than 62001 ms.
+// One microsecond, in seconds: slack for ceil() so a keyframe a hair over an
+// exact ms (62.000 s) rounds to 62000 ms, not 62001.
 constexpr double kMillisecondSlack = 0.000001;
-// A remux fragment starts at a source keyframe, so its length is whatever
-// the encoder's GOP structure gives. Until 0.32.11 any fragment longer than
-// 3x the target (12 s) rejected remux for the whole file. Scene-cut x264/x265
-// encodes have such gaps routinely, so on the live cluster every HEVC title
-// went to a full software transcode (5-13 s setup per request, ~real-time
-// segments) although the client could play the stream as-is (2026-09-07).
-// HLS carries variable fragment lengths; the bound now only rejects what the
-// original check was written for: a partial index whose last entry is
-// followed by minutes of unindexed media (`kMaximumTailSeconds`), and
-// fragments so long that a seek would wait unreasonably
-// (`kMaximumFragmentSeconds`).
+// A remux fragment starts at a source keyframe, so its length follows the GOP;
+// HLS carries variable lengths. The bounds reject only a partial index followed
+// by long unindexed media (kMaximumTailSeconds) and fragments so long a seek
+// would wait unreasonably (kMaximumFragmentSeconds).
 constexpr double kMaximumFragmentSeconds = 90.0;
 constexpr double kMaximumTailSeconds = 90.0;
 
@@ -41,12 +32,9 @@ bool format_token(std::string_view names, std::string_view wanted) {
     return false;
 }
 
-// A keyframe timestamp, in whole milliseconds, rounded UP rather than to
-// nearest. llround can round a fractional-millisecond keyframe timestamp down;
-// reconstructing microseconds from that truncated value later (run_pipeline)
-// then lands avformat_seek_file's AVSEEK_FLAG_BACKWARD search one keyframe
-// *earlier* than intended -- a full GOP's worth of avoidable decode, and now
-// also a generation that would begin before the baseline it published.
+// A keyframe timestamp in whole ms, rounded up: rounding down would land
+// run_pipeline's AVSEEK_FLAG_BACKWARD search a keyframe early, before the
+// published baseline.
 int64_t keyframe_ms(double seconds) {
     return static_cast<int64_t>(std::ceil(seconds * 1000.0 - kMillisecondSlack));
 }
@@ -69,19 +57,10 @@ std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds
     IndexedPlan result;
     result.seek_requested_ms = clamp_seek_ms(requested_seek_ms, duration_seconds);
 
-    // The baseline is the LAST indexed keyframe at or BEFORE the request, not
-    // the first one after it. A stream copy has no decoder and an fMP4
-    // fragment's first sample must be a sync sample, so this is the only split
-    // the container permits that still contains the position asked for.
-    // Starting after the request instead put the content between the two in no
-    // generation at all, recoverable by no client: a skipped scene for a viewer
-    // seek, and deleted content mid-playback on the reaped-session recovery
-    // path, which rebuilds a generation at a position a viewer has reached.
-    //
-    // A candidate is compared after it has been rounded up to milliseconds, so
-    // a keyframe that rounds past the request is not a candidate. That is what
-    // keeps seek_offset_ms from going negative by a millisecond where a
-    // keyframe sits a fraction of a millisecond after the requested position.
+    // The baseline is the last indexed keyframe at or before the request: a copy
+    // has no decoder and an fMP4 fragment must start on a sync sample, so this is
+    // the only split that still contains the position. Candidates are compared
+    // after rounding up to ms, so seek_offset_ms never goes negative.
     double baseline_seconds = 0.0;
     bool have_baseline = false;
     for (const double seconds : keyframe_seconds) {
@@ -95,13 +74,9 @@ std::optional<IndexedPlan> indexed_plan(std::span<const double> keyframe_seconds
         baseline_seconds = seconds;
         have_baseline = true;
     }
-    // No indexed keyframe at or before the request leaves the baseline at zero
-    // and the whole request in the offset. A decodable stream's first sample is
-    // necessarily a sync sample, so a copy can always begin at the beginning;
-    // the index simply did not name it. The mode is preserved, the invariant is
-    // preserved, and nothing is lost. In practice unreachable -- a file's first
-    // frame is virtually always indexed -- so this exists to keep the invariant
-    // free of an escape hatch rather than to serve a case seen in the field.
+    // No indexed keyframe at or before the request: baseline zero, the whole
+    // request in the offset. A decodable stream starts on a sync sample, so a copy
+    // can always begin at the start; mode and invariant are preserved.
     result.actual_seek_seconds = baseline_seconds;
     result.seek_offset_ms = result.seek_requested_ms - result.seek_ms;
 

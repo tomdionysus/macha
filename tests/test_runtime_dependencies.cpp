@@ -100,10 +100,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_ffmpeg_log_bridge) {
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_advertised_api_endpoint_is_validated) {
-    // This string is handed to clients verbatim and every request URL is built
-    // from it, so a malformed one fails far from the file that set it. The
-    // shipped example config has always promised these are "rejected at
-    // startup"; until 0.38.0 nothing checked.
+    // Clients build every request URL from this string verbatim, so a
+    // malformed one is rejected at startup rather than failing far away.
     TempDir t;
     auto keyfile = (t.path() / "key").string();
     auto write = [&](const std::string& endpoint) {
@@ -133,16 +131,15 @@ MACHA_FAST_TEST("runtime_dependencies", test_advertised_api_endpoint_is_validate
     // A host on its own is not an origin: the client cannot know the scheme.
     CHECK(rejected("media.example.net:7438"));
     CHECK(rejected("//media.example.net"));
-    // A path would be dropped by a client treating this as an origin, and the
-    // 404s would appear nowhere near the cause.
+    // A client treating this as an origin would drop the path.
     CHECK(rejected("https://media.example.net/macha"));
     CHECK(rejected("https://media.example.net:443/"));
     // An unbracketed IPv6 literal cannot be parsed back out of a URL.
     CHECK(rejected("http://2001:db8::1:7438"));
     CHECK(rejected("http://"));
 
-    // The deployments this exists for: a TLS proxy on the implicit port, the
-    // same with it stated, and a plain port-forwarded node.
+    // A TLS proxy on the implicit port, the same with it stated, and a plain
+    // port-forwarded node.
     for (const auto* accepted : {"https://media.example.net", "https://media.example.net:443",
                                  "http://media.example.net:7438", "http://[2001:db8::1]:7438"}) {
         auto config = load_yaml_config(write(accepted));
@@ -151,8 +148,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_advertised_api_endpoint_is_validate
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_edge_node_needs_no_data_backends) {
-    // An edge node (0.42.0): storage.hosts_extents false and no storage.data
-    // at all. The metadata store stays required and is defaulted as usual.
+    // An edge node: storage.hosts_extents false and no storage.data at all.
+    // The metadata store stays required and is defaulted as usual.
     TempDir t;
     auto keyfile = (t.path() / "key").string();
     auto yaml = t.path() / "edge.yaml";
@@ -196,8 +193,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_edge_node_needs_no_data_backen
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_a_repair_weight_of_zero) {
-    // A zero repair weight is a repair that stops whenever the node is busy,
-    // which the weight pair exists to rule out (0.59.0).
+    // A zero repair weight would stop repair whenever the node is busy.
     TempDir t;
     auto keyfile = (t.path() / "key").string();
     auto yaml = t.path() / "node.yaml";
@@ -228,9 +224,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_a_repair_weight_of_zer
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_unknown_keys) {
-    // A node does not start on a configuration it does not understand: a
-    // misspelt key would otherwise leave its setting at the default, silently.
-    // Every unknown key is named, at whatever depth, including inside a list.
+    // Unknown keys are refused, so a misspelt key cannot silently leave its
+    // setting at the default. Each is named, at any depth, including in lists.
     TempDir t;
     auto keyfile = (t.path() / "key").string();
     auto yaml = t.path() / "node.yaml";
@@ -268,8 +263,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_refuses_unknown_keys) {
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_example_configuration_loads) {
-    // The shipped example is what operators copy; every key in it must be one
-    // the loader reads.
+    // Every key in the shipped example must be one the loader reads.
     const auto example = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "macha.yaml.example";
     REQUIRE(std::filesystem::exists(example));
     std::string message;
@@ -527,8 +521,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.storage_backends[0].reserve_free == 2ULL * 1024 * 1024 * 1024);
     CHECK(yc.storage_packing.threshold == 512ULL * 1024);
     CHECK(yc.storage_packing.target_size == 32ULL * 1024 * 1024);
-    // torrent.log_level is its own threshold, parsed like the process one and
-    // defaulting to INFO so the alert stream is quiet unless asked for.
+    // torrent.log_level is its own threshold, defaulting to INFO.
     CHECK(yc.torrent.log_level == LogLevel::debug);
     CHECK(Config{}.torrent.log_level == LogLevel::info);
     CHECK(yc.metadata_store.path == state / "control");
@@ -597,7 +590,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.connectivity_check.timeout == 2600ms);
     CHECK(yc.inbound_capable == Tristate::no);
     CHECK(yc.hosts_extents == Tristate::automatic);
-    CHECK(yc.metadata_min_write_replicas == 2); // legacy metadata_replicas: 3 -> old 2-vote floor
+    CHECK(yc.metadata_min_write_replicas == 2); // from metadata_replicas: 3
     CHECK(yc.min_write_replicas == 2);
     CHECK(yc.write_stall == 1750ms);
     CHECK(yc.data_inflight_bytes == 96ULL * 1024 * 1024);
@@ -662,11 +655,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(!yc.ingest.delete_owned_source_on_cancel);
     CHECK(yc.torrent.enabled == (std::string_view(torrent_enabled) == "true"));
     CHECK(yc.torrent.search_providers.empty());
-    // libtorrent maps its own listen port and both of these default to on
-    // inside libtorrent, so before they were exposed the session did it
-    // whatever the configuration said. Assert they are actually read: an
-    // unread key is indistinguishable from one that works until a router
-    // gets an unexpected mapping.
+    // Both default to on inside libtorrent, so assert the keys are read.
     CHECK(!yc.torrent.upnp);
     CHECK(!yc.torrent.natpmp);
     CHECK(Config{}.torrent.upnp);
@@ -707,10 +696,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
         }
         CHECK(rejected);
     }
-    // The advertised API endpoint is a URL, and a path is rejected rather
-    // than accepted and quietly mishandled: a client that treats it as an
-    // origin would drop the path and 404 against a node that looks correctly
-    // configured -- and only in the deployment that has a proxy in front.
+    // The advertised API endpoint is an origin; a path is rejected, since a
+    // client treating it as an origin would drop it.
     for (const char* invalid_endpoint :
          {"https://node.example/macha", "node.example:7438", "ftp://node.example",
           "https://", "https://node.example:0", "https://node.example:99999",
@@ -725,9 +712,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
         }
         CHECK(rejected);
     }
-    // Scheme and host, with or without a port, and a bracketed IPv6 literal,
-    // are all accepted. The TLS-offload shape is the second one: plain http
-    // on the bind, https on the advertised endpoint.
+    // Scheme and host, with or without a port, and a bracketed IPv6 literal
+    // are accepted; https here with plain http on the bind is TLS offload.
     for (const char* valid_endpoint : {"http://node.example", "https://node.example:443",
                                        "http://[2001:db8::1]:7438"}) {
         auto valid = yc;
@@ -752,8 +738,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
         CHECK(rejected);
     }
 
-    // CLI remains useful for node-local/runtime overrides, but configuration
-    // now always starts from an explicit YAML file.
+    // Configuration starts from an explicit YAML file; the CLI overrides it.
     std::vector<std::string> override_args{"macha", "--config", yaml.string(),
                                             "--port", "8123", "--replicas", "5",
                                             "--min-write-replicas", "3",
@@ -941,9 +926,8 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     CHECK(tagged_probe->musicbrainz_release_id == std::optional<std::string>{"rel-tagged-1"});
     CHECK(tagged_probe->musicbrainz_artist_id == std::optional<std::string>{"artist-tagged-1"});
 
-    // Embedded APIC artwork and provider artwork are independent catalogue
-    // candidates. Neither should suppress or replace the other merely because
-    // both have the semantic role "cover".
+    // Embedded APIC and provider artwork are independent candidates; sharing
+    // the role "cover" does not let one replace the other.
     auto music_art_http = std::make_unique<FakeHttpClient>();
     music_art_http->add("/ws/2/release/rel-tagged-1", 200, "application/json",
         R"JSON({"id":"rel-tagged-1","title":"I'm Raving The Remixes","date":"1996-01-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-tagged-1","name":"Scooter"}}],"release-group":{"id":"rg-tagged-1"},"media":[{"position":1,"tracks":[{"position":1,"title":"I'm Raving (Progressive Remix)","recording":{"id":"rec-tagged-1","title":"I'm Raving (Progressive Remix)"}}]}]})JSON");
@@ -982,12 +966,8 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed) {
-    // The engine says why it could not produce facts, and the reason survives
-    // to the client unchanged. "This node could not read the bytes" and "these
-    // bytes are not media" are different situations: the first may succeed on
-    // another node, the second will not succeed anywhere. Before this the two
-    // arrived identically and a partitioned node looked like a corrupt file
-    // (2026-09-07).
+    // The engine's failure reason reaches the client unchanged: unreadable
+    // bytes may succeed on another node, unparseable bytes will not anywhere.
     struct UnreachableInput : MediaInput {
         uint64_t size() const override { return 8ULL * 1024 * 1024; }
         size_t read(uint64_t, std::span<uint8_t>, Clock::time_point, std::atomic_bool*) override {
@@ -1058,14 +1038,9 @@ MACHA_FAST_TEST("runtime_dependencies", test_probe_failure_reports_why_it_failed
 }
 
 MACHA_FAST_TEST("runtime_dependencies", test_aac_encodes_a_standard_channel_configuration) {
-    // Asked of the real encoder in this build, because the defect was the
-    // encoder answering a legal request with something a browser will not
-    // parse. A channelConfiguration of 0 means the layout was described in a
-    // Program Config Element; Chrome's MP4 parser rejects that, the init
-    // segment fails to parse, MediaSource ends with a decode error, and the
-    // title is unplayable everywhere Chromium is the engine. Every 5.1 source
-    // transcoded to AAC hit it, because E-AC-3 decodes to 5.1(side)
-    // (2026-09-08).
+    // Uses the real encoder in this build. A channelConfiguration of 0 means a
+    // Program Config Element, which Chrome's MP4 parser rejects, so every
+    // channel count must encode to a standard configuration.
     const auto* codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
     REQUIRE(codec != nullptr);
     for (int channels = 1; channels <= 8; ++channels) {
@@ -1076,15 +1051,13 @@ MACHA_FAST_TEST("runtime_dependencies", test_aac_encodes_a_standard_channel_conf
         enc->sample_rate = 48000;
         enc->sample_fmt = AV_SAMPLE_FMT_FLTP;
         enc->time_base = AVRational{1, enc->sample_rate};
-        // The extradata only exists when the muxer asked for a global header,
-        // which is what fragmented MP4 does and what carries the config a
-        // browser reads.
+        // Fragmented MP4 asks for a global header; only then is the extradata
+        // carrying the config produced.
         enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         REQUIRE(av_channel_layout_from_string(&enc->ch_layout, layout) == 0);
         const bool opened = avcodec_open2(enc, codec, nullptr) == 0;
         if (!opened) {
-            // A build whose AAC encoder refuses this many channels is a
-            // different situation from one that encodes them unparseably.
+            // Refusing a channel count is not the defect under test.
             avcodec_free_context(&enc);
             continue;
         }
@@ -1099,8 +1072,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_aac_encodes_a_standard_channel_conf
         CHECK(enc->ch_layout.nb_channels >= channels);
         avcodec_free_context(&enc);
     }
-    // The mapping itself: every count names a layout, and the surround pair
-    // sits at the back, which is what makes it standard.
+    // Every count names a layout, with the surround pair at the back.
     CHECK(std::string(macha::aac_standard_channel_layout(6)) == "5.1");
     CHECK(std::string(macha::aac_standard_channel_layout(2)) == "stereo");
     CHECK(std::string(macha::aac_standard_channel_layout(0)) == "stereo");

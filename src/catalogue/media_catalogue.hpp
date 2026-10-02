@@ -89,8 +89,8 @@ class MediaProbeCandidateGenerator {
 std::vector<MediaProbeCandidate> probe_media_candidates(const MediaProbeContext&);
 std::vector<MediaProbeCandidate> probe_media_candidates(std::string_view path, const FsEntry&,
                                                         std::string_view root = {});
-// Run the same candidate generators against a host-side file before it enters
-// the Macha namespace. Audio tags are read directly with libav when available.
+// The same candidate generators over a host file not yet in the namespace;
+// audio tags are read with libav when available.
 std::vector<MediaProbeCandidate> probe_host_media_candidates(const std::filesystem::path&,
                                                              uint64_t size);
 std::optional<MediaProbe> probe_media_path(std::string_view path, const FsEntry&);
@@ -147,9 +147,8 @@ struct ProviderRequestError : std::runtime_error {
         : std::runtime_error(message), status(http_status), code(std::move(error_code)) {}
 };
 
-// MusicBrainz asks each client for at most one request a second. Every
-// MusicBrainzProvider on a node shares one gate, so the scanner's requests and
-// the metadata editor's together keep to it; the circuit is shared the same way.
+// MusicBrainz allows one request a second per client: every MusicBrainzProvider
+// on a node shares this gate and its circuit.
 struct MusicBrainzGate {
     std::mutex mutex;
     std::chrono::steady_clock::time_point last_request{};
@@ -204,9 +203,8 @@ class MetadataProvider {
     virtual bool supports(MediaProbeKind) const = 0;
     virtual std::optional<ProviderMatch> lookup(const MediaProbe&) = 0;
     virtual std::vector<ProviderSearchResult> search(const ProviderSearchQuery&) { return {}; }
-    // The images the provider has for a role of the record `kind`:`id` names
-    // (a TMDB `movie` or `tv`, a MusicBrainz `release`); `numbers` narrow a
-    // show to a season or an episode.
+    // Images for a role of record `kind`:`id` (TMDB `movie`/`tv`, MusicBrainz
+    // `release`); `numbers` narrow a show to a season or episode.
     virtual std::vector<ArtworkOption> artwork_options(std::string_view /*kind*/,
                                                        std::string_view /*id*/,
                                                        std::string_view /*role*/,
@@ -307,8 +305,7 @@ class CatalogueScanProvider {
     virtual ~CatalogueScanProvider() = default;
     virtual std::string_view name() const noexcept = 0;
     virtual const std::vector<std::string>& roots() const noexcept = 0;
-    // Cheap namespace-discovery predicate. This must never open/read media;
-    // expensive tag/container probing belongs to hint processing.
+    // Cheap discovery predicate: never reads media; probing is hint processing.
     virtual bool accepts_path(std::string_view path) const noexcept = 0;
     virtual MediaProbeFile probe_file(FileSystem&, std::string_view root,
                                       std::string_view path, const FsEntry&) = 0;
@@ -388,10 +385,9 @@ struct ProviderRefMatch {
     std::vector<std::string> item_ids;
 };
 
-// Enumerate the file members of one catalogue root from a single immutable
-// metadata snapshot.  Discovery and the namespace signature used for destructive
-// reconciliation must come from the same generation; callers must not combine
-// this result with live readdir()/getattr() state.
+// The files under one catalogue root in one metadata snapshot. Discovery and the
+// reconciliation's namespace signature must share a generation: never mix this
+// with live readdir()/getattr().
 std::vector<std::pair<std::string, FsEntry>> catalogue_snapshot_files(
     std::string_view root, const MetadataSnapshot& namespace_snapshot,
     const NamespaceNodeStore* namespace_nodes, std::stop_token stop = {});
@@ -407,9 +403,8 @@ class CatalogueScanner {
     std::shared_ptr<MediaEngine> profile_engine_;
     MediaInformationService* media_information_{};
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
-    // The metadata editor's own providers: the same configuration over the
-    // unbudgeted client, so an operator's request neither spends nor waits on
-    // a scan batch's provider budget. One editor request at a time.
+    // The editor's providers over the unbudgeted client, so an operator's
+    // request never waits on a scan's budget. One editor request at a time.
     std::vector<std::unique_ptr<CatalogueScanProvider>> editor_providers_;
     std::mutex editor_mutex_;
     std::shared_ptr<MusicBrainzGate> musicbrainz_gate_{std::make_shared<MusicBrainzGate>()};
@@ -452,10 +447,9 @@ class CatalogueScanner {
                                       std::string_view metadata_provider);
 
   public:
-    // One hint against one namespace snapshot, as a batch prepares it. Public
-    // so a test can hand it the snapshot and its age. `snapshot_taken_unix_ms`:
-    // when the batch took the snapshot; a hint created after it may name a
-    // file the snapshot cannot contain, and is deferred rather than failed.
+    // One hint against one namespace snapshot. A hint created after
+    // `snapshot_taken_unix_ms` may name a file the snapshot lacks, and is
+    // deferred rather than failed.
     std::optional<PreparedHintMatch> prepare_hint(
         const CatalogueHint&, std::stop_token, const MetadataSnapshot& namespace_snapshot,
         uint64_t snapshot_taken_unix_ms, DistributedStore::DurabilityBatch& artwork_batch);

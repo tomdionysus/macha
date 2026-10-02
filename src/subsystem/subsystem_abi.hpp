@@ -13,25 +13,16 @@ namespace macha {
 //
 //   extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry();
 //
-// Core and its plugins are always built from the same source tree, same
-// commit, in the same CMake invocation -- never distributed or versioned
-// independently (see TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md) --
-// so a plain C++ virtual interface across the dlopen boundary is safe; the
-// only part that must cross as a flat C symbol is this one bootstrap entry
-// point.
+// Core and plugins are always built together from one commit, so a C++
+// virtual interface across dlopen is safe; only this entry point is flat C.
 inline constexpr const char* kSubsystemEntrySymbol = "macha_subsystem_entry";
 
 struct SubsystemPluginEntry {
-    // Must equal macha::kBuildIdentity (version.hpp.in) of the core that
-    // loads this plugin. A mismatch means this plugin was built against a
-    // different revision of macha_core than the one currently running -- for
-    // example a partial deploy -- and must be refused rather than loaded:
-    // the ABI is not guaranteed compatible.
+    // Must equal the loading core's macha::kBuildIdentity; a mismatch (e.g. a
+    // partial deploy) is refused, as the ABI may differ.
     std::string_view build_identity;
-    // Returning no instance (rather than throwing) means "this node is
-    // configured not to run this capability" -- the supervisor reports
-    // `unavailable` and does not retry. Throwing means the attempt failed and
-    // is subject to the backoff/disable policy.
+    // nullptr: this node is configured not to run the capability (reported
+    // `unavailable`, not retried). Throwing: failed, subject to backoff/disable.
     std::unique_ptr<Subsystem> (*create)(const SubsystemContext&);
 };
 

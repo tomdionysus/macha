@@ -18,16 +18,11 @@
 #include <string_view>
 #include <thread>
 
-// Observation: what the object ledger experiment's T0 measures, recorded
-// beside the code it measures and written only to a local file. Nothing here
-// reaches Status or any API response, and nothing here may change a decision
-// the node takes: every probe is a counter increment, a histogram record or an
-// event appended to a bounded queue. See
-// TODO/2026-09-29-object-ledger-implementation-plan.md, T0.
+// Measurement probes, written only to a local file. Nothing here reaches
+// Status or the API, and no probe may change a node decision: each is a
+// counter increment, a histogram record or a bounded-queue event.
 namespace macha {
 
-// ---- Buckets ------------------------------------------------------------
-//
 // Log-linear: values 0-7 have a bucket each, and every power of two from 8 up
 // is split into eight equal buckets, so a bucket's width is at most 1/8 of
 // its lower bound and any quantile read from it is within 12.5% of the value
@@ -44,8 +39,6 @@ size_t observation_bucket(uint64_t value) noexcept;
 // Precondition for both: bucket < observation_bucket_count.
 uint64_t observation_bucket_lower(size_t bucket) noexcept;
 uint64_t observation_bucket_upper(size_t bucket) noexcept;
-
-// ---- Histograms ---------------------------------------------------------
 
 // A histogram's counts at one moment, or over a window (the difference of
 // two moments). A plain value; every operation on it is deterministic.
@@ -82,8 +75,6 @@ class LatencyHistogram {
     HistogramSnapshot snapshot() const noexcept;
 };
 
-// ---- Events -------------------------------------------------------------
-
 // A one-off fact with its own time: a startup finished, a backend went
 // offline. Fields are rendered as JSON strings or numbers.
 struct ObservationEvent {
@@ -93,8 +84,6 @@ struct ObservationEvent {
     std::map<std::string, std::string> texts;
     bool operator==(const ObservationEvent&) const = default;
 };
-
-// ---- The registry -------------------------------------------------------
 
 struct ObservationSnapshot {
     std::map<std::string, HistogramSnapshot, std::less<>> histograms;
@@ -179,8 +168,6 @@ class ObservedDuration {
 // "OTHER". A pure function of its inputs.
 std::string observation_route_label(std::string_view method, std::string_view path);
 
-// ---- Rendering ----------------------------------------------------------
-
 // One JSON line per window. Histograms and counters that did not move in the
 // window are omitted; each histogram carries its count, sum, max, p50, p90,
 // p99 and its non-empty buckets as [index, count] pairs, so windows can be
@@ -190,8 +177,6 @@ std::string render_observation_window(uint64_t start_unix_ms, uint64_t end_unix_
                                       const ObservationSnapshot& window,
                                       const std::map<std::string, uint64_t>& gauges);
 std::string render_observation_event(const ObservationEvent&);
-
-// ---- The file -----------------------------------------------------------
 
 // Appends lines to one file, rotating it to `<path>.1` (replacing any older
 // one) once it reaches max_bytes, so the pair never exceeds about twice that.

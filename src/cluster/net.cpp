@@ -20,37 +20,33 @@
 
 namespace macha {
 namespace {
-// 22 (0.64.0): the metadata snapshot carries torrent requests (SM15/SM16,
-// DLT9). A protocol-21 node would reject those records, full-record
-// fallback included, so the two cannot share a cluster.
+// 22: the metadata snapshot carries torrent requests (SM15/SM16, DLT9),
+// which a protocol-21 node rejects, so the two cannot share a cluster.
 constexpr uint16_t protocol_version = 22;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
 // Fast health/membership RPCs must never queue behind storage-backed control
 // handlers such as metadata checkpointing.
-// A small best-effort notification (telemetry, session gossip) may queue behind
-// work the writer already holds, provided its own payload is under
-// max_notify_payload_bytes and the writer's pending payload is under
-// max_notify_backlog_bytes. Requiring an entirely idle writer instead meant a
-// node stopped being visible to its peers exactly while it was busy. The writer
-// picks by frame priority, so such a frame never overtakes operational RPC, and
-// the bound stops a peer that has stopped draining from accumulating
-// notifications without limit.
+// A small best-effort notification (telemetry, session gossip) may queue
+// behind work the writer holds if its payload is under
+// max_notify_payload_bytes and the writer's backlog under
+// max_notify_backlog_bytes, so a busy node stays visible to its peers. The
+// writer picks by frame priority, so it never overtakes operational RPC; the
+// bound stops a non-draining peer accumulating notifications.
 constexpr size_t max_notify_payload_bytes = 64 * 1024;
 constexpr size_t max_notify_backlog_bytes = 1024 * 1024;
 constexpr size_t fast_control_worker_count = 2;
 constexpr size_t control_worker_count = 2;
 constexpr size_t data_worker_count = 8;
-// Lower-priority object writes/repair must never occupy every execution slot.
-// Keep capacity ready for viewer-blocking reads even when all DATA workers would
-// otherwise already be inside synchronous storage handlers.
+// DATA workers kept free for viewer-blocking reads, so lower-priority writes
+// and repair never occupy every slot.
 constexpr size_t foreground_data_worker_reserve = 2;
 static_assert(foreground_data_worker_reserve < data_worker_count);
 constexpr size_t max_pending_requests = max_pending_rpc_requests;
 constexpr size_t max_peer_outbound = max_peer_outbound_messages;
-// A connection owns at most this many queued payload bytes. The writer may
-// additionally own one dequeued message, itself bounded to the same size.
+// Queued payload bytes per connection; the writer may also hold one
+// dequeued message of at most this size.
 constexpr size_t max_peer_outbound_bytes = 128ULL * 1024 * 1024;
 constexpr size_t max_pre_auth_sessions = 8;
 constexpr auto rpc_handshake_timeout = std::chrono::seconds(5);
@@ -90,12 +86,10 @@ void socket_options(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-    // The OS default first probe is two hours out, which is longer than any
-    // NAT keeps an idle mapping. An idle DATA lane through CGNAT died silently
-    // and the next extent read paid a stall and a redial; for a node that
-    // cannot be dialled the redial can only come from its own side. Probe at
-    // 60 s, every 15 s after that, and give up after four: a dead mapping is
-    // noticed inside two minutes at no application cost.
+    // The OS default first probe (two hours) outlives any NAT mapping, and a
+    // node that cannot be dialled can only redial from its own side. Probe at
+    // 60 s, every 15 s after, give up after four: a dead mapping is noticed
+    // within two minutes at no application cost.
     int keep_idle = 60;
     int keep_interval = 15;
     int keep_count = 4;
@@ -135,10 +129,9 @@ bool allowed_on_lane(TransportLane lane, MessageType type) noexcept {
         return !object_message;
     if (object_message)
         return true;
-    // These are transport/session replies or controls which can legitimately
-    // accompany object traffic on an established DATA session. A ping is
-    // allowed too since 0.42.0: an idle DATA lane carried nothing, so a dead
-    // one (a NAT mapping that expired) was found by the next extent read.
+    // Transport/session replies and controls that may accompany object
+    // traffic on a DATA session; ping too, so an idle lane's dead NAT
+    // mapping is detected.
     return type == MessageType::ok || type == MessageType::error ||
            type == MessageType::session_retire || type == MessageType::promote_read_ahead ||
            type == MessageType::promote_foreground || type == MessageType::cancel_transfer ||
@@ -328,13 +321,10 @@ std::exception_ptr rpc_error(const std::string& text) {
     return std::make_exception_ptr(std::runtime_error(text));
 }
 
-// A notification is advisory: membership gossip carries the same generation,
-// and every caller sits inside something that must not wait on a peer for
-// long (metadata acceptance holds the mutation mutex while it announces).
-// Wait for the writer to send it, but stop waiting the moment the connection
-// is no longer usable, and never beyond a hard bound. The writer abandons the
-// queue on exit, so normally this returns on the promise; the bound is for
-// the case nobody has thought of yet.
+// A notification is advisory (membership gossip carries the same generation)
+// and callers must not wait on a peer for long (metadata acceptance announces
+// under the mutation mutex). Waits for the writer to send it, but stops once
+// the connection is unusable, and never beyond a hard bound.
 template <class Usable>
 void wait_for_notify(std::future<void>& future, Usable&& usable) {
     constexpr auto bound = std::chrono::seconds(5);
@@ -378,18 +368,13 @@ bool is_bulk_message(MessageType type) {
 }
 
 // A request_id of 0 means "no reply expected". Only these types are dispatched
-// to a handler when they arrive that way; anything else is discarded, which is
-// how a gossip type that was never added here goes silently nowhere -- as
-// session_sync did from 0.24.0 until 0.38.0.
+// when they arrive that way; anything else is discarded silently.
 //
-// Session and user gossip ride FrameType::control rather than speculative,
-// unlike telemetry. Speculative maps to MemoryClass::speculative, which is the
-// same budget data work draws from, so periodic control-plane gossip there can
-// take memory a loader or viewer needs -- observed as a hard deadlock in
-// DataResourceArbiter::acquire on a node with a tight data budget. Control has
-// its own reserve and cannot starve data work. The cost is that gossip is
-// written ahead of viewer traffic, which is acceptable only because these
-// payloads are a few hundred bytes and are sent solely when something changed.
+// Session and user gossip ride FrameType::control, not speculative:
+// speculative draws on the DATA memory budget, where periodic gossip could
+// starve (and has deadlocked) loader or viewer work. Control has its own
+// reserve. Writing gossip ahead of viewer traffic is acceptable because
+// these payloads are a few hundred bytes, sent only on change.
 bool is_notification_message(MessageType type) {
     return type == MessageType::telemetry || type == MessageType::session_sync ||
            type == MessageType::user_sync || type == MessageType::dial_request;
@@ -1147,10 +1132,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         std::promise<RpcReply> promise;
         Clock::time_point started{Clock::now()};
         std::atomic<int64_t> last_progress_ns{steady_ns()};
-        // Only a ping's round trip feeds the peer latency estimate: every
-        // other call's elapsed time is mostly payload size and handler work
-        // (a 35 KB commit store, a retention batch), which made a LAN peer
-        // look 114 ms away while its own view of us was 4 ms (2026-09-07).
+        // Only a ping's round trip feeds the latency estimate; other calls'
+        // times are dominated by payload size and handler work.
         bool latency_sample{};
     };
 
@@ -1183,10 +1166,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     size_t outbound_bytes_{}; // queued payload bytes; guarded by outbound_mutex_
     std::map<uint64_t, FrameType> inbound_classes_; // guarded by outbound_mutex_
     std::set<uint64_t> cancelled_inbound_;          // guarded by outbound_mutex_
-    // Outbound request state must survive while the writer has temporarily
-    // removed an item from outbound_ to send one frame. Otherwise promotion or
-    // cancellation that arrives during send_fragment() misses the transfer and
-    // the writer requeues it at the old class (or requeues a cancelled upload).
+    // Kept while the writer has an item dequeued for sending, so a promotion
+    // or cancellation during send_fragment() still applies to it.
     std::map<uint64_t, FrameType> outbound_classes_; // guarded by outbound_mutex_
     std::set<uint64_t> cancelled_outgoing_;          // guarded by outbound_mutex_
     std::atomic_uint64_t next_request_{1};           // TCP dialler owns odd request IDs.
@@ -1341,9 +1322,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
     void cancel_inbound(uint64_t request_id) {
         DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
-        // Unknown cancellation IDs are untrusted wire input, not state. Only a
-        // request which is actually registered inbound may create a cancellation
-        // tombstone; this bounds the set by real in-flight work.
+        // Untrusted input: only a registered inbound request may create a
+        // tombstone, bounding the set by real in-flight work.
         if (!inbound_classes_.contains(request_id))
             return;
         cancelled_inbound_.insert(request_id);
@@ -1436,9 +1416,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     void dispatch_notification(RpcFrame frame) {
         if (!inbound_handler_)
             return;
-        // Notifications have no reply route, but ordinary message handling must
-        // still run on the server's bounded executor rather than this socket
-        // reader. A no-op completion preserves that ownership boundary.
+        // No reply route, but handling still runs on the server's bounded
+        // executor rather than this socket reader.
         inbound_handler_(peer_, std::move(frame), [](const RpcMessage&) {});
     }
 
@@ -1449,13 +1428,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             });
     }
 
-    // Caller holds outbound_mutex_. Every queued frame that somebody is
-    // waiting on is released with an error rather than left on a promise no
-    // thread will ever set. Until 0.43.0 only close() did this; a connection
-    // whose reader noticed the peer had gone (broken_ set, writer exiting)
-    // left its queue behind, and a notify() queued in that window waited on
-    // future.get() forever -- under MetadataManager's mutation mutex, so the
-    // node could never publish again (es-1, 2026-09-15, caught with gdb).
+    // Caller holds outbound_mutex_. Releases every waited-on queued frame
+    // with an error rather than leave a promise no thread will set (a stuck
+    // notify() under the metadata mutation mutex would block publication).
     void abandon_outbound_locked(const char* reason) {
         for (auto& item : outbound_) {
             if (!item.sent)
@@ -1678,11 +1653,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         peer_observer_(peer_);
     }
 
-    // Starts the reader and writer. Called once, by the owner, after
-    // make_shared has returned: a thread started from the constructor could
-    // dispatch a request before the object had an owner, so shared_from_this()
-    // threw, and could reach close() while reader_ and writer_ were still being
-    // assigned. Each thread waits here until both are.
+    // Starts the reader and writer; called once by the owner after
+    // make_shared, so shared_from_this() works and close() cannot race the
+    // assignment of reader_ and writer_. Each thread waits until both are set.
     void start() {
         std::lock_guard starting(start_mutex_);
         reader_ = std::jthread([this](std::stop_token stop) {
@@ -1814,11 +1787,10 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         }
         std::unique_lock lock(outbound_mutex_, std::try_to_lock);
         // A small notification may queue behind existing work; anything larger
-        // still waits for an idle writer so it cannot add queueing delay in
-        // front of operational RPC. Class does not decide this: telemetry rides
-        // SPECULATIVE and is precisely the traffic that must survive a busy
-        // writer, while best_outbound_locked() still sends every more urgent
-        // frame first.
+        // waits for an idle writer so it adds no delay ahead of operational
+        // RPC. Size decides, not class: telemetry rides SPECULATIVE and must
+        // survive a busy writer, and best_outbound_locked() still sends more
+        // urgent frames first.
         if (!lock.owns_lock() || broken_.load())
             return false;
         const bool small_notification = message.payload.size() <= max_notify_payload_bytes;
@@ -1915,12 +1887,10 @@ std::string RpcClient::dial_key(const Endpoint& endpoint, TransportLane lane) {
 }
 
 TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexcept {
-    // Object payloads are the viewer-critical transport and keep the DATA lane
-    // to themselves. Metadata may still carry read-ahead/speculative frame
-    // priorities, so it is dispatched by the data worker pool and fragmented
-    // behind control messages, but it deliberately travels on the separate
-    // CONTROL TCP session. This prevents multi-megabyte namespace CAS/repair
-    // traffic from sharing a socket with foreground media reads.
+    // Object payloads keep the DATA lane to themselves. Metadata may carry
+    // DATA frame priorities and run on the data workers, but travels on the
+    // CONTROL session so multi-megabyte namespace traffic never shares a
+    // socket with foreground media reads.
     if (type == MessageType::get_object || type == MessageType::put_object ||
         type == MessageType::put_object_deferred || type == MessageType::object_durability_barrier)
         return TransportLane::data;
@@ -2039,9 +2009,8 @@ void RpcClient::reconcile_locked(const NodeId& peer, TransportLane lane,
     if (!have_outbound || !have_inbound)
         return;
 
-    // A node that accepts no inbound connections must keep the sessions it
-    // dialled: nothing can replace them from the other side. Its inbound map
-    // should be empty anyway, but never let the id order retire its outbound.
+    // An inbound-incapable node keeps the sessions it dialled: nothing can
+    // replace them from the other side.
     if (local_().id < peer || !local_inbound_capable()) {
         auto fn = inbound->second.retire;
         inbound_routes_.erase(inbound);
@@ -2088,7 +2057,7 @@ void RpcClient::register_inbound(InboundRoute route) {
     }
     for (auto& fn : retire)
         fn();
-    // A caller may be parked in await_reverse_dial() for exactly this route.
+    // await_reverse_dial() may be waiting for this route.
     connection_cv_.notify_all();
 }
 
@@ -2116,10 +2085,8 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                    p != endpoint_peers_.end())
             known = p->second;
 
-        // Retry backoff applies to creating a new TCP connection, not to an
-        // already-established canonical route. A failed dial may leave an
-        // endpoint in backoff just as the peer reconnects inbound; rejecting
-        // that healthy route here creates an unnecessary outage/reconnect loop.
+        // Backoff governs new dials, not an established canonical route: a
+        // peer reconnecting inbound during backoff must not be rejected.
         if (known) {
             if (actual)
                 *actual = *known;
@@ -2140,12 +2107,10 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         if (health != health_.end() && Clock::now() < health->second.retry_after)
             throw std::runtime_error("peer in retry backoff");
 
-        // A peer that accepts no inbound connections is never dialled: its
-        // advertised endpoint is a routing key, not an address anyone can
-        // reach. Ask it to open the lane over the CONTROL session it holds to
-        // us and wait for that to arrive; without such a session there is
-        // nothing to ask over, and the failure is the same transient one a
-        // refused dial would be.
+        // A peer that accepts no inbound connections is never dialled (its
+        // endpoint is only a routing key): ask it over its CONTROL session to
+        // open the lane and wait. With no session the failure is transient, as
+        // a refused dial is.
         if (known && !peer_inbound_capable_locked(*known)) {
             await_reverse_dial(lock, *known, lane, retry_key);
             ++connections_reused_;
@@ -2157,9 +2122,8 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
             break;
 
         connection_cv_.wait(lock, [&] { return !connection_dials_.contains(flight_key); });
-        // The leader may have installed an outbound route, accepted a
-        // simultaneous inbound route, or failed and established retry
-        // backoff. Re-evaluate all three states rather than blindly redialling.
+        // The leader may have installed an outbound route, accepted an inbound
+        // one, or failed into backoff: re-evaluate rather than redial.
         known.reset();
     }
 
@@ -2297,13 +2261,8 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
 
     NodeId actual{};
     auto outbound = connection(endpoint, expected, &actual, lane);
-    // Why the canonical route could not carry this call. Swallowing it was a
-    // real outage: a caller exhausting the connection's shared pending-reply
-    // budget threw "peer pending reply limit reached" here, the reason was
-    // discarded, and every layer above reported "no canonical RPC route to
-    // peer" -- a dead link. On 2026-09-22 that turned a self-inflicted
-    // concurrency limit into hours of ingest failures blamed on the WAN, and
-    // the true message had never once been logged on any node in the cluster.
+    // Keep why the canonical route refused the call (e.g. the shared
+    // pending-reply budget), so it is not reported as a dead link.
     if (outbound && outbound->usable()) {
         try {
             return outbound->call(type, payload, frame_type);
@@ -2313,11 +2272,9 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
     }
     if (auto existing = call_existing(actual, lane, type, payload, frame_type, &route_error))
         return std::move(*existing);
-    // Two nodes that dial each other at once keep one session per lane: the
-    // lower id keeps the one it dialled and retires the other. The higher id's
-    // dial can therefore be retired before it is used, while the peer's own
-    // session has not yet registered here -- a gap of moments, in which a call
-    // used to fail with no route at all. Wait for that session instead.
+    // Simultaneous dials keep one session per lane (the lower id keeps its
+    // own), so the higher id's dial can be retired before the peer's session
+    // registers here. Wait for that session rather than fail.
     if (route_error.empty() && actual != NodeId{} && await_route(actual, lane))
         if (auto existing = call_existing(actual, lane, type, payload, frame_type, &route_error))
             return std::move(*existing);
@@ -2413,7 +2370,7 @@ AsyncRpc RpcClient::stalled_call_for_tests_locked() {
                 held->set_exception(std::make_exception_ptr(
                     std::runtime_error("RPC cancelled: peer is stalled by a test fixture")));
             } catch (const std::future_error&) {
-                // Already released or cancelled; either way it is settled.
+                // Already released or cancelled: settled.
             }
         }
     };
@@ -2463,11 +2420,9 @@ RpcReply RpcClient::call(const NodeInfo& node, MessageType type, std::span<const
 
 namespace {
 
-// Shared wait loop for the two synchronous call() overloads: log a stall
-// notice, and past the no-progress deadline cancel the request and fail it
-// with a transient error the caller retries under its own policy. Before
-// discipline 2 a control call could sit "active while peer health is
-// monitored" for minutes (150-230 s accept_metadata_commit, 2026-09-06).
+// Wait loop for the synchronous call() overloads: log a stall notice and,
+// past the no-progress deadline, cancel and fail with a transient error the
+// caller retries under its own policy.
 RpcReply wait_for_reply(AsyncRpc& async, std::string_view peer, MessageType type,
                         FrameType frame_type, Clock::time_point call_started,
                         std::chrono::milliseconds stall_notice,
@@ -2605,9 +2560,8 @@ bool RpcClient::has_route(const NodeId& peer, TransportLane lane) const {
 
 void RpcClient::await_reverse_dial(std::unique_lock<std::mutex>& lock, const NodeId& peer,
                                    TransportLane lane, const std::string& retry_key) {
-    // Find something to ask over. Only a CONTROL session the peer opened can
-    // exist (that is what "accepts no inbound connections" means), but an
-    // outbound one is honoured too should a test or a misdeclared node have one.
+    // Something to ask over: normally the CONTROL session the peer opened, but
+    // an outbound one (tests, a misdeclared node) is honoured too.
     std::function<bool(const RpcMessage&, FrameType)> try_notify;
     std::function<void(const RpcMessage&)> notify;
     {
@@ -2667,8 +2621,8 @@ void RpcClient::await_reverse_dial(std::unique_lock<std::mutex>& lock, const Nod
                       " accepts no inbound connections and the dial request was not queued";
         }
     }
-    // The same backoff a refused dial earns, so a caller retrying in a loop
-    // does not turn every attempt into another request over the wire.
+    // The backoff a refused dial earns, so a retrying caller does not send a
+    // request over the wire on every attempt.
     lock.unlock();
     observe_result(retry_key, false, std::chrono::milliseconds(0));
     throw std::runtime_error(failure);
@@ -2703,8 +2657,7 @@ void RpcClient::open_requested_lanes(std::stop_token stop) {
         maintained = maintained_peers_;
     }
     // An inbound-incapable node keeps both lanes open to every capable peer
-    // on its own initiative; dial_request only ever covers the window between
-    // a drop and the next pass here.
+    // itself; dial_request only covers the gap until the next pass.
     if (maintained && !local_inbound_capable()) {
         for (const auto& peer : maintained()) {
             if (!node_inbound_capable(peer))
@@ -2724,8 +2677,7 @@ void RpcClient::open_requested_lanes(std::stop_token stop) {
             const Endpoint endpoint{peer.host, peer.port};
             (void)connection(endpoint, &peer.id, nullptr, lane);
         } catch (const std::exception& error) {
-            // "peer in retry backoff" is the ordinary outcome while a peer is
-            // down; the backoff is what keeps this from being a dial loop.
+                // Expected while a peer is down; the backoff prevents a dial loop.
             Log::debug("lane maintenance peer=" + to_string(peer.id).substr(0, 12) + " lane=" +
                        transport_lane_name(lane) + ": " + error.what());
         }
@@ -2818,12 +2770,9 @@ void RpcClient::health_loop(std::stop_token stop) {
         bool done{};
     };
 
-    // Discipline 2 for the probe itself. A ping that never answers used to be
-    // held until the round deadline, which is dead_after -- so the one attempt
-    // consumed the whole liveness budget and the peer expired at the instant
-    // the probe was abandoned, with no retry able to land first. A third of
-    // the budget leaves room for the 50 ms retry path below to establish
-    // health twice more before the peer is declared dead.
+    // A third of the liveness budget per probe, leaving room for two 50 ms
+    // retries before the peer is declared dead; one attempt must not consume
+    // the whole of dead_after.
     const auto probe_attempt_budget =
         std::max(dead_after_ / 3, std::chrono::milliseconds(100));
 
@@ -2841,9 +2790,9 @@ void RpcClient::health_loop(std::stop_token stop) {
             return;
 
         reap_retired();
-        // Lanes a peer asked for, or that this (inbound-incapable) node keeps
-        // open on its own account. Runs on every wake so a dial_request is
-        // answered promptly; the probes below keep their heartbeat cadence.
+        // Requested lanes, and those an inbound-incapable node keeps open.
+        // Every wake, so a dial_request is answered promptly; probes keep
+        // heartbeat cadence.
         open_requested_lanes(stop);
         if (stop.stop_requested())
             return;
@@ -2862,10 +2811,8 @@ void RpcClient::health_loop(std::stop_token stop) {
                 const auto& peer = known->second;
                 if (route_usable_locked(peer, TransportLane::control))
                     active_peers.try_emplace(peer, endpoint);
-                // An idle DATA lane carried nothing until 0.42.0, so a NAT
-                // mapping that expired underneath it was found by the next
-                // extent read. Probe it too -- but only when it exists; a
-                // DATA session is dialled on demand, never to be probed.
+                // Probe an existing DATA lane too, so an expired NAT mapping is
+                // found before the next extent read. Never dial one to probe it.
                 if (route_usable_locked(peer, TransportLane::data))
                     data_peers.try_emplace(peer, endpoint);
             }
@@ -2896,11 +2843,9 @@ void RpcClient::health_loop(std::stop_token stop) {
                             : std::string("health unavailable until dead_after: ") +
                                   probe.last_error;
 
-                    // AsyncRpc::abort() closes the exact PeerConnection/Session
-                    // which owns this failed probe. Do not then close_endpoint():
-                    // the peer may have reconnected on a replacement canonical
-                    // route while this probe was outstanding, and closing by
-                    // NodeId would tear down that new healthy route as collateral.
+                    // abort() closes exactly the route that owns this probe.
+                    // close_endpoint() would also tear down a replacement
+                    // route the peer opened meanwhile.
                     if (probe.rpc) {
                         Log::debug("peer " + endpoint_key(probe.endpoint) + " lane=" +
                                    transport_lane_name(probe.lane) +
@@ -2908,14 +2853,11 @@ void RpcClient::health_loop(std::stop_token stop) {
                         probe.rpc->abort();
                         probe.rpc.reset();
                     } else if (probe.lane == TransportLane::control) {
-                        // No concrete route was ever acquired, so there is no
-                        // route-specific abort target. Clear any stale route/map
-                        // state associated with the endpoint.
+                        // No route was acquired, so clear any stale endpoint state.
                         close_endpoint(probe.endpoint, reason);
                     }
-                    // A DATA probe that never found a route has nothing to
-                    // close: the lane is already gone, and CONTROL decides
-                    // whether the peer itself is dead.
+                    // No route, nothing to close: CONTROL decides whether the
+                    // peer is dead.
                     probe.done = true;
                     --remaining;
                     progressed = true;
@@ -2927,10 +2869,8 @@ void RpcClient::health_loop(std::stop_token stop) {
                         std::future_status::ready) {
                         if (now - probe.attempt_started < probe_attempt_budget)
                             continue;
-                        // Abandon this attempt, not the peer. The retry below
-                        // still has most of the liveness budget to work with,
-                        // and a ping that answers on the second attempt must
-                        // not cost the peer its membership.
+                        // Abandon this attempt, not the peer: the retry still
+                        // has most of the liveness budget.
                         probe.rpc->cancel();
                         probe.rpc.reset();
                         probe.last_error =
@@ -2957,9 +2897,7 @@ void RpcClient::health_loop(std::stop_token stop) {
                         probe.last_error = error.what();
                     }
                     if (probe.lane == TransportLane::data) {
-                        // The session answered with an error or broke: it is
-                        // no longer a usable DATA lane, and the next attempt
-                        // below would only find it gone. Done.
+                        // Error or broken session: no longer a usable DATA lane.
                         probe.done = true;
                         --remaining;
                         continue;
@@ -2975,7 +2913,7 @@ void RpcClient::health_loop(std::stop_token stop) {
                         auto existing = call_existing(probe.peer, TransportLane::data,
                                                       MessageType::ping, {}, FrameType::control);
                         if (!existing) {
-                            // The lane closed between the census and now.
+                            // The lane closed since the census.
                             probe.done = true;
                             --remaining;
                             progressed = true;
@@ -3099,9 +3037,8 @@ void RpcClient::invalidate_identity_association(const IdentityAssociationReset& 
             return identity_reset_matches_node(reset, node);
         };
 
-        // Remove all cached endpoint -> peer associations in scope. For an IP
-        // reset (port == 0), this intentionally covers every advertised port
-        // on that address.
+        // Drop cached endpoint -> peer associations in scope; an IP reset
+        // (port == 0) covers every port on the address.
         for (auto it = endpoints_.begin(); it != endpoints_.end();) {
             if (!endpoint_in_scope(it->second)) {
                 ++it;
@@ -3360,9 +3297,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
     void cancel_inbound(uint64_t request_id) {
         DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
-        // Cancellation IDs are untrusted input. Only remember cancellation for
-        // work this session actually owns, otherwise arbitrary IDs become an
-        // unbounded tombstone set.
+        // Untrusted input: tombstone only work this session owns, keeping the
+        // set bounded.
         if (!inbound_classes.contains(request_id))
             return;
         cancelled_inbound.insert(request_id);
@@ -3586,10 +3522,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 return false;
         }
         std::unique_lock lock(outbound_mutex, std::try_to_lock);
-        // Same rule as the outbound peer connection: a small notification may
-        // queue behind existing work, so telemetry keeps flowing over an
-        // inbound route that is carrying traffic, while anything larger waits
-        // for an idle writer.
+        // As for PeerConnection: a small notification may queue behind
+        // existing work; anything larger waits for an idle writer.
         if (!lock.owns_lock() || !ready.load() || done.load())
             return false;
         const bool small_notification = message.payload.size() <= max_notify_payload_bytes;
@@ -4077,15 +4011,11 @@ void RpcServer::stop() {
     reap_sessions(true);
     Log::debug("shutdown: RPC sessions reaped");
 
-    // Drop what is still queued BEFORE asking the workers to finish. The
-    // worker loops only return once their queue is empty, so with the drop
-    // after the join (as it was until 0.41.0) every request that arrived
-    // before stop() was executed *during* shutdown, against a node whose
-    // outbound transport, retained-memory ledger and local writer had
-    // already been stopped -- and a handler that then blocked blocked the
-    // join, which is what "shutdown: RPC sessions reaped" as the last line
-    // of a hung test looks like. Shutdown owes those callers an error reply,
-    // not an answer.
+    // Drop what is still queued BEFORE asking the workers to finish: worker
+    // loops return only once their queue is empty, so a later drop would
+    // execute every pending request during shutdown against stopped
+    // transport, ledger and writer, and a blocked handler would block the
+    // join. Shutdown owes those callers an error reply.
     std::vector<RpcClient::InboundReply> dropped;
     {
         DiagnosticLock lock(request_mutex_, "rpc.server.queue");
@@ -4214,10 +4144,8 @@ void RpcServer::session_loop(Session* session) {
         pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
         pre_auth_slot = false;
         if (session->channel->lane() == TransportLane::probe) {
-            // A dial-back probe (see MessageType::dial_back_probe): the peer
-            // wanted to know whether this endpoint answers, and the completed
-            // handshake is the whole answer. No route, no observer, no reader
-            // loop -- the teardown below is all that is left to do.
+            // A dial-back probe: the completed handshake is the whole answer.
+            // No route, observer or reader loop; only teardown remains.
             Log::debug("node connection probe accepted peer=" +
                        to_string(session->peer.id).substr(0, 12) + " remote=" +
                        session->remote_host);

@@ -85,14 +85,10 @@ MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_is_process_memory_charged_unt
     delivered = {};
     CHECK(memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] == 0);
 
-    // Reassembly is still bounded by the ledger, but at the non-control
-    // capacity rather than the durable-lower budget. It is deliberately exempt
-    // from the latter: publication holds durable bytes until a peer confirms
-    // the write, and the confirmation is itself an RPC message that has to be
-    // reassembled, so charging reassembly against the budget publication fills
-    // lets a node wedge itself with no way out (es-1, 2026-09-08). The ceiling
-    // here is capacity minus the control reserve -- 3584 of these 4096 -- so
-    // 2000 + 1800 must still be refused.
+    // Reassembly is bounded at the non-control capacity, not the durable-lower
+    // budget: a write's confirmation must be reassembled while publication
+    // holds that budget. The ceiling is 4096 minus the control reserve (3584),
+    // so 2000 + 1800 is refused.
     MessageAssembler saturated(4, 4096, 4096, &memory);
     CHECK(!saturated.push(fragment(2, true, false, 2000)).has_value());
     bool rejected = false;
@@ -107,10 +103,8 @@ MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_is_process_memory_charged_unt
 MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     std::atomic_int cancelled{};
 
-    // AsyncRpc is an owning cancellation handle. Moving it must transfer that
-    // ownership; destruction of the moved-from object must be inert. This is
-    // particularly important on libc++, where std::function's moved-from state
-    // is permitted to remain non-empty.
+    // Moving an AsyncRpc transfers cancellation ownership; the moved-from
+    // object's destruction is inert (libc++ may leave a moved-from std::function non-empty).
     std::optional<AsyncRpc> moved;
     {
         std::promise<RpcReply> promise;
@@ -121,8 +115,7 @@ MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     moved.reset();
     CHECK(cancelled.load() == 1);
 
-    // Move assignment must also cancel any request already owned by the target,
-    // while leaving the source destructor inert.
+    // Move assignment cancels the target's request and leaves the source inert.
     std::promise<RpcReply> first_promise;
     std::promise<RpcReply> second_promise;
     AsyncRpc first(first_promise.get_future(), [&] { ++cancelled; }, {});
@@ -197,8 +190,7 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
     telemetry.port = remote_info.port;
     const RpcMessage notice{MessageType::telemetry, encode_telemetry_set({telemetry})};
 
-    // Production gossips telemetry as SPECULATIVE (NodeRuntime::telemetry_loop).
-    // The dialler-to-acceptor direction enters RpcServer::session_loop.
+    // Telemetry is gossiped as SPECULATIVE. Dialler to acceptor: RpcServer::session_loop.
     REQUIRE(wait_until(
         [&] {
             (void)remote_client.broadcast_best_effort(notice, FrameType::speculative);
@@ -206,9 +198,8 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
         },
         2s));
 
-    // The acceptor-to-dialler direction enters PeerConnection::reader_loop.
-    // Production route reconciliation can retain either direction, so both are
-    // required for cluster-wide Status aggregation.
+    // Acceptor to dialler: PeerConnection::reader_loop. Route reconciliation
+    // may retain either direction, so both must work.
     REQUIRE(wait_until(
         [&] {
             (void)local_client.broadcast_best_effort(notice, FrameType::speculative);
@@ -216,9 +207,7 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
         },
         2s));
 
-    // CONTROL remains a legal class for this message -- validate_frame_semantics()
-    // throws otherwise -- so a caller that wants telemetry on the control lane
-    // is not silently broken by the class the gossip loop happens to use.
+    // CONTROL is also a legal class for telemetry.
     const auto before = local_received.load(std::memory_order_relaxed);
     REQUIRE(wait_until(
         [&] {
@@ -282,8 +271,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
         5s, 30s, 4096);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // A non-multiple of max_frame_size proves that the final frame is naturally
-    // short rather than padded to a fixed transport block size.
+    // Not a multiple of max_frame_size: the final frame is short, not padded.
     auto odd = pattern(12'345);
     auto odd_reply = client.call(endpoint, MessageType::ping, odd, 1s);
     CHECK(odd_reply.message.payload == odd);
@@ -293,22 +281,20 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     CHECK(metadata_reply.message.type == MessageType::ok);
     CHECK(metadata_reply.message.payload == Bytes{0x4d});
 
-    // Content-addressed metadata objects are potentially large and therefore
-    // run at speculative worker priority, but they deliberately stay on the
-    // CONTROL TCP session. Catalogue bootstrap must not require a DATA lane.
+    // Control objects run at speculative priority but stay on the CONTROL
+    // session, so catalogue bootstrap needs no DATA lane.
     auto control_object_reply = client.call(endpoint, MessageType::put_control_object,
                                             Bytes{0x43, 0x41, 0x54}, FrameType::speculative, 2s);
     CHECK(control_object_reply.message.type == MessageType::ok);
     CHECK(client.stats().canonical_connections == 1);
 
-    // Loader has a distinct on-wire value and is valid for bulk DATA without
-    // being interpreted as viewer read-ahead or speculative maintenance.
+    // Loader is its own on-wire class, valid for bulk DATA.
     auto loader_reply =
         client.call(endpoint, MessageType::put_object, Bytes{0x4c}, FrameType::loader, 2s);
     CHECK(loader_reply.message.type == MessageType::ok);
     CHECK(loader_reply.message.payload == Bytes{0x4c});
-    // The control-lane calls above leave a smoothed latency for the peer;
-    // commit fan-out orders replicas by it. Loopback: well under a second.
+    // The calls above leave a smoothed peer latency (commit fan-out orders
+    // replicas by it); on loopback, well under a second.
     {
         const auto latency = client.peer_latency(server_info.id);
         REQUIRE(latency.has_value());
@@ -320,9 +306,8 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
         order.clear();
     }
 
-    // Start a large speculative transfer, then introduce foreground work. The
-    // writer reconsiders priority after every <=4 KiB variable-length frame, so
-    // foreground reaches the server before the speculative message completes.
+    // The writer reconsiders priority after every frame (<= 4 KiB), so
+    // foreground work overtakes a large speculative transfer.
     Bytes speculative(32 * 1024 * 1024, 0x53);
     auto background =
         client.call_async(endpoint, MessageType::put_object, speculative, FrameType::speculative);
@@ -342,10 +327,9 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     REQUIRE(work.frame_timings.contains(FrameType::loader));
     CHECK(work.frame_timings.at(FrameType::loader).requests >= 1);
 
-    // Cancellation can race with the writer while one frame is outside the
-    // outbound deque. The cancelled transfer must not be requeued after that
-    // frame, otherwise the peer sees continuation frames after cancel_transfer
-    // discarded its assembler state and tears down the canonical connection.
+    // A transfer cancelled while one of its frames is outside the outbound
+    // deque is not requeued; the peer would otherwise see continuation frames
+    // after cancel_transfer and tear down the connection.
     Bytes cancelled_payload(32 * 1024 * 1024, 0x43);
     auto cancelled = client.call_async(endpoint, MessageType::put_object, cancelled_payload,
                                        FrameType::speculative);
@@ -367,8 +351,7 @@ MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
     config.metadata_min_write_replicas = 1;
     auto& node = fixture.start();
 
-    // Remove unrelated startup accounting, then prove a user loader write does
-    // not refresh the viewer/read-ahead activity clock used by playback gates.
+    // Clear startup accounting; a loader write must not refresh the viewer clock.
     (void)node.take_activity_bytes(FrameType::read_ahead);
     (void)node.take_activity_bytes(FrameType::foreground);
     (void)node.take_activity_bytes(FrameType::loader);
@@ -380,19 +363,8 @@ MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
 }
 
 MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_own_class) {
-    // The other half of the same rule, and the one that was missing. A loader
-    // write must not look like a viewer -- viewer reserves and the DATA
-    // pressure gate key off the viewer clocks, and conflating them would make
-    // an import look like a viewer and gate other loader work behind it -- but
-    // it must be visible *somewhere*, because law 3 puts it above background
-    // maintenance and maintenance decides it is idle from these clocks.
-    //
-    // Until 0.53.0 there was no loader clock at all, so a node in the middle
-    // of an operator's 36 GB import reported itself idle and handed
-    // maintenance its idle share of the spindle the import was waiting on:
-    // gbni-1 on 2026-09-22 at 91% utilisation, macha-maint reading 51.6 MB/s,
-    // the import's writes getting 2.8 MB/s, with busy_bandwidth_fraction
-    // already set to 0.0 and unable to help.
+    // A loader write is not a viewer, but it must refresh the loader clock:
+    // maintenance ranks below loader work and judges idleness from these clocks.
     TestNode fixture("loader-activity-clock");
     auto& config = fixture.config();
     config.replication = 1;
@@ -413,9 +385,7 @@ MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_o
     CHECK(store.take_foreground_bytes() == 0);
     CHECK(store.take_interactive_bytes() == 0);
 
-    // And it must not be mistaken for somebody watching: the DATA pressure
-    // gate and the torrent rate clamp both ask this question, and an import is
-    // not a viewer.
+    // Not a viewer to the DATA pressure gate or the torrent rate clamp.
     CHECK(!node.viewer_recently_active(30s));
 }
 
@@ -492,11 +462,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retaine
 }
 
 MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
-    // fi-1, 2026-09-25: a 10G store with 81 bytes free, still an owner of
-    // every extent at replicas 2 on two nodes. Each live object cost gbni-1 a
-    // WAN probe and a refused 4 MB put, which spent repair's whole operation
-    // budget; the pull never ran. A peer that advertises no room for an
-    // extent is not a push target.
+    // A peer that advertises no room for an extent is not a push target.
     TestNode fixture("repair-full-peer", ConfigProfile::functional);
     auto& config = fixture.config();
     config.replication = 2;
@@ -555,10 +521,8 @@ MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
 }
 
 MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_with_it) {
-    // fi-1, 2026-09-29: credit accrued at ~50 KB/s (a tenth of a WAN link)
-    // and a repair step could not start below one extent of it, so a pass
-    // probed a handful of objects every ~80 s. Probing is paid for by the
-    // operation budget; credit pays for the bytes of a transfer only.
+    // Probing is paid for by the operation budget; credit pays only for a
+    // transfer's bytes.
     TestNode fixture("repair-credit-gates-transfers", ConfigProfile::functional);
     auto& config = fixture.config();
     config.replication = 2;
@@ -617,8 +581,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_w
     REQUIRE(store.should_own(wanted));
     const auto short_of_an_extent = node.config().extent_size - 1;
 
-    // Push: the peer is probed, and the put is charged the object's own size
-    // (0.72.0 charged a full extent), so it waits for exactly that much.
+    // Push: the peer is probed, and the put waits for credit of the object's own size.
     const std::vector<ObjectId> held_live{held};
     auto push = store.repair_step(held_bytes.size() - 1, 16, held_live);
     CHECK(probes.load() > 0);
@@ -737,9 +700,7 @@ TestNode& repair_fixture(std::optional<TestNode>& slot, const char* name) {
 } // namespace
 
 MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object) {
-    // Until 0.73.0 the push phase asked a peer about one object per round
-    // trip (~90 ms on the WAN between gbni-1 and fi-1) and at most 16 a step.
-    // Now a step asks about its whole window, up to have_valid_objects_max
+    // A push step asks about its whole window, up to have_valid_objects_max
     // objects a request, each checked on the peer as have_object checks one.
     std::optional<TestNode> slot;
     auto& fixture = repair_fixture(slot, "repair-batched-presence");
@@ -763,7 +724,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object
     CHECK(peer.single_probes.load() == 0);
     CHECK(peer.puts.load() == 0);
 
-    // A peer that predates have_valid_objects is asked one object at a time.
+    // A peer without have_valid_objects is asked one object at a time.
     peer.knows_batch = false;
     DistributedStore older(node);
     const auto fallback = older.repair_step(8ULL * 1024 * 1024, 16, live);
@@ -773,10 +734,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object
 }
 
 MACHA_TEST("rpc_cluster", test_repair_pushes_several_objects_at_once) {
-    // gbni-1 to fi-1, 2026-09-29: one push in flight at a time, each waiting
-    // for a WAN round trip and fi-1's durable write, ~0.35 s an object, so
-    // mostly small objects moved at ~500 KB/s with full credit and an idle
-    // link. A step's sends now go out together.
+    // A step's pushes go out together, not one round trip at a time.
     std::optional<TestNode> slot;
     auto& fixture = repair_fixture(slot, "repair-pipelined-pushes");
     auto& node = fixture.start();
@@ -805,11 +763,8 @@ MACHA_TEST("rpc_cluster", test_repair_pushes_several_objects_at_once) {
 }
 
 MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_and_restarts) {
-    // Until 0.73.1 every new live-set generation -- every metadata commit --
-    // sent the push cursor back to the start, and so did every restart; with
-    // have_valid_objects each object passed again is a full read on the peer.
-    // After a restart gbni-1 spent four minutes re-reading the ~2,900 objects
-    // it had already copied to fi-1 before it sent anything new.
+    // The push cursor survives a new live-set generation and a restart; each
+    // object passed again would cost a full read on the peer.
     std::optional<TestNode> slot;
     auto& fixture = repair_fixture(slot, "repair-pass-position");
     auto& node = fixture.start();
@@ -857,9 +812,8 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
 }
 
 MACHA_TEST("rpc_cluster", test_repair_without_a_generation_tells_live_sets_apart_by_identity) {
-    // A caller that gives no generation (repair_once, the tests) changes the
-    // live set by handing over another one: a pass that a new set arrived
-    // part-way through is not reported settled; the same set again is.
+    // With no generation, a pass that a different live set arrived part-way
+    // through is not reported settled; the same set again is.
     std::optional<TestNode> slot;
     auto& fixture = repair_fixture(slot, "repair-live-identity");
     auto& node = fixture.start();
@@ -895,9 +849,8 @@ MACHA_TEST("rpc_cluster", test_repair_without_a_generation_tells_live_sets_apart
 }
 
 MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers) {
-    // gbni-1, 2026-09-29: pushes of 16-100 KB objects to fi-1 estimated the
-    // link at ~20 KB/s -- a round trip and a far-end write, not bandwidth --
-    // on a path that moves 1.3 MB/s, and repair's credit followed it down.
+    // Small-object pushes measure round trips and far-end writes, not
+    // bandwidth, so they must not drag the link estimate down.
     std::optional<TestNode> slot;
     auto& fixture = repair_fixture(slot, "repair-estimate-extents");
     auto& node = fixture.start();
@@ -922,20 +875,16 @@ MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers
     REQUIRE(peer.puts.load() == 2);
     CHECK(extents.estimated_network_bps() > 0.0);
 
-    // What the transport counted: this node's speculative bytes out carry
-    // both objects.
+    // This node's speculative bytes out carry both objects.
     const auto totals = node.traffic_totals();
     CHECK(totals.out_bytes[static_cast<size_t>(FrameType::speculative)] >=
           small_bytes.size() + large_bytes.size());
 }
 
 MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_viewers) {
-    // A peer's viewers share repair's links, so they pace repair as this
-    // node's own viewers do -- weighted turns, never a stop. A node is usually
-    // serving someone, and a copy not restored now makes a later viewer wait.
-    // Here a peer reports viewer traffic for the whole test: the missing copy
-    // must still come back, and the pacer must have taken turns rather than
-    // run unrestricted.
+    // A peer's viewers pace repair as local ones do: weighted turns, never a
+    // stop. With a peer reporting viewer traffic throughout, the missing copy
+    // still comes back and the pacer takes turns.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -1004,12 +953,8 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_v
 }
 
 MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_extent) {
-    // Until 0.62.0 repair decided "this node already holds it" by reading,
-    // decrypting and hashing the whole extent, under a DATA lease, for every
-    // live object on every pass. On gbni-1 that made one pass a full read of
-    // its 1.5 TB store; at a busy node's share it checked about one extent
-    // every thirty seconds and never reached the ones it lacked. Presence is
-    // an index lookup; corruption belongs to scrub and the read path.
+    // Repair checks presence by index lookup, never by reading the extent;
+    // corruption belongs to scrub and the read path.
     TestNode fixture("repair-presence-by-index", ConfigProfile::functional);
     auto& config = fixture.config();
     config.replication = 1;
@@ -1035,17 +980,13 @@ MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_e
     }
     CHECK(examined >= live.size());
     CHECK(node.data_resources().stats().speculative_admissions == before);
-    // And the progress is visible, not just in a trace line.
+    // The progress shows in the diagnostics.
     CHECK(store.repair_diagnostics().pull_examined == examined);
 }
 
 MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_turn_ended) {
-    // Repair yields between operations, never inside one. Until 0.59.0 the
-    // yield predicate was also polled while a pull was in flight: the fetch
-    // was abandoned, or its bytes discarded once they had arrived, so on a
-    // node that was never quiet -- gbni-1, ingesting all day -- a WAN pull
-    // longer than repair's turn could never complete. Here the turn ends the
-    // moment the peer receives the request; the extent must still land.
+    // Repair yields between operations, never inside one: the turn ends the
+    // moment the peer receives the request, and the extent still lands.
     TestNode fixture("repair-in-flight-pull", ConfigProfile::functional);
     auto& config = fixture.config();
     config.replication = 2;
@@ -1151,8 +1092,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     REQUIRE(slow.wait_for(500ms) == std::future_status::ready);
     CHECK(slow.get().message.payload == slow_payload);
 
-    // Empty request immediately follows prior frames on the same channel. This
-    // would desynchronise the old GCM framing bug.
+    // An empty request straight after prior frames on the same channel stays in sync.
     auto empty_reply = client.call(endpoint, MessageType::ping, {}, 1s);
     CHECK(empty_reply.message.type == MessageType::ok);
     CHECK(empty_reply.message.payload.empty());
@@ -1161,10 +1101,8 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     CHECK(stats.connections_created == 1);
     CHECK(stats.connections_reused >= 2);
 
-    // The argument to synchronous call() is now a stall-observation interval,
-    // not a request deadline. A healthy RPC may take arbitrarily longer than
-    // that interval and must still complete without its connection being torn
-    // down merely because wall-clock time elapsed.
+    // call()'s interval observes stalls; it is not a deadline. A healthy RPC
+    // may take far longer and still completes on the same connection.
     Bytes very_slow_payload{1};
     auto started = Clock::now();
     auto very_slow = client.call(endpoint, MessageType::ping, very_slow_payload, 50ms);
@@ -1172,8 +1110,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     CHECK(very_slow.message.payload == very_slow_payload);
     CHECK(Clock::now() - started >= 60ms);
 
-    // The same persistent connection remains usable after a slow request; there is no
-    // timeout-induced backoff/reconnect cycle.
+    // The connection stays usable after a slow request, with no reconnect.
     auto recovered = client.call(endpoint, MessageType::ping, fast_payload, 50ms);
     CHECK(recovered.message.type == MessageType::ok);
     CHECK(client.stats().connections_created == 1);
@@ -1278,8 +1215,7 @@ MACHA_TEST("rpc_cluster", test_rpc_full_extent_reply_uses_owned_transport_handof
     CHECK(reply.message.type == MessageType::object_reply);
     CHECK(reply.message.payload == extent_reply);
 
-    // Moving the handler result into the transport must leave the canonical
-    // fragmented DATA session aligned and reusable.
+    // The fragmented DATA session stays aligned and reusable.
     auto repeated = client.call(server_info, MessageType::get_object, Bytes{0x02},
                                 FrameType::foreground, 2s);
     CHECK(repeated.message.payload == extent_reply);
@@ -1326,8 +1262,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
         return RpcMessage{MessageType::ok, request.payload};
     };
 
-    // Once A has called B, B can originate an RPC back over the accepted socket.
-    // It must not create a second B->A TCP connection.
+    // Once A has called B, B calls back over the accepted socket, not a second connection.
     {
         TestNode a(keys, node_info(), echo);
         TestNode b(keys, node_info(), echo);
@@ -1338,9 +1273,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
               Bytes{2});
         CHECK(b.client.stats().connections_created == 0);
 
-        // DATA is a second independently canonical bidirectional lane. A opens
-        // it lazily; B must reuse the accepted data session rather than dial a
-        // third physical connection back to A.
+        // DATA is a second canonical lane, opened lazily by A; B reuses it.
         CHECK(a.client.call(b.info, MessageType::put_object, Bytes{3}, FrameType::foreground, 1s)
                   .message.payload == Bytes{3});
         CHECK(b.client.call(a.info, MessageType::get_object, Bytes{4}, FrameType::foreground, 1s)
@@ -1351,8 +1284,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
 
     }
 
-    // Simultaneous cross-dial starts with two physical sessions. Both nodes
-    // must select the same winner and all later RPCs must reuse it.
+    // A simultaneous cross-dial: both nodes pick the same winner and reuse it.
     {
         TestNode a(keys, node_info(), echo);
         TestNode b(keys, node_info(), echo);
@@ -1404,8 +1336,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
         CHECK(b.client.stats().connections_created == b_created);
     }
 
-    // Endpoint spelling is not peer identity. A hostname alias can cause a
-    // transient second dial, but authenticated NodeId dedup leaves one route.
+    // A hostname alias may cause a transient second dial; NodeId dedup leaves one route.
     {
         TestNode a(keys, node_info(), echo);
         TestNode b(keys, node_info(), echo);
@@ -1420,10 +1351,8 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
         CHECK(a.client.stats().connections_created == created);
     }
 
-    // A failed dial puts the endpoint into retry backoff, but that backoff must
-    // not mask a canonical route which arrives inbound immediately afterwards.
-    // This is the normal recovery shape when a peer reconnects while the other
-    // side is still remembering the failed outbound attempt.
+    // A failed dial's backoff must not mask a canonical route that arrives
+    // inbound straight afterwards.
     {
         TestNode a(keys, node_info(), echo);
         TestNode b(keys, node_info(), echo);
@@ -1444,16 +1373,13 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
               Bytes{11});
         REQUIRE(wait_until([&] { return a.client.stats().canonical_connections == 1; }));
 
-        // Still inside the failed dial's minimum 250-ms retry-backoff window.
-        // Endpoint lookup must reuse the authenticated inbound route before
-        // consulting dial backoff.
+        // Inside the 250 ms backoff window: the inbound route is used first.
         CHECK(a.client.call(b_endpoint, MessageType::members, Bytes{12}, 1s).message.payload ==
               Bytes{12});
     }
 
-    // Retirement is a drain, not a reset. Force the higher NodeId to have a
-    // slow request outstanding on the connection which cross-dial arbitration
-    // will discard, then create the canonical lower->higher connection.
+    // Retirement is a drain, not a reset: a slow request on the connection
+    // arbitration discards still completes.
     {
         auto first = node_info();
         auto second = node_info();
@@ -1510,15 +1436,9 @@ MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
                a.canonical_connections == 1 && b.canonical_connections == 1;
     }));
 
-    // Simultaneous dials are the subject here: both nodes bootstrap toward
-    // each other, so one can still have a dial in flight when the other's
-    // inbound route has already become canonical, and the loser of that
-    // tie-break counts as a created connection when it lands. The predicate
-    // above cannot see a dial in flight, and sampling before that late dial
-    // landed failed this case once in 5,292 case-runs (2026-09-14). What is
-    // under test is that the churn STOPS, so wait for one quiet window --
-    // six heartbeats with nothing created on either side -- and only then
-    // assert that the next window is quiet too.
+    // A late dial still in flight can land after the route is canonical, so
+    // wait for one quiet window (six heartbeats with nothing created on either
+    // side), then assert that the next is quiet too: the churn stops.
     REQUIRE(wait_until([&] {
         const auto a0 = n1.rpc_stats().connections_created;
         const auto b0 = n2.rpc_stats().connections_created;
@@ -1652,10 +1572,8 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
         20ms, 80ms);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // The 20-ms value below is not a deadline: both 120-ms RPCs are healthy and
-    // must complete without the peer transport being destroyed. They also
-    // outlive the 80-ms peer-death window while priority control pings on the independent control
-    // connection prove that the peer itself remains alive.
+    // 20 ms is not a deadline: both 120 ms RPCs complete, outliving the 80 ms
+    // peer-death window while control pings prove the peer alive.
     Bytes object_payload(256 * 1024, 0x5a);
     auto data = client.call_async(endpoint, MessageType::put_object, object_payload);
     std::this_thread::sleep_for(5ms);
@@ -1759,8 +1677,7 @@ MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
         100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Occupy every data worker. Health and membership use a separate control TCP
-    // stream and must remain prompt regardless of data-lane work.
+    // With every data worker busy, health and membership stay prompt on the control stream.
     std::vector<AsyncRpc> bulk;
     for (int i = 0; i < 8; ++i)
         bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x5a},
@@ -1790,17 +1707,9 @@ MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
 }
 
 MACHA_TEST("rpc_cluster", test_have_objects_flood_does_not_delay_unrelated_control_rpc) {
-    // Governing invariant from the 2026-09-06 retention-check-batching
-    // incident: a flood of retention-check traffic (have_object/have_objects)
-    // must never be able to delay an unrelated control-plane message,
-    // unconditionally -- not "should usually hold," under an
-    // adversarial-sized batch. have_objects (like have_object and
-    // retain_objects before it) always uses a data-lane FrameType
-    // (loader/speculative), which RpcServer routes to data_workers_ --  a
-    // pool entirely separate from the fast_control_workers_/control_workers_
-    // pools that service ping/members/put_control_object/etc regardless of
-    // frame type. This test proves that separation holds even when every
-    // data worker is simultaneously blocked servicing have_objects.
+    // Retention checks (have_objects) use a data-lane FrameType and so run on
+    // data_workers_; with every data worker blocked on them, control messages
+    // on the control pools are not delayed.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto port = free_port();
@@ -1841,9 +1750,7 @@ MACHA_TEST("rpc_cluster", test_have_objects_flood_does_not_delay_unrelated_contr
         100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Occupy every data worker with have_objects requests, exactly the shape
-    // an adversarially large retain_data() batch produces. Health and
-    // membership must remain prompt regardless.
+    // Every data worker busy with have_objects, as a large retain_data() batch makes it.
     std::vector<AsyncRpc> bulk;
     for (int i = 0; i < 8; ++i)
         bulk.push_back(
@@ -1909,9 +1816,7 @@ MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) 
         100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Occupy both ordinary control handlers with storage-shaped work. Health
-    // and membership must use the reserved fast-control executor rather than
-    // queue behind those handlers.
+    // With both control handlers busy, health and membership use the fast-control executor.
     auto slow1 =
         client.call_async(endpoint, MessageType::have_object, Bytes{1}, FrameType::control);
     auto slow2 =
@@ -1939,11 +1844,8 @@ MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) 
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_call_fails_after_no_progress_deadline) {
-    // Discipline 2: a control call that makes no progress must fail with a
-    // transient error after the deadline instead of "remaining active while
-    // peer health is monitored" indefinitely. A call that is merely slow but
-    // finishes inside the deadline is unaffected, and a zero deadline keeps
-    // the old wait-forever behaviour.
+    // A control call that makes no progress fails with a transient error at
+    // its deadline; a slow call inside it is unaffected; zero means no deadline.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto port = free_port();
@@ -2063,8 +1965,8 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
         100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // One metadata mutation may execute while two more wait in the dedicated
-    // bounded queue. These cover every mutation RPC routed to the executor.
+    // One metadata mutation executes while two wait in its bounded queue,
+    // covering every mutation RPC routed to the executor.
     auto history =
         client.call_async(endpoint, MessageType::put_metadata_history_entry, Bytes{0x01, 0x02});
     REQUIRE(metadata_gate.wait_for_entries(1));
@@ -2079,15 +1981,12 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
         },
         2s));
 
-    // Job-count pressure is explicit: overload receives an ordinary RPC error
-    // without closing the session or occupying a control/data worker.
+    // A full queue answers with an ordinary RPC error; the session stays open.
     auto queue_full = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{0x07});
     REQUIRE(queue_full.wait_for(1s) == std::future_status::ready);
     CHECK(queue_full.get().message.type == MessageType::error);
 
-    // Health, membership, speculative storage validation, and foreground DATA
-    // work all complete while the metadata worker and queue remain deliberately
-    // blocked.
+    // Other classes of work complete while the metadata worker and queue are blocked.
     CHECK(client.call(endpoint, MessageType::ping, {}, 100ms).message.type == MessageType::ok);
     CHECK(client.call(endpoint, MessageType::members, {}, 100ms).message.type ==
           MessageType::members_reply);
@@ -2109,16 +2008,15 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
         },
         2s));
 
-    // Payload-byte pressure is enforced even when no other metadata work is
-    // present; the rejected job never reaches the handler.
+    // The payload-byte limit applies with no other metadata work queued; the
+    // rejected job never reaches the handler.
     auto too_large =
         client.call_async(endpoint, MessageType::accept_metadata_commit, Bytes(9, 0x0a));
     REQUIRE(too_large.wait_for(1s) == std::future_status::ready);
     CHECK(too_large.get().message.type == MessageType::error);
     CHECK(metadata_calls.load() == 3);
-    // Every other executor class has an independent byte owner as well. A
-    // rejected payload never enters a queue and cannot consume another class's
-    // reserved memory.
+    // Every executor class has its own byte limit; a rejected payload never
+    // enters a queue.
     auto fast_too_large = client.call_async(endpoint, MessageType::ping, Bytes(2, 0x11));
     auto validation_too_large =
         client.call_async(endpoint, MessageType::have_object, Bytes(2, 0x12));
@@ -2227,8 +2125,8 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
     auto same_peer_next = client_a.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
     auto other_peer = client_b.call_async(endpoint, MessageType::put_metadata_commit, Bytes{3});
 
-    // The second worker may serve another peer, but it must not allow one
-    // peer's acceptance/store sequence to overtake that peer's blocked owner.
+    // The second worker may serve another peer, but never overtakes this
+    // peer's blocked sequence.
     REQUIRE(wait_until([&] { return second_peer_started.load(); }, 2s));
     CHECK(!first_peer_second_started.load());
 
@@ -2284,15 +2182,13 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect
     auto queued = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
     REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 1; }, 2s));
 
-    // A queued job has not crossed a durability boundary and is removed by an
-    // ordinary transfer cancellation without ever entering the handler.
+    // A queued job is removed by cancellation without entering the handler.
     queued.cancel();
     REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 0; }, 2s));
     CHECK(handler_calls.load() == 1);
 
-    // Once execution owns a job, disconnecting its reply route must not cancel
-    // work across an unknown durability boundary. It finishes independently;
-    // the now-detached reply is simply discarded.
+    // A running job is not cancelled by losing its reply route; it finishes
+    // and the reply is discarded.
     before_durability.open();
     REQUIRE(after_durability.wait_for_entries(1));
     CHECK(durable_jobs.load() == 1);
@@ -2341,8 +2237,7 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_shutdown_finishes_owner_and
     REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 1; }, 2s));
 
     auto stopping = std::async(std::launch::async, [&] { server.stop(); });
-    // Closing the session detaches both client replies before the running
-    // durability owner is released. The queued request can no longer execute.
+    // Closing the session detaches both replies; the queued request never executes.
     REQUIRE(running.wait_for(2s) == std::future_status::ready);
     REQUIRE(queued.wait_for(2s) == std::future_status::ready);
     running_gate.open();
@@ -2407,10 +2302,8 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     });
     REQUIRE(blocked.wait_for_entries(1));
 
-    // This is the live node-50 failure shape: a synchronous RPC is still
-    // outstanding when Service joins its maintenance owner. Shutdown must close
-    // outbound routes first, causing the call to fail without waiting for its
-    // ordinary peer-health/stall deadline.
+    // Shutdown closes outbound routes first, so an outstanding synchronous RPC
+    // fails without waiting for its stall deadline.
     const auto started = Clock::now();
     auto stopping = std::async(std::launch::async, [&] { service.stop(); });
     REQUIRE(stopping.wait_for(2s) == std::future_status::ready);
@@ -2419,9 +2312,7 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     REQUIRE(pending.wait_for(1s) == std::future_status::ready);
     CHECK(pending.get());
 
-    // Cancellation is a shutdown state, not merely a one-shot connection
-    // close. A maintenance pass already between stop checks must not recreate a
-    // route and begin another synchronous RPC after the first close completes.
+    // Cancellation persists: no new route or synchronous RPC after the close.
     const auto retry_started = Clock::now();
     bool retry_rejected = false;
     try {
@@ -2468,8 +2359,7 @@ MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) 
         100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // Loader work may use most of the DATA execution pool, but it must
-    // leave execution capacity for a playback/seek read that arrives later.
+    // Loader work leaves DATA execution capacity for a later playback read.
     std::vector<AsyncRpc> bulk;
     for (int i = 0; i < 8; ++i)
         bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x42},
@@ -2493,21 +2383,14 @@ MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) 
 }
 
 MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_gives_up_when_nothing_is_moving) {
-    // A DATA credit wait with no caller deadline used to wait for ever. A
-    // caller that holds credit while acquiring more therefore hung silently
-    // and permanently instead of failing -- exactly what
-    // test_storage_data_credit_reserves did on any host with fewer than six
-    // cores, where it sat for 360 s with no diagnostic of any kind.
-    //
-    // Waiting is still correct under contention: any release anywhere resets
-    // the window, so a waiter behind genuine work waits as long as it takes.
-    // Only a wholly stalled arbiter gives up.
+    // A DATA credit wait with no deadline gives up only when the arbiter is
+    // wholly stalled; any release resets the window, so contention still waits.
     constexpr uint64_t capacity = 4 * 1024 * 1024;
     constexpr uint64_t reserve = 1024 * 1024;
     constexpr uint64_t chunk = 1024 * 1024;
 
-    // background_concurrency 2, so a third loader acquire can never be
-    // admitted while the first two are held -- the live wedge, reproduced.
+    // background_concurrency 2: a third loader acquire cannot be admitted
+    // while the first two are held.
     DataResourceArbiter arbiter(capacity, reserve, 2, 200ms);
     auto context = DataWorkContext(FrameType::loader, chunk);
     auto first = arbiter.acquire(context, chunk);
@@ -2519,23 +2402,20 @@ MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_gives_up_when_nothing_is_mo
     auto third = arbiter.acquire(context, chunk);
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - started);
-    // Fails visibly rather than hanging, and reports it rather than returning
-    // an indistinguishable empty optional in silence.
+    // It gives up after the no-progress window instead of hanging.
     CHECK(!third.has_value());
     CHECK(waited >= 200ms);
     CHECK(waited < 5s);
 
-    // And releasing makes room again, so the arbiter is not left poisoned by
-    // having given up once.
+    // Releasing makes room again: giving up once does not poison the arbiter.
     first.reset();
     auto fourth = arbiter.acquire(context, chunk);
     CHECK(fourth.has_value());
 }
 
 MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_survives_genuine_contention) {
-    // The other half: a waiter must NOT give up while work is flowing. Here a
-    // holder releases inside the no-progress window, so the window resets and
-    // the waiter is admitted rather than abandoned.
+    // A waiter does not give up while work flows: a release inside the
+    // no-progress window resets it, and the waiter is admitted.
     constexpr uint64_t capacity = 4 * 1024 * 1024;
     constexpr uint64_t reserve = 1024 * 1024;
     constexpr uint64_t chunk = 1024 * 1024;
@@ -2557,11 +2437,8 @@ MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_survives_genuine_contention
 }
 
 MACHA_TEST("rpc_cluster", test_a_namespace_node_below_the_floor_is_metadata_not_ready) {
-    // 2026-09-24, gbni-1: "ingest failed: namespace node could not reach the
-    // metadata durability floor" while its only peer restarted. The failure
-    // is transient cluster state and must carry the type callers retry on;
-    // as a bare runtime_error it failed the ingest that 0.57.0 was meant to
-    // keep alive.
+    // Missing the metadata durability floor is transient cluster state and
+    // must carry the type callers retry on.
     TestService fixture("namespace-node-below-floor", ConfigProfile::isolated);
     fixture.config().replication = 1;
     fixture.config().metadata_min_write_replicas = 1;
@@ -2579,11 +2456,8 @@ MACHA_TEST("rpc_cluster", test_a_namespace_node_below_the_floor_is_metadata_not_
 }
 
 MACHA_TEST("rpc_cluster", test_a_local_control_object_is_found_while_data_credit_is_exhausted) {
-    // 2026-09-23: ensure_control_local took a 4 MiB speculative DATA credit to
-    // validate an 18 KB local control object; under DATA pressure the wait
-    // was abandoned, retain_control failed, and seven ingests died with
-    // "CONTROL retention floor unavailable". The control store is not on the
-    // DATA device and must not wait for its credit.
+    // The control store is not on the DATA device: validating a local control
+    // object never waits for DATA credit.
     TestService fixture("control-local-without-data-credit", ConfigProfile::isolated);
     auto& config = fixture.config();
     config.replication = 1;
@@ -2615,14 +2489,8 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     const auto extent = config.extent_size;
     config.data_inflight_bytes = 4 * extent;
     config.data_viewer_reserve_bytes = extent;
-    // This test is about the BYTE budget and the viewer reserve, not the
-    // background concurrency ceiling, so state the ceiling rather than
-    // inheriting it. Left unset it defaults to hardware_concurrency() / 2
-    // (NodeRuntime's constructor), and the three loader acquires below then
-    // wedge on any host with fewer than six cores -- acquire() takes no
-    // deadline, so it waits for ever rather than failing. Every node in a
-    // typical deployment is a four-core board; this deadlocked on all of them
-    // while passing on the developer's twelve-core machine.
+    // Fix the ceiling: its default, hardware_concurrency() / 2, would block the
+    // three loader acquires below on hosts with fewer than six cores.
     config.maintenance.background_concurrency = 4;
     auto& node = fixture.start();
 
@@ -2645,10 +2513,8 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     client_info.failure_domain = "client-site";
     RpcClient client(fixture.keys(), [client_info] { return client_info; },
                      [](const NodeInfo&) {}, [](uint64_t) {}, 500ms, 100ms, 2s);
-    // The node records this client as a peer from the handshake and pings it
-    // back over the same connection. A client with no inbound handler throws
-    // on that ping, which closes the connection and fails every call pending
-    // on it -- 10-15/20 on a busy laptop. Serve inbound like a node does.
+    // The node pings this client back over the same connection as a peer;
+    // without an inbound handler that ping would close it and fail pending calls.
     RpcServer client_server(
         "127.0.0.1", client_info.port, fixture.keys(), client_info,
         [](const NodeInfo&, FrameType, const RpcMessage&) {
@@ -2665,8 +2531,7 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
                                             FrameType::loader);
     REQUIRE(wait_until([&] { return node.data_resources().stats().loader_waits >= 1; }, 1s));
 
-    // The storage-backed viewer request uses the reserved physical DATA credit,
-    // while fast CONTROL remains wholly outside the DATA arbiter.
+    // The viewer request uses the reserved DATA credit; fast CONTROL is outside the arbiter.
     auto viewer_started = Clock::now();
     auto viewer = client.call(endpoint, MessageType::get_object, request.data(),
                               FrameType::foreground, 500ms);
@@ -2678,9 +2543,8 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     CHECK(control.message.type == MessageType::ok);
     CHECK(Clock::now() - control_started < 200ms);
 
-    // Presence validation decrypts and hashes the complete stored object. Its
-    // default RPC classification must therefore enter speculative DATA
-    // admission rather than execute synchronously on a CONTROL worker.
+    // Presence validation reads the whole object, so it goes through
+    // speculative DATA admission, not a CONTROL worker.
     auto blocked_validation =
         client.call_async(endpoint, MessageType::have_object, request.data());
     REQUIRE(blocked_validation.wait_for(1s) == std::future_status::ready);
@@ -2710,26 +2574,17 @@ MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
     auto pf = free_port();
     auto ps = free_port();
 
-    // This test is specifically about object PUT quorum latency. Keep metadata
-    // consensus out of the test and use two deterministic RPC peers rather than
-    // relying on service discovery/background maintenance to make the fast peer
-    // reachable. That removes a platform/timing dependency which made this test
-    // intermittently (and on macOS, consistently) fail before the assertion it
-    // was intended to exercise.
+    // Object PUT quorum latency only: metadata consensus is kept out, and the
+    // two peers are injected rather than discovered.
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     c1.dead_after = 3s;
     c1.metadata_min_write_replicas = 1;
-    // Keep the node's background membership exchange out of this latency test.
-    // The peers are injected directly below; the test should measure object
-    // quorum completion, not race a 100ms control-plane scheduler.
+    // Keep background membership exchange out of the measurement.
     c1.heartbeat = 10s;
     Service s1(c1, keys);
     s1.start();
     // start() returns while local storage is still recovering, and put()
-    // below refuses ("data storage is still recovering") until it is not.
-    // Nothing else in this test touches the service before that put, so
-    // there is no implicit wait; with DEBUG logging slowing startup this
-    // failed 6 of 10 runs (2026-09-14).
+    // refuses until it has.
     REQUIRE(s1.node().wait_local_state_ready(10s));
 
     NodeInfo fast_info;
@@ -2836,9 +2691,8 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
     node.membership().observe(slow2, true);
     REQUIRE(node.membership().active().size() == 3);
 
-    // R=3 is a convergence target, not a foreground quorum. With W=1 the
-    // durable local placement satisfies publication immediately; slow desired
-    // replicas must not even be placed on the foreground critical path.
+    // R=3 is a convergence target, not a foreground quorum: with W=1 the local
+    // copy publishes at once, and slow replicas stay off the critical path.
     DistributedStore store(node);
     auto data = pattern(128 * 1024);
     auto id = object_id(data);
@@ -2848,10 +2702,8 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
     CHECK(elapsed < 500ms);
     CHECK(node.local_store().has(id));
 
-    // The second copy is not the foreground's problem, but it is not left to
-    // the repair cursor either: the prompt-replication worker pushes the
-    // object to a placement owner right away (it is what the stalled fake
-    // owners receive, once their gate opens).
+    // The prompt-replication worker pushes the second copy to a placement
+    // owner without waiting for repair.
     stalled_owner_gate.open();
     REQUIRE(wait_until([&] { return stalled_owner_gate.entered() >= 1; }, 10s));
     REQUIRE(wait_until([&] { return store.prompt_replication_stats().copies >= 1; }, 10s));
@@ -2860,10 +2712,7 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
 }
 
 MACHA_TEST("rpc_cluster", test_prompt_replication_sends_nothing_to_a_full_owner) {
-    // 0.64.1. Every new object went to fi-1, whose backend had 81 bytes free;
-    // each 4 MB put was refused and resent every 30 s for ever, about 2 MB/s
-    // into Finland, counted nowhere. An owner that gossips no room is not a
-    // destination, and the object is left to repair.
+    // An owner that gossips no room is not a destination; the object is left to repair.
     TestNode fixture("full-owner", ConfigProfile::functional);
     auto& config = fixture.config();
     const auto& keys = fixture.keys();
@@ -2946,11 +2795,8 @@ MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
     }
     REQUIRE(ranked.size() == 2);
 
-    // A synchronous call_async() failure must not increment a dead
-    // "completed" counter but was not treated as a failed replica. With no
-    // pending RPC, the quorum loop then slept forever instead of trying the
-    // deterministic fallback owner. Keep a cancellation watchdog so this
-    // regression fails boundedly rather than hanging the entire test binary.
+    // A synchronous call_async() failure counts as a failed replica, so the
+    // quorum loop tries the fallback owner. The watchdog bounds a hang.
     std::atomic_bool cancelled{false};
     std::jthread watchdog([&](std::stop_token stop) {
         const auto deadline = Clock::now() + 2s;
@@ -2979,9 +2825,8 @@ MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
     config.metadata_min_write_replicas = 1;
 
     auto& service = fixture.start();
-    // Bootstrap-configured pristine nodes retain genesis only as local codec
-    // material. It is not accepted authority and must never be advertised to
-    // an established cluster while the joiner is disconnected.
+    // A pristine bootstrap node holds genesis only as local codec material,
+    // never advertised as accepted authority.
     CHECK(service.node().metadata_replica().accepted_heads().empty());
     bool rejected = false;
     try {
@@ -3006,11 +2851,9 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     NodeRuntime node(config, keys);
     node.start();
 
-    // Keep an unreachable peer in active membership and choose its identity so
-    // the old placement scheme would have selected this fresh node as a genesis
-    // authority. This deterministically exercises the dangerous path: both metadata
-    // RPC surveys fail, yet a replication-1 joiner could previously form an
-    // empty generation-2 namespace on itself.
+    // An unreachable peer in active membership, with an identity that makes
+    // this fresh node a placement candidate: both metadata surveys fail, and
+    // the replication-1 joiner must not form an empty generation-2 namespace.
     static constexpr char label[] = "macha/metadata-placement/v1";
     const auto placement_key = sha256({reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1});
     NodeInfo phantom;
@@ -3109,12 +2952,8 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    // Reachability deliberately precedes local metadata recovery. This test is
-    // about an already-established write floor, so make both metadata planes
-    // ready before creating that established history. Membership alone does not
-    // say that: the replica set can still be waiting on its bootstrap
-    // checkpoint survey, and the mkdir below is then refused for a reason that
-    // has nothing to do with what this test checks.
+    // Reachability precedes metadata recovery; make both metadata planes
+    // ready before establishing history.
     (void)s1.filesystem();
     (void)s2.filesystem();
     REQUIRE(wait_metadata_writable(s1));
@@ -3135,8 +2974,7 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
     s3.start();
     REQUIRE(wait_until([&] { return s1.node().membership().active().size() >= 3; }));
 
-    // The bad peer is quarantined from metadata writes; it cannot reduce the
-    // availability of the two policy-compatible replicas which already satisfy W=2.
+    // The quarantined peer cannot block the two compatible replicas that satisfy W=2.
     s1.filesystem().mkdir("/still-writable", 0755, getuid(), getgid());
     REQUIRE(wait_until([&] {
         try {
@@ -3186,8 +3024,7 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
                s2.node().membership().active().size() >= 2;
     }));
 
-    // Both peers may attempt genesis simultaneously after symmetric discovery.
-    // Competing generation-2 proposals must converge on one metadata history.
+    // Both peers may attempt genesis at once; competing proposals converge on one history.
     std::exception_ptr first_error;
     std::exception_ptr second_error;
     std::atomic<unsigned> ready{};
@@ -3297,9 +3134,8 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    // Equal generation is not convergence: simultaneous founders can briefly
-    // hold distinct same-generation heads.  Establish a single shared head so
-    // later reconciliation cannot pollute the burst/coalescing counters.
+    // Equal generation is not convergence; wait for one shared head so later
+    // reconciliation does not pollute the burst counters.
     REQUIRE(wait_until(
         [&] {
             const auto d1 = s1.metadata_convergence_diagnostics();
@@ -3460,9 +3296,8 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     REQUIRE(repair_gate1.wait_for_entries(1, 5s));
     REQUIRE(repair_gate2.wait_for_entries(1, 5s));
 
-    // Prime node 1's remote generation to the sibling generation. The next
-    // notice therefore carries no numeric advance; its only new information is
-    // that node 2's accepted-head topology changed at the same generation.
+    // Prime node 1 with the sibling generation, so the next notice's only news
+    // is a changed accepted-head topology at the same generation.
     s2.node().announce_metadata_generation(left.generation);
     REQUIRE(
         wait_until([&] { return s1.node().remote_metadata_generation() == left.generation; }, 5s));
@@ -3478,9 +3313,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         },
         2s));
 
-    // Installing identical acceptance evidence changes no accepted-head
-    // topology and must therefore produce neither a local event nor a remote
-    // rebroadcast.
+    // Identical acceptance evidence produces no local event and no rebroadcast.
     std::this_thread::sleep_for(100ms);
     const auto before_duplicate1 = s1.metadata_convergence_diagnostics();
     const auto before_duplicate2 = s2.metadata_convergence_diagnostics();
@@ -3525,9 +3358,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         },
         10s));
 
-    // The first write after a reconciliation used to be forced to a full
-    // snapshot because DLT5 could not clear the merge commit's merge_parents.
-    // DLT6 can, so it must stay a compact delta over the merge commit.
+    // The first write after a reconciliation is a compact delta over the merge commit.
     auto merge_heads = s1.node().metadata_replica().accepted_heads();
     REQUIRE(merge_heads.size() == 1);
     const auto merge_head = merge_heads.front();
@@ -3549,23 +3380,10 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
 }
 
 MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_reconciliation) {
-    // What this measures: several foreground readers on ONE node all observe
-    // the same two-head divergence, and reconciliation_mutex_ makes exactly
-    // one of them mint the merge commit. That is a property of one
-    // MetadataManager, so that is all this runs: bare NodeRuntimes and one
-    // manager, no Service.
-    //
-    // Until 0.43.0 this ran two Services and failed 1 in 4 on the Pis, in
-    // two ways that were the same fault. Accepting a sibling head announces
-    // it (NodeRuntime::accept_metadata_commit -> announce_metadata_generation),
-    // and both Services' maintenance loops react to that notice by
-    // reconciling -- which is the product working as designed. Depending on
-    // how far that background merge had got when the test looked, either
-    // the setup assertion saw one head instead of two, or the merge frame
-    // had already been appended before history_before was read and the
-    // readers found nothing left to reconcile (history 0, not 1). Neither
-    // is what this case is about, and the earlier metadata_cache = 0 fix
-    // below closed only the cache half of the same race.
+    // Several readers on one node observe the same two-head divergence, and
+    // reconciliation_mutex_ makes exactly one mint the merge commit. Bare
+    // NodeRuntimes and one manager, no Service: a Service's maintenance would
+    // reconcile in the background.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -3578,9 +3396,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     c1.replication = c2.replication = 2;
     c1.min_write_replicas = c2.min_write_replicas = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
-    // read_record() serves from the process cache first, and read_group()'s
-    // single-head path caches whichever head it saw. No TTL: every reader
-    // must actually read.
+    // No cache TTL: every reader must actually read.
     c1.metadata_cache = std::chrono::milliseconds(0);
 
     NodeRuntime n1(c1, keys);
@@ -3597,8 +3413,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         10s));
 
     MetadataManager metadata1(n1);
-    // One committed mutation, so the base the siblings fork from is a real
-    // post-genesis record rather than the protocol genesis.
+    // One mutation, so the siblings fork from a real post-genesis record.
     metadata1.mutate([](MetadataSnapshot& snapshot) {
         FsEntry entry;
         entry.type = EntryType::directory;
@@ -3609,9 +3424,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     });
     REQUIRE(n1.metadata_replica().committed_generation() > 1);
 
-    // Create a genuine two-head divergence on node 1 alone, bypassing RPC, via
-    // the same locally-authored-sibling pattern as
-    // test_service_same_generation_sibling_notice_triggers_reconciliation.
+    // A two-head divergence on node 1 alone, from a locally authored sibling.
     const auto base = n1.metadata_replica().committed();
     auto make_sibling = [&](NodeRuntime& node, const std::string& path) {
         auto snapshot = decode_snapshot(base.payload);
@@ -3646,9 +3459,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
 
     const auto history_before = n1.metadata_replica().diagnostics().history_records;
 
-    // Several concurrent foreground reads all observe the same divergence.
-    // Before the reconciliation_mutex_ fix, each could independently merge
-    // and publish its own commit; this asserts exactly one is produced.
+    // Concurrent reads all observe the divergence; exactly one merge commit results.
     constexpr int reader_count = 8;
     std::vector<std::thread> readers;
     std::vector<MetadataRecord> results(reader_count);
@@ -3677,12 +3488,8 @@ MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configure
     c1.ingest.enabled = false;
     c1.torrent.enabled = false;
 
-    // Stall local-state readiness forever -- simulating the "readiness never
-    // completes and never fails" internal stall this fix targets -- using the
-    // same stage-gating pattern as
-    // test_control_plane_and_status_api_are_online_while_backends_recover.
-    // The injected StartupStallHandler lets the test observe the timeout
-    // firing without the process actually terminating.
+    // Stall local-state readiness forever; the injected StartupStallHandler
+    // observes the timeout without terminating the process.
     TestGate stall_gate;
     std::atomic_bool handler_called{false};
     std::string diagnostic;
@@ -3718,23 +3525,19 @@ MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configure
 
     CHECK(threw);
     CHECK(handler_called.load(std::memory_order_acquire));
-    // Must resolve close to the configured bound, not hang indefinitely --
-    // the direct regression check for the previously-unbounded wait.
+    // Resolves near the configured bound rather than hanging.
     CHECK(elapsed >= 150ms);
     CHECK(elapsed < 5s);
     CHECK(diagnostic.find("data_storage=recovering") != std::string::npos);
 
-    // Let the still-stalled initialise_services() thread proceed so ordinary
-    // shutdown can join it cleanly rather than hanging on the same stall.
+    // Release the stalled initialise_services() thread so shutdown can join it.
     stall_gate.open();
     service.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_service_startup_gate_waits_while_recovery_progresses) {
-    // Discipline 2: the startup gate must not kill a recovery that is slow
-    // but progressing (gbni-1 crash-looped eight times on a 120 s elapsed
-    // gate during a 5-minute replay on 2026-09-06), and must still kill one
-    // that has genuinely stopped.
+    // The startup gate spares a slow but progressing recovery and still kills
+    // one that has stopped.
     TestCluster cluster;
     auto c1 = config_for(cluster.path() / "progressing-startup", cluster.keyfile(), free_port());
     c1.service_startup_timeout = 0ms;            // no absolute ceiling
@@ -3815,14 +3618,8 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
         config->min_write_replicas = 1;
         config->metadata_min_write_replicas = 2;
         config->heartbeat = 50ms;
-        // Not 200 ms: that asserted that every ping on a laptop running
-        // twelve test processes completes in 200 ms, which is not this
-        // test's subject and is false often enough (1 in 12 full-suite runs,
-        // 2026-09-14) that n1 and n2 declared each other dead, flapped in a
-        // 4 s cycle and the node could not converge. Same reasoning as
-        // test_catalogue_uses_final_state_after_coalesced_metadata_burst:
-        // liveness comfortably above scheduler jitter, with the 5 s wait
-        // below still long enough to see s3 drop out at this value.
+        // Well above scheduler jitter, yet short enough for the 5 s wait below
+        // to see s3 drop out.
         config->dead_after = 2s;
         config->catalogue.scanner.enabled = false;
         config->catalogue.api.enabled = false;
@@ -3915,9 +3712,7 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
 }
 
 MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_resumes_when_it_returns) {
-    // 2026-09-23: seven ingests died with "CONTROL retention floor
-    // unavailable" -- MetadataNotReady, a cluster condition that passed within
-    // minutes. An ingest that meets it now blocks with metadata_unavailable and
+    // An ingest that meets MetadataNotReady blocks with metadata_unavailable,
     // is retried, and completes once metadata is writable again.
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -4012,9 +3807,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     s1.start();
     s2.start();
     s3->start();
-    // The write below needs all three to place and accept DATA: every service
-    // ready, and the writer seeing three members that host extents. Membership
-    // alone arrives before either.
+    // The write needs every service ready and three extent-hosting members;
+    // membership alone arrives before either.
     const auto hosting = [](Service& service) {
         const auto active = service.node().membership().active();
         return std::count_if(active.begin(), active.end(),
@@ -4038,8 +3832,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
         return s1.node().local_store().valid(extent) && s2.node().local_store().valid(extent) &&
                s3->node().local_store().valid(extent);
     }));
-    // The accepted file reference itself must already have installed physical
-    // liveness evidence on the DATA durability floor.
+    // The accepted file reference has already installed a DATA claim.
     CHECK(s1.node().claims().retained(RetentionClass::data, extent));
     CHECK(s2.node().claims().retained(RetentionClass::data, extent));
     CHECK(s3->node().claims().retained(RetentionClass::data, extent));
@@ -4052,10 +3845,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
                s2.node().membership().active().size() == 2;
     }));
 
-    // Metadata W=2 is still available, but this semantic file touch needs a
-    // fresh causal retention dot on DATA W=3 so that a concurrent delete cannot
-    // erase the inherited liveness claim. The metadata head must not advance
-    // when that pre-publication retention barrier cannot be satisfied.
+    // Metadata W=2 holds, but the file touch needs a fresh retention dot on
+    // DATA W=3; when that barrier fails the metadata head must not advance.
     bool refused = false;
     try {
         s1.filesystem().chmod("/retained.bin", 0600);
@@ -4075,10 +3866,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
                s2.node().membership().active().size() == 3 &&
                s3->node().membership().active().size() == 3;
     }));
-    // Membership is a control-plane observation; it can precede availability
-    // of the ordinary control worker which serves retention/object queries.
-    // Prove that exact path is usable before requiring the W=3 mutation. Each
-    // failed attempt is itself deadline-bounded and aborts its concrete route.
+    // Membership can precede the control worker that serves retention queries,
+    // so prove that path before the W=3 mutation; each attempt is deadline-bounded.
     REQUIRE(wait_until([&] {
         try {
             const auto returning_id = s3->node().node_id();
@@ -4124,8 +3913,7 @@ MACHA_TEST("rpc_cluster", test_commit_replicas_ordered_local_then_nearest) {
     CHECK(ordered[1].host == "lan");
     CHECK(ordered[2].host == "wan");
     CHECK(ordered[3].host == "unknown");
-    // No measurements yet: the local replica still leads, the rest keep
-    // their given order.
+    // No measurements: local first, the rest in their given order.
     const auto cold = order_commit_replicas({wan, lan, local}, local.id, {});
     CHECK(cold[0].host == "local");
     CHECK(cold[1].host == "wan");
@@ -4195,10 +3983,8 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         }
     }));
 
-    // Placement is intentionally free to choose either active replica. Record
-    // the concrete claims/copies present on the cohort that will remain online;
-    // the invariant is that destructive maintenance must not remove any of
-    // those pre-existing resources while a durably-known node is unreachable.
+    // Record the claims and copies on the cohort that stays online: none may be
+    // removed while a durably known node is unreachable.
     const bool n1_claim_before = s1.node().claims().retained(RetentionClass::data, extent);
     const bool n2_claim_before = s2.node().claims().retained(RetentionClass::data, extent);
     const bool n1_copy_before = s1.node().local_store().valid(extent);
@@ -4206,9 +3992,8 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     REQUIRE(n1_claim_before || n2_claim_before);
     REQUIRE(n1_copy_before || n2_copy_before);
 
-    // The remaining W=2 cohort may continue accepting metadata while node 3 is
-    // offline, but the persisted roster must make that degraded state a hard
-    // fence for claim release and physical reclamation.
+    // The W=2 cohort keeps accepting metadata with node 3 offline, but the
+    // persisted roster fences claim release and reclamation.
     s3->stop();
     s3.reset();
     REQUIRE(wait_until([&] {
@@ -4228,9 +4013,7 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         }
     }));
 
-    // Give maintenance several complete zero-grace passes. If partition GC is
-    // accidentally re-enabled, this fails by observing either the causal claim
-    // or the local bytes disappear while the known third node remains offline.
+    // Several zero-grace passes: neither the claim nor the bytes may go.
     std::this_thread::sleep_for(800ms);
     if (n1_claim_before)
         CHECK(s1.node().claims().retained(RetentionClass::data, extent));
@@ -4241,9 +4024,8 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     if (n2_copy_before)
         CHECK(s2.node().local_store().valid(extent));
 
-    // Recreate the third process from its original persistent state. All three
-    // sides must directly rediscover one another and metadata must converge
-    // before the healthy-cluster GC epoch is allowed to reclaim the delete.
+    // The third node returns from its persistent state; metadata must converge
+    // before GC may reclaim the delete.
     s3 = std::make_unique<Service>(c3, keys);
     s3->start();
     REQUIRE(wait_until(
@@ -4280,13 +4062,8 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
 }
 
 MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_quiet) {
-    // Repair is paced by weight against busier classes, never stopped by
-    // them. Until 0.59.0 any loader byte in the quiet window zeroed repair's
-    // budget (busy_bandwidth_fraction 0.0, the shipped default and the
-    // cluster's setting) and ended its slice, so a node that was always
-    // ingesting never restored a copy: gbni-1 was still ~0.9 TB short of
-    // es-1's data when es-1 went on 2026-09-24. Here the loader is active for
-    // the whole test and the missing copy must still come back.
+    // Repair is paced by weight against busier classes, never stopped: with
+    // the loader active throughout, the missing copy still comes back.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -4331,8 +4108,7 @@ MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_qui
     REQUIRE(!s2.node().local_store().valid(id));
     s2.node().notify_storage_mutation();
 
-    // The loader thread may not have run yet on a busy machine (fi-1's suite,
-    // 2026-10-02): wait for its first note before calling the node busy.
+    // The loader thread may not have run yet: wait for its first note.
     REQUIRE(wait_until([&] {
         return s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
     }, 5s));
@@ -4384,8 +4160,7 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
                s2.node().membership().active().size() == 3 &&
                s3->node().membership().active().size() == 3;
     }));
-    // Establish normal metadata state so maintenance is running against a valid
-    // accepted branch before we create the deliberately unreachable object.
+    // An accepted branch first, so maintenance runs against valid metadata.
     s1.filesystem().mkdir("/base", 0755, getuid(), getgid());
     REQUIRE(wait_until([&] {
         try {
@@ -4403,9 +4178,8 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     s1.node().claims().retain(RetentionClass::data, id, claim);
     s2.node().claims().retain(RetentionClass::data, id, claim);
 
-    // Keep another replica offline while installing a deliberately future/
-    // concurrent claim dot which the current branch clock does not dominate.
-    // Namespace reachability is absent, but causal GC must not erase this claim.
+    // With a replica offline, install a claim dot the branch clock does not
+    // dominate: unreachable from the namespace, it must still not be erased.
     s3->stop();
     s3.reset();
     REQUIRE(wait_until([&] {
@@ -4416,15 +4190,12 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     REQUIRE(s2.node().local_store().remove(id));
     CHECK(s2.node().claims().retained(RetentionClass::data, id));
     CHECK(!s2.node().local_store().valid(id));
-    // This direct store mutation simulates corruption detection outside the
-    // normal RPC/storage wrappers. In the event-driven scheduler that detector
-    // must publish the concrete mutation event; heartbeat cadence is not a
-    // maintenance trigger.
+    // A detector outside the storage wrappers must publish the mutation event;
+    // heartbeats do not trigger maintenance.
     s2.node().notify_storage_mutation();
 
-    // `id` is deliberately absent from namespace/catalogue reachability. The
-    // only reason maintenance can know it must restore this physical copy is the
-    // durable local retention claim itself.
+    // `id` is unreachable from namespace and catalogue; only its retention
+    // claim tells maintenance to restore it.
     REQUIRE(wait_until([&] { return s2.node().local_store().valid(id); }, 5s));
     auto restored = s2.node().local_store().get(id);
     REQUIRE(restored.has_value());
@@ -4436,12 +4207,8 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
 }
 
 MACHA_TEST("rpc_cluster", test_held_retention_claims_cost_repair_no_credit) {
-    // 2026-09-29, both nodes on 0.72.0: bytes_transferred stayed 0 with the
-    // credit at 0. The claim walk charged an extent of credit for every claim
-    // it examined, held or not, so claims already on disk spent everything
-    // before any transfer could. Here credit arrives at one extent a second
-    // and the node holds 64 claimed objects; the one claimed object it lacks
-    // must still come back promptly.
+    // Claims already held cost no credit: with credit at one extent a second
+    // and 64 claimed objects held, the one it lacks comes back promptly.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -4536,8 +4303,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
                    s4.node().membership().active().size() >= 4;
         }));
 
-        // Establish one accepted base on every replica before deliberately
-        // partitioning the cluster into two disjoint write-capable pairs.
+        // One accepted base everywhere before partitioning into two writable pairs.
         s1.filesystem().mkdir("/base", 0755, getuid(), getgid());
         MetadataManager initial_repair(s1.node());
         initial_repair.repair_once();
@@ -4576,9 +4342,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
 
     Hash256 right_head{};
     {
-        // Nodes 3+4 never observed /left. They must nevertheless remain
-        // writable because they are an arbitrary surviving pair satisfying the
-        // configured metadata durability floor.
+        // Nodes 3 and 4 never saw /left but satisfy the floor, so stay writable.
         Service s3(c3, keys);
         Service s4(c4, keys);
         s3.start();
@@ -4607,9 +4371,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         REQUIRE(right_head != left_head);
         CHECK(s3.node().metadata_replica().acceptance(right_head).has_value());
 
-        // Bring back one member of the other pair. The active pair now carries
-        // two previously accepted sibling histories. Neither may be discarded:
-        // reconciliation must create an accepted descendant of both.
+        // With one member of the other pair back, two accepted sibling histories
+        // meet; reconciliation must descend from both.
         s4.stop();
         Service s2(c2, keys);
         s2.start();
@@ -4698,9 +4461,8 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         s1.stop();
     }
 
-    // Replica policy is deliberately changed only while the whole cluster is
-    // stopped. On restart the the available metadata replicas commit the new DATA policy and
-    // object repair converges existing content to the new data replica count.
+    // The replica policy changes while the cluster is stopped; on restart the
+    // new policy is committed and repair converges content to it.
     c1.replication = c2.replication = 2;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
     {
@@ -4713,11 +4475,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
                    s2.node().membership().active().size() >= 2;
         }));
 
-        // The write floor has to be re-established at the NEW policy before a
-        // mutation is legal. Membership says both nodes are up; it does not say
-        // the floor has caught up with a policy that changed while they were
-        // down, and until it has, the commit is refused as
-        // "metadata commit durability floor unavailable".
+        // The write floor must be re-established at the new policy first.
         REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
         MetadataManager m1(s1.node());
@@ -4781,9 +4539,8 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
     auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, {{"127.0.0.1", p1}});
-    // Equal configured capacities give each node an equal placement share.
-    // Node 1 is then filled locally: current free space must not change its
-    // placement weight, and the missing replica should spill to the fallback.
+    // Equal capacities, equal shares; filling node 1 does not change its
+    // weight, and the missing replica spills to the fallback.
     c1.storage_backends.front().limit = 2ULL * 1024 * 1024;
     c2.storage_backends.front().limit = 2ULL * 1024 * 1024;
     c3.storage_backends.front().limit = 2ULL * 1024 * 1024;
@@ -4831,9 +4588,7 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
     });
     REQUIRE(fallback != services.end());
 
-    // Foreground put() commits at quorum and does not wait for the full third
-    // owner. Placement repair subsequently spills that missing replica to the
-    // next deterministic capacity-aware fallback node.
+    // put() commits at quorum; repair then spills the missing replica to the fallback.
     REQUIRE(wait_until([&] {
         for (auto* service : services) {
             if (!service->node().local_store().has(id))
@@ -4899,9 +4654,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
             return false;
         }
     }));
-    // R=2 is convergence, while the write floor remains W=1. Drive the repair
-    // primitive explicitly so this lifecycle test verifies convergence itself
-    // rather than depending on the production maintenance scheduler's backoff.
+    // R=2 is convergence, W=1 the floor; drive repair directly rather than
+    // waiting on the maintenance scheduler.
     DistributedStore initial_convergence(s2->node());
     REQUIRE(wait_until([&] {
         initial_convergence.repair_once(16ULL * 1024 * 1024, objects);
@@ -4909,8 +4663,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
                            [&](const auto& id) { return s2->node().local_store().has(id); });
     }));
 
-    // Force one normal metadata maintenance pass so node 2 is demonstrably a
-    // durable committed-checkpoint witness before the voter is destroyed.
+    // One metadata pass makes node 2 a durable checkpoint witness first.
     MetadataManager witness_repair(s2->node());
     witness_repair.repair_once();
     CHECK(s2->node().metadata_replica().committed().generation > 1);
@@ -4919,8 +4672,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     s1->stop();
     s1.reset();
 
-    // Simulate complete loss of node 1: identity, namespace state, cache and
-    // every authoritative object are gone. The shared cluster key/config remain.
+    // Node 1 loses everything but the cluster key and config.
     std::error_code ec;
     std::filesystem::remove_all(c1.state_path, ec);
     std::filesystem::remove_all(c1.storage_backends.front().path, ec);
@@ -4928,19 +4680,15 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         std::filesystem::remove_all(c1.cache.path, ec);
     std::filesystem::create_directories(c1.storage_backends.front().path);
 
-    // A wiped founder cannot discover the survivor unless it is explicitly
-    // given a bootstrap route. This is the same replacement-node operation a
-    // real deployment performs after losing local state.
+    // A wiped node needs a bootstrap route to find the survivor.
     auto replacement_config = c1;
     replacement_config.bootstrap = {{"127.0.0.1", p2}};
     auto replacement = std::make_unique<Service>(replacement_config, keys);
     replacement->start();
     CHECK(replacement->node().node_id() != old_n1);
 
-    // Wait until the destroyed node has expired from placement membership.
-    // Repair before that point may correctly retain the old owner in the R=2
-    // preferred set and therefore has no reason to pull every object to the
-    // replacement yet.
+    // Until the destroyed node expires from membership, repair may rightly keep
+    // it as an owner and pull nothing to the replacement.
     REQUIRE(wait_until(
         [&] {
             const auto active = replacement->node().membership().active();
@@ -4964,9 +4712,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         },
         10s));
 
-    // Once the committed namespace is recovered, prove the same bounded repair
-    // primitive used by maintenance repopulates the replacement's R=2 ownership
-    // from the survivor.
+    // With the namespace recovered, repair repopulates the replacement from the survivor.
     DistributedStore replacement_convergence(replacement->node());
     REQUIRE(wait_until(
         [&] {
@@ -4987,8 +4733,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     }
     CHECK(output == input);
 
-    // Recovery also reconstructs a writable metadata replica view; it is not a
-    // read-only salvage mode.
+    // The recovered metadata replica is writable.
     replacement->filesystem().mkdir("/after-replacement", 0755, getuid(), getgid());
     REQUIRE(wait_until(
         [&] {
@@ -5004,12 +4749,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     s2->stop();
 }
 
-// Three nodes whose commits are durable on every replica: what one node
-// writes is on the other two when the call returns, so no claim below waits
-// for replication. Only forming the cluster is waited for. The metadata
-// cache lasts its longest (5 s), far beyond the milliseconds between a
-// commit and its check, so a change seen through another node was made
-// visible by the replica's committed generation, not by a cache expiring.
+// Three nodes whose commits are durable on every replica, so nothing below
+// waits for replication. The metadata cache lasts 5 s, so a change seen through
+// another node came from the replica's committed generation, not cache expiry.
 struct DurableTrio {
     TestCluster cluster;
     std::vector<Config> configs;
@@ -5088,9 +4830,8 @@ Bytes read_whole(Service& node, const std::string& path, size_t size) {
     return out;
 }
 
-// Any node may found a virgin namespace -- here the one with the highest
-// NodeId, which no rule of "lowest founds" would pick -- and its root is on
-// every replica when the founding call returns.
+// Any node may found a virgin namespace (here the highest NodeId), and its root
+// is on every replica when the founding call returns.
 MACHA_HEAVY_TEST("rpc_cluster", test_any_node_founds_the_namespace_on_every_replica) {
     DurableTrio trio;
     size_t founder = 0;
@@ -5231,9 +4972,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_runtime_cache_keeps_a_playback_fetch) {
     CHECK(*again == *fetched);
 }
 
-// Unlinking a committed file retires its object: the inventory lists it as
-// garbage, not live. The cached inventory is one shared snapshot until the
-// namespace changes, sorted and without duplicates.
+// Unlinking retires the object to garbage. The cached inventory is one shared,
+// sorted, duplicate-free snapshot until the namespace changes.
 MACHA_TEST("rpc_cluster", test_unlink_retires_an_object_from_the_maintenance_inventory) {
     TestService fixture("inventory");
     fixture.config().replication = 1;
@@ -5268,7 +5008,6 @@ MACHA_TEST("rpc_cluster", test_unlink_retires_an_object_from_the_maintenance_inv
     CHECK(after->metadata_generation > first->metadata_generation);
 }
 
-// A file cannot be renamed over a directory.
 MACHA_TEST("rpc_cluster", test_rename_of_a_file_onto_a_directory_is_eisdir) {
     TestService fixture("rename-eisdir");
     fixture.config().replication = 1;
@@ -5288,9 +5027,8 @@ MACHA_TEST("rpc_cluster", test_rename_of_a_file_onto_a_directory_is_eisdir) {
     CHECK(fs.getattr("/media/dir").type == EntryType::directory);
 }
 
-// Waits until a Service's maintenance pass is parked in its wait with no
-// wake-up for five consecutive looks: it has done everything it can at the
-// clock's current time. Observes the pass; it does not time it.
+// Waits until the maintenance pass is parked with no wake-up for five
+// consecutive looks: done with all it can at the current clock time.
 void settle_maintenance(Service& service) {
     const auto deadline = Clock::now() + 20s;
     uint64_t seen = service.maintenance_wakeups();
@@ -5305,10 +5043,8 @@ void settle_maintenance(Service& service) {
     REQUIRE(quiet >= 5);
 }
 
-// A node that joins pulls the objects it should hold through its own
-// maintenance pass; nobody calls repair. The joiner's pass runs on a manual
-// clock (its deadlines, credit and idleness alike): the test steps the clock
-// and waits only for the pass to park, never for an amount of time.
+// A joining node pulls its objects through its own maintenance pass, run on a
+// manual clock: the test steps the clock and waits only for the pass to park.
 MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_maintenance) {
     TestCluster cluster;
     const uint16_t first = free_port();
@@ -5355,8 +5091,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
         return std::all_of(ids.begin(), ids.end(),
                            [&](const ObjectId& id) { return n3.node().local_store().has(id); });
     };
-    // Each step: let the pass finish what it can now, then move its clock
-    // on a second. The pull is bounded in steps, not in time.
+    // Each step settles the pass, then moves its clock a second; bounded in steps.
     int steps = 0;
     for (; steps < 60 && !holds_all(); ++steps) {
         settle_maintenance(n3);
@@ -5369,21 +5104,12 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
     n1.stop();
 }
 
-// Needs the real libmacha-torrent plugin, which only exists in a build where
-// libtorrent was found; without it the node has no download engine at all
-// and there is nothing here to assert.
+// Needs the libmacha-torrent plugin, built only when libtorrent is found.
 #ifdef MACHA_TEST_PLUGIN_DIR
 MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes) {
-    // repair_once() used to hold mutation_mutex_ across its per-peer
-    // replication fan-out. mutate_impl() takes the same mutex, so one peer
-    // that stopped answering turned a background maintenance pass into a
-    // stall of every local metadata write: on es-1 (2026-09-10) ten threads
-    // sat in mutate_impl behind one maint thread parked in AsyncRpc::get(),
-    // and six torrent ingests read "queued" while the cluster reported
-    // healthy. The fan-out now runs with the lock released. This holds the
-    // exact RPC the maint thread was stuck in (has_metadata_history_entry, the
-    // remote_has probe inside push_history_to_peer) and proves a foreground
-    // write no longer waits for it.
+    // repair_once() runs its per-peer fan-out without mutation_mutex_: with
+    // the has_metadata_history_entry probe to a silent peer held, a foreground
+    // write does not wait.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -5424,8 +5150,7 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     const auto started = std::chrono::steady_clock::now();
     s1.filesystem().mkdir("/during-stall", 0755, getuid(), getgid());
     const auto elapsed = std::chrono::steady_clock::now() - started;
-    // Before the fix this waited for the control no-progress deadline (30 s)
-    // to cancel the probe and hand the mutex back.
+    // Well inside the 30 s control no-progress deadline.
     CHECK(elapsed < 3s);
     CHECK(!repair_done.load());
 
@@ -5446,10 +5171,8 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
 }
 
 MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_peer_is_silent) {
-    // GET /api/v1/torrents/jobs listed from a snapshot refresh that surveyed
-    // the peers' accepted heads whenever any peer had announced a newer
-    // generation: 0.6-1.7 s a request on fi-1 while torrents committed
-    // progress on both nodes (2026-09-29). An HTTP read never waits on a peer.
+    // GET /api/v1/torrents/jobs never waits on a peer, even when a peer has
+    // announced a newer generation.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -5467,8 +5190,7 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    // A write before the metadata floor forms throws "replica set forming";
-    // wait for the floor itself, on both nodes (1 run in ~200, 2026-10-02).
+    // A write before the metadata floor forms is refused; wait for it on both nodes.
     REQUIRE(wait_metadata_writable(s1));
     REQUIRE(wait_metadata_writable(s2));
     s1.filesystem().mkdir("/warm", 0755, getuid(), getgid());
@@ -5479,13 +5201,8 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
     s2.filesystem().mkdir("/elsewhere", 0755, getuid(), getgid());
     REQUIRE(wait_until([&] { return s1.node().remote_metadata_generation() > before; }, 10s));
 
-    // Node 2 now answers nothing node 1 asks it. The listing must not wait:
-    // a listing that surveyed node 2 would block on the stalled call. The
-    // count of stalled calls is not the evidence -- node 1's background work
-    // (membership, repair, metadata convergence) calls node 2 all the time,
-    // and in a 20 ms window 98% of runs held one with no listing at all, so
-    // counting them failed this case about one run in a hundred for calls
-    // the listing never made (2026-10-02).
+    // Node 2 now answers nothing, so a listing that surveyed it would block.
+    // Stalled-call counts are no evidence: background work calls node 2 constantly.
     const auto peer = s2.node().node_id();
     s1.node().stall_peer_for_tests(peer);
     const auto started = std::chrono::steady_clock::now();
@@ -5500,14 +5217,8 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
 }
 
 MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_progress_budget) {
-    // WriteHandle::drain_one_extent() waits on its extent future with no
-    // deadline. Underneath, put_impl() spilled a stalled replica after
-    // write_stall and looked for a replacement -- but a spilled put still
-    // counted as unfinished, so with no replacement replica the loop could
-    // never conclude and spun at 1 ms forever: the "never fails, never
-    // completes" shape one layer below the 0.36.8 fix. The put now honours
-    // the pipeline's no-progress budget and fails retryably, which the
-    // publication retry policy already backs off and parks.
+    // A put whose stalled replica has no replacement fails retryably within
+    // the pipeline's no-progress budget rather than spinning forever.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -5530,11 +5241,8 @@ MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_p
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-    // Seeing the peer is not the same as having formed the metadata replica
-    // set, and the mutation below needs the latter: under load it threw
-    // `metadata replica set forming: waiting for bootstrap checkpoint survey`
-    // (1 in 3,528 case-runs, 2026-09-15). Genesis is generation 1, so a
-    // committed generation past it is the precondition create_file depends on.
+    // Seeing the peer is not a formed metadata replica set; create_file needs
+    // a committed generation past genesis (1).
     REQUIRE(wait_until([&] {
         return s1.node().metadata_replica().committed_generation() > 1;
     }, 10s));
@@ -5606,27 +5314,20 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     c1.replication = c2.replication = 2;
     c1.min_write_replicas = c2.min_write_replicas = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
-    // ingest.enabled requires catalogue.scanner.enabled; disable the actual
-    // provider lookups (they'd otherwise require a TMDB token file) since
-    // this test never lets a job reach the cataloguing phase.
+    // ingest.enabled requires the scanner; provider lookups are off (no jobs
+    // reach cataloguing, and they would need a TMDB token).
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = true;
     c1.catalogue.scanner.movies.enabled = c2.catalogue.scanner.movies.enabled = false;
     c1.catalogue.scanner.tv.enabled = c2.catalogue.scanner.tv.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
     c1.ingest.enabled = c2.ingest.enabled = true;
     c1.ingest.source_roots = {source_dir};
-    // Node 2 runs no torrents (0.64.0): it must still list node 1's, act on
-    // them, place a new one there, and refuse one pinned to itself -- the
-    // fi-1 case, which until 0.64.0 answered every torrent route 503.
+    // Node 2 runs no torrents: it still lists node 1's, acts on them, places
+    // a new one there, and refuses one pinned to itself.
     c1.torrent.enabled = true;
     c2.torrent.enabled = false;
-    // The download engine is a plugin: load the one this build produced, so
-    // the test exercises the real dlopen/build-identity/factory path rather
-    // than anything linked into the test binary. It gets a directory holding
-    // only that plugin, rather than the build's shared plugin directory: two
-    // full Services start here, and every other plugin in the shared
-    // directory would be dlopen'd by both of them (libmacha-fuse pulls in
-    // libfuse/macFUSE) for no reason this test cares about.
+    // Load this build's torrent plugin through the real dlopen path, from a
+    // directory holding only it, so neither Service loads any other plugin.
     TempDir plugin_dir;
     {
         const std::filesystem::path torrent_plugin = MACHA_TEST_TORRENT_PLUGIN;
@@ -5649,13 +5350,9 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 
     const auto node1_id = to_string(s1.node().node_id());
 
-    // Only node 1 owns these jobs. Node 2 must see and act on them purely
-    // through the new cluster-wide RPC survey. The dummy source file is not
-    // real media, so the worker rejects it almost immediately -- wait for
-    // that deterministic "failed" convergence rather than racing to pause it
-    // mid-flight (a pause() that wins the race is still overwritten when the
-    // in-flight plan_job() finishes and unconditionally writes its own
-    // terminal state).
+    // Only node 1 owns these jobs; node 2 sees them through the cluster RPC
+    // survey. The dummy file is not media, so wait for the job to fail rather
+    // than race a pause() that plan_job() would overwrite.
     const auto ingest_id = s1.ingest().submit_path(source_file, "filesystem");
     REQUIRE(wait_until(
         [&] {
@@ -5663,8 +5360,7 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
             return job && job->state == IngestJobState::failed;
         },
         5s));
-    // The failure carries a code first (operator rule, 2026-09-24), and the
-    // API shape emits it beside the message.
+    // The failure carries a code, emitted beside the message.
     {
         const auto failed = s1.ingest().job(ingest_id);
         REQUIRE(failed.has_value());
@@ -5674,18 +5370,13 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         CHECK(json.find("error_code")->asString() == "no_supported_media");
     }
 
-    // The engine is supplied by the libmacha-torrent plugin the Service
-    // dlopens from this build's plugin directory, so a non-null handle here
-    // is also the assertion that the whole load path worked.
-    // Each plugin's first construction runs on its own supervised lifecycle
-    // thread, so the capability appears shortly after the service reports
-    // ready rather than synchronously with it.
+    // A non-null handle proves the plugin load path. Plugins are constructed
+    // on their own lifecycle threads, so it appears shortly after ready.
     std::shared_ptr<TorrentService> s1_torrents;
     REQUIRE(wait_until([&] { return (s1_torrents = s1.torrents()) != nullptr; }, 5s));
     const auto torrent_id = s1_torrents->add(
         "magnet:?xt=urn:btih:3333333333333333333333333333333333333333&dn=Test");
-    // A torrent job has no equivalent fast-fail path (add() only creates the
-    // libtorrent session entry), so pausing it immediately is reliable.
+    // add() only creates the session entry, so pausing at once is reliable.
     REQUIRE(s1_torrents->pause(torrent_id));
 
     auto get = [](AcquisitionApi& api, const std::string& path) {
@@ -5705,8 +5396,7 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
             std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
     };
 
-    // Node 2 answers from its view of the cluster, refreshed every 5 s in the
-    // background; take a poll now rather than sleep through an interval.
+    // Node 2's cluster view refreshes every 5 s; poll now instead of waiting.
     s2.cluster_jobs().refresh_now();
 
     // --- Ingest: list visibility from the non-owning node ---
@@ -5754,26 +5444,16 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
         CHECK(node_id->asString() == node1_id);
         const auto* state = parsed.find("state");
         REQUIRE(state != nullptr);
-        // This response is node 1's own synchronous answer, round-tripped
-        // through the RPC survey -- it is the proof the action landed there,
-        // not the UI's local guess. The proof is the 200 itself: the route
-        // answers with an error unless the action reported `changed`.
-        //
-        // The `state` it carries is node 1's job as re-read AFTER resume()
-        // released its lock (IngestManager::handle_job_action), by which time
-        // a worker may already have picked the now-queued job up and
-        // re-failed it against the same non-media dummy file. Asserting
-        // "queued" asserted that no worker got there first, a window the
-        // product never promised and which closed in 1 of 5,292 case-runs on
-        // 2026-09-14. What the reply must never say is a state resume cannot
-        // lead to.
+        // Node 1's own answer via the RPC survey: the 200 proves the action
+        // landed (the route errors unless it reported `changed`). A worker may
+        // already have re-failed the job, so only states resume can lead to pass.
         const auto reported = state->asString();
         CHECK((reported == "queued" || reported == "scanning" || reported == "importing" ||
                reported == "failed"));
     }
 
-    // --- Torrent: a job node 1 already had becomes a cluster request its
-    // coordinator claims for itself (0.64.0), visible from node 2 ---
+    // --- Torrent: node 1's existing job becomes a cluster request its
+    // coordinator claims, visible from node 2 ---
     s1.torrent_coordinator().pass_now();
     REQUIRE(wait_until([&] { return s2.torrent_coordinator().request(torrent_id).has_value(); }, 10s));
     s2.cluster_jobs().refresh_now();
@@ -5948,8 +5628,7 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
         }
     }));
 
-    // Direct reachability, not merely gossip, must be established before the
-    // round's gate opens -- mirrors the destructive-GC fence.
+    // The round's gate needs direct reachability, not merely gossip.
     REQUIRE(wait_until([&] {
         return s1.node().membership().all_known_reachable() &&
                s2.node().membership().all_known_reachable();
@@ -5957,10 +5636,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
 
     CHECK(s1.node().metadata_replica().diagnostics().history_records >= 3);
 
-    // s1 proposes; both nodes ack; s1 commits and compacts locally within
-    // this one call. s2 only has a committed proof so far -- it re-roots its
-    // own history.log on its own next attempt, exactly as production relies
-    // on the next maintenance tick to do.
+    // s1 proposes, both ack, s1 commits and compacts in this call; s2 holds a
+    // committed proof and re-roots its history.log on its own next attempt.
     s1.metadata_manager().attempt_history_checkpoint(1, 1);
     CHECK(s1.node().metadata_replica().diagnostics().history_records == 1);
     auto proof1 = s1.node().metadata_replica().checkpoint_proof();
@@ -5988,11 +5665,9 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
 }
 
 MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_from_a_peer) {
-    // 2026-09-06: a head the local replica cannot replay must be repaired
-    // over the wire from a peer that can still materialize it -- while the
-    // node keeps running. Exercises get_metadata_history_record end to end:
-    // MetadataManager::repair_unreconstructable_heads() -> peer's
-    // MetadataReplica::full_history_record() -> local reanchor_history().
+    // A head the local replica cannot replay is repaired from a peer while the
+    // node runs: repair_unreconstructable_heads() -> the peer's
+    // full_history_record() -> local reanchor_history().
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto p1 = free_port();
@@ -6022,16 +5697,14 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
     const auto head = certificates.front().hash;
     CHECK(s1.node().metadata_replica().history_contains(head));
 
-    // Break the head on s2 exactly the way the incident presented: the
-    // replica confirms it cannot reconstruct it, excludes it and flags it.
+    // The replica on s2 cannot reconstruct the head, so excludes and flags it.
     replica.set_force_unreconstructable_for_tests(
         [head](const Hash256& hash) { return hash == head; });
     (void)replica.accepted_heads();
     REQUIRE(wait_until([&] {
         return replica.unreconstructable_heads() == std::vector<Hash256>{head};
     }));
-    // Lift the simulated fault; the flag (30s cooldown) persists on its own,
-    // so only the repair path can clear it inside this test's window.
+    // Lift the fault; the flag's 30 s cooldown means only repair can clear it here.
     replica.set_force_unreconstructable_for_tests({});
 
     REQUIRE(wait_until([&] {
@@ -6088,19 +5761,14 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_concurrent_proposers_
                s2.node().membership().all_known_reachable();
     }));
 
-    // Both nodes independently observe the same single accepted head and
-    // propose at the same time. The protocol is leaderless and idempotent by
-    // (floor_hash, epoch) identity -- neither proposal should conflict with
-    // or corrupt the other, and both replicas must converge on exactly the
-    // same committed proof.
+    // Both nodes propose at once; the leaderless protocol is idempotent by
+    // (floor_hash, epoch), so both converge on the same committed proof.
     std::thread t1([&] { s1.metadata_manager().attempt_history_checkpoint(1, 1); });
     std::thread t2([&] { s2.metadata_manager().attempt_history_checkpoint(1, 1); });
     t1.join();
     t2.join();
 
-    // Whichever proposer's commit broadcast lost the race, its own next
-    // attempt still converges via the identical (floor_hash, epoch) acked
-    // locally by the other's proposal.
+    // The loser's next attempt converges via the same (floor_hash, epoch).
     REQUIRE(wait_until([&] {
         s1.metadata_manager().attempt_history_checkpoint(1, 1);
         s2.metadata_manager().attempt_history_checkpoint(1, 1);
@@ -6152,12 +5820,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_aborts_when_a_partici
                s2.node().membership().all_known_reachable();
     }));
 
-    // A durably-known participant that cannot be reached at all -- not just
-    // one that disagrees -- must abort the round outright rather than
-    // compact against an incomplete view of the cluster.
-    // discover_accepted_heads_required()'s required-response semantics are
-    // exactly what is under test here, independent of the time-based
-    // all_known_reachable() gate.
+    // An unreachable durably known participant aborts the round
+    // (discover_accepted_heads_required(), independent of all_known_reachable()).
     s2.stop();
     s1.metadata_manager().attempt_history_checkpoint(1, 1);
     CHECK(s1.node().metadata_replica().diagnostics().history_records > 1);
@@ -6197,10 +5861,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
                s2.node().membership().all_known_reachable();
     }));
 
-    // Simulate a proposer crashing after collecting every ack but before
-    // broadcasting the commit: hand-install a merely-acked proof on s2 for
-    // exactly the (floor_hash, epoch) a real round would have produced,
-    // without ever committing or compacting it.
+    // A proposer that crashed after every ack but before the commit: an
+    // acked-only proof on s2 for the (floor_hash, epoch) a round would produce.
     const auto floor = s1.node().metadata_replica().accepted_heads();
     REQUIRE(floor.size() == 1);
     HistoryCheckpointProof stranded;
@@ -6211,16 +5873,10 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
     s2.node().metadata_replica().record_checkpoint_ack(stranded);
     CHECK(s2.node().metadata_replica().checkpoint_proof()->status ==
          HistoryCheckpointProof::Status::acked);
-    // A stranded ack alone -- never promoted to committed -- must never by
-    // itself cause s2's own history to be re-rooted. record_checkpoint_ack()
-    // only ever records the durable ack; it never calls
-    // compact_history_if_safe() as a side effect, and nothing else has
-    // called it here either.
+    // A stranded ack alone never re-roots s2's history.
     CHECK(s2.node().metadata_replica().diagnostics().history_records > 1);
 
-    // The next real maintenance cycle re-proposes a fresh (floor_hash,
-    // epoch) from scratch -- cheap to re-ack since the floor is unchanged --
-    // and completes normally, superseding the stranded record.
+    // The next maintenance cycle re-proposes and completes, superseding it.
     REQUIRE(wait_until([&] {
         s1.metadata_manager().attempt_history_checkpoint(1, 1);
         return s1.node().metadata_replica().diagnostics().history_records == 1;
@@ -6238,25 +5894,10 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
     s1.stop();
 }
 
-// 0.42.0: a node that accepts no inbound connections. Modelled with a
-// black-hole advertised address (192.0.2.1, TEST-NET-1) and a short connect
-// timeout, so no OS firewall is needed: any dial to it would hang and fail,
-// and the assertions below are that nobody ever makes one.
 MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_liveness_budget) {
-    // A peer is live only while it has been observed inside dead_after, and
-    // health_loop's CONTROL ping is what observes it. Each probe round was
-    // built with deadline = started + dead_after_, and call_async_known
-    // carries no no-progress deadline of its own -- so a ping that *hung*
-    // (rather than failed, which has always had a 50 ms retry path) occupied
-    // the entire liveness budget in a single attempt, and the peer expired at
-    // the instant the probe proving it alive was abandoned. On es-1/fi-1 that
-    // was a ten-second read-only window with both ends healthy, fatal to any
-    // ingest whose commit landed in it (2026-09-19/20).
-    //
-    // The stall fixture holds every `ping` this node sends to the peer and
-    // never answers, and `stalled_calls_for_tests()` counts the attempts, so
-    // the retry behaviour is directly observable: one attempt per liveness
-    // window before the fix, one per third of it after.
+    // A hung health ping is retried within the liveness budget, not held for
+    // all of dead_after. The stall fixture holds every ping unanswered and
+    // stalled_calls_for_tests() counts the attempts.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -6265,8 +5906,7 @@ MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_livenes
                          {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "probe-budget-n2", cluster.keyfile(), p2,
                          {{"127.0.0.1", p1}});
-    // Three seconds of liveness budget derives a one-second attempt budget,
-    // so a working retry path gets three attempts inside one window.
+    // A 3 s liveness budget gives 1 s attempts: three per window.
     c1.dead_after = c2.dead_after = 3s;
 
     Service s1(c1, keys);
@@ -6281,8 +5921,6 @@ MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_livenes
     const auto peer = s2.node().node_id();
     s1.node().stall_peer_for_tests(peer, MessageType::ping);
     const auto started = std::chrono::steady_clock::now();
-    // Before the fix this sat at one for the whole three seconds: the single
-    // attempt was held until the round deadline, which *is* dead_after.
     const bool retried =
         wait_until([&] { return s1.node().stalled_calls_for_tests() >= 3; }, 3s);
     const auto elapsed = std::chrono::steady_clock::now() - started;
@@ -6292,6 +5930,8 @@ MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_livenes
     CHECK(elapsed < c1.dead_after);
 }
 
+// A node that accepts no inbound connections, modelled by a black-hole
+// advertised address (192.0.2.1, TEST-NET-1) and a short connect timeout.
 MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_own_sessions) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -6413,14 +6053,10 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
     CHECK(site.client.stats().canonical_connections == 2);
 }
 
-// `network.inbound_capable: auto` on a whole node: resolved from what a peer
-// reports after dialling back, persisted, and reversed once the address
-// becomes dialable. The site advertises a black-hole address first.
 MACHA_TEST("rpc_cluster", test_a_call_whose_dial_is_retired_by_a_simultaneous_connect_waits_for_the_peer) {
-    // Two nodes that dial each other at once keep one session: the lower id
-    // keeps the one it dialled and retires the other. The higher id's call can
-    // find its own dial already retired and the peer's session not yet
-    // registered. That gap is forced here and the call must wait it out.
+    // In a simultaneous connect the lower id keeps its own dial and retires the
+    // other; the higher id's call may find its dial retired before the peer's
+    // session registers. That gap is forced here; the call must wait it out.
     struct Node {
         NodeInfo info;
         RpcClient client;
@@ -6460,15 +6096,13 @@ MACHA_TEST("rpc_cluster", test_a_call_whose_dial_is_retired_by_a_simultaneous_co
     Node low(keys, a);
     Node high(keys, b);
 
-    // The low node's session reaches the high node but is not registered there
-    // yet.
+    // The low node's session reaches the high node but is not yet registered.
     high.client.hold_inbound_for_tests(low.info.id);
     REQUIRE(low.client.call(high.info, MessageType::members, Bytes{1}, 2s).message.payload ==
             Bytes{1});
     REQUIRE(!high.client.has_route(low.info.id, TransportLane::control));
 
-    // The high node dials; the low node keeps its own session and retires the
-    // new one. The high node's call proceeds only once that has reached it.
+    // The low node retires the high node's dial; the call waits for that.
     std::atomic_bool retired{false};
     high.client.set_after_dial_for_tests([&] {
         retired.store(wait_until(
@@ -6483,6 +6117,8 @@ MACHA_TEST("rpc_cluster", test_a_call_whose_dial_is_retired_by_a_simultaneous_co
     CHECK(call.get().message.payload == Bytes{2});
 }
 
+// `network.inbound_capable: auto`: resolved from a peer's dial-back, persisted,
+// and reversed once the address becomes dialable.
 MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives_restart) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto& keys = cluster.keys();

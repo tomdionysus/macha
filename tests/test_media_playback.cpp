@@ -17,9 +17,8 @@ std::string idempotency_of(const HttpResponse& response) {
     return field ? field->asString() : std::string{};
 }
 
-// FakeMediaEngine with its store kept reachable, so a test can watch what a
-// refused request did (or did not) do to the producer, and can publish a
-// fragment while a request is held on it.
+// FakeMediaEngine with its store reachable, so a test can watch what a refused
+// request did to the producer, and publish a fragment while a request is held.
 class ObservableHlsMediaEngine final : public FakeMediaEngine {
     mutable std::mutex store_mutex_;
     std::shared_ptr<MediaSegmentStore> store_;
@@ -47,8 +46,7 @@ class ObservableHlsMediaEngine final : public FakeMediaEngine {
     }
 };
 
-// Playback serves every payload as a range-capable stream rather than an
-// inline body, so a test that wants to read one has to drain it.
+// Playback serves payloads as range-capable streams, so reading one means draining it.
 std::string response_text(const HttpResponse& response) {
     if (!response.stream) return std::string(response.body.begin(), response.body.end());
     Bytes bytes(static_cast<size_t>(response.stream->size()));
@@ -106,9 +104,8 @@ class CoalescingProbeMediaEngine final : public MediaEngine {
     unsigned probes() const { return probes_.load(); }
 };
 
-// Mirrors FakeMediaEngine for probe/HLS start, but extract_webvtt_segment
-// blocks on a gate so a test can hold a session's subtitle_cache mutex open
-// for as long as needed while exercising other playback operations.
+// Like FakeMediaEngine, but extract_webvtt_segment blocks on a gate so a test
+// can hold a session's subtitle_cache mutex while exercising other operations.
 class GatedSubtitleMediaEngine final : public MediaEngine {
     TestGate& gate_;
     mutable std::mutex mutex_;
@@ -236,10 +233,9 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(retained.stats().owner_bytes[static_cast<size_t>(MemoryOwner::playback_segment)] ==
           2 * 1024);
     REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    // The playlist is a plan and the plan exists, so it is complete before any
-    // fragment is: every planned entry, closed, from the first fetch. What
-    // stops a client queueing against the encoder is no longer withholding the
-    // list -- it is the admission policy on the fragment requests themselves.
+    // The playlist is the plan: every planned entry, closed, from the first
+    // fetch, before any fragment exists. Admission on fragment requests is what
+    // stops a client queueing against the encoder.
     const auto planned_playlist = store->playlist();
     CHECK(!planned_playlist.empty());
     CHECK(planned_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
@@ -281,9 +277,8 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
     CHECK(state.descriptor_bytes >= state.segment_count);
     CHECK(state.planned_segments == 4);
 
-    // And production changed none of it. Backpressure, spill and the ledger
-    // are producer-side concerns; the playlist is a promise made up front and
-    // a VOD list may not be revised once a player has built a seek map from it.
+    // Production changes none of it: a VOD list may not be revised once a
+    // player has built a seek map from it.
     auto playlist = store->playlist();
     CHECK(playlist == planned_playlist);
     CHECK(playlist.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
@@ -309,12 +304,9 @@ MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
 }
 
 MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_waiter_reversibly) {
-    // Regression for a seek/generation-replacement stall: a request blocked
-    // in wait_object() on a not-yet-produced segment of a superseded
-    // generation must wake promptly (rather than only once the replacement
-    // pipeline's own startup completes), and marking superseded is
-    // reversible so a replacement attempt that fails leaves the still-active
-    // store's normal long-poll behaviour intact.
+    // A request blocked in wait_object() on an unproduced segment of a
+    // superseded generation wakes promptly; marking superseded is reversible,
+    // so a failed replacement leaves the active store's long-poll intact.
     TempDir t;
     auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms,
                                                       std::vector<double>{4.0, 4.0, 4.0, 4.0, 4.0});
@@ -340,8 +332,7 @@ MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_wait
     CHECK(superseded_state.error.empty());
     CHECK(!superseded_state.finished);
 
-    // A replacement that later fails clears superseded, restoring normal
-    // long-poll blocking for the still-active generation.
+    // A failed replacement clears superseded, restoring normal long-poll blocking.
     store->mark_superseded(false);
     std::atomic_bool second_wait_returned{};
     std::jthread second_waiter([&] {
@@ -359,10 +350,8 @@ MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_wait
 }
 
 MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_refuses_beyond_them) {
-    // Phase 3 of TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md. A
-    // hold is an explicitly admitted resource, so the limits are testable
-    // without a thread ever blocking -- which is the property that makes an
-    // async HttpServer an improvement here rather than a rewrite.
+    // A hold is an explicitly admitted resource, so the limits are testable
+    // without any thread blocking.
     SegmentHoldArbiter arbiter(2, 3);
     auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
 
@@ -373,9 +362,7 @@ MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_
     REQUIRE(second.has_value());
     CHECK(arbiter.outstanding("session-a") == 2);
 
-    // A third from the same session is refused, and refused for the right
-    // reason: this is the deeply prefetching player that queued thirty
-    // requests, not a node that has run out of room.
+    // A third from the same session is refused for the session limit, not the node's.
     auto third = arbiter.try_acquire("session-a", &why);
     CHECK(!third.has_value());
     CHECK(why == SegmentHoldArbiter::Refusal::session_limit);
@@ -385,8 +372,8 @@ MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_
     REQUIRE(other.has_value());
     CHECK(arbiter.outstanding() == 3);
 
-    // The global budget binds across sessions regardless of whose share is
-    // free: session-b is one under its own limit and still refused.
+    // The global budget binds across sessions: session-b is under its own limit
+    // and still refused.
     auto beyond = arbiter.try_acquire("session-b", &why);
     CHECK(!beyond.has_value());
     CHECK(why == SegmentHoldArbiter::Refusal::budget_exhausted);
@@ -412,11 +399,9 @@ MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_
 }
 
 MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_never_advances_the_producer) {
-    // The refusal, end to end. Three things have to hold together: a request
-    // outside the window is answered immediately rather than held, it is a
-    // retryable 503 rather than a 404, and it does not drag the producer's
-    // authorised window forward on behalf of a request the node declined to
-    // serve.
+    // A request outside the window is answered at once rather than held, as a
+    // retryable 503 rather than a 404, and does not move the producer's
+    // authorised window forward.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -440,8 +425,7 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
-    // Short enough that a test which reaches the deadline still finishes
-    // quickly; the point being measured is which requests reach it at all.
+    // Short, so a request that reaches the deadline still finishes quickly.
     streaming.segment_timeout = 400ms;
     streaming.segment_hold_window = 8;
     auto engine = std::make_unique<ObservableHlsMediaEngine>();
@@ -464,10 +448,9 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     const auto url = created_json.find("stream")->find("url")->asString();
     const auto base = url.substr(0, url.rfind('/'));
 
-    // A held request no longer blocks the handler: it answers with a
-    // deferral and is re-run when the store publishes or the deadline
-    // passes. http_resolve drives that the way HttpServer does, on this
-    // thread, so the case reads as it did when the handler blocked.
+    // A held request answers with a deferral and is re-run when the store
+    // publishes or the deadline passes; http_resolve drives that on this
+    // thread, as HttpServer does.
     auto get = [&](const std::string& object) {
         HttpRequest request;
         request.method = "GET";
@@ -485,8 +468,8 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     auto produced = get("segment-000000.m4s");
     CHECK(produced.status == 200);
 
-    // Beyond the window. The frontier is one fragment and the window is eight,
-    // so index 9 is one nothing is working toward.
+    // Beyond the window: the frontier is one fragment and the window eight, so
+    // nothing is working toward index 9.
     const auto refused_at = Clock::now();
     auto refused = get("segment-000009.m4s");
     const auto refused_elapsed = Clock::now() - refused_at;
@@ -496,16 +479,14 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     CHECK(refused_body.find("beyond_hold_window") != std::string::npos);
     CHECK(refused.headers["Retry-After"] == "1");
     CHECK(refused.headers["Cache-Control"] == "no-store");
-    // Immediately: it must not have been held, so it cannot have approached
-    // the segment timeout.
+    // Immediately: not held anywhere near the segment timeout.
     CHECK(refused_elapsed < 200ms);
 
-    // And the producer was never told about it. Noting an index we declined
-    // would authorise production to run toward a fragment we refused to serve.
+    // The producer is not told: noting a declined index would authorise
+    // production toward a fragment the node refused to serve.
     CHECK(store->snapshot().highest_requested == 0);
 
-    // Past the end of the plan is a genuine miss: the playlist never promised
-    // it, so 404 is the honest answer rather than "come back later".
+    // Past the end of the plan is a genuine miss: 404, not "come back later".
     auto missing = get("segment-000099.m4s");
     CHECK(missing.status == 404);
     CHECK(store->snapshot().highest_requested == 0);
@@ -513,21 +494,18 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     // Inside the window: held, and served when the fragment arrives.
     std::jthread producer([&] {
         std::this_thread::sleep_for(60ms);
-        // A distinguishable length: fragment 0 is four bytes, so a size of
-        // eleven can only be fragment 1.
+        // Fragment 0 is four bytes, so eleven bytes identifies fragment 1.
         store->publish_segment(Bytes(11, 0x31), 4.0);
     });
     auto held = get("segment-000001.m4s");
     producer.join();
     CHECK(held.status == 200);
-    // Segments are served as a stream rather than an inline body, so the
-    // length is what identifies which fragment came back.
+    // The length identifies which fragment came back.
     CHECK(held.content_length() == 11);
-    // An admitted request is exactly the one that may move the frontier.
+    // Only an admitted request may move the frontier.
     CHECK(store->snapshot().highest_requested == 1);
 
-    // A held request that reaches its deadline still answers retryably rather
-    // than as a missing object.
+    // A held request that reaches its deadline answers retryably, not as missing.
     const auto timed_out_at = Clock::now();
     auto timed_out = get("segment-000002.m4s");
     const auto timed_out_elapsed = Clock::now() - timed_out_at;
@@ -538,10 +516,8 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
 }
 
 MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_anything_is_published) {
-    // Phase 2 of TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md.
-    // The playlist is a plan, and the plan exists before any media does, so
-    // there is nothing to wait for: it is served complete and closed on the
-    // first fetch and does not change afterwards.
+    // The playlist is the plan, which exists before any media: served complete
+    // and closed on the first fetch, and unchanged afterwards.
     TempDir t;
     const std::vector<double> plan{2.0, 4.0, 4.0, 3.5};
     auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms, plan);
@@ -558,8 +534,7 @@ MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_a
     CHECK(first.find("#EXT-X-ENDLIST") != std::string::npos);
     CHECK(first.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
 
-    // Every planned entry is advertised, including the three nothing has
-    // produced and the one nothing has even started.
+    // Every planned entry is advertised, produced or not.
     for (int i = 0; i < 4; ++i) {
         std::ostringstream name;
         name << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s";
@@ -567,24 +542,19 @@ MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_a
     }
     CHECK(first.find("segment-000004.m4s") == std::string::npos);
 
-    // EXTINF is the plan -- an unproduced fragment has no measured length --
-    // and TARGETDURATION is the longest planned entry, rounded up.
+    // EXTINF is the planned length; TARGETDURATION is the longest planned entry,
+    // rounded up.
     CHECK(first.find("#EXTINF:2.000,") != std::string::npos);
     CHECK(first.find("#EXTINF:3.500,") != std::string::npos);
     CHECK(first.find("#EXT-X-TARGETDURATION:4\n") != std::string::npos);
 
-    // Byte-identical on every later fetch. A VOD playlist is immutable, and a
-    // player that built a seek map from the first fetch must not be able to
-    // find a different timeline underneath it later.
+    // Byte-identical on every later fetch: a VOD playlist is immutable.
     REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
     CHECK(store->playlist() == first);
     REQUIRE(store->publish_segment(Bytes(64, 0x10), 2.0));
     CHECK(store->playlist() == first);
 
-    // Including when a fragment turns out longer than it was planned as. The
-    // playlist has already promised a length and cannot revise it; that is
-    // exactly why the plan has to predict the output, and why the transcode
-    // timeline harness measures declared against carried.
+    // Even when a fragment is longer than planned: the promised length stands.
     REQUIRE(store->publish_segment(Bytes(64, 0x11), 6.0));
     CHECK(store->playlist() == first);
 
@@ -594,8 +564,8 @@ MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_a
     CHECK(store->snapshot().error.empty());
     CHECK(store->playlist() == first);
 
-    // A generation that breaks still withholds the playlist rather than
-    // serving a promise it can no longer keep.
+    // A broken generation withholds the playlist rather than serve a promise
+    // it cannot keep.
     auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
                                                       4000ms, plan);
     REQUIRE(!broken->playlist().empty());
@@ -604,19 +574,13 @@ MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_a
 }
 
 MACHA_TEST("media_playback", test_media_segment_store_holds_an_init_request_until_it_is_published) {
-    // One hold path for anything a client can request -- Phase 1 of
-    // TODO/archive/2026-09-08-bounded-vod-playlist-and-segment-holds.md. Once a
-    // complete playlist is served before anything has been published, the
-    // client asks for init.mp4 before the muxer has written the first moof.
-    // wait_object() used to return immediately for every non-segment name, so
-    // that request would have been answered 404 for an object the playlist
-    // promises exists.
+    // One hold path for anything a client can request: init.mp4 may be asked
+    // for before the muxer has written it, and is held rather than a 404.
     TempDir t;
     auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms,
                                                      std::vector<double>{4.0, 4.0});
 
-    // The immediate lookup misses -- this is exactly what the HTTP layer used
-    // to turn into a 404.
+    // The immediate lookup misses.
     CHECK(!store->object("init.mp4").has_value());
 
     std::atomic_bool init_returned{};
@@ -634,17 +598,15 @@ MACHA_TEST("media_playback", test_media_segment_store_holds_an_init_request_unti
     REQUIRE(waited_init.has_value());
     CHECK(std::string(waited_init->begin(), waited_init->end()) == "init");
 
-    // A generation that ends without ever publishing an init fragment releases
-    // the waiter rather than holding it for the life of the request.
+    // A generation that ends without an init fragment releases the waiter.
     auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
                                                       4000ms, std::vector<double>{4.0});
     std::jthread breaker([&] { broken->fail("generation broke"); });
     CHECK(!broken->wait_object("init.mp4", {}).has_value());
     breaker.join();
 
-    // MPEG-TS has no init fragment, so that request must not hold: nothing
-    // could ever publish it. Timed, because the failure this guards against is
-    // a wait that only ends when the timeout does.
+    // MPEG-TS has no init fragment, so that request must not hold; timed,
+    // because a wrong answer would only end at the timeout.
     auto ts = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-ts", 4000ms,
                                                   std::vector<double>{4.0}, MediaContainer::mpegts);
     const auto before = std::chrono::steady_clock::now();
@@ -710,10 +672,8 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(full->segment_durations.size() == 30);
     for (const auto duration : full->segment_durations) CHECK(duration <= 4.001);
 
-    // Regression: avformat_find_stream_info() can leave a Matroska
-    // AVStream index containing only keyframes encountered during probing. The
-    // old planner accepted that as complete and advertised the entire
-    // unindexed tail as one fragment, e.g. segments=1 for a full movie.
+    // avformat_find_stream_info() can leave a Matroska index holding only the
+    // keyframes seen while probing; that is not a complete index.
     const std::vector<double> partial{0.0, 2.0};
     CHECK(!media_vod::indexed_plan(partial, 120.0, 0, 4.0).has_value());
 
@@ -722,39 +682,31 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     const std::vector<double> partial_with_several_starts{0.0, 4.0, 8.0, 12.0, 16.0};
     CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0, 4.0).has_value());
 
-    // Sparse but complete GOPs can still be remuxed: a fragment is as long as
-    // the source GOP makes it.
+    // Sparse but complete GOPs can still be remuxed; a fragment is as long as its GOP.
     std::vector<double> sparse_complete;
     for (double seconds = 0.0; seconds < 60.0; seconds += 10.0)
         sparse_complete.push_back(seconds);
     CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0, 4.0).has_value());
 
-    // Scene-cut encodes (x264/x265 defaults) leave keyframe gaps well past
-    // 3x the target fragment. Until 0.32.11 one such gap anywhere sent the
-    // whole file to a software transcode; a 40 s fragment is a long fragment,
-    // not an unusable index.
+    // Scene-cut encodes leave keyframe gaps well past 3x the target; a 40 s
+    // fragment is a long fragment, not an unusable index.
     std::vector<double> scene_cut{0.0, 4.0, 44.0, 48.0, 52.0, 90.0, 94.0, 118.0};
     auto scene_cut_plan = media_vod::indexed_plan(scene_cut, 120.0, 0, 4.0);
     REQUIRE(scene_cut_plan.has_value());
     CHECK(std::abs(scene_cut_plan->longest_segment_seconds - 40.0) < 0.0005);
-    // ... while a gap a viewer would wait minutes to seek across still is.
+    // A gap a viewer would wait minutes to seek across is unusable.
     const std::vector<double> huge_gap{0.0, 4.0, 110.0, 114.0, 118.0};
     CHECK(!media_vod::indexed_plan(huge_gap, 120.0, 0, 4.0).has_value());
 
-    // One fragment is legitimate for genuinely short media; the regression
-    // is accepting one fragment for a long presentation with an incomplete
-    // index, not the segment count itself.
+    // One fragment is legitimate for genuinely short media.
     const std::vector<double> short_index{0.0};
     auto short_plan = media_vod::indexed_plan(short_index, 6.0, 0, 4.0);
     REQUIRE(short_plan.has_value());
     CHECK(short_plan->segment_durations.size() == 1);
     CHECK(std::abs(short_plan->segment_durations.front() - 6.0) < 0.0005);
 
-    // The server does what it is told. A seek starts at the LAST keyframe at
-    // or before the request, never after it, and reports the remainder as an
-    // offset rather than moving the position and calling the new position the
-    // answer. Starting after the request put the content in between in no
-    // generation at all.
+    // A seek starts at the last keyframe at or before the request, never after,
+    // and reports the remainder as an offset.
     auto seeked = media_vod::indexed_plan(complete, 120.0, 61'000, 4.0);
     REQUIRE(seeked.has_value());
     CHECK(std::abs(seeked->actual_seek_seconds - 60.0) < 0.0005);
@@ -763,8 +715,7 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(seeked->seek_requested_ms == 61'000);
     CHECK(seeked->seek_ms + seeked->seek_offset_ms == seeked->seek_requested_ms);
 
-    // A request that already is a keyframe costs nothing: offset zero, and the
-    // property that lets a client opt into exactly-aligned seeks.
+    // A request on a keyframe has offset zero, so clients can make aligned seeks.
     auto aligned = media_vod::indexed_plan(complete, 120.0, 62'000, 4.0);
     REQUIRE(aligned.has_value());
     CHECK(aligned->seek_ms == 62'000);
@@ -772,24 +723,21 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
 
     // A keyframe a fraction of a millisecond after the request is not a
     // candidate: it rounds UP to 61'001 ms (rounding down would land
-    // avformat_seek_file's backward search one keyframe early), and a baseline
-    // past the request would make the offset negative.
+    // avformat_seek_file's backward search one keyframe early).
     const std::vector<double> fractional{0.0, 30.0, 61.0004, 90.0};
     auto fractional_plan = media_vod::indexed_plan(fractional, 120.0, 61'000, 4.0);
     REQUIRE(fractional_plan.has_value());
     CHECK(fractional_plan->seek_ms == 30'000);
     CHECK(fractional_plan->seek_offset_ms == 31'000);
 
-    // Out of range clamps to [0, duration - 1 ms], and the invariant holds
-    // against the clamped request so a client can see the clamp happened
-    // instead of mistaking it for a violation.
+    // Out of range clamps to [0, duration - 1 ms]; the invariant holds against
+    // the clamped request, so the clamp is visible.
     CHECK(media_vod::clamp_seek_ms(500'000, 120.0) == 119'999);
     CHECK(media_vod::clamp_seek_ms(-5, 120.0) == 0);
 
     // No indexed keyframe at or before the request: baseline zero, the offset
-    // carries the whole request, and the mode is not substituted. A decodable
-    // stream's first sample is necessarily a sync sample, so a copy can always
-    // begin at the beginning; the index simply did not name it.
+    // carries the whole request, and the mode is kept (a stream's first sample
+    // is always a sync sample).
     const std::vector<double> late_index{40.0, 44.0, 48.0};
     auto unnamed_start = media_vod::indexed_plan(late_index, 60.0, 20'000, 4.0);
     REQUIRE(unnamed_start.has_value());
@@ -797,9 +745,7 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
     CHECK(unnamed_start->seek_offset_ms == 20'000);
     CHECK(unnamed_start->seek_requested_ms == 20'000);
 
-    // The Cues behind a plan, logged on success as well as on rejection: these
-    // gaps bound the true GOP from above, so offsets clustering well below them
-    // say the index is sparse rather than the GOP long.
+    // The Cues behind a plan; the gaps bound the true GOP from above.
     const auto density = media_vod::index_density(complete, 120.0);
     CHECK(density.entries == 60);
     CHECK(std::abs(density.longest_gap_seconds - 2.0) < 0.0005);
@@ -807,8 +753,7 @@ MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_
 }
 
 namespace {
-// The Ratatouille case: HEVC Main 10, PQ transfer (Dolby Vision profile 8),
-// E-AC3 audio, in Matroska.
+// HEVC Main 10, PQ transfer (Dolby Vision profile 8), E-AC3 audio, in Matroska.
 class HdrFakeMediaEngine final : public FakeMediaEngine {
   public:
     MediaProbeResult probe(const MediaSource& source, std::chrono::milliseconds timeout = {}) override {
@@ -880,8 +825,7 @@ MACHA_TEST("media_playback", test_direct_play_serves_a_matroska_source) {
     auto response = playback.handle(request);
     REQUIRE(response.status == 201);
     auto session = Json::parse(std::string(response.body.begin(), response.body.end()));
-    // Matroska is a container like any other: the source object over byte
-    // ranges, with the facts reported alongside it.
+    // Matroska is served direct over byte ranges, with the facts alongside.
     CHECK(session.find("mode")->asString() == "direct");
     CHECK(session.find("stream")->find("url")->asString().ends_with("/direct"));
     CHECK(session.find("stream")->find("mime_type")->asString() == "video/x-matroska");
@@ -889,16 +833,8 @@ MACHA_TEST("media_playback", test_direct_play_serves_a_matroska_source) {
 }
 
 MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_node) {
-    // This case used to be test_media_playlist_waits_for_the_first_fragment,
-    // which asserted the 0.32.14 contract: withhold the playlist until a
-    // fragment exists, so a player cannot queue requests against an encoder
-    // that has produced nothing. The incident behind it was real -- a native
-    // player prefetched deeply, waited on the encoder for each request in
-    // turn, and cost a 2017 television a 98-second black screen -- but
-    // withholding the playlist was never what made that safe. It is re-expressed
-    // here against the mechanism that now guards it: the playlist is complete
-    // up front, and a client that asks for more than its share is refused
-    // promptly rather than held.
+    // The playlist is complete up front; a client that asks for more than its
+    // share of fragment holds is refused promptly rather than held.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -925,8 +861,7 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     streaming.max_session_holds = 2;
     streaming.max_concurrent_holds = 8;
     streaming.segment_hold_window = 8;
-    // Long enough that the two admitted holds are still outstanding while the
-    // rest of the case runs, short enough that the case ends without them.
+    // The two admitted holds outlast the rest of the case, then time out.
     streaming.segment_timeout = 1500ms;
     auto engine = std::make_unique<ObservableHlsMediaEngine>();
     auto* engine_ptr = engine.get();
@@ -956,27 +891,22 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
                             std::move(request));
     };
 
-    // The playlist itself no longer waits for anything: complete, closed, and
-    // available before a second fragment exists.
+    // The playlist is complete and closed before a second fragment exists.
     auto playlist_response = get("media.m3u8");
     REQUIRE(playlist_response.status == 200);
     const auto playlist = response_text(playlist_response);
     CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
     CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
     CHECK(playlist.find("segment-000014.m4s") != std::string::npos);
-    // Which is exactly why a client may now ask for all of it at once.
-
-    // Two requests for fragments nothing has produced: both admitted, both
-    // held. That is this session's entire share -- one in flight, one prefetch.
+    // Two requests for unproduced fragments: both admitted and held, the
+    // session's whole share (one in flight, one prefetch).
     HttpResponse first_hold;
     HttpResponse second_hold;
     std::jthread first([&] { first_hold = get("segment-000001.m4s"); });
     std::jthread second([&] { second_hold = get("segment-000002.m4s"); });
     std::this_thread::sleep_for(150ms);
 
-    // The third is refused, immediately, and says which limit it met. Before
-    // this mechanism existed, this was the request that joined a queue behind
-    // the encoder and the television went black.
+    // The third is refused immediately, naming the limit it met.
     const auto refused_at = Clock::now();
     auto refused = get("segment-000003.m4s");
     const auto refused_elapsed = Clock::now() - refused_at;
@@ -987,10 +917,7 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     CHECK(refused.headers["Retry-After"] == "1");
     CHECK(refused_elapsed < 200ms);
 
-    // And the node is still answering control traffic while both holds are
-    // outstanding. This is the governing-law-1 gate. A hold no longer costs a
-    // worker (0.43.0: it is a parked continuation), so the budget is now a
-    // fairness bound; control traffic staying prompt is still the point.
+    // Control traffic stays prompt while both holds are outstanding (law 1).
     HttpRequest status_request;
     status_request.method = "GET";
     status_request.path = "/api/v1/playback/status";
@@ -1000,8 +927,7 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     CHECK(status_response.status == 200);
     CHECK(status_elapsed < 300ms);
 
-    // The two holds reach their deadline and answer retryably rather than as
-    // missing objects.
+    // Both holds reach their deadline and answer retryably, not as missing.
     first.join();
     second.join();
     CHECK(first_hold.status == 500);
@@ -1009,8 +935,7 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     CHECK(std::string(first_hold.body.begin(), first_hold.body.end()).find("segment_not_ready") !=
           std::string::npos);
 
-    // Releasing them returned the session's share, so the client is admitted
-    // again rather than being locked out by its own earlier prefetch.
+    // Their release returned the session's share, so the client is admitted again.
     auto store = engine_ptr->store();
     REQUIRE(store != nullptr);
     std::jthread producer([&] {
@@ -1029,17 +954,15 @@ MACHA_TEST("media_playback", test_segment_store_mpegts_mode_has_no_init_and_ts_n
                                                      std::vector<double>{2.0, 4.0, 4.0},
                                                      MediaContainer::mpegts);
     CHECK(store->container() == MediaContainer::mpegts);
-    // Complete and closed before anything is published here too: the container
-    // changes the names and the version, not the shape of the promise.
+    // Complete and closed before anything is published; only names and version differ.
     const auto planned_playlist = store->playlist();
     CHECK(!planned_playlist.empty());
     CHECK(planned_playlist.find("#EXT-X-VERSION:3") != std::string::npos);
     CHECK(planned_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
     CHECK(planned_playlist.find("segment-000002.ts") != std::string::npos);
     CHECK(planned_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
-    // No init segment in MPEG-TS: the first fragment alone makes it ready, and
-    // there is no init object for a client to be held on -- nothing could ever
-    // publish one, so that request is a genuine miss rather than an early one.
+    // MPEG-TS has no init segment: the first fragment makes it ready, and an
+    // init request is a genuine miss, not held.
     CHECK(!store->wait_object("init.mp4", 100ms).has_value());
     REQUIRE(store->publish_segment(Bytes(188 * 3, 0x47), 2.0));
     REQUIRE(store->wait_ready(10ms));
@@ -1109,9 +1032,8 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     for (double seconds = 0.0; seconds < 120.0; seconds += 2.0)
         remux.video_random_access_points.push_back(seconds);
 
-    // A PATCH seek and a create seek agree: the baseline is the keyframe at or
-    // before the request, and the remainder is published as an offset rather
-    // than moved silently.
+    // A PATCH seek and a create seek agree: baseline at the keyframe at or before
+    // the request, the remainder published as an offset.
     auto remux_seek = reseek_hls_vod(remux, 61s);
     REQUIRE(remux_seek.has_value());
     CHECK(remux_seek->playback.seek == 60s);
@@ -1135,19 +1057,13 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     CHECK(transcode_seek->playback.seek_offset == 0s);
     CHECK(transcode_seek->playback.seek_requested == 61s);
     REQUIRE(transcode_seek->segment_durations.size() >= 2);
-    // A seek's first fragment is the short start-up fragment (2 s), so the
-    // generation answers after 2 s of encoding; the rest keep the target.
+    // A seek's first fragment is the 2 s start-up fragment; the rest keep the target.
     CHECK(std::abs(transcode_seek->segment_durations.front() - 2.0) < 0.0005);
     CHECK(std::abs(transcode_seek->segment_durations[1] - 4.0) < 0.0005);
 
-    // A transcode plan whose keyframe index is known does NOT snap: the
-    // encoder can start on any frame, so it starts exactly where it was told
-    // to. Until 2026-09-18 this snapped forward to the next keyframe to spare
-    // the decoder its pre-roll; that pre-roll is the price of asking for a
-    // non-keyframe and it is the client's to pay, whereas snapping put the
-    // content between the request and the keyframe in no generation at all.
-    // The keyframes below include one at 62.5274s, deliberately not a round
-    // number of milliseconds, which must not attract the seek to itself.
+    // A transcode with a known keyframe index does not snap: the encoder starts
+    // exactly where it was told. The keyframe at 62.5274 s, not a whole number
+    // of milliseconds, must not attract the seek.
     HlsVodPlan transcode_with_keyframes;
     transcode_with_keyframes.playback.mode = PlaybackMode::transcode;
     transcode_with_keyframes.playback.video = MediaTransform::transcode;
@@ -1163,14 +1079,12 @@ MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_s
     REQUIRE(!unsnapped_seek->segment_durations.empty());
     CHECK(std::abs(unsnapped_seek->segment_durations.front() - 2.0) < 0.0005);
 
-    // Seeking past the last known keyframe is not a special case any more.
+    // Seeking past the last known keyframe is not a special case.
     auto past_last_keyframe = reseek_hls_vod(transcode_with_keyframes, 6500s);
     REQUIRE(past_last_keyframe.has_value());
     CHECK(past_last_keyframe->playback.seek == 6500s);
 
-    // A decline names the precondition that failed rather than being silent:
-    // across a day on es-1 nothing recorded whether this path was declining or
-    // never being reached.
+    // A decline names the precondition that failed.
     HlsVodPlan unavailable;
     std::string reason;
     CHECK(!reseek_hls_vod(unavailable, 10s, &reason).has_value());
@@ -1186,9 +1100,8 @@ MACHA_FAST_TEST("media_playback", test_media_timestamp_repair) {
     CHECK(first.dts == -69952);
     CHECK(state.repair_count() == 0);
 
-    // This is the exact failure shape seen from the MP4 muxer: two packets
-    // arrive with equal DTS after a seek/rescale. The second one must advance
-    // and the same correction must remain applied to later source timestamps.
+    // Two packets with equal DTS after a seek/rescale: the second advances, and
+    // the same correction applies to later source timestamps.
     MediaPacketTimestamps equal{-69912, -69952, 40};
     normalize_media_timestamps(state, equal);
     CHECK(equal.dts == -69951);
@@ -1274,8 +1187,7 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     REQUIRE(response.status == 503);
     auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
     // One envelope for every error: error.code is the snake_case discriminator,
-    // error.message is for a human, and everything else about the failure hangs
-    // off the same object rather than being a sibling of it.
+    // error.message is for a human, and every other detail hangs off `error`.
     const auto* error = body.find("error");
     REQUIRE(error != nullptr);
     CHECK(error->find("code")->asString() == "playback_probe_failed");
@@ -1378,9 +1290,8 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
         REQUIRE(profile.find("streams")->asArray().size() == 4);
     }
 
-    // A distinct manager has an empty process-local cache. It must construct
-    // the identical response semantics without invoking its media engine's
-    // probe path (and therefore without opening the media source for probing).
+    // A distinct manager, with an empty process-local cache, answers the same
+    // without probing the media source.
     {
         auto engine = std::make_unique<FakeMediaEngine>();
         auto* observed = engine.get();
@@ -1403,8 +1314,8 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
         playback.stop();
     }
 
-    // Replacing the path changes its immutable extent-manifest identity. The
-    // old profile remains valid for the old object but cannot hit the new one.
+    // Replacing the file changes its extent-manifest identity, so the old profile
+    // cannot hit the new object.
     auto replacement = pattern(128 * 1024 + 41);
     for (auto& byte : replacement) byte ^= 0x5a;
     auto replacement_writer = service.filesystem().open_write("/media/profile.mp4", true);
@@ -1576,8 +1487,8 @@ MACHA_TEST("media_playback", test_failed_idempotent_creation_releases_joiners_an
     CHECK(second.status == 503);
     CHECK(observed->probes() == 1);
 
-    // The failed association and its sole pending-session reservation must be
-    // gone. With max_sessions=1, reaching a second probe proves both releases.
+    // With max_sessions=1, reaching a second probe proves the failed association
+    // and its pending-session reservation were both released.
     auto retry = playback.handle(request);
     CHECK(retry.status == 503);
     CHECK(observed->probes() == 2);
@@ -2029,9 +1940,8 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     streaming.temp_path = t.path() / "playback";
     streaming.max_video_transcodes = 1;
     streaming.video_decoder_threads = 3;
-    // Renewals below come 20 ms apart; the lease must outlast a loaded
-    // host's sleep overrun between two of them. At 50 ms it did not (the
-    // case failed 53/120 on an overloaded laptop, at the same rate on 0.73.2).
+    // Renewals come 20 ms apart; the lease must outlast a loaded host's sleep
+    // overrun between two of them.
     streaming.pipeline_idle = 500ms;
     streaming.session_idle = 5min;
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
@@ -2079,8 +1989,8 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     }
     CHECK(playback_status().find("video_transcodes")->asUInt64() == 1);
 
-    // A client retrying an obsolete generation is told it is gone for good,
-    // but those requests must not keep an abandoned encoder leased.
+    // Requests for an obsolete generation are answered gone and do not renew
+    // the abandoned encoder's lease.
     for (int i = 0; i < 4; ++i) {
         HttpRequest stale;
         stale.method = "GET";
@@ -2091,12 +2001,8 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
 
     REQUIRE(wait_until([&] {
         auto status = playback_status();
-        // Reclaiming the pipeline does not, by itself, surrender the
-        // entitlement: that goes on its own clock, transcode_entitlement_idle,
-        // which is left at its five-minute default here so this test stays
-        // about pipeline reclamation alone. The entitlement timer has its own
-        // test -- see the stream-fetch keep-alive case below, which is where
-        // the two numbers are shown diverging.
+        // The entitlement is on its own clock, transcode_entitlement_idle, left
+        // at its default here; the keep-alive case below tests it.
         return status.find("sessions")->asUInt64() == 1 &&
                status.find("video_transcodes")->asUInt64() == 1 &&
                status.find("running_video_transcode_pipelines")->asUInt64() == 0 &&
@@ -2106,20 +2012,15 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
                status.find("heap_reclaim_runs")->asUInt64() >= 1;
     }, 5s));
 
-    // Physical reclamation alone does not surrender the logical entitlement:
-    // otherwise an ordinary resume or seek could be rejected the moment a
-    // pipeline went idle, which is sixty seconds. It is surrendered, but on
-    // the slower transcode_entitlement_idle clock, and that is tested
-    // separately rather than here.
+    // Reclaiming the pipeline does not surrender the entitlement, so a resume
+    // or seek after an idle pipeline is not refused.
     auto second = playback.handle(create);
     REQUIRE(second.status == 429);
     auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
     auto second_error = second_json.find("error");
     REQUIRE(second_error != nullptr);
     CHECK(second_error->find("code")->asString() == "resource_limit");
-    // Node-scoped on the create path: no session exists yet, so trying another
-    // node costs nothing and is the right move. The update path says the
-    // opposite, because there the session is pinned here.
+    // Node-scoped on create: no session exists yet, so another node may serve it.
     CHECK(second_error->find("scope")->asString() == "node");
     CHECK(second_error->find("node_healthy")->asBool());
     CHECK(second_error->find("alternative_may_succeed")->asBool());
@@ -2138,13 +2039,9 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
 }
 
 MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_session_poll_does_not) {
-    // The keep-alive contract, pinned because a client has to be told it and
-    // because the distinction is easy to erase by accident. A paused viewer
-    // keeps its transcode entitlement by asking for a stream object inside
-    // transcode_entitlement_idle -- a playlist fetch is enough. Polling the
-    // session does NOT count: it keeps the session alive, deliberately, but it
-    // is not evidence that anyone still wants the media, which is the question
-    // the entitlement answers.
+    // A paused viewer keeps its transcode entitlement by fetching a stream object
+    // (a playlist is enough) within transcode_entitlement_idle. Polling the
+    // session keeps the session alive but not the entitlement.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2168,12 +2065,9 @@ MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.max_video_transcodes = 1;
-    // Long enough that a fetch every 100ms keeps the pipeline alive -- a
-    // reclaimed pipeline removes its generation directory, so the playlist
-    // this test fetches has to still exist.
+    // A fetch every 100ms keeps the pipeline (and so the playlist it serves) alive.
     streaming.pipeline_idle = 250ms;
-    // Clamped into [pipeline_idle, session_idle], so both bounds must leave
-    // room for the value under test.
+    // Clamped into [pipeline_idle, session_idle].
     streaming.transcode_entitlement_idle = 600ms;
     streaming.session_idle = 5min;
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
@@ -2205,9 +2099,7 @@ MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_
     };
     REQUIRE(entitlements() == 1);
 
-    // Polling the session keeps it alive but is not stream activity, so the
-    // entitlement still goes. Poll throughout, well inside the window, and the
-    // slot must still be released.
+    // Polling well inside the window is not stream activity: the slot is released.
     HttpRequest poll;
     poll.method = "GET";
     poll.path = "/api/v1/playback/sessions/" + session_id;
@@ -2220,9 +2112,7 @@ MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_
     // The session itself survived the release: the viewer keeps its place.
     CHECK(playback.handle(poll).status == 200);
 
-    // Now the other half. A fresh session, kept warm by fetching the playlist,
-    // holds its entitlement across a span that would otherwise have released
-    // it twice over.
+    // A fresh session kept warm by playlist fetches holds its entitlement.
     auto second = playback.handle(create);
     REQUIRE(second.status == 201);
     auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
@@ -2246,13 +2136,8 @@ MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_
 }
 
 MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_one_never_existed) {
-    // Two different facts share one shape -- the generation in the URL is not
-    // the one this session is producing -- and a client must act differently
-    // on each. Below the current generation the object existed here and was
-    // replaced, which is permanent and must not be retried; above it, nothing
-    // has produced that far, which is an ordinary not-found. Answering 404 to
-    // both made every regenerate look like a segment index that never existed,
-    // and a client that retries those reads a healthy node as a failing one.
+    // A URL generation below the current one was replaced (permanent, not to be
+    // retried); one above it is an ordinary not-found.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2295,8 +2180,7 @@ MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_o
     const auto first_url = created_json.find("stream")->find("url")->asString();
     const auto first_generation = created_json.find("generation")->asUInt64();
 
-    // A seek ends the current generation and begins a new one. This is the
-    // routine event -- not an exotic one -- that the status has to describe.
+    // A seek ends the current generation and begins a new one.
     Json::Object patch_root{{"seek_ms", 5'000}};
     auto patch_text = Json(std::move(patch_root)).dump();
     HttpRequest patch;
@@ -2319,17 +2203,13 @@ MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_o
     auto stale_error = stale_json.find("error");
     REQUIRE(stale_error != nullptr);
     CHECK(stale_error->find("code")->asString() == "generation_superseded");
-    // The axes are the point, not the status. `request` says do not walk the
-    // cluster: no other node has this session, so a walk would collect this
-    // same refusal from every healthy node it tried and charge each one for
-    // it. `node_healthy` is the correction. `alternative_may_succeed` is the
-    // instruction -- a different request, against this same node, works.
+    // Scope `request`: no other node has this session, so do not walk the
+    // cluster. A different request against this node may succeed.
     CHECK(stale_error->find("scope")->asString() == "request");
     CHECK(stale_error->find("node_healthy")->asBool());
     CHECK(stale_error->find("alternative_may_succeed")->asBool());
 
-    // Above the current generation nothing has produced that far, which is an
-    // ordinary not-found rather than something that is gone.
+    // Above the current generation: an ordinary not-found.
     auto future_url = patched_json.find("stream")->find("url")->asString();
     const auto marker = "/" + std::to_string(second_generation) + "/";
     const auto at = future_url.find(marker);
@@ -2371,8 +2251,7 @@ MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.max_video_transcodes = 1;
-    // The clock under test. The ordinary one stays long, so a failure here is
-    // the unused clock firing and never session_idle expiring the session.
+    // The clock under test; session_idle stays long, so only this one can fire.
     streaming.session_unused_idle = 150ms;
     streaming.session_idle = 5min;
     streaming.pipeline_idle = 5min;
@@ -2398,9 +2277,7 @@ MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_
         return Json::parse(std::string(response.body.begin(), response.body.end()));
     };
 
-    // A viewer creates a session and is never heard from again: the phone is
-    // force-quit, the app is suspended with its DELETE unsent, the power goes.
-    // No client-side fix reaches this, which is why the server must.
+    // A session created and never used again (app killed, DELETE never sent).
     auto abandoned = playback.handle(create);
     REQUIRE(abandoned.status == 201);
     auto abandoned_json = Json::parse(std::string(abandoned.body.begin(), abandoned.body.end()));
@@ -2421,8 +2298,8 @@ MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_
     CHECK(admitted_json.find("session_id")->asString() !=
           abandoned_json.find("session_id")->asString());
 
-    // And a session that IS being streamed from keeps the long clock: one
-    // fetch is enough, forever, so a paused player is never evicted by this.
+    // One stream fetch moves a session onto the long clock, so a paused player
+    // is never evicted by this one.
     HttpRequest stream;
     stream.method = "GET";
     stream.path = admitted_json.find("stream")->find("url")->asString();
@@ -2479,11 +2356,8 @@ MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_
     const auto subtitle_url = created_json.find("stream")->find("subtitle_url")->asString();
     const auto subtitle_base = subtitle_url.substr(0, subtitle_url.rfind('/'));
 
-    // Hold this session's subtitle_cache mutex open for the whole test by
-    // blocking inside extract_webvtt_segment, exactly as a slow real
-    // extraction would. Before the fix this alone was enough to stall
-    // status() (and therefore create/patch/delete/cleanup, which all take
-    // the same global session mutex) for as long as the gate stayed shut.
+    // Hold this session's subtitle_cache mutex for the whole test by blocking
+    // inside extract_webvtt_segment, as a slow extraction would.
     HttpResponse segment_response;
     std::jthread segment_request([&] {
         HttpRequest segment;
@@ -2501,18 +2375,14 @@ MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_
     const auto status_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - status_started);
     REQUIRE(status_response.status == 200);
-    // status() must not block on the subtitle_cache mutex the gated request
-    // is still holding: the per-session read is try_lock, so a busy session
-    // just contributes nothing to this snapshot instead of stalling status()
-    // (and, via the global mutex, every other playback operation) for as
-    // long as the gate stays shut.
+    // status() does not block on the held mutex: the per-session read is
+    // try_lock, so a busy session contributes nothing to the snapshot.
     CHECK(status_elapsed < 500ms);
     auto status_json = Json::parse(std::string(status_response.body.begin(), status_response.body.end()));
     CHECK(status_json.find("sessions")->asUInt64() == 1);
     CHECK(status_json.find("subtitle_cache_entries")->asUInt64() == 0);
 
-    // A second, unrelated session-mutating call must also not be stuck
-    // behind the global mutex while the gate is held.
+    // Nor is an unrelated session-mutating call stuck behind the global mutex.
     HttpRequest second_create;
     second_create.method = "POST";
     second_create.path = "/api/v1/playback/sessions";
@@ -2608,22 +2478,20 @@ MACHA_FAST_TEST("media_playback", test_older_video_profiles_are_stale_and_regene
     // Fresh profiles carry the depth/transfer signalling negotiation needs.
     CHECK(profile.schema_version == catalogue_media_profile_schema);
     CHECK(valid_catalogue_media_profile("macha:abc", profile));
-    // A profile stored before 0.32.12 does not, so it is regenerated: a
-    // stale one let a Dolby Vision title be copied to a client that could
-    // not decode it.
+    // A profile from an older schema lacks it, so it is regenerated.
     for (uint32_t older = 1; older < catalogue_media_profile_schema; ++older) {
         profile.schema_version = older;
         CHECK(!valid_catalogue_media_profile("macha:abc", profile));
     }
     profile.schema_version = 1;
-    // ... unless nothing in it is a video stream.
+    // Unless it has no video stream.
     profile.probe.streams = {audio};
     CHECK(valid_catalogue_media_profile("macha:abc", profile));
 }
 
 namespace {
-// Two audio tracks, English and French, beside the fake engine's one video
-// and two English subtitles: a file where every choice is a real one.
+// English and French audio beside the fake engine's one video and two English
+// subtitles, so every choice is a real one.
 class TwoAudioFakeMediaEngine final : public FakeMediaEngine {
   public:
     MediaProbeResult probe(const MediaSource& source, std::chrono::milliseconds timeout = {}) override {
@@ -2636,11 +2504,9 @@ class TwoAudioFakeMediaEngine final : public FakeMediaEngine {
 } // namespace
 
 MACHA_TEST("media_playback", test_the_server_plays_what_it_is_told_and_chooses_nothing) {
-    // Operator, 2026-09-24: "The server supplies facts, operations, then does
-    // what it's told." Playback is by media_id; a stream, a language or a
-    // container left open when there are several is refused with the
-    // candidates, and a language the media lacks is never answered with
-    // another track.
+    // Playback is by media_id; a stream, language or container left open when
+    // there are several is refused with the candidates, and a language the
+    // media lacks is never answered with another track.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -2732,8 +2598,7 @@ MACHA_TEST("media_playback", test_the_server_plays_what_it_is_told_and_chooses_n
                                       400),
                              "choice_required", "subtitle_stream");
     CHECK(subtitles.size() == 2);
-    // Direct serves the file untouched and the player picks its own tracks:
-    // there is nothing for the server to choose, so nothing is refused.
+    // Direct serves the file untouched and the player picks tracks: nothing is refused.
     auto direct = instruct(Json::Object{{"mode", "direct"}});
     CHECK(direct.find("mode")->asString() == "direct");
     CHECK(direct.find("output")->find("audio") == nullptr);
@@ -2800,8 +2665,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
         auto response = playback.handle(request);
         REQUIRE(response.status == expect);
         auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
-        // Release the slot: this test walks the whole permutation table and
-        // would otherwise hit the session limit rather than the contract.
+        // Release the slot so the permutation walk does not hit the session limit.
         if (const auto* id = parsed.find("session_id")) {
             HttpRequest remove;
             remove.method = "DELETE";
@@ -2824,23 +2688,19 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(source_streams.front().find("color_transfer")->asString() == "smpte2084");
     CHECK(source_streams.front().find("bit_depth")->asInt64() == 10);
 
-    // A remux instruction copies both, 10-bit PQ HEVC and E-AC-3 included:
-    // the server does not second-guess the client's decoder.
+    // Remux copies both, 10-bit PQ HEVC and E-AC-3 included.
     auto remuxed = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
     CHECK(remuxed.find("mode")->asString() == "remux");
     CHECK(remuxed.find("output")->find("video")->find("codec")->asString() == "hevc");
     CHECK(remuxed.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
     CHECK(remuxed.find("output")->find("audio")->find("codec")->asString() == "eac3");
 
-    // The mixture: copy the video, re-encode the audio. It is a transcode,
-    // because something is being re-encoded, and it says so in the request.
+    // Copy the video, re-encode the audio: a transcode, as the request says.
     auto mixed = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
     CHECK(mixed.find("mode")->asString() == "transcode");
     CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
-    // A codec change is not a downmix. The 5.1 source stays 5.1 through the
-    // AAC encode; it used to arrive as stereo because the encoder was fixed
-    // at two channels (2026-09-07).
+    // A codec change is not a downmix: the 5.1 source stays 5.1 through AAC.
     CHECK(mixed.find("output")->find("audio")->find("channels")->asUInt64() == 6);
     CHECK(transcoded.find("output")->find("audio")->find("channels")->asUInt64() == 6);
 
@@ -2849,9 +2709,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(video_only.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(video_only.find("output")->find("audio")->find("transform")->asString() == "copy");
 
-    // The segment container is instructed too, and the session reports the
-    // container it actually served: a request is not evidence of what was
-    // performed, and this was the one field a client could not verify.
+    // The segment container is instructed too, and the session reports the one served.
     auto ts = instruct(Json::Object{{"mode", "transcode"}, {"container", "mpegts"}});
     CHECK(ts.find("output")->find("format")->asString() == "mpegts");
     CHECK(ts.find("output")->find("container")->asString() == "mpegts");
@@ -2859,8 +2717,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     CHECK(ts_copy.find("output")->find("container")->asString() == "mpegts");
     CHECK(ts_copy.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(ts_copy.find("output")->find("audio")->find("transform")->asString() == "copy");
-    // No default container: fMP4 and MPEG-TS are both real options, so an
-    // HLS instruction without one is refused with both listed.
+    // No default container: an HLS instruction without one is refused with both listed.
     auto fmp4 = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
     CHECK(fmp4.find("output")->find("container")->asString() == "fmp4");
     auto unnamed = instruct(Json::Object{{"mode", "remux"}}, 400);
@@ -2875,9 +2732,8 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     instruct(Json::Object{{"mode", "auto"}}, 400);
     instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"max_height", 720}}, 400);
 
-    // The mode has to describe what is being done. direct and remux copy
-    // every stream; transcode re-encodes at least one. A mode naming
-    // something it is not doing is refused, not reinterpreted (2026-09-07).
+    // direct and remux copy every stream; transcode re-encodes at least one. A
+    // mode naming something it is not doing is refused, not reinterpreted.
     instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio", "transcode"}}, 400);
     instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "transcode"}}, 400);
     instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"max_height", 720}}, 400);
@@ -2886,7 +2742,7 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     instruct(Json::Object{{"mode", "direct"}, {"max_height", 720}}, 400);
     instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}}, 400);
 
-    // And the legal permutations stay legal.
+    // The legal permutations are accepted.
     instruct(Json::Object{{"mode", "direct"}, {"video", "copy"}, {"audio", "copy"}});
     instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}});
     instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "transcode"}});
@@ -2925,9 +2781,7 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
                              std::move(fake_engine));
     playback.start();
 
-    // Direct hands over the source file untouched. A quality instruction is a
-    // re-encode, so pairing one with direct describes something direct is not
-    // doing and is refused rather than quietly ignored.
+    // A quality instruction is a re-encode, so it is refused with direct, not ignored.
     Json::Object illegal_prefs{{"mode", "direct"},
                                {"max_height", 1},
                                {"max_bitrate", static_cast<uint64_t>(1)}};
@@ -3025,13 +2879,8 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
 }
 
 MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
-    // `mode` is the shorthand for the whole transform, so an update naming it
-    // must not be judged against instructions from the mode it replaced. The
-    // client sent {"mode":"direct"} and was refused for copying-versus-
-    // re-encoding a stream it had not mentioned, because the session had been
-    // created as a transcode with the video copied -- which is what the
-    // chooser answers for most of this library, so Direct and Remux failed
-    // for viewers nearly everywhere (2026-09-08).
+    // `mode` is shorthand for the whole transform, so an update naming it is not
+    // judged against per-stream instructions from the mode it replaces.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -3092,15 +2941,14 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
         playback.handle(remove);
     };
 
-    // The mixture the chooser actually produces: transcode, video copied.
+    // Transcode with the video copied.
     auto mixed = create(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
     CHECK(mixed.find("mode")->asString() == "transcode");
     CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
     CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
     auto id = mixed.find("session_id")->asString();
 
-    // One field named, and it is obeyed: the per-stream instruction belonged
-    // to the mode that has just been replaced.
+    // Obeyed: the per-stream instruction belonged to the replaced mode.
     auto direct = update(id, Json::Object{{"mode", "direct"}});
     CHECK(direct.find("mode")->asString() == "direct");
     CHECK(direct.find("preferences")->find("video")->isNull());
@@ -3113,17 +2961,14 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
     CHECK(remuxed.find("output")->find("audio")->find("transform")->asString() == "copy");
     id = remuxed.find("session_id")->asString();
 
-    // An update that names both sets both: this drops only what the same
-    // update does not restate.
+    // An update that names both sets both.
     auto restated = update(id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
     CHECK(restated.find("mode")->asString() == "transcode");
     CHECK(restated.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(restated.find("output")->find("audio")->find("transform")->asString() == "copy");
     discard(restated.find("session_id")->asString());
 
-    // A quality instruction belongs to the mode that was asked for too, and
-    // is refused outright under direct, so it cannot be allowed to outlive a
-    // transcode either.
+    // A quality instruction also belongs to its mode, so it does not outlive a transcode.
     auto capped = create(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}});
     CHECK(capped.find("preferences")->find("max_height")->asInt64() == 720);
     auto uncapped = update(capped.find("session_id")->asString(), Json::Object{{"mode", "direct"}});
@@ -3205,9 +3050,7 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
 
 namespace {
 // A pipeline whose first fragment and start progress the test controls, for
-// `start=async`.
-// What the engine and the test share about one pipeline, owned by both so a
-// stopped pipeline never leaves the test holding a dangling session.
+// `start=async`; shared by engine and test so neither holds a dangling session.
 struct ProgressingState {
     std::atomic_bool running{true};
     std::shared_ptr<MediaSegmentStore> segments;
@@ -3440,7 +3283,7 @@ MACHA_TEST("media_playback", test_a_stalled_async_start_fails_and_frees_its_slot
     CHECK(next.status == 202);
     const auto next_id = AsyncStartFixture::body(next).find("session_id")->asString();
     CHECK(f.call("DELETE", next_id).status == 204);
-    // And the failure is gone after its retention.
+    // The failure is gone after its retention.
     REQUIRE(wait_until([&] { return f.call("GET", id).status == 404; }, 3s));
 }
 
@@ -3558,8 +3401,7 @@ MACHA_TEST("media_playback", test_async_direct_play_and_replays_answer_without_a
 }
 
 namespace {
-// One node, one tiny file and a PlaybackManager admitting a single video
-// transcode: the shape of fi-1 when a held slot refuses everybody else.
+// One node, one tiny file and a PlaybackManager admitting a single video transcode.
 struct SingleSlotPlayback {
     TempDir t;
     std::unique_ptr<Service> service;
@@ -3628,9 +3470,6 @@ struct SingleSlotPlayback {
 } // namespace
 
 MACHA_TEST("media_playback", test_a_patch_out_of_transcode_releases_the_slot) {
-    // Until 0.60.0 the entitlement outlived the transcode: a session PATCHed
-    // to direct kept the node's only slot while it streamed, plus the idle
-    // period, and refused every other viewer (fi-1, 2026-09-25 08:57Z).
     SingleSlotPlayback fixture;
     auto first = fixture.create("transcode", "viewer-1", "a1");
     REQUIRE(first.status == 201);
@@ -3652,9 +3491,9 @@ MACHA_TEST("media_playback", test_a_patch_out_of_transcode_releases_the_slot) {
 }
 
 MACHA_TEST("media_playback", test_the_signed_stream_url_closes_its_session_without_a_bearer) {
-    // The page-exit close (0.60.0): a browser unloading a page cannot finish
-    // a preflighted DELETE, so the session is closed through its own signed
-    // stream URL with no Authorization header -- a CORS simple request.
+    // A page unloading cannot finish a preflighted DELETE, so the session is
+    // closed through its signed stream URL with no Authorization header (a
+    // CORS simple request).
     SingleSlotPlayback fixture;
     auto created = fixture.create("transcode", "viewer-1", "a1");
     REQUIRE(created.status == 201);
@@ -3691,23 +3530,9 @@ MACHA_TEST("media_playback", test_the_signed_stream_url_closes_its_session_witho
 }
 
 MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_entitlement) {
-    // This case used to assert the opposite, and the name it had --
-    // "logical viewer keeps one transcode entitlement across replacements" --
-    // described the defect rather than a requirement. A playback session was a
-    // property of the bearer: a second POST on one auth session superseded the
-    // first, returned the same session_id, and handed back the same transcode
-    // entitlement. That is why the Web Client could not hand over, and it is
-    // not what POST to a collection means.
-    //
-    // Now each create is a member of the collection. Distinct ids, distinct
-    // logical viewers, and an entitlement per session rather than one retained
-    // across replacements.
-    //
-    // THE CONSEQUENCE WORTH KNOWING, asserted at the end: a client that
-    // re-POSTs a transcode without releasing its previous session now takes a
-    // SECOND slot and is refused, where it used to get its own session back.
-    // Core is clear of this -- regenerate releases before it creates -- but any
-    // client that does not release first sees a 429 it never saw before.
+    // Each create is a new member of the collection: distinct ids and an
+    // entitlement per session. A client that re-POSTs a transcode without
+    // releasing its previous session needs a second slot and is refused.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -3772,16 +3597,13 @@ MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_ent
     CHECK(status().find("video_transcodes")->asUInt64() == 1);
     CHECK(status().find("sessions")->asUInt64() == 1);
 
-    // A second create on the SAME bearer is a second session, not a
-    // replacement. This is the whole change.
+    // A second create on the same bearer is a second session, not a replacement.
     auto second = create("direct", "ui-player-1", "attempt-2");
     REQUIRE(second.status == 201);
     const auto second_id = session_id_of(second);
     CHECK(second_id != first_id);
     CHECK(status().find("sessions")->asUInt64() == 2);
-    // Direct needs no encoder, so the first session's slot is untouched --
-    // entitlements are per session and are not multiplied by splitting a
-    // viewer into several.
+    // Direct needs no encoder; the first session keeps its slot.
     CHECK(status().find("video_transcodes")->asUInt64() == 1);
 
     // Both are addressable, independently, by their own ids.
@@ -3797,10 +3619,7 @@ MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_ent
     // cannot take it while it is held.
     CHECK(create("transcode", "ui-player-2", "other-attempt").status == 429);
 
-    // ... and neither can the account that already holds it. This is the
-    // behaviour change a client feels: previously this returned 201 with the
-    // caller's own session_id, by retaining the entitlement across the
-    // replacement.
+    // Nor can the account that already holds it.
     CHECK(create("transcode", "ui-player-1", "attempt-3").status == 429);
 
     // Releasing the session that holds the slot frees it for anyone.
@@ -3880,8 +3699,6 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(playback_status_json.find("heap_reclaim_successes") != nullptr);
 
     // A transformed stream can begin at its resume point in the initial POST.
-    // This avoids creating a generation at zero only to destroy it immediately
-    // with a PATCH before the player has loaded anything.
     Json::Object initial_seek_preferences{{"mode", "remux"}, {"container", "fmp4"}};
     Json::Object initial_seek_root{{"media_id", media_id},
                                    {"seek_ms", 23000},
@@ -3902,9 +3719,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(plans.size() == 1);
     CHECK(plans.back().seek == 23s);
 
-    // A transformed seek-only PATCH must reuse the already prepared VOD plan.
-    // Re-probing/re-planning here makes cached
-    // seeks take several seconds on Matroska media.
+    // A transformed seek-only PATCH reuses the prepared VOD plan without re-probing.
     const auto probes_before_seek = fake_engine_ptr->probes();
     const auto prepares_before_seek = fake_engine_ptr->vod_prepares();
     Json::Object fast_seek_root{{"seek_ms", 35000}};
@@ -3925,9 +3740,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(plans.size() == 2);
     CHECK(plans.back().seek == 35s);
 
-    // The web client may include its current preferences in every PATCH.  If
-    // those preferences are unchanged, the request is still semantically a
-    // seek-only update and must retain the reusable random-access plan.
+    // A PATCH restating unchanged preferences is still seek-only and keeps the
+    // random-access plan.
     Json::Object redundant_seek_preferences{{"mode", "remux"}, {"container", "fmp4"}};
     Json::Object redundant_seek_root{{"seek_ms", 47000},
                                      {"preferences", Json(std::move(redundant_seek_preferences))}};
@@ -3954,10 +3768,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     remove_initial_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_initial_seek).status == 204);
 
-    // Reopening the same immutable media with the same transformed plan should
-    // reuse both the probe and prepared VOD/random-access plan. The first
-    // fragment still belongs to a fresh pipeline generation, but source/index
-    // inspection is not repeated merely because the previous session ended.
+    // Reopening the same media with the same transformed plan reuses the probe
+    // and the prepared plan; only the pipeline generation is fresh.
     const auto probes_before_reopen = fake_engine_ptr->probes();
     const auto prepares_before_reopen = fake_engine_ptr->vod_prepares();
     auto reopened_seek = playback.handle(initial_seek);
@@ -4028,9 +3840,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(direct_response.stream->read(0, direct_bytes) == direct_bytes.size());
     CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 100));
 
-    // A subtitle-only PATCH must not rebuild or seek the A/V generation.
-    // The subtitle resource changes independently and gets a stream-specific
-    // URL so browser caches cannot return the previously-selected track.
+    // A subtitle-only PATCH does not rebuild or seek the A/V generation; the
+    // subtitle gets a stream-specific URL so caches cannot serve the old track.
     const auto probes_before_subtitle = fake_engine_ptr->probes();
     const auto prepares_before_subtitle = fake_engine_ptr->vod_prepares();
     Json::Object subtitle_only_preferences{{"subtitle_stream", 2}};
@@ -4117,10 +3928,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     bad_track.body.assign(bad_track_text.begin(), bad_track_text.end());
     CHECK(playback.handle(bad_track).status == 400);
 
-    // Quality is a real session preference, not a client-only label. Requesting
-    // 720p must rebuild the negotiated Auto session at 720p. Remux is not a
-    // valid quality-preserving choice here, while Direct remains exposed as the
-    // explicit byte-stream override and deliberately ignores quality constraints.
+    // Requesting 720p rebuilds the session at 720p. Remux cannot honour quality;
+    // Direct stays exposed as the byte-stream override.
     Json::Object quality_preferences{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}};
     Json::Object quality_root{{"preferences", Json(std::move(quality_preferences))}};
     auto quality_text = Json(std::move(quality_root)).dump();
@@ -4177,10 +3986,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     unsupported.path = "/api/v1/playback/sessions";
     unsupported.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     unsupported.body.assign(unsupported_text.begin(), unsupported_text.end());
-    // Capabilities are advisory: the instruction is performed, not refused
-    // for contradicting them. Until 0.60.0 this was asserted as a 429 because
-    // the session above kept its transcode slot after being PATCHed to direct;
-    // leaving transcode now releases the slot, so the create is admitted.
+    // Capabilities are advisory: the instruction is performed, not refused. The
+    // session above released its slot on leaving transcode, so this is admitted.
     auto unsupported_response = playback.handle(unsupported);
     REQUIRE(unsupported_response.status == 201);
     {
@@ -4210,9 +4017,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     CHECK(patched_json.find("output")->find("video")->find("transform")->asString() == "transcode");
     CHECK(patched_json.find("output")->find("video")->find("codec")->asString() == "h264");
     CHECK(patched_json.find("output")->find("audio")->find("transform")->asString() == "transcode");
-    // A codec change is not a downmix: the source's channel layout survives
-    // the AAC encode, and the bitrate follows the layout rather than a fixed
-    // stereo assumption. This source is stereo.
+    // A codec change is not a downmix: the source's (stereo) layout survives AAC.
     CHECK(patched_json.find("output")->find("audio")->find("channels")->asUInt64() == 2);
     CHECK(patched_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 2 * 64000);
     auto hls_url = patched_json.find("stream")->find("url")->asString();
@@ -4248,8 +4053,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     REQUIRE(subtitle_segment_response.status == 200);
     CHECK(subtitle_segment_response.content_type.starts_with("text/vtt"));
 
-    // The same in-place subtitle path must preserve a live transformed HLS
-    // generation as well; no replacement MediaEngineSession is started.
+    // The in-place subtitle path also preserves a live transformed generation.
     const auto plans_before_transformed_subtitle_off = fake_engine_ptr->started_plans().size();
     Json::Object transformed_subtitle_off_preferences{{"subtitle_stream", Json(nullptr)},
                                                       {"subtitle_language", ""}};
@@ -4285,8 +4089,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove).status == 204);
 
-    // A playback lease is a snapshot, not a pathname alias. Replacing the file
-    // after resolve must not switch bytes underneath an already-running direct stream.
+    // A playback lease is a snapshot: replacing the file does not change the
+    // bytes of a running direct stream.
     Json::Object path_root{{"media_id", "path:/media/test.mp4"},
                            {"preferences", Json(Json::Object{{"mode", "direct"}})}};
     auto path_text = Json(std::move(path_root)).dump();
@@ -4323,10 +4127,7 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     remove_path.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
     CHECK(playback.handle(remove_path).status == 204);
 
-    // Session creation must wake an otherwise indefinitely-blocked cleanup
-    // worker. A short idle timeout catches the condition_variable_any mistake
-    // where notify_all() was paired with a predicate that could never become
-    // true and therefore silently swallowed the notification.
+    // Session creation wakes the otherwise indefinitely blocked cleanup worker.
     streaming.session_idle = 50ms;
     playback.reconfigure(streaming);
     auto expiring = playback.handle(create);
@@ -4352,9 +4153,7 @@ MACHA_FAST_TEST("media_playback", test_subtitle_text_normalisation) {
           "Hello\nworld");
 }
 
-// The vocabulary is a table of facts about file formats, so it is tested as
-// one. The invariant that matters is the one that failed in the field: a file
-// the catalogue admits must be a file playback can name (2026-09-07).
+// Every file the catalogue admits is one playback can name.
 MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catalogue_admits) {
     for (std::string_view ext : {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".mpg",
                                  ".mpeg", ".ts", ".m2ts", ".webm"}) {
@@ -4383,8 +4182,8 @@ MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catal
     CHECK(container_for_format("mov,mp4,m4a,3gp,3g2,mj2", "film.mp4") == "mp4");
     CHECK(container_for_format("avi", "film.avi") == "avi");
     CHECK(container_for_format("mpegts", "film.ts") == "mpegts");
-    // Nothing probed: the name stands in. Nothing either table knows: libav's
-    // own name for it, never the empty string.
+    // Nothing probed: the name stands in; unknown to both tables: libav's own
+    // name, never empty.
     CHECK(container_for_format("", "film.mkv") == "matroska");
     CHECK(container_for_format("nut", "film.nut") == "nut");
     CHECK(container_for_format("", "film.qqq").empty());
@@ -4427,8 +4226,7 @@ MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catal
 
 
 namespace {
-// Shared shape for the session-resource cases below: a node, one playable
-// file, and a playback manager whose limits the caller chooses.
+// A node, one playable file, and a playback manager with caller-chosen limits.
 struct PlaybackFixture {
     TempDir t;
     std::filesystem::path keyfile{t.path() / "key"};
@@ -4530,12 +4328,8 @@ struct PlaybackFixture {
 } // namespace
 
 MACHA_TEST("media_playback", test_the_collection_lists_only_the_callers_own_sessions) {
-    // The listing is what makes handover possible -- a client that has lost
-    // its id finds its own session again -- so it is also the thing that must
-    // never show one account another's. It is node-local by decision: these
-    // are this node's sessions, and a client wanting the account's sessions
-    // cluster-wide asks each node, learning the provenance it needs to probe
-    // or release one as it goes.
+    // The node-local listing lets a client find its own sessions again, and
+    // never shows one account another's.
     PlaybackFixture fixture(8);
     const auto alice = PlaybackFixture::viewer("alice");
     const auto bob = PlaybackFixture::viewer("bob");
@@ -4561,7 +4355,7 @@ MACHA_TEST("media_playback", test_the_collection_lists_only_the_callers_own_sess
     CHECK(ids.count(PlaybackFixture::id_of(second)) == 1);
     CHECK(ids.count(PlaybackFixture::id_of(theirs)) == 0);
 
-    // The cap is stated rather than left to be discovered by refusal.
+    // The cap is stated, not left to be discovered by refusal.
     auto account = body.find("account");
     CHECK(account->find("sessions")->asUInt64() == 2);
     CHECK(account->find("max_sessions")->asUInt64() == 8);
@@ -4570,14 +4364,8 @@ MACHA_TEST("media_playback", test_the_collection_lists_only_the_callers_own_sess
 }
 
 MACHA_TEST("media_playback", test_one_account_cannot_touch_anothers_session) {
-    // Before the routes moved, an id was only ever known to the client that
-    // made it, and the control routes checked nothing. Now several sessions
-    // exist per account and a listing hands ids out, so an unchecked id means
-    // any authenticated account could read, re-seek or DELETE another
-    // viewer's session mid-film -- and free its cap slots.
-    //
-    // 404 rather than 403 on purpose: whether an id exists on this node is not
-    // something one account gets to learn about another.
+    // The control routes check the owner, answering 404 rather than 403 so one
+    // account cannot learn whether another's id exists.
     PlaybackFixture fixture(8);
     const auto alice = PlaybackFixture::viewer("alice");
     const auto bob = PlaybackFixture::viewer("bob");
@@ -4590,18 +4378,14 @@ MACHA_TEST("media_playback", test_one_account_cannot_touch_anothers_session) {
     CHECK(fixture.control("PATCH", id, bob, R"({"seek_ms":1000})").status == 404);
     CHECK(fixture.control("DELETE", id, bob).status == 404);
 
-    // ... and the owner is unaffected by any of that.
+    // The owner is unaffected.
     CHECK(fixture.control("GET", id, alice).status == 200);
     CHECK(fixture.control("DELETE", id, alice).status == 204);
 }
 
 MACHA_TEST("media_playback", test_ownership_survives_a_session_replacement) {
-    // A session is replaced wholesale on a subtitle change, a fast-path seek
-    // and a mode change, each copying fields one at a time. When `account`
-    // was not among the copied fields the replacement became unreachable to
-    // the account that made it -- and, worse, stopped counting against the
-    // per-account cap, so a mode switch was a way to launder sessions past the
-    // limit. Field-by-field copies lose new fields silently; this pins it.
+    // A session replaced by a subtitle change, fast-path seek or mode change
+    // keeps its `account`: still reachable by its owner and counted against the cap.
     PlaybackFixture fixture(8);
     const auto alice = PlaybackFixture::viewer("alice");
 
@@ -4623,12 +4407,8 @@ MACHA_TEST("media_playback", test_ownership_survives_a_session_replacement) {
 }
 
 MACHA_TEST("media_playback", test_the_account_cap_refuses_with_its_own_code_and_states_the_limit) {
-    // The cap must be distinguishable from a node-wide or transcode limit. A
-    // node limit is this node's property and a client is right to try another;
-    // an account cap is identical on every node, so a client that walks
-    // collects N identical refusals and charges N healthy nodes on the way
-    // through -- turning one account at its limit into a cluster that looks
-    // like it is failing.
+    // The account cap is distinguishable from a node limit: it is the same on
+    // every node, so a client must not walk the cluster for it.
     PlaybackFixture fixture(2, 16);
     const auto alice = PlaybackFixture::viewer("alice");
     const auto bob = PlaybackFixture::viewer("bob");
@@ -4638,17 +4418,14 @@ MACHA_TEST("media_playback", test_the_account_cap_refuses_with_its_own_code_and_
 
     auto refused = fixture.create(alice);
     REQUIRE(refused.status == 429);
-    // Bound to a named Json: find() hands back a pointer into the document,
-    // so reading it off a temporary is a use-after-free that survives long
-    // enough to look like a server crash.
+    // Bound to a named Json: find() returns a pointer into the document.
     const auto refusal = PlaybackFixture::body_of(refused);
     auto error = refusal.find("error");
     CHECK(error->find("code")->asString() == "account_session_limit");
-    // Do not walk: every node would answer the same way, and this node is
-    // perfectly healthy.
+    // Do not walk: every node would answer the same.
     CHECK(error->find("scope")->asString() == "request");
     CHECK(error->find("node_healthy")->asBool() == true);
-    // Stated, so a client can plan rather than guess.
+    // Stated, so a client can plan.
     CHECK(error->find("sessions")->asUInt64() == 2);
     CHECK(error->find("max_sessions")->asUInt64() == 2);
 
@@ -4663,9 +4440,8 @@ MACHA_TEST("media_playback", test_the_account_cap_refuses_with_its_own_code_and_
 }
 
 MACHA_TEST("media_playback", test_one_account_cannot_take_every_transcode_on_a_node) {
-    // Transcode entitlements are per session, so without a per-account bound
-    // one account could open sessions until it held every transcode slot on
-    // the node. The node here allows four; one account may hold two.
+    // Entitlements are per session, so a per-account bound stops one account
+    // taking every transcode slot. The node allows four; one account two.
     PlaybackFixture fixture(32, 16);
     const auto alice = PlaybackFixture::viewer("alice");
     const auto bob = PlaybackFixture::viewer("bob");
@@ -4679,8 +4455,7 @@ MACHA_TEST("media_playback", test_one_account_cannot_take_every_transcode_on_a_n
     const auto refusal = PlaybackFixture::body_of(refused);
     const auto* error = refusal.find("error");
     CHECK(error->find("code")->asString() == "account_transcode_limit");
-    // The same on every node, so not worth walking; but the same request
-    // without a transcode needs no entitlement and may succeed here.
+    // Not worth walking; the same request without a transcode may succeed here.
     CHECK(error->find("scope")->asString() == "request");
     CHECK(error->find("node_healthy")->asBool() == true);
     CHECK(error->find("alternative_may_succeed")->asBool() == true);
@@ -4691,7 +4466,7 @@ MACHA_TEST("media_playback", test_one_account_cannot_take_every_transcode_on_a_n
     CHECK(fixture.create(alice).status == 201);
     CHECK(fixture.create_transcode(bob).status == 201);
 
-    // Stated beside the session count, so a client can plan against it.
+    // Stated beside the session count.
     const auto listed = PlaybackFixture::body_of(fixture.list(alice));
     CHECK(listed.find("account")->find("transcodes")->asUInt64() == 2);
     CHECK(listed.find("account")->find("max_transcodes")->asUInt64() == 2);
@@ -4703,13 +4478,8 @@ MACHA_TEST("media_playback", test_one_account_cannot_take_every_transcode_on_a_n
 }
 
 MACHA_TEST("media_playback", test_an_idempotency_key_is_scoped_to_its_account) {
-    // The key is client-chosen and often predictable ("retry-1"), and the map
-    // was global: any authenticated account could occupy another's key and
-    // turn that account's legitimate retry into a 409. Not a takeover -- the
-    // creation fingerprint carries the auth session id, so a stolen key
-    // conflicts rather than replaying someone else's session -- but a denial
-    // of the retry path, which is the path a client is on when something has
-    // already gone wrong.
+    // Idempotency keys are client-chosen and often predictable ("retry-1"), so
+    // they are scoped per account: one account cannot turn another's retry into a 409.
     PlaybackFixture fixture(8);
     const auto alice = PlaybackFixture::viewer("alice");
     const auto bob = PlaybackFixture::viewer("bob");
@@ -4721,22 +4491,15 @@ MACHA_TEST("media_playback", test_an_idempotency_key_is_scoped_to_its_account) {
     CHECK(mine.status == 201);
     CHECK(PlaybackFixture::id_of(mine) != PlaybackFixture::id_of(squatted));
 
-    // Within one account the key still means what it meant: the same request
-    // replays rather than creating a second session.
+    // Within one account the same request replays rather than creating a second session.
     auto replayed = fixture.create(alice, "retry-1");
     REQUIRE(replayed.status == 201);
     CHECK(PlaybackFixture::id_of(replayed) == PlaybackFixture::id_of(mine));
 }
 
 MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_actually_has) {
-    // A client has to know how far past the fragment it last asked for a
-    // viewer may arrive and still find media produced, and before 0.45.0 it
-    // could not: neither max_ahead_segments nor segment_duration_ms was on the
-    // wire or in the configuration reference, so a client either hardcoded the
-    // defaults or guessed. A client that hardcoded 8 and 4000 against this
-    // node -- 3 and 2000 -- would believe it had 32 s of authorised production
-    // ahead of the frontier when it has 6, and would sit refused at the
-    // frontier for the difference.
+    // A session reports how far past its last requested fragment media is
+    // produced, from this node's max_ahead_segments and segment duration.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -4760,8 +4523,7 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
-    // Deliberately not the defaults, so the assertion cannot pass by
-    // coincidence against 8 x 4000.
+    // Not the defaults, so the assertion cannot pass by coincidence.
     streaming.max_ahead_segments = 3;
     streaming.segment_duration = 2000ms;
     PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
@@ -4788,17 +4550,13 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
     REQUIRE(look_ahead != nullptr);
     CHECK(look_ahead->asInt64() == 6000);
 
-    // Direct play has no pipeline and therefore no frontier. Null says that;
-    // zero would read as "no look-ahead", which is a different claim and one a
-    // client could reasonably act on.
+    // Direct play has no pipeline and so no frontier: null, not zero ("no look-ahead").
     auto direct = create_session("direct");
     REQUIRE(direct.find("stream") != nullptr);
     REQUIRE(direct.find("stream")->find("look_ahead_ms") != nullptr);
     CHECK(direct.find("stream")->find("look_ahead_ms")->isNull());
 
-    // The production figures ride beside look_ahead_ms on the same object,
-    // and are absent for direct play for the same reason the frontier is
-    // null: there is no pipeline whose rate could be reported.
+    // Production figures sit beside look_ahead_ms, and are absent for direct play.
     const auto* production = transformed.find("stream")->find("production");
     REQUIRE(production != nullptr);
     REQUIRE(production->find("produced_ms") != nullptr);
@@ -4809,19 +4567,8 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
 }
 
 MACHA_TEST("media_playback", test_production_rate_excludes_time_parked_on_demand) {
-    // The rate a client divides out of this pair has to be the rate the node
-    // COULD sustain, because that is what answers "can a handover close the
-    // gap before the viewer reaches it". Wall clock cannot answer it: the
-    // producer runs to max_ahead_segments beyond demand and then blocks, so a
-    // viewer watching at normal speed keeps it parked most of its life and
-    // wall clock reports about 1.0x no matter how fast the encoder is. That
-    // is the one wrong answer with a cost -- it says "cannot outrun realtime"
-    // about a node that comfortably can, and defers a handover that would
-    // have worked.
-    //
-    // So: produce four fragments of media quickly, hold the producer parked
-    // on the gate for far longer than it spent encoding, and require that the
-    // parked interval is not in the total.
+    // producing_ms counts encode time only, so the rate is what the node could
+    // sustain: time parked at the look-ahead limit is excluded.
     TempDir t;
     MediaSegmentStore store(2, 64ULL * 1024 * 1024, t.path() / "spill", 4000ms);
     REQUIRE(store.publish_init(Bytes{'i', 'n', 'i', 't'}));
@@ -4829,9 +4576,7 @@ MACHA_TEST("media_playback", test_production_rate_excludes_time_parked_on_demand
     constexpr auto park = 2000ms;
     std::thread producer([&] {
         for (int i = 0; i < 4; ++i) {
-            // Stand in for encode work, so the measured total is distinctly
-            // non-zero and the assertion below cannot pass by measuring
-            // nothing at all.
+            // Stands in for encode work, so the measured total is non-zero.
             std::this_thread::sleep_for(20ms);
             store.publish_segment(Bytes{'s', 'e', 'g'}, 4.0);
         }
@@ -4848,23 +4593,17 @@ MACHA_TEST("media_playback", test_production_rate_excludes_time_parked_on_demand
     const auto state = store.snapshot();
     CHECK(state.segment_count == 4);
     CHECK(state.produced_media_ms == 16'000);
-    // Four fragments at 20 ms of simulated encode each. The bound is loose on
-    // purpose -- this runs on nodes an order of magnitude slower than a
-    // developer box -- but it is far below the parked interval, so the only
-    // way to exceed it is to have counted the park.
+    // Four 20 ms fragments. The upper bound is loose for slow nodes but far
+    // below the parked interval, so exceeding it means the park was counted.
     CHECK(state.producing_ms >= 40);
     CHECK(state.producing_ms < 1'000);
-    // ... and the park really did happen, so the bound above is a bound on
-    // something.
     CHECK(state.produced_age_ms < 1'000);
     CHECK(!state.producer_parked);
 }
 
 namespace {
-// A remux engine whose source index names a keyframe every 10 s, so a seek
-// that is not on one has somewhere to land *before* it. FakeMediaEngine's own
-// index is empty, which makes every offset zero and would let the invariant
-// pass by never being exercised.
+// A remux engine with a keyframe every 10 s, so an off-keyframe seek lands
+// before the request (FakeMediaEngine's empty index makes every offset zero).
 class KeyframedRemuxMediaEngine final : public FakeMediaEngine {
   public:
     HlsVodPlan prepare_hls_vod(const MediaSource& source, const PlaybackPlan& plan,
@@ -4879,8 +4618,7 @@ class KeyframedRemuxMediaEngine final : public FakeMediaEngine {
             vod.video_random_access_points.push_back(seconds);
         const auto requested_ms =
             media_vod::clamp_seek_ms(plan.seek.count(), duration_seconds);
-        // Only a stream copy is bound to a sync sample. A transcode starts on
-        // the frame it was asked for, keyframe index or no keyframe index.
+        // Only a stream copy is bound to a sync sample; a transcode starts on the frame asked for.
         if (plan.video != MediaTransform::copy) {
             vod.playback.seek = std::chrono::milliseconds(requested_ms);
             vod.playback.seek_offset = {};
@@ -4900,13 +4638,8 @@ class KeyframedRemuxMediaEngine final : public FakeMediaEngine {
 } // namespace
 
 MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
-    // Measured on es-1 and fi-1 on 2026-09-17: a remux seek started AFTER the
-    // position asked for, by up to 9.3 s, always forward, because the planner
-    // took the first keyframe at or after the request. The content between the
-    // request and that keyframe was in no generation at all and no client could
-    // recover it -- a skipped scene for a viewer seek, and deleted content
-    // mid-playback on the reaped-session recovery path, which rebuilds a
-    // generation at a position a viewer has actually reached.
+    // A seek never starts after the position asked for: seek_ms + seek_offset_ms
+    // equals the request exactly, with a non-negative offset.
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
@@ -4941,11 +4674,9 @@ MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
         const auto seek = payload.find("seek_ms")->asInt64();
         const auto offset = payload.find("seek_offset_ms")->asInt64();
         const auto requested = payload.find("seek_requested_ms")->asInt64();
-        // Exactly, in integer milliseconds, no tolerance and no rounding slack.
+        // Exact, in integer milliseconds.
         CHECK(seek + offset == requested);
-        // Never negative, so the generation always contains the position asked
-        // for: this is the whole point, and an offset that could go negative
-        // would put content in no generation again.
+        // Never negative, so the generation contains the position asked for.
         CHECK(offset >= 0);
         return requested;
     };
@@ -4965,15 +4696,14 @@ MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
         return Json::parse(std::string(response.body.begin(), response.body.end()));
     };
 
-    // Remux: the baseline is the last keyframe at or BEFORE 23 s, and the
-    // remainder is published rather than silently added to the request.
+    // Remux: baseline at the last keyframe at or before 23 s, remainder published.
     auto remux = create("remux", 23'000);
     CHECK(remux.find("mode")->asString() == "remux");
     CHECK(honoured(remux) == 23'000);
     CHECK(remux.find("seek_ms")->asInt64() == 20'000);
     CHECK(remux.find("seek_offset_ms")->asInt64() == 3'000);
 
-    // A seek-only PATCH agrees with a create seek; it is the same rule.
+    // A seek-only PATCH follows the same rule as a create seek.
     Json::Object patch_root{{"seek_ms", 35'000}};
     auto patch_text = Json(std::move(patch_root)).dump();
     HttpRequest patch;
@@ -4987,18 +4717,15 @@ MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
     CHECK(honoured(patched) == 35'000);
     CHECK(patched.find("seek_ms")->asInt64() == 30'000);
     CHECK(patched.find("seek_offset_ms")->asInt64() == 5'000);
-    // The mode is never substituted. A remux request stays remux, including
-    // when its keyframe situation is awkward.
+    // The mode is never substituted.
     CHECK(patched.find("mode")->asString() == "remux");
 
-    // A request that already is a keyframe costs nothing: this is the property
-    // that lets a client opt into exactly-aligned seeks by asking for one.
+    // A request on a keyframe has offset zero.
     auto aligned = create("remux", 30'000);
     CHECK(honoured(aligned) == 30'000);
     CHECK(aligned.find("seek_offset_ms")->asInt64() == 0);
 
-    // Transcode is frame-accurate: the encoder can start on any frame, so it
-    // does, and the offset is always zero.
+    // Transcode is frame-accurate: the offset is always zero.
     auto transcode = create("transcode", 23'000);
     CHECK(transcode.find("mode")->asString() == "transcode");
     CHECK(honoured(transcode) == 23'000);

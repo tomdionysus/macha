@@ -49,10 +49,8 @@ std::string json_body(const HttpResponse& response) {
 } // namespace
 
 MACHA_FAST_TEST("users", test_roles_are_capabilities_not_a_ladder) {
-    // Two implications, both downward: every capability can read media and see
-    // cluster health. Nothing else implies anything. Importing torrents must
-    // not carry the right to delete the catalogue, and managing the catalogue
-    // must not carry the right to hand out accounts.
+    // Every capability implies media_viewer and view_status, and nothing else
+    // implies anything.
     auto importer = expand_roles({std::string(role_importer)});
     CHECK(importer.size() == 3);
     CHECK(std::count(importer.begin(), importer.end(), role_media_viewer) == 1);
@@ -71,8 +69,7 @@ MACHA_FAST_TEST("users", test_roles_are_capabilities_not_a_ladder) {
     CHECK(viewer.size() == 2);
     CHECK(std::count(viewer.begin(), viewer.end(), role_view_status) == 1);
 
-    // view_status is the weakest capability: implied by everything, implying
-    // nothing. Granting it alone must not hand out media.
+    // view_status implies nothing; alone it grants no media.
     auto status_only = expand_roles({std::string(role_view_status)});
     CHECK(status_only.size() == 1);
     CHECK(std::count(status_only.begin(), status_only.end(), role_view_status) == 1);
@@ -100,8 +97,7 @@ MACHA_FAST_TEST("users", test_provider_requests_need_the_manager_role_even_to_re
 }
 
 MACHA_FAST_TEST("users", test_user_merge_is_deterministic_and_commutative) {
-    // Two replicas that saw the same writes in a different order must land on
-    // the same record, or a partition heals into a flap rather than a value.
+    // Replicas that saw the same writes in any order land on the same record.
     const auto low = sample("u1", 1, false, 1);
     const auto high = sample("u1", 2, false, 1);
     {
@@ -113,8 +109,7 @@ MACHA_FAST_TEST("users", test_user_merge_is_deterministic_and_commutative) {
         CHECK(a.table_hash() == b.table_hash());
         CHECK(a.find("u1")->version == 2);
     }
-    // At equal version a tombstone wins: a deletion must not be undone by a
-    // concurrent edit on the other side of a partition.
+    // At equal version a tombstone wins over a concurrent edit.
     {
         UserStore a(16), b(16);
         const auto live = sample("u1", 5, false, 9);
@@ -142,9 +137,8 @@ MACHA_FAST_TEST("users", test_user_merge_is_deterministic_and_commutative) {
 }
 
 MACHA_FAST_TEST("users", test_user_table_never_evicts_to_make_room) {
-    // Unlike the session cache, dropping a record here either locks someone
-    // out or resurrects a deleted account. At capacity the new record is
-    // refused and every existing one is kept.
+    // Dropping a record would lock someone out or resurrect a deleted account,
+    // so at capacity a new record is refused and every existing one kept.
     UserStore store(2);
     REQUIRE(store.apply(sample("u1", 1)));
     REQUIRE(store.apply(sample("u2", 1)));
@@ -167,8 +161,7 @@ MACHA_FAST_TEST("users", test_user_tombstone_is_retained_and_blocks_resurrection
     auto removed = store.remove(created->id, node_id(1));
     REQUIRE(removed.has_value());
     CHECK(removed->tombstone);
-    // Deleting bumps the credential generation too: a tombstone alone would
-    // stop new logins while leaving live sessions working.
+    // Deleting bumps the credential generation, retiring live sessions too.
     CHECK(removed->credential_generation > generation_before);
     CHECK(!store.find(created->id).has_value());
     CHECK(store.tombstones() == 1);
@@ -199,8 +192,8 @@ MACHA_FAST_TEST("users", test_password_verification_and_parameters) {
     CHECK(!store.verify("nobody", "correct horse").ok);
     CHECK(!store.verify("alice", "").ok);
 
-    // The record carries the parameters it was written with, so raising the
-    // defaults later cannot invalidate an existing password.
+    // The record carries its KDF parameters, so changing defaults cannot
+    // invalidate an existing password.
     CHECK(created->kdf == 1);
     CHECK(created->kdf_n > 0);
     CHECK(created->kdf_r > 0);
@@ -221,9 +214,8 @@ MACHA_FAST_TEST("users", test_password_change_bumps_credential_generation) {
     CHECK(!store.verify("bob", "first").ok);
     CHECK(store.verify("bob", "second").ok);
 
-    // A roles-only change invalidates sessions too: a session carries the
-    // roles it was minted with, so a demotion that left them alive would not
-    // take effect until they expired -- up to the whole TTL.
+    // A roles-only change invalidates sessions too, since a session carries the
+    // roles it was minted with.
     auto reroled = store.update(created->id, "",
                                 std::vector<std::string>{std::string(role_manage_users)},
                                 node_id(1));
@@ -243,16 +235,14 @@ MACHA_FAST_TEST("users", test_user_table_persist_reload_is_sealed) {
         auto created = store.create("carol", "secret", {std::string(role_manage_users)}, node_id(1));
         REQUIRE(created.has_value());
         id = created->id;
-        // Write-through: no explicit persist() call, and no idle window to
-        // wait for -- a credential must be durable when the call returns.
+        // Write-through: durable when the call returns, with no persist() call.
     }
     REQUIRE(std::filesystem::exists(path));
     {
         std::ifstream input(path, std::ios::binary);
         const std::string raw((std::istreambuf_iterator<char>(input)),
                               std::istreambuf_iterator<char>());
-        // Password hashes replicate to an offsite node; the file must not be
-        // readable plaintext on a stolen disk.
+        // The file is encrypted: no plaintext on a stolen disk.
         CHECK(raw.find("carol") == std::string::npos);
         CHECK(raw.find("MACHUSR1") == std::string::npos);
     }
@@ -263,8 +253,8 @@ MACHA_FAST_TEST("users", test_user_table_persist_reload_is_sealed) {
         CHECK(found->username == "carol");
         CHECK(reloaded.verify("carol", "secret").ok);
     }
-    // The wrong key must not silently produce an empty-but-usable table that
-    // then replicates over the real one.
+    // The wrong key must not yield an empty-but-usable table that would
+    // replicate over the real one.
     {
         std::array<uint8_t, 32> other{};
         other.fill(9);
@@ -300,9 +290,7 @@ MACHA_FAST_TEST("users", test_user_codec_round_trip) {
 }
 
 MACHA_FAST_TEST("users", test_session_wire_stays_v1_until_a_user_is_present) {
-    // A pre-0.38 peer must keep merging anonymous sessions across a rolling
-    // upgrade, so a payload gains the new magic only when it actually carries
-    // something the old decoder has no field for.
+    // A payload uses the v2 magic only when it carries a field v1 cannot hold.
     AuthSession anonymous;
     anonymous.id = "s1";
     anonymous.token_hash = sha256(Bytes{1});
@@ -352,16 +340,15 @@ MACHA_FAST_TEST("users", test_anonymous_is_an_ordinary_account) {
     PasswordCredentialValidator validator(node.users(), config.session);
     auto minted = validator.validate(Json(Json::Object{}));
     REQUIRE(minted.outcome == CredentialOutcome::ok);
-    // An anonymous session is an ordinary bound session, so it is retired by
-    // the same credential_generation check as anyone else's.
+    // An anonymous session is an ordinary bound session, retired by the same
+    // credential_generation check.
     CHECK(minted.credentials.user_id == anonymous->id);
     CHECK(minted.credentials.credential_generation == anonymous->credential_generation);
     CHECK(std::count(minted.credentials.roles.begin(), minted.credentials.roles.end(),
                      role_media_viewer) == 1);
 
-    // Changing what an unauthenticated visitor may do is an ordinary PATCH of
-    // an ordinary account, and takes effect on the next mint rather than on
-    // restart. This is the only control over what a television can reach.
+    // A visitor's capabilities are the anonymous account's roles: an ordinary
+    // update, effective on the next mint.
     auto widened = node.users().update(
         anonymous->id, "", std::vector<std::string>{std::string(role_importer)}, node.node_id());
     REQUIRE(widened.has_value());
@@ -371,20 +358,16 @@ MACHA_FAST_TEST("users", test_anonymous_is_an_ordinary_account) {
                      role_importer) == 1);
     CHECK(after.credentials.credential_generation != minted.credentials.credential_generation);
 
-    // allow_anonymous: false is the whole point of the switch -- browsing
-    // without an account stops, and the refusal says why rather than 401-ing
-    // as if a token were merely missing.
+    // allow_anonymous: false stops browsing without an account, with a
+    // refusal that says why rather than a bare 401.
     auto closed = config.session;
     closed.allow_anonymous = false;
     PasswordCredentialValidator strict(node.users(), closed);
     CHECK(strict.validate(Json(Json::Object{})).outcome == CredentialOutcome::disabled);
 }
 
-// Anonymous access switched off and anonymous granted nothing are different
-// states, and a cluster may legitimately be in either. Reporting the second as
-// the first told a client to show a login form when the truthful answer was
-// that it already had a session and this cluster gives visitors no
-// capabilities.
+// Anonymous granted nothing still mints a session; only switching anonymous
+// access off refuses.
 MACHA_FAST_TEST("users", test_anonymous_with_no_roles_still_mints_a_powerless_session) {
     TestCluster cluster;
     auto config = cluster.node_config("n1");
@@ -401,18 +384,15 @@ MACHA_FAST_TEST("users", test_anonymous_with_no_roles_still_mints_a_powerless_se
     CHECK(minted.credentials.roles.empty());
     CHECK(minted.credentials.user_id == anonymous->id);
 
-    // Switching anonymous access off is still a different answer, and it is
-    // the only thing that produces one.
+    // Switching anonymous access off is the only thing that refuses.
     auto closed = config.session;
     closed.allow_anonymous = false;
     PasswordCredentialValidator strict(node.users(), closed);
     CHECK(strict.validate(Json(Json::Object{})).outcome == CredentialOutcome::disabled);
 }
 
-// `session.allow_anonymous: false` guards the no-credentials path only. An
-// anonymous account that could be logged into would therefore be a second door
-// beside the switch -- and the session it handed back would be an ordinary
-// bound one that outlives the switch being turned off.
+// allow_anonymous guards only the no-credentials path, so a password on the
+// anonymous account would be a second door beside the switch.
 MACHA_FAST_TEST("users", test_anonymous_has_no_password_and_cannot_be_given_one) {
     TestCluster cluster;
     auto config = cluster.node_config("n1");
@@ -434,21 +414,17 @@ MACHA_FAST_TEST("users", test_anonymous_has_no_password_and_cannot_be_given_one)
     }
     CHECK(!node.users().verify(anonymous_username, "unused-password").ok);
 
-    // The store refuses to install one, so no caller -- API, CLI or a future
-    // one -- can route around the rule.
+    // The store itself refuses one, so no caller can route around the rule.
     CHECK(!node.users()
                .update(anonymous->id, "a-long-enough-password", std::nullopt, node.node_id())
                .has_value());
-    // Roles remain ordinary, which is the whole control over what a visitor
-    // may do.
+    // Roles remain editable.
     REQUIRE(node.users()
                 .update(anonymous->id, "",
                         std::vector<std::string>{std::string(role_media_viewer)}, node.node_id())
                 .has_value());
 
-    // Before 0.38.4 this was reachable by any holder of an anonymous session:
-    // /api/v1/users/me needs only media_viewer, and a self PATCH carrying a
-    // password set the anonymous account's credential and handed back a token.
+    // A self PATCH from an anonymous session carrying a password is refused.
     SessionIdentity visitor{"s", Hash256{}, {std::string(role_media_viewer)}, anonymous->id};
     auto refused = api.handle(
         users_request("PATCH", "/api/v1/users/me", visitor, R"({"password":"a-long-enough-pw"})"));
@@ -459,7 +435,7 @@ MACHA_FAST_TEST("users", test_anonymous_has_no_password_and_cannot_be_given_one)
                                  R"({"password":"a-long-enough-pw"})"));
     CHECK(refused_by_id.status == 409);
 
-    // And the client is told, so it does not draw a field the server refuses.
+    // The client is told, so it does not offer the field.
     auto listed = api.handle(
         users_request("GET", "/api/v1/users/" + anonymous->id, admin_identity()));
     REQUIRE(listed.status == 200);
@@ -478,7 +454,6 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
     REQUIRE(genesis.has_value());
     CHECK(genesis->root.username == root_username);
     CHECK(genesis->anonymous.username == anonymous_username);
-    // root holds every capability; anonymous can only read.
     // No recovery key is issued, and root carries no envelope.
     CHECK(genesis->recovery_key.empty());
     CHECK(!genesis->root.recovery.present());
@@ -488,24 +463,19 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
     CHECK(user_has_role(genesis->anonymous, role_media_viewer));
     CHECK(user_has_role(genesis->anonymous, role_view_status));
     CHECK(store.verify(root_username, genesis->password).ok);
-    // Anonymous is created with no credential at all rather than a random
-    // password nobody is told: there is nothing to leak, nothing to guess, and
-    // nothing that could become a way past allow_anonymous.
+    // Anonymous has no credential at all: nothing to leak or guess.
     const std::array<uint8_t, 32> no_hash{};
     const std::array<uint8_t, 16> no_salt{};
     CHECK(genesis->anonymous.kdf == 0);
     CHECK(genesis->anonymous.password_hash.bytes == no_hash);
     CHECK(genesis->anonymous.salt == no_salt);
 
-    // The generated password has to survive being read off a screen and
-    // retyped, so no vowels and none of the characters that look alike.
+    // The password is retypable: no vowels and no look-alike characters.
     CHECK(genesis->password.size() >= 20);
     for (const char c : genesis->password)
         CHECK(std::string("aeiou015lIOS").find(c) == std::string::npos);
 
-    // The password file names the way back, and it is macha-users rather
-    // than a recovery key -- nothing must point an operator at a key that was
-    // never issued.
+    // The password file names macha-users as the way back, not a recovery key.
     {
         std::ifstream input(genesis->path);
         const std::string text((std::istreambuf_iterator<char>(input)),
@@ -526,17 +496,14 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
         CHECK(text.find(genesis->password) != std::string::npos);
     }
 
-    // Once only: a second call on a table that already holds anything must not
-    // mint a second root with a new password and full privileges.
+    // Once only: a non-empty table gets no second root.
     CHECK(!create_initial_accounts(store, keys, state, node_id(1)).has_value());
 
-    // Root cannot be removed at all: the store refuses to leave the cluster
-    // with nobody holding manage_users.
+    // Root, the sole manage_users holder, cannot be removed.
     CHECK(!store.remove(genesis->root.id, node_id(1)).has_value());
     CHECK(store.find(genesis->root.id).has_value());
 
-    // And not even once an account is gone: all() counts tombstones precisely
-    // so that a deletion cannot cause the next restart to recreate anything.
+    // Tombstones count as accounts, so a deletion never re-enables creation.
     REQUIRE(store.remove(genesis->anonymous.id, node_id(1)).has_value());
     CHECK(!create_initial_accounts(store, keys, state, node_id(1)).has_value());
 }
@@ -557,8 +524,7 @@ MACHA_FAST_TEST("users", test_root_and_anonymous_cannot_be_removed_or_recreated)
         CHECK(node.users().find(id).has_value());
     }
 
-    // The client is told which fields it may offer, so it never has to test a
-    // username against a hardcoded list of its own.
+    // The client is told which fields it may offer.
     auto listed = api.handle(users_request("GET", "/api/v1/users/" + genesis->anonymous.id,
                                            admin_identity()));
     REQUIRE(listed.status == 200);
@@ -567,9 +533,7 @@ MACHA_FAST_TEST("users", test_root_and_anonymous_cannot_be_removed_or_recreated)
     REQUIRE(may != nullptr);
     CHECK(!may->find("rename")->asBool());
     CHECK(!may->find("delete")->asBool());
-    // Anonymous's roles are the only control over what an unauthenticated
-    // television can reach, so they must stay editable -- while its password,
-    // which does not exist, must not be offered.
+    // Anonymous's roles stay editable; its password is not offered.
     CHECK(may->find("set_roles")->asBool());
     CHECK(!may->find("set_password")->asBool());
 
@@ -646,8 +610,7 @@ MACHA_FAST_TEST("users", test_failed_logins_lock_out_then_recover) {
 
     CHECK(attempt("wrong") == CredentialOutcome::rejected);
     CHECK(attempt("wrong") == CredentialOutcome::rejected);
-    // scrypt is deliberately expensive; an unauthenticated endpoint that runs
-    // it has to stop answering before it becomes the DoS.
+    // scrypt is expensive, so the unauthenticated endpoint is rate limited.
     CHECK(attempt("right") == CredentialOutcome::rate_limited);
     std::this_thread::sleep_for(260ms);
     CHECK(attempt("right") == CredentialOutcome::ok);
@@ -665,8 +628,7 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     REQUIRE(created.status == 201);
     auto body = Json::parse(json_body(created));
     const auto id = body.find("id")->asString();
-    // A credential must have no read path at all, or an account that can manage
-    // users becomes an offline-cracking dump.
+    // Credentials have no read path at all.
     CHECK(json_body(created).find("long-enough-pw") == std::string::npos);
     CHECK(json_body(created).find("salt") == std::string::npos);
     CHECK(json_body(created).find("password_hash") == std::string::npos);
@@ -674,8 +636,7 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     CHECK(body.find("roles")->asArray().size() == 3);
     // The record carries its LWW counter for optimistic concurrency.
     CHECK(body.find("version")->asUInt64() == 1);
-    // An ordinary account may be renamed and deleted; the client is told so
-    // rather than working it out from the name.
+    // An ordinary account may be deleted and re-roled; the client is told so.
     CHECK(body.find("mutable")->find("delete")->asBool());
     CHECK(body.find("mutable")->find("set_roles")->asBool());
 
@@ -694,8 +655,7 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
                       R"({"username":"x","password":"long-enough-pw","roles":["wizard"]})"));
     CHECK(bogus.status == 400);
 
-    // Password policy is enforced, and says which field was wrong so the
-    // message can land under the right input.
+    // Password policy is enforced and names the offending field.
     auto weak = api.handle(users_request("POST", "/api/v1/users", admin_identity(),
                                          R"({"username":"y","password":"short"})"));
     CHECK(weak.status == 400);
@@ -707,14 +667,13 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     CHECK(duplicate.status == 409);
     CHECK(json_body(duplicate).find("username_taken") != std::string::npos);
 
-    // Changing your own password must not be a privilege-escalation route.
+    // A self PATCH cannot escalate privileges.
     SessionIdentity viewer{"s", Hash256{}, {std::string(role_media_viewer)}, id};
     auto escalate = api.handle(
         users_request("PATCH", "/api/v1/users/me", viewer, R"({"roles":["manage_users"]})"));
     CHECK(escalate.status == 403);
 
-    // Changing your own password hands back a fresh session, so a person is
-    // not logged out by their own change.
+    // Changing your own password hands back a fresh session.
     auto changed = api.handle(
         users_request("PATCH", "/api/v1/users/me", viewer, R"({"password":"another-long-pw"})"));
     REQUIRE(changed.status == 200);
@@ -724,8 +683,7 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     CHECK(node.users().verify("frank", "another-long-pw").ok);
 
     // The last account that can manage users can be neither removed nor
-    // demoted: either would replicate perfectly and leave nobody able to undo
-    // it. The refusal has its own code so a client can say why.
+    // demoted; the refusal has its own code.
     auto manager =
         api.handle(users_request("POST", "/api/v1/users", admin_identity(),
                                  R"({"username":"gail","password":"long-enough-pw",)"
@@ -778,9 +736,7 @@ MACHA_TEST("users", test_users_replicate_and_login_works_on_the_other_node) {
     n1.propagate_users();
 
     REQUIRE(wait_until([&] { return n2.users().find(created->id).has_value(); }, 5s));
-    // The point of replicating the table rather than only the session: n2 can
-    // authenticate this person itself, without reaching the node that first
-    // knew about them.
+    // n2 authenticates the user itself, without reaching n1.
     auto check = n2.users().verify("grace", "pw");
     CHECK(check.ok);
     CHECK(check.user_id == created->id);
@@ -803,8 +759,7 @@ MACHA_TEST("users", test_users_replicate_and_login_works_on_the_other_node) {
             return seen && seen->credential_generation == changed->credential_generation;
         },
         5s));
-    // The session record itself is untouched; it is the generation mismatch
-    // against the replicated user that retires it.
+    // The session record is untouched; the generation mismatch retires it.
     CHECK(n2.sessions().validate(minted->bearer_token).has_value());
     CHECK(n2.users().find(check.user_id)->credential_generation !=
           minted->session.credential_generation);
@@ -822,15 +777,13 @@ MACHA_TEST("users", test_a_node_that_was_down_learns_a_deletion_not_a_resurrecti
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
-    // The gossip backstop rides the telemetry tick; make it quick enough to
-    // observe convergence without a push.
+    // The gossip backstop rides the telemetry tick.
     c1.telemetry_interval = c2.telemetry_interval = 250ms;
 
     NodeRuntime n1(c1, cluster.keys());
     n1.start();
 
-    // Created and deleted entirely while n2 is down, so n2 never sees the live
-    // record -- only the tombstone can reach it.
+    // Created and deleted while n2 is down: only the tombstone can reach it.
     auto created = n1.users().create("heidi", "pw", {std::string(role_media_viewer)}, n1.node_id());
     REQUIRE(created.has_value());
     REQUIRE(n1.users().remove(created->id, n1.node_id()).has_value());
@@ -841,9 +794,7 @@ MACHA_TEST("users", test_a_node_that_was_down_learns_a_deletion_not_a_resurrecti
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
 
-    // No explicit propagate_users() here: this is the periodic backstop, which
-    // sends the whole table precisely so a node that missed a window converges
-    // rather than staying stale forever.
+    // No explicit propagate_users(): the periodic whole-table backstop delivers it.
     REQUIRE(wait_until([&] { return n2.users().tombstones() == 1; }, 10s));
     CHECK(!n2.users().find(created->id).has_value());
     CHECK(!n2.users().verify("heidi", "pw").ok);
@@ -854,12 +805,7 @@ MACHA_TEST("users", test_a_node_that_was_down_learns_a_deletion_not_a_resurrecti
 }
 
 MACHA_TEST("users", test_login_does_not_wait_on_an_unreachable_peer) {
-    // The regression this whole change exists for: propagate_session used to
-    // call() every peer membership still called active, each to
-    // control_no_progress_deadline (30 s). One unreachable-but-not-yet-dead
-    // peer therefore stalled every login by that long -- which is exactly the
-    // situation (degraded cluster, peers unreachable) in which you need to log
-    // in. Nothing in the request path may wait on a peer.
+    // Nothing in the login path waits on a peer, even one not yet declared dead.
     TestCluster cluster;
     const auto p1 = free_port();
     const auto dead = free_port(); // nothing ever listens here
@@ -897,12 +843,8 @@ MACHA_TEST("users", test_login_does_not_wait_on_an_unreachable_peer) {
 }
 
 MACHA_FAST_TEST("users", test_recovery_key_machinery_is_dormant_but_sound) {
-    // Nothing issues or accepts a recovery key yet. The machinery is kept for a
-    // deployment model that does not exist yet -- one where the operator
-    // cannot get a shell on a node -- so it is tested rather than left to rot.
-    //
-    // The property under test is the one that made the design worth keeping:
-    // holding the cluster key must NOT yield the recovery key.
+    // Nothing issues or accepts a recovery key, but the machinery is tested:
+    // holding the cluster key must not yield the recovery key.
     TestCluster cluster;
     const auto& keys = cluster.keys();
 
@@ -911,8 +853,7 @@ MACHA_FAST_TEST("users", test_recovery_key_machinery_is_dormant_but_sound) {
     CHECK(issued.envelope.present());
     CHECK(recovery_key_matches(issued.envelope, keys, issued.key));
 
-    // Nothing in the stored envelope is the key, or a hash of it. The only way
-    // to produce a matching key from the envelope is to break X25519.
+    // The stored envelope holds neither the key nor a hash of it.
     const auto raw = unhex(issued.key);
     REQUIRE(raw.has_value());
     const auto envelope_bytes = Bytes(issued.envelope.ephemeral_public.begin(),
@@ -936,23 +877,19 @@ MACHA_FAST_TEST("users", test_recovery_key_machinery_is_dormant_but_sound) {
     // Right length, wrong value.
     CHECK(!recovery_key_matches(issued.envelope, keys, std::string(64, '0')));
 
-    // Each issue is independent: re-issuing invalidates the previous key,
-    // which is what makes a lost one replaceable.
+    // Re-issuing invalidates the previous key.
     CHECK(recovery_key_matches(other.envelope, keys, other.key));
     CHECK(!recovery_key_matches(other.envelope, keys, issued.key));
 
-    // An envelope sealed against a different cluster key must not verify, even
-    // with the key that sealed it -- it no longer unlocks this cluster. This
-    // is what the plaintext comparison catches that the AEAD tag does not.
+    // An envelope sealed under a different cluster key does not verify, even
+    // with its own key: the plaintext comparison catches what the AEAD tag does not.
     ClusterKeys foreign = keys;
     foreign.master.front() = static_cast<uint8_t>(foreign.master.front() ^ 0xFF);
     CHECK(!recovery_key_matches(issued.envelope, foreign, issued.key));
 }
 
 MACHA_FAST_TEST("users", test_the_last_user_manager_cannot_be_demoted_or_removed) {
-    // The invariant: it must never be possible to reach a cluster where no
-    // account can administer accounts. Not a property of root -- root's roles
-    // are ordinary -- but of the role, so it moves as the role moves.
+    // Some account always holds manage_users: the protection follows the role, not root.
     TestCluster cluster;
     NodeRuntime node(cluster.node_config("n1"), cluster.keys());
     TempDir dir;
@@ -970,9 +907,7 @@ MACHA_FAST_TEST("users", test_the_last_user_manager_cannot_be_demoted_or_removed
     CHECK(json_body(demoted).find("last_user_manager") != std::string::npos);
     CHECK(user_has_role(*node.users().find(root_id), role_manage_users));
 
-    // But its roles are not frozen: adding to them is fine, and the client is
-    // told precisely which role is pinned rather than being handed a blanket
-    // "roles are read-only".
+    // Its roles can still be added to, and the client is told which role is pinned.
     auto widened = api.handle(
         users_request("PATCH", "/api/v1/users/" + root_id, admin_identity(),
                       R"({"roles":["manage_users","media_viewer"]})"));
@@ -1011,11 +946,8 @@ MACHA_FAST_TEST("users", test_the_last_user_manager_cannot_be_demoted_or_removed
 }
 
 MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accounts) {
-    // The upgrade lockout: an existing cluster has bootstrap peers, so no node
-    // treats itself as founding one, so nothing creates accounts -- and with
-    // no anonymous account the session mint refuses, which means every route
-    // refuses. Status must say so, because the symptom (403 everywhere) points
-    // nowhere near the cause.
+    // A cluster with bootstrap peers creates no accounts, so with no anonymous
+    // account every route refuses; Status must say why.
     TestCluster cluster;
     auto config = cluster.node_config("upgraded");
     config.bootstrap.push_back(Endpoint{"127.0.0.1", free_port()});
@@ -1025,8 +957,7 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
     PasswordCredentialValidator validator(node.users(), config.session);
     CHECK(validator.validate(Json(Json::Object{})).outcome == CredentialOutcome::disabled);
 
-    // macha-users init is the documented way out, and it produces exactly what
-    // a founding node would have produced.
+    // macha-users init produces exactly what a founding node would have.
     TempDir dir;
     auto created = create_initial_accounts(node.users(), cluster.keys(), dir.path(),
                                            node.node_id());
@@ -1035,7 +966,7 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
     CHECK(created->anonymous.username == anonymous_username);
     CHECK(created->root.roles.size() == 5);
 
-    // And now anonymous access works again, without a restart.
+    // Anonymous access then works without a restart.
     CHECK(validator.validate(Json(Json::Object{})).outcome == CredentialOutcome::ok);
 
     // Running it twice is refused rather than minting a second root.
@@ -1043,11 +974,8 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
                                    node.node_id()).has_value());
 }
 
-// Implications are resolved when a session is minted, not only when a record is
-// written. An account created before view_status existed holds roles that never
-// mention it, and must still see cluster health -- otherwise upgrading takes the
-// diagnostic screen away from every existing account until someone edits them
-// all, which is the worst possible moment to lose it.
+// Implications are resolved when a session is minted, not only when a record
+// is written, so stored roles lacking an implied role still get it.
 MACHA_FAST_TEST("users", test_role_implications_reach_accounts_written_before_them) {
     TestCluster cluster;
     NodeRuntime node(cluster.node_config("n1"), cluster.keys());
@@ -1055,8 +983,7 @@ MACHA_FAST_TEST("users", test_role_implications_reach_accounts_written_before_th
                                        {std::string(role_manager)}, node.node_id());
     REQUIRE(created.has_value());
 
-    // Rewrite the record the way a pre-0.38.5 node would have stored it: the
-    // granted role plus the media_viewer of the day, and no view_status.
+    // A stored record with the granted role and media_viewer but no view_status.
     auto legacy = *created;
     legacy.roles = {std::string(role_manager), std::string(role_media_viewer)};
     legacy.version = created->version + 1;
@@ -1073,10 +1000,7 @@ MACHA_FAST_TEST("users", test_role_implications_reach_accounts_written_before_th
     CHECK(std::count(check.roles.begin(), check.roles.end(), role_manage_users) == 0);
 }
 
-// Cluster health is a capability like any other. A session the cluster granted
-// nothing must not be shown the node roster, capacities and diagnostics -- and
-// an operator who wants that public says so by granting view_status, rather
-// than by the route having no gate at all.
+// /api/v1/status requires view_status; /api/v1/health requires no session.
 MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
     TestService fixture("status-role");
     fixture.config().catalogue.api.enabled = true;
@@ -1091,13 +1015,12 @@ MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
             {"Authorization", "Bearer " + minted->bearer_token}};
     };
 
-    // What a roles-less anonymous session is in a registered-users-only
-    // deployment: a real session that may do nothing.
+    // A session with no roles may do nothing.
     auto refused = raw_http_get(port, "/api/v1/status", token_for({}));
     CHECK(refused.find("403") != std::string::npos);
     CHECK(refused.find("view_status") != std::string::npos);
 
-    // Granting it alone is enough for health, and grants nothing else.
+    // view_status alone is enough for status, and grants no media.
     auto allowed = raw_http_get(port, "/api/v1/status",
                                 token_for({std::string(role_view_status)}));
     CHECK(allowed.find("200") != std::string::npos);
@@ -1105,27 +1028,13 @@ MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
                                       token_for({std::string(role_view_status)}));
     CHECK(media_refused.find("403") != std::string::npos);
 
-    // And every other capability implies it, so nobody who could see status
-    // before loses it.
+    // Every other capability implies it.
     auto importer = raw_http_get(port, "/api/v1/status",
                                  token_for({std::string(role_importer)}));
     CHECK(importer.find("200") != std::string::npos);
 
-    // Liveness is a separate route with no token at all, because the things
-    // that ask it -- a load balancer, an uptime monitor, a client choosing an
-    // endpoint -- have no session and should not need one. It says whether this
-    // node is serving, and what it is: a client that cannot tell Macha from any
-    // other thing answering {"status":"ok"} will adopt the wrong endpoint.
-    //
-    // `version` joined it in 0.42.1 by an explicit operator decision, over the
-    // objection that an unauthenticated route should not name the build. The
-    // reasoning is recorded at health_response(): `service` already names the
-    // product, so the version narrows which exploit an attacker reaches for
-    // rather than whether they try one.
-    //
-    // What stays out is the cluster's shape. No node id, no topology, no
-    // capacities -- that is what view_status is for, and it is the whole point
-    // of the gate this test exists to pin.
+    // Health needs no token: status, service and version, but nothing of the
+    // cluster's shape.
     auto health = raw_http_get(port, "/api/v1/health");
     CHECK(health.find("200") != std::string::npos);
     CHECK(health.find("\"status\":\"ok\"") != std::string::npos);
@@ -1136,27 +1045,9 @@ MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
 }
 
 MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {
-    // Observed live on 2026-09-12 during the 0.38.0 rollout. Gossip announces
-    // on change, and marks a peer told when broadcast_best_effort() reports it
-    // QUEUED a frame -- which is not the same as the peer having received and
-    // applied it. A node that is still starting has no usable inbound route,
-    // so it is marked told while receiving nothing, and since neither the
-    // table nor the membership set changes afterwards it waits for ever. The
-    // upgraded node sat refusing every request with anonymous_disabled until
-    // the sender happened to restart.
-    //
-    // What this test actually covers is the late-JOINER half: n2 does not
-    // exist when the announcement is made, and converges because its arrival
-    // changes n1's peer set. That is a real path and it is worth holding, but
-    // it is NOT the path that failed live -- there, gbni-2 was already a known
-    // member, so its restart changed nothing n1 could see and only the
-    // periodic re-announce could have saved it.
-    //
-    // The re-announce itself is not covered here: at a 30 s interval a unit
-    // test would have to wait that long, and the interval is a constant rather
-    // than config. It was verified against the real cluster instead, by
-    // restarting a converged node and watching it refill without touching the
-    // sender. If this is ever made configurable, assert it here properly.
+    // A node that does not exist when the users table is announced still
+    // converges once it joins. The 30 s periodic re-announce (a constant, not
+    // config) is not exercised here.
     TestCluster cluster;
     const auto p1 = free_port();
     const auto p2 = free_port();
@@ -1172,8 +1063,7 @@ MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {
     auto created = n1.users().create("late", "long-enough-pw", {std::string(role_media_viewer)},
                                      n1.node_id());
     REQUIRE(created.has_value());
-    // Announce now, while n2 does not exist at all: n1 records having told
-    // every peer it knows about, which is none.
+    // Announce while n2 does not exist: n1 has no peer to tell.
     n1.propagate_users();
 
     NodeRuntime n2(c2, cluster.keys());
@@ -1182,8 +1072,7 @@ MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
 
-    // Deliberately no further mutation and no explicit propagate: only the
-    // periodic re-announce can deliver this.
+    // No further mutation and no explicit propagate.
     REQUIRE(wait_until([&] { return n2.users().find(created->id).has_value(); }, 60s));
     CHECK(n2.users().verify("late", "long-enough-pw").ok);
     CHECK(n1.users().table_hash() == n2.users().table_hash());

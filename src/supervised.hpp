@@ -11,18 +11,12 @@
 
 namespace macha {
 
-// The mandatory entry points for every subsystem-owned thread body. An
-// exception escaping a std::jthread/std::thread lambda does not reach any
-// caller's try/catch -- it calls std::terminate() and aborts the whole
-// process. These are the one place that boundary is guarded, and each says
-// what a fault means for the thread, because "log it and let the thread end"
-// is not isolation: on 2026-09-26 gbni-1's torrent worker died on one stale
-// handle and every torrent sat unchanged for a day while Status said
-// `running`.
+// Mandatory entry points for every subsystem-owned thread body. An exception
+// escaping a thread lambda calls std::terminate(); these guard that boundary,
+// and each defines what a fault means for the thread.
 //
-// Every fault is recorded against `name` (supervised_thread_statuses(), shown
-// in Status as `threads`) and logged at ERROR. `name` identifies the thread
-// (e.g. "ingest", "torrent", "fuse-namespace"); threads of one pool share it.
+// Every fault is recorded against `name` (supervised_thread_statuses(), Status
+// `threads`) and logged at ERROR. Threads of one pool share a name.
 
 // A service loop: `body` runs until `stop`. If it throws, the body is run
 // again after a backoff (1 s doubling to 60 s; back to 1 s after a run that

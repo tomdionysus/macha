@@ -13,11 +13,9 @@
 
 namespace macha {
 
-// What this node has sustained transcoding each kind of source: the last
-// observations of a finished generation's produced / producing media time
-// (parked time excluded), kept per class and persisted so a restart does not
-// forget what the hardware can do. Measured, never estimated; a class never
-// seen is simply absent.
+// Transcode rates this node has sustained per source class: the last finished
+// generations' produced / producing media time (parked time excluded),
+// persisted across restarts. Measured only; an unseen class is absent.
 class TranscodeRateBook {
   public:
     static constexpr size_t kept_observations = 16;

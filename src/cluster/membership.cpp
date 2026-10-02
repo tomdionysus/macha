@@ -11,8 +11,8 @@ namespace macha {
 namespace {
 constexpr std::array<uint8_t, 8> known_magic_v1{'M', 'A', 'C', 'H', 'M', 'E', 'M', '1'};
 constexpr std::array<uint8_t, 8> known_magic_v2{'M', 'A', 'C', 'H', 'M', 'E', 'M', '2'};
-// v3 (0.42.0) appends NodeInfo::flags to every entry, so a restarting node
-// remembers which peers it must not dial before it has heard from anyone.
+// v3 appends NodeInfo::flags to every entry, so a restarting node knows which
+// peers it must not dial before it has heard from anyone.
 constexpr std::array<uint8_t, 8> known_magic_v3{'M', 'A', 'C', 'H', 'M', 'E', 'M', '3'};
 constexpr uint32_t max_known_nodes = 65536;
 constexpr uint32_t max_identity_resets = 65536;
@@ -54,8 +54,7 @@ void Membership::load_known() {
         node.port = reader.u16();
         if (version2)
             node.seen_unix_ms = reader.u64();
-        // v1/v2 rosters predate the flags: every node they name is a
-        // dialable storage node, which is what NodeInfo's default says.
+        // v1/v2 carry no flags: NodeInfo's default (dialable storage node) applies.
         if (version3)
             node.flags = reader.u8();
         if (node.id == NodeId{} || node.id == self_.id || node.host.empty() || !node.port)
@@ -207,10 +206,8 @@ void Membership::observe(NodeInfo n, bool direct) {
         if (!identity_reset_matches_endpoint(reset, n.host, n.port) ||
             !identity_reset_matches_node(reset, n.id))
             continue;
-        // A reset is a freshness boundary, not a permanent blacklist. Stale
-        // gossip cannot recreate the invalidated association, while a directly
-        // authenticated peer may establish it again. Once that fresh observation
-        // propagates with a post-reset seen time, ordinary gossip is valid too.
+        // A reset is a freshness boundary, not a blacklist: only a direct
+        // observation or gossip seen after the reset re-establishes the node.
         if (!direct && n.seen_unix_ms <= reset.reset_unix_ms)
             return;
     }
@@ -226,12 +223,9 @@ void Membership::observe(NodeInfo n, bool direct) {
                                          i->second.info.port != n.port ||
                                          i->second.info.failure_domain != n.failure_domain ||
                                          i->second.info.flags != n.flags;
-        // A direct observation proves liveness, but the NodeInfo it carries
-        // is the peer's handshake-time copy, held for the life of that
-        // session. Gossip that arrived since is newer, and until 0.42.0 the
-        // heartbeat ping replaced it with the stale copy every round; with
-        // the flags in NodeInfo that would have flapped placement on every
-        // resolution change. The newer record wins; direct only refreshes.
+        // A direct observation carries the peer's handshake-time NodeInfo,
+        // which gossip may have superseded (flags included, which drive
+        // placement). The newer record wins; direct only refreshes liveness.
         const bool newer = n.seen_unix_ms > i->second.info.seen_unix_ms;
         if (newer) {
             i->second.info = std::move(n);
@@ -261,9 +255,8 @@ bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
         return identity_reset_matches_endpoint(reset, info.host, info.port) &&
                identity_reset_matches_node(reset, info.id);
     });
-    // The tombstone itself is operational recovery state. Persist it even when
-    // the stale member is not currently in the roster, so reset remains usable
-    // while cluster metadata is unavailable and across a local restart.
+    // Persist the tombstone even when the member is absent from the roster, so
+    // the reset survives a restart and works without cluster metadata.
     persist_known_locked();
     return true;
 }

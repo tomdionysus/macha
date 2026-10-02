@@ -1,28 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-// Part of the libmacha-torrent plugin, not of macha_core. libtorrent's disk
-// I/O is a virtual disk_interface chosen by session_params::disk_io_constructor;
-// this is macha's implementation of it.
+// libmacha-torrent plugin only: macha's libtorrent disk_interface (set via
+// session_params::disk_io_constructor). Every read, write and hash is admitted
+// at loader class and timed into the disk service monitor, so a torrent is a
+// loader under the laws, not an unmetered writer beside them.
 //
-// Why it exists: libtorrent's default backend runs ten threads of plain file
-// I/O that neither the DATA arbiter admits nor the disk service monitor
-// measures. On 2026-09-23 that pool wrote 65 MB/s onto es-1's DATA spindle,
-// the monitor blamed publication for the slowness it measured, and seven
-// ingests died (TODO/archive/2026-09-23-torrent-writes-starve-publication-incident.md).
-// Every read, write and hash this backend performs is admitted at loader class
-// and timed into the monitor, so the torrent is one more loader under the laws
-// rather than an unmetered writer beside them.
-//
-// Stage 1 of TODO/archive/2026-09-23-torrent-disk-backend-plan.md: payload is written
-// in the torrent's own file layout under the save path.
-//
-// Stage 2: each file-relative extent of that payload is published to the store
-// as soon as every piece covering it has verified, and recorded in the job's
-// TorrentExtentJournal, so the ingest commits the file by naming its extents
-// instead of copying it. The payload file is the assembly area for its
-// extents; reading an extent back goes through one function (read_extent),
-// which is the seam where a staging format of macha's own would replace it.
+// Payload is written in the torrent's file layout under the save path. Each
+// file-relative extent is published to the store once every piece covering it
+// verifies, and recorded in the job's TorrentExtentJournal, so the ingest
+// commits files by naming extents instead of copying. Extents are read back
+// only through read_extent.
 
 #include "cluster/data_work.hpp"
 #include "types.hpp"
@@ -48,10 +36,9 @@ struct TorrentPublicationProgress {
     bool complete() const { return published >= extents; }
 };
 
-// Pieces libtorrent has verified, routed from the session's alerts (on the
-// torrent manager's thread) to the disk backend that owns the storage, and
-// the backend's publication progress answered back. A torrent is named by its
-// save path, which is unique per job.
+// Verified pieces routed from the session's alerts (manager thread) to the
+// disk backend owning the storage, and its publication progress back. A
+// torrent is named by its save path, unique per job.
 class TorrentPieceVerifications {
   public:
     using Sink = std::function<void(const std::string&, int)>;
@@ -61,8 +48,7 @@ class TorrentPieceVerifications {
         std::lock_guard lock(mutex_);
         if (sink_) sink_(save_path, piece);
     }
-    // Nothing when no backend is publishing, or the backend does not hold
-    // this torrent.
+    // Empty when no backend is publishing or none holds this torrent.
     std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
         std::lock_guard lock(mutex_);
         if (!progress_) return std::nullopt;
@@ -86,27 +72,21 @@ class TorrentPieceVerifications {
 };
 
 struct TorrentDiskHooks {
-    // Blocks until `bytes` of loader-class DATA credit is held, and returns
-    // it; the credit is released when the returned object is destroyed. It
-    // must return promptly with nullptr once `aborting` is set. Empty means
-    // "no admission" (tests).
+    // Blocks until `bytes` of loader-class DATA credit is held and returns it,
+    // released on destruction. Returns nullptr promptly once `aborting` is
+    // set. Empty: no admission.
     std::function<std::shared_ptr<void>(uint64_t bytes, const std::atomic_bool& aborting)> admit;
-    // Service time of one completed file operation on the DATA device. Empty
-    // when staging is not on that device: charging another disk's latency to
-    // the DATA spindle would pressure it for nothing.
+    // Service time of one file operation on the DATA device. Empty when
+    // staging is on another device, whose latency must not pressure DATA.
     std::function<void(std::chrono::nanoseconds elapsed, uint64_t bytes)> observe;
-    // Worker threads doing file I/O. Two or three on a four-core node with one
-    // spindle; libtorrent's own default of ten queued thirty-odd requests deep
-    // on es-1.
+    // File I/O worker threads: two or three suit a four-core, one-spindle node.
     size_t threads{2};
-    // Stage 2. With extent_size, publish and verifications all set, every
-    // extent of the payload is published once its pieces verify. Unset, the
-    // backend only writes payload files (stage 1 behaviour, and tests).
+    // With extent_size, publish and verifications all set, extents are
+    // published as their pieces verify; unset, only payload files are written.
     uint64_t extent_size{};
-    // Stores one extent's bytes durably and returns its object id, or nothing
-    // on failure (the backend retries). `abort` is set when the backend shuts
-    // down; a store honouring it ends a write in flight promptly, and the
-    // extent, never journalled, is published again when the torrent resumes.
+    // Stores one extent durably and returns its id, or nothing on failure (the
+    // backend retries). `abort` is set at shutdown to end a write promptly; the
+    // unjournalled extent is published again on resume.
     std::function<std::optional<ObjectId>(std::span<const uint8_t>, std::atomic_bool& abort)> publish;
     std::shared_ptr<TorrentPieceVerifications> verifications;
     // How long a failed publication waits before it is tried again.
@@ -115,11 +95,10 @@ struct TorrentDiskHooks {
 
 libtorrent::disk_io_constructor_type macha_disk_io_constructor(TorrentDiskHooks hooks);
 
-// TorrentDiskHooks::admit backed by the node's DATA arbiter at loader class:
-// an acquisition is durable work the user asked for, so it yields to a slow
-// device only when a viewer would otherwise wait (law 3). It waits in
-// one-second slices so an abort is seen promptly; a slice that ends early is
-// the arbiter stopping or refusing outright, and then it returns nullptr.
+// TorrentDiskHooks::admit on the DATA arbiter at loader class: yields only
+// when a viewer would otherwise wait (law 3). Waits in one-second slices to
+// see an abort; a slice ending early means the arbiter stopped or refused,
+// and it returns nullptr.
 std::function<std::shared_ptr<void>(uint64_t, const std::atomic_bool&)>
 loader_admission(DataResourceArbiter& arbiter);
 

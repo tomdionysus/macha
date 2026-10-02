@@ -24,9 +24,8 @@
 namespace macha {
 namespace {
 
-// ASCII case folding. Names that differ only by case are one name to a
-// Windows filesystem, and to any person browsing the library; full Unicode
-// folding belongs to the namespace-wide case policy, not to this.
+// ASCII case folding: names differing only by case are one name to Windows
+// and to anyone browsing the library.
 std::string fold_case(std::string_view value) {
     std::string out(value);
     for (auto& c : out)
@@ -239,7 +238,7 @@ IngestJob parse_job(const Json& value) {
     job.updated_unix_ms = json_u64(value, "updated_unix_ms");
     job.error_code = json_string(value, "error_code");
     job.error = json_string(value, "error");
-    // Recorded before error codes existed: an error is never shown without one.
+    // A record with an error but no code gets one: an error never shows without a code.
     if (!job.error.empty() && job.error_code.empty()) job.error_code = "import_failed";
     if (const auto* files = value.find("files")) {
         for (const auto& file : files->asArray()) job.files.push_back(parse_file(file));
@@ -371,11 +370,8 @@ Json ingest_job_json(const IngestJob& job, bool include_files,
     return Json(std::move(out));
 }
 
-// Wire shape for the cluster RPC survey: the persistence shape (job_json/
-// parse_job) plus the two transient fields it deliberately never persists
-// (rate_bytes_per_second, eta_seconds -- resetting those across a local
-// restart is intentional; a remote peer answering a live survey should
-// still report its own current values).
+// The persistence shape plus the transient rate and ETA, which are never
+// persisted but a live peer still reports.
 Json ingest_job_wire_json(const IngestJob& job) {
     auto out = job_json(job);
     out["rate_bytes_per_second"] = job.rate_bytes_per_second;
@@ -529,8 +525,7 @@ Bytes IngestManager::handle_jobs_query(std::span<const uint8_t> request_payload)
             if (const auto* id = request.find("job_id"); id && id->isString())
                 job_id = id->asString();
         } catch (const std::exception&) {
-            // Malformed survey request: answer as "list all" rather than fail
-            // the whole peer.
+            // A malformed request lists all rather than failing the peer.
         }
     }
     Json::Array out_jobs;
@@ -592,14 +587,12 @@ void IngestManager::load_state() {
             for (const auto& value : jobs->asArray()) {
                 auto job = parse_job(value);
                 if (job.id.empty()) continue;
-                // Work interrupted by daemon exit is restartable. Explicit pauses and
-                // terminal states remain exactly as the operator left them.
+                // Interrupted work restarts; pauses and terminal states stand.
                 if (job.state == IngestJobState::scanning || job.state == IngestJobState::importing)
                     job.state = IngestJobState::queued;
 
-                // 0.13.x completed an ingest before catalogue work was observable.
-                // Promote those jobs back to the catalogue phase once so existing
-                // completed imports are repaired automatically after upgrade.
+                // A version-1 state file completed jobs without the catalogue
+                // phase: send them back to it once.
                 if (version < 2 && job.state == IngestJobState::completed) {
                     bool queued_catalogue = false;
                     for (const auto& file : job.files) {
@@ -645,7 +638,7 @@ void IngestManager::start() {
     catalogue_worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("ingest-catalogue", stop, [this, stop] { catalogue_loop(stop); });
     });
-    // Deletes discarded payloads off every request path; also finishes what a
+    // Deletes discarded payloads off the request path, including any a
     // previous run left in the trash.
     trash_worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("staging-trash", stop, [this, stop] {
@@ -681,8 +674,7 @@ void IngestManager::reconfigure(IngestConfig config) {
     // Paths define persisted/resumable job identity and cannot safely move live.
     if (config.staging_path != config_.staging_path || config.enabled != config_.enabled)
         Log::warn("ingest enabled/staging_path changes require restart");
-    // The pool is sized once at start(); resizing it live would have to stop
-    // threads that may be mid-copy, which is not worth the failure mode.
+    // The pool is sized at start(): resizing live would stop threads mid-copy.
     if (config.max_concurrent_jobs != config_.max_concurrent_jobs)
         Log::warn("ingest.max_concurrent_jobs change requires restart (running with " +
                   std::to_string(config_.max_concurrent_jobs) + ")");
@@ -856,10 +848,9 @@ void IngestManager::cleanup_source(const IngestJob& job) {
     if (!allowed_external_source(job.source_path))
         throw std::runtime_error("refusing to delete ingest source outside configured source roots");
 
-    // External directories may contain files that were not recognised or
-    // imported. Clear is move-like only for the files in the persisted ingest
-    // plan; never remove an arbitrary source tree wholesale. Empty directories
-    // are pruned afterwards, stopping at the submitted source root.
+    // Removes only the files in the persisted plan, never the whole source
+    // tree, which may hold files not imported; then prunes empty directories
+    // up to the submitted source root.
     std::vector<std::filesystem::path> imported;
     imported.reserve(job.files.size());
     for (const auto& file : job.files) {
@@ -955,8 +946,8 @@ bool IngestManager::clear(std::string_view id) {
 
     const bool delete_source = terminal_job.delete_source_on_clear &&
         (terminal_job.state == IngestJobState::completed || terminal_job.source_owned);
-    // A cancelled job's worker may still be copying: its files are its own
-    // until it lets go, which it does at its next control check.
+    // A cancelled job's worker owns its files until it lets go at its next
+    // control check.
     if (!active) {
         if (delete_source) cleanup_source(terminal_job);
         cleanup_partials(terminal_job);
@@ -1076,8 +1067,7 @@ void IngestManager::enqueue_catalogue_hints(IngestJob& job) {
 std::string IngestManager::select_job_locked() const {
     const auto now = now_ms();
     for (const auto& [id, job] : jobs_) {
-        // Another worker already owns this one; skipping is what makes the
-        // pool concurrent rather than N threads fighting over the head job.
+        // Claimed by another worker.
         if (active_job_ids_.contains(id)) continue;
         if (job.state == IngestJobState::queued) return id;
         if (job.state == IngestJobState::blocked &&
@@ -1103,23 +1093,20 @@ void IngestManager::loop(std::stop_token stop) {
                     if (!blocked_ready_ms || ready < *blocked_ready_ms) blocked_ready_ms = ready;
                 }
 
-                // Wake for anything this worker could actually claim -- not
-                // merely for "a queued job exists", which with a pool would
-                // wake every idle worker for a job one of them already holds.
+                // Wake only for a job this worker could claim, not one another
+                // worker already holds.
                 auto claimable = [&] { return !select_job_locked().empty(); };
 
                 if (blocked_ready_ms) {
                     const auto remaining_ms = *blocked_ready_ms > now ? *blocked_ready_ms - now : 0;
                     cv_.wait_for(lock, stop, std::chrono::milliseconds(remaining_ms), claimable);
                 } else {
-                    // Terminal/paused-only job sets are quiescent. New work and all
-                    // relevant API state changes already notify this condition.
+                    // Only terminal or paused jobs: new work and API changes notify.
                     cv_.wait(lock, stop, claimable);
                 }
                 continue;
             }
-            // Claim under the same lock that selected it, or two workers race
-            // onto one job between the select and the claim.
+            // Claim under the lock that selected it, so no two workers take it.
             active_job_ids_.insert(selected);
             peak_active_jobs_ = std::max(peak_active_jobs_, active_job_ids_.size());
         }
@@ -1147,8 +1134,7 @@ void IngestManager::loop(std::stop_token stop) {
                 Log::warn("ingest clear cleanup failed id=" + cleared->job.id + ": " + e.what());
             }
         }
-        // Releasing a claim can make a blocked/queued job selectable to a
-        // peer worker that is already parked on the condition.
+        // A released claim can make a job selectable to a parked worker.
         cv_.notify_all();
         if (have_after && after.state == IngestJobState::cancelled) {
             cleanup_partials(after);
@@ -1172,9 +1158,8 @@ void IngestManager::catalogue_loop(std::stop_token stop) {
             });
         };
         if (cataloguing()) {
-            // Catalogue completion is persisted by the hint queue rather than
-            // callback-driven into ingest, so it has to be polled -- but only
-            // while a copied job is genuinely awaiting that external result.
+            // The hint queue records catalogue completion; poll only while a
+            // copied job awaits it.
             cv_.wait_for(lock, stop, std::chrono::milliseconds(500),
                          [&] { return stop.stop_requested(); });
         } else {
@@ -1184,8 +1169,7 @@ void IngestManager::catalogue_loop(std::stop_token stop) {
 }
 
 void IngestManager::process_job(const std::string& id, std::stop_token stop) {
-    // The job's extent journal (published_extents) is cached only for the
-    // life of this call, whichever way it leaves.
+    // The job's extent journal is cached only for the life of this call.
     struct ForgetExtentJournal {
         IngestManager& self;
         const std::string& id;
@@ -1253,10 +1237,9 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             }
             return;
         }
-        // Metadata not writable (no quorum, a retention floor not met) is a
-        // cluster condition, not this job's fault: it blocks and is retried
-        // after blocked_retry. On 2026-09-23 seven ingests died on it instead.
-        // Its code stays metadata_unavailable, as before.
+        // Unwritable metadata (no quorum, retention floor unmet) is a cluster
+        // condition: the job blocks as metadata_unavailable and retries after
+        // blocked_retry.
         if (dynamic_cast<const MetadataNotReady*>(&e)) {
             // Said once when the job blocks, not on every retry.
             const auto line = "ingest blocked id=" + id + ": " + e.what() + "; retrying";
@@ -1284,8 +1267,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.updated_unix_ms = now_ms();
         std::lock_guard lock(mutex_);
         auto it = jobs_.find(id);
-        // The operator's cancel stands: a failure met while the worker had not
-        // yet noticed it is not the job's outcome.
+        // A cancel stands over a failure met before the worker noticed it.
         if (it == jobs_.end() || it->second.state == IngestJobState::cancelled)
             return;
         it->second = job;
@@ -1368,13 +1350,8 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     }
 
     std::map<std::filesystem::path, std::vector<size_t>> media_by_parent;
-    // A destination is taken if the filesystem already has it or an earlier
-    // file of this job was given it. Checking only the filesystem let two
-    // files of one torrent plan the same path -- the extras of Rome's two
-    // seasons, each with a "Menu Art.mkv" -- and the second then failed with
-    // destination_conflict once the first had been imported (2026-09-25).
-    // Compared ignoring case (0.64.2): two names that differ only by case
-    // are one name on Windows and to anyone browsing.
+    // A destination is taken if the filesystem has it or an earlier file of
+    // this job was given it, ignoring case.
     std::set<std::string> planned_destinations;
     const auto taken = [&](const std::string& path) {
         if (planned_destinations.contains(fold_case(path))) return true;
@@ -1389,8 +1366,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         if (destination.empty()) continue;
         destination = with_existing_case(destination);
 
-        // Resolve collisions once and persist the selected path. Resume never
-        // re-runs this choice for a planned job.
+        // Chosen once and persisted; resume never re-chooses.
         std::string candidate = destination;
         for (unsigned suffix = 2; taken(candidate); ++suffix)
             candidate = append_collision_suffix(destination, suffix);
@@ -1407,10 +1383,9 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         job.bytes_total += size;
     }
 
-    // Preserve useful sidecars without making them catalogue entries. Associate
-    // language subtitle/artwork names with the nearest media file in the same
-    // source directory. Generic folder/cover/poster art is accepted only when
-    // that directory resolves to one destination directory.
+    // Sidecars are kept but not catalogued. Language subtitles and artwork
+    // follow the nearest media file in their source directory; generic
+    // folder/cover/poster art only when that directory maps to one destination.
     for (const auto& source : host_files) {
         if (!sidecar_extension(source)) continue;
         const auto parent_it = media_by_parent.find(source.parent_path());
@@ -1498,10 +1473,8 @@ std::string IngestManager::choose_destination(const std::filesystem::path& sourc
     return {};
 }
 
-// The destination with each folder that already exists spelt as it already
-// is (0.64.2). The 720p Martian landed in "/Movies/the martian (2015)" beside
-// "/Movies/The Martian (2015)" because its release name was lowercase and the
-// existing-folder check matched case exactly (gbni-1, 2026-09-27).
+// The destination with each existing folder spelt as it already is, so a
+// differently cased release joins the existing folder.
 std::string IngestManager::with_existing_case(const std::string& destination) {
     const std::filesystem::path path(destination);
     std::vector<std::string> parts;
@@ -1534,7 +1507,6 @@ std::string IngestManager::with_existing_case(const std::string& destination) {
     return current + "/" + parts.back();
 }
 
-// Something at this path already, ignoring case.
 bool IngestManager::exists_ignoring_case(const std::string& path) {
     try {
         (void)fs_.getattr(path);
@@ -1570,16 +1542,7 @@ void IngestManager::ensure_namespace_parents(std::string_view path) {
             try {
                 fs_.mkdir(current, 0755, policy.root_uid, policy.root_gid);
             } catch (const FsError& created) {
-                // Another job got there first. Every import under one
-                // scanner root shares that root, and a series or artist
-                // directory is shared by every file in it, so two workers
-                // planning into a fresh namespace both see ENOENT above and
-                // both ask for the directory; the metadata mutation retries
-                // the loser against the winner's commit and answers EEXIST.
-                // That is the directory existing, which is what was wanted.
-                // Until 0.43.0 this failed the losing job outright with the
-                // bare message "exists" (1 in 3 concurrent-import runs on
-                // es-1, 2026-09-15).
+                // Another worker created it concurrently: EEXIST is success.
                 if (created.code() != EEXIST) throw;
                 const auto existing = fs_.getattr(current);
                 if (existing.type != EntryType::directory)
@@ -1636,11 +1599,10 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         file.copied = 0;
     }
 
-    // A torrent has usually published every extent of this file already, as
-    // its pieces verified (TODO/archive/2026-09-23-torrent-disk-backend-plan.md,
-    // stage 2): commit the file by naming them, and do not copy it. The
-    // commit's DATA retention barrier refuses a manifest naming objects the
-    // cluster does not hold, so a refused commit costs a copy, never data.
+    // A torrent usually published every extent as its pieces verified: commit
+    // by naming them instead of copying. The retention barrier refuses a
+    // manifest naming objects the cluster lacks, so a refusal costs a copy,
+    // never data.
     if (file.copied == 0) {
         if (auto extents = published_extents(job, file)) {
             try {
@@ -1787,14 +1749,13 @@ std::optional<std::vector<ExtentRef>> IngestManager::published_extents(
     if (!std::filesystem::is_directory(job.source_path, ec)) return std::nullopt;
     std::lock_guard lock(extent_journals_mutex_);
     auto found = extent_journals_.find(job.id);
-    // Loaded once per run of a job, and released when process_job returns:
-    // the torrent manager submits a torrent's ingest only once every extent
-    // is published (or publication has stalled), so the journal is final.
+    // Loaded once per run, released when process_job returns: a torrent's
+    // ingest is submitted only once publication is done or stalled, so the
+    // journal is final.
     if (found == extent_journals_.end())
         found = extent_journals_.emplace(job.id, TorrentExtentJournal::load(job.source_path)).first;
     if (found->second.empty()) return std::nullopt;
-    // From here the source has a journal, so a copy is a missed adoption and
-    // says why: on 2026-09-24 a torrent copied silently for want of this.
+    // The source has a journal: a copy from here is a missed adoption and logs why.
     const auto relative =
         std::filesystem::path(file.source_path).lexically_relative(job.source_path).generic_string();
     const auto entry = found->second.find(relative);
@@ -1839,11 +1800,10 @@ void IngestManager::refresh_progress(IngestJob& job, uint64_t sample_bytes,
 }
 
 void IngestManager::resolve_duplicate_destinations(IngestJob& job) {
-    // Discipline 3: a plan that gives two files one destination has a
-    // deterministic resolution, so it is resolved, logged and persisted
-    // rather than failing the job on every retry. Completed files keep their
-    // paths; an unfinished file that shares one gets the next free suffix and
-    // a fresh partial, since a shared partial cannot be trusted.
+    // Discipline 3: resolved, logged and persisted rather than failing every
+    // retry. Completed files keep their paths; an unfinished file sharing one
+    // gets the next free suffix and a fresh partial, as a shared partial
+    // cannot be trusted.
     std::set<std::string> used;
     for (const auto& file : job.files)
         if (file.completed) used.insert(file.destination_path);

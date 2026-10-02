@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Crash-isolation UAT for the FUSE subsystem (see
-// TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, Stage A). The claim under
-// test is the one the whole exercise exists for: a FUSE mount that cannot be
-// built, or that dies after it was built, degrades to a per-subsystem
-// faulted/restarting state while this node's metadata, RPC, HTTP API and
-// playback keep serving. Before this, FuseFrontend's constructor threw into
-// main() -- a 0.24.3 journal-bookkeeping bug crash-looped corvus-es-1 49 times
-// that way -- and a lost mount called Service::request_stop().
+// Crash isolation for the FUSE subsystem: a mount that cannot be built, or dies
+// after it was built, degrades to a per-subsystem faulted/restarting state
+// while the node's metadata, RPC, HTTP API and playback keep serving.
 //
-// libfuse is behind FuseMountDriver so these run without a kernel mount, which
-// is what lets them run at all: no test host here has ever had one, and the
-// mount lifecycle is precisely the part that was never covered.
+// libfuse sits behind FuseMountDriver, so these run without a kernel mount.
 #include "fuse/fuse_frontend.hpp"
 #include "fuse/fuse_subsystem.hpp"
 #include "subsystem/subsystem_registry.hpp"
@@ -30,9 +23,8 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Stands in for libfuse: it "mounts" by returning from the call that
-// establishes the mount, serves by blocking, and can be told to end either
-// cleanly (an ordinary stop) or by losing the mount (a fault).
+// Stands in for libfuse: "mounts" by returning, serves by blocking, and ends
+// either cleanly (an ordinary stop) or by losing the mount (a fault).
 struct MountControl {
     std::mutex mutex;
     std::condition_variable cv;
@@ -58,9 +50,8 @@ struct MountControl {
 
 class TestMountDriver final : public FuseMountDriver {
     std::shared_ptr<MountControl> control_;
-    // Per instance, deliberately: each mount attempt gets a fresh driver, and
-    // the supervisor stops the faulted one on its way to building the next.
-    // Sharing this flag made a rebuilt mount exit the moment it came up.
+    // Per instance: the supervisor stops the faulted driver while building the
+    // next, so a shared flag would end the rebuilt mount at once.
     bool exit_requested_{};
 
   public:
@@ -114,12 +105,11 @@ SubsystemRetryPolicy fast_policy() {
     return policy;
 }
 
-// A Config the test owns, so a mount path (and a deliberately broken spool
-// path) can be changed between one attempt and the next.
+// A Config the test owns, so the mount and spool paths can change between attempts.
 Config mountable_config(const Config& base, const std::filesystem::path& mount_path) {
     Config config = base;
     config.fuse.mount_path = mount_path;
-    // Nothing here is root, and the immutable flag is not what is under test.
+    // Tests do not run as root, and the immutable flag is not under test.
     config.fuse.fail_closed_mountpoint = false;
     config.fuse.publication_quiet = 0ms;
     return config;
@@ -161,9 +151,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_mounts_and_publishes_its_fronte
     }, 20s));
     control->wait_mounted();
 
-    // Published for core to find, and usable: the frontend answers before,
-    // during and after a mount, because none of what core asks it for needs
-    // the kernel.
+    // Published and usable: nothing core asks the frontend for needs the kernel.
     auto frontend = registry.fuse();
     REQUIRE(frontend);
     CHECK(!frontend->blocked_namespace_operation().has_value());
@@ -171,7 +159,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_mounts_and_publishes_its_fronte
 
     supervisor.stop();
 
-    // Withdrawn on the way out, so nothing can reach a stopped frontend.
+    // Withdrawn on stop, so nothing can reach a stopped frontend.
     CHECK(!registry.fuse());
     CHECK(fuse_status(supervisor) == std::nullopt); // stop() clears the entries.
     CHECK(control->run_count() == 1);
@@ -200,8 +188,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_clean_stop_is_not_a_fault) {
     CHECK(before->last_fault.empty());
 
     supervisor.stop();
-    // An unmount we asked for is not a fault: nothing retried, nothing to
-    // tell an operator about.
+    // A requested unmount is not a fault: nothing is retried.
     CHECK(control->run_count() == 1);
 }
 
@@ -224,9 +211,8 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_rebuilds_the_mount_after_losing
     auto first = registry.fuse();
     REQUIRE(first);
 
-    // The mount goes away underneath a running node -- `umount -l`, a kernel
-    // module reload, a mountpoint that vanished. Until this work that called
-    // Service::request_stop() and exited the process with code 8.
+    // The mount goes away underneath a running node (`umount -l`, a module
+    // reload, a vanished mountpoint).
     control->lose();
 
     REQUIRE(wait_until([&] {
@@ -246,7 +232,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_rebuilds_the_mount_after_losing
     REQUIRE(second);
     CHECK(second.get() != first.get());
 
-    // The rest of the node never noticed.
+    // The rest of the node is unaffected.
     CHECK(service.filesystem().getattr("/").type == EntryType::directory);
     CHECK(service.ready());
 
@@ -261,10 +247,8 @@ MACHA_TEST("fuse_subsystem",
 
     auto config = mountable_config(fixture.config(), fixture.path() / "mnt");
 
-    // A spool directory that cannot exist: its parent is a regular file. This
-    // is the es-1 shape in the form it can still take after discipline 3 made
-    // journal replay itself survive every frame mutation -- construction
-    // fails before a single FUSE request could ever be served.
+    // A spool directory that cannot exist (its parent is a regular file), so
+    // construction fails before any FUSE request is served.
     const auto blocker = fixture.path() / "not-a-directory";
     { std::ofstream out(blocker); out << "x"; }
     config.fuse.spool_path = blocker / "spool";
@@ -289,8 +273,8 @@ MACHA_TEST("fuse_subsystem",
     CHECK(!registry.fuse());
     CHECK(control->run_count() == 0); // never got as far as mounting.
 
-    // Everything this subsystem is not: the node still serves its namespace,
-    // and the manage endpoints answer "nothing to report" rather than failing.
+    // The node still serves its namespace, and the manage endpoints answer
+    // "nothing to report" rather than failing.
     CHECK(service.ready());
     CHECK(service.filesystem().getattr("/").type == EntryType::directory);
     CHECK(!service.blocked_namespace_operation().has_value());
@@ -299,8 +283,7 @@ MACHA_TEST("fuse_subsystem",
     CHECK(!service.retry_parked_publication(1));
     CHECK(!service.abandon_parked_publication(1));
 
-    // Fix what was wrong and the next attempt succeeds, with no restart of
-    // anything else -- the point of retrying in place.
+    // Once the cause is fixed the next attempt succeeds, with nothing else restarted.
     std::filesystem::remove(blocker);
     config.fuse.spool_path = fixture.path() / "spool";
     config.fuse.operation_journal_path = fixture.path() / "spool" / "operations.log";
@@ -327,8 +310,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_path_is_unavail
     supervisor.add_builtin("fuse", make_fuse_subsystem);
     supervisor.start(context_for(config, service, registry));
 
-    // Not configured to mount is a deliberate operator choice, not a fault:
-    // `unavailable`, no retry loop, nothing for anyone to fix.
+    // No mount configured is a choice, not a fault: `unavailable`, no retries.
     REQUIRE(wait_until([&] {
         auto status = fuse_status(supervisor);
         return status && status->state == SubsystemState::unavailable;
@@ -345,8 +327,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_path_is_unavail
 MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_driver_is_unavailable) {
     TestService fixture("fuse-subsystem-no-driver", ConfigProfile::isolated);
     auto& service = fixture.start();
-    // Deliberately no driver: this is a build with no FUSE adapter linked,
-    // which after Stage B is also a node with no libmacha-fuse installed.
+    // No driver: a node with no FUSE adapter (no libmacha-fuse installed).
     set_fuse_mount_driver_factory({});
 
     auto config = mountable_config(fixture.config(), fixture.path() / "mnt");
@@ -368,13 +349,9 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_driver_is_unava
 
 #ifdef MACHA_TEST_FUSE_PLUGIN
 MACHA_TEST("fuse_subsystem", test_fuse_plugin_loads_over_the_real_dlopen_path) {
-    // Stage B: the adapter is a real dlopen'd module, so the load path this
-    // exercises is discovery, entry symbol, and build-identity check against
-    // the running core -- the part that a partial deploy gets wrong. The
-    // mount itself cannot be attempted here (no kernel mount on any test
-    // host), so this configures no mount path: the plugin must then decline
-    // cleanly and report `unavailable`, which is also what a node that
-    // installs the plugin without configuring a mount looks like.
+    // The adapter is a real dlopen'd module: discovery, entry symbol and
+    // build-identity check. No mount path is configured (test hosts have no
+    // kernel mount), so the plugin must decline cleanly as `unavailable`.
     TestService fixture("fuse-plugin-dlopen", ConfigProfile::isolated);
     auto& service = fixture.start();
 
@@ -399,8 +376,7 @@ MACHA_TEST("fuse_subsystem", test_fuse_plugin_loads_over_the_real_dlopen_path) {
 
     auto statuses = supervisor.statuses();
     REQUIRE(statuses.size() == 1);
-    // Named for the file it came from, so Status says which file to look for
-    // on disk -- the same contract libmacha-torrent has.
+    // Named for the file it came from, so Status says which file to look for.
     CHECK(statuses[0].name == plugin.stem().string());
     CHECK(statuses[0].restart_count == 0);
     CHECK(statuses[0].last_fault.empty());

@@ -7,24 +7,22 @@
 
 #include <functional>
 
-// The horizon builder at stage 0: the node's filesystem, catalogue and
-// control store as its sources (concrete until the metadata contract, T4),
-// over two builds that are functions of what they are given.
+// The horizon builder over the node's filesystem, catalogue and control
+// store, delegating to two builds that are pure functions of their inputs.
 namespace macha {
 
 class DistributedStore;
 class NodeRuntime;
 
-// The inventory from the namespace's objects and the catalogue's: data is
-// both live sets, control the catalogue's, the tombstones the namespace's.
+// Data is both live sets, control the catalogue's, tombstones the namespace's.
 std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects& namespace_objects,
                                                         const CatalogueMaintenance& catalogue);
 
 // One catalogue root's retained objects; throws when the root is unreadable.
 using CatalogueRetentionSource = std::function<CatalogueRetentionObjects(const ObjectId& root)>;
 
-// The release horizon at `head`, reading tree nodes from `nodes`. A
-// catalogue root or tree node that cannot be read leaves it incomplete.
+// The release horizon at `head`, reading tree nodes from `nodes`; incomplete
+// when a catalogue root or tree node cannot be read.
 ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNodeStore& nodes,
                            const CatalogueRetentionSource& catalogue);
 

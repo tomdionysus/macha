@@ -64,39 +64,32 @@ enum class MessageType : uint16_t {
     commit_history_floor = 38,
     session_sync = 39,
     have_objects = 40,
-    // 0.53.1: the CONTROL-plane counterpart of have_objects, which answers
-    // from local_store() and so can say nothing about control objects. A
-    // metadata publication needs it to avoid re-uploading a control graph the
-    // peer already holds: before this existed it pushed every referenced
-    // object on every commit, which on a tree-backed namespace meant 840
-    // objects a commit and 5,469 objects in three minutes against a control
-    // store that grew by none of them. Reply: have_control_objects_reply. A
-    // peer that does not know this message answers with an error, and the
-    // caller falls back to sending the whole graph as it always did.
+    // CONTROL-plane counterpart of have_objects (which answers from
+    // local_store() only), so a metadata publication skips control objects
+    // the peer already holds. Reply: have_control_objects_reply; a peer that
+    // errors is sent the whole graph.
     have_control_objects = 45,
-    // 0.64.0: an action on a claimed torrent while metadata cannot be
-    // written. The owner applies it at once and journals the intent until it
-    // can be published. Reply: torrent_intent_reply.
+    // An action on a claimed torrent while metadata cannot be written: the
+    // owner applies it and journals the intent until it can publish.
+    // Reply: torrent_intent_reply.
     torrent_intent = 46,
-    // 0.73.0: repair's batched presence probe. Unlike have_objects, which
-    // answers from the index, each id is answered the way have_object answers
-    // one: read, decrypt and hash, so a corrupt copy is reported absent and
-    // repair replaces it. At most have_valid_objects_max ids a request. Reply:
-    // have_valid_objects_reply. An older peer answers with an error and the
-    // caller probes it one object at a time as before.
+    // Repair's batched presence probe. Unlike have_objects (index lookup),
+    // each id is read, decrypted and hashed like have_object, so a corrupt
+    // copy reports absent. At most have_valid_objects_max ids. Reply:
+    // have_valid_objects_reply; a peer that errors is probed per object.
     have_valid_objects = 47,
-    // 0.27.0: the immutable record for a history hash as a self-contained
-    // full-body entry, materialized by the serving peer (get_metadata_history_entry
-    // returns the peer's *stored* frame, which may be exactly the delta the
-    // caller cannot replay). Reply: metadata_history_entry_reply.
+    // A history hash's record as a self-contained full-body entry,
+    // materialised by the server (get_metadata_history_entry returns the
+    // stored frame, possibly a delta the caller cannot replay).
+    // Reply: metadata_history_entry_reply.
     get_metadata_history_record = 41,
     user_sync = 42,
-    // 0.42.0 / protocol 21: nodes that accept no inbound connections.
-    // dial_request is a notification (request_id 0) sent over an existing
-    // CONTROL route to a peer that cannot be dialled: "open this lane to me".
-    // dial_back_probe asks a peer to make one throwaway TCP connection to the
-    // sender's advertised endpoint and report whether the handshake completed;
-    // it is how `network.inbound_capable: auto` finds out the truth.
+    // For nodes that accept no inbound connections. dial_request is a
+    // notification (request_id 0) over an existing CONTROL route asking a
+    // non-dialable peer to open a lane to the sender. dial_back_probe asks a
+    // peer to make one throwaway connection to the sender's advertised
+    // endpoint and report whether the handshake completed; it is how
+    // `network.inbound_capable: auto` resolves.
     dial_request = 43,
     dial_back_probe = 44,
     ok = 100,
@@ -126,46 +119,31 @@ enum class MessageType : uint16_t {
 };
 
 // Each id in a have_valid_objects request is a full read on the peer, so a
-// request is bounded to what one data worker should do in one handler.
+// request is bounded to one data worker's handler-sized job.
 inline constexpr size_t have_valid_objects_max = 16;
 
-// Transport priority is a property of the frame type itself. There is no
-// independent priority field on the wire which can contradict it.
+// Transport priority derives from the frame type; there is no separate
+// priority field on the wire.
 enum class TransportLane : uint8_t {
     control = 1,
     data = 2,
-    // A dial-back probe: the handshake completes (which authenticates both
-    // ends) and the connection is closed. Nothing is ever sent on it and the
-    // accepting side registers no route for it, so a probe can never retire a
-    // real session in reconcile_locked() the way an ordinary accepted session
-    // would.
+    // Dial-back probe: handshake (authenticating both ends), then close.
+    // Nothing is sent and no route is registered, so a probe cannot retire a
+    // real session in reconcile_locked().
     probe = 3,
 };
 
 const char* transport_lane_name(TransportLane) noexcept;
 
-// What one peer connection will hold for all callers on its lane: messages
-// queued for the writer, and replies still outstanding. A caller that
-// pipelines a batch has to size its window against these rather than against
-// a number of its own invention.
-//
-// On 2026-09-22 a tree-backed metadata commit fired all 838 of its
-// control-object writes at once, overran the outbound queue, and the whole
-// publication failed -- reported as a dead network link, because three
-// separate `catch` blocks on that path discarded the reason. The queue is the
-// binding limit of the two and it is timing-dependent, since the writer drains
-// it concurrently: on the live cluster every commit of 65 objects got through,
-// every commit of 828+ failed, and 353 did both on different days.
+// Per-connection limits shared by every caller on a lane: messages queued for
+// the writer and replies outstanding. A pipelining caller must size its window
+// against these. The queue is the binding limit and is timing-dependent, as
+// the writer drains it concurrently.
 inline constexpr size_t max_pending_rpc_requests = 512;
 inline constexpr size_t max_peer_outbound_messages = 256;
-
-
-
-// Bytes this node has put on and taken off the wire, by frame class, since
-// start: every sealed fragment, header and AEAD overhead included. One is
-// shared by a node's RPC client and server and every channel they open, so it
-// is the node's whole cluster traffic. Only Macha's own traffic is counted;
-// anything else using the same link is invisible here.
+// Cluster bytes in and out by frame class since start, every sealed fragment
+// with header and AEAD overhead. One instance is shared by the node's client,
+// server and all their channels. Only Macha's own traffic.
 struct TransportTraffic {
     static constexpr size_t classes = 6; // indexed by FrameType's wire value
     std::array<std::atomic_uint64_t, classes> in_bytes{};
@@ -187,8 +165,8 @@ FrameType default_frame_type(MessageType) noexcept;
 struct RpcMessage {
     MessageType type{MessageType::error};
     Bytes payload;
-    // Fragment payload ownership follows the completed message through any
-    // executor/future handoff. This prevents an uncharged asynchronous gap.
+    // Fragment memory leases follow the message through executor/future
+    // handoffs, so no asynchronous gap goes uncharged.
     std::shared_ptr<std::vector<RetainedMemoryLedger::Lease>> retained_memory;
 
     RpcMessage() = default;
@@ -216,15 +194,13 @@ struct RpcStats {
 };
 
 struct RpcServerExecutionLimits {
-    // One owner is sufficient for the default node and avoids multiplying idle
-    // threads across large test/deployment clusters. The executor supports more
-    // workers when explicitly configured, while preserving per-peer FIFO.
+    // One worker by default avoids idle threads across large clusters; more
+    // may be configured, with per-peer FIFO preserved.
     size_t metadata_workers{1};
     size_t metadata_pending_jobs{64};
     size_t metadata_pending_bytes{256ULL * 1024 * 1024};
-    // Queue ownership is bounded in bytes as well as jobs. These pools are
-    // deliberately separate: loader/speculative payloads cannot consume the
-    // memory reserved for control or viewer work.
+    // Byte-bounded queues, separate so loader/speculative payloads cannot
+    // consume memory reserved for control or viewer work.
     size_t fast_control_pending_bytes{1ULL * 1024 * 1024};
     size_t control_pending_bytes{16ULL * 1024 * 1024};
     size_t data_pending_bytes{64ULL * 1024 * 1024};
@@ -260,9 +236,8 @@ struct WireFragment {
     Bytes payload;
 };
 
-// Stateful fragment reassembly has aggregate limits in addition to the wire's
-// per-message limit. Keeping this as a small transport primitive also makes the
-// adversarial accounting invariant directly testable without opening sockets.
+// Fragment reassembly with aggregate limits beyond the per-message limit;
+// standalone so its accounting is testable without sockets.
 class MessageAssembler {
     struct Partial {
         FrameType frame_type{FrameType::control};
@@ -368,9 +343,8 @@ class RpcClient {
     class PeerConnection;
     friend class RpcServer;
 
-    // Replies transfer ownership from the bounded handler directly into the
-    // transport queue. Passing by const reference silently copied complete
-    // multi-megabyte object replies at this boundary.
+    // Replies are moved from the handler into the transport queue, not
+    // copied: they can be multi-megabyte objects.
     using InboundReply = std::function<void(RpcMessage)>;
     using InboundHandler = std::function<void(const NodeInfo&, RpcFrame, InboundReply)>;
     using InboundPromoter = std::function<void(const NodeInfo&, uint64_t, FrameType)>;
@@ -391,11 +365,8 @@ class RpcClient {
     struct PeerHealth {
         unsigned failures{};
         Clock::time_point retry_after{};
-        // Smoothed round trip of the CONTROL-lane heartbeat pings to this
-        // endpoint (the health loop sends one per heartbeat; nothing else
-        // feeds it, so payload size and handler work do not distort it).
-        // Lets commit fan-out prefer the near replica instead of NodeId
-        // order (gbni-1 crossed the WAN for every commit, 2026-09-07).
+        // Smoothed round trip of the health loop's CONTROL-lane heartbeat
+        // pings only, so payload size and handler work do not distort it.
         std::optional<double> control_latency_ms;
     };
 
@@ -411,21 +382,16 @@ class RpcClient {
     std::shared_ptr<TransportTraffic> traffic_{std::make_shared<TransportTraffic>()};
     mutable std::mutex mutex_;
     std::condition_variable connection_cv_;
-    // Creating a transport is expensive: authentication starts two persistent
-    // threads and DATA traffic immediately exercises multi-megabyte buffers.
-    // Coalesce cold concurrent callers for the same authenticated peer/lane,
-    // while allowing unrelated peers and lanes to connect independently.
+    // Dialling is expensive (two persistent threads, multi-megabyte DATA
+    // buffers): concurrent cold callers for one peer/lane share one dial.
     std::set<std::string> connection_dials_;
     std::map<std::string, std::shared_ptr<PeerConnection>> connections_;
     std::vector<std::shared_ptr<PeerConnection>> retired_connections_;
     std::map<std::string, InboundRoute> inbound_routes_;
     std::map<std::string, NodeId> endpoint_peers_;
-    // In-process fixture for an unresponsive peer: outbound calls to a listed
-    // peer (all messages, or one message type) are handed back as an AsyncRpc
-    // that never resolves until released, with idle_for() advancing exactly as
-    // it would for a dead link. Not reachable from configuration. This is the
-    // hook the lock-across-RPC and stalled-put regressions need to reproduce a
-    // silent peer without a network.
+    // Test fixture for an unresponsive peer: calls to a listed peer (all
+    // messages, or one type) return an AsyncRpc that never resolves until
+    // released, with idle_for() advancing as for a dead link.
     std::map<NodeId, std::optional<MessageType>> stalled_peers_for_tests_;
     std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_for_tests_;
     AsyncRpc stalled_call_for_tests_locked();
@@ -439,14 +405,12 @@ class RpcClient {
     std::map<std::string, PeerHealth> health_;
     std::map<std::string, Endpoint> endpoints_;
     std::map<std::string, IdentityAssociationReset> identity_resets_;
-    // What each authenticated peer said about itself (NodeInfo::flags), from
-    // the handshake and from membership gossip via note_peer(). A peer with
-    // inbound_capable clear is never dialled: connection() asks it to dial
-    // instead. Guarded by mutex_.
+    // Each authenticated peer's NodeInfo::flags, from the handshake and from
+    // note_peer(). A peer without inbound_capable is never dialled; it is asked
+    // to dial instead. Guarded by mutex_.
     std::map<NodeId, uint8_t> peer_flags_;
-    // Lanes the health thread has been asked to open from this side: by a
-    // peer's dial_request, or by maintain_lanes_to() for every capable peer
-    // when this node is itself inbound-incapable. Keyed by route_key.
+    // Lanes the health thread must open from this side (a peer's dial_request,
+    // or the maintained peers when this node is inbound-incapable). Keyed by route_key.
     std::map<std::string, std::pair<NodeInfo, TransportLane>> requested_lanes_;
     std::function<std::vector<NodeInfo>()> maintained_peers_;
     std::atomic_uint64_t lane_wakeups_{};
@@ -471,11 +435,9 @@ class RpcClient {
                                                NodeId* actual, TransportLane);
     AsyncRpc call_async_known(const Endpoint&, const NodeId*, MessageType, std::span<const uint8_t>,
                               FrameType);
-    // Send on a route that already exists (outbound first, then inbound);
-    // never dials. Empty when the peer has no usable route on `lane`.
-    // `why`, when given, receives the reason a usable route still refused the
-    // call. Discarding it made a caller exhausting the connection's shared
-    // pending-reply budget indistinguishable from a peer with no route at all.
+    // Sends on an existing route (outbound first, then inbound); never dials.
+    // Empty when no usable route exists on `lane`. `why`, if given, receives
+    // the reason a usable route refused the call (e.g. pending-reply budget).
     std::optional<AsyncRpc> call_existing(const NodeId&, TransportLane, MessageType,
                                           std::span<const uint8_t>, FrameType,
                                           std::string* why = nullptr);
@@ -483,9 +445,8 @@ class RpcClient {
     bool peer_inbound_capable_locked(const NodeId&) const;
     bool route_usable_locked(const NodeId&, TransportLane) const;
     void note_peer_locked(const NodeInfo&);
-    // Wait (bounded by connect_timeout) for a peer that cannot be dialled to
-    // open `lane` to us after a dial_request. Returns the inbound route's
-    // presence; throws with the reason when it never arrives.
+    // Waits (bounded by connect_timeout) for a non-dialable peer to open
+    // `lane` to us after a dial_request; throws with the reason if it never does.
     void await_reverse_dial(std::unique_lock<std::mutex>& lock, const NodeId& peer,
                             TransportLane lane, const std::string& retry_key);
     void open_requested_lanes(std::stop_token);
@@ -522,8 +483,8 @@ class RpcClient {
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
-    // `no_progress_deadline`: fail the call (cancelling it) once it has made
-    // no progress for this long; zero waits indefinitely as before.
+    // `no_progress_deadline`: cancel and fail the call once it has made no
+    // progress for this long; zero waits indefinitely.
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>,
                   std::chrono::milliseconds stall_notice,
                   std::chrono::milliseconds no_progress_deadline = {});
@@ -537,33 +498,25 @@ class RpcClient {
                   std::chrono::milliseconds stall_notice,
                   std::chrono::milliseconds no_progress_deadline = {});
     RpcStats stats() const;
-    // Every channel this client opens counts into it; the node's server is
-    // given the same one, so it is the node's whole cluster traffic.
+    // Shared with the node's server: the node's whole cluster traffic.
     const std::shared_ptr<TransportTraffic>& traffic() const noexcept { return traffic_; }
     // Smoothed CONTROL-lane round trip to a peer, if any call has completed.
     std::optional<std::chrono::milliseconds> peer_latency(const NodeId&) const;
     std::map<NodeId, std::chrono::milliseconds> peer_latencies() const;
 
-    // Nodes that accept no inbound connections (0.42.0). The transport needs
-    // to know a peer's flags before it decides whether to dial: the handshake
-    // teaches it for peers it has met, note_peer() for peers membership has
-    // only heard about.
+    // Teaches the transport a peer's flags (inbound-capable or not) before it
+    // has met the peer in a handshake.
     void note_peer(const NodeInfo&);
     bool has_route(const NodeId&, TransportLane) const;
-    // A peer asked (or membership decided) that this side should open `lane`
-    // to `peer`. Queued for the health thread, which dials under the ordinary
-    // retry backoff; a request never bypasses it, so a peer that keeps losing
-    // a lane cannot make this node redial in a loop.
+    // Queues `lane` to `peer` for the health thread to dial under the ordinary
+    // retry backoff, so a peer that keeps losing a lane cannot cause a redial loop.
     void request_lane(const NodeInfo& peer, TransportLane lane);
     // While this node is inbound-incapable, keep CONTROL and DATA dialled to
-    // every peer the callback returns (the active inbound-capable set): it is
-    // the only side that can restore its own reachability, so it never waits
-    // to be asked when it can avoid it.
+    // every peer the callback returns: only this side can restore its reachability.
     void set_maintained_peers(std::function<std::vector<NodeInfo>()>);
-    // One-shot dial-back: a fresh TCP connection to `endpoint`, a full
-    // handshake that must authenticate as `expected`, then close. Never
-    // registered as a route; this is the evidence `inbound_capable: auto`
-    // is built on. Returns the error text, empty on success.
+    // One-shot dial-back: a fresh connection to `endpoint` whose handshake
+    // must authenticate as `expected`, then closed; never a route. The
+    // evidence for `inbound_capable: auto`. Returns the error text, empty on success.
     std::string probe_dial(const Endpoint& endpoint, const NodeId& expected);
     // Tear down one lane to a peer (both directions) without touching the
     // other. Tests use it to stand in for a NAT mapping silently expiring.
@@ -645,8 +598,8 @@ class RpcServer {
     std::atomic_size_t active_metadata_requests_{};
     std::atomic_uint64_t rejected_metadata_requests_{};
     std::atomic_uint64_t rejected_requests_{};
-    // Message types occupy a small fixed wire namespace. Fixed atomic buckets
-    // keep diagnostics bounded and avoid a lock or allocation on the handler path.
+    // Fixed buckets over the small wire namespaces: bounded, lock- and
+    // allocation-free on the handler path.
     std::array<AtomicTiming, 6> frame_timings_{};
     std::array<AtomicTiming, 256> message_timings_{};
     size_t active_nonforeground_data_{};

@@ -17,19 +17,14 @@
 
 namespace macha {
 
-// Mirrors the local-node "startup.phase" vocabulary already reported by the
-// Status API's root object (ClusterStatusService::status_response), so a peer
-// observed via telemetry and this node's own startup phase read the same way.
-// "ready" is the default: a legacy sender/record that predates this field, or
-// one truncated on decode, reports itself as ready rather than perpetually
-// "recovering", preserving prior behavior for anything that omits it.
+// Same vocabulary as the Status API's "startup.phase". Defaults to ready, so
+// a record that omits it is not read as perpetually recovering.
 enum class NodePhase : uint8_t { starting, recovering, ready };
 
 std::string_view node_phase_name(NodePhase);
 
-// What a node has sustained transcoding one kind of source: the median of its
-// recent finished generations' produced / producing media time, parked time
-// excluded. A measurement, never an estimate; an unseen class is absent.
+// Median sustained transcode rate for one source class: produced / producing
+// media time of recent finished generations, parked time excluded.
 struct TranscodeRate {
     std::string kind;        // "video" or "audio"
     std::string codec;       // the source stream's codec
@@ -41,9 +36,8 @@ struct TranscodeRate {
     auto operator<=>(const TranscodeRate&) const = default;
 };
 
-// This node's cluster traffic for one frame class (the wire value of
-// FrameType): bytes on and off the wire since start, and the rate over the
-// last telemetry interval. Only Macha's own traffic.
+// This node's own cluster traffic for one frame class (FrameType wire value):
+// bytes since start, and rate over the last telemetry interval.
 struct TrafficClass {
     uint8_t frame_class{};
     uint64_t in_bytes{};
@@ -53,8 +47,7 @@ struct TrafficClass {
     auto operator<=>(const TrafficClass&) const = default;
 };
 
-// Cumulative per-class totals as the transport counts them, indexed by the
-// FrameType wire value.
+// Cumulative per-class totals, indexed by FrameType wire value.
 struct TrafficTotals {
     std::array<uint64_t, 6> in_bytes{};
     std::array<uint64_t, 6> out_bytes{};
@@ -73,15 +66,9 @@ struct NodeTelemetry {
     uint64_t storage_used{};
     uint64_t cache_capacity{};
     uint64_t cache_used{};
-    // What the block cache has actually DONE, as opposed to how full it is.
-    // Monotonic since start and diffed by a consumer rather than read
-    // absolutely, which is what makes them safe on a payload clients cache.
-    //
-    // cache_used above is a function of writes alone, so until 2026-09-21 a
-    // cache that had never returned a byte reported identically to one working
-    // perfectly. On a node with hosts_extents false the block cache is the
-    // only reason it can serve media at all, so "is it serving?" is not a
-    // curiosity there -- it is the difference between an edge node and a proxy.
+    // Block-cache activity, monotonic since start; consumers diff them.
+    // cache_used reflects writes only; these show whether the cache serves,
+    // which is all an edge node (hosts_extents false) serves from.
     uint64_t cache_hits{};
     uint64_t cache_misses{};
     uint64_t cache_evictions{};
@@ -97,102 +84,56 @@ struct NodeTelemetry {
     uint64_t rpc_connections_reused{};
     uint64_t rpc_connections_canonical{};
     NodePhase phase{NodePhase::ready};
-    // Where clients should reach this node's HTTP API, as a complete URL --
-    // distinct from host/port above, which is the RPC address and is never
-    // proxied. Empty means the sender doesn't run (or hasn't yet reported)
-    // an API endpoint. Carries a scheme precisely because the API may sit
-    // behind a TLS-terminating proxy while binding plain HTTP internally, so
-    // neither scheme nor port is derivable from anything else here.
+    // Client-facing HTTP API URL, distinct from the RPC host/port. Carries a
+    // scheme because the API may sit behind a TLS proxy. Empty: none reported.
     std::string api_endpoint;
-    // Hardware threads on this node. Zero means the sender did not report one,
-    // which a consumer must treat as "no opinion" rather than as zero cores:
-    // load1 and process_cpu_percent are both per-core quantities, and this
-    // cluster is deliberately non-uniform hardware, so comparing either
-    // between nodes without it compares nothing.
+    // Hardware threads; zero means unreported. load1 and CPU percent are
+    // per-core, so cross-node comparison needs it.
     uint32_t cpu_cores{};
-    // Physical RAM on this node. Total rather than available: on Linux
-    // "available" is dominated by page cache, so a node that has just served a
-    // large file looks starved while being perfectly healthy -- and serving
-    // large files is the whole workload here. Zero means the sender could not
-    // determine it, which a consumer must render as unknown rather than as a
-    // node with no memory. Display only; nothing schedules or ranks on it,
-    // since total RAM would prefer a large thrashing node over a small idle
-    // one.
+    // Physical RAM, total (Linux "available" is dominated by page cache).
+    // Zero means unknown. Display only; nothing schedules on it.
     uint64_t memory_total_bytes{};
-    // The budgets this node itself enforces on a playback request: how long it
-    // may take to bring the first transformed fragment up
-    // (`streaming.startup_timeout_ms`), and how long it holds a request for a
-    // fragment that is not ready yet (`streaming.segment_timeout_ms`).
-    //
-    // Reported because a client has to bound its own attempt against the node
-    // it is actually talking to, including nodes it has never used -- these
-    // are self-reported facts, relayed like load1 and cpu_cores, not a
-    // cluster-wide figure any node is entitled to compute. A client that
-    // hardcodes a budget below a node's own entitlement abandons that node
-    // while it is still working: measured on 2026-09-18, a 12 s client budget
-    // against this 15 s one threw away an 11.7 s transcode that was about to
-    // succeed and started the identical encode on the other node.
-    //
-    // Zero means the sender did not report one -- an older node, or one with
-    // streaming disabled -- and a consumer must read that as "cannot say",
-    // never as licence to shorten its own budget. A default would be
-    // indistinguishable at runtime from an answer.
+    // The node's own playback budgets: `streaming.startup_timeout_ms` (first
+    // transformed fragment) and `streaming.segment_timeout_ms` (hold for an
+    // unready fragment). Self-reported so a client bounds its attempt against
+    // this node; a shorter client budget abandons work about to succeed.
+    // Zero means unreported ("cannot say"), never licence to shorten.
     uint32_t playback_startup_timeout_ms{};
     uint32_t playback_segment_timeout_ms{};
-    // How long this node keeps a pipeline alive with nothing asking for it,
-    // and how long it keeps the session itself. A client holding a standby
-    // sizes its window against the first: held past the node's pipeline
-    // teardown, it promotes something that cannot serve, on the very path
-    // whose job is to make a failover invisible. The second bounds a deferred
-    // release -- a session abandoned on an unreachable node is worth retrying
-    // a close against until the node has expired it, and not after.
-    //
-    // Both were private copies of this node's configuration held as literals
-    // in clients until 0.48.0, which is the shape that cost a 12.7 s viewer
-    // freeze when a client's 8-segment assumption met a node configured for 4.
+    // Idle lifetimes of a pipeline and of a session. A standby held past the
+    // first cannot serve; a deferred close is worth retrying until the second.
     uint32_t playback_pipeline_idle_ms{};
     uint32_t playback_session_idle_ms{};
-    // How many playback sessions one account may hold on this node. A client
-    // choosing where to put a standby needs this about the candidate, not
-    // about the node it happens to be talking to, which is why it rides here
-    // rather than only on that node's own playback status.
+    // Per-account session cap; published here so a client can judge a standby
+    // candidate other than the node it is talking to.
     uint32_t playback_max_sessions_per_account{};
     // How many of one account's sessions may hold a transcode here at once.
     uint32_t playback_max_transcodes_per_account{};
-    // Node-wide, every account together. 0.48.0 published the per-account cap
-    // and not this one, which left a client able to state "another screen on
-    // this account is playing" and unable to state "this node is full" -- the
-    // two refusals mean opposite things and only one of them was legible.
+    // Node-wide, all accounts: lets a client tell "node full" from "another
+    // screen on this account".
     uint32_t playback_max_sessions{};
-    // How long a session may hold a transcode entitlement with no stream
-    // activity before the node releases it. A paused client that wants to keep
-    // its slot must ask for a stream object inside this window; a playlist
-    // fetch is enough and costs no media bytes. Published so a client can time
-    // its keep-alive against the node it is actually on rather than a
-    // hardcoded guess -- the same reason the two idle timers above are here.
+    // Idle time after which a session's transcode entitlement is released; a
+    // paused client keeps its slot by requesting a stream object (a playlist
+    // suffices) within it.
     uint32_t playback_transcode_entitlement_idle_ms{};
-    // `start=async` (0.69.0): a start fails only when its progress has not
-    // moved for startup_no_progress_ms; a long-poll waits at most
-    // start_wait_max_ms; a failed start stays readable for
-    // start_failed_retention_ms. Zero means the node does not offer
-    // `start=async`.
+    // `start=async`: a start fails only when progress stalls for
+    // startup_no_progress_ms; a long-poll waits at most start_wait_max_ms; a
+    // failed start stays readable for start_failed_retention_ms. Zero: not offered.
     uint32_t playback_startup_no_progress_ms{};
     uint32_t playback_start_wait_max_ms{};
     uint32_t playback_start_failed_retention_ms{};
     std::vector<TranscodeRate> playback_transcode_rates;
-    // The operator's display name for the node (`node_name`), or empty.
+    // The operator's `node_name`, or empty.
     std::string node_name;
-    // Per-class cluster traffic (0.73.0). Empty means the sender did not say.
-    // The rates are over traffic_window_ms, the interval since the sender's
-    // previous sample; zero on its first sample after start, when it has none.
+    // Per-class cluster traffic; empty when unreported. Rates are over
+    // traffic_window_ms since the sender's previous sample (zero on its first).
     std::vector<TrafficClass> traffic;
     uint32_t traffic_window_ms{};
 
     auto operator<=>(const NodeTelemetry&) const = default;
 };
 
-// Passed as a group rather than as two more positional integers into an
-// already long refresh_local signature, where a transposition would be silent.
+// Grouped so adjacent integers in refresh_local cannot be silently transposed.
 struct PlaybackBudgets {
     uint32_t startup_timeout_ms{};
     uint32_t segment_timeout_ms{};
@@ -208,9 +149,6 @@ struct PlaybackBudgets {
     std::vector<TranscodeRate> transcode_rates;
 };
 
-// Grouped for the same reason as PlaybackBudgets below it: refresh_local's
-// signature is already long, and three more adjacent uint64_ts is precisely
-// where a transposition is silent and survives review.
 struct CacheActivity {
     uint64_t hits{};
     uint64_t misses{};
@@ -250,7 +188,7 @@ class TelemetryStore {
     Clock::time_point previous_traffic_at_{};
 
   public:
-    // The display name this node reports for itself from its next sample on.
+    // Takes effect from the next sample.
     void set_node_name(std::string name) {
         std::lock_guard lock(mutex_);
         node_name_ = std::move(name);

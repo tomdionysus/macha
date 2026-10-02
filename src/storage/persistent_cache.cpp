@@ -37,9 +37,7 @@ void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> by
         throw std::runtime_error("cannot create cache metadata: " + std::string(strerror(errno)));
     try {
         write_all(fd, bytes);
-        // Cache metadata is a hint, not authoritative state. A crash may lose
-        // it wholesale; startup simply ignores a torn/missing record and the
-        // cache remains disposable by contract.
+        // Cache metadata is a hint; startup ignores a torn or missing record.
         if (::close(fd))
             throw std::runtime_error("cannot close cache metadata: " + std::string(strerror(errno)));
         fd = -1;
@@ -120,9 +118,7 @@ void PersistentBlockCache::rebuild_lru_locked() {
     if (!store_)
         return;
 
-    // Reconcile the on-disk cache exactly once when it is opened.  Runtime
-    // eviction is maintained incrementally from here; it must never recurse
-    // over the complete cache tree on every inserted extent.
+    // The only full walk of the cache; eviction is incremental from here.
     for (const auto& id : store_->list()) {
         lru_.push_back(id);
         lru_index_[id] = std::prev(lru_.end());
@@ -160,18 +156,15 @@ void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& stor
             evictions_.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // LocalStore serialises physical mutations internally. Cache mode is
-        // intentionally ephemeral and never establishes stable-storage barriers, so
-        // deliberately do it without state_mutex_: foreground cache readers
-        // only need a shared_ptr snapshot and continue independently.
+        // Outside state_mutex_: LocalStore serialises its own mutations, the
+        // cache issues no barriers, and readers hold only a shared_ptr snapshot.
         (void)store->remove(*victim);
     }
 }
 
 bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data) {
-    // Cache mutation is serialised independently of reads.  This also makes the
-    // in-memory block count a reservation mechanism: two writers cannot both
-    // observe one remaining slot and exceed max_blocks.
+    // Writers are serialised apart from reads, so two cannot both take the
+    // last slot and exceed max_blocks.
     std::lock_guard writer(writer_mutex_);
 
     std::shared_ptr<LocalStore> store;
@@ -190,10 +183,8 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
             return true;
         }
 
-        // Make one slot before doing the encrypted put. No durability barrier is
-        // required for cache data; a crash may discard the entire cache. No
-        // recursive directory walk is performed here; lru_ is authoritative
-        // for this cache process after the one-time open reconciliation.
+        // Make one slot before the put. No durability barrier: a crash may
+        // discard the whole cache. lru_ is authoritative after open.
         while (true) {
             std::optional<ObjectId> victim;
             {
@@ -207,13 +198,8 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
                 lru_index_.erase(*victim);
                 lru_.pop_front();
                 block_count_.store(lru_.size(), std::memory_order_relaxed);
-                // Counted here as well as in trim_to_limit, because THIS is
-                // the eviction that happens in normal operation: put() makes
-                // its own slot inline and never calls trim_to_limit, which
-                // only runs on reconfigure. Instrumenting trim alone reported
-                // almost no evictions on a cache evicting constantly, which is
-                // worse than no counter -- it would have made a thrashing
-                // cache look calm.
+                // Counted here too: put() evicts inline in normal operation;
+                // trim_to_limit runs only on reconfigure.
                 evictions_.fetch_add(1, std::memory_order_relaxed);
             }
             (void)store->remove(*victim);
@@ -272,9 +258,7 @@ std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
             std::lock_guard lock(state_mutex_);
             current = store_ == store;
         }
-        // A read that threw is a miss like any other: the caller got nothing
-        // and will go to the network. Counting it as neither would make a
-        // cache failing every read look idle rather than broken.
+        // A read that threw is a miss, so a failing cache looks broken, not idle.
         misses_.fetch_add(1, std::memory_order_relaxed);
         if (current) {
             (void)store->remove(id);

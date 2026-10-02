@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The torrent's disk backend (src/torrent/torrent_disk_io.cpp), driven through
-// libtorrent's disk_interface exactly as a session drives it: jobs issued on
-// one thread, completions arriving on the io_context.
+// The torrent disk backend, driven through libtorrent's disk_interface as a
+// session drives it: jobs issued on one thread, completions on the io_context.
 
 #include "test_framework.hpp"
 #include "test_support.hpp"
@@ -59,8 +58,7 @@ using test_support::TempDir;
 
 constexpr int block = lt::default_block_size;
 
-// Non-repeating: a periodic pattern gives equal extents equal object ids, which
-// content addressing then (correctly) deduplicates.
+// Non-repeating, so content addressing does not deduplicate equal extents.
 std::vector<char> pattern_bytes(size_t size, int seed) {
     std::vector<char> out(size);
     uint64_t state = 0x9e3779b97f4a7c15ULL ^ static_cast<uint64_t>(seed);
@@ -213,9 +211,7 @@ const lt::status_t status_ok = lt::status_t::no_error;
 const lt::status_t status_full_check = lt::status_t::need_full_check;
 #endif
 
-// Descriptors this process holds on files under `dir`: the payload files a
-// backend has open, and nothing else (sockets and pipes come and go with the
-// swarm and say nothing about the backend).
+// Descriptors this process holds on files under `dir` (sockets and pipes excluded).
 size_t open_files_under(const std::filesystem::path& dir) {
     const auto prefix = std::filesystem::weakly_canonical(dir).string();
     size_t count = 0;
@@ -236,9 +232,8 @@ size_t open_files_under(const std::filesystem::path& dir) {
     return count;
 }
 
-// A hybrid (v1 + v2) torrent over files written under `seed_dir`. Hybrid on
-// purpose: v2 inserts pad files between files, and hashing runs both
-// async_hash's block hashes and async_hash2.
+// A hybrid (v1 + v2) torrent over files under `seed_dir`: v2 inserts pad files,
+// and hashing exercises both async_hash and async_hash2.
 std::shared_ptr<lt::torrent_info> make_torrent(const std::filesystem::path& seed_dir,
                                                const std::vector<int64_t>& sizes, int piece_length) {
     std::filesystem::create_directories(seed_dir / "payload");
@@ -289,11 +284,10 @@ bool wait_for(Predicate done, std::chrono::milliseconds timeout) {
 } // namespace
 
 MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_and_leaves_nothing_behind) {
-    // A seeder on libtorrent's own backend and a leecher on macha's, over
-    // loopback, three times over: every byte arrives intact, every read,
-    // write and hash went through a real DATA arbiter at loader class, every
-    // credit is returned, and deleting the torrent leaves no payload and no
-    // open descriptor behind.
+    // A seeder on libtorrent's backend and a leecher on macha's, over loopback,
+    // three times: every byte arrives intact, all I/O goes through a real DATA
+    // arbiter at loader class, every credit is returned, and deleting the
+    // torrent leaves no payload and no open descriptor.
     TempDir dir;
     const std::vector<int64_t> sizes{300000, 5000, 131072, 70001};
     const auto torrent = make_torrent(dir.path() / "seed", sizes, 2 * block);
@@ -306,7 +300,7 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
     TorrentDiskHooks hooks;
     hooks.admit = loader_admission(arbiter);
     hooks.observe = [&](std::chrono::nanoseconds, uint64_t bytes) { observed_bytes += bytes; };
-    // Stage 2: every extent is published as its pieces verify.
+    // Every extent is published as its pieces verify.
     constexpr uint64_t extent_size = 64 * 1024;
     hooks.extent_size = extent_size;
     hooks.verifications = std::make_shared<TorrentPieceVerifications>();
@@ -341,7 +335,7 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
         leech.save_path = leech_dir.string();
         auto downloading = leecher.add_torrent(leech);
         downloading.connect_peer(seed_endpoint);
-        // What TorrentManager::drain_alerts does in production.
+        // As TorrentManager::drain_alerts does.
         auto pump = [&] {
             std::vector<lt::alert*> alerts;
             leecher.pop_alerts(&alerts);
@@ -384,7 +378,7 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
 
         leecher.remove_torrent(downloading, lt::session_handle::delete_files);
         CHECK(wait_for([&] { return !std::filesystem::exists(leech_dir / "payload"); }, 10s));
-        // And the journal that described it, so a later add starts clean.
+        // The journal goes too, so a later add starts clean.
         CHECK(wait_for([&] { return !std::filesystem::exists(TorrentExtentJournal::path_for(leech_dir)); }, 10s));
         CHECK(wait_for([&] { return open_files_under(leech_dir) == 0; }, 10s));
         CHECK(wait_for([&] { return arbiter.stats().used_bytes == 0; }, 10s));
@@ -393,11 +387,10 @@ MACHA_TEST("torrent_disk_io", test_a_real_swarm_downloads_through_the_backend_an
 }
 
 MACHA_TEST("torrent_disk_io", test_extents_publish_once_their_pieces_verify_and_journal_the_manifest) {
-    // Stage 2. Extents are file-relative and deliberately not aligned to
-    // pieces here (48 KiB extents over 32 KiB pieces, files that end mid-piece),
-    // so an extent is published only when every piece covering it has
-    // verified, each exactly once, and the journal's manifests rebuild every
-    // file byte for byte. The first attempt fails, to prove it is retried.
+    // Extents are file-relative and not piece-aligned (48 KiB extents over
+    // 32 KiB pieces, files ending mid-piece): each is published exactly once,
+    // when every piece covering it has verified, and the journal's manifests
+    // rebuild every file byte for byte. The first attempt fails, to prove retry.
     TempDir dir;
     std::mutex published_mutex;
     std::map<ObjectId, Bytes> published;
@@ -461,10 +454,8 @@ MACHA_TEST("torrent_disk_io", test_extents_publish_once_their_pieces_verify_and_
 }
 
 MACHA_TEST("torrent_disk_io", test_publication_progress_is_reported_until_every_extent_is_published) {
-    // The torrent manager hands a downloaded torrent to the ingest only when
-    // this says every extent is published; Pretty Woman (2026-09-24) was
-    // handed over 30-odd extents early and copied. Publication is held back
-    // here so the incomplete state is observable, then released.
+    // The manager hands a torrent to ingest only once every extent is
+    // published; publication is held back so the incomplete state is observable.
     TempDir dir;
     std::atomic_bool release{false};
     TorrentDiskHooks hooks;
@@ -502,12 +493,8 @@ MACHA_TEST("torrent_disk_io", test_publication_progress_is_reported_until_every_
 }
 
 MACHA_TEST("torrent_disk_io", test_a_removed_torrent_keeps_its_files_alive_until_publication_lets_go) {
-    // gbni-1, 2026-09-24: two core dumps, both publisher() ->
-    // file_storage::file_path on a torrent already freed -- at every service
-    // stop, and very likely behind the day's crashes after a finished torrent
-    // was removed. The storage now holds libtorrent's torrent owner, as
-    // libtorrent's own backend does, and a removed torrent's queued
-    // publications are dropped rather than retried.
+    // The storage holds libtorrent's torrent owner, so a removed torrent's file
+    // list outlives any publication in flight; queued ones are dropped.
     TempDir dir;
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
@@ -566,12 +553,9 @@ MACHA_TEST("torrent_disk_io", test_a_removed_torrent_keeps_its_files_alive_until
 }
 
 MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held_bitfield) {
-    // Trainspotting, 2026-09-24: publication stopped at 162 of 436 extents
-    // with the publisher idle, because verifications for the rest never
-    // arrived. Only some pieces are reported here, as alerts would be when
-    // the queue drops them; then every held piece is reported again, as the
-    // manager now does from the torrent's bitfield. Everything publishes,
-    // exactly once.
+    // Only some pieces are reported, as when the alert queue drops some; then
+    // every held piece is reported again from the bitfield, as the manager
+    // does. Everything publishes, exactly once.
     TempDir dir;
     std::atomic<int> publishes{0};
     TorrentDiskHooks hooks;
@@ -597,8 +581,8 @@ MACHA_TEST("torrent_disk_io", test_lost_piece_alerts_are_recovered_from_the_held
 }
 
 MACHA_TEST("torrent_disk_io", test_a_restarted_backend_does_not_republish_journalled_extents) {
-    // Resume: extents the journal already records are not published again
-    // when the same payload is added to a new backend and its pieces verify.
+    // Extents the journal records are not published again when the payload is
+    // added to a new backend and its pieces verify.
     TempDir dir;
     std::atomic<int> publishes{0};
     auto make_hooks = [&] {
@@ -648,7 +632,7 @@ MACHA_TEST("torrent_disk_io", test_pieces_spanning_files_round_trip_through_the_
     CHECK(f1 == std::vector<char>(data.begin() + 40000, data.begin() + 70000));
     CHECK(f2 == std::vector<char>(data.begin() + 70000, data.end()));
 
-    // And every piece hashes to what was written, read back across files.
+    // Every piece hashes to what was written, read back across files.
     for (int piece = 0; piece < h.files.num_pieces(); ++piece) {
         const auto got = h.hash(lt::piece_index_t(piece));
         REQUIRE(got.has_value());
@@ -674,13 +658,9 @@ MACHA_TEST("torrent_disk_io", test_pieces_spanning_files_round_trip_through_the_
 }
 
 MACHA_TEST("torrent_disk_io", test_a_hash_issued_before_its_writes_complete_sees_them) {
-    // libtorrent may ask for a piece's hash before the writes of its blocks
-    // have completed. With four workers and no pumping in between, the hash
-    // must still read what the writes wrote: jobs for one torrent run in order.
-    //
-    // Writes are made slow inside admission, as a pressured device makes them,
-    // so a hash that were not ordered behind them would run on another worker
-    // and read the previous round's bytes.
+    // A hash issued before its blocks' writes complete still reads them: jobs
+    // for one torrent run in order across four workers. Writes are slowed in
+    // admission so an unordered hash would read the previous round's bytes.
     TempDir dir;
     TorrentDiskHooks hooks;
     hooks.threads = 4;
@@ -731,9 +711,8 @@ MACHA_TEST("torrent_disk_io", test_every_read_write_and_hash_is_admitted_and_mea
 }
 
 MACHA_TEST("torrent_disk_io", test_a_blocked_admission_pushes_back_on_the_network) {
-    // When the device is not admitting, queued writes pass the queue limit,
-    // async_write says so, and libtorrent stops reading from peers until
-    // on_disk(). That is how the network rate comes to follow the disk.
+    // When the device is not admitting, queued writes pass the limit,
+    // async_write says so, and libtorrent stops reading peers until on_disk().
     TempDir dir;
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
@@ -848,8 +827,8 @@ MACHA_TEST("torrent_disk_io", test_delete_removes_the_payload_and_nothing_else) 
 }
 
 MACHA_TEST("torrent_disk_io", test_a_three_hundred_file_torrent_holds_a_bounded_number_of_descriptors) {
-    // A discography is thousands of small files; the backend caches at most
-    // 64 descriptors per torrent and releases them all on release_files.
+    // The backend caches at most 64 descriptors per torrent and releases them
+    // all on release_files.
     TempDir dir;
     std::vector<int64_t> sizes(300, 1000);
     Harness h(layout(sizes, block), dir.path(), {});
@@ -863,10 +842,9 @@ MACHA_TEST("torrent_disk_io", test_a_three_hundred_file_torrent_holds_a_bounded_
 }
 
 MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_on_abort) {
-    // The arbiter-backed admission the node installs: loader class, so it
-    // is admitted on a pressured device with no viewer (law 3), waits while
-    // the loader ceiling is full, proceeds when a lease is released, and gives
-    // up promptly once the backend aborts.
+    // The node's arbiter-backed admission at loader class: admitted on a
+    // pressured device with no viewer, waits while the loader ceiling is full,
+    // proceeds when a lease is released, and gives up promptly on abort.
     DiskServiceMonitor monitor;
     DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 1, 500ms);
     arbiter.observe_device(&monitor, 1);
@@ -914,9 +892,8 @@ MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_
 namespace macha {
 namespace {
 
-// Shared by the session-policy cases (0.61.0): a session on macha's disk
-// backend that counts every byte the backend reads, which is how a check
-// shows itself.
+// A session on macha's disk backend that counts every byte read, which is how
+// a recheck shows itself.
 struct CountingSession {
     DataResourceArbiter arbiter{64 * 1024 * 1024, 16 * 1024 * 1024, 2, 500ms};
     std::atomic<uint64_t> read_bytes{0};
@@ -934,10 +911,8 @@ struct CountingSession {
 const std::vector<int64_t> policy_sizes{4 * 1024 * 1024, 3 * 1024 * 1024};
 
 MACHA_TEST("torrent_disk_io", test_a_held_torrent_is_not_restarted_by_the_queue) {
-    // Measured on fi-1, 2026-09-25: a torrent paused straight after add
-    // while auto-managed was running, fully re-checked and seeding three
-    // seconds later -- libtorrent's queue manager overrides pause(). Every
-    // Macha pause was that. A hold clears auto-management first.
+    // libtorrent's queue manager undoes pause() on an auto-managed torrent,
+    // so a hold clears auto-management first.
     TempDir dir;
     const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
     CountingSession s;
@@ -972,9 +947,7 @@ MACHA_TEST("torrent_disk_io", test_a_torrent_held_at_add_is_never_checked) {
 }
 
 MACHA_TEST("torrent_disk_io", test_resume_data_lets_a_restart_skip_the_recheck) {
-    // gbni-1, 2026-09-25: with no resume data every restart re-hashed every
-    // staged byte of every torrent -- an hour at the disk's full 90 MB/s --
-    // with all the others queued behind it.
+    // Without resume data a restart re-hashes every staged byte.
     TempDir dir;
     const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
     const auto resume_file = dir.path() / "resume" / "job.resume";
@@ -1019,10 +992,8 @@ MACHA_TEST("torrent_disk_io", test_resume_data_lets_a_restart_skip_the_recheck) 
 }
 
 MACHA_TEST("torrent_disk_io", test_resume_data_saved_while_held_does_not_keep_a_released_job_held) {
-    // Smallville, gbni-1, 2026-09-25: resume data written while the torrent
-    // was held restores paused and not auto-managed, so after a restart it
-    // stayed held although its job no longer was, and a magnet that never
-    // fetches its metadata never leaves `staging_full`. The job decides.
+    // Resume data saved while held restores paused and not auto-managed; the
+    // job, not the resume data, decides whether the torrent stays held.
     TempDir dir;
     const auto torrent = make_torrent(dir.path() / "t", policy_sizes, 4 * block);
     const auto resume_file = dir.path() / "resume" / "job.resume";
@@ -1079,10 +1050,9 @@ MACHA_FAST_TEST("torrent_disk_io", test_a_queued_check_is_told_apart_from_a_runn
 }
 
 MACHA_TEST("torrent_disk_io", test_shutdown_cancels_a_publication_in_flight) {
-    // A node stopping while an extent is being stored must not wait on that
-    // write: the publish hook is handed the backend's abort flag, set when the
-    // backend shuts down, so a store honouring it returns at once. The extent
-    // is left out of the journal and is published again on resume.
+    // Shutdown does not wait on an extent being stored: the publish hook gets
+    // the backend's abort flag, so the store returns at once; the extent stays
+    // out of the journal and is published again on resume.
     TempDir dir;
     std::atomic_bool entered{false};
     std::atomic_bool saw_abort{false};
