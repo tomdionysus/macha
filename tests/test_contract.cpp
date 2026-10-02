@@ -384,8 +384,8 @@ MACHA_TEST("contract", test_the_wait_guard_on_a_cold_catalogue) {
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state());
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
 
     WaitGuard::set_mode(WaitGuard::Mode::throw_on_violation);
     const WorkContext control(FrameType::control, {}, nullptr, "test control");

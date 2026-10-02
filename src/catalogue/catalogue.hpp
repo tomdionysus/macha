@@ -159,6 +159,7 @@ class CatalogueUnavailable : public std::runtime_error {
 class CatalogueManager {
     NodeRuntime& node_;
     LocalState& local_;
+    MetadataServer& metadata_server_;
     DistributedStore& store_;
     MetadataView& metadata_;
     mutable std::mutex mutex_;
@@ -210,7 +211,7 @@ class CatalogueManager {
                 std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict = {});
 
   public:
-    CatalogueManager(NodeRuntime&, LocalState&, DistributedStore&, MetadataView&);
+    CatalogueManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&);
 
     const ClusterKeys& cluster_keys() const noexcept { return node_.keys(); }
 

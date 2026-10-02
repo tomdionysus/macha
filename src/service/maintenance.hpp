@@ -59,6 +59,7 @@ struct MaintenancePort {
 struct MaintenanceDependencies {
     NodeRuntime& node;
     LocalState& local;
+    MetadataServer& metadata_server;
     DistributedStore& store;
     MetadataView& metadata;
     MetadataMaintenance& metadata_upkeep;
@@ -109,6 +110,7 @@ class Maintenance final {
 
     NodeRuntime& node_;
     LocalState& local_;
+    MetadataServer& metadata_server_;
     DistributedStore& store_;
     MetadataView& metadata_;
     MetadataMaintenance& metadata_upkeep_;

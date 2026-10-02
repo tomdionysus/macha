@@ -945,7 +945,7 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     music_art_config.music.musicbrainz.contact = "https://example.test/macha";
     music_art_config.music.discogs.enabled = false;
     music_art_config.max_provider_requests_per_scan = 8;
-    CatalogueScanner music_art_scanner(service.node(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner music_art_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
                                        music_art_config, std::move(music_art_http));
     CHECK(music_art_scanner.scan_once() == 1);
     auto music_album = service.catalogue().get("musicbrainz:album:rg-tagged-1");

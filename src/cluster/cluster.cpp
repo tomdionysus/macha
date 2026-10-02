@@ -415,7 +415,7 @@ void NodeRuntime::recover_local(std::stop_token stop) {
     advertise_storage_backends(static_cast<uint32_t>(data.online_backends()));
     metadata_server_ = std::make_unique<MetadataServer>(
         *this, local_state_->replica(), local_state_->cache(), routes_,
-        cfg_.metadata_min_write_replicas);
+        cfg_.metadata_min_write_replicas, cfg_.heartbeat);
     advertise_metadata_generation(local_state_->replica().committed().generation);
     server_.set_local(members_.self());
     storage_server_ = std::make_unique<StorageServer>(
@@ -1328,8 +1328,6 @@ void NodeRuntime::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         // Readiness is orthogonal to membership: refresh available local
         // planes, then exchange regardless.
-        if (progress_.complete())
-            advertise_metadata_generation(local_state_->replica().generation());
 
         std::set<std::pair<std::string, uint16_t>> exchanged;
         const auto known_nodes = members_.all();

@@ -1436,9 +1436,10 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
-FileSystem::FileSystem(NodeRuntime& n, LocalState& local, DistributedStore& s, MetadataView& m,
+FileSystem::FileSystem(NodeRuntime& n, LocalState& local, MetadataServer& metadata_server,
+                       DistributedStore& s, MetadataView& m,
                        RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
-    : n_(n), local_(local), retained_memory_(retained_memory), s_(s), m_(m), playback_(playback) {
+    : n_(n), local_(local), metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s), m_(m), playback_(playback) {
     extent_worker_limit_ = std::max<size_t>(1, n_.config().fuse.commit_workers);
     extent_task_limit_ = extent_worker_limit_ * 2;
     extent_workers_.reserve(extent_worker_limit_);
@@ -2078,7 +2079,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
     if (auto available = m_.current()) {
         if (auto found = install_and_lookup(*available))
             return found;
-        if (available->generation >= n_.known_metadata_generation())
+        if (available->generation >= metadata_server_.known_generation())
             return {};
     }
 
@@ -2352,7 +2353,7 @@ std::optional<Hash256> FileSystem::available_namespace_signature(
 }
 
 std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
-    const auto known_generation = n_.known_metadata_generation();
+    const auto known_generation = metadata_server_.known_generation();
     {
         std::lock_guard lock(maintenance_index_mutex_);
         if (maintenance_index_ && maintenance_index_generation_ >= known_generation)
