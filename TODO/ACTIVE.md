@@ -58,40 +58,21 @@ resumes from `develop` and the experiment's version line ceases to exist.
   so weak as thresholds: fi-1's K3 (2 hours), K7 `start_ready` and
   `update_ready` on both nodes (only the asynchronous paths record them).
   Found along the way, recorded, not fixed:
-  - **shutdown hangs while an fsync waits for publication** (2 of 6
-    top-up restarts SIGKILLed at 60 s; **reproduced first time on fi-1,
-    2026-10-01 21:58Z**: 256 MiB through FUSE, restart at the fsync).
-    Mechanism, from gdb and kernel stacks of the stopping process
-    (`build/repro/claude-repro-fsync-20261001T215759Z/`) and the code:
-    `dd` is in the kernel's `fuse_fsync` waiting for an answer; a libfuse
-    worker is in `op_fsync` -> `FuseFrontend::fsync` waiting on its broker's
-    future; the broker runs `wait_for_inode_publication`
-    (`src/fuse/fuse_frontend.cpp:2178`), which with no deadline is an
-    unbounded `data_cv.wait` -- `cancelled` is checked only between waits,
-    so a stop does not wake it; the publication it waits for never
-    completes and never errors during shutdown (the store's writes are
-    cancelled and the async publication retries them with back-off, seen
-    on gbni-1); `FuseSubsystem::stop()` joins, `SubsystemSupervisor::stop()`
-    joins it, until systemd's SIGKILL. Recovery replays the journal (64
-    operations this time); the data survives. A fix makes the wait
-    stop-aware (notify on cancel, or a bounded wait that rechecks) and
-    fails the publication on stop instead of retrying it; with A1's
-    declared waits this is the class of wait the experiment exists to
-    make visible. Not fixed: for the operator.
-  - **the FUSE publication writer cap can be exceeded** (P0; found by
-    `filesystem_fuse/test_fuse_publication_backlog_wider_than_ledger_completes`
-    failing about 1 run in 100-300, on `develop` as on the experiment).
-    `runnable_data_locked()` (`src/fuse/fuse_frontend.cpp`) reads
-    `writer_cap_reached()` once under the queue lock and admits inodes
-    without a publication while the count is below the cap; each admitted
-    inode opens its publication later under only its own mutex
-    (`set_data_publication_locked`), so workers in that window all open
-    one and the count passes the cap. The cap is what keeps the
-    retained-memory ledger from deadlocking against itself (es-1,
-    2026-09-09). Fix: take the slot at selection, under the queue lock
-    (count reserved-but-not-yet-open publications in the cap), release it
-    if the publication is never opened. A scheduling change: for the
-    operator.
+  - **fixed (2026-10-02, `-fuse-fixes`): shutdown hung while an fsync
+    waited for publication.** `FuseSubsystem::stop()` joined the mount
+    before stopping the frontend, the mount could not exit with an fsync
+    outstanding, and the fsync's wait for publication was unbounded and not
+    woken by a stop. `FuseFrontend::interrupt_waits()` now ends those waits
+    with EIO before the mount is joined (the data is journalled and
+    publishes after the restart). Test:
+    `filesystem_fuse/test_an_fsync_waiting_for_publication_ends_when_waits_are_interrupted`.
+    To confirm on the cluster with T5's first deploy (restart against an
+    fsync).
+  - **fixed (2026-10-02, `-fuse-fixes`): the FUSE publication writer cap
+    could be exceeded.** The cap was read at selection and taken at
+    creation under different locks; a worker now reserves its slot at
+    selection, under the queue lock. The backlog case, which failed about
+    1 run in 100-300 (also on `develop`), passes.
   - repair completes no pass: one to three months a pass at its rate
     (baseline.md K4). Repair's pace, not a broken gauge;
   - an unattributed restart of fi-1 at 16:00:01Z from the laptop's
