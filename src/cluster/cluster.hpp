@@ -7,6 +7,7 @@
 #include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
 #include "cluster/storage_server.hpp"
+#include "cluster/local_state.hpp"
 #include "cluster/node_identity.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
@@ -66,16 +67,6 @@ class NodeRuntime {
     using StartupStageHook = std::function<void(std::string_view)>;
 
   private:
-    enum ReadyBit : uint32_t {
-        ready_control_plane = 1U << 0,
-        ready_data_storage = 1U << 1,
-        ready_control_storage = 1U << 2,
-        ready_cache = 1U << 3,
-        ready_retention = 1U << 4,
-        ready_metadata = 1U << 5,
-        ready_failed = 1U << 31,
-    };
-
     Config cfg_;
     // Owned by the root, which built it under the state path's lock.
     const NodeIdentity& identity_;
@@ -116,24 +107,22 @@ class NodeRuntime {
     RpcClient client_;
     RpcServer server_;
 
-    std::unique_ptr<StoragePool> local_;
-    std::unique_ptr<LocalStore> control_;
-    std::unique_ptr<PersistentBlockCache> cache_;
-    std::unique_ptr<RetentionStore> retention_;
-    std::unique_ptr<MetadataReplica> meta_;
+    // Recovered by local_recovery_; published, with its servers, by
+    // local_ready_.
+    RecoveryProgress progress_;
+    std::unique_ptr<LocalState> local_state_;
     // Built with the replica, so its routes answer from then on.
     std::unique_ptr<MetadataServer> metadata_server_;
     // Built when the last local plane recovers, so its routes answer from then.
     std::unique_ptr<StorageServer> storage_server_;
     StartupStageHook startup_stage_hook_;
-    std::atomic_uint32_t ready_bits_{};
+    std::atomic_bool control_plane_online_{};
+    std::atomic_bool local_ready_{};
     uint64_t startup_unix_ms_{};
     std::atomic_uint64_t ready_unix_ms_{};
     mutable std::mutex readiness_mutex_;
     std::condition_variable readiness_cv_;
-    std::string recovery_error_;
-    std::jthread storage_recovery_;
-    std::jthread state_recovery_;
+    std::jthread local_recovery_;
     std::jthread connectivity_worker_;
     std::mutex connectivity_wait_mutex_;
     std::condition_variable_any connectivity_wait_cv_;
@@ -170,13 +159,7 @@ class NodeRuntime {
     std::atomic_bool outbound_calls_stopped_{};
 
 
-    bool ready(ReadyBit bit) const noexcept {
-        return (ready_bits_.load(std::memory_order_acquire) & static_cast<uint32_t>(bit)) != 0;
-    }
-    void mark_ready(ReadyBit bit);
-    void mark_recovery_failed(std::string);
-    void recover_storage(std::stop_token);
-    void recover_state(std::stop_token);
+    void recover_local(std::stop_token);
     bool all_local_state_ready() const noexcept;
 
     void bind_control_routes();
@@ -310,7 +293,8 @@ class NodeRuntime {
         return metadata_announcements_.load(std::memory_order_acquire);
     }
     uint64_t known_metadata_generation() const {
-        const auto local = ready(ready_metadata) ? metadata_replica().generation() : 0;
+        const auto local =
+            local_ready_.load(std::memory_order_acquire) ? local_state_->replica().generation() : 0;
         const auto remote = remote_metadata_generation_.load();
         return local > remote ? local : remote;
     }
