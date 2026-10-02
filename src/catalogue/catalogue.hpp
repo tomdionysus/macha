@@ -97,6 +97,15 @@ struct CatalogueStatus {
     std::string error;
 };
 
+// The metadata head a maintenance inventory of the catalogue is taken
+// against, captured before the catalogue's repair runs.
+struct CatalogueMaintenanceHead {
+    std::optional<ObjectId> root;
+    std::set<ObjectId> roots;
+    uint64_t generation{};
+    bool current{};
+};
+
 struct CatalogueMaintenance {
     // DATA objects referenced by the catalogue. These participate in ordinary
     // DHT placement/repair and global reachability GC.
@@ -266,7 +275,15 @@ class CatalogueManager {
                            const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
                            const std::set<std::string>& vanished_media = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
-    CatalogueMaintenance maintenance_objects();
+    // The maintenance inventory's catalogue half, in three steps the pass
+    // calls in order at one point (spec A4): the metadata head it is taken
+    // against (may read the committed record when behind), the catalogue's
+    // repair (which may commit a catalogue-root reconciliation; false when
+    // it failed), and the read itself, which fetches any catalogue object it
+    // lacks into the control store and is otherwise without effect.
+    CatalogueMaintenanceHead maintenance_head();
+    bool maintenance_repair();
+    CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&, bool repaired);
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
                                                  const std::optional<ObjectId>& new_root);
     size_t control_gc_step(std::span<const ObjectId> live,

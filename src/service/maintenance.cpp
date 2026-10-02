@@ -527,8 +527,12 @@ void Maintenance::run(std::stop_token stop) {
                 if ((!inventory || !inventory->catalogue_complete() ||
                      inventory->generation() != objects->metadata_generation) &&
                     (!inventory || !repair_only || metadata_ready_for_dependants)) {
+                    // The catalogue's repair is a step of its own (spec A4), between
+                    // the head its inventory is read against and the read.
+                    const auto catalogue_head = catalogue_.maintenance_head();
+                    const bool catalogue_repaired = catalogue_.maintenance_repair();
                     // The pass reads what the ledger holds, never its own copy.
-                    ledger_.publish(builder_.inventory(*objects));
+                    ledger_.publish(builder_.inventory(*objects, catalogue_head, catalogue_repaired));
                     inventory = ledger_.inventory();
                     rebuilt_inventory = true;
                     observations().record("maintenance.inventory.build_us",

@@ -42,3 +42,33 @@ metadata reference, by receiver name; that none is missed is the
 compiler's guarantee, not the count's.
 
 - Suites 700/700, 17/17; traces 240/240 over 20 runs.
+
+## T4b: the catalogue's hidden repair split out (2026-10-02)
+
+- `CatalogueManager::maintenance_objects()` ran the catalogue's repair
+  inside what reads as a read (spec A4's known case). It is now three
+  steps the pass calls in order at the same point: `maintenance_head()`
+  (the metadata head the inventory is taken against, captured before the
+  repair as before, because the read's completeness compares with it),
+  `maintenance_repair()` (the repair; false when it failed), and
+  `maintenance_objects(head, repaired)`. The builder's `inventory` takes
+  the head and the outcome; it repairs and commits nothing.
+- The audit's other finding: the read still fetches catalogue objects it
+  lacks into the control store (`ensure_control_local`), declared on it and
+  recorded in A4.
+- Traces identical: 1200/1200 over `--repeat 100`, no fixture changed.
+- `tests/test_catalogue_maintenance.cpp`: the catalogue against a fake
+  `MetadataView` (possible now that it takes the contract): a repair that
+  cannot read metadata reports failure; the read is complete only when
+  the repair succeeded and the head is current.
+- Mutation (`build/claude-t4b-mutate*.py`): 6, then 2 against the new
+  test. Three killed by the trace fixtures and invariants; two (the
+  repair's outcome) killed only by the new test; one survives by design:
+  **skipping the inventory-time repair changes nothing any test sees,
+  because the pass already runs the catalogue's repair in its own
+  `catalogue-repair` stage earlier in every pass**
+  (`src/service/maintenance.cpp`, the `refresh_needed()` block). The
+  inventory-time call is a second repair per pass; each may commit a
+  catalogue-root reconciliation. Removing it is a behaviour change for the
+  operator (ACTIVE, the conflict loop).
+- Suites 702/702, 17/17.

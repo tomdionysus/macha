@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "catalogue/catalogue.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
 #include "cluster/distributed_store.hpp"
@@ -33,6 +34,14 @@
 #include <vector>
 
 namespace macha::test_support {
+
+// The catalogue's half of a maintenance inventory, as the pass takes it:
+// the head, the repair, then the read (spec A4).
+inline CatalogueMaintenance maintenance_inventory(CatalogueManager& catalogue) {
+    const auto head = catalogue.maintenance_head();
+    const bool repaired = catalogue.maintenance_repair();
+    return catalogue.maintenance_objects(head, repaired);
+}
 
 using namespace std::chrono_literals;
 

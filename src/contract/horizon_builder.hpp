@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "catalogue/catalogue.hpp"
 #include "contract/horizon.hpp"
 #include "contract/work.hpp"
 #include "filesystem/filesystem.hpp"
@@ -26,10 +27,13 @@ class HorizonBuilder {
     virtual std::shared_ptr<const MaintenanceObjects> namespace_objects() = 0;
 
     // The inventory at that generation: the namespace's objects and the
-    // catalogue's. Until T4 this runs the catalogue's repair first (spec A4,
-    // the one side effect a build has at stage 0).
+    // catalogue's, read against `head` (captured before the catalogue's
+    // repair ran) and whether that repair succeeded. The catalogue's read
+    // fetches any catalogue object it lacks into the control store; it
+    // repairs and commits nothing (spec A4).
     static constexpr Waits inventory_waits = Waits::state_device | Waits::network;
-    virtual std::shared_ptr<const InventoryHorizon> inventory(const MaintenanceObjects&) = 0;
+    virtual std::shared_ptr<const InventoryHorizon>
+    inventory(const MaintenanceObjects&, const CatalogueMaintenanceHead& head, bool repaired) = 0;
 
     // The release horizon at a head: its files' extents, the conflict roots,
     // every catalogue root's retained objects and the namespace tree's own

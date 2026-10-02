@@ -3669,7 +3669,7 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     REQUIRE(!node.local_store().has(missing_root));
     metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.catalogue_root = missing_root; });
 
-    const auto maintenance = catalogue.maintenance_objects();
+    const auto maintenance = maintenance_inventory(catalogue);
     // Even when the current immutable catalogue cannot yet be fetched/decoded,
     // its metadata-referenced root is unconditionally live and GC must fail closed.
     CHECK(maintenance.control_live.contains(missing_root));

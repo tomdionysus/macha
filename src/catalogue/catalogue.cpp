@@ -1711,16 +1711,12 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
     return out;
 }
 
-CatalogueMaintenance CatalogueManager::maintenance_objects() {
+CatalogueMaintenanceHead CatalogueManager::maintenance_head() {
     // Maintenance liveness must be based on converged catalogue metadata, not
     // the deliberately stale-tolerant API cache returned by current_snapshot().
     // Otherwise an obsolete catalogue root/artwork object can remain marked
     // live indefinitely after a remote catalogue mutation, preventing GC.
-    CatalogueMaintenance out;
-    std::optional<ObjectId> metadata_root;
-    std::set<ObjectId> metadata_roots;
-    uint64_t metadata_generation = 0;
-    bool metadata_current = false;
+    CatalogueMaintenanceHead head;
     try {
         auto view = metadata_.current();
         if (!view || view->generation < node_.known_metadata_generation()) {
@@ -1728,26 +1724,39 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
             view = metadata_.current();
         }
         if (view) {
-            metadata_generation = view->generation;
-            metadata_current = view->generation >= node_.known_metadata_generation();
-            metadata_root = view->snapshot->catalogue_root;
-            metadata_roots = metadata_catalogue_root_set(*view->snapshot);
-            // A catalogue-root conflict keeps the effective catalogue at the
-            // common-ancestor value, but every alternative remains durable state
-            // until explicit resolution. Protect all immutable alternative roots
-            // (and, below, their manifests/shards/artwork) from reachability GC.
-            out.control_live.insert(metadata_roots.begin(), metadata_roots.end());
+            head.generation = view->generation;
+            head.current = view->generation >= node_.known_metadata_generation();
+            head.root = view->snapshot->catalogue_root;
+            head.roots = metadata_catalogue_root_set(*view->snapshot);
         }
     } catch (...) {
-        metadata_current = false;
+        head.current = false;
     }
+    return head;
+}
 
-    bool repair_ok = true;
+bool CatalogueManager::maintenance_repair() {
     try {
         repair_once();
+        return true;
     } catch (...) {
-        repair_ok = false;
+        return false;
     }
+}
+
+CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMaintenanceHead& head,
+                                                           bool repaired) {
+    CatalogueMaintenance out;
+    const auto& metadata_root = head.root;
+    const auto& metadata_roots = head.roots;
+    const uint64_t metadata_generation = head.generation;
+    const bool metadata_current = head.current;
+    // A catalogue-root conflict keeps the effective catalogue at the
+    // common-ancestor value, but every alternative remains durable state
+    // until explicit resolution. Protect all immutable alternative roots
+    // (and, below, their manifests/shards/artwork) from reachability GC.
+    out.control_live.insert(metadata_roots.begin(), metadata_roots.end());
+    bool repair_ok = repaired;
     std::optional<ObjectId> root;
     std::shared_ptr<const CatalogueSnapshot> cached;
     {

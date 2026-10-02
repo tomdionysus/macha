@@ -73,8 +73,9 @@ std::shared_ptr<const MaintenanceObjects> NodeHorizonBuilder::namespace_objects(
 }
 
 std::shared_ptr<const InventoryHorizon>
-NodeHorizonBuilder::inventory(const MaintenanceObjects& namespace_objects) {
-    return build_inventory(namespace_objects, catalogue_.maintenance_objects());
+NodeHorizonBuilder::inventory(const MaintenanceObjects& namespace_objects,
+                              const CatalogueMaintenanceHead& head, bool repaired) {
+    return build_inventory(namespace_objects, catalogue_.maintenance_objects(head, repaired));
 }
 
 ReleaseBuild NodeHorizonBuilder::release(const MetadataSnapshotView& head) {
