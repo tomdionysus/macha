@@ -140,9 +140,17 @@ class NodeRuntime {
     std::atomic_uint64_t remote_metadata_generation_{};
     std::atomic_uint64_t remote_metadata_epoch_{};
     std::atomic_uint64_t metadata_announcements_{};
-    std::atomic_uint64_t telemetry_storage_used_{};
-    std::atomic_uint64_t telemetry_storage_capacity_{};
-    std::atomic_uint64_t telemetry_metadata_generation_{};
+    // The latest local-state figures their owners advertised; zero until
+    // the first push, so a recovering node reports zero rather than vanishing.
+    std::atomic_uint64_t advertised_storage_used_{};
+    std::atomic_uint64_t advertised_storage_capacity_{};
+    std::atomic_uint32_t advertised_backends_online_{};
+    std::atomic_uint64_t advertised_metadata_generation_{};
+    std::atomic_uint64_t advertised_cache_capacity_{};
+    std::atomic_uint64_t advertised_cache_used_{};
+    std::atomic_uint64_t advertised_cache_hits_{};
+    std::atomic_uint64_t advertised_cache_misses_{};
+    std::atomic_uint64_t advertised_cache_evictions_{};
     std::atomic_uint32_t telemetry_peers_known_{1};
     std::atomic_uint32_t telemetry_peers_active_{1};
     std::atomic_uint64_t telemetry_demand_{1};
@@ -198,6 +206,13 @@ class NodeRuntime {
     // Service-owned workers can leave an RPC wait before Service joins them.
     void cancel_outbound_calls();
     void stop();
+    // Local-state facts the control plane publishes. The owners of the stores
+    // push them; membership and telemetry carry the latest. Lock-free, any
+    // thread.
+    void advertise_storage(uint64_t used, uint64_t capacity);
+    void advertise_storage_backends(uint32_t online);
+    void advertise_metadata_generation(uint64_t generation);
+    void advertise_cache(uint64_t capacity, uint64_t used, const CacheActivity& activity);
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;
     const Config& config() const {
