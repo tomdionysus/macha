@@ -93,7 +93,7 @@ UserMutability UsersApi::mutability(const UserRecord& user) const {
     out.set_password = user.username != anonymous_username;
     out.set_roles = true;
 
-    if (user_has_role(user, role_manage_users) && node_.users().sole_user_manager(user.id)) {
+    if (user_has_role(user, role_manage_users) && accounts_.users().sole_user_manager(user.id)) {
         // Only manage_users is pinned to this account; its other roles stay editable.
         // Dropping it would replicate a cluster nobody can administer, with no undo.
         out.required_roles.emplace_back(role_manage_users);
@@ -125,13 +125,13 @@ HttpResponse UsersApi::create(const HttpRequest& request) {
     auto roles =
         read_roles(body).value_or(std::vector<std::string>{std::string(role_media_viewer)});
 
-    auto created = node_.users().create(username->asString(), password, roles, node_.node_id());
+    auto created = accounts_.users().create(username->asString(), password, roles, node_.node_id());
     if (!created) {
-        if (node_.users().find_by_username(username->asString()))
+        if (accounts_.users().find_by_username(username->asString()))
             return http_error(409, "username_taken", "that username already exists");
         return http_error(507, "too_many_users", "the cluster user table is full");
     }
-    node_.propagate_users();
+    accounts_.propagate_users();
     auto response = http_json(201, user_json(*created, mutability(*created)).dump());
     response.headers["Location"] = std::string(users_prefix) + created->id;
     return response;
@@ -145,7 +145,7 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
                           "password must be at least " + std::to_string(min_password_length) +
                               " characters");
     if (!password.empty()) {
-        auto target = node_.users().find(user_id);
+        auto target = accounts_.users().find(user_id);
         if (target && target->username == anonymous_username)
             return http_error(409, "no_password",
                               "the 'anonymous' account has no password and cannot be given "
@@ -161,11 +161,11 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
         return http_error(400, "bad_request", "nothing to change");
 
     if (roles) {
-        auto target = node_.users().find(user_id);
+        auto target = accounts_.users().find(user_id);
         if (target && user_has_role(*target, role_manage_users) &&
             std::find(roles->begin(), roles->end(), role_manage_users) == roles->end()) {
             size_t managers = 0;
-            for (const auto& other : node_.users().list())
+            for (const auto& other : accounts_.users().list())
                 if (user_has_role(other, role_manage_users))
                     ++managers;
             if (managers <= 1)
@@ -175,18 +175,18 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
         }
     }
 
-    auto updated = node_.users().update(user_id, password, roles, node_.node_id());
+    auto updated = accounts_.users().update(user_id, password, roles, node_.node_id());
     if (!updated)
         return http_error(404, "not_found", "no such user");
-    node_.propagate_users();
+    accounts_.propagate_users();
 
     auto payload = user_json(*updated, mutability(*updated));
     // A password change bumps credential_generation, invalidating every session
     // minted against the old one, the caller's included; return a fresh session.
     if (!password.empty() && self) {
-        if (auto minted = node_.sessions().create(updated->roles, updated->id,
+        if (auto minted = accounts_.sessions().create(updated->roles, updated->id,
                                                   updated->credential_generation)) {
-            node_.propagate_session(minted->session);
+            accounts_.propagate_session(minted->session);
             payload.asObject()["token"] = minted->bearer_token;
             payload.asObject()["token_type"] = "Bearer";
             payload.asObject()["session_id"] = minted->session.id;
@@ -198,7 +198,7 @@ HttpResponse UsersApi::update(const HttpRequest& request, const std::string& use
 HttpResponse UsersApi::remove(const HttpRequest& request, const std::string& user_id) {
     if (request.session && request.session->user_id == user_id)
         return http_error(409, "cannot_delete_self", "you cannot delete your own account");
-    auto target = node_.users().find(user_id);
+    auto target = accounts_.users().find(user_id);
     // root is the one way back in when every other account is locked out,
     // misroled or forgotten: change its password, never remove it.
     if (target && reserved_username(target->username))
@@ -208,7 +208,7 @@ HttpResponse UsersApi::remove(const HttpRequest& request, const std::string& use
     // Removing the last account manager would replicate, with nobody able to undo it.
     if (target && user_has_role(*target, role_manage_users)) {
         size_t remaining = 0;
-        for (const auto& user : node_.users().list())
+        for (const auto& user : accounts_.users().list())
             if (user_has_role(user, role_manage_users))
                 ++remaining;
         if (remaining <= 1)
@@ -216,10 +216,10 @@ HttpResponse UsersApi::remove(const HttpRequest& request, const std::string& use
                               "this is the only account that can manage users; "
                               "grant manage_users to another account first");
     }
-    auto removed = node_.users().remove(user_id, node_.node_id());
+    auto removed = accounts_.users().remove(user_id, node_.node_id());
     if (!removed)
         return http_error(404, "not_found", "no such user");
-    node_.propagate_users();
+    accounts_.propagate_users();
     return {204, "application/json; charset=utf-8", {}, {}};
 }
 
@@ -231,7 +231,7 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
         if (request.path == users_root) {
             if (request.method == "GET") {
                 Json::Array out;
-                for (const auto& user : node_.users().list())
+                for (const auto& user : accounts_.users().list())
                     out.push_back(user_json(user, mutability(user)));
                 Json::Object body;
                 // "items" is the envelope every collection in this API uses.
@@ -255,7 +255,7 @@ HttpResponse UsersApi::handle(const HttpRequest& request) {
         const auto user_id = self ? request.session->user_id : tail;
 
         if (request.method == "GET") {
-            auto user = node_.users().find(user_id);
+            auto user = accounts_.users().find(user_id);
             if (!user)
                 return http_error(404, "not_found", "no such user");
             return http_json(200, user_json(*user, mutability(*user)).dump());

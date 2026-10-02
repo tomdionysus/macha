@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "auth/accounts.hpp"
 #include "service/convergence_demand.hpp"
 #include "cluster/distributed_store.hpp"
 #include "fuse/fuse_frontend.hpp"
@@ -37,6 +38,7 @@ struct StatusSources {
 // Reads the node it is built with; everything else arrives per request.
 class ClusterStatusService {
     NodeRuntime& node_;
+    Accounts& accounts_;
     const ActivityClocks& activity_;
     const DataResourceArbiter& data_resources_;
     const RetainedMemoryLedger& retained_memory_;
@@ -54,7 +56,7 @@ class ClusterStatusService {
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
-    ClusterStatusService(NodeRuntime&, const ActivityClocks&, const DataResourceArbiter&,
+    ClusterStatusService(NodeRuntime&, Accounts&, const ActivityClocks&, const DataResourceArbiter&,
                          const RetainedMemoryLedger&);
     ~ClusterStatusService();
     void start();
