@@ -352,11 +352,11 @@ class TestNode {
                                                         node_->resources.data,
                                                         node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
-                *node_, node_->local_state(), nullptr, [this](const MetadataPublicationContext& context) {
+                *node_, node_->local_state(), node_->metadata_server(), nullptr, [this](const MetadataPublicationContext& context) {
                     if (publication_guard_)
                         publication_guard_(context);
                 });
-            filesystem_ = std::make_unique<FileSystem>(*node_, node_->local_state(), *store_, *metadata_,
+            filesystem_ = std::make_unique<FileSystem>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_,
                                                        node_->resources.memory);
         }
         return *node_;

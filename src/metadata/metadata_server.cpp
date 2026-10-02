@@ -5,6 +5,7 @@
 #include "codec.hpp"
 #include "log.hpp"
 #include "storage/persistent_cache.hpp"
+#include "supervised.hpp"
 
 #include <algorithm>
 
@@ -22,9 +23,10 @@ RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
 
 MetadataServer::MetadataServer(NodeRuntime& node, MetadataReplica& replica,
                                PersistentBlockCache& cache, MessageRoutes& routes,
-                               size_t min_write_replicas)
+                               size_t min_write_replicas,
+                               std::chrono::milliseconds refresh_interval)
     : node_(node), replica_(replica), cache_(cache), routes_(routes),
-      min_write_replicas_(min_write_replicas) {
+      min_write_replicas_(min_write_replicas), refresh_interval_(refresh_interval) {
     // Identity-reset tombstones must be active before metadata exchange.
     try {
         const auto committed_snapshot = decode_snapshot(replica_.committed().payload);
@@ -34,11 +36,38 @@ MetadataServer::MetadataServer(NodeRuntime& node, MetadataReplica& replica,
         Log::debug("cannot preload identity reset tombstones: " + std::string(error.what()));
     }
     bind_routes();
+    refresher_ = std::jthread([this](std::stop_token stop) {
+        run_supervised_loop("metadata-refresh", stop, [this, stop] { refresh_loop(stop); });
+    });
 }
 
+// Routes first, so no request reaches the replica while the refresher stops.
 MetadataServer::~MetadataServer() {
     for (const auto type : bound_)
         routes_.unbind(type);
+    if (refresher_.joinable()) {
+        refresher_.request_stop();
+        refresh_cv_.notify_all();
+        refresher_.join();
+    }
+}
+
+void MetadataServer::refresh_loop(std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        {
+            std::unique_lock lock(refresh_mutex_);
+            refresh_cv_.wait_for(lock, stop, refresh_interval_, [] { return false; });
+        }
+        if (stop.stop_requested())
+            return;
+        node_.advertise_metadata_generation(replica_.generation());
+    }
+}
+
+uint64_t MetadataServer::known_generation() const {
+    const auto local = replica_.generation();
+    const auto remote = node_.remote_metadata_generation();
+    return local > remote ? local : remote;
 }
 
 void MetadataServer::route(MessageType type, MessageRoutes::Handler handler) {

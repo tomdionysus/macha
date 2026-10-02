@@ -93,7 +93,7 @@ MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_files
     REQUIRE(claimed->id == hint_id);
     hints.mark_no_match(hint_id, "movies", media_id, "no metadata provider match");
 
-    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
                              config.catalogue.scanner);
     ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
                      scanner);
@@ -195,7 +195,7 @@ MACHA_TEST("invariants", test_manual_entry_attaches_to_existing_parents_by_id) {
     catalogue.upsert_many({parent(CatalogueKind::show, "tmdb:tv:1", "Scanner Show"), season_two,
                            parent(CatalogueKind::artist, "musicbrainz:artist:a", "Scanner Artist")});
 
-    CatalogueScanner scanner(service.node(), fs, catalogue, hints, config.catalogue.scanner);
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, catalogue, hints, config.catalogue.scanner);
     ManageApi manage(service.node(), service.metadata_manager(), fs, catalogue, hints, scanner);
 
     int file = 0;
@@ -309,7 +309,7 @@ MACHA_TEST("invariants", test_unmatched_files_match_to_a_provider_reference) {
     scanner_config.tv.roots = {"/TV"};
     scanner_config.tv.tmdb.token_file = token;
     scanner_config.music.roots = {"/Music"};
-    CatalogueScanner scanner(service.node(), fs, catalogue, hints, scanner_config, std::move(http));
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, catalogue, hints, scanner_config, std::move(http));
     ManageApi manage(service.node(), service.metadata_manager(), fs, catalogue, hints, scanner);
 
     int file = 0;
@@ -412,7 +412,7 @@ MACHA_TEST("invariants", test_a_provider_reference_needs_its_provider_configured
     scanner_config.movies.roots = {"/Movies"};
     auto http = std::make_unique<FakeHttpClient>();
     auto* http_ptr = http.get();
-    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints, scanner_config,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints, scanner_config,
                              std::move(http));
     ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
                      scanner);
@@ -464,7 +464,7 @@ MACHA_TEST("invariants", test_provider_search_finds_records_and_says_which_are_c
     scanner_config.tv.roots = {"/TV"};
     scanner_config.tv.tmdb.token_file = token;
     scanner_config.music.roots = {"/Music"};
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
                              service.catalogue_hints(), scanner_config, std::move(http));
     ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(),
                      service.catalogue(), service.catalogue_hints(), scanner);
@@ -572,7 +572,7 @@ MACHA_TEST("invariants", test_artwork_options_list_and_a_choice_becomes_the_item
     scanner_config.tv.roots = {"/TV"};
     scanner_config.tv.tmdb.token_file = token;
     scanner_config.music.roots = {"/Music"};
-    CatalogueScanner scanner(service.node(), service.filesystem(), catalogue,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), catalogue,
                              service.catalogue_hints(), scanner_config, std::move(http));
     ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(), catalogue,
                      service.catalogue_hints(), scanner);
@@ -691,7 +691,7 @@ MACHA_TEST("invariants", test_manual_items_lose_only_files_gone_from_the_namespa
     scanner_config.movies.roots = {"/Movies"};
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), fs, catalogue, service.catalogue_hints(),
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, catalogue, service.catalogue_hints(),
                              scanner_config, std::make_unique<FakeHttpClient>());
     (void)scanner.scan_once();
 
@@ -736,7 +736,7 @@ MACHA_TEST("invariants", test_a_file_bound_to_two_items_is_listed_as_a_conflict)
     });
 
     auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), service.filesystem(), service.catalogue(), hints,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), hints,
                              config.catalogue.scanner);
     ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(),
                      service.catalogue(), hints, scanner);
@@ -768,7 +768,7 @@ MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
 
     auto& fs = service.filesystem();
     auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
                              config.catalogue.scanner);
     ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
                      scanner);
@@ -915,7 +915,7 @@ MACHA_TEST("invariants", test_manage_identity_reset_breaks_metadata_unavailable_
 
     auto& fs = service.filesystem();
     auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
                              config.catalogue.scanner);
     ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
                      scanner);
@@ -972,7 +972,7 @@ MACHA_TEST("invariants", test_manage_identity_reset_does_not_wait_for_metadata_a
 
     auto& fs = service.filesystem();
     auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), fs, service.catalogue(), hints,
+    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
                              config.catalogue.scanner);
     ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
                      scanner);
@@ -2143,7 +2143,7 @@ MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesys
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
 
     const auto live_bytes = pattern(8192, 5);
     write_file(fs, "/live.bin", live_bytes);
@@ -2189,7 +2189,7 @@ MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
 
     const auto old_bytes = pattern(4096, 31);
     const auto new_bytes = pattern(4096, 32);
@@ -2232,7 +2232,7 @@ MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_g
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
 
     FsEntry dir;
     dir.type = EntryType::directory;
@@ -2529,7 +2529,7 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
     fixture.start();
     REQUIRE(wait_until([&] { return fixture.node().local_store().online_backends() == 1; }));
 
-    CatalogueManager catalogue(fixture.node(), fixture.node().local_state(), fixture.store(), fixture.metadata());
+    CatalogueManager catalogue(fixture.node(), fixture.node().local_state(), fixture.node().metadata_server(), fixture.store(), fixture.metadata());
     DistributedStore::DurabilityBatch batch;
     const auto a = pattern(64 * 1024, 201);
     const auto b = pattern(64 * 1024, 202);
@@ -3577,7 +3577,7 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
-    CatalogueManager catalogue(node, node.local_state(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
     catalogue.repair_once(); // establish a coherent empty cached catalogue
 
     const auto missing_root = object_id(pattern(32123, 11));

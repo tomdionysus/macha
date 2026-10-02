@@ -4032,7 +4032,7 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
     config.torrent.enabled = false;
 
     auto& service = fixture.start();
-    MetadataManager metadata(service.node(), service.local_state());
+    MetadataManager metadata(service.node(), service.local_state(), service.metadata_server());
     auto committed = metadata.mutate_delta([](MetadataSnapshot& snapshot, MetadataDelta&) {
         FsEntry entry;
         entry.type = EntryType::directory;

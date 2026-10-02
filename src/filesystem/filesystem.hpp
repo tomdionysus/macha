@@ -259,6 +259,7 @@ class FileSystem {
 
     NodeRuntime& n_;
     LocalState& local_;
+    MetadataServer& metadata_server_;
     RetainedMemoryLedger& retained_memory_;
     DistributedStore& s_;
     MetadataView& m_;
@@ -335,7 +336,8 @@ class FileSystem {
         const FilesystemNamespaceMutation&);
 
   public:
-    FileSystem(NodeRuntime&, LocalState&, DistributedStore&, MetadataView&, RetainedMemoryLedger&,
+    FileSystem(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&,
+               RetainedMemoryLedger&,
                PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
@@ -388,7 +390,7 @@ class FileSystem {
     uint64_t local_committed_metadata_generation() const noexcept {
         return local_.replica().committed_generation();
     }
-    uint64_t known_metadata_generation() const noexcept { return n_.known_metadata_generation(); }
+    uint64_t known_metadata_generation() const noexcept { return metadata_server_.known_generation(); }
     std::vector<ObjectId> live_objects();
     // Hashes namespace/content identity, excluding catalogue metadata, so the
     // catalogue scanner's own commits cannot trigger a rescan loop.

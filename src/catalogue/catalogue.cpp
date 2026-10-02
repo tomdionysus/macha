@@ -560,9 +560,11 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapsho
     return newest ? newest->artwork : std::vector<CatalogueArtwork>{};
 }
 
-CatalogueManager::CatalogueManager(NodeRuntime& node, LocalState& local, DistributedStore& store,
+CatalogueManager::CatalogueManager(NodeRuntime& node, LocalState& local,
+                                   MetadataServer& metadata_server, DistributedStore& store,
                                    MetadataView& metadata)
-    : node_(node), local_(local), store_(store), metadata_(metadata) {}
+    : node_(node), local_(local), metadata_server_(metadata_server), store_(store),
+      metadata_(metadata) {}
 
 std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& snapshot) {
     std::set<ObjectId> ids;
@@ -731,7 +733,7 @@ void CatalogueManager::repair_once() {
         {
             std::lock_guard lock(mutex_);
             const auto now = Clock::now();
-            if (ready_ && cached_metadata_generation_ >= node_.known_metadata_generation() &&
+            if (ready_ && cached_metadata_generation_ >= metadata_server_.known_generation() &&
                 now < cache_until_ && control_converged_root_ == cached_root_) {
                 std::vector<NodeId> active_nodes;
                 for (const auto& node : node_.membership().active())
@@ -756,7 +758,7 @@ void CatalogueManager::repair_once() {
         // A newer generation known but not yet acquired is left to
         // MetadataManager::repair_once(); refresh_needed() stays true, so the
         // view is adopted once metadata maintenance publishes it.
-        if (view->generation < node_.known_metadata_generation())
+        if (view->generation < metadata_server_.known_generation())
             return;
 
         // At most one root conflict per pass. Disjoint item merges are
@@ -822,7 +824,7 @@ bool CatalogueManager::refresh_needed() const {
     std::lock_guard lock(mutex_);
     if (!ready_ || !cached_)
         return true;
-    return cached_metadata_generation_ < node_.known_metadata_generation() ||
+    return cached_metadata_generation_ < metadata_server_.known_generation() ||
            Clock::now() >= cache_until_;
 }
 
@@ -833,7 +835,7 @@ CatalogueStatus CatalogueManager::status() const {
         std::lock_guard lock(mutex_);
         status.enabled = true;
         status.metadata_generation = cached_metadata_generation_;
-        status.known_metadata_generation = node_.known_metadata_generation();
+        status.known_metadata_generation = metadata_server_.known_generation();
         status.root = cached_root_;
         status.items = cached_ ? cached_->items.size() : 0;
         status.ready = ready_;
@@ -1311,7 +1313,7 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
     }
 
     // An early-negative test only: a stale snapshot must never cause a false 404.
-    const auto known_generation = node_.known_metadata_generation();
+    const auto known_generation = metadata_server_.known_generation();
     if (cached_generation >= known_generation)
         return true;
 
@@ -1678,13 +1680,13 @@ CatalogueMaintenanceHead CatalogueManager::maintenance_head() {
     CatalogueMaintenanceHead head;
     try {
         auto view = metadata_.current();
-        if (!view || view->generation < node_.known_metadata_generation()) {
+        if (!view || view->generation < metadata_server_.known_generation()) {
             (void)metadata_.record();
             view = metadata_.current();
         }
         if (view) {
             head.generation = view->generation;
-            head.current = view->generation >= node_.known_metadata_generation();
+            head.current = view->generation >= metadata_server_.known_generation();
             head.root = view->snapshot->catalogue_root;
             head.roots = metadata_catalogue_root_set(*view->snapshot);
         }

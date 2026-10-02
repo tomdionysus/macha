@@ -4,6 +4,10 @@
 #include "cluster/message_routes.hpp"
 #include "metadata/metadata.hpp"
 
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace macha {
@@ -16,11 +20,13 @@ class PersistentBlockCache;
 // Built once the replica has recovered, which applies the committed
 // snapshot's identity-reset tombstones before any metadata route answers;
 // binds its routes on construction and unbinds them on destruction (unbind
-// waits for calls in flight). Announcements go out through the node.
+// waits for calls in flight). Announcements go out through the node, and a
+// refresher keeps the replica's generation advertised.
 class MetadataServer {
   public:
     MetadataServer(NodeRuntime& node, MetadataReplica& replica, PersistentBlockCache& cache,
-                   MessageRoutes& routes, size_t min_write_replicas);
+                   MessageRoutes& routes, size_t min_write_replicas,
+                   std::chrono::milliseconds refresh_interval);
     ~MetadataServer();
     MetadataServer(const MetadataServer&) = delete;
     MetadataServer& operator=(const MetadataServer&) = delete;
@@ -29,17 +35,25 @@ class MetadataServer {
     // when the accepted-head set changes. Thread-safe.
     bool accept_commit(const MetadataAcceptance&);
     std::vector<MetadataAcceptance> heads() const;
+    // The newest generation this node knows of: its replica's, or a newer
+    // one a peer has announced. Lock-free on the node side.
+    uint64_t known_generation() const;
 
   private:
     void route(MessageType, MessageRoutes::Handler);
     void bind_routes();
+    void refresh_loop(std::stop_token);
 
     NodeRuntime& node_;
     MetadataReplica& replica_;
     PersistentBlockCache& cache_;
     MessageRoutes& routes_;
     const size_t min_write_replicas_;
+    const std::chrono::milliseconds refresh_interval_;
     std::vector<MessageType> bound_;
+    std::mutex refresh_mutex_;
+    std::condition_variable_any refresh_cv_;
+    std::jthread refresher_;
 };
 
 } // namespace macha

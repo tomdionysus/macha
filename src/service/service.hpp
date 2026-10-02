@@ -142,6 +142,9 @@ class Service {
     LocalState& local_state() {
         return node_.local_state();
     }
+    MetadataServer& metadata_server() {
+        return node_.metadata_server();
+    }
     MetadataManager& metadata_manager() {
         wait_services_ready();
         return services_->metadata();

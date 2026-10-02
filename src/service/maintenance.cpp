@@ -89,7 +89,8 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 } // namespace
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
-    : node_(dependencies.node), local_(dependencies.local), store_(dependencies.store), metadata_(dependencies.metadata),
+    : node_(dependencies.node), local_(dependencies.local),
+      metadata_server_(dependencies.metadata_server), store_(dependencies.store), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
       builder_(dependencies.builder), ledger_(dependencies.ledger),
       media_information_(dependencies.media_information), events_(dependencies.events),
@@ -214,7 +215,7 @@ void Maintenance::run(std::stop_token stop) {
     absorbed_metadata_ = events_.count(NodeEvent::metadata);
     absorbed_topology_ = events_.count(NodeEvent::topology);
     absorbed_total_ = absorbed_storage_ + absorbed_metadata_ + absorbed_topology_;
-    port_.metadata_convergence.request(node_.known_metadata_generation());
+    port_.metadata_convergence.request(metadata_server_.known_generation());
     uint64_t observed_event = absorbed_total_;
     auto network_quiescent_until = Clock::time_point{};
     auto local_quiescent_until = Clock::time_point{};
@@ -767,7 +768,7 @@ void Maintenance::run(std::stop_token stop) {
                 facts.release_view = release_metadata_view.has_value();
                 facts.retention_baseline_complete =
                     release_metadata_view && release_metadata_view->snapshot->retention_baseline_complete;
-                facts.known_generation = node_.known_metadata_generation();
+                facts.known_generation = metadata_server_.known_generation();
                 const auto control = control_gate(facts, inventory.get());
                 // The rule the DATA and tombstone gates keep: a newly built
                 // inventory is never used destructively in the pass that
@@ -807,7 +808,7 @@ void Maintenance::run(std::stop_token stop) {
                 // (unstamped) tombstones stay protected for the grace interval. Retention
                 // claims are checked before every physical delete, so an inventory older
                 // than the metadata generation is still safe for orphan cleanup.
-                facts.known_generation = node_.known_metadata_generation();
+                facts.known_generation = metadata_server_.known_generation();
                 const auto data = data_gate(facts, inventory.get());
                 const std::string& gc_skip_reason = data.reason;
                 trace_gate("gate.data", data.permitted, data.conditions);
@@ -1196,7 +1197,7 @@ bool Maintenance::absorb_events() {
     if (metadata != absorbed_metadata_)
         media_information_.request_prune();
     if (metadata != absorbed_metadata_ || topology != absorbed_topology_)
-        wake = port_.metadata_convergence.request(node_.known_metadata_generation()) || wake;
+        wake = port_.metadata_convergence.request(metadata_server_.known_generation()) || wake;
     absorbed_storage_ = storage;
     absorbed_metadata_ = metadata;
     absorbed_topology_ = topology;
