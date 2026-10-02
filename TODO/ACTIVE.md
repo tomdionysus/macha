@@ -10,7 +10,7 @@ finished work; `BACKLOG.md` holds the older, unverified P-1 to P2 sections;
 spec and handover (evidence, not requirements). Work top-to-bottom unless
 new evidence changes the order.
 
-**Start here after a clear: read [the handover](HANDOVER-2026-10-02.md),**
+**Start here after a clear: read [the handover](HANDOVER-2026-10-03.md),**
 then the experiment section below, then the canonical spec and plan.
 
 ## First: the object ledger experiment
