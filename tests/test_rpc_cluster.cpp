@@ -5466,6 +5466,10 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
+    // A write before the metadata floor forms throws "replica set forming";
+    // wait for the floor itself, on both nodes (1 run in ~200, 2026-10-02).
+    REQUIRE(wait_metadata_writable(s1));
+    REQUIRE(wait_metadata_writable(s2));
     s1.filesystem().mkdir("/warm", 0755, getuid(), getgid());
     REQUIRE(s1.metadata_manager().available_snapshot_view().has_value());
 
@@ -5474,14 +5478,19 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
     s2.filesystem().mkdir("/elsewhere", 0755, getuid(), getgid());
     REQUIRE(wait_until([&] { return s1.node().remote_metadata_generation() > before; }, 10s));
 
-    // Node 2 now answers nothing node 1 asks it.
+    // Node 2 now answers nothing node 1 asks it. The listing must not wait:
+    // a listing that surveyed node 2 would block on the stalled call. The
+    // count of stalled calls is not the evidence -- node 1's background work
+    // (membership, repair, metadata convergence) calls node 2 all the time,
+    // and in a 20 ms window 98% of runs held one with no listing at all, so
+    // counting them failed this case about one run in a hundred for calls
+    // the listing never made (2026-10-02).
     const auto peer = s2.node().node_id();
     s1.node().stall_peer_for_tests(peer);
     const auto started = std::chrono::steady_clock::now();
     (void)s1.torrent_coordinator().requests();
     (void)s1.torrent_coordinator().request("does-not-exist");
     const auto elapsed = std::chrono::steady_clock::now() - started;
-    CHECK(s1.node().stalled_calls_for_tests() == 0);
     CHECK(elapsed < 1s);
     s1.node().release_peer_for_tests(peer);
 
