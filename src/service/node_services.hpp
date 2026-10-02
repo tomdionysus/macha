@@ -37,7 +37,7 @@
 //   node, resources, job routes, registry, port (outside, outlive this)
 //   job routes     <- ingest, torrent coordinator (bound here once built,
 //                     unbound before they are destroyed)
-//   resources      -> store (activity, DATA, memory), filesystem (memory),
+//   resources      -> store (activity, DATA, memory, events), filesystem (memory),
 //                     playback (rate book, memory), subsystems (DATA, memory)
 //   playback       -> filesystem, hydration
 //   store          -> metadata, catalogue, filesystem, hydration, builder, maintenance
@@ -49,7 +49,7 @@
 //                     playback, subsystems, builder
 //   hints          -> scanner, ingest, catalogue API, manage API
 //   media engine   -> media info, scanner, playback
-//   media info     -> scanner, ingest, catalogue API, playback
+//   media info     -> scanner, ingest, catalogue API, playback, maintenance
 //   scanner        -> catalogue API, manage API, playback
 //   hydration      -> subsystems
 //   ingest         -> cluster jobs, acquisition API, subsystems
@@ -74,10 +74,8 @@ struct NodeServicesInstruments {
 
 class NodeServices {
   public:
-    // `signal_maintenance` rings the node's maintenance pass (Service's
-    // handler for node events), which the claims barrier does after it.
     NodeServices(NodeRuntime&, NodeResources&, JobRoutes&, SubsystemRegistry&, MaintenancePort&,
-                 std::function<void(ServiceEvent)> signal_maintenance, NodeServicesInstruments);
+                 NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
     NodeServices& operator=(const NodeServices&) = delete;
@@ -122,7 +120,6 @@ class NodeServices {
     JobRoutes& job_routes_;
     SubsystemRegistry& registry_;
     MaintenancePort& port_;
-    std::function<void(ServiceEvent)> signal_maintenance_;
     NodeServicesInstruments instruments_;
     bool started_{};
     bool stopped_{};

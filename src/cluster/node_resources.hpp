@@ -3,6 +3,7 @@
 
 #include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
+#include "cluster/node_events.hpp"
 #include "cluster/transcode_rates.hpp"
 #include "config.hpp"
 #include "retained_memory.hpp"
@@ -10,8 +11,8 @@
 
 namespace macha {
 
-// The node-wide budgets and books every layer shares, built by the root before
-// the node and handed out by reference. Members are in dependency order; the
+// The node-wide budgets, books and event counts every layer shares, built by
+// the root before the node and handed out by reference. Members are in dependency order; the
 // owner calls stop() before stopping anything that waits on them.
 class NodeResources {
   public:
@@ -27,6 +28,7 @@ class NodeResources {
     DataResourceArbiter data;
     RetainedMemoryLedger memory;
     TranscodeRateBook transcode_rates;
+    NodeEvents events;
 
     // Refuses new leases and wakes every waiter. Idempotent.
     void stop();

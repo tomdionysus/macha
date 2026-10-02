@@ -273,7 +273,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         : BareNodeResources(config),
           NodeRuntime(std::move(config), keys, resources.activity, resources.data,
                       resources.memory, resources.transcode_rates, job_routes,
-                      std::move(hook)) {}
+                      resources.events, std::move(hook)) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;
@@ -347,7 +347,7 @@ class TestNode {
         if (!store_) {
             store_ = std::make_unique<DistributedStore>(*node_, node_->resources.activity,
                                                         node_->resources.data,
-                                                        node_->resources.memory);
+                                                        node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
                 *node_, nullptr, [this](const MetadataPublicationContext& context) {
                     if (publication_guard_)

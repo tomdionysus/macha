@@ -216,12 +216,12 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activity,
                          DataResourceArbiter& data_resources,
                          RetainedMemoryLedger& retained_memory,
-                         TranscodeRateBook& transcode_rates, JobRoutes& job_routes,
+                         TranscodeRateBook& transcode_rates, JobRoutes& job_routes, NodeEvents& events,
                          StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), keys_(keys),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
       activity_(activity), data_resources_(data_resources), retained_memory_(retained_memory),
-      transcode_rates_(transcode_rates), job_routes_(job_routes),
+      transcode_rates_(transcode_rates), job_routes_(job_routes), events_(events),
       inbound_(initial_inbound_resolution(cfg_)),
       members_(self_info(cfg_, id_, 0, 0, 0,
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
@@ -250,8 +250,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
               remote_metadata_generation_.store(
                   std::max(previous_generation, peer.metadata_generation));
               if (topology_changed || peer.metadata_generation > previous_generation)
-                  signal_service_event(topology_changed ? ServiceEvent::topology
-                                                        : ServiceEvent::metadata);
+                  events_.notify(topology_changed ? NodeEvent::topology
+                                                        : NodeEvent::metadata);
           },
           [this](uint64_t generation) {
               auto current = remote_metadata_generation_.load();
@@ -265,7 +265,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
               // membership observer above and are non-events.
               if (current <= generation) {
                   remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
-                  signal_service_event(ServiceEvent::metadata);
+                  events_.notify(NodeEvent::metadata);
               }
           },
           cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size,
@@ -292,8 +292,8 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
                                                                         peer.metadata_generation)) {
               }
               if (topology_changed || peer.metadata_generation > previous_generation)
-                  signal_service_event(topology_changed ? ServiceEvent::topology
-                                                        : ServiceEvent::metadata);
+                  events_.notify(topology_changed ? NodeEvent::topology
+                                                        : NodeEvent::metadata);
           },
           cfg_.max_frame_size, {}, &retained_memory_),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
@@ -681,7 +681,7 @@ void NodeRuntime::apply_inbound_resolution(bool inbound_capable, std::string sou
     // moves as for a join or leave.
     if (members_.set_flags(inbound_capable, hosts)) {
         server_.set_local(members_.self());
-        signal_service_event(ServiceEvent::topology);
+        events_.notify(NodeEvent::topology);
         signal_telemetry_refresh();
     }
     Log::info(std::string("node inbound resolution changed inbound_capable=") +
@@ -946,25 +946,6 @@ bool NodeRuntime::peer_viewers_active(std::chrono::milliseconds fresh_for) const
     return false;
 }
 
-void NodeRuntime::set_service_event_callback(std::function<void(ServiceEvent)> callback) {
-    std::lock_guard lock(service_event_mutex_);
-    service_event_ = std::move(callback);
-}
-
-void NodeRuntime::notify_storage_mutation() {
-    signal_service_event(ServiceEvent::storage);
-}
-
-void NodeRuntime::signal_service_event(ServiceEvent event) {
-    std::function<void(ServiceEvent)> callback;
-    {
-        std::lock_guard lock(service_event_mutex_);
-        callback = service_event_;
-    }
-    if (callback)
-        callback(event);
-}
-
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // The accepted-head set can change without a higher generation (a
     // concurrent same-generation sibling). MetadataManager caches key off
@@ -972,7 +953,7 @@ void NodeRuntime::announce_metadata_generation(uint64_t generation) {
     // pre-sibling snapshot until the cache TTL expires.
     metadata_announcements_.fetch_add(1, std::memory_order_relaxed);
     remote_metadata_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    signal_service_event(ServiceEvent::metadata);
+    events_.notify(NodeEvent::metadata);
     members_.metadata_generation(generation);
     server_.set_local(members_.self());
     Writer writer;
@@ -1252,7 +1233,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 return error_reply("DATA resource admission stopping");
             activity_.note(frame_type, data.size());
             if (!local_store().has(id))
-                notify_storage_mutation();
+                events_.notify(NodeEvent::storage);
             if (request.type == MessageType::put_object_deferred) {
                 const auto generation = local_store().put_deferred(id, data);
                 if (!generation)
@@ -1555,7 +1536,7 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
     const bool topology_changed =
         membership_changed || active_ids(before_active) != active_ids(members_.active());
     if (topology_changed || newest_metadata > previous_generation)
-        signal_service_event(topology_changed ? ServiceEvent::topology : ServiceEvent::metadata);
+        events_.notify(topology_changed ? NodeEvent::topology : NodeEvent::metadata);
 }
 
 PublicConnectivityStatus NodeRuntime::public_connectivity_status() const {

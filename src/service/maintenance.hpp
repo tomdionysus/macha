@@ -2,8 +2,10 @@
 #pragma once
 
 #include "catalogue/catalogue.hpp"
+#include "catalogue/media_information.hpp"
 #include "cluster/cluster.hpp"
 #include "cluster/distributed_store.hpp"
+#include "cluster/node_events.hpp"
 #include "contract/horizon.hpp"
 #include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
@@ -33,14 +35,11 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 using MaintenanceTraceHook = std::function<void(std::string_view kind, std::string_view detail)>;
 
 // Where Service and the maintenance pass meet. Service owns it; it outlives
-// the pass, since events arrive and diagnostics are read before the pass
-// exists and after it stops.
+// the pass, since diagnostics are read before the pass exists and after it
+// stops.
 struct MaintenancePort {
-    // Service rings it: `event` advances, and the pass wakes when told to.
-    std::mutex wait_mutex;
-    std::condition_variable_any wait_cv;
-    std::atomic_uint64_t event{1};
-    // Which metadata convergence passes are owed.
+    // Which metadata convergence passes are owed; the pass alone requests them,
+    // from the node's events.
     ConvergenceDemand metadata_convergence;
 
     // Diagnostics the pass writes. `stage` is where it is spending its time
@@ -65,6 +64,10 @@ struct MaintenanceDependencies {
     CatalogueManager& catalogue;
     HorizonBuilder& builder;
     ObjectLedger& ledger;
+    // Pruned when metadata changes.
+    MediaInformationService& media_information;
+    // Wakes the pass; it turns what it sees into work.
+    NodeEvents& events;
     MaintenancePort& port;
     std::shared_ptr<MaintenanceClock> clock;
     MaintenanceTraceHook trace;
@@ -92,6 +95,13 @@ class Maintenance final {
 
   private:
     void run(std::stop_token);
+    // Turns the events counted since the last call into work: metadata and
+    // topology into convergence demand, metadata into a media-information
+    // prune. True when they call for a pass: a storage event, or demand that
+    // scheduled a new run. Pass thread only, holding no lock.
+    bool absorb_events();
+    // Waits until absorb_events() calls for a pass, `deadline`, or `stop`.
+    void wait_for_events(std::stop_token, Clock::time_point deadline);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
                                    const std::vector<GarbageRef>& stamp);
@@ -103,6 +113,8 @@ class Maintenance final {
     CatalogueManager& catalogue_;
     HorizonBuilder& builder_;
     ObjectLedger& ledger_;
+    MediaInformationService& media_information_;
+    NodeEvents& events_;
     MaintenancePort& port_;
     std::shared_ptr<MaintenanceClock> clock_;
     MaintenanceTraceHook maintenance_trace_;
@@ -110,6 +122,11 @@ class Maintenance final {
     Clock::time_point constructed_;
 
     bool cluster_stable_observed_{};
+    // The event counts absorb_events() has turned into work, and their sum.
+    uint64_t absorbed_storage_{};
+    uint64_t absorbed_metadata_{};
+    uint64_t absorbed_topology_{};
+    uint64_t absorbed_total_{};
 
     std::jthread thread_;
 };
