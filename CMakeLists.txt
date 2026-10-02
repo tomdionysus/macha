@@ -591,6 +591,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_horizon_builder.cpp
         tests/test_predicates.cpp
         tests/test_catalogue_maintenance.cpp
+        tests/test_namespace_entries.cpp
         tests/test_claim_walk.cpp
         tests/test_component.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
