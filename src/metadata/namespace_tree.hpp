@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/walk.hpp"
 #include "metadata/metadata.hpp"
 #include "types.hpp"
 
@@ -163,6 +164,19 @@ void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
 // cutover and so that a detached namespace can never be read as an empty one.
 // Throws if the snapshot is detached and no store is supplied, rather than
 // visiting nothing and reporting success.
+// The namespace's entries after `from`, in path order, as far as the budget
+// allows: one budget operation per entry returned (the spec's
+// `entries(view, cursor, budget)`, B2). A tree-backed snapshot is walked
+// from the root, skipping every subtree that ends at or before the cursor,
+// so a resumed page reads only the nodes on its own path; a map-backed one
+// is read from the map. The page's cursor resumes after its last entry; at
+// the end it is the start again and the page is complete. A node the store
+// cannot supply throws, as the callback walk does.
+using NamespaceItem = std::pair<std::string, FsEntry>;
+Page<NamespaceItem, std::string> namespace_entries(const MetadataSnapshot& snapshot,
+                                                   const NamespaceNodeStore* store,
+                                                   Cursor<std::string> from, Budget& budget);
+
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               const NamespaceVisitor& visit);
 

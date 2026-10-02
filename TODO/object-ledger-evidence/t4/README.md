@@ -72,3 +72,27 @@ compiler's guarantee, not the count's.
   catalogue-root reconciliation. Removing it is a behaviour change for the
   operator (ACTIVE, the conflict loop).
 - Suites 702/702, 17/17.
+
+## T4c: `entries`, the resumable, budgeted namespace walk (2026-10-02)
+
+- `namespace_entries(snapshot, store, cursor, budget)`
+  (`src/metadata/namespace_tree.{hpp,cpp}`): the entries after a cursor
+  path, in path order, one budget operation per entry. A tree is walked
+  from the root, skipping each subtree that ends at or before the cursor
+  (a branch child holds the keys from its first key up to the next
+  child's), so a resumed page reads only its own root-to-leaf path; a
+  map-backed snapshot reads the map. The page that takes the last entry
+  is complete (no empty final page). Missing nodes and a tree with no store
+  throw, as the callback walk does. The callback walk stays for whole
+  passes.
+- `tests/test_namespace_entries.cpp`: on eight namespace sizes (0 to 257)
+  built with fanouts of 3-6 to force deep trees, and on the same entries
+  map-backed, paging at seven bounds gives exactly the callback walk's set
+  and order, with the expected page count; a resume near the end of a
+  1000-entry tree reads under a tenth of its nodes; a cursor between paths;
+  cancellation; missing node or store.
+- Mutation (`build/claude-t4c-mutate.py`): 10, all killed.
+- Owed with T4's fi-1 run: the same equivalence on a copy of each live
+  node's namespace (the acceptance's second half), which needs an
+  operator-side check over a state directory.
+- Suites 707/707.
