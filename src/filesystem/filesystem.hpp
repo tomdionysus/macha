@@ -264,7 +264,7 @@ class FileSystem {
 
     NodeRuntime& n_;
     DistributedStore& s_;
-    MetadataManager& m_;
+    MetadataView& m_;
     PlaybackTracker* playback_{};
     std::mutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_;
@@ -352,7 +352,7 @@ class FileSystem {
         const FilesystemNamespaceMutation&);
 
   public:
-    FileSystem(NodeRuntime&, DistributedStore&, MetadataManager&, PlaybackTracker* = nullptr);
+    FileSystem(NodeRuntime&, DistributedStore&, MetadataView&, PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
     void mkdir(const std::string&, uint32_t, uint32_t, uint32_t);
@@ -400,10 +400,10 @@ class FileSystem {
     MetadataSnapshotView local_snapshot_view();
     std::optional<MetadataSnapshotView> available_snapshot_view() const;
     uint64_t available_snapshot_generation() const noexcept {
-        return m_.available_snapshot_generation();
+        return m_.current_generation();
     }
     uint64_t available_namespace_revision() const noexcept {
-        return m_.available_namespace_revision();
+        return m_.current_namespace_revision();
     }
     uint64_t local_committed_metadata_generation() const noexcept {
         return n_.metadata_replica().committed_generation();

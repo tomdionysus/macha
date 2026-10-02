@@ -558,8 +558,15 @@ consumer of this contract and the ledger's.
 
 Implemented by `MetadataManager`, `MetadataReplica` and the namespace
 primitives. Domain: replicated. Counts are approximate call sites outside
-`src/metadata/` from a text search, to be replaced by an exact survey
-before the contract is written.
+`src/metadata/` from a text search; the exact survey (T4a, by the
+compiler) is `object-ledger-evidence/t4/README.md`. It split the contract
+in two (`src/contract/metadata_view.hpp`): `MetadataView`, everything below
+except `repair_step`, plus `current_generation()`,
+`current_namespace_revision()`, `record()` and Status's diagnostics, which
+the table missed; and `MetadataMaintenance`, the component's upkeep of its
+replicas (`repair_step`, `note_replica_validation`,
+`repair_unreconstructable_heads`, `attempt_history_checkpoint`), which only
+the maintenance pass takes.
 
 | operation | today | approx. sites | waits on |
 |---|---|---|---|
@@ -944,6 +951,10 @@ supersede earlier ones where they conflict.
   baseline is `object-ledger-evidence/t0/baseline.md`; its thin series are
   weak thresholds, marked. The conflict loop and the shutdown hang are
   0.73 behaviour (T0's diff is observation only), recorded in ACTIVE.
+- **2026-10-02 (T4a). The metadata contract is two contracts**: the view
+  (`MetadataView`) and the component's upkeep (`MetadataMaintenance`), so
+  no reader sees repair; the survey is the compiler's, the contract's
+  operations are the manager's existing ones under the spec's names.
 - **2026-10-02 (T3f). The predicates defined** (the table in B3): the
   spec had named seven and defined one. Each is over four facts of one
   DATA object; ownership is placement's owner set (`Placement`,

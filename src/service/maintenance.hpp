@@ -59,7 +59,8 @@ struct MaintenancePort {
 // The contracts the maintenance pass requires: concrete components at stage
 // 0, the ledger and the horizon builder excepted; the metadata and ledger
 // contracts (T3, T4) replace them. Every reference outlives the component.
-using MaintenanceContracts = Dependencies<NodeRuntime, DistributedStore, MetadataManager,
+using MaintenanceContracts = Dependencies<NodeRuntime, DistributedStore, MetadataView,
+                                          MetadataMaintenance,
                                           CatalogueManager, HorizonBuilder, ObjectLedger,
                                           MaintenancePort>;
 
@@ -97,7 +98,8 @@ class Maintenance final : public Component {
 
     NodeRuntime& node_;
     DistributedStore& store_;
-    MetadataManager& metadata_;
+    MetadataView& metadata_;
+    MetadataMaintenance& metadata_upkeep_;
     CatalogueManager& catalogue_;
     HorizonBuilder& builder_;
     ObjectLedger& ledger_;

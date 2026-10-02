@@ -506,7 +506,7 @@ Json identity_reset_json(const IdentityAssociationReset& reset) {
 
 } // namespace
 
-ManageApi::ManageApi(NodeRuntime& node, MetadataManager& metadata, FileSystem& fs,
+ManageApi::ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
                      CatalogueManager& catalogue, CatalogueHintQueue& hints,
                      CatalogueScanner& scanner)
     : node_(node), metadata_(metadata), fs_(fs), catalogue_(catalogue), hints_(hints),
@@ -727,7 +727,7 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                         }
                     }
                     if (host.empty()) {
-                        auto view = metadata_.snapshot_view(WorkContext(
+                        auto view = metadata_.converged(WorkContext(
                             FrameType::control, {}, nullptr, "POST /api/v1/manage/nodes/{id}"));
                         if (auto found = view.snapshot->node_status.find(*stale_id);
                             found != view.snapshot->node_status.end()) {

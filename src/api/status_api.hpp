@@ -19,7 +19,7 @@ namespace macha {
 
 class ClusterStatusService {
     NodeRuntime& node_;
-    std::atomic<MetadataManager*> metadata_{nullptr};
+    std::atomic<MetadataView*> metadata_{nullptr};
     std::jthread persistence_;
     std::mutex wait_mutex_;
     std::condition_variable_any wait_cv_;
@@ -44,7 +44,7 @@ class ClusterStatusService {
 
   public:
     explicit ClusterStatusService(NodeRuntime&);
-    void attach_metadata(MetadataManager& metadata) {
+    void attach_metadata(MetadataView& metadata) {
         metadata_.store(&metadata, std::memory_order_release);
     }
     void detach_metadata() {
