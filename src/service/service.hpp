@@ -22,6 +22,7 @@
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
 #include "service/node_services.hpp"
+#include "cluster/node_resources.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
@@ -63,6 +64,8 @@ class Service {
         if (lifecycle_)
             lifecycle_(event);
     }
+    // Built, and stopped, before the node that waits on them.
+    NodeResources resources_;
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin and FUSE as a supervised builtin. Each publishes

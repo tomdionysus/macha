@@ -1180,7 +1180,7 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     auto peer_config = cluster.node_config("peer-node");
 
     TestGate recovery_gate;
-    NodeRuntime recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
+    BareNode recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
         if (stage == "data-storage" || stage == "control-storage")
             recovery_gate.enter_and_wait();
     });
@@ -1196,7 +1196,7 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     CHECK(recovering.readiness().control_plane_online);
     CHECK(!recovering.readiness().local_state_ready);
 
-    NodeRuntime peer(peer_config, cluster.keys());
+    BareNode peer(peer_config, cluster.keys());
     peer.start();
     REQUIRE(peer.wait_local_state_ready(10s));
 
@@ -1223,7 +1223,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
     auto peer_config = cluster.node_config("status-recovering-peer");
 
     TestGate recovery_gate;
-    NodeRuntime recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
+    BareNode recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
         if (stage == "data-storage" || stage == "control-storage")
             recovery_gate.enter_and_wait();
     });
@@ -1239,7 +1239,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
     CHECK(recovering.readiness().control_plane_online);
     CHECK(!recovering.readiness().local_state_ready);
 
-    NodeRuntime peer(peer_config, cluster.keys());
+    BareNode peer(peer_config, cluster.keys());
     peer.start();
     REQUIRE(peer.wait_local_state_ready(10s));
 
@@ -1299,7 +1299,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
 // they live on a separate route that a poll never touches.
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("status-split"), cluster.keys());
+    BareNode node(cluster.node_config("status-split"), cluster.keys());
     ClusterStatusService status(node);
 
     const auto body_of = [](const HttpResponse& response) {
@@ -2327,8 +2327,8 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.storage_packing = c2.storage_packing = StoragePackingConfig{0, 0};
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
     n1.start();
     n2.start();
     REQUIRE(wait_until([&] {
@@ -3099,8 +3099,8 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     auto client_config = cluster.node_config("durability-epoch-client");
     server_config.replication = client_config.replication = 1;
     server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
-    NodeRuntime server(server_config, cluster.keys());
-    NodeRuntime client(client_config, cluster.keys());
+    BareNode server(server_config, cluster.keys());
+    BareNode client(client_config, cluster.keys());
     server.start();
     client.start();
     REQUIRE(server.wait_local_state_ready(10s));
@@ -3155,8 +3155,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     auto client_config = cluster.node_config("durability-group-rpc-client");
     server_config.replication = client_config.replication = 1;
     server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
-    NodeRuntime server(server_config, cluster.keys());
-    NodeRuntime client(client_config, cluster.keys());
+    BareNode server(server_config, cluster.keys());
+    BareNode client(client_config, cluster.keys());
     server.start();
     client.start();
     REQUIRE(server.wait_local_state_ready(10s));
@@ -3233,8 +3233,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     auto client_config = cluster.node_config("durability-generation-rpc-client");
     server_config.replication = client_config.replication = 1;
     server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
-    NodeRuntime server(server_config, cluster.keys());
-    NodeRuntime client(client_config, cluster.keys());
+    BareNode server(server_config, cluster.keys());
+    BareNode client(client_config, cluster.keys());
     server.start();
     client.start();
     REQUIRE(server.wait_local_state_ready(10s));
@@ -3593,7 +3593,7 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
     // Not the defaults, so the assertion cannot pass by coincidence.
     streaming_config.streaming.startup_timeout = 9000ms;
     streaming_config.streaming.segment_timeout = 3000ms;
-    NodeRuntime streamer(streaming_config, cluster.keys());
+    BareNode streamer(streaming_config, cluster.keys());
     streamer.start();
     REQUIRE(streamer.wait_local_state_ready(10s));
 
@@ -3630,7 +3630,7 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
     // zero a client might act on.
     auto quiet_config = cluster.node_config("quiet");
     REQUIRE(!quiet_config.streaming.enabled);
-    NodeRuntime quiet(quiet_config, cluster.keys());
+    BareNode quiet(quiet_config, cluster.keys());
     quiet.start();
     REQUIRE(quiet.wait_local_state_ready(10s));
 

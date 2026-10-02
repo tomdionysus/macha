@@ -184,18 +184,14 @@ class DataResourceArbiter {
   public:
     DataResourceArbiter(uint64_t capacity_bytes, uint64_t viewer_reserve_bytes,
                         uint64_t background_concurrency = 0,
-                        std::chrono::milliseconds no_progress_deadline = {});
-    // Set once during node construction, before any work is admitted.
+                        std::chrono::milliseconds no_progress_deadline = {},
+                        std::function<bool()> viewer_recently_active = {});
+    // Set once when the node's DATA store recovers, before it admits work.
     void observe_device(const DiskServiceMonitor* monitor,
                         uint64_t min_background_under_pressure) {
         std::lock_guard lock(mutex_);
         service_monitor_ = monitor;
         min_background_under_pressure_ = std::max<uint64_t>(1, min_background_under_pressure);
-    }
-    // Set once during node construction, before any work is admitted.
-    void observe_viewers(std::function<bool()> recently_active) {
-        std::lock_guard lock(mutex_);
-        viewer_recently_active_ = std::move(recently_active);
     }
     std::optional<Lease> acquire(const DataWorkContext& context, uint64_t bytes);
     std::optional<Lease> try_acquire(const DataWorkContext& context, uint64_t bytes);
@@ -206,8 +202,10 @@ class DataResourceArbiter {
 inline DataResourceArbiter::DataResourceArbiter(uint64_t capacity_bytes,
                                                 uint64_t viewer_reserve_bytes,
                                                 uint64_t background_concurrency,
-                                                std::chrono::milliseconds no_progress_deadline)
+                                                std::chrono::milliseconds no_progress_deadline,
+                                                std::function<bool()> viewer_recently_active)
     : capacity_bytes_(capacity_bytes), viewer_reserve_bytes_(viewer_reserve_bytes),
+      viewer_recently_active_(std::move(viewer_recently_active)),
       background_concurrency_(background_concurrency),
       no_progress_deadline_(no_progress_deadline) {
     if (!capacity_bytes_ || !viewer_reserve_bytes_ || viewer_reserve_bytes_ >= capacity_bytes_)

@@ -27,7 +27,7 @@ HttpRequest session_request(std::string method, std::optional<SessionIdentity> i
 
 MACHA_FAST_TEST("session", test_session_create_and_validate) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     const auto anonymous = give_anonymous_account(node);
     SessionApi api(node);
 
@@ -74,7 +74,7 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
 
 MACHA_FAST_TEST("session", test_session_rejects_non_anonymous_credentials) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     SessionApi api(node);
 
     auto request = session_request("POST");
@@ -91,7 +91,7 @@ MACHA_FAST_TEST("session", test_session_rejects_non_anonymous_credentials) {
 
 MACHA_FAST_TEST("session", test_session_revoke_invalidates_immediately) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     const auto anonymous = give_anonymous_account(node);
     SessionApi api(node);
 
@@ -217,8 +217,8 @@ MACHA_TEST("session", test_session_cluster_propagation) {
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
-    NodeRuntime n1(c1, cluster.keys());
-    NodeRuntime n2(c2, cluster.keys());
+    BareNode n1(c1, cluster.keys());
+    BareNode n2(c2, cluster.keys());
     n1.start();
     n2.start();
 
@@ -247,8 +247,8 @@ MACHA_TEST("session", test_session_revoke_propagates_cluster_wide) {
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
-    NodeRuntime n1(c1, cluster.keys());
-    NodeRuntime n2(c2, cluster.keys());
+    BareNode n1(c1, cluster.keys());
+    BareNode n2(c2, cluster.keys());
     n1.start();
     n2.start();
 
