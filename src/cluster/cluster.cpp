@@ -185,57 +185,30 @@ RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
     return {MessageType::metadata_identity_reply, writer.take()};
 }
 
-NodeId load_v18_node_id(const std::filesystem::path& state) {
-    static constexpr std::string_view expected = "macha-state-layout-v18";
-    const auto marker = state / "storage-layout";
-    if (std::filesystem::exists(marker)) {
-        std::ifstream input(marker);
-        std::string value;
-        std::getline(input, value);
-        if (!input && value.empty())
-            throw std::runtime_error("cannot read storage layout marker");
-        if (value != expected)
-            throw std::runtime_error(
-                "incompatible Macha storage layout; 0.18 requires a fresh namespace");
-    } else {
-        // No migration path: an older namespace/backend layout is refused, not
-        // reinterpreted. .macha.lock (from StorageLock) is the only entry a
-        // fresh state directory may hold.
-        for (const auto& entry : std::filesystem::directory_iterator(state)) {
-            if (entry.path().filename() == ".macha.lock")
-                continue;
-            throw std::runtime_error(
-                "existing unversioned Macha state detected; 0.18 requires a fresh namespace");
-        }
-        durable_replace_file(marker, std::string(expected) + "\n");
-    }
-    return load_or_create_node_id(state);
-}
 } // namespace
 
-NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activity,
+NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, ActivityClocks& activity,
                          DataResourceArbiter& data_resources,
                          RetainedMemoryLedger& retained_memory,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes, NodeEvents& events,
                          StartupStageHook startup_stage_hook)
-    : cfg_(normalize_config(std::move(config))), keys_(keys),
-      id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
+    : cfg_(normalize_config(std::move(config))), identity_(identity),
       activity_(activity), data_resources_(data_resources), retained_memory_(retained_memory),
       transcode_rates_(transcode_rates), routes_(routes), events_(events),
       inbound_(initial_inbound_resolution(cfg_)),
-      members_(self_info(cfg_, id_, 0, 0, 0,
+      members_(self_info(cfg_, identity_.id, 0, 0, 0,
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
                cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
-      public_connectivity_(cfg_, id_, Endpoint{members_.self().host, members_.self().port}),
-      telemetry_(id_, cfg_.state_path / "telemetry" / "last-known.bin"),
+      public_connectivity_(cfg_, identity_.id, Endpoint{members_.self().host, members_.self().port}),
+      telemetry_(identity_.id, cfg_.state_path / "telemetry" / "last-known.bin"),
       sessions_(cfg_.session.anonymous_ttl, cfg_.session.max_sessions,
                cfg_.state_path / "sessions" / "sessions.bin"),
       users_(cfg_.session.max_users, cfg_.state_path / "users" / "users.bin",
-             hkdf_sha256(keys_.master, {},
+             hkdf_sha256(identity_.keys.master, {},
                          std::span<const uint8_t>(
                              reinterpret_cast<const uint8_t*>("macha/users/v1"), 14))),
       client_(
-          keys_, [this] { return members_.self(); },
+          identity_.keys, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
               const auto active_before = members_.active();
               const auto previous =
@@ -271,7 +244,7 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
           cfg_.connect_timeout, cfg_.heartbeat, cfg_.dead_after, cfg_.max_frame_size,
           &retained_memory_),
       server_(
-          cfg_.listen_host, cfg_.port, keys_, members_.self(),
+          cfg_.listen_host, cfg_.port, identity_.keys, members_.self(),
           [this](const NodeInfo& peer, FrameType frame_type, const RpcMessage& request) {
               return routes_.dispatch(peer, frame_type, request);
           },
@@ -303,14 +276,14 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activi
     client_.set_maintained_peers([this] {
         std::vector<NodeInfo> out;
         for (auto& node : members_.active())
-            if (node.id != id_ && node_inbound_capable(node))
+            if (node.id != identity_.id && node_inbound_capable(node))
                 out.push_back(std::move(node));
         return out;
     });
     // The transport must know non-dialable peers before the first exchange,
     // not after the first refused dial.
     for (const auto& node : members_.all())
-        if (node.id != id_)
+        if (node.id != identity_.id)
             client_.note_peer(node);
     // Membership loaded durable identity-reset tombstones before the
     // transport existed; seed the other consumers so stale routes and
@@ -440,8 +413,8 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
             startup_stage_hook_("data-storage");
         if (stop.stop_requested())
             return;
-        auto local = std::make_unique<StoragePool>(cfg_.state_path, id_, cfg_.storage_backends,
-                                                   keys_.storage, std::chrono::milliseconds(500),
+        auto local = std::make_unique<StoragePool>(cfg_.state_path, identity_.id, cfg_.storage_backends,
+                                                   identity_.keys.storage, std::chrono::milliseconds(500),
                                                    cfg_.storage_packing);
         if (stop.stop_requested())
             return;
@@ -491,28 +464,28 @@ void NodeRuntime::recover_state(std::stop_token stop) {
             cfg_.metadata_store.path,
             LocalStoreOptions{cfg_.metadata_store.limit, 0, cfg_.metadata_store.packing.threshold,
                               cfg_.metadata_store.packing.target_size},
-            keys_.storage);
+            identity_.keys.storage);
         mark_ready(ready_control_storage);
 
         if (startup_stage_hook_)
             startup_stage_hook_("cache");
         if (stop.stop_requested())
             return;
-        cache_ = std::make_unique<PersistentBlockCache>(cfg_.cache, keys_.storage);
+        cache_ = std::make_unique<PersistentBlockCache>(cfg_.cache, identity_.keys.storage);
         mark_ready(ready_cache);
 
         if (startup_stage_hook_)
             startup_stage_hook_("retention");
         if (stop.stop_requested())
             return;
-        retention_ = std::make_unique<RetentionStore>(cfg_.state_path, keys_.storage);
+        retention_ = std::make_unique<RetentionStore>(cfg_.state_path, identity_.keys.storage);
         mark_ready(ready_retention);
 
         if (startup_stage_hook_)
             startup_stage_hook_("metadata");
         if (stop.stop_requested())
             return;
-        meta_ = std::make_unique<MetadataReplica>(cfg_.state_path, keys_.storage,
+        meta_ = std::make_unique<MetadataReplica>(cfg_.state_path, identity_.keys.storage,
                                                  cache_->metadata(), cfg_.bootstrap.empty(),
                                                  cfg_.metadata_materialization_cache_bytes);
 
@@ -566,7 +539,7 @@ void NodeRuntime::start() {
     // readiness.
     server_.start();
     mark_ready(ready_control_plane);
-    Log::info("node " + to_string(id_).substr(0, 12) + " listening on " +
+    Log::info("node " + to_string(identity_.id).substr(0, 12) + " listening on " +
               std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain +
               " state=recovering");
 
@@ -585,7 +558,7 @@ void NodeRuntime::start() {
     }
 
     if (cfg_.bootstrap.empty()) {
-        if (auto initial = create_initial_accounts(users_, keys_, cfg_.state_path, id_)) {
+        if (auto initial = create_initial_accounts(users_, identity_.keys, cfg_.state_path, identity_.id)) {
             // The password is in the 0600 file, never in a log line.
             Log::warn("accounts: created the '" + initial->root.username + "' and '" +
                       initial->anonymous.username + "' accounts for this new cluster");
@@ -624,7 +597,7 @@ void NodeRuntime::refuse_impossible_cluster() const {
     for (const auto& endpoint : cfg_.bootstrap) {
         const auto found =
             std::find_if(known.begin(), known.end(), [&](const NodeInfo& node) {
-                return node.id != id_ && node.host == endpoint.host && node.port == endpoint.port;
+                return node.id != identity_.id && node.host == endpoint.host && node.port == endpoint.port;
             });
         if (found == known.end() || node_inbound_capable(*found))
             return;
@@ -724,7 +697,7 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
 
         std::optional<NodeInfo> peer;
         for (const auto& node : members_.active()) {
-            if (node.id == id_ || !node_inbound_capable(node))
+            if (node.id == identity_.id || !node_inbound_capable(node))
                 continue;
             if (client_.has_route(node.id, TransportLane::control)) {
                 peer = node;
@@ -1275,7 +1248,7 @@ void NodeRuntime::bind_storage_routes() {
                 // node-wide mutation generation. A later barrier for a covered
                 // generation is a no-op even with newer writes dirty here.
                 Writer reply;
-                reply.fixed(durability_epoch_.bytes);
+                reply.fixed(identity_.durability_epoch.bytes);
                 reply.u64(generation->domain);
                 reply.u64(generation->generation);
                 reply.u64(generation->backend_instance);
@@ -1319,7 +1292,7 @@ void NodeRuntime::bind_storage_routes() {
                       probe_ids.push_back(ObjectId{reader.fixed<32>()});
               }
               reader.finish();
-              if (expected_epoch != durability_epoch_) {
+              if (expected_epoch != identity_.durability_epoch) {
                   // The requester's placement token is from a previous process
                   // incarnation and cannot become true again, but the objects may
                   // be on disk. With ids, answer from disk with fresh tokens
@@ -1327,13 +1300,13 @@ void NodeRuntime::bind_storage_routes() {
                   if (probe_ids.empty()) {
                       Log::debug("object durability barrier refused: epoch changed expected=" +
                                  to_string(expected_epoch).substr(0, 8) +
-                                 " current=" + to_string(durability_epoch_).substr(0, 8) +
+                                 " current=" + to_string(identity_.durability_epoch).substr(0, 8) +
                                  " domain=" + std::to_string(domain) +
                                  " generation=" + std::to_string(required_generation));
                       return error_reply("storage durability epoch changed");
                   }
                   Writer reply;
-                  reply.fixed(durability_epoch_.bytes);
+                  reply.fixed(identity_.durability_epoch.bytes);
                   std::vector<std::pair<ObjectId, StoragePool::DurabilityToken>> present;
                   present.reserve(probe_ids.size());
                   for (const auto& id : probe_ids)
@@ -1350,7 +1323,7 @@ void NodeRuntime::bind_storage_routes() {
                             std::to_string(present.size()) + "/" +
                             std::to_string(probe_ids.size()) +
                             " expected=" + to_string(expected_epoch).substr(0, 8) +
-                            " current=" + to_string(durability_epoch_).substr(0, 8));
+                            " current=" + to_string(identity_.durability_epoch).substr(0, 8));
                   members_.storage(local_store().used(), local_store().limit());
                   return {MessageType::ok, reply.take()};
               }
@@ -1561,7 +1534,7 @@ void NodeRuntime::merge(std::span<const uint8_t> payload) {
             previous->port != node.port || previous->failure_domain != node.failure_domain ||
             previous->metadata_write_replicas_required != node.metadata_write_replicas_required ||
             previous->flags != node.flags;
-        if (node.id != id_)
+        if (node.id != identity_.id)
             client_.note_peer(node);
         members_.observe(std::move(node));
     }
@@ -1739,7 +1712,7 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
                 const auto digest = sha256(payload);
                 std::set<NodeId> peers;
                 for (const auto& peer : members_.active())
-                    if (peer.id != id_)
+                    if (peer.id != identity_.id)
                         peers.insert(peer.id);
                 const auto now = Clock::now();
                 const bool sessions_due =
@@ -1799,7 +1772,7 @@ void NodeRuntime::propagate_identity_reset(const IdentityAssociationReset& reset
     (void)apply_identity_reset(reset);
     const auto payload = encode_identity_resets({reset});
     for (const auto& peer : members_.active()) {
-        if (peer.id == id_)
+        if (peer.id == identity_.id)
             continue;
         try {
             auto reply = call(peer, MessageType::identity_resets, payload);
@@ -1843,7 +1816,7 @@ void NodeRuntime::gossip_users_if_changed() {
         const auto table = users_.table_hash();
         std::set<NodeId> peers;
         for (const auto& peer : members_.active())
-            if (peer.id != id_)
+            if (peer.id != identity_.id)
                 peers.insert(peer.id);
         // Unchanged, nobody new, re-announce not due: send nothing.
         const auto now = Clock::now();
@@ -1942,7 +1915,7 @@ void NodeRuntime::loop(std::stop_token stop) {
             try {
                 auto known =
                     std::find_if(known_nodes.begin(), known_nodes.end(), [&](const NodeInfo& node) {
-                        return node.id != id_ && node.host == endpoint.host &&
+                        return node.id != identity_.id && node.host == endpoint.host &&
                                node.port == endpoint.port;
                     });
                 if (known != known_nodes.end() && unreachable_by_design(*known))
@@ -1957,7 +1930,7 @@ void NodeRuntime::loop(std::stop_token stop) {
             }
         }
         for (const auto& node : known_nodes) {
-            if (node.id == id_)
+            if (node.id == identity_.id)
                 continue;
             if (!exchanged.emplace(node.host, node.port).second)
                 continue;

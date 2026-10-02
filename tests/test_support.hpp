@@ -261,8 +261,10 @@ class TestService {
 // The root parts a NodeRuntime takes, built before it (a base is built first).
 struct BareNodeResources {
     NodeResources resources;
+    NodeIdentity identity;
     MessageRoutes routes;
-    explicit BareNodeResources(const Config& config) : resources(config) {}
+    BareNodeResources(const Config& config, ClusterKeys keys)
+        : resources(config), identity(config.state_path, std::move(keys)) {}
 };
 
 // A NodeRuntime that owns its root parts, as Service does: the resources are
@@ -270,8 +272,8 @@ struct BareNodeResources {
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
-        : BareNodeResources(config),
-          NodeRuntime(std::move(config), keys, resources.activity, resources.data,
+        : BareNodeResources(config, keys),
+          NodeRuntime(std::move(config), identity, resources.activity, resources.data,
                       resources.memory, resources.transcode_rates, routes,
                       resources.events, std::move(hook)) {}
     ~BareNode() { stop(); }

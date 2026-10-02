@@ -66,6 +66,8 @@ class Service {
     }
     // Built, and stopped, before the node that waits on them.
     NodeResources resources_;
+    // After resources_, whose lock it reads the state path under.
+    NodeIdentity identity_;
     // Inbound requests by message type; each part binds what it answers.
     MessageRoutes routes_;
     NodeRuntime node_;
