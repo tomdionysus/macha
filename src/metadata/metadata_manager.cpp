@@ -53,7 +53,21 @@ bool bool_reply(const RpcReply& reply) {
 
 } // namespace
 
-MetadataManager::MetadataManager(NodeRuntime& node) : node_(node) {}
+MetadataManager::MetadataManager(NodeRuntime& node, DistributedStore* namespace_store)
+    : node_(node), namespace_store_(namespace_store) {
+    if (!namespace_store_)
+        return;
+    // Replay writes nodes locally and replicates nothing: a history entry
+    // being materialised is a commit that already reached the floor when it
+    // was made, and re-establishing that here would make rebuilding a local
+    // head depend on peers being up. That is the shape of outage this codebase
+    // has already had once.
+    node_.metadata_replica().set_namespace_delta_applier(
+        [this](const ObjectId& root, const MetadataDelta& delta) {
+            auto nodes = ControlNamespaceNodeStore::for_replay(node_, *namespace_store_);
+            return apply_delta_to_namespace_tree(root, nodes, delta);
+        });
+}
 
 const char* metadata_availability_name(MetadataAvailability availability) noexcept {
     switch (availability) {
@@ -276,24 +290,6 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
         node_.remote_metadata_generation() > cache_->generation)
         return {};
     return cache_;
-}
-
-void MetadataManager::set_namespace_store(DistributedStore* store) {
-    namespace_store_ = store;
-    if (!store) {
-        node_.metadata_replica().set_namespace_delta_applier({});
-        return;
-    }
-    // Replay writes nodes locally and replicates nothing: a history entry
-    // being materialised is a commit that already reached the floor when it
-    // was made, and re-establishing that here would make rebuilding a local
-    // head depend on peers being up. That is the shape of outage this codebase
-    // has already had once.
-    node_.metadata_replica().set_namespace_delta_applier(
-        [this](const ObjectId& root, const MetadataDelta& delta) {
-            auto nodes = ControlNamespaceNodeStore::for_replay(node_, *namespace_store_);
-            return apply_delta_to_namespace_tree(root, nodes, delta);
-        });
 }
 
 void require_coherent_namespace(const MetadataSnapshot& snapshot) {
@@ -2177,6 +2173,13 @@ void MetadataManager::repair_once() {
     cache_record(record, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
 
-
+Page<std::pair<std::string, FsEntry>, std::string>
+MetadataManager::entries(const MetadataSnapshotView& view, Cursor<std::string> from,
+                         Budget& budget) {
+    if (!namespace_store_)
+        return namespace_entries(*view.snapshot, nullptr, std::move(from), budget);
+    auto nodes = ControlNamespaceNodeStore::for_reading(node_, *namespace_store_);
+    return namespace_entries(*view.snapshot, &nodes, std::move(from), budget);
+}
 
 } // namespace macha

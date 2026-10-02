@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/walk.hpp"
 #include "contract/work.hpp"
 #include "metadata/metadata.hpp"
 
@@ -90,6 +91,13 @@ class MetadataView {
     // reads; not in the spec's first table, found by the T4 survey).
     static constexpr Waits record_waits = converged_waits;
     virtual MetadataRecord record() = 0;
+
+    // A page of `view`'s namespace entries after `from`, in path order, one
+    // budget operation per entry (namespace_entries over this node's control
+    // store). Waits on the state device for tree nodes.
+    static constexpr Waits entries_waits = Waits::state_device;
+    virtual Page<std::pair<std::string, FsEntry>, std::string>
+    entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) = 0;
 
     static constexpr Waits release_head_waits = Waits::none;
     virtual std::optional<MetadataSnapshotView> release_head() const = 0;
