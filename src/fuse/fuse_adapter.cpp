@@ -287,9 +287,6 @@ void set_file_flags(fuse_file_info* fi) {
 int op_open(const char* path, fuse_file_info* fi) {
     trace_request("open", path, fi);
     const int access = fi->flags & O_ACCMODE;
-    // A read-only open is the earliest reliable indication that a viewer may
-    // imminently need content. Loader creates and writable opens must not
-    // manufacture a foreground quiet window.
     FuseLatency latency{"open", path};
     return guarded("open", [&] {
         auto h = std::make_unique<Handle>();
@@ -492,12 +489,8 @@ class CoveredMountpointGuard {
             throw std::runtime_error("cannot stat FUSE mountpoint: " +
                                      std::string(std::strerror(error)));
         }
-        // What the directory looked like before anything guarded it, not what
-        // it looks like now. A supervised mount can be attempted more than
-        // once in a process, and after an unexpected mount loss the directory
-        // is deliberately left non-writable -- recording that as "original"
-        // would make a later clean unmount restore the fail-closed mode
-        // permanently.
+        // The mode from before any guard: after a mount loss the directory is
+        // left non-writable, and restoring that would make it permanent.
         const auto& preparation = fuse_mountpoint_preparation();
         original_mode_ = preparation.covered_mode_known
                              ? static_cast<mode_t>(preparation.covered_mode)
@@ -515,9 +508,8 @@ class CoveredMountpointGuard {
     bool protect() {
         if (fd_ < 0)
             return false;
-        // The immutable flag set at preparation already fails closed for
-        // every writer, root included, and makes chmod on the directory
-        // fail with EPERM; there is nothing left for the mode bits to do.
+        // The immutable flag already fails closed for every writer, root
+        // included, and makes chmod fail with EPERM.
         if (fuse_mountpoint_preparation().immutable)
             return true;
         const auto fail_closed_mode = static_cast<mode_t>(original_mode_ & ~0222);
@@ -532,10 +524,8 @@ class CoveredMountpointGuard {
     }
 };
 
-// The kernel-facing half of the FUSE subsystem: mount, serve, unmount. It
-// owns no policy -- whether to retry, what to tell an operator, and what
-// happens to the rest of the node when this fails are the supervisor's and
-// FuseSubsystem's business (fuse_subsystem.cpp).
+// Mount, serve, unmount. No policy: retry and fault handling belong to
+// FuseSubsystem and the supervisor.
 class LibfuseMountDriver final : public FuseMountDriver {
     std::mutex mutex_;
     struct fuse* instance_{};
@@ -543,12 +533,9 @@ class LibfuseMountDriver final : public FuseMountDriver {
     bool exit_requested_{};
     bool unmounted_{};
 
-    // Ending a loop that is blocked reading /dev/fuse takes more than
-    // fuse_session_exit(), which only sets a flag an idle worker will not
-    // observe until the next request arrives. Unmounting makes those reads
-    // fail, which is what actually returns the loop. libfuse's own signal
-    // handlers used to do this; signals now belong to core's sigwait loop
-    // (main.cpp), so the subsystem ends its own loop.
+    // fuse_session_exit() only sets a flag an idle worker sees on its next
+    // request; unmounting fails the blocked /dev/fuse reads and returns the
+    // loop. Signals belong to core's sigwait loop, not libfuse.
     void wake_locked() {
         if (session_)
             fuse_session_exit(session_);
@@ -611,19 +598,16 @@ class LibfuseMountDriver final : public FuseMountDriver {
             instance_ = instance;
             session_ = session;
             unmounted_ = false;
-            // Asked to stop between construction and the mount coming up.
+            // Stop requested before the mount came up.
             if (exit_requested_ || stop.stop_requested())
                 wake_locked();
         }
-        // A stop on the owning lifecycle thread ends the loop exactly as an
-        // explicit request_exit() does.
         std::stop_callback stop_wake(stop, [this] { request_exit(); });
 
         filesystem.reset_io_cancellation();
         std::atomic_bool unexpected_mount_loss{false};
-        // fuse_mount() has already succeeded. A mount-table probe can strengthen
-        // that observation, but failure to inspect the table must never be treated
-        // as evidence that the mount disappeared.
+        // fuse_mount() succeeded; a failed mount-table probe is never evidence
+        // the mount disappeared.
         std::atomic_bool mount_seen{true};
 
         std::jthread mount_watchdog([&](std::stop_token watchdog_stop) {
@@ -644,9 +628,8 @@ class LibfuseMountDriver final : public FuseMountDriver {
                     continue;
                 }
                 if (probe.state == MountTableState::probe_error) {
-                    // In particular, EMFILE must not convert descriptor pressure
-                    // into a false fail-closed namespace shutdown. Require three
-                    // successful probes which positively report the mount absent.
+                    // E.g. EMFILE must not trigger a false fail-closed shutdown;
+                    // only successful probes reporting absence count as misses.
                     consecutive_misses = 0;
                     ++consecutive_probe_errors;
                     if (consecutive_probe_errors == 1 || consecutive_probe_errors % 30 == 0) {
@@ -672,10 +655,8 @@ class LibfuseMountDriver final : public FuseMountDriver {
                 Log::error("FUSE mount disappeared for three consecutive successful watchdog "
                            "checks; the namespace is fail-closed and the mount will be rebuilt");
                 filesystem.request_io_cancellation();
-                // Deliberately only fuse_session_exit here, never fuse_unmount:
-                // the Macha mount is already gone, and whatever now occupies
-                // that path is not ours to unmount. The dead fuse fd is what
-                // returns the loop.
+                // Never fuse_unmount: our mount is gone and whatever occupies
+                // the path is not ours. The dead fuse fd returns the loop.
                 fuse_session_exit(session);
                 return;
             }
@@ -724,7 +705,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
     }
 };
 
-// Linking this translation unit is what gives a build the ability to mount.
+// Linking this translation unit gives a build the ability to mount.
 const bool g_libfuse_driver_registered = [] {
     set_fuse_mount_driver_factory(
         []() -> std::unique_ptr<FuseMountDriver> { return std::make_unique<LibfuseMountDriver>(); });

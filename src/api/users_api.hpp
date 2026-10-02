@@ -7,11 +7,9 @@
 
 namespace macha {
 
-// Admin surface for the cluster user table, plus the one route a person needs
-// for their own account (/api/v1/users/me). Every mutation is local-then-
-// notify: apply to this node's replica, persist, queue the table to whatever
-// peers are reachable, return. Nothing here waits on a peer, so it works on a
-// node that is temporarily alone.
+// Admin surface for the cluster user table, plus /api/v1/users/me for the
+// caller's own account. Every mutation is local-then-notify: apply to this
+// replica, persist, queue to reachable peers, return. Nothing waits on a peer.
 class UsersApi {
     NodeRuntime& node_;
 

@@ -118,7 +118,7 @@ CatalogueHint parse_hint(const Json& value) {
     hint.result = json_string(value, "result");
     hint.error_code = json_string(value, "error_code");
     hint.error = json_string(value, "error");
-    // Recorded before error codes existed: an error is never shown without one.
+    // A record with an error but no code gets one: an error never shows without a code.
     if (!hint.error.empty() && hint.error_code.empty()) hint.error_code = "catalogue_error";
     if (const auto* ids = value.find("catalogue_item_ids"))
         for (const auto& id : ids->asArray()) hint.catalogue_item_ids.push_back(id.asString());
@@ -291,20 +291,16 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
             hint.created_unix_ms = now;
         }
 
-        // Terminal work is a path-level result cache as well as provenance.
-        // Periodic/mutation rediscovery of the same media content must not turn
-        // into repeated provider requests. The scanner uses the stable media id
-        // as source_ref, so a changed file at the same path reopens the item.
+        // A terminal hint caches the path's result, so rediscovering the same
+        // content asks no provider again. The scanner's source_ref is the media
+        // id, so a changed file at the same path reopens it.
         bool reopen_terminal = false;
         if (was_terminal) {
             if (submission.source == "manual") {
                 reopen_terminal = true;
             } else if (submission.source == "media-profile") {
-                // An explicit profile request is made only after the durable
-                // catalogue has reported a miss. Reopen path-level catalogue
-                // work even if this origin was seen before; otherwise a
-                // cleared, rejected, or previously incomplete profile could
-                // remain pending forever.
+                // Made only after a catalogue miss: always reopen, or a
+                // cleared, rejected or incomplete profile could stay pending.
                 reopen_terminal = true;
             } else if (submission.source == "scanner" || submission.source == "namespace") {
                 if (!hint.media_id.empty() && !submission.source_ref.empty())
@@ -312,17 +308,14 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
                 else
                     reopen_terminal = source_ref_changed;
             } else {
-                // Ingest and future explicit producers represent occurrences,
-                // not observations. A new source_ref is therefore new work.
+                // Other producers report occurrences: a new origin is new work.
                 reopen_terminal = !origin_known;
             }
         }
 
-        // Do not attach passive ephemeral observations to a terminal result;
-        // otherwise merely scanning an ingest result would keep the hint record
-        // alive after the ingest job is cleared. Negative scanner results retain
-        // their own origin when they are produced, so unchanged no-match paths
-        // still remain deduplicated across scans.
+        // Passive observations do not attach to a terminal result, or a scan
+        // would keep an ingest's hint alive after the job is cleared. Scanner
+        // no-matches keep their own origin, so they stay deduplicated.
         const bool passive_terminal_observation = was_terminal && ephemeral && !reopen_terminal;
         if (!passive_terminal_observation) {
             if (source_known && ephemeral && !origin_known) {
@@ -350,8 +343,7 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
             hint.error_code.clear();
         } else if (hint.state == CatalogueHintState::deferred &&
                    submission.priority > previous_priority) {
-            // A stronger producer (for example ingest over a periodic scan)
-            // makes a deferred path immediately eligible again.
+            // A stronger producer makes a deferred path eligible at once.
             hint.state = CatalogueHintState::queued;
             hint.ready_after_unix_ms = 0;
         }
@@ -362,9 +354,8 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
     }
     if (changed) {
         mark_state_dirty_locked();
-        // New work is an admission boundary: once submit returns, the hint must
-        // survive a crash. Bulk scanner submission is already coalesced by
-        // submit_many(), so this is one write per discovery pass, not per item.
+        // Durable once submit returns; submit_many() makes this one write per
+        // discovery pass.
         persist_dirty_state_locked(true);
         changed_locked();
     }
@@ -408,11 +399,8 @@ std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
     ++best->second.attempts;
     best->second.updated_unix_ms = now;
     lane_served_[scheduling_lane(best->second.path)] = ++schedule_sequence_;
-    // `processing` is an in-memory ownership state, not durable truth. Persisting
-    // it rewrites the complete hint queue for every claim. If the process dies
-    // before completion, leaving the durable state queued/deferred simply makes
-    // the item replay once after restart, which is the desired at-least-once
-    // recovery behaviour. Terminal/deferred transitions remain durable.
+    // `processing` is not persisted: a crash replays the item once from its
+    // durable queued/deferred state (at-least-once).
     return best->second;
 }
 
@@ -440,11 +428,9 @@ uint64_t CatalogueHintQueue::revision() const {
 bool CatalogueHintQueue::wait_for_change(std::stop_token stop, uint64_t observed_revision,
                                          std::chrono::milliseconds timeout) {
     std::unique_lock lock(mutex_);
-    // Terminal/candidate worker updates are intentionally coalesced. The
-    // scanner revisits this wait at least once per second while active, so a
-    // dirty queue is persisted within two seconds even if no further hints
-    // mutate. A crash inside that window replays at most the recent work, which
-    // preserves the queue's existing at-least-once semantics.
+    // Coalesced worker updates: the scanner waits here at least once a second
+    // while active, so a dirty queue persists within two seconds; a crash
+    // replays at most that window.
     persist_dirty_state_locked(false);
     return change_cv_.wait_for(lock, stop, timeout, [&] {
         return revision_ != observed_revision;
@@ -555,8 +541,7 @@ size_t CatalogueHintQueue::defer_matching(
         ++deferred;
     }
     if (deferred) {
-        // Provider outage is one scheduling event, not N independent hint
-        // failures. Persist and wake once for the complete affected provider set.
+        // A provider outage is one event: persist and wake once.
         mark_state_dirty_locked();
         persist_dirty_state_locked(true);
         changed_locked();
@@ -606,8 +591,7 @@ void CatalogueHintQueue::fail(std::string_view id, std::string code, std::string
     hint.error = std::move(error);
     hint.ready_after_unix_ms = 0;
     hint.updated_unix_ms = now_ms();
-    // Failed hints are the persistent dead-letter/give-up list. Explicit origin
-    // removal may still erase them later, but failure itself must remain visible.
+    // Failed hints are the durable dead-letter list.
     mark_state_dirty_locked();
     persist_dirty_state_locked(true);
     changed_locked();
@@ -715,9 +699,8 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
         });
         removed += before - origins.size();
         recompute_priority(it->second);
-        // A failed hint outlives the job that raised it (0.64.0): clearing
-        // Colony deleted S02E13's failed hint, the only record that the file
-        // was never catalogued. Only a settled outcome goes with its job.
+        // Only a settled outcome goes with its job; a failed hint outlives it
+        // as the record that the file was never catalogued.
         const bool settled = it->second.state == CatalogueHintState::catalogued ||
                              it->second.state == CatalogueHintState::no_match;
         if (origins.empty() && settled) it = hints_.erase(it);
@@ -783,9 +766,8 @@ size_t CatalogueHintQueue::rename_prefix(std::string_view source_value,
         auto new_path = normalize_path(destination + suffix);
         hint.path = new_path;
         hint.id = hint_id_for_path(new_path);
-        // A worker may still hold the old id/path. Requeue the renamed work so
-        // completion against that stale claim cannot strand a durable `processing`
-        // record or resolve a replacement file.
+        // A worker may hold the old id/path: requeue so its stale completion
+        // can neither strand `processing` nor resolve a replacement file.
         if (hint.state == CatalogueHintState::processing) {
             hint.state = CatalogueHintState::queued;
             hint.ready_after_unix_ms = 0;
@@ -797,9 +779,8 @@ size_t CatalogueHintQueue::rename_prefix(std::string_view source_value,
     if (moved.empty()) return 0;
 
     for (auto& [path, hint] : moved) {
-        // Namespace truth wins over a stale hint that happened to occupy the new
-        // path. `FileSystem::rename(..., no_replace=true)` has already guaranteed
-        // that no live destination entry was overwritten.
+        // Namespace truth wins over a stale hint at the new path; the no-replace
+        // rename overwrote no live entry.
         hints_.erase(path);
         hints_.emplace(std::move(path), std::move(hint));
     }

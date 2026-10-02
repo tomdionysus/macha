@@ -97,15 +97,9 @@ class StoragePool final : public ObjectStore {
     void reconfigure(const std::vector<StorageBackendConfig>&);
     void refresh();
 
-    // Strict write. Provisional callers use put_deferred() so the durability
-    // token cannot be discarded accidentally.
-    // What this pool's devices are actually doing. Fed by every put and get
-    // below, whatever class of work issued it, and consulted by DATA admission
-    // so that work nobody is waiting for yields a slow device to work somebody
-    // is. Lives here rather than in LocalStore because the contended thing is
-    // the pool's physical backends -- the control store is a different device
-    // and must not be gated by their pressure, which is exactly the
-    // distinction the 2026-09-20 measurements turned on.
+    // Service time of this pool's DATA devices, fed by every put and get and
+    // consulted by DATA admission. Per pool, not per LocalStore: the control
+    // store is a different device and must not be gated by DATA pressure.
     DiskServiceMonitor& service_monitor() noexcept {
         return service_monitor_;
     }
@@ -116,16 +110,16 @@ class StoragePool final : public ObjectStore {
         service_monitor_.configure(thresholds);
     }
 
+    // Strict write. Provisional callers use put_deferred() so the durability
+    // token cannot be discarded accidentally.
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<DurabilityToken> put_deferred(const ObjectId&, std::span<const uint8_t>);
     void durability_barrier(const DurabilityToken&,
                             DurabilityUrgency = DurabilityUrgency::batchable);
     bool durability_covered(const DurabilityToken&) const;
-    // Re-derive a placement token for an object this pool already holds: the
-    // answer to a durability question whose previous token died with a
-    // process or backend incarnation. Flushes the holding backend first so
-    // "present" implies "durable" for the current incarnation. Empty when no
-    // online backend has the object.
+    // Re-derives a placement token for a held object whose previous token died
+    // with a process or backend incarnation. Flushes the holding backend first
+    // so present implies durable. Empty when no online backend has it.
     std::optional<DurabilityToken> reassert_durable(const ObjectId&);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const override;
@@ -140,10 +134,9 @@ class StoragePool final : public ObjectStore {
                                      const std::function<bool()>& should_yield = {});
     MaintenanceResult scrub_step(uint64_t budget_bytes, size_t operation_budget,
                                  const std::function<bool()>& should_yield = {});
-    // Mark/sweep one bounded slice of authoritative local objects. `live` and
-    // `protected_ids` must be sorted/unique. An unreferenced object is removed
-    // only after it has also aged past orphan_grace; recent uncommitted puts
-    // therefore cannot race metadata commit.
+    // Mark/sweep one bounded slice. `live` and `protected_ids` must be
+    // sorted/unique. An unreferenced object is removed only once older than
+    // orphan_grace, so uncommitted puts cannot race metadata commit.
     MaintenanceResult gc_step(std::span<const ObjectId> live,
                               const std::vector<ObjectId>& protected_ids,
                               std::chrono::milliseconds orphan_grace,
@@ -151,14 +144,12 @@ class StoragePool final : public ObjectStore {
                               const std::function<bool()>& should_yield = {},
                               const std::function<bool(const ObjectId&)>& is_retained = {});
 
-    // Compatibility helper for callers/tests that explicitly request a complete
-    // pass. Service maintenance uses rebalance_step() so a settled large store
-    // is never enumerated in one scheduler tick.
+    // A complete pass, for tests and explicit callers; maintenance uses
+    // rebalance_step().
     uint64_t rebalance_once(uint64_t budget_bytes = 0);
 
-    // Reclaim dead records from packed authoritative DATA incrementally. Each
-    // LocalStore invocation rewrites at most one pack, so temporary disk demand
-    // is bounded by a pack rather than by the backend's complete live corpus.
+    // Reclaims dead pack records incrementally; at most one pack per
+    // LocalStore per call, bounding temporary disk use.
     size_t compact_packs(std::stop_token = {});
 
     uint64_t used() const;

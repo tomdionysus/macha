@@ -45,11 +45,10 @@ MACHA_FAST_TEST("models", test_metadata_delta_state_model) {
     const auto mutator = model_node(1);
     const auto retire_node = model_node(2);
 
-    // Exercise a deterministic sequence containing simultaneous upserts,
-    // erasures, catalogue changes, garbage retirement/reaffirmation and
-    // idempotency-clock advancement. Each transition is encoded and decoded
-    // before it is applied, so this checks the real wire format as well as the
-    // state transition.
+    // A deterministic sequence of upserts, erasures, catalogue changes, garbage
+    // retirement/reaffirmation and idempotency-clock advances. Each transition
+    // is encoded and decoded before it is applied, so the wire format is
+    // checked too.
     for (uint32_t step = 1; step <= 96; ++step) {
         auto expected = state;
         expected.mutation_sequences[mutator] = step;
@@ -95,8 +94,7 @@ MACHA_FAST_TEST("models", test_metadata_delta_state_model) {
         const auto applied = apply_metadata_delta(state, decoded);
         check_snapshot_equal(applied, expected);
 
-        // Full snapshot serialization must agree with the delta path at every
-        // generated state, not only at a hand-picked endpoint.
+        // Snapshot serialisation must agree with the delta path at every state.
         check_snapshot_equal(decode_snapshot(encode_snapshot(applied)), expected);
         state = std::move(expected);
     }
@@ -158,16 +156,14 @@ MACHA_FAST_TEST("models", test_hydration_scheduler_state_model) {
     CHECK(foreground_next == foreground.size());
     CHECK(background_next == background.size());
     REQUIRE(first_background_turn.has_value());
-    // A 15:1 reinforced priority ratio is allowed to bias service heavily, but
-    // weighted fair scheduling must service the lower-priority run before the
-    // high-priority run is exhausted.
+    // A 15:1 priority ratio may bias service heavily, but the lower-priority run
+    // must be serviced before the high-priority run is exhausted.
     CHECK(*first_background_turn < foreground.size());
     CHECK(!scheduler.next({high, low, reinforcement},
                           [&](const ObjectId& id) { return present.contains(id); })
                .has_value());
 
-    // An unavailable prefix may stall its own ordered run, but it may not stall
-    // an independent run and the scheduler must never jump over that prefix.
+    // An unavailable prefix stalls only its own run, and is never jumped over.
     scheduler.reset();
     present.clear();
     const auto blocked_object = foreground.front();

@@ -37,8 +37,7 @@ struct SubsystemSupervisor::Entry {
     size_t restart_count{};
     std::string last_fault;
     std::unique_ptr<Subsystem> instance;
-    // Set by the running instance's fault sink; consumed by run_entry, which
-    // then tears the instance down and retries it under the usual policy.
+    // Set by the instance's fault sink; run_entry tears down and retries.
     bool fault_requested{};
     std::string pending_fault;
 
@@ -48,18 +47,9 @@ struct SubsystemSupervisor::Entry {
         return plugin_path.empty() ? std::string("<builtin>") : plugin_path.string();
     }
 
-    // Deliberately no dlclose. Unmapping a plugin's code invalidates anything
-    // of it that outlives the Subsystem instance -- a shared_ptr's deleter
-    // and control block, a vtable, a std::function -- and core legitimately
-    // holds such references (SubsystemRegistry hands out
-    // std::shared_ptr<TorrentService>, whose destructor lives in the plugin).
-    // Closing the library on supervisor stop crashed
-    // rpc_cluster/test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node
-    // in exactly that way: the last shared_ptr released after the unmap.
-    // Restarting a faulted subsystem re-creates the instance from the library
-    // that is still loaded, so nothing needs the unload; loading a *new build*
-    // of a plugin without restarting the process is explicitly out of scope
-    // (see the plan's "Risks and open questions").
+    // Never dlclose: core holds plugin code beyond the instance's life (e.g.
+    // a shared_ptr<TorrentService> whose deleter lives in the plugin).
+    // Restarts reuse the loaded library; hot-loading a new build is out of scope.
 };
 
 SubsystemSupervisor::SubsystemSupervisor(std::filesystem::path plugin_dir,
@@ -85,7 +75,7 @@ void SubsystemSupervisor::start(SubsystemContext context) {
 
     for (auto& entry : entries_) {
         if (entry->state == SubsystemState::disabled)
-            continue; // failed to load above; nothing to run.
+            continue; // failed to load
         Entry* raw = entry.get();
         raw->lifecycle = std::jthread([this, raw](std::stop_token stop) {
             run_supervised_loop(raw->name, stop, [this, raw, stop] { run_entry(*raw, stop); });
@@ -95,9 +85,7 @@ void SubsystemSupervisor::start(SubsystemContext context) {
 
 void SubsystemSupervisor::discover_plugins() {
     std::error_code discovery_error;
-    // No plugin directory is an ordinary configuration, not an error: a node
-    // may run only builtins (and every test does). Builtins registered through
-    // add_builtin() are already in entries_ and must still be started.
+    // No plugin directory is ordinary: builtins are already in entries_.
     if (!std::filesystem::is_directory(plugin_dir_, discovery_error))
         return;
 
@@ -123,18 +111,13 @@ void SubsystemSupervisor::discover_plugins() {
             continue;
         }
 
-        ::dlerror(); // clear any pending error before dlsym, per dlsym(3).
+        ::dlerror(); // clear any pending error, per dlsym(3)
         auto* raw_symbol = ::dlsym(entry->handle, kSubsystemEntrySymbol);
         if (const char* symbol_error = ::dlerror(); symbol_error || !raw_symbol) {
-            // Not a real plugin at all, most likely: `plugin_path` defaults
-            // to the executable's own directory, which on a real install can
-            // be a shared system bindir holding unrelated .so files (e.g.
-            // /usr/bin/ld.so on Debian/RPi OS) that happen to match the
-            // extension filter. That is an expected, harmless occurrence,
-            // not a broken deployment -- log it quietly and don't report a
-            // fake "subsystem" for it at all. Unloading is safe here, unlike
-            // for a real plugin (see Entry): nothing of this library was ever
-            // called, so nothing can hold a reference into it.
+            // Not a plugin: the default plugin_path is the executable's
+            // directory, which may hold unrelated .so files (/usr/bin/ld.so).
+            // Log quietly and report nothing. Unloading is safe: none of its
+            // code was called.
             Log::debug("subsystem plugin candidate '" + entry->name +
                       "' has no entry symbol '" + kSubsystemEntrySymbol +
                       "', skipping as not a macha plugin: " +
@@ -175,9 +158,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
     while (!stop.stop_requested()) {
         {
             std::lock_guard lock(entry.mutex);
-            // `restarting` is the honest word for every attempt after the
-            // first: an operator watching Status sees the difference between
-            // a node coming up and a subsystem being rebuilt under it.
+            // Status tells a first start from a rebuild.
             entry.state = entry.restart_count ? SubsystemState::restarting
                                               : SubsystemState::starting;
             entry.fault_requested = false;
@@ -188,19 +169,17 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         bool declined = false;
         std::string fault;
         try {
-            // Each attempt gets this lifecycle thread's own stop token, so a
-            // factory that blocks (FuseFrontend waits for the initial
-            // namespace) can be cancelled by an ordinary supervisor stop.
+            // Lets stop() cancel a blocking factory (FuseFrontend waits for
+            // the initial namespace).
             SubsystemContext attempt = context_;
             attempt.startup_stop = stop;
             instance = entry.factory(attempt);
             if (instance) {
-                // Installed before start(), so a subsystem whose own threads
-                // begin working inside start() can already report through it.
+                // Before start(): threads started inside start() can report.
                 instance->attach_fault_sink([&entry](std::string reason) {
                     std::lock_guard lock(entry.mutex);
                     if (entry.fault_requested)
-                        return; // the first reason is the useful one.
+                        return; // first reason wins
                     entry.fault_requested = true;
                     entry.pending_fault =
                         reason.empty() ? std::string("subsystem reported a fault")
@@ -218,11 +197,8 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         }
 
         if (declined) {
-            // The plugin loaded and its factory ran, but this node is
-            // configured not to run the capability (e.g. torrent.enabled is
-            // false). That is a deliberate operator choice, not a fault: no
-            // instance, no retry, no backoff, and Status says `unavailable`
-            // rather than `disabled`.
+            // Configured off on this node (e.g. torrent.enabled false): not a
+            // fault, so no retry and Status says `unavailable`.
             Log::info("subsystem plugin '" + entry.name +
                       "' loaded but its capability is not enabled on this node path=" +
                       entry.origin());
@@ -232,10 +208,6 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         }
 
         if (fault.empty()) {
-            // Every terminal outcome of a load says so at INFO. Without this
-            // the successful case was the only silent one, so confirming that
-            // a deployed plugin was actually picked up meant inspecting
-            // /proc/<pid>/maps -- see docs/operations.md, "Subsystem plugins".
             Log::info("subsystem plugin '" + entry.name + "' loaded and running path=" +
                       entry.origin());
             {
@@ -243,13 +215,10 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
                 entry.state = SubsystemState::running;
                 entry.instance = std::move(instance);
             }
-            retry.succeeded(); // a clean start resets backoff.
+            retry.succeeded(); // resets backoff, keeps the failure window
 
-            // Park until either the supervisor is stopping or the instance
-            // reports a fault of its own. RetryState::succeeded() above kept
-            // the failure window deliberately, so a subsystem that flaps --
-            // mounts, loses the mount, mounts again -- still walks into
-            // `disabled` rather than remounting forever.
+            // Park until stopping or a reported fault. The kept failure window
+            // drives a flapping subsystem into `disabled`.
             std::unique_lock lock(entry.mutex);
             entry.cv.wait(lock, stop, [&entry] { return entry.fault_requested; });
             const bool post_start_fault = entry.fault_requested;
@@ -269,19 +238,16 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
                     Log::warn("subsystem '" + entry.name + "' stop() threw an unknown exception");
                 }
             }
-            // Destroy the faulted instance before constructing its
-            // replacement: "restartable in place" means the old one is gone,
-            // and its fault sink still points at this entry until it is.
+            // Destroy before building the replacement; its fault sink points
+            // at this entry until then.
             owned.reset();
 
             if (!post_start_fault)
-                return; // ordinary shutdown.
+                return; // ordinary shutdown
 
             Log::error("subsystem '" + entry.name + "' faulted while running: " + fault);
         } else {
-            // A partially-constructed instance never reached `running`; drop
-            // it here so its destructor runs before the retry delay, not
-            // after the next attempt has already built its replacement.
+            // Destroy before the retry delay, not after the next attempt.
             instance.reset();
             Log::error("subsystem '" + entry.name + "' failed to start: " + fault);
         }

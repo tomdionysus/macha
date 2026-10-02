@@ -13,9 +13,7 @@ enum class FrameType : uint8_t {
     foreground = 2,
     read_ahead = 3,
     speculative = 4,
-    // User-requested bulk work. Keep the existing speculative wire value
-    // stable; priority is defined by frame_type_priority(), not enum order.
-    loader = 5,
+    loader = 5, // user-requested bulk work; wire values are fixed
 };
 
 } // namespace macha

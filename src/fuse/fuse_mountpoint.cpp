@@ -148,16 +148,11 @@ MountpointPreparation guard_covered_mountpoint(const std::filesystem::path& moun
 
 void prepare_fuse_mountpoint(const std::filesystem::path& mount_path, const FuseConfig& config) {
     recover_stale_mount(mount_path.string(), config);
-    // The covered directory is a trap while no mount covers it: a writer that
-    // arrives before the mount (an rsync started 25 s after the daemon, while
-    // local services were still coming up) fills the host disk with files the
-    // mount then hides -- 52 GB on a shared host's root disk, 2026-09-07. A
-    // mode change does not stop root; the immutable flag does, and it stays
-    // in place across restarts so the pre-mount window is closed for good.
+    // While unmounted, writes into the covered directory fill the host disk
+    // with files the mount then hides. Only the immutable flag stops root; it
+    // persists across restarts so the pre-mount window stays closed.
     auto prepared = guard_covered_mountpoint(mount_path, config.fail_closed_mountpoint);
-    // Preparation runs once per mount attempt, not once per process (a
-    // supervised mount re-prepares before each retry). The original mode is
-    // whatever the first attempt saw; later attempts inherit it.
+    // Runs per mount attempt; the original mode is the first attempt's.
     if (g_mountpoint_preparation.covered_mode_known) {
         prepared.covered_mode = g_mountpoint_preparation.covered_mode;
         prepared.covered_mode_known = true;

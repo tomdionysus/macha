@@ -23,16 +23,14 @@ double ReplicaSelector::score(const State& state, ReplicaWorkClass work) {
         std::min<uint32_t>(state.consecutive_failures, 8) * failure_penalty_ms;
 
     if (work == ReplicaWorkClass::foreground) {
-        // Foreground optimises completion latency. Existing foreground work is
-        // the strongest ordinary load signal; speculative work still matters,
-        // but foreground is free to use the same peer if it remains clearly
-        // faster than the alternatives.
+        // Optimise completion latency: in-flight foreground work weighs most,
+        // but a clearly faster peer still wins when already busy.
         return transfer + transfer * 1.50 * state.foreground_in_flight +
                transfer * 0.75 * state.speculative_in_flight + failures;
     }
 
-    // Speculation yields aggressively to foreground and prefers unused peers,
-    // which naturally stripes concurrent hydration over a healthy replica set.
+    // Speculation yields to any foreground work and prefers unused peers, which
+    // stripes concurrent hydration over the replica set.
     if (state.foreground_in_flight)
         return 1.0e12 + transfer * state.foreground_in_flight + failures;
     return transfer + transfer * 2.0 * state.speculative_in_flight + failures;

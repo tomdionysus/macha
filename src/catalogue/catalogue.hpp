@@ -62,21 +62,17 @@ inline constexpr uint32_t catalogue_media_profile_schema = 3;
 struct CatalogueSnapshot {
     std::map<std::string, CatalogueItem> items;
     struct MediaProfile {
-        // Schema 2 (0.32.12) adds each stream's codec level and colour
-        // transfer; schema 3 (0.32.16) adds its Dolby Vision profile and
-        // base-layer compatibility. The client instructs from these facts, so
-        // an older profile with a video stream is stale: it is regenerated on
-        // that media's next playback and republished. Reading one is what let
-        // a Dolby Vision title be handed to a decoder that could not take it
-        // (2026-09-07).
+        // Schema 2 adds each stream's codec level and colour transfer; schema 3
+        // its Dolby Vision profile and base-layer compatibility. Clients decide
+        // from these, so an older profile with a video stream is stale and is
+        // regenerated on the media's next playback.
         uint32_t schema_version{catalogue_media_profile_schema};
         bool complete{true};
         MediaProbeResult probe;
         auto operator<=>(const MediaProfile&) const = default;
     };
     std::map<std::string, MediaProfile, std::less<>> media_profiles;
-    // A media's keyframe byte index: an immutable DATA object, like artwork,
-    // referenced beside the profile rather than inside it.
+    // A media's keyframe byte index: an immutable DATA object beside the profile.
     std::map<std::string, ObjectId, std::less<>> media_indexes;
 };
 
@@ -97,8 +93,8 @@ struct CatalogueStatus {
     std::string error;
 };
 
-// The metadata head a maintenance inventory of the catalogue is taken
-// against, captured before the catalogue's repair runs.
+// The metadata head a catalogue maintenance inventory is taken against,
+// captured before the repair runs.
 struct CatalogueMaintenanceHead {
     std::optional<ObjectId> root;
     std::set<ObjectId> roots;
@@ -107,14 +103,13 @@ struct CatalogueMaintenanceHead {
 };
 
 struct CatalogueMaintenance {
-    // DATA objects referenced by the catalogue. These participate in ordinary
-    // DHT placement/repair and global reachability GC.
+    // DATA objects the catalogue references, under ordinary placement, repair
+    // and reachability GC.
     std::set<ObjectId> live;
-    // Catalogue manifest/shards are control-plane objects. They are protected
-    // and swept in the dedicated control store, never by DATA placement.
+    // Catalogue manifest and shards, kept and swept in the control store.
     std::set<ObjectId> control_live;
-    // False means current catalogue metadata could not be fully converged, so
-    // the live set is conservative but incomplete and physical GC must not run.
+    // False: metadata did not fully converge, the live set is incomplete, and
+    // physical GC must not run.
     bool complete{true};
 };
 
@@ -154,9 +149,8 @@ class CatalogueConflict : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// The catalogue content/provider result is not at fault; the cluster cannot
-// currently satisfy the control/DATA durability contract. Scanner work catches
-// this separately and defers without consuming semantic failure attempts.
+// The cluster cannot currently meet the control/DATA durability contract; the
+// content is not at fault. Scanner work defers without spending an attempt.
 class CatalogueUnavailable : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -174,13 +168,11 @@ class CatalogueManager {
     uint64_t cached_metadata_generation_{};
     Clock::time_point cache_until_{};
     uint64_t last_sync_unix_ms_{};
-    // CONTROL objects for a successor catalogue are staged on metadata replicas
-    // before metadata publication can reference them. Track both the current
-    // catalogue-root epoch and the epoch in which each unreferenced object was
-    // first observed by GC. An object cannot be reclaimed in that same epoch:
-    // only observing a later catalogue root proves that it was not merely
-    // data-before-metadata staging for the current root. The time point also
-    // detects content-addressed objects re-affirmed after the current root.
+    // A successor catalogue's CONTROL objects are staged before metadata
+    // references them, so an unreferenced object is reclaimable only once a
+    // later catalogue root has been seen than the epoch it was first seen
+    // unreferenced in. The time point catches objects re-affirmed since the
+    // current root.
     Clock::time_point control_gc_root_epoch_{};
     uint64_t control_gc_root_epoch_sequence_{};
     bool control_gc_root_epoch_initialized_{};
@@ -226,9 +218,8 @@ class CatalogueManager {
     CatalogueStatus status() const;
     CatalogueSnapshot snapshot();
     std::shared_ptr<const CatalogueSnapshot> snapshot_view();
-    // The same, for a caller that says who it is. Warm, it waits on nothing
-    // (the cached snapshot); cold, it loads the catalogue from metadata and
-    // the control store, and the wait guard refuses that to control work.
+    // Warm, waits on nothing (cached snapshot); cold, loads from metadata and
+    // the control store, which the wait guard refuses to control work.
     std::shared_ptr<const CatalogueSnapshot> snapshot_view(const WorkContext&);
     std::optional<CatalogueItem> get(std::string_view id);
     std::optional<MediaProbeResult> media_profile(std::string_view media_id);
@@ -238,15 +229,12 @@ class CatalogueManager {
     void put_media_profile(std::string media_id, MediaProbeResult profile);
     void put_media_profiles(std::map<std::string, MediaProbeResult, std::less<>> profiles);
     size_t prune_media_profiles(const std::set<std::string>& live_media_ids);
-    // The stored keyframe byte index of a media, as its bytes; empty when none
-    // is stored or its object cannot be read.
+    // The stored keyframe byte index; empty when none or unreadable.
     std::optional<Bytes> media_index(std::string_view media_id);
-    // Store `bytes` as a DATA object and reference it as the media's index.
     void put_media_index(std::string media_id, std::span<const uint8_t> bytes);
     std::vector<CatalogueItem> list(std::optional<CatalogueKind> kind = {},
                                     std::optional<std::string_view> parent = {});
-    // `keep`, when given, filters before ranking, so `limit` counts only the
-    // items it keeps.
+    // `keep` filters before ranking, so `limit` counts only kept items.
     std::vector<CatalogueItem> search(std::string_view query, size_t limit = 50,
                                       const std::function<bool(const CatalogueItem&)>& keep = {});
     CatalogueItem upsert(CatalogueItem, std::optional<uint64_t> expected_revision = {});
@@ -275,12 +263,10 @@ class CatalogueManager {
                            const std::map<std::string, MediaProbeResult, std::less<>>& profiles = {},
                            const std::set<std::string>& vanished_media = {});
     std::optional<CatalogueArtworkContent> artwork(const ObjectId&);
-    // The maintenance inventory's catalogue half, in three steps the pass
-    // calls in order at one point (spec A4): the metadata head it is taken
-    // against (may read the committed record when behind), the catalogue's
-    // repair (which may commit a catalogue-root reconciliation; false when
-    // it failed), and the read itself, which fetches any catalogue object it
-    // lacks into the control store and is otherwise without effect.
+    // The maintenance inventory's catalogue half, called in order (spec A4):
+    // the head (may read the committed record when behind); the repair (may
+    // commit a root reconciliation; false on failure); the read, which only
+    // fetches missing catalogue objects into the control store.
     CatalogueMaintenanceHead maintenance_head();
     bool maintenance_repair();
     CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&, bool repaired);

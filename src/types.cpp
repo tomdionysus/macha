@@ -49,8 +49,7 @@ std::string to_string(const ObjectId& id) {
 
 
 std::string endpoint_identity_key(std::string_view host, uint16_t port) {
-    // Brackets keep IPv6 endpoints unambiguous while preserving the familiar
-    // host:port representation used in diagnostics and management responses.
+    // Brackets keep IPv6 endpoints unambiguous in host:port form.
     return "[" + std::string(host) + "]:" + std::to_string(port);
 }
 

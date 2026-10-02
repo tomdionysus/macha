@@ -274,10 +274,8 @@ bool valid_catalogue_media_profile(
             stream.width < 0 || stream.height < 0 || stream.channels < 0 ||
             stream.sample_rate < 0 || stream.bit_depth < 0 || stream.level < 0)
             return false;
-        // A schema-1 profile knows nothing about a video stream's sample
-        // depth signalling or transfer; negotiation needs both, so such a
-        // profile is stale and is regenerated on the next playback (and
-        // republished). Audio-only profiles are unaffected.
+        // An older-schema profile lacks facts clients need for video, so it is
+        // stale and regenerated on next playback; audio-only ones stand.
         if (profile.schema_version < catalogue_media_profile_schema &&
             stream.type == MediaStreamType::video && !stream.attached_picture)
             return false;
@@ -483,8 +481,8 @@ std::optional<CatalogueSnapshot> merge_catalogue_snapshots(
         if (selected) merged.media_indexes.emplace(id, *selected);
     }
 
-    // Avoid combining a parent deletion on one branch with a child creation or
-    // change on another branch. Keep the root conflict durable in that case.
+    // A parent deletion on one branch with a child change on the other is not
+    // merged; the root conflict stays durable.
     for (const auto& [_, item] : merged.items)
         if (item.parent_id && !merged.items.contains(*item.parent_id))
             return {};
@@ -668,9 +666,8 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
             control_converged_nodes_ = std::move(active_nodes);
             control_convergence_retry_ = {};
         } else {
-            // Publication requires only metadata_min_write_replicas durable
-            // copies. Missing/offline replicas are convergence debt and do not
-            // invalidate an already-published catalogue root.
+            // Publication needs only metadata_min_write_replicas copies; missing
+            // replicas are convergence debt, not an invalid root.
             control_converged_root_.reset();
             control_converged_nodes_.clear();
             control_convergence_retry_ = Clock::now() + std::chrono::seconds(5);
@@ -727,9 +724,8 @@ bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& 
 }
 
 void CatalogueManager::repair_once() {
-    // Catalogue refresh is single-flight. API workers can all observe the same
-    // generation notice or TTL expiry at once; only one of them should perform
-    // metadata replica I/O and fetch/decode a replacement immutable root.
+    // Single-flight: of the API workers seeing the same notice or TTL expiry,
+    // only one does the replica I/O and decodes the new root.
     std::lock_guard refresh_lock(refresh_mutex_);
     try {
         {
@@ -746,12 +742,9 @@ void CatalogueManager::repair_once() {
             }
         }
 
-        // MetadataManager is the owner of authoritative replicated metadata reads.
-        // Catalogue convergence consumes the decoded immutable view it has
-        // already established instead of independently repeating the same replica validation
-        // read whenever the catalogue TTL expires or a generation notice arrives.
-        // A genuinely cold CatalogueManager may bootstrap MetadataManager once;
-        // after that this path is strictly memory-only.
+        // MetadataManager owns replicated metadata reads; this consumes its
+        // decoded view. A cold manager may bootstrap it once; after that this
+        // path is memory-only.
         auto view = metadata_.current();
         if (!view) {
             (void)metadata_.record();
@@ -760,17 +753,14 @@ void CatalogueManager::repair_once() {
         if (!view)
             throw std::runtime_error("catalogue metadata snapshot unavailable after successful read");
 
-        // If a newer generation is merely known but has not yet been acquired,
-        // leave convergence to MetadataManager::repair_once(). Do not create a
-        // second replica-validating reader from CatalogueManager. refresh_needed() remains
-        // true, so the catalogue will adopt the view immediately after metadata
-        // maintenance publishes it.
+        // A newer generation known but not yet acquired is left to
+        // MetadataManager::repair_once(); refresh_needed() stays true, so the
+        // view is adopted once metadata maintenance publishes it.
         if (view->generation < node_.known_metadata_generation())
             return;
 
-        // Resolve at most one catalogue-root conflict per maintenance pass. A
-        // disjoint three-way item merge is automatic; any genuine same-item or
-        // parent/child collision remains a durable first-class conflict.
+        // At most one root conflict per pass. Disjoint item merges are
+        // automatic; same-item or parent/child collisions stay durable conflicts.
         if (reconcile_catalogue_conflict(*view)) {
             view = metadata_.current();
             if (!view)
@@ -783,11 +773,8 @@ void CatalogueManager::repair_once() {
         {
             std::lock_guard lock(mutex_);
             if (ready_ && cached_root_ == metadata.catalogue_root) {
-                // MachaDFS namespace mutations advance the global metadata
-                // generation far more often than the catalogue root changes.
-                // The catalogue object itself is immutable/content-addressed,
-                // so an unchanged root means the cached snapshot is still
-                // exactly current. Record convergence without reloading it.
+                // The root is content-addressed: unchanged, the cached snapshot
+                // is current, whatever the generation did.
                 cached_metadata_generation_ = generation;
                 cache_until_ = Clock::now() + node_.config().metadata_cache;
                 last_sync_unix_ms_ = unix_ms();
@@ -805,9 +792,8 @@ void CatalogueManager::repair_once() {
         cache(generation, metadata, std::move(snapshot));
     } catch (const std::exception& e) {
         std::lock_guard lock(mutex_);
-        // A failed convergence attempt must not invalidate a catalogue snapshot
-        // that was previously loaded successfully. Warm API reads can continue
-        // from that immutable root while the next request/background pass retries.
+        // A failed attempt keeps the loaded snapshot; warm reads continue on it
+        // while a later pass retries.
         error_code_ = "unavailable";
         error_ = e.what();
         throw;
@@ -817,16 +803,13 @@ void CatalogueManager::repair_once() {
 std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
     {
         std::lock_guard lock(mutex_);
-        // Warm reads are deliberately memory-only. Catalogue convergence is a
-        // control-plane/background responsibility; an API GET must never block
-        // on metadata replica I/O merely because a short validation TTL expired.
+        // Warm reads are memory-only: convergence is background work, and a GET
+        // never blocks on replica I/O for an expired TTL.
         if (ready_ && cached_)
             return cached_;
     }
 
-    // A genuinely cold manager has no coherent snapshot to serve, so its first
-    // read still has to establish one synchronously. Subsequent reads remain on
-    // the immutable shared snapshot while background convergence replaces it.
+    // A cold manager's first read loads a snapshot synchronously.
     repair_once();
 
     std::lock_guard lock(mutex_);
@@ -860,9 +843,8 @@ CatalogueStatus CatalogueManager::status() const {
         cached = cached_;
     }
 
-    // Potentially large artwork walks and backend existence probes must not hold
-    // the snapshot publication mutex; ordinary API reads only need that mutex
-    // long enough to acquire the immutable shared snapshot.
+    // Artwork walks and existence probes run outside the publication mutex,
+    // which readers hold only to take the shared snapshot.
     std::set<ObjectId> art;
     if (cached)
         for (const auto& [_, item] : cached->items)
@@ -1136,9 +1118,8 @@ void CatalogueManager::commit(
     const auto required = durability_required();
     const auto new_artwork = data_object_ids(next);
 
-    // Artwork is ordinary immutable DATA. Validate only newly introduced references;
-    // unchanged artwork was already proven by the committed catalogue. DHT placement,
-    // fallback, replication and repair are exactly the same as for media objects.
+    // Artwork is ordinary immutable DATA. Only new references are validated;
+    // unchanged ones were proven by the committed catalogue.
     for (const auto& id : new_artwork) {
         if (old_artwork.contains(id)) continue;
         if (!store_.get(id, 0, FrameType::speculative))
@@ -1177,9 +1158,8 @@ void CatalogueManager::commit(
         return;
     }
 
-    // A catalogue metadata commit may reference a control object only after the
-    // configured metadata write floor has durably stored it. Every active node
-    // is eligible; DATA capacity is irrelevant to this control path.
+    // A commit may reference a control object only once the metadata write
+    // floor holds it. Every active node is eligible, whatever its DATA capacity.
     for (const auto& [id, encoded] : changed_control) {
         if (store_.replicate_control(id, encoded) < required)
             throw CatalogueUnavailable("catalogue shard could not reach metadata durability floor");
@@ -1189,12 +1169,8 @@ void CatalogueManager::commit(
 
     try {
         if (resolved_conflict) {
-            // mutate_delta, not mutate: a tree-backed namespace has no entry
-            // map to diff, so a commit must declare its change set. This was
-            // the last caller still using the non-exact path, and on
-            // 2026-09-22 it took every catalogue route to 503 on all three
-            // nodes -- every client reporting "no API" while health and auth
-            // answered fine, because the catalogue is what a client renders.
+            // mutate_delta: a tree-backed namespace has no entry map to diff,
+            // so a commit declares its change set.
             metadata_.mutate_delta([&](MetadataSnapshot& metadata, MetadataDelta& delta) {
                 if (metadata.catalogue_root != expected_root)
                     throw CatalogueConflict("catalogue changed concurrently");
@@ -1208,9 +1184,7 @@ void CatalogueManager::commit(
                 metadata.conflicts.erase(found);
                 delta.catalogue = CatalogueDelta::set;
                 delta.catalogue_root = root;
-                // The standing conflict set is part of the record, so the
-                // delta carries it rather than leaving a replay to infer the
-                // erase.
+                // The delta carries the conflict set; a replay infers nothing.
                 delta.replace_conflicts = metadata.conflicts;
                 for (const auto& id : old_artwork)
                     if (!new_artwork.contains(id))
@@ -1336,17 +1310,14 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
         cached_generation = cached_metadata_generation_;
     }
 
-    // This is intentionally only an early-negative test. A stale catalogue
-    // snapshot must never turn a potentially valid mutation into a false 404.
+    // An early-negative test only: a stale snapshot must never cause a false 404.
     const auto known_generation = node_.known_metadata_generation();
     if (cached_generation >= known_generation)
         return true;
 
-    // Global metadata generations also advance for namespace, garbage and voter
-    // changes. If MetadataManager has already decoded the known generation and
-    // its immutable catalogue root is unchanged, the cached catalogue is still
-    // exactly current even though its bookkeeping generation is older. This is
-    // a memory-only proof and avoids a replica repair for a definite 404.
+    // If MetadataManager has decoded the known generation and the catalogue
+    // root is unchanged, the cache is current despite an older generation: a
+    // memory-only proof, sparing a replica repair for a definite 404.
     if (auto available = metadata_.current();
         available && available->generation >= known_generation &&
         available->snapshot->catalogue_root == cached_root)
@@ -1372,10 +1343,8 @@ CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     if (expected_revision && root->second.revision != *expected_revision)
         throw CatalogueConflict("catalogue item revision changed");
 
-    // Clearing metadata is deliberately stronger than editing an item blank.
-    // Remove the catalogue entity, and for hierarchy entities remove its
-    // descendants as well. Preserve the immutable media identities before the
-    // removal so the caller can enqueue only those files for re-enrichment.
+    // Removes the entity and its descendants, returning their media ids so the
+    // caller can re-enrich only those files.
     std::set<std::string> removed_ids{root->first};
     bool grew = true;
     while (grew) {
@@ -1482,10 +1451,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
             const bool metadata_locked =
                 manual != it->second.external_ids.end() && manual->second == "1";
             if (metadata_locked) {
-                // A user-edited catalogue item remains authoritative for descriptive
-                // metadata. Scanner reconciliation still discovers additional local
-                // media bindings, and the complete-scan pass below still removes
-                // bindings that vanished from the namespace.
+                // A user-edited item keeps its descriptive metadata; its media
+                // bindings are still reconciled.
                 auto preserved = it->second;
                 preserved.media_ids.insert(preserved.media_ids.end(), item.media_ids.begin(),
                                            item.media_ids.end());
@@ -1501,10 +1468,9 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                 changed = true;
                 continue;
             }
-            // Scanner artwork is a candidate set, not one slot per role. Preserve
-            // every previously known immutable object unless the provider/local
-            // scan already supplied the same role+object again. This allows, for
-            // example, an embedded MP3 cover and a provider cover to coexist.
+            // Scanner artwork is a candidate set, not one slot per role: known
+            // objects are kept unless resupplied, so an embedded cover and a
+            // provider cover coexist.
             for (const auto& art : it->second.artwork) {
                 const bool already_present = std::any_of(
                     item.artwork.begin(), item.artwork.end(), [&](const auto& candidate) {
@@ -1512,9 +1478,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                     });
                 if (!already_present) item.artwork.push_back(art);
             }
-            // A provider match may represent another local file for an item
-            // already known to the catalogue. Preserve existing bindings here;
-            // the active-media reconciliation below removes vanished ones.
+            // A match may be another file of a known item: keep existing
+            // bindings; vanished ones are removed below.
             item.media_ids.insert(item.media_ids.end(), it->second.media_ids.begin(),
                                   it->second.media_ids.end());
             std::sort(item.media_ids.begin(), item.media_ids.end());
@@ -1534,8 +1499,8 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
     }
 
     if (prune_missing) {
-        // Only scanner-owned leaf bindings are reconciled against a complete
-        // namespace scan. Manually-created catalogue entries are never removed.
+        // Only scanner-owned leaf bindings are reconciled; manual entries are
+        // never removed.
         for (auto& [_, item] : current.items) {
             auto marker = item.external_ids.find("macha_scanner");
             if (marker == item.external_ids.end() || marker->second != "1")
@@ -1584,7 +1549,7 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
             } else ++it;
         }
 
-        // Remove now-empty scanner-created hierarchy nodes from the bottom up.
+        // Bottom-up removal of empty scanner-created hierarchy nodes.
         bool removed = true;
         while (removed) {
             removed = false;
@@ -1635,10 +1600,8 @@ CatalogueArtwork CatalogueManager::put_artwork(std::string_view item_id, std::st
     try {
         (void)upsert(*item, item->revision);
     } catch (...) {
-        // stage_artwork() is content-addressed. A concurrent successful commit
-        // may make this exact hash live at any point after our failed upsert, so
-        // even local check-then-delete cleanup is unsafe. Leave failed staging
-        // as an unreachable orphan for the grace-period reachability collector.
+        // Content-addressed: a concurrent commit may make this hash live, so
+        // failed staging is left as an orphan for reachability GC.
         throw;
     }
     return art;
@@ -1657,10 +1620,8 @@ std::optional<CatalogueArtworkContent> CatalogueManager::artwork(const ObjectId&
     }
     if (!mime_type)
         return {};
-    // Reading DATA must never require the reader to become an authoritative
-    // owner. A full/small node can serve artwork directly from its DHT owner,
-    // exactly as it can read a remotely placed media extent. The normal get()
-    // path may use cache opportunistically without consuming DATA replica quota.
+    // Reading DATA never makes the reader an owner: artwork is read from its
+    // owner like any remote extent, cached without using replica quota.
     auto bytes = store_.get(id, 0, FrameType::foreground);
     if (!bytes)
         return {};
@@ -1712,10 +1673,8 @@ CatalogueRetentionObjects CatalogueManager::retention_objects(
 }
 
 CatalogueMaintenanceHead CatalogueManager::maintenance_head() {
-    // Maintenance liveness must be based on converged catalogue metadata, not
-    // the deliberately stale-tolerant API cache returned by current_snapshot().
-    // Otherwise an obsolete catalogue root/artwork object can remain marked
-    // live indefinitely after a remote catalogue mutation, preventing GC.
+    // Liveness comes from converged metadata, not the stale-tolerant API cache,
+    // or obsolete objects could stay live after a remote mutation.
     CatalogueMaintenanceHead head;
     try {
         auto view = metadata_.current();
@@ -1751,10 +1710,8 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     const auto& metadata_roots = head.roots;
     const uint64_t metadata_generation = head.generation;
     const bool metadata_current = head.current;
-    // A catalogue-root conflict keeps the effective catalogue at the
-    // common-ancestor value, but every alternative remains durable state
-    // until explicit resolution. Protect all immutable alternative roots
-    // (and, below, their manifests/shards/artwork) from reachability GC.
+    // A root conflict's alternatives stay durable until resolved: protect
+    // their roots, manifests, shards and artwork from GC.
     out.control_live.insert(metadata_roots.begin(), metadata_roots.end());
     bool repair_ok = repaired;
     std::optional<ObjectId> root;
@@ -1833,15 +1790,10 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
                                          size_t operation_budget) {
     if (!operation_budget) return 0;
 
-    // Catalogue publication is intentionally data-before-metadata: immutable
-    // manifest/shard objects must already satisfy the metadata write floor
-    // before an accepted metadata commit may reference them. Consequently a future
-    // root's CONTROL objects are temporarily unreachable from the *current*
-    // metadata root. Time alone is not a sufficient fence: the root may advance
-    // between staging and a maintenance pass whose live set still reflects the
-    // previous root. Give every unreferenced object an explicit catalogue-root
-    // epoch. It must survive the epoch in which GC first observes it (or in which
-    // it is re-affirmed); only a later root epoch can make it an ordinary orphan.
+    // Publication is data-before-metadata, so a future root's CONTROL objects
+    // are briefly unreferenced. Time is no fence: the root may advance between
+    // staging and a pass. An unreferenced object survives the root epoch in
+    // which GC first sees (or re-affirms) it; only a later epoch orphans it.
     Clock::time_point root_epoch;
     uint64_t root_epoch_sequence = 0;
     {
@@ -1867,10 +1819,8 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
             continue;
         }
 
-        // A content-addressed object may have existed for several catalogue
-        // generations and then been re-used by the current publication. LocalStore
-        // touches an existing object on put(), so preserve any object whose durable
-        // age shows that it was staged/re-affirmed after this root was observed.
+        // A content-addressed object may be reused by the current publication;
+        // put() touches it, so keep any object touched since this root was seen.
         if (!node_.control_store().older_than(*id, staged_since_root)) {
             std::lock_guard lock(mutex_);
             if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
@@ -1888,9 +1838,8 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
             if (inserted || seen->second == root_epoch_sequence)
                 continue;
 
-            // Keep the root epoch stable across the local removal. cache() takes
-            // the same mutex when publishing a newly observed root, so stale-live
-            // GC can never race a root transition and delete that root's staging.
+            // cache() takes this mutex to publish a new root, so GC never races
+            // a root transition and deletes its staging.
             if (node_.claims().retained(RetentionClass::control, *id))
                 continue;
             if (node_.control_store().remove_if_older_than(*id, grace)) {

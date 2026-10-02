@@ -4,22 +4,11 @@
 //
 //   macha-recover [endpoint]
 //
-// Cluster recovery keys are not issued in this deployment model, so this tool
-// has nothing to present and no route to present it to. It exists so that an
-// operator who reaches for it in an emergency -- because older notes and the
-// shipped config example name it -- is told what to do instead of being handed
-// "command not found".
-//
-// The machinery for recovery keys is still in src/users.{hpp,cpp} and still
-// tested; nothing calls it. See create_genesis_root() for why.
+// Recovery keys are not issued: the recovery-key code in src/users.{hpp,cpp}
+// is unused (see create_genesis_root()).
 #include <iostream>
 
 int main(int argc, char** argv) {
-    // Recovery keys are not issued in this deployment model, so there is
-    // nothing for this tool to present. It stays, and exits successfully,
-    // because it is named in older notes and in the shipped config example:
-    // an operator reaching for it in an emergency must be told what to do
-    // instead, not handed "command not found" and left guessing.
     (void)argc;
     (void)argv;
     std::cout

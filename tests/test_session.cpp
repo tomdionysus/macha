@@ -8,10 +8,8 @@ using namespace macha::test_support;
 
 namespace {
 
-// Anonymous access is an ordinary account, so a node that does not yet hold it
-// cannot mint an anonymous session -- which is the correct answer, not a bug.
-// A real cluster gets it at genesis; a bare NodeRuntime in a test has to be
-// given one.
+// Anonymous access is an ordinary account created at genesis; a bare
+// NodeRuntime in a test must be given one before it can mint anonymous sessions.
 UserRecord give_anonymous_account(NodeRuntime& node) {
     auto created = node.users().create_without_password(
         anonymous_username, {std::string(role_media_viewer)}, node.node_id());
@@ -42,9 +40,8 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     CHECK(!body.find("id")->asString().empty());
     CHECK(!body.find("token")->asString().empty());
     REQUIRE(body.find("roles")->isArray());
-    // Anonymous is read-only at genesis, and what it may do is that account's
-    // roles rather than a config key: media_viewer as granted, plus the
-    // view_status every capability implies.
+    // Anonymous's capabilities are its account's roles: media_viewer as
+    // granted, plus the view_status every capability implies.
     const auto& minted_roles = body.find("roles")->asArray();
     REQUIRE(minted_roles.size() == 2);
     const auto holds = [&](std::string_view role) {
@@ -53,7 +50,6 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     };
     CHECK(holds("media_viewer"));
     CHECK(holds("view_status"));
-    // An anonymous session is bound to the anonymous account like any other.
     CHECK(body.find("user_id")->asString() == anonymous.id);
     CHECK(body.find("expires_unix_ms")->asUInt64() > body.find("created_unix_ms")->asUInt64());
 
@@ -132,11 +128,7 @@ MACHA_FAST_TEST("session", test_session_expiry) {
 }
 
 MACHA_FAST_TEST("session", test_session_create_enforces_max_sessions) {
-    // Regression: a runaway client (observed live -- a broken proactive-
-    // refresh timer that re-minted on every request) must hit a hard local
-    // cap rather than growing this node's replica without bound. create()
-    // used to skip the max_sessions check entirely (only apply(), the
-    // gossip-received path, enforced it).
+    // create() enforces max_sessions locally, not only apply() on the gossip path.
     SessionManager manager(1min, 2);
     REQUIRE(manager.create({"anonymous"}).has_value());
     REQUIRE(manager.create({"anonymous"}).has_value());
@@ -145,9 +137,8 @@ MACHA_FAST_TEST("session", test_session_create_enforces_max_sessions) {
 }
 
 std::optional<AuthSession> stored(const SessionManager& manager, const Hash256& token_hash) {
-    // find()/validate() intentionally hide a revoked record (it must never
-    // authenticate a request), so this test inspects the raw stored record
-    // via recent() instead, which applies no such liveness filter.
+    // find()/validate() hide revoked records, so read the raw record via
+    // recent(), which applies no liveness filter.
     for (auto& session : manager.recent(1min))
         if (session.token_hash == token_hash) return session;
     return std::nullopt;

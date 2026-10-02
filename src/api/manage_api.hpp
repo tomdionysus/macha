@@ -15,9 +15,9 @@
 
 namespace macha {
 
-// Human management surface over MachaDFS and catalogue exception state.  This
-// deliberately orchestrates the existing namespace/catalogue primitives rather
-// than maintaining a second management database.
+// Human management surface over MachaDFS and catalogue exception state,
+// orchestrating the namespace/catalogue primitives rather than keeping a
+// second management database.
 class ManageApi {
     NodeRuntime& node_;
     MetadataView& metadata_;

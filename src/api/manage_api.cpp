@@ -556,9 +556,8 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
 
         const auto key = identity_reset_key(reset.host, reset.port);
         try {
-            // Peer propagation and the cluster-metadata audit are deliberately
-            // outside the HTTP request. The locally durable tombstone is the
-            // operational commit; these steps make that intent converge.
+            // The locally durable tombstone is the commit; peer propagation and the
+            // cluster-metadata audit converge it outside the request.
             node_.propagate_identity_reset(reset);
             const auto committed = metadata_.mutate_delta(
                 [&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
@@ -577,9 +576,8 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
                       " epoch=" + std::to_string(reset.epoch) +
                       " metadata_generation=" + std::to_string(committed.generation));
         } catch (const std::exception& error) {
-            // The operational reset remains durable in Membership and travels
-            // in subsequent identity-reset exchanges. A later explicit reset
-            // can retry the optional cluster-metadata audit without undoing it.
+            // The reset stays durable in Membership and travels in later identity-reset
+            // exchanges; a later explicit reset can retry the audit.
             Log::warn("management identity reset audit deferred scope=" + key +
                       " epoch=" + std::to_string(reset.epoch) + " error=" + error.what());
         }
@@ -587,9 +585,8 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
 }
 
 HttpResponse ManageApi::handle(const HttpRequest& request) {
-    // Management writes are intentionally serialized. Combined with immutable
-    // media-id verification below this prevents two stale UI sessions from both
-    // resolving or deleting the same exception through this API.
+    // Management writes are serialised; with media-id verification below, two
+    // stale UI sessions cannot both resolve or delete the same exception.
     std::unique_lock mutation_lock(mutation_mutex_, std::defer_lock);
     if (request.method != "GET") mutation_lock.lock();
     try {
@@ -625,10 +622,9 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
             reset.reason = std::move(reason);
             const auto key = identity_reset_key(reset.host, reset.port);
 
-            // Association reset is a recovery primitive. It must not depend on
-            // the metadata state whose convergence can itself be fenced by the
-            // stale identity. Allocate from every locally known tombstone,
-            // apply and propagate first, then publish the durable metadata audit.
+            // A recovery primitive: it must not depend on metadata whose convergence the
+            // stale identity may fence. Allocate from every local tombstone, apply and
+            // propagate, then publish the durable metadata audit.
             reset.epoch = 1;
             auto advance_epoch = [&](const IdentityAssociationReset& existing) {
                 if (existing.epoch < reset.epoch)
@@ -641,9 +637,8 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 if (identity_reset_key(existing.host, existing.port) == key)
                     advance_epoch(existing);
 
-            // The request commits only the small local recovery record. Peer
-            // propagation and metadata auditing may be arbitrarily slow and
-            // therefore belong exclusively to the asynchronous audit worker.
+            // The request commits only the local recovery record; slow propagation and
+            // auditing belong to the asynchronous audit worker.
             node_.apply_identity_reset(reset);
             queue_identity_reset_audit(reset);
 
@@ -663,12 +658,12 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
             return http_json(202, Json(std::move(out)).dump());
         };
 
-        // General cluster management action. This does not require a NodeId:
+        // Cluster-wide association reset; no NodeId required:
         //   host + port + node_id => one known endpoint->NodeId association
         //   host + port           => whatever stale identity occupied that endpoint
-        //   host                  => all stale endpoint associations on that IP/host
-        // The wildcard forms suppress pre-reset gossip but allow a fresh,
-        // directly authenticated peer to establish a replacement association.
+        //   host                  => all stale endpoint associations on that host
+        // Wildcard forms suppress pre-reset gossip but let a fresh, directly
+        // authenticated peer establish a replacement association.
         if (request.method == "POST" &&
             request.path == "/api/v1/manage/identity-associations/reset") {
             const auto body = parse_body(request);
@@ -692,8 +687,7 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                                          string_value(body, "reason"));
         }
 
-        // Node-scoped convenience route retained for Status node detail and
-        // future node management actions under /api/v1/manage/nodes/....
+        // Node-scoped route, used by Status node detail.
         constexpr std::string_view node_manage_prefix = "/api/v1/manage/nodes/";
         if (request.method == "POST" && request.path.starts_with(node_manage_prefix)) {
             const auto id_text = route_id(request.path, node_manage_prefix,
@@ -714,10 +708,8 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                     port = static_cast<uint16_t>(raw);
                 }
 
-                // When no endpoint is supplied, resolve the node's most recent
-                // endpoint from live membership and then durable status. If the
-                // caller supplies only a host, port=0 is intentionally retained
-                // as a host-wide reset for this NodeId.
+                // Without an endpoint, use the node's latest from live membership, then
+                // durable status. A host alone keeps port=0: a host-wide reset for this NodeId.
                 if (host.empty()) {
                     for (const auto& member : node_.membership().all()) {
                         if (member.id == *stale_id) {
@@ -1014,8 +1006,8 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
                 bindings = media_bindings(*catalogue_.snapshot_view(
                     WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/manage/filesystem")));
             } catch (const std::exception& e) {
-                // MachaDFS browsing is independent of catalogue availability.
-                // Binding annotations are a convenience only.
+                // MachaDFS browsing does not depend on the catalogue; binding annotations are
+                // a convenience.
                 Log::debug("manage MachaDFS browse without catalogue bindings: " +
                            std::string(e.what()));
             }

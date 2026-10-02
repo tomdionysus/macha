@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The ledger's predicate queries (the object ledger spec, B3). Primitives:
-// each predicate over all sixteen combinations of its facts, against the
-// spec's definitions written out as a table here; each query against a fake
-// ledger and placement, over every page bound, against the predicate
-// applied to the whole set at once.
+// The ledger's predicate queries. Each predicate is checked over all sixteen
+// combinations of its facts against the spec's table below; each query runs
+// against a fake ledger and placement, over every page bound, and is compared
+// with the predicate applied to the whole set at once.
 #include "contract/object_ledger.hpp"
 #include "contract/predicates.hpp"
 #include "test_framework.hpp"

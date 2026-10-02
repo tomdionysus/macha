@@ -158,12 +158,10 @@ void NodeServices::request_stop() {
     media_information_.request_stop();
 }
 
-// Dependants stop before providers. The graph leaves free whether the
-// producers -- the plugins, the torrent coordinator and the cluster job view
-// -- stop before or after maintenance; they stop first, while the node still
-// admits DATA work and outbound RPC (a plugin writes into the store until it
-// is stopped), and then outbound calls are cancelled, so the joins that
-// follow, maintenance's among them, cannot wait on a slow peer.
+// Dependants stop before providers. The producers (plugins, torrent
+// coordinator, cluster job view) stop before maintenance, while the node still
+// admits DATA work and outbound RPC; then outbound calls are cancelled so the
+// joins that follow cannot wait on a slow peer.
 void NodeServices::stop() {
     if (!started_ || stopped_)
         return;
@@ -197,11 +195,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     const RetentionDot dot{context.origin, context.sequence};
     std::vector<ObjectId> data;
     std::vector<ObjectId> control;
-    // Phase timing for the pre-publication barrier: on the live cluster
-    // (2026-09-07) mutations spent 9-15 s here while retain_data() itself
-    // reported nothing over 250 ms, so the seconds were in the collection
-    // step (a full parent snapshot decode, catalogue root diffs) or the
-    // CONTROL claim. Name the phase instead of guessing.
+    // Per-phase timing, so a slow barrier names its phase.
     const auto barrier_started = Clock::now();
     uint64_t decode_ms = 0, collect_ms = 0, catalogue_ms = 0, data_ms = 0, control_ms = 0;
     const auto since_ms = [](Clock::time_point t) {
@@ -236,19 +230,16 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     auto before = decode_snapshot(context.parent.payload);
     decode_ms = since_ms(decode_started);
     const auto collect_started = Clock::now();
-    // Both namespaces below may be trees rather than maps, so every read of
-    // them goes through the namespace primitives. These are retention claims:
-    // an entry missed here is an object that never acquires liveness evidence
-    // and can be collected while it is still referenced.
+    // Either namespace may be a tree, so reads go through the namespace
+    // primitives. An entry missed here never gets liveness evidence and can be
+    // collected while still referenced.
     auto namespace_nodes = ControlNamespaceNodeStore::for_reading(node_, store_);
     const bool establish_baseline =
         !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
     if (establish_baseline) {
-        // Migration safety: before protocol-20 retention-aware GC is enabled for
-        // an upgraded namespace, every object reachable from the reconciled
-        // migration view must acquire physical liveness evidence. This is a
-        // one-time potentially-large publication; normal partition-time GC does
-        // not require global convergence after the baseline exists.
+        // Baseline: before retention-aware GC is enabled for a namespace, every
+        // object reachable from the reconciled view must acquire liveness evidence.
+        // One-time and potentially large.
         for_each_namespace_entry(context.proposed, &namespace_nodes,
                                  [&](const std::string&, const FsEntry& entry) {
                                      add_entry(entry);
@@ -260,8 +251,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
         }
-        // The namespace tree is control objects too, every one of them
-        // reachable from the root and none of them from anything else.
+        // Tree nodes are control objects, all reachable only from the root.
         if (context.proposed.namespace_root)
             collect_namespace_tree_nodes(*context.proposed.namespace_root, namespace_nodes,
                                          control);
@@ -269,23 +259,16 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
         if (context.delta) {
             for (const auto& [_, entry] : context.delta->upsert_entries)
                 add_entry(entry);
-            // A DLT8 append carries only the new extents, but the semantic
-            // change is to the whole file: like the upsert it replaces, it
-            // needs a fresh retention dot on every extent the file now holds
-            // (a touch that carries no extents included), or a concurrent
-            // delete could release the inherited claim.
+            // An append carries only new extents but changes the whole file: every
+            // extent it now holds needs a fresh dot (a touch with no extents too), or a
+            // concurrent delete could release the inherited claim.
             for (const auto& [path, _] : context.delta->append_entries) {
                 if (auto found = namespace_entry(context.proposed, &namespace_nodes, path))
                     add_entry(*found);
             }
         } else {
-            // The no-delta path: rediscover what changed by comparing the
-            // two namespaces entry by entry. Under trees that is a walk of
-            // one plus a lookup per path in the other, which is worse than
-            // the two map walks it replaces -- and it is exactly the cost
-            // Stage C removes by carrying the change set into the commit
-            // instead. This branch is the fallback; every ordinary mutation
-            // arrives with a delta and takes the cheap path above.
+            // Fallback without a delta: compare the namespaces entry by entry (under
+            // trees, a walk plus a lookup per path). Ordinary mutations carry a delta.
             for_each_namespace_entry(
                 context.proposed, &namespace_nodes,
                 [&](const std::string& path, const FsEntry& entry) {
@@ -295,10 +278,8 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
                 });
         }
 
-        // The tree nodes this commit introduced need claims exactly as the
-        // catalogue shards it changed do. Without them the nodes that say
-        // where every file lives are unreferenced control objects to the
-        // collector, which is what they were from the cutover until this line.
+        // Tree nodes this commit introduced need claims, as changed catalogue shards
+        // do; otherwise the collector sees them as unreferenced.
         if (context.proposed.namespace_root &&
             before.namespace_root != context.proposed.namespace_root)
             collect_namespace_tree_changes(before.namespace_root, *context.proposed.namespace_root,

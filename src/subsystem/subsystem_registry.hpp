@@ -9,31 +9,20 @@ namespace macha {
 class FuseFrontend;
 class TorrentService;
 
-// Where a subsystem plugin publishes the capability it implements and where
-// core looks that capability up. Core never names a plugin's concrete class
-// (TorrentManager lives in libmacha-torrent, not in macha_core); it holds
-// only the abstract interface it finds here, and "no plugin loaded" is simply
-// a null lookup rather than a compile-time fact.
-//
-// Lookups return a shared_ptr deliberately. A supervised subsystem is
-// destroyed and reconstructed in place on fault, which would dangle a raw
-// pointer an HTTP handler was already inside; a caller that took a copy keeps
-// the old instance alive until it is done with it.
+// Where subsystem plugins publish their capabilities and core looks them up by
+// abstract interface; "no plugin loaded" is a null lookup. Lookups return
+// shared_ptr because a faulted subsystem is rebuilt in place: a caller's copy
+// keeps the old instance alive until it is done.
 class SubsystemRegistry {
   public:
     void publish_torrent(std::shared_ptr<TorrentService>);
-    // Takes the instance being withdrawn, not just a "clear it" command: a
-    // faulted subsystem's stop() can land after its replacement has already
-    // published, and must not withdraw the live one.
+    // Withdraws only if the given instance is current: a faulted subsystem's stop()
+    // can run after its replacement has published.
     void withdraw_torrent(const TorrentService*);
     std::shared_ptr<TorrentService> torrent() const;
 
-    // FUSE publishes its concrete FuseFrontend rather than an abstract
-    // service, because unlike TorrentManager it is core's own class: it lives
-    // in macha_core and only the libfuse-facing adapter moves into a plugin
-    // (see TODO/archive/2026-09-14-fuse-supervised-subsystem-plan.md, decision 2).
-    // Status and the manage endpoints therefore keep their concrete types, and
-    // tests keep constructing a FuseFrontend directly.
+    // Concrete type: FuseFrontend lives in macha_core; only the libfuse
+    // adapter is a plugin.
     void publish_fuse(std::shared_ptr<FuseFrontend>);
     void withdraw_fuse(const FuseFrontend*);
     std::shared_ptr<FuseFrontend> fuse() const;

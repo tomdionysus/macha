@@ -32,9 +32,9 @@ std::chrono::milliseconds maintenance_background_interval(const MaintenanceConfi
 // says how, deterministically (ids in hex, no times).
 using MaintenanceTraceHook = std::function<void(std::string_view kind, std::string_view detail)>;
 
-// Where Service and the maintenance pass meet. Service owns it and it
-// outlives the component: events arrive and the diagnostics are read from
-// the start of the node, before the pass exists, and after it has stopped.
+// Where Service and the maintenance pass meet. Service owns it; it outlives
+// the pass, since events arrive and diagnostics are read before the pass
+// exists and after it stops.
 struct MaintenancePort {
     // Service rings it: `event` advances, and the pass wakes when told to.
     std::mutex wait_mutex;

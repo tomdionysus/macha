@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The libmacha-torrent plugin's boundary with core: the one exported C symbol
-// (kSubsystemEntrySymbol) plus the Subsystem that owns a TorrentManager's
-// lifecycle and publishes it to the SubsystemRegistry while it is running.
-// See TODO/archive/2026-09-05-subsystem-plugin-isolation-plan.md, Phase 1.
+// The plugin's boundary with core: the exported kSubsystemEntrySymbol and the
+// Subsystem owning a TorrentManager's lifecycle and registry publication.
 
 #include "log.hpp"
 #include "macha_version.hpp"
@@ -24,12 +22,8 @@ class TorrentSubsystem final : public Subsystem {
                      TorrentConfig config, const std::filesystem::path& state_path)
         : registry_(registry),
           manager_(std::make_shared<TorrentManager>(node, ingest, std::move(config), state_path)) {
-        // Published here rather than in start(): construction is what makes
-        // the engine usable (it loads persisted jobs and answers queries and
-        // actions immediately), and start() only spins the polling worker. If
-        // start() does throw, the supervisor destroys this object, whose
-        // destructor withdraws it again -- so a failed start still leaves the
-        // capability absent.
+        // Published at construction, which makes the engine usable; start()
+        // only runs the worker. A failed start destroys this, withdrawing it.
         registry_.publish_torrent(manager_);
     }
 
@@ -37,10 +31,8 @@ class TorrentSubsystem final : public Subsystem {
 
     std::string_view name() const noexcept override { return "torrent"; }
 
-    // The worker reports a fault it cannot contain to one job here, and the
-    // supervisor rebuilds this subsystem from jobs.json. Until 0.63.0 this was
-    // the default no-op: the worker died on 2026-09-26 and Status still said
-    // `running`.
+    // A fault the worker cannot contain to one job: the supervisor rebuilds
+    // this subsystem from jobs.json.
     void attach_fault_sink(FaultSink sink) override { manager_->set_fault_sink(std::move(sink)); }
 
     void start() override { manager_->start(); }
@@ -62,10 +54,7 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
                 throw std::runtime_error("torrent subsystem requires config, node, ingest and "
                                          "registry in its context");
             if (!context.config->torrent.enabled) {
-                // Not a fault: an operator turned it off. Returning no
-                // instance leaves the capability unavailable without the
-                // supervisor's retry/disable machinery treating it as a
-                // failing plugin.
+                // Disabled, not a fault: no instance, and no supervisor retry.
                 macha::Log::info("torrent subsystem not started: torrent.enabled is false");
                 return {};
             }

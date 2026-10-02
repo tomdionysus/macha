@@ -12,10 +12,8 @@
 #include <string>
 #include <string_view>
 
-// Edges by referrer (the object ledger spec, B2): the replicated metadata as
-// the components above it see it. Implemented by MetadataManager; each
-// operation is the manager's existing one under the contract's name, so a
-// caller moved onto the contract calls exactly what it called before.
+// Edges by referrer (object ledger spec, B2): the replicated metadata as the
+// components above it see it. Implemented by MetadataManager.
 namespace macha {
 
 // One decoded snapshot and the head it is at.
@@ -52,8 +50,8 @@ struct MetadataMutationIdentity {
     uint64_t sequence{};
 };
 
-// Where a mutation's wall time has gone since start: the pre-publication
-// retention barrier and the commit fan-out, totals and maxima in ms.
+// Mutation wall time since start: the pre-publication retention barrier and
+// the commit fan-out, totals and maxima in ms.
 struct MetadataMutationTiming {
     uint64_t mutations{};
     uint64_t retention_ms_total{};
@@ -71,24 +69,20 @@ class MetadataView {
     static constexpr Waits current_waits = Waits::none;
     virtual std::optional<MetadataSnapshotView> current() const = 0;
 
-    // The snapshot at the newest generation this node knows of: the cache
-    // when it is current, otherwise read from the replicas. With a work
-    // context, the wait guard refuses it to work that may not wait on the
-    // network.
+    // The snapshot at the newest generation known: the cache when current,
+    // else read from the replicas. With a work context, the wait guard
+    // refuses work that may not wait on the network.
     static constexpr Waits converged_waits = Waits::state_device | Waits::network;
     virtual MetadataSnapshotView converged() = 0;
     virtual MetadataSnapshotView converged(const WorkContext&) = 0;
 
-    // The snapshot at the sole accepted head, which retention release reads;
-    // none while heads diverge. Waits on nothing.
     // The generation and namespace revision of current(), without taking the
     // view. Waits on nothing.
     virtual uint64_t current_generation() const noexcept = 0;
     virtual uint64_t current_namespace_revision() const noexcept = 0;
 
     // The committed record at the newest generation known: the cache, else
-    // read from the replicas (the catalogue's cold start and its record
-    // reads; not in the spec's first table, found by the T4 survey).
+    // read from the replicas (the catalogue's cold start and record reads).
     static constexpr Waits record_waits = converged_waits;
     virtual MetadataRecord record() = 0;
 
@@ -99,6 +93,8 @@ class MetadataView {
     virtual Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) = 0;
 
+    // The snapshot at the sole accepted head, which retention release reads;
+    // none while heads diverge. Waits on nothing.
     static constexpr Waits release_head_waits = Waits::none;
     virtual std::optional<MetadataSnapshotView> release_head() const = 0;
 
@@ -126,19 +122,18 @@ class MetadataView {
 
 };
 
-// The metadata component's upkeep of its own replicas, separate from the
-// view so that no reader sees it: only the maintenance pass takes it.
-// Single owner (the pass's thread). Implemented by MetadataManager.
+// The metadata component's upkeep of its own replicas, kept off the view so
+// no reader sees it. Single owner (the maintenance pass's thread).
+// Implemented by MetadataManager.
 class MetadataMaintenance {
   public:
     virtual ~MetadataMaintenance() = default;
 
-    // One metadata repair step: converge the replicas toward the accepted
-    // heads.
+    // One repair step: converge the replicas toward the accepted heads.
     static constexpr Waits repair_step_waits = Waits::state_device | Waits::network;
     virtual void repair_step() = 0;
-    // Records whether the last validation of the replica set succeeded, and
-    // why not; Status reads it.
+    // Records whether the last replica-set validation succeeded, and why
+    // not; Status reads it.
     static constexpr Waits note_validation_waits = Waits::none;
     virtual void note_replica_validation(bool available, std::string_view reason = {}) = 0;
     // Repairs accepted heads the local replica cannot reconstruct, from

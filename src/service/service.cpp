@@ -38,10 +38,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       startup_stall_handler_(std::move(startup_stall_handler)) {
     cluster_status_.attach_convergence_diagnostics(
         [this] { return maintenance_port_.metadata_convergence.diagnostics(); });
-    // Installed once, for the life of the Service, rather than re-attached
-    // whenever a mount comes and goes: the registry already answers "is there
-    // a frontend right now", and a supervised FUSE can be rebuilt underneath
-    // this provider any number of times.
+    // Installed once for the Service's life: the registry answers whether a
+    // frontend exists right now, and a supervised FUSE may be rebuilt beneath it.
     cluster_status_.attach_fuse_diagnostics(
         [this]() -> std::optional<FuseFrontendDiagnostics> {
             auto frontend = registry_.fuse();
@@ -58,11 +56,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                 auto session = node_.sessions().validate(token);
                 if (!session)
                     return std::nullopt;
-                // A user-bound session is only as live as the account behind
-                // it. Both lookups are O(1) against this node's own replicas,
-                // so an isolated node still answers: a deletion or password
-                // change reaches here as a replicated user record, not as an
-                // RPC we have to make.
+                // A user-bound session is only as live as its account. Both lookups are
+                // O(1) against local replicas, so an isolated node still answers.
                 if (!session->user_id.empty()) {
                     auto user = node_.users().find(session->user_id);
                     if (!user || user->credential_generation != session->credential_generation)
@@ -70,10 +65,9 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                 }
                 return std::optional(session_identity(*session));
             });
-        // What answers on the control lane: liveness, cluster status, the
-        // session and account routes. Everything else -- catalogue,
-        // playback, the web client -- is the data lane, so a node that is
-        // saturated serving fragments still says what is wrong with it.
+        // The control lane: liveness, cluster status, session and account routes.
+        // Everything else is the data lane, so a node saturated serving fragments
+        // still says what is wrong with it.
         catalogue_http_->set_control_prefixes(
             {"/api/v1/health", "/api/v1/status", "/api/v1/session", "/api/v1/users"});
         cluster_status_.attach_http_diagnostics(
@@ -85,10 +79,9 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
     }
 }
 
-// Each of these answers "nothing to report" when this node has no mount --
-// not configured for one, or its subsystem is faulted between restarts. The
-// shared_ptr is taken for the duration of the call so a subsystem restart
-// cannot pull the frontend out from under a handler already inside one.
+// Each answers "nothing to report" when this node has no mount. The
+// shared_ptr is held for the call so a subsystem restart cannot pull the
+// frontend out from under a handler.
 std::optional<BlockedNamespaceOperation> Service::blocked_namespace_operation() const {
     auto frontend = registry_.fuse();
     return frontend ? frontend->blocked_namespace_operation() : std::nullopt;
@@ -119,30 +112,19 @@ Service::~Service() {
 }
 
 std::string_view Service::required_role(const HttpRequest& request) {
-    // Roles are capabilities, not a ladder, so this maps a route to the single
-    // capability it needs. Checked once here, before dispatch, rather than per
-    // handler -- a check a new route can forget to add is not a gate.
+    // Roles are capabilities, not a ladder: each route maps to the one capability
+    // it needs, checked once here before dispatch so a new route cannot omit it.
     const bool mutating = request.method == "POST" || request.method == "PUT" ||
                           request.method == "PATCH" || request.method == "DELETE";
 
-    // A session is the caller's own to mint, read and revoke, so gating it
-    // would mean needing a role to find out which roles you have. It is the one
-    // route that requires a valid session and no role at all.
+    // A session is the caller's own to mint, read and revoke: the one route that
+    // requires a valid session and no role.
     if (request.path == "/api/v1/session")
         return {};
 
-    // Cluster and node health. Until 0.38.5 this carried no role, on the
-    // argument that an importer watching an ingest is the person who most needs
-    // it -- which is right, and is now expressed as an implication in
-    // expand_roles() instead: every capability implies view_status, so that
-    // account still sees it. What carrying no role could not express is the
-    // other case: an account the cluster granted nothing -- a roles-less
-    // anonymous session in a registered-users-only deployment -- was still
-    // shown the cluster's topology, node names, capacities and diagnostics.
-    //
-    // Liveness probing is not this route. /api/v1/health answers that with no
-    // token and no role; anything wanting more than "is this node serving" is
-    // asking about the cluster and needs the capability that says so.
+    // Cluster and node health. Every capability implies view_status
+    // (expand_roles()), so only a session granted nothing is refused. Liveness is
+    // /api/v1/health, with no token and no role.
     if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
         // A connectivity check is not a read: it makes this node dial every
         // peer on the caller's say-so.
@@ -175,21 +157,14 @@ std::string_view Service::required_role(const HttpRequest& request) {
 }
 
 HttpResponse Service::handle_http(const HttpRequest& request) {
-    // Liveness, for anything that needs to know whether this node is serving
-    // before it has a token -- a load balancer, an uptime monitor, a client
-    // choosing an endpoint. It carries the running version -- deliberately,
-    // since 0.42.1: reading what a node is running without a token is how
-    // every on-box check and every deploy verification is done, and a version
-    // is a fact about this process rather than about the cluster. Nothing
-    // beyond that: no node identity, no topology, no configuration. It is
-    // reachable unauthenticated from wherever the API is reachable, so
-    // everything that describes the cluster lives behind /api/v1/status and
-    // the view_status role.
+    // Liveness for callers without a token: a load balancer, an uptime monitor, a
+    // client choosing an endpoint. Carries the running version, a fact about this
+    // process; no node identity, topology or configuration, which stay behind
+    // /api/v1/status and view_status.
     if (request.path == "/api/v1/health")
         return health_response();
-    // Session creation/introspection must work while local services are
-    // still recovering -- the control plane is online long before local
-    // storage and metadata finish recovery.
+    // Sessions work while local services recover: the control plane is online
+    // long before storage and metadata.
     if (request.path == "/api/v1/session")
         return session_api_.handle(request);
 
@@ -199,24 +174,18 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
         return http_error(403, "forbidden",
                           "this action requires the '" + std::string(role) + "' role");
 
-    // After the gate, not before it: dispatching Status first was what made its
-    // required_role() unreachable. It stays ahead of the services_ready_ check
-    // below, because a node that is still recovering is exactly when it is
-    // asked what is wrong.
+    // After the gate, so required_role() applies; before the services_ready_
+    // check, because a recovering node is exactly when Status is asked.
     if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
         return cluster_status_.handle(request);
 
-    // Account management does not depend on local storage or metadata, for the
-    // same reason session creation does not: an operator must be able to fix
-    // an account on a node that is still recovering.
+    // Account management works on a recovering node too, so an operator can fix
+    // an account there.
     if (UsersApi::routes(request.path))
         return users_api_.handle(request);
 
-    // The web client is static files and does not depend on local services,
-    // so it loads while they are still recovering -- the client can then show
-    // what Status says rather than failing to load at all. Everything under
-    // /api stays the server's, 404s included: WebApi refuses those itself,
-    // but the routing says so too, so the isolation is visible here.
+    // The web client is static and loads while services recover, so it can show
+    // what Status says. Everything under /api stays the server's, 404s included.
     if (web_.enabled() && !WebApi::api_path(request.path))
         return web_.handle(request);
 
@@ -273,9 +242,8 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                               "no namespace operation with this sequence is currently blocked");
         return {204, "application/json; charset=utf-8", {}, {}};
     }
-    // Discipline 4: standing metadata conflicts, listed and resolved here so
-    // a set nobody knew about cannot silently persist (116 of them, 336 KB
-    // in every snapshot and every merge delta, on 2026-09-06).
+    // Standing metadata conflicts, listed and resolved here so none persists
+    // unnoticed.
     constexpr std::string_view conflicts_path = "/api/v1/manage/metadata/conflicts";
     if (request.path == conflicts_path) {
         if (request.method != "GET")
@@ -407,32 +375,12 @@ HttpResponse Service::health_response() const {
         state = "starting";
         status = 503;
     }
-    // `service` says what answered, and is the only field a caller may gate on.
-    // "I reached something" and "I reached Macha" are different questions, and
-    // until 0.42.1 this body could not tell them apart: {"status":"ok"} is what
-    // a router admin page, a container probe, or -- the case that prompted this
-    // -- a web host serving a single-page app's index document for unknown
-    // paths would produce, and a client probing its own origin would adopt
-    // itself and then fail every call against a pile of HTML.
-    //
-    // It is present in every state, both 503s included, precisely because a
-    // client probing an address it was handed is most likely to meet a node
-    // that is still starting: identity and readiness are different axes, and a
-    // caller that can tell them apart waits instead of giving up.
-    //
-    // `version` is here by an explicit operator decision (2026-09-15), taken
-    // against the argument for leaving it out. The objection was that this
-    // route needs no token, so naming the build tells an unauthenticated
-    // caller which known defects apply. The answer taken: `service` already
-    // names the product, and anyone who reads that will try the known Macha
-    // exploits regardless -- the version narrows which one they reach for, it
-    // does not decide whether they try. What it genuinely adds is a way to
-    // index *unpatched* hosts at scale, which is a mass-scanner's economics
-    // and not this project's threat model.
-    //
-    // Still no node id and no topology: those are the cluster's shape and stay
-    // behind view_status. A client must gate on `service` alone -- asserting
-    // on `version` would break it every release.
+    // `service` says what answered and is the only field a caller may gate on: it
+    // tells Macha apart from anything else answering {"status":"ok"}, such as a
+    // host serving an SPA index for unknown paths. Present in every state, 503s
+    // included: identity and readiness are separate axes. `version` is deliberate
+    // (`service` already names the product); clients must not gate on it. No node
+    // id or topology: those stay behind view_status.
     return http_json(status, Json(Json::Object{{"service", std::string("macha")},
                                                {"status", std::string(state)},
                                                {"version", std::string(kServerVersion)}})
@@ -476,11 +424,10 @@ std::string Service::describe_readiness_stall() const {
 void Service::wait_services_ready() {
     if (services_ready_.load(std::memory_order_acquire))
         return;
-    // Discipline 2: the gate fires on *no progress*, not on elapsed time. A
-    // slow recovery that keeps ticking startup_progress() (frames parsed,
-    // deltas applied, journal records read, readiness stages) is left alone;
-    // one that has not ticked for service_startup_no_progress is a stall. An
-    // absolute ceiling is honoured only when configured.
+    // The gate fires on no progress, not elapsed time: a recovery that keeps
+    // ticking startup_progress() is left alone; one that has not ticked for
+    // service_startup_no_progress is a stall. An absolute ceiling applies only
+    // when configured.
     const auto& config = node_.config();
     const auto started = Clock::now();
     auto last_progress_at = started;
@@ -512,16 +459,11 @@ void Service::wait_services_ready() {
     if (signalled)
         throw std::runtime_error(startup_error_.empty() ? "server startup failed" : startup_error_);
 
-    // Local-state readiness/subsystem construction neither completed nor
-    // threw within the configured bound: a suspected internal stall (a lock
-    // or lost wakeup somewhere below this point), not a clean, catchable
-    // failure. The startup thread may be permanently blocked and can never
-    // safely be joined, so ordinary exception unwinding here -- which would
-    // destruct this Service and try to join it in stop() -- is not safe.
-    // Terminate the process outright and rely on the service supervisor
-    // (systemd Restart=on-failure in production) to bring up a fresh,
-    // unstuck instance; recovery replay on the next boot is what actually
-    // resolves the stalled state, not this process limping on.
+    // Startup neither completed nor threw within the bound: a suspected stall (a
+    // lock or lost wakeup below here). The startup thread may never be joinable,
+    // so unwinding, which destroys this Service and joins it in stop(), is unsafe.
+    // Terminate and let the supervisor (systemd Restart=on-failure) start a fresh
+    // instance; its recovery replay resolves the state.
     const auto diagnostic = describe_readiness_stall();
     const auto message =
         "service startup stalled: no recovery progress for " +
@@ -535,10 +477,9 @@ void Service::wait_services_ready() {
         "ms); " + diagnostic + "; terminating for restart";
     Log::error(message);
     if (startup_stall_handler_) {
-        // Test-only: observe the stall without killing the test process. The
-        // underlying startup thread is still stuck; the caller is
-        // responsible for releasing whatever it gated on before this Service
-        // is destroyed, or its own join in stop() will hang the same way.
+        // Test-only: observe the stall without dying. The startup thread is still
+        // stuck; the caller must release what it gated on before destroying this
+        // Service, or stop() hangs joining it.
         startup_stall_handler_(diagnostic);
         throw std::runtime_error(message);
     }
@@ -734,10 +675,9 @@ void Service::signal_maintenance(ServiceEvent event) {
     if (event == ServiceEvent::metadata || event == ServiceEvent::topology)
         wake = maintenance_port_.metadata_convergence.request(node_.known_metadata_generation());
     maintenance_port_.event.fetch_add(1, std::memory_order_release);
-    // A burst received while its convergence pass is already queued/running
-    // only advances the high-water epoch. The active owner observes that epoch
-    // and schedules one follow-up; waking the same owner for every notice adds
-    // no information and recreates the notification storm this state replaces.
+    // A burst while the pass is queued or running only advances the high-water
+    // epoch; the active owner schedules one follow-up, so waking it per notice
+    // adds nothing.
     if (wake)
         maintenance_port_.wait_cv.notify_all();
 }

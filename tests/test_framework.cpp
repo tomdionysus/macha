@@ -27,11 +27,9 @@ namespace macha::test {
 namespace {
 
 #if defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
-// Test cases deliberately use _Exit() after fork so child teardown cannot run
-// parent-owned process handlers. That also bypasses LeakSanitizer's atexit
-// hook, so sanitizer builds must request the check explicitly after the test
-// function (and all of its local owners) has unwound. The weak symbol keeps
-// ordinary builds independent of the sanitizer runtime.
+// Forked cases leave through _Exit(), bypassing LeakSanitizer's atexit hook, so
+// the leak check is requested explicitly once the test function has unwound.
+// The weak symbol keeps ordinary builds independent of the sanitizer runtime.
 extern "C" int __lsan_do_recoverable_leak_check() __attribute__((weak));
 #endif
 
@@ -49,9 +47,7 @@ struct Options {
     unsigned slots{};
     unsigned timeout_scale{};
     // Run every selected case this many times and report a per-case failure
-    // count at the end. This is the measurement the "known flake" habit never
-    // had: a rate on named hardware at real parallelism, instead of a
-    // recollection (TODO/archive/2026-09-14-test-suite-must-be-deterministic-plan.md).
+    // rate at the end, measured at real parallelism.
     unsigned repeat{1};
     bool list{};
     bool verbose{};
@@ -64,14 +60,9 @@ unsigned default_slots() {
     return std::min(12u, detected);
 }
 
-// Each case declares a wall-clock deadline (30s fast, 60s integration, 120s
-// heavy) chosen against an ordinary build. A sanitizer build is slower by a
-// large constant factor -- roughly 2-3x for AddressSanitizer, 5-15x for
-// ThreadSanitizer -- so those same deadlines would fire as timeouts on code
-// that is behaving correctly, and a spurious timeout is worse than useless
-// here: it hides the sanitizer report the run existed to produce. Scale the
-// deadlines by default when the binary is actually instrumented, so
-// MACHA_SANITIZE builds are usable without every caller remembering a flag.
+// Case deadlines (30s fast, 60s integration, 120s heavy) are set for an
+// ordinary build. Sanitizer builds run 2-15x slower, so an instrumented binary
+// scales them by default; a spurious timeout would hide the sanitizer report.
 unsigned default_timeout_scale() {
 #if defined(__SANITIZE_THREAD__)
     return 10;
@@ -180,8 +171,7 @@ struct RunningCase {
     int log_fd{-1};
     unsigned slots{};
     Clock::time_point started{};
-    // The case's declared timeout after the scale factor, so the deadline the
-    // scheduler enforces and the one a failure reports are the same number.
+    // Scaled once, so the enforced and reported deadlines are the same number.
     std::chrono::seconds deadline{};
 };
 
@@ -211,21 +201,12 @@ std::string read_capture(int fd) {
     return output;
 }
 
-// Coverage counters are written by an atexit handler, and a test child
-// deliberately never runs one: it leaves through std::_Exit, which is what
-// stops a forked child flushing buffers it inherited from the parent. So the
-// counters have to be dumped by hand, and reset on entry -- a child inherits
-// the parent's accumulated counts at fork(), and without a reset every case
-// would re-report the parent's startup as its own.
-//
-// Without this, every case in the suite contributes nothing at all and the
-// report reads 0% however many tests pass.
-//
-// Clang also expands the profile name's %p once, in the parent, so every
-// forked case would dump into the parent's file, overwriting and corrupting
-// it ("failed to uncompress data"). Each case names its own file instead.
-// And each image carries its own copy of the runtime, so macha_core's
-// counters are named, reset and written by macha_core (src/coverage.hpp).
+// Coverage counters are normally written by an atexit handler, which a child
+// leaving through std::_Exit never runs, so each case dumps them by hand. They
+// are reset on entry, since a child inherits the parent's counts at fork().
+// Clang expands %p in the profile name once, in the parent, so each case names
+// its own file. Each image has its own runtime copy, so macha_core's counters
+// are named, reset and written by macha_core (src/coverage.hpp).
 #if defined(MACHA_COVERAGE)
 #if defined(__clang__)
 extern "C" void __llvm_profile_reset_counters(void);
@@ -264,10 +245,9 @@ void coverage_dump() {}
     coverage_reset();
     child_failures.store(0, std::memory_order_relaxed);
     set_case_index(selection_index + 1);
-    // A case's output is only ever shown when it fails, so a more verbose
-    // level costs nothing on a green run and is the difference between a
-    // diagnosable failure and "it timed out". The product's own `shutdown:`
-    // and `peer ... liveness failure:` lines are DEBUG.
+    // Case output is shown only on failure, so verbose logging costs nothing
+    // on a green run. The `shutdown:` and `peer ... liveness failure:` lines
+    // are DEBUG.
     if (const char* level = std::getenv("MACHA_TEST_LOG_LEVEL")) {
         try {
             Log::set_logger(std::make_shared<ConsoleLogger>(parse_log_level(level)));
@@ -300,11 +280,8 @@ RunningCase launch(const TestCase& test, std::size_t selection_index,
                    std::chrono::seconds deadline) {
     const int capture_fd = create_capture_file();
     const auto started = Clock::now();
-    // fork() duplicates userspace stream buffers.  If the parent has reported
-    // completed cases into a redirected (and therefore fully-buffered) stream,
-    // a later child would otherwise flush that inherited text into its own
-    // capture file.  That made parallel failures appear to contain results and
-    // timeouts from unrelated tests.
+    // fork() duplicates userspace stream buffers; flush so a child does not
+    // write the parent's buffered output into its own capture file.
     std::cout.flush();
     std::cerr.flush();
     const pid_t pid = ::fork();
@@ -432,9 +409,8 @@ int run_all(int argc, char** argv) {
     for (const auto& test : tests)
         if (selected(test, options)) selected_tests.push_back(&test);
     const auto distinct_cases = selected_tests.size();
-    // Repetitions are scheduled as further selections of the same cases, so
-    // a case's repeats are spread across the run and land next to unrelated
-    // work, which is the condition a suspected flake has to be measured in.
+    // Repetitions are further selections of the same cases, so repeats spread
+    // across the run beside unrelated work.
     for (unsigned rep = 1; rep < options.repeat; ++rep)
         for (std::size_t i = 0; i < distinct_cases; ++i)
             selected_tests.push_back(selected_tests[i]);
@@ -449,20 +425,15 @@ int run_all(int argc, char** argv) {
         return 2;
     }
 
-    // A case can require more slots than a deliberately small --jobs value.
-    // Clamp its effective cost to the configured budget so --jobs=1 is a real
-    // serial mode rather than a deadlock.
+    // Clamp a case's slot cost to the --jobs budget so a small budget cannot
+    // deadlock.
     auto effective_slots = [&](const TestCase& test) {
         return std::min(options.slots, slots_for(test.cost));
     };
 
-    // Two runners on one machine -- a developer's filtered run beside CI, or
-    // two sweeps -- would otherwise hand the same case index, and therefore
-    // the same 64-port block, to two different tests at once. Every test
-    // cluster shares one deterministic key, so a collision is not a bind
-    // failure but a foreign node authenticating into this test's cluster
-    // ("metadata write-floor policy mismatch peer=..." from a test that
-    // started no such peer, 2026-09-14). Each runner therefore shifts the
+    // Two runners on one machine would hand the same case index, and so the
+    // same 64-port block, to two tests. Test clusters share one key, so a
+    // collision lets a foreign node join the cluster. Each runner shifts the
     // block namespace by a salt its children inherit; set it explicitly to
     // reproduce a run's exact ports.
     if (!std::getenv("MACHA_TEST_PORT_SALT")) {
@@ -522,8 +493,8 @@ int run_all(int argc, char** argv) {
             finished_any = true;
         }
 
-        // Child completion is the only event that can free scheduler slots.
-        // This short parent-only poll interval does not delay or pace a test.
+        // Only child completion frees slots; this parent-only poll does not pace
+        // a test.
         if (!finished_any && (!launched_any || pending.empty()))
             std::this_thread::sleep_for(std::chrono::milliseconds{2});
     }
@@ -544,8 +515,7 @@ int run_all(int argc, char** argv) {
                 if (!result.passed)
                     std::cerr << "  " << full_name(*result.test) << '\n';
         } else {
-            // One line per distinct case that failed at least once, with its
-            // rate: the number this whole mode exists to produce.
+            // One line per case that failed at least once, with its rate.
             std::cerr << "Failed cases (failures/" << options.repeat << " runs):\n";
             std::vector<std::pair<const TestCase*, unsigned>> tally;
             for (const auto& result : results) {

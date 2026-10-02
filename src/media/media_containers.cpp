@@ -19,9 +19,8 @@ bool same_token(std::string_view left, std::string_view right) {
                       });
 }
 
-// One row per file name we recognise: the container the name claims, and
-// whether the catalogue should treat the file as video or as audio. An empty
-// container means the name does not say and the probe decides.
+// One row per recognised file name: the container it claims and whether it is
+// video or audio. An empty container means the probe decides.
 struct ExtensionFact {
     std::string_view extension;
     std::string_view container;
@@ -52,13 +51,12 @@ constexpr std::array<ExtensionFact, 23> extension_facts{{
     {".aac", "adts", Kind::audio},
     {".wav", "wav", Kind::audio},
     {".aiff", "aiff", Kind::audio},
-    // A name that states a codec and not a container. The probe decides.
+    // Names a codec, not a container; the probe decides.
     {".alac", "", Kind::audio},
 }};
 
-// libavformat lists every name a demuxer answers to ("matroska,webm",
-// "mov,mp4,m4a,3gp,3g2,mj2", "mp3"), so each token is looked up separately
-// and the file name disambiguates a family that names more than one.
+// libavformat lists every name a demuxer answers to ("matroska,webm"), so each
+// token is looked up and the file name disambiguates a family.
 struct FormatFact {
     std::string_view format;
     std::string_view container;
@@ -85,17 +83,10 @@ constexpr std::array<FormatFact, 18> format_facts{{
     {"aiff", "aiff"},
 }};
 
-// What each streaming container carries as a copy.
-//
-// fMP4 takes AAC and Opus as they have always worked; (E-)AC-3 needs the
-// muxer to parse a packet before it can write the dac3/dec3 sample-entry box,
-// which is what `delay_moov` does. Measured on this libavformat: without it
-// the header write fails "Invalid argument" (the 503s of 2026-09-07).
-//
-// MPEG-TS predates the fMP4 HLS arrangement and is where these codecs'
-// carriage was first defined, so its list is the older, wider one: it is the
-// route by which a 2017 television plays copied HEVC and E-AC-3 that it
-// refuses in fMP4 (2026-09-07).
+// Copy support per streaming container. fMP4 takes (E-)AC-3 only with
+// `delay_moov`: the dac3/dec3 box needs a parsed packet, else the header write
+// fails. MPEG-TS's list is wider; it is the route for clients that refuse
+// copied HEVC or E-AC-3 in fMP4.
 struct CarriageFact {
     std::string_view codec;
     Kind kind;
@@ -116,13 +107,11 @@ constexpr std::array<CarriageFact, 10> carriage_facts{{
     {"mp2", Kind::audio, false, true},
 }};
 
-// Subtitle codecs a session can convert to WebVTT cues.
 constexpr std::array<std::string_view, 6> webvtt_source_codecs{
     "ass", "mov_text", "ssa", "subrip", "text", "webvtt"};
 
-// Content-Type for a source served unchanged, by its probed container: one
-// type when the media has a picture, one when it is sound alone. An empty
-// audio type means the container is not used for sound alone.
+// Content-Type by probed container: one type with a picture, one for sound
+// alone. An empty audio type means the container is not used for sound alone.
 struct ContainerMime {
     std::string_view container;
     std::string_view video;
@@ -145,7 +134,6 @@ constexpr std::array<ContainerMime, 13> container_mimes{{
     {"aiff", "", "audio/aiff"},
 }};
 
-// Content-Type for the files a session generates rather than serves.
 struct GeneratedFact {
     std::string_view extension;
     std::string_view mime;
@@ -228,9 +216,7 @@ std::string container_for_format(std::string_view format, std::string_view path)
         return std::string(*probed.begin());
     }
     if (!by_name.empty()) return by_name;
-    // Neither table knows this one. libav's own name for it is still a better
-    // answer than silence: a client can print it, and it names the thing it
-    // was handed.
+    // Unknown to both tables: libav's own name beats silence.
     return std::string(first_token);
 }
 

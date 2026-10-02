@@ -18,10 +18,8 @@ namespace macha {
 // durability. The metadata snapshot is retained separately and is not charged
 // against max_blocks.
 class PersistentBlockCache {
-    // Cache object reads are on the foreground playback path.  Do not hold a
-    // cache-wide mutex while LocalStore decrypts/reads a multi-megabyte object:
-    // cache insertion can fsync and evict, and historically made an otherwise
-    // local cache hit wait hundreds of milliseconds behind that work.
+    // Reads are on the playback path: never hold a cache-wide mutex while
+    // LocalStore reads an object, or a hit waits behind insertion and eviction.
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     mutable std::mutex metadata_mutex_;
@@ -32,16 +30,7 @@ class PersistentBlockCache {
     std::list<ObjectId> lru_;
     std::map<ObjectId, std::list<ObjectId>::iterator> lru_index_;
     std::atomic_size_t block_count_{};
-    // Hits, misses and evictions since this process started. Monotonic and
-    // never reset, because a consumer diffs two reads rather than reading one
-    // absolutely -- which is also what makes them safe to publish on a payload
-    // clients cache, unlike an instantaneous count.
-    //
-    // Until 2026-09-21 the only observable thing about this cache was
-    // block_count_, which is a function of writes alone: a cache that had
-    // never returned a byte reported identically to one working perfectly, on
-    // telemetry, on the status API and in the logs. Answering "is it serving
-    // anything?" took an hour of manual measurement against a live node.
+    // Since process start; monotonic, never reset, so consumers diff two reads.
     std::atomic_uint64_t hits_{};
     std::atomic_uint64_t misses_{};
     std::atomic_uint64_t evictions_{};
@@ -61,9 +50,8 @@ class PersistentBlockCache {
     bool has(const ObjectId&) const;
     bool remove(const ObjectId&);
     size_t blocks() const;
-    // Cumulative since start; entries is instantaneous. A sustained zero-hit,
-    // high-eviction cache is a defect condition -- see the cache-sizing
-    // invariant in TODO/ACTIVE.md -- and nothing can notice it without these.
+    // Cumulative since start; entries is instantaneous. Sustained zero hits
+    // with high evictions is a defect.
     struct Stats {
         uint64_t hits{};
         uint64_t misses{};
