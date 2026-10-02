@@ -563,7 +563,7 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapsho
 }
 
 CatalogueManager::CatalogueManager(NodeRuntime& node, DistributedStore& store,
-                                   MetadataManager& metadata)
+                                   MetadataView& metadata)
     : node_(node), store_(store), metadata_(metadata) {}
 
 std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& snapshot) {
@@ -752,10 +752,10 @@ void CatalogueManager::repair_once() {
         // read whenever the catalogue TTL expires or a generation notice arrives.
         // A genuinely cold CatalogueManager may bootstrap MetadataManager once;
         // after that this path is strictly memory-only.
-        auto view = metadata_.available_snapshot_view();
+        auto view = metadata_.current();
         if (!view) {
-            (void)metadata_.read_record();
-            view = metadata_.available_snapshot_view();
+            (void)metadata_.record();
+            view = metadata_.current();
         }
         if (!view)
             throw std::runtime_error("catalogue metadata snapshot unavailable after successful read");
@@ -772,7 +772,7 @@ void CatalogueManager::repair_once() {
         // disjoint three-way item merge is automatic; any genuine same-item or
         // parent/child collision remains a durable first-class conflict.
         if (reconcile_catalogue_conflict(*view)) {
-            view = metadata_.available_snapshot_view();
+            view = metadata_.current();
             if (!view)
                 return;
         }
@@ -1122,7 +1122,7 @@ void CatalogueManager::commit(
     std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict) {
     MetadataRecord metadata_record;
     try {
-        metadata_record = metadata_.read_record();
+        metadata_record = metadata_.record();
     } catch (const std::exception& e) {
         throw CatalogueUnavailable(std::string("catalogue metadata unavailable: ") + e.what());
     }
@@ -1239,7 +1239,7 @@ void CatalogueManager::commit(
                                    e.what());
     }
 
-    auto committed_record = metadata_.read_record();
+    auto committed_record = metadata_.record();
     auto committed_metadata = decode_snapshot(committed_record.payload);
     {
         std::lock_guard lock(mutex_);
@@ -1347,7 +1347,7 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
     // its immutable catalogue root is unchanged, the cached catalogue is still
     // exactly current even though its bookkeeping generation is older. This is
     // a memory-only proof and avoids a replica repair for a definite 404.
-    if (auto available = metadata_.available_snapshot_view();
+    if (auto available = metadata_.current();
         available && available->generation >= known_generation &&
         available->snapshot->catalogue_root == cached_root)
         return true;
@@ -1722,10 +1722,10 @@ CatalogueMaintenance CatalogueManager::maintenance_objects() {
     uint64_t metadata_generation = 0;
     bool metadata_current = false;
     try {
-        auto view = metadata_.available_snapshot_view();
+        auto view = metadata_.current();
         if (!view || view->generation < node_.known_metadata_generation()) {
-            (void)metadata_.read_record();
-            view = metadata_.available_snapshot_view();
+            (void)metadata_.record();
+            view = metadata_.current();
         }
         if (view) {
             metadata_generation = view->generation;

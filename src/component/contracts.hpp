@@ -17,7 +17,8 @@ class CatalogueManager;
 class DistributedStore;
 class FileSystem;
 class HorizonBuilder;
-class MetadataManager;
+class MetadataMaintenance;
+class MetadataView;
 class NodeRuntime;
 class ObjectLedger;
 struct MaintenancePort;
@@ -30,8 +31,11 @@ template <> struct ContractName<NodeRuntime> {
 template <> struct ContractName<DistributedStore> {
     static constexpr std::string_view value = "distributed-store";
 };
-template <> struct ContractName<MetadataManager> {
+template <> struct ContractName<MetadataView> {
     static constexpr std::string_view value = "metadata";
+};
+template <> struct ContractName<MetadataMaintenance> {
+    static constexpr std::string_view value = "metadata-maintenance";
 };
 template <> struct ContractName<CatalogueManager> {
     static constexpr std::string_view value = "catalogue";
