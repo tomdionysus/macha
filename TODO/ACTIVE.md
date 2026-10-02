@@ -50,7 +50,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | T2 slice | `-t2` | merged; assessed |
   | T3 ledger | `-t3` | merged; assessed (`t3/assessment.md`) |
   | T4 metadata | `-t4` | merged 2026-10-02; assessed (`t4/assessment.md`) |
-  | T5 conversions | `-t5` | next; the first deploy since T0 |
+  | T5 conversions | `-t5` | T5.1: the node's composition root as code (`NodeServices`); next: the rest of the setters and locators; first deploy |
 
 - **T0's baseline is filled** (2026-10-01): soak plus a six-hour top-up,
   2026-09-30 07:04Z to 2026-10-01 20:43Z,

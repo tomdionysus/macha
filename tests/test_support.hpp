@@ -293,6 +293,7 @@ class TestNode {
     Config config_;
     std::unique_ptr<NodeRuntime> node_;
     std::unique_ptr<DistributedStore> store_;
+    std::function<void(const MetadataPublicationContext&)> publication_guard_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<FileSystem> filesystem_;
     bool started_{};
@@ -332,13 +333,24 @@ class TestNode {
         return *node_;
     }
 
+    // A guard run before each of this node's metadata commits is
+    // published, as Service's claims barrier is; set by a test that needs to
+    // hold a publication. Not synchronised: set it while no commit runs.
+    void set_publication_guard(std::function<void(const MetadataPublicationContext&)> guard) {
+        publication_guard_ = std::move(guard);
+    }
+
     NodeRuntime& wait_ready() {
         REQUIRE(node_);
         REQUIRE(started_);
         REQUIRE(node_->wait_local_state_ready(std::chrono::seconds{10}));
         if (!store_) {
             store_ = std::make_unique<DistributedStore>(*node_);
-            metadata_ = std::make_unique<MetadataManager>(*node_);
+            metadata_ = std::make_unique<MetadataManager>(
+                *node_, nullptr, [this](const MetadataPublicationContext& context) {
+                    if (publication_guard_)
+                        publication_guard_(context);
+                });
             filesystem_ = std::make_unique<FileSystem>(*node_, *store_, *metadata_);
         }
         return *node_;

@@ -3883,7 +3883,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publicati
     }
 
     std::atomic_bool gate_once{};
-    fixture.metadata().set_publication_retention([&](const MetadataPublicationContext&) {
+    fixture.set_publication_guard([&](const MetadataPublicationContext&) {
         if (!gate_once.exchange(true))
             publication_gate.enter_and_wait();
     });

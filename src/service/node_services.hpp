@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "acquisition/ingest.hpp"
+#include "api/acquisition_api.hpp"
+#include "api/catalogue_api.hpp"
+#include "api/manage_api.hpp"
+#include "catalogue/catalogue.hpp"
+#include "catalogue/catalogue_hints.hpp"
+#include "catalogue/media_catalogue.hpp"
+#include "catalogue/media_information.hpp"
+#include "cluster/distributed_store.hpp"
+#include "filesystem/filesystem.hpp"
+#include "filesystem/hydration.hpp"
+#include "ledger/node_horizon_builder.hpp"
+#include "ledger/retention_ledger.hpp"
+#include "metadata/metadata_manager.hpp"
+#include "playback/playback.hpp"
+#include "service/maintenance.hpp"
+#include "service/maintenance_clock.hpp"
+#include "subsystem/subsystem_registry.hpp"
+#include "subsystem/subsystem_supervisor.hpp"
+#include "torrent/torrent.hpp"
+
+#include <functional>
+#include <memory>
+#include <string_view>
+
+// The node's services: everything built once the node's local state has
+// recovered, as one composition root. The members below are declared in
+// dependency order -- each takes, at construction, references to members
+// declared before it -- so construction follows the graph and destruction
+// reverses it. start() runs in the same order; stop() reverses it, with the
+// one ordering the graph leaves free pinned (see stop()).
+//
+// The graph, provider -> dependants:
+//   node, registry, port (outside, outlive this)
+//   playback      -> filesystem, hydration
+//   store         -> metadata, catalogue, filesystem, hydration, ledger, builder, maintenance
+//   metadata      -> catalogue, filesystem, torrent coordinator, manage API, maintenance
+//   catalogue     -> filesystem users (media information, scanner, hydration, APIs,
+//                    playback), builder, maintenance; metadata's publication guard
+//                    calls back into it (wired at construction, used only after)
+//   filesystem    -> media information, scanner, hydration, ingest, APIs, playback,
+//                    subsystems, builder
+//   hints         -> scanner, ingest, catalogue API, manage API
+//   media info    -> scanner, ingest, catalogue API, playback
+//   scanner       -> catalogue API, manage API, playback
+//   hydration     -> subsystems
+//   ingest        -> cluster jobs, acquisition API, subsystems
+//   cluster jobs  -> torrent coordinator, acquisition API
+//   torrent coord -> acquisition API
+//   subsystems    (plugins: torrent, FUSE) need ingest, filesystem, hydration
+//   ledger, builder -> maintenance
+namespace macha {
+
+using LifecycleHook = std::function<void(std::string_view event)>;
+
+// What the root is given besides its collaborators: the instruments a test
+// injects (production passes none) and when the Service was constructed.
+struct NodeServicesInstruments {
+    std::shared_ptr<MaintenanceClock> clock;
+    MaintenanceTraceHook trace;
+    std::function<void(std::string_view)> maintenance_stage_hook;
+    LifecycleHook lifecycle;
+    Clock::time_point constructed;
+};
+
+class NodeServices {
+  public:
+    // `signal_maintenance` rings the node's maintenance pass (Service's
+    // handler for node events), which the claims barrier does after it.
+    NodeServices(NodeRuntime&, SubsystemRegistry&, MaintenancePort&,
+                 std::function<void(ServiceEvent)> signal_maintenance, NodeServicesInstruments);
+    ~NodeServices();
+    NodeServices(const NodeServices&) = delete;
+    NodeServices& operator=(const NodeServices&) = delete;
+
+    // Starts every service, providers before dependants.
+    void start();
+    // Asks every service to stop and returns: filesystem I/O is cancelled,
+    // then each service is asked in reverse order.
+    void request_stop();
+    // Stops every service (requesting first), dependants before providers.
+    void stop();
+    // The live-reloadable limits of the services that have any.
+    void reconfigure(const Config&);
+
+    PlaybackTracker& playback() { return playback_; }
+    DistributedStore& store() { return store_; }
+    MetadataManager& metadata() { return metadata_; }
+    CatalogueManager& catalogue() { return catalogue_; }
+    FileSystem& filesystem() { return filesystem_; }
+    CatalogueHintQueue& catalogue_hints() { return catalogue_hints_; }
+    MediaInformationService& media_information() { return media_information_; }
+    HydrationManager& hydration() { return hydration_; }
+    IngestManager& ingest() { return ingest_; }
+    ClusterJobView& cluster_jobs() { return cluster_jobs_; }
+    TorrentCoordinator& torrent_coordinator() { return torrent_coordinator_; }
+    AcquisitionApi& acquisition_api() { return acquisition_api_; }
+    CatalogueApi& catalogue_api() { return catalogue_api_; }
+    ManageApi& manage_api() { return manage_api_; }
+    PlaybackManager& streaming() { return streaming_; }
+    SubsystemSupervisor& subsystems() { return subsystems_; }
+
+  private:
+    void note(std::string_view event) const {
+        if (instruments_.lifecycle)
+            instruments_.lifecycle(event);
+    }
+    // The claims barrier run before every metadata commit is published.
+    void retain_metadata_publication(const MetadataPublicationContext&);
+
+    NodeRuntime& node_;
+    SubsystemRegistry& registry_;
+    MaintenancePort& port_;
+    std::function<void(ServiceEvent)> signal_maintenance_;
+    NodeServicesInstruments instruments_;
+    bool started_{};
+    bool stopped_{};
+
+    PlaybackTracker playback_;
+    DistributedStore store_;
+    MetadataManager metadata_;
+    CatalogueManager catalogue_;
+    FileSystem filesystem_;
+    CatalogueHintQueue catalogue_hints_;
+    std::shared_ptr<MediaEngine> media_engine_;
+    MediaInformationService media_information_;
+    CatalogueScanner scanner_;
+    HydrationManager hydration_;
+    IngestManager ingest_;
+    TorrentSearchManager torrent_search_;
+    ClusterJobView cluster_jobs_;
+    TorrentCoordinator torrent_coordinator_;
+    AcquisitionApi acquisition_api_;
+    CatalogueApi catalogue_api_;
+    ManageApi manage_api_;
+    PlaybackManager streaming_;
+    SubsystemSupervisor subsystems_;
+    RetentionLedger ledger_;
+    NodeHorizonBuilder horizon_builder_;
+    Maintenance maintenance_;
+};
+
+} // namespace macha
