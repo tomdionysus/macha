@@ -712,7 +712,7 @@ bool MetadataManager::accept_commit_on(const NodeInfo& owner,
     // NodeRuntime detects and notifies accepted-head changes for the local
     // path; do not announce again after this returns.
     if (owner.id == node_.node_id())
-        return node_.accept_metadata_commit(acceptance);
+        return node_.metadata_server().accept_commit(acceptance);
     try {
         const auto encoded = encode_metadata_acceptance(acceptance);
         return bool_reply(
@@ -850,7 +850,7 @@ std::vector<std::pair<NodeInfo, MetadataAcceptance>> MetadataManager::discover_a
         try {
             std::vector<MetadataAcceptance> heads;
             if (owner.id == node_.node_id()) {
-                heads = node_.metadata_heads();
+                heads = node_.metadata_server().heads();
             } else {
                 auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
                 if (reply.message.type != MessageType::metadata_heads_reply)
@@ -873,7 +873,7 @@ bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
     if (owner.id == node_.node_id()) {
         if (!node_.metadata_replica().store_commit(record))
             return false;
-        return node_.accept_metadata_commit(acceptance);
+        return node_.metadata_server().accept_commit(acceptance);
     }
     if (!push_history_to_peer(owner, record.hash, frame_type)) {
         // Local history may be compactly rooted at this record; a full commit
@@ -916,7 +916,7 @@ MetadataManager::discover_accepted_heads_required(const std::vector<NodeInfo>& n
         try {
             std::vector<MetadataAcceptance> heads;
             if (owner.id == node_.node_id()) {
-                heads = node_.metadata_heads();
+                heads = node_.metadata_server().heads();
             } else {
                 auto reply = node_.call(owner, MessageType::get_metadata_heads, {}, frame_type);
                 if (reply.message.type != MessageType::metadata_heads_reply)
@@ -1123,7 +1123,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             continue;
         bool accepted = false;
         for (const auto& certificate : head.certificates)
-            accepted = node_.accept_metadata_commit(certificate) || accepted;
+            accepted = node_.metadata_server().accept_commit(certificate) || accepted;
         if (!accepted) {
             constexpr auto retry_cooldown = std::chrono::seconds(30);
             {

@@ -316,6 +316,7 @@ set(MACHA_CORE_SOURCES
     src/metadata/namespace_tree.cpp
     src/metadata/namespace_control_store.cpp
     src/metadata/metadata_manager.cpp
+    src/metadata/metadata_server.cpp
     src/auth/session.cpp
     src/auth/users.cpp
     src/http/http.cpp
