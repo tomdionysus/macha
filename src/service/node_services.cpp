@@ -21,11 +21,11 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 
 } // namespace
 
-NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources,
+NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, JobRoutes& job_routes,
                            SubsystemRegistry& registry, MaintenancePort& port,
                            std::function<void(ServiceEvent)> signal_maintenance,
                            NodeServicesInstruments instruments)
-    : node_(node), resources_(resources), registry_(registry), port_(port),
+    : node_(node), resources_(resources), job_routes_(job_routes), registry_(registry), port_(port),
       signal_maintenance_(std::move(signal_maintenance)), instruments_(std::move(instruments)),
       store_(node_, resources_.activity, resources_.data, resources_.memory,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
@@ -91,6 +91,16 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources,
                                            horizon_builder_, ledger_, port_, instruments_.clock,
                                            instruments_.trace, instruments_.maintenance_stage_hook,
                                            instruments_.constructed}) {
+    using Route = JobRoutes::Route;
+    job_routes_.bind(Route::ingest_jobs, [this](std::span<const uint8_t> payload) {
+        return ingest_.handle_jobs_query(payload);
+    });
+    job_routes_.bind(Route::ingest_action, [this](std::span<const uint8_t> payload) {
+        return ingest_.handle_job_action(payload);
+    });
+    job_routes_.bind(Route::torrent_intent, [this](std::span<const uint8_t> payload) {
+        return torrent_coordinator_.handle_intent(payload);
+    });
     note("services constructed");
 }
 
@@ -104,6 +114,9 @@ void NodeServices::reconfigure(const Config& updated) {
 
 NodeServices::~NodeServices() {
     stop();
+    job_routes_.unbind(JobRoutes::Route::torrent_intent);
+    job_routes_.unbind(JobRoutes::Route::ingest_action);
+    job_routes_.unbind(JobRoutes::Route::ingest_jobs);
 }
 
 void NodeServices::start() {
@@ -128,6 +141,7 @@ void NodeServices::start() {
     context.node = &node_;
     context.data_resources = &resources_.data;
     context.retained_memory = &resources_.memory;
+    context.job_routes = &job_routes_;
     context.ingest = &ingest_;
     context.registry = &registry_;
     context.filesystem = &filesystem_;
