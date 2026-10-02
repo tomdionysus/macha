@@ -258,6 +258,7 @@ class FileSystem {
     friend class WriteHandle;
 
     NodeRuntime& n_;
+    LocalState& local_;
     RetainedMemoryLedger& retained_memory_;
     DistributedStore& s_;
     MetadataView& m_;
@@ -334,7 +335,7 @@ class FileSystem {
         const FilesystemNamespaceMutation&);
 
   public:
-    FileSystem(NodeRuntime&, DistributedStore&, MetadataView&, RetainedMemoryLedger&,
+    FileSystem(NodeRuntime&, LocalState&, DistributedStore&, MetadataView&, RetainedMemoryLedger&,
                PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
@@ -385,7 +386,7 @@ class FileSystem {
         return m_.current_namespace_revision();
     }
     uint64_t local_committed_metadata_generation() const noexcept {
-        return n_.metadata_replica().committed_generation();
+        return local_.replica().committed_generation();
     }
     uint64_t known_metadata_generation() const noexcept { return n_.known_metadata_generation(); }
     std::vector<ObjectId> live_objects();
@@ -402,7 +403,7 @@ class FileSystem {
     // Read-only view of the namespace tree nodes. Cheap, so made per call
     // rather than cached, which also prevents writing through it.
     ControlNamespaceNodeStore namespace_nodes() {
-        return ControlNamespaceNodeStore::for_reading(n_, s_);
+        return ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     }
     void note_interactive_activity(uint64_t bytes = 0) { s_.interactive_activity(bytes); }
     void note_foreground_activity(uint64_t bytes = 0) { s_.foreground_activity(bytes); }

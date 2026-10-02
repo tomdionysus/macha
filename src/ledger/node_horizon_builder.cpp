@@ -64,8 +64,8 @@ ReleaseBuild build_release(const MetadataSnapshotView& head, const NamespaceNode
 }
 
 NodeHorizonBuilder::NodeHorizonBuilder(FileSystem& filesystem, CatalogueManager& catalogue,
-                                       NodeRuntime& node, DistributedStore& store) noexcept
-    : filesystem_(filesystem), catalogue_(catalogue), node_(node), store_(store) {}
+                                       LocalStore& control, DistributedStore& store) noexcept
+    : filesystem_(filesystem), catalogue_(catalogue), control_(control), store_(store) {}
 
 std::shared_ptr<const MaintenanceObjects> NodeHorizonBuilder::namespace_objects() {
     return filesystem_.maintenance_objects_cached();
@@ -78,7 +78,7 @@ NodeHorizonBuilder::inventory(const MaintenanceObjects& namespace_objects,
 }
 
 ReleaseBuild NodeHorizonBuilder::release(const MetadataSnapshotView& head) {
-    auto nodes = ControlNamespaceNodeStore::for_reading(node_, store_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(control_, store_);
     return build_release(head, nodes, [this](const ObjectId& root) {
         return catalogue_.retention_objects(std::nullopt, root);
     });

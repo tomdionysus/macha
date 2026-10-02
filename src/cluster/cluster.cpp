@@ -362,6 +362,12 @@ const LocalStore& NodeRuntime::control_store() const {
         throw std::runtime_error("control storage is still recovering");
     return local_state_->control();
 }
+LocalState& NodeRuntime::local_state() {
+    if (!all_local_state_ready())
+        throw std::runtime_error("local state is still recovering");
+    return *local_state_;
+}
+
 MetadataServer& NodeRuntime::metadata_server() {
     if (!all_local_state_ready())
         throw std::runtime_error("metadata replica is still recovering");

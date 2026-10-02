@@ -89,7 +89,7 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 } // namespace
 
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
-    : node_(dependencies.node), store_(dependencies.store), metadata_(dependencies.metadata),
+    : node_(dependencies.node), local_(dependencies.local), store_(dependencies.store), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
       builder_(dependencies.builder), ledger_(dependencies.ledger),
       media_information_(dependencies.media_information), events_(dependencies.events),
@@ -148,7 +148,7 @@ std::vector<GarbageRef> Maintenance::collect_garbage(const std::vector<GarbageRe
         // sweep. Authoritative bytes are not deleted here: the sweep's atomic
         // age-check-and-remove spares a recently reaffirmed object even if this view
         // is stale. A cache copy is disposable and goes now.
-        node_.block_cache().remove(candidate.id);
+        local_.cache().remove(candidate.id);
         matured.push_back(candidate);
     }
     return matured;
@@ -207,7 +207,7 @@ void Maintenance::run(std::stop_token stop) {
     auto metadata_retry_backoff = maintenance_background_interval(policy);
     auto catalogue_retry_due = Clock::time_point{};
     auto formation_settle_due = Clock::time_point{};
-    uint64_t last_local_metadata_generation = node_.metadata_replica().committed_generation();
+    uint64_t last_local_metadata_generation = local_.replica().committed_generation();
     // Events before the pass existed are not replayed; one convergence run
     // validates the state they left.
     absorbed_storage_ = events_.count(NodeEvent::storage);
@@ -269,7 +269,7 @@ void Maintenance::run(std::stop_token stop) {
         const auto current_event = events_.total();
         const bool event_changed = current_event != observed_event;
         observed_event = current_event;
-        const auto local_metadata_generation = node_.metadata_replica().committed_generation();
+        const auto local_metadata_generation = local_.replica().committed_generation();
         if (local_metadata_generation != last_local_metadata_generation) {
             catalogue_dirty = true;
             metadata_retry_due = Clock::time_point{};
@@ -375,14 +375,14 @@ void Maintenance::run(std::stop_token stop) {
             bool metadata_ready_for_dependants = !metadata_dirty;
             if (metadata_dirty &&
                 (metadata_retry_due == Clock::time_point{} || now >= metadata_retry_due)) {
-                if (node_.metadata_replica().committed_generation() <= 1 &&
+                if (local_.replica().committed_generation() <= 1 &&
                     !established_metadata_peer &&
                     now < formation_settle_due) {
                     metadata_ready_for_dependants = false;
                     metadata_retry_due = formation_settle_due;
                 } else {
                     const bool virgin_follower =
-                        node_.metadata_replica().committed_generation() <= 1 &&
+                        local_.replica().committed_generation() <= 1 &&
                         !established_metadata_peer &&
                         !last_active_nodes.empty() &&
                         node_.node_id() !=
@@ -424,8 +424,8 @@ void Maintenance::run(std::stop_token stop) {
                                 // stall non-destructive DATA repair: a locally
                                 // committed branch is still a valid reachability
                                 // source. Destructive GC is fenced on `stable`.
-                                const auto local = node_.metadata_replica().committed();
-                                if (node_.metadata_replica().recovery_required() ||
+                                const auto local = local_.replica().committed();
+                                if (local_.replica().recovery_required() ||
                                     local.generation <= 1)
                                     throw;
                                 Log::debug("metadata repair deferred; continuing non-destructive "
@@ -440,8 +440,8 @@ void Maintenance::run(std::stop_token stop) {
                                     std::min(policy.no_progress_backoff,
                                              std::max(metadata_retry_backoff * 2,
                                                       maintenance_background_interval(policy)));
-                                const auto local = node_.metadata_replica().committed();
-                                if (node_.metadata_replica().recovery_required() ||
+                                const auto local = local_.replica().committed();
+                                if (local_.replica().recovery_required() ||
                                     local.generation <= 1)
                                     throw;
                                 Log::debug("metadata repair deferred; continuing non-destructive "
@@ -859,7 +859,7 @@ void Maintenance::run(std::stop_token stop) {
                     // collapse that window.
                     const auto orphan_grace =
                         std::max(policy.garbage_grace, policy.no_progress_backoff);
-                    auto gc = node_.local_store().gc_step(
+                    auto gc = local_.data().gc_step(
                         inventory->referenced_ids(RetentionClass::data), protected_ids,
                         orphan_grace, 64,
                         [this] {
@@ -927,7 +927,7 @@ void Maintenance::run(std::stop_token stop) {
                 local_credit >= node_.config().extent_size) {
                 enter_stage("local-rebalance");
                 const auto rebalance_stage = Clock::now();
-                auto rebalance = node_.local_store().rebalance_step(
+                auto rebalance = local_.data().rebalance_step(
                     static_cast<uint64_t>(local_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_.foreground_idle_for() < quiet ||
@@ -988,14 +988,14 @@ void Maintenance::run(std::stop_token stop) {
             // backends.
             if (!busy) {
                 enter_stage("compact-packs");
-                (void)node_.local_store().compact_packs(stop);
+                (void)local_.data().compact_packs(stop);
             }
 
             if (!busy && scrub_due && scrub_credit >= node_.config().extent_size) {
                 enter_stage("scrub");
                 const auto scrub_stage = Clock::now();
                 auto scrub =
-                    node_.local_store().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
+                    local_.data().scrub_step(static_cast<uint64_t>(scrub_credit), 64, [this] {
                         const auto quiet = node_.config().maintenance.foreground_quiet;
                         return store_.foreground_idle_for() < quiet ||
                                store_.interactive_idle_for() < quiet ||
