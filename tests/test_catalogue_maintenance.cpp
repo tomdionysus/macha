@@ -6,6 +6,7 @@
 // metadata manager behind it.
 #include "catalogue/catalogue.hpp"
 #include "cluster/distributed_store.hpp"
+#include "metadata/namespace_tree.hpp"
 #include "test_support.hpp"
 
 #include <stdexcept>
@@ -42,6 +43,10 @@ struct FakeMetadataView final : MetadataView {
     uint64_t conflicts_superseded() const noexcept override { return 0; }
     uint64_t conflicts_resolved() const noexcept override { return 0; }
     MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
+    Page<std::pair<std::string, FsEntry>, std::string>
+    entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {
+        return namespace_entries(*v.snapshot, nullptr, std::move(from), budget);
+    }
 };
 
 struct Node {
