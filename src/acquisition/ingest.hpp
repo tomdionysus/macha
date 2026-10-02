@@ -233,7 +233,7 @@ class IngestManager {
     void cleanup_partials(const IngestJob&);
 
   public:
-    // The ingest job routes' handlers (JobRoutes): this node's own jobs only;
+    // The ingest job messages' handlers: this node's own jobs only;
     // ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);

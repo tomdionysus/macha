@@ -21,10 +21,10 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 
 } // namespace
 
-NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, JobRoutes& job_routes,
+NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageRoutes& routes,
                            SubsystemRegistry& registry, MaintenancePort& port,
                            NodeServicesInstruments instruments)
-    : node_(node), resources_(resources), job_routes_(job_routes), registry_(registry), port_(port),
+    : node_(node), resources_(resources), routes_(routes), registry_(registry), port_(port),
       instruments_(std::move(instruments)),
       store_(node_, resources_.activity, resources_.data, resources_.memory, resources_.events,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
@@ -91,16 +91,21 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, JobRoute
                                            resources_.events, port_, instruments_.clock,
                                            instruments_.trace, instruments_.maintenance_stage_hook,
                                            instruments_.constructed}) {
-    using Route = JobRoutes::Route;
-    job_routes_.bind(Route::ingest_jobs, [this](std::span<const uint8_t> payload) {
-        return ingest_.handle_jobs_query(payload);
-    });
-    job_routes_.bind(Route::ingest_action, [this](std::span<const uint8_t> payload) {
-        return ingest_.handle_job_action(payload);
-    });
-    job_routes_.bind(Route::torrent_intent, [this](std::span<const uint8_t> payload) {
-        return torrent_coordinator_.handle_intent(payload);
-    });
+    routes_.bind(MessageType::get_ingest_jobs,
+                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                     return RpcMessage{MessageType::ingest_jobs_reply,
+                                       ingest_.handle_jobs_query(request.payload)};
+                 });
+    routes_.bind(MessageType::ingest_job_action,
+                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                     return RpcMessage{MessageType::ingest_job_action_reply,
+                                       ingest_.handle_job_action(request.payload)};
+                 });
+    routes_.bind(MessageType::torrent_intent,
+                 [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                     return RpcMessage{MessageType::torrent_intent_reply,
+                                       torrent_coordinator_.handle_intent(request.payload)};
+                 });
     note("services constructed");
 }
 
@@ -114,9 +119,9 @@ void NodeServices::reconfigure(const Config& updated) {
 
 NodeServices::~NodeServices() {
     stop();
-    job_routes_.unbind(JobRoutes::Route::torrent_intent);
-    job_routes_.unbind(JobRoutes::Route::ingest_action);
-    job_routes_.unbind(JobRoutes::Route::ingest_jobs);
+    routes_.unbind(MessageType::torrent_intent);
+    routes_.unbind(MessageType::ingest_job_action);
+    routes_.unbind(MessageType::get_ingest_jobs);
 }
 
 void NodeServices::start() {
@@ -141,7 +146,7 @@ void NodeServices::start() {
     context.node = &node_;
     context.data_resources = &resources_.data;
     context.retained_memory = &resources_.memory;
-    context.job_routes = &job_routes_;
+    context.routes = &routes_;
     context.ingest = &ingest_;
     context.registry = &registry_;
     context.filesystem = &filesystem_;

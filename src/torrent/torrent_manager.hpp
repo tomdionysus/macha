@@ -135,7 +135,7 @@ class TorrentManager final : public TorrentService {
     std::string add_parsed(std::string id, ParsedAdd& parsed, bool held);
 
   public:
-    // The torrent job routes' handlers (JobRoutes): this node's own jobs
+    // The torrent job messages' handlers: this node's own jobs
     // only; ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);

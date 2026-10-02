@@ -1795,27 +1795,37 @@ MACHA_FAST_TEST("foundations", test_coverage_child_profile_name) {
     CHECK(coverage::child_profile_name("", 7, "x").empty());
 }
 
-MACHA_FAST_TEST("foundations", test_job_routes_answer_only_while_bound) {
-    JobRoutes routes;
-    const Bytes request{1, 2, 3};
-    using Route = JobRoutes::Route;
-    CHECK(!routes.call(Route::ingest_jobs, request));
+MACHA_FAST_TEST("foundations", test_message_routes_answer_only_while_bound) {
+    MessageRoutes routes;
+    const NodeInfo peer;
+    const RpcMessage request{MessageType::get_ingest_jobs, Bytes{1, 2, 3}};
+    CHECK(routes.dispatch(peer, FrameType::control, request).type == MessageType::error);
 
-    routes.bind(Route::ingest_jobs, [](std::span<const uint8_t> payload) {
-        return Bytes(payload.rbegin(), payload.rend());
-    });
-    const auto reply = routes.call(Route::ingest_jobs, request);
-    REQUIRE(reply);
-    CHECK(*reply == Bytes({3, 2, 1}));
-    // Each route is its own binding.
-    CHECK(!routes.call(Route::torrent_jobs, request));
+    routes.bind(MessageType::get_ingest_jobs,
+                [](const NodeInfo&, FrameType, const RpcMessage& message) {
+                    return RpcMessage{MessageType::ingest_jobs_reply,
+                                      Bytes(message.payload.rbegin(), message.payload.rend())};
+                });
+    const auto reply = routes.dispatch(peer, FrameType::control, request);
+    CHECK(reply.type == MessageType::ingest_jobs_reply);
+    CHECK(reply.payload == Bytes({3, 2, 1}));
+    // Each type is its own binding.
+    CHECK(routes.dispatch(peer, FrameType::control,
+                          RpcMessage{MessageType::get_torrent_jobs, {}})
+              .type == MessageType::error);
 
-    // A second bind replaces the first.
-    routes.bind(Route::ingest_jobs, [](std::span<const uint8_t>) { return Bytes{9}; });
-    CHECK(routes.call(Route::ingest_jobs, request) == std::optional<Bytes>(Bytes{9}));
+    // A handler that throws answers an error carrying the reason.
+    routes.bind(MessageType::get_ingest_jobs,
+                [](const NodeInfo&, FrameType, const RpcMessage&) -> RpcMessage {
+                    throw std::runtime_error("no jobs here");
+                });
+    const auto failed = routes.dispatch(peer, FrameType::control, request);
+    REQUIRE(failed.type == MessageType::error);
+    Reader reader(failed.payload);
+    CHECK(reader.string(4096) == "no jobs here");
 
-    routes.unbind(Route::ingest_jobs);
-    CHECK(!routes.call(Route::ingest_jobs, request));
+    routes.unbind(MessageType::get_ingest_jobs);
+    CHECK(routes.dispatch(peer, FrameType::control, request).type == MessageType::error);
 }
 
 MACHA_FAST_TEST("foundations", test_node_events_count_each_kind) {

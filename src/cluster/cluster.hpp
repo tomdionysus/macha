@@ -4,7 +4,7 @@
 #include "config.hpp"
 #include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
-#include "cluster/job_routes.hpp"
+#include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
@@ -91,8 +91,10 @@ class NodeRuntime {
     RetainedMemoryLedger& retained_memory_;
     // Playback records, telemetry publishes.
     TranscodeRateBook& transcode_rates_;
-    // Job RPCs pass through opaque to whichever component the root bound.
-    JobRoutes& job_routes_;
+    // Inbound requests are dispatched here; this node binds the types it
+    // answers and records them for unbinding.
+    MessageRoutes& routes_;
+    std::vector<MessageType> bound_routes_;
     // Storage, metadata and topology changes are counted here for whoever
     // watches; the node never calls a consumer.
     NodeEvents& events_;
@@ -180,7 +182,11 @@ class NodeRuntime {
     void recover_state(std::stop_token);
     bool all_local_state_ready() const noexcept;
 
-    RpcMessage handle(const NodeInfo&, FrameType, const RpcMessage&);
+    void bind_control_routes();
+    void bind_storage_routes();
+    void bind_metadata_routes();
+    void route(MessageType, MessageRoutes::Handler);
+    void unbind_routes();
     void loop(std::stop_token);
     void local_writer_loop(std::stop_token);
     // Public-endpoint discovery, then (for `inbound_capable: auto`) the
@@ -202,7 +208,7 @@ class NodeRuntime {
   public:
     // The caller holds state_path's StorageLock for this node's life.
     NodeRuntime(Config, ClusterKeys, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
-                TranscodeRateBook&, JobRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
+                TranscodeRateBook&, MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
     void request_stop();
