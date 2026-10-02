@@ -149,7 +149,7 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     CHECK(convergence->find("requested_epoch")->asUInt64() ==
           convergence->find("completed_epoch")->asUInt64());
     CHECK(convergence->find("latest_generation")->asUInt64() ==
-          service.node().known_metadata_generation());
+          service.metadata_server().known_generation());
     CHECK(!convergence->find("scheduled")->asBool());
 
     service.registry().withdraw_fuse(frontend.get());
@@ -944,7 +944,7 @@ MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_f
     // local replica and must not enter MetadataManager, which would throw
     // MetadataNotReady.
     CHECK(!s1.metadata_manager().available_snapshot_view().has_value());
-    const auto local_record = s1.node().metadata_replica().current();
+    const auto local_record = s1.local_state().replica().current();
     const auto first_local = s1.filesystem().local_snapshot_view();
     CHECK(first_local.generation == local_record.generation);
     CHECK(first_local.hash == local_record.hash);
@@ -968,8 +968,8 @@ MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_f
 
     auto f1 = std::make_shared<FuseFrontend>(s1.filesystem(), s1.resources().memory, c1.fuse);
     auto f2 = std::make_shared<FuseFrontend>(s2.filesystem(), s2.resources().memory, c2.fuse);
-    CHECK(s1.node().metadata_replica().current().generation > 1);
-    CHECK(s2.node().metadata_replica().current().generation > 1);
+    CHECK(s1.local_state().replica().current().generation > 1);
+    CHECK(s2.local_state().replica().current().generation > 1);
 
     f1->stop();
     f2->stop();
@@ -1026,8 +1026,8 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     s2.start();
     REQUIRE(wait_until(
         [&] {
-            return s1.node().metadata_replica().current().generation > 1 &&
-                   s2.node().metadata_replica().current().generation > 1;
+            return s1.local_state().replica().current().generation > 1 &&
+                   s2.local_state().replica().current().generation > 1;
         },
         5s));
 
@@ -1086,7 +1086,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
         const auto entry = fs.getattr(path);
         REQUIRE(entry.extents.size() == 1);
         retired_ids.push_back(entry.extents.front().id);
-        REQUIRE(service.node().local_store().has(retired_ids.back()));
+        REQUIRE(service.local_state().data().has(retired_ids.back()));
     }
     REQUIRE(wait_until(
         [&] {
@@ -1110,7 +1110,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
                                   [&](const GarbageRef& garbage) { return garbage.id == id; });
         REQUIRE(found != snapshot.garbage.end());
         latest_retirement = std::max(latest_retirement, found->retired_at_ns);
-        CHECK(service.node().local_store().has(id));
+        CHECK(service.local_state().data().has(id));
     }
 
     repair_gate.open();
@@ -1120,7 +1120,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     const auto before_deadline_ns = latest_retirement + grace_ns - wall_time_ns();
     if (before_deadline_ns > 100'000'000)
         std::this_thread::sleep_for(std::chrono::nanoseconds(before_deadline_ns - 50'000'000));
-    CHECK(service.node().local_store().has(retired_ids.back()));
+    CHECK(service.local_state().data().has(retired_ids.back()));
     const auto before_grace = service.metadata_convergence_diagnostics();
     // On mismatch, report the direction: an extra run means a metadata or
     // topology event arrived after the follow-up began; a missing one means the
@@ -1141,7 +1141,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     REQUIRE(wait_until(
         [&] {
             return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
-                return service.node().local_store().has(id);
+                return service.local_state().data().has(id);
             });
         },
         5s));
@@ -1278,7 +1278,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
         REQUIRE(!entry.extents.empty());
         for (const auto& extent : entry.extents)
             if (!extent.hole)
-                CHECK(service.node().block_cache().has(extent.id));
+                CHECK(service.local_state().cache().has(extent.id));
     }
 }
 
@@ -4389,8 +4389,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_c
         // object makes reuse observable: the same open handle still reads it,
         // a fresh handle cannot. erase_all() refuses to remove a retained live
         // object, so simulate physical loss by removing the local and cached copies.
-        REQUIRE(service.node().local_store().remove(entry.extents.front().id));
-        (void)service.node().block_cache().remove(entry.extents.front().id);
+        REQUIRE(service.local_state().data().remove(entry.extents.front().id));
+        (void)service.local_state().cache().remove(entry.extents.front().id);
         Bytes second(4096);
         REQUIRE(frontend->read(handle, 8192, second) == second.size());
         CHECK(std::equal(second.begin(), second.end(), bytes.begin() + 8192));

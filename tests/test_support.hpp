@@ -9,6 +9,7 @@
 #include "fuse/fuse_frontend.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "service/service.hpp"
+#include "supervised.hpp"
 #include "test_framework.hpp"
 #include "types.hpp"
 
@@ -264,30 +265,83 @@ struct BareNodeResources {
     NodeIdentity identity;
     RecoveryProgress progress;
     MessageRoutes routes;
-    BareNodeResources(const Config& config, ClusterKeys keys)
-        : resources(config), identity(config.state_path, std::move(keys)) {}
+    LocalState::StageHook stage_hook;
+    BareNodeResources(const Config& config, ClusterKeys keys, LocalState::StageHook hook)
+        : resources(config), identity(config.state_path, std::move(keys)),
+          stage_hook(std::move(hook)) {}
 };
 
-// A NodeRuntime that owns its root parts, as Service does: the resources are
-// built first and stopped before the node.
+// A NodeRuntime with the root parts it takes, owned as Service owns them:
+// resources first, then the node; start() brings the control plane online
+// and recovers local state on its own thread; stop() stops the resources,
+// the node and that recovery, in that order. The store accessors are the
+// tests' convenience; each throws until local state has recovered.
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
-        : BareNodeResources(config, keys),
-          NodeRuntime(std::move(config), identity, progress, resources.activity, resources.data,
-                      resources.memory, resources.transcode_rates, routes,
+        : BareNodeResources(config, keys, hook),
+          NodeRuntime(std::move(config), identity, progress, resources.memory,
+                      resources.transcode_rates, routes,
                       resources.events, std::move(hook)) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;
+    void start() {
+        NodeRuntime::start();
+        if (recovery_.joinable())
+            return;
+        recovery_ = std::jthread([this](std::stop_token stop) {
+            run_supervised_once("cluster-state-recovery", [this, stop] {
+                try {
+                    local_ = std::make_unique<LocalServices>(config(), identity, progress,
+                                                             stage_hook, stop, *this, resources,
+                                                             routes);
+                } catch (const std::exception&) {
+                    // Cancelled, or recorded in `progress`.
+                    return;
+                }
+                progress.mark_complete(unix_ms());
+                signal_telemetry_refresh();
+            });
+        });
+    }
     void request_stop() {
         resources.stop();
         NodeRuntime::request_stop();
+        if (recovery_.joinable())
+            recovery_.request_stop();
     }
     void stop() {
         resources.stop();
         NodeRuntime::stop();
+        if (recovery_.joinable()) {
+            recovery_.request_stop();
+            recovery_.join();
+        }
     }
+
+    LocalState& local_state() { return local("local state").state(); }
+    MetadataServer& metadata_server() { return local("metadata replica").metadata(); }
+    StoragePool& local_store() { return local("data storage").state().data(); }
+    LocalStore& control_store() { return local("control storage").state().control(); }
+    PersistentBlockCache& block_cache() { return local("persistent cache").state().cache(); }
+    ClaimStore& claims() { return local("retention state").state().retention(); }
+    MetadataReplica& metadata_replica() { return local("metadata replica").state().replica(); }
+    uint64_t known_metadata_generation() {
+        return progress.complete() ? local_->metadata().known_generation()
+                                   : remote_metadata_generation();
+    }
+
+  private:
+    LocalServices& local(std::string_view what) {
+        if (!progress.complete())
+            throw std::runtime_error(std::string(what) + " is still recovering");
+        return *local_;
+    }
+
+    // Declared in this order so the recovery thread goes before what it built.
+    std::unique_ptr<LocalServices> local_;
+    std::jthread recovery_;
 };
 
 class TestNode {

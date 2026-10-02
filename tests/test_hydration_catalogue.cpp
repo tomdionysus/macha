@@ -1489,7 +1489,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     CHECK(profile_engine->probes() == 1);
     CHECK(catalogued->artwork.size() == 2);
     for (const auto& art : catalogued->artwork)
-        CHECK(service.node().local_store().has(art.id));
+        CHECK(service.local_state().data().has(art.id));
     auto revision = catalogued->revision;
     CHECK(scanner.scan_once() == 0);
     REQUIRE(service.catalogue().get("tmdb:movie:335984").has_value());
@@ -4735,13 +4735,13 @@ MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root
     Bytes staged = pattern(4096 + 37);
     staged[0] ^= 0x6d;
     const auto staged_id = object_id(staged);
-    REQUIRE(service.node().control_store().put(staged_id, staged));
+    REQUIRE(service.local_state().control().put(staged_id, staged));
     std::this_thread::sleep_for(5ms);
 
     const std::vector<ObjectId> no_live;
     for (int i = 0; i < 4; ++i)
         (void)service.catalogue().control_gc_step(no_live, 0ms, 64);
-    CHECK(service.node().control_store().has(staged_id));
+    CHECK(service.local_state().control().has(staged_id));
 
     // Once a successor catalogue root is committed/observed, an unreferenced
     // object from the previous publication epoch becomes an ordinary orphan.
@@ -4756,9 +4756,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root
     REQUIRE(maintenance.complete);
     std::vector<ObjectId> live(maintenance.control_live.begin(),
                                maintenance.control_live.end());
-    for (int i = 0; i < 4 && service.node().control_store().has(staged_id); ++i)
+    for (int i = 0; i < 4 && service.local_state().control().has(staged_id); ++i)
         (void)service.catalogue().control_gc_step(live, 0ms, 64);
-    CHECK(!service.node().control_store().has(staged_id));
+    CHECK(!service.local_state().control().has(staged_id));
 }
 
 MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
@@ -4913,9 +4913,9 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // offline, that claim would remain as the physical safety barrier for a
     // potentially unseen accepted branch.
     REQUIRE(wait_until([&] {
-        return !s1.node().local_store().has(first_art.id) &&
-               !s2.node().local_store().has(first_art.id) &&
-               !s3.node().local_store().has(first_art.id);
+        return !s1.local_state().data().has(first_art.id) &&
+               !s2.local_state().data().has(first_art.id) &&
+               !s3.local_state().data().has(first_art.id);
     }, 10s));
 
     CatalogueApi api(s3.catalogue(), s3.catalogue_hints());
@@ -5100,9 +5100,9 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         }
     }
     const auto final_generation =
-        s2.node().metadata_replica().committed_generation();
+        s2.local_state().replica().committed_generation();
     REQUIRE(wait_until([&] {
-        return s1.node().known_metadata_generation() >= final_generation;
+        return s1.metadata_server().known_generation() >= final_generation;
     }, 5s));
     // Not "no catalogue repair yet": the gate stops s1's repair pass, not its
     // committed generation, because publish_commit accepts commits on replicas
@@ -5216,7 +5216,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
 
     const auto unreclaimed = [&] {
         return std::none_of(superseded.begin(), superseded.end(), [&](const ObjectId& id) {
-            return s1.node().local_store().has(id) || s2.node().local_store().has(id);
+            return s1.local_state().data().has(id) || s2.local_state().data().has(id);
         });
     };
     const auto gc_started = Clock::now();
@@ -5232,8 +5232,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         // Name what is left and on which node.
         std::string remaining;
         for (const auto& id : superseded) {
-            const bool on1 = s1.node().local_store().has(id);
-            const bool on2 = s2.node().local_store().has(id);
+            const bool on1 = s1.local_state().data().has(id);
+            const bool on2 = s2.local_state().data().has(id);
             if (!on1 && !on2)
                 continue;
             if (!remaining.empty())
@@ -5252,10 +5252,10 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
                 claims += ' ';
             claims += to_string(id).substr(0, 12);
             claims += ":s1=";
-            claims += s1.node().claims().retained(RetentionClass::data, id) ? "held" : "free";
+            claims += s1.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
             claims += ",s2=";
-            claims += s2.node().claims().retained(RetentionClass::data, id) ? "held" : "free";
-            const auto state = s2.node().claims().claims(RetentionClass::data, id);
+            claims += s2.local_state().retention().retained(RetentionClass::data, id) ? "held" : "free";
+            const auto state = s2.local_state().retention().claims(RetentionClass::data, id);
             claims += "(adds:";
             for (const auto& [origin, sequence] : state.adds)
                 claims += to_string(origin).substr(0, 6) + "=" + std::to_string(sequence) + ";";
@@ -5282,12 +5282,12 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             " claims=[" + claims + "] s2_release_view=" +
             (view2 ? std::to_string(view2->generation) : std::string("none")) +
             " s2_release_clock=[" + clock2 + "] s2_committed=" +
-            std::to_string(s2.node().metadata_replica().committed_generation()) +
-            " s2_known=" + std::to_string(s2.node().known_metadata_generation()) +
+            std::to_string(s2.local_state().replica().committed_generation()) +
+            " s2_known=" + std::to_string(s2.metadata_server().known_generation()) +
             " s2_all_reachable=" + (s2.node().membership().all_known_reachable() ? "yes" : "no") +
             " s2_stable=" + (cluster2.stable ? "yes" : "no") +
-            " s2_heads=" + std::to_string(s2.node().metadata_replica().accepted_heads().size()) +
-            " s1_heads=" + std::to_string(s1.node().metadata_replica().accepted_heads().size()) +
+            " s2_heads=" + std::to_string(s2.local_state().replica().accepted_heads().size()) +
+            " s1_heads=" + std::to_string(s1.local_state().replica().accepted_heads().size()) +
             " s2_self=" + to_string(s2.node().node_id()).substr(0, 6) +
             " s1_self=" + to_string(s1.node().node_id()).substr(0, 6) + " | " +
             

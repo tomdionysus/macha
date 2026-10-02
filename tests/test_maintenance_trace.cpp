@@ -156,18 +156,17 @@ class TracedNode {
     // Objects held and claimed per store and class, and for each named object
     // whether it is held and claimed.
     std::vector<std::string> state() {
-        auto& node = service_->node();
+        auto& local = service_->local_state();
         std::vector<std::string> lines{
-            "state: data_objects=" + std::to_string(node.local_store().list().size()) +
+            "state: data_objects=" + std::to_string(local.data().list().size()) +
             " data_claims=" +
-            std::to_string(node.claims().retained_ids(RetentionClass::data).size()) +
+            std::to_string(local.retention().retained_ids(RetentionClass::data).size()) +
             " control_claims=" +
-            std::to_string(node.claims().retained_ids(RetentionClass::control).size())};
+            std::to_string(local.retention().retained_ids(RetentionClass::control).size())};
         for (const auto& [name, id] : watched_)
             lines.push_back("object " + name + ": held=" +
-                            (node.local_store().has(id) ? "1" : "0") + " claimed=" +
-                            (node.claims().retained(RetentionClass::data, id) ? "1"
-                                                                                       : "0"));
+                            (local.data().has(id) ? "1" : "0") + " claimed=" +
+                            (local.retention().retained(RetentionClass::data, id) ? "1" : "0"));
         return lines;
     }
 
@@ -516,13 +515,13 @@ MACHA_TEST("maintenance_trace", test_trace_backend_offline_and_back) {
     auto away = node.backend();
     away += ".away";
     std::filesystem::rename(node.backend(), away);
-    REQUIRE(wait_until([&] { return service.node().local_store().online_backends() == 0; }, 5s));
+    REQUIRE(wait_until([&] { return service.local_state().data().online_backends() == 0; }, 5s));
     node.advance(100ms);
     node.step("backend offline");
     node.advance(10min);
     node.step("offline past the back-off");
     std::filesystem::rename(away, node.backend());
-    REQUIRE(wait_until([&] { return service.node().local_store().online_backends() == 1; }, 5s));
+    REQUIRE(wait_until([&] { return service.local_state().data().online_backends() == 1; }, 5s));
     node.advance(100ms);
     node.step("backend back");
     check_against_fixture("backend-offline", node.trace());
@@ -542,8 +541,8 @@ MACHA_TEST("maintenance_trace", test_trace_claimed_objects_lost) {
     }
     node.advance(100ms);
     node.step("three files written");
-    for (const auto& id : service.node().claims().retained_ids(RetentionClass::data))
-        REQUIRE(service.node().local_store().remove(id));
+    for (const auto& id : service.local_state().retention().retained_ids(RetentionClass::data))
+        REQUIRE(service.local_state().data().remove(id));
     node.advance(10min);
     // Nothing is walked: repair waits for an event, and a lost file is not one.
     node.step("their objects lost");
@@ -630,7 +629,7 @@ MACHA_TEST("maintenance_trace", test_trace_incomplete_catalogue_and_release_hori
     node.step("catalogue item and a file added");
     const auto root = service.metadata_manager().snapshot().catalogue_root;
     REQUIRE(root.has_value());
-    REQUIRE(service.node().control_store().remove(*root));
+    REQUIRE(service.local_state().control().remove(*root));
     fs.unlink("/claimed.bin");
     node.advance(100ms);
     node.step("catalogue root lost, file deleted");

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "metadata/metadata_server.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/distributed_store.hpp"
 #include "metadata/metadata_manager.hpp"
