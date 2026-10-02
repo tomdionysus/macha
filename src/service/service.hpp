@@ -140,6 +140,10 @@ class Service {
         wait_services_ready();
         return services_->metadata();
     }
+    DistributedStore& store() {
+        wait_services_ready();
+        return services_->store();
+    }
     CatalogueManager& catalogue() {
         wait_services_ready();
         return services_->catalogue();

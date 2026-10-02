@@ -157,6 +157,26 @@ class DistributedStore final : public Placement {
     std::deque<ObjectId> prompt_queue_;
     std::set<ObjectId> prompt_queued_;
     std::jthread prompt_thread_;
+    // Opportunistic local copies of fetched objects (cache fill and
+    // promotion), written by one worker so a read never waits on them.
+    struct LocalCopyJob {
+        ObjectId id;
+        Bytes data;
+        bool promote{};
+        bool cache{};
+        RetainedMemoryLedger::Lease memory;
+    };
+    std::mutex local_copy_mutex_;
+    std::condition_variable local_copy_cv_;
+    std::deque<LocalCopyJob> local_copies_;
+    size_t local_copy_bytes_{};
+    // A dequeued job not yet written; with the queue empty and this false,
+    // every queued copy is settled.
+    bool local_copy_writing_{};
+    std::condition_variable local_copy_settled_cv_;
+    // Set by the destructor so a writer waiting for DATA credit gives up.
+    std::atomic_bool local_copy_cancelled_{};
+    std::jthread local_writer_;
     std::atomic_uint64_t prompt_copies_{};
     std::atomic_uint64_t prompt_failures_{};
     std::atomic_uint64_t prompt_skipped_no_room_{};
@@ -212,6 +232,8 @@ class DistributedStore final : public Placement {
     void note_repair_local_unreadable(const ObjectId&);
     void queue_prompt_replication(const ObjectId&);
     void prompt_replication_loop(std::stop_token);
+    void enqueue_local_copy(const ObjectId&, std::span<const uint8_t>, bool promote);
+    void local_writer_loop(std::stop_token);
     mutable std::mutex fetch_mutex_;
     std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_;
     ReplicaSelector replica_selector_;
@@ -263,6 +285,8 @@ class DistributedStore final : public Placement {
                      RetainedMemoryLedger& retained_memory, NodeEvents& events,
                      DistributedStoreOptions options = {});
     ~DistributedStore();
+    // Waits until every local copy queued so far is written or dropped.
+    void wait_local_copies_settled();
     struct PromptReplicationStats {
         uint64_t queued{};
         uint64_t copies{};
