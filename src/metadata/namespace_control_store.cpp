@@ -8,16 +8,16 @@
 
 namespace macha {
 
-ControlNamespaceNodeStore::ControlNamespaceNodeStore(NodeRuntime& node, DistributedStore& store,
+ControlNamespaceNodeStore::ControlNamespaceNodeStore(LocalStore& control, DistributedStore& store,
                                                      size_t required, Mode mode)
-    : node_(node), store_(store), required_(required), mode_(mode) {}
+    : control_(control), store_(store), required_(required), mode_(mode) {}
 
 ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
     if (mode_ == Mode::read)
         throw std::logic_error("namespace node store opened for reading cannot write a node");
     const auto id = object_id(node);
     if (mode_ == Mode::replay) {
-        if (!node_.control_store().put(id, node))
+        if (!control_.put(id, node))
             throw std::runtime_error("namespace node could not be written locally during replay: " +
                                      to_string(id));
         written_.push_back(id);
@@ -27,7 +27,7 @@ ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
     // by content address, so skip it. update_namespace_tree rewrites the
     // spine, mostly byte-identical nodes; replicating each costs a WAN round
     // trip, which dominates commit cost.
-    if (node_.control_store().has(id))
+    if (control_.has(id))
         return id;
     // MetadataNotReady: a peer dropping out mid-commit is transient, and
     // callers (an ingest) block and retry on that type rather than failing.
@@ -39,11 +39,11 @@ ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
 }
 
 std::optional<Bytes> ControlNamespaceNodeStore::get(const ObjectId& id) const {
-    if (auto local = node_.control_store().get(id))
+    if (auto local = control_.get(id))
         return local;
     if (!store_.ensure_control_local(id))
         return {};
-    return node_.control_store().get(id);
+    return control_.get(id);
 }
 
 ObjectId LocalNamespaceNodeStore::put(std::span<const uint8_t> node) {

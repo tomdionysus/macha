@@ -347,15 +347,15 @@ class TestNode {
         REQUIRE(started_);
         REQUIRE(node_->wait_local_state_ready(std::chrono::seconds{10}));
         if (!store_) {
-            store_ = std::make_unique<DistributedStore>(*node_, node_->resources.activity,
+            store_ = std::make_unique<DistributedStore>(*node_, node_->local_state(), node_->resources.activity,
                                                         node_->resources.data,
                                                         node_->resources.memory, node_->resources.events);
             metadata_ = std::make_unique<MetadataManager>(
-                *node_, nullptr, [this](const MetadataPublicationContext& context) {
+                *node_, node_->local_state(), nullptr, [this](const MetadataPublicationContext& context) {
                     if (publication_guard_)
                         publication_guard_(context);
                 });
-            filesystem_ = std::make_unique<FileSystem>(*node_, *store_, *metadata_,
+            filesystem_ = std::make_unique<FileSystem>(*node_, node_->local_state(), *store_, *metadata_,
                                                        node_->resources.memory);
         }
         return *node_;

@@ -134,10 +134,11 @@ struct TorrentManager::Impl {
         : session(make_session_params(config, advertise, std::move(disk_hooks))) {}
 };
 
-TorrentManager::TorrentManager(NodeRuntime& node, DataResourceArbiter& data_resources,
+TorrentManager::TorrentManager(NodeRuntime& node, LocalState& local,
+                               DataResourceArbiter& data_resources,
                                IngestManager& ingest, TorrentConfig config,
                                const std::filesystem::path& state_path)
-    : node_(node), data_resources_(data_resources), ingest_(ingest), config_(std::move(config)),
+    : node_(node), local_(local), data_resources_(data_resources), ingest_(ingest), config_(std::move(config)),
       state_file_(state_path / "torrent" / "jobs.json"),
       resume_dir_(state_path / "torrent" / "resume") {
     if (!config_.enabled) return;
@@ -1118,7 +1119,6 @@ bool TorrentManager::publication_settled_locked(const std::string& id, const Tor
 TorrentDiskHooks TorrentManager::disk_hooks() const {
     TorrentDiskHooks hooks;
     hooks.threads = config_.disk_threads;
-    NodeRuntime* node = &node_;
     hooks.admit = loader_admission(data_resources_);
     // Every verified extent is published durably at loader class into the
     // ingest's store and journalled; the ingest commits files by naming them.
@@ -1148,12 +1148,9 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
         }
     }
     if (shared) {
-        hooks.observe = [node](std::chrono::nanoseconds elapsed, uint64_t bytes) {
-            try {
-                node->local_store().service_monitor().note(elapsed, bytes);
-            } catch (const std::exception&) {
-                // No DATA pool yet (early start-up) or none at all (edge node).
-            }
+        hooks.observe = [monitor = &local_.data().service_monitor()](
+                            std::chrono::nanoseconds elapsed, uint64_t bytes) {
+            monitor->note(elapsed, bytes);
         };
     }
     Log::info("torrent disk backend threads=" + std::to_string(hooks.threads) +

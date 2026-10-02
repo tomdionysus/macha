@@ -1413,6 +1413,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
+    sources.local = &node.local_state();
     sources.metadata = &metadata;
     HttpRequest request;
     request.method = "GET";
@@ -1730,6 +1731,7 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
 
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
+    sources.local = &node.local_state();
     sources.metadata = &metadata;
     HttpRequest request;
     request.method = "GET";
@@ -1822,6 +1824,7 @@ MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresh
 
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
+    sources.local = &node.local_state();
     sources.metadata = &metadata;
     HttpRequest request;
     request.method = "GET";
@@ -1874,6 +1877,7 @@ MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster
 
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
+    sources.local = &node.local_state();
     sources.metadata = &metadata;
     HttpRequest root_request;
     root_request.method = "GET";
@@ -2139,7 +2143,7 @@ MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesys
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), store, metadata);
 
     const auto live_bytes = pattern(8192, 5);
     write_file(fs, "/live.bin", live_bytes);
@@ -2185,7 +2189,7 @@ MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), store, metadata);
 
     const auto old_bytes = pattern(4096, 31);
     const auto new_bytes = pattern(4096, 32);
@@ -2228,7 +2232,7 @@ MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_g
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), store, metadata);
 
     FsEntry dir;
     dir.type = EntryType::directory;
@@ -2339,7 +2343,7 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
 
-    DistributedStore distributed(n1, n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
+    DistributedStore distributed(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
     const auto bytes = pattern(128 * 1024, 9);
     const auto id = object_id(bytes);
     REQUIRE(distributed.put(id, bytes));
@@ -2525,7 +2529,7 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
     fixture.start();
     REQUIRE(wait_until([&] { return fixture.node().local_store().online_backends() == 1; }));
 
-    CatalogueManager catalogue(fixture.node(), fixture.store(), fixture.metadata());
+    CatalogueManager catalogue(fixture.node(), fixture.node().local_state(), fixture.store(), fixture.metadata());
     DistributedStore::DurabilityBatch batch;
     const auto a = pattern(64 * 1024, 201);
     const auto b = pattern(64 * 1024, 202);
@@ -3573,7 +3577,7 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
-    CatalogueManager catalogue(node, store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), store, metadata);
     catalogue.repair_once(); // establish a coherent empty cached catalogue
 
     const auto missing_root = object_id(pattern(32123, 11));

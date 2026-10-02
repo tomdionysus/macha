@@ -323,10 +323,10 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         }
         if (owner.id == n_.node_id()) {
             const auto started = Clock::now();
-            if (!n_.local_store().has(id))
+            if (!local_.data().has(id))
                 events_.notify(NodeEvent::storage);
             if (batch) {
-                if (const auto token = n_.local_store().put_deferred(id, data)) {
+                if (const auto token = local_.data().put_deferred(id, data)) {
                     ++success;
                     successful_replicas.push_back(
                         {owner.id, n_.durability_epoch(), token->domain, token->generation,
@@ -334,7 +334,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                 } else {
                     ++replacement_needed;
                 }
-            } else if (n_.local_store().put(id, data)) {
+            } else if (local_.data().put(id, data)) {
                 ++success;
             } else {
                 ++replacement_needed;
@@ -581,7 +581,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
             continue;
         }
         try {
-            n_.local_store().durability_barrier(
+            local_.data().durability_barrier(
                 {replica.domain, replica.generation, replica.backend_instance},
                 DurabilityUrgency::batchable);
             durable[key] = replica.generation;
@@ -644,7 +644,7 @@ bool DistributedStore::durability_barrier(DurabilityBatch& batch, FrameType fram
             for (auto& replica : requirement.replicas) {
                 if (!stale_local.contains(key_of(replica)))
                     continue;
-                if (auto token = n_.local_store().reassert_durable(requirement.id)) {
+                if (auto token = local_.data().reassert_durable(requirement.id)) {
                     replica = {n_.node_id(), n_.durability_epoch(), token->domain,
                                token->generation, token->backend_instance};
                     durable[key_of(replica)] = replica.generation;
@@ -814,12 +814,12 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
             // The bytes were verified when put; scrub finds later corruption.
             // No DATA admission for an index lookup; the remote handler matches.
             const bool present = object_class == RetentionClass::data
-                                     ? n_.local_store().has(id)
-                                     : n_.control_store().has(id);
+                                     ? local_.data().has(id)
+                                     : local_.control().has(id);
             if (!present)
                 return false;
         }
-        n_.claims().retain_batch(object_class, ids, dot);
+        local_.retention().retain_batch(object_class, ids, dot);
         return true;
     }
 
@@ -1074,8 +1074,8 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
             // object's physical age, so reachability GC cannot race a commit
             // that reuses an old orphan.
             for (const auto& id : ids) {
-                auto bytes = n_.control_store().get(id);
-                if (!bytes || !n_.control_store().put(id, *bytes))
+                auto bytes = local_.control().get(id);
+                if (!bytes || !local_.control().put(id, *bytes))
                     return false;
             }
             return true;
@@ -1111,7 +1111,7 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
             if (in_flight.size() >= put_window)
                 drain();
             // Read bytes only for what is sent.
-            auto bytes = n_.control_store().get(id);
+            auto bytes = local_.control().get(id);
             if (!bytes) {
                 for (auto& [rpc, _] : in_flight)
                     rpc.cancel();
@@ -1166,11 +1166,11 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     return true;
 }
 
-DistributedStore::DistributedStore(NodeRuntime& n, ActivityClocks& activity,
+DistributedStore::DistributedStore(NodeRuntime& n, LocalState& local, ActivityClocks& activity,
                                    DataResourceArbiter& data_resources,
                                    RetainedMemoryLedger& retained_memory, NodeEvents& events,
                                    DistributedStoreOptions options)
-    : n_(n), activity_(activity), data_resources_(data_resources),
+    : n_(n), local_(local), activity_(activity), data_resources_(data_resources),
       retained_memory_(retained_memory), events_(events), repair_trace_(std::move(options.repair_trace)) {
     if (options.repair_position) {
         repair_position_path_ = std::move(*options.repair_position);
@@ -1294,7 +1294,7 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                       [](const Retry& a, const Retry& b) { return a.due < b.due; });
         };
         try {
-            if (!n_.local_store().has(*id)) continue; // gone (deleted, or never local)
+            if (!local_.data().has(*id)) continue; // gone (deleted, or never local)
             auto nodes = ranked(*id);
             const size_t target = std::min(n_.config().replication, nodes.size());
             if (target < 2) continue;
@@ -1329,7 +1329,7 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
                 }
                 continue;
             }
-            auto data = n_.local_store().get(*id);
+            auto data = local_.data().get(*id);
             if (!data) continue;
             if (put_on(*destination, *id, *data, false)) {
                 prompt_copies_.fetch_add(1, std::memory_order_relaxed);
@@ -1356,9 +1356,9 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
     if (!resource)
         return false;
     if (target.id == n_.node_id()) {
-        if (!n_.local_store().has(id))
+        if (!local_.data().has(id))
             events_.notify(NodeEvent::storage);
-        return n_.local_store().put(id, data);
+        return local_.data().put(id, data);
     }
     Writer writer;
     writer.fixed(id.bytes);
@@ -1390,7 +1390,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                 n_.config().extent_size, deadline, cancelled);
             if (!memory)
                 return {};
-            auto bytes = n_.local_store().get(id);
+            auto bytes = local_.data().get(id);
             if (!bytes)
                 return {};
             auto object = std::make_shared<ObjectBuffer>();
@@ -1729,7 +1729,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         n_.config().extent_size, deadline, cancelled);
     if (!local_memory)
         return {};
-    auto local_data = n_.local_store().get(id);
+    auto local_data = local_.data().get(id);
     local_resource.reset();
     if (auto data = std::move(local_data)) {
         if (interactive)
@@ -1758,7 +1758,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         n_.config().extent_size, deadline, cancelled);
     if (!cache_memory)
         return {};
-    auto cache_data = n_.block_cache().get(id);
+    auto cache_data = local_.cache().get(id);
     cache_resource.reset();
     if (auto cached = std::move(cache_data)) {
         if (interactive)
@@ -1806,7 +1806,7 @@ std::map<NodeId, std::map<ObjectId, bool>> DistributedStore::batched_have_object
     if (auto self = ids_by_node.find(n_.node_id()); self != ids_by_node.end()) {
         auto& out = results[n_.node_id()];
         for (const auto& id : self->second)
-            out[id] = n_.local_store().has(id);
+            out[id] = local_.data().has(id);
     }
 
     const size_t batch_size = std::max<size_t>(1, n_.config().retention_check_batch_size);
@@ -2049,7 +2049,7 @@ bool DistributedStore::has_on(const NodeInfo& target, const ObjectId& id) {
     if (target.id == n_.node_id()) {
         // Presence-only candidate probe, not the retention commit; no decrypt
         // and no DATA admission for an index lookup.
-        return n_.local_store().has(id);
+        return local_.data().has(id);
     }
     Writer writer;
     writer.fixed(id.bytes);
@@ -2090,7 +2090,7 @@ size_t DistributedStore::replicate_control(const ObjectId& id,
     for (const auto& target : n_.membership().active()) {
         try {
             if (target.id == n_.node_id()) {
-                if (n_.control_store().put(id, data))
+                if (local_.control().put(id, data))
                     ++success;
                 continue;
             }
@@ -2110,18 +2110,18 @@ size_t DistributedStore::replicate_control(const ObjectId& id,
 }
 
 bool DistributedStore::locally_available(const ObjectId& id) const {
-    return n_.local_store().has(id) || n_.block_cache().has(id);
+    return local_.data().has(id) || local_.cache().has(id);
 }
 
 bool DistributedStore::cache_local(const ObjectId& id, std::span<const uint8_t> data) {
-    if (!n_.block_cache().enabled())
+    if (!local_.cache().enabled())
         return false;
     try {
         auto resource = data_resources_.acquire(
             DataWorkContext(FrameType::speculative, data.size()), data.size());
         if (!resource)
             return false;
-        return n_.block_cache().put(id, data);
+        return local_.cache().put(id, data);
     } catch (const std::exception& e) {
         Log::debug("cache write-through skipped object=" + to_string(id) + " error=" + e.what());
         return false;
@@ -2129,20 +2129,20 @@ bool DistributedStore::cache_local(const ObjectId& id, std::span<const uint8_t> 
 }
 
 bool DistributedStore::hydration_available() const {
-    return n_.block_cache().enabled();
+    return local_.cache().enabled();
 }
 
 bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType frame_type) {
-    if (n_.local_store().has(id) || n_.block_cache().has(id))
+    if (local_.data().has(id) || local_.cache().has(id))
         return true;
-    if (!n_.block_cache().enabled())
+    if (!local_.cache().enabled())
         return false;
     auto data = get_remote(id, stripe, frame_type, false, false);
     if (!data)
         return false;
     auto resource = data_resources_.acquire(
         DataWorkContext(frame_type, data->bytes.size()), data->bytes.size());
-    return resource && n_.block_cache().put(id, data->bytes);
+    return resource && local_.cache().put(id, data->bytes);
 }
 
 bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
@@ -2152,13 +2152,13 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
             DataWorkContext(local_class, n_.config().extent_size), n_.config().extent_size);
         if (!resource)
             return false;
-        if (n_.local_store().valid(id))
+        if (local_.data().valid(id))
             return true;
     }
-    if (auto cached = n_.block_cache().get(id)) {
+    if (auto cached = local_.cache().get(id)) {
         auto resource = data_resources_.acquire(
             DataWorkContext(local_class, cached->size()), cached->size());
-        if (resource && n_.local_store().put(id, *cached))
+        if (resource && local_.data().put(id, *cached))
             return true;
     }
     auto data = get_remote(id, 0,
@@ -2168,13 +2168,13 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
         return false;
     auto resource = data_resources_.acquire(
         DataWorkContext(local_class, data->bytes.size()), data->bytes.size());
-    return resource && n_.local_store().put(id, data->bytes);
+    return resource && local_.data().put(id, data->bytes);
 }
 
 bool DistributedStore::ensure_control_local(const ObjectId& id) {
     // No DATA credit: the control store is not on the DATA device, and DATA
     // pressure must not fail a commit's control-object check.
-    if (n_.control_store().valid(id))
+    if (local_.control().valid(id))
         return true;
 
     Writer writer;
@@ -2209,7 +2209,7 @@ bool DistributedStore::ensure_control_local(const ObjectId& id) {
                 continue;
             }
             note_network(data.size(), Clock::now() - started);
-            if (n_.control_store().put(id, data))
+            if (local_.control().put(id, data))
                 return true;
             last_failure = "local control store put failed";
         } catch (const std::exception& e) {
@@ -2231,9 +2231,9 @@ void DistributedStore::erase_all(const ObjectId& id) {
                 auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, n_.config().extent_size),
                     n_.config().extent_size);
-                if (resource && !n_.claims().retained(RetentionClass::data, id))
-                    (void)n_.local_store().remove(id);
-                (void)n_.block_cache().remove(id);
+                if (resource && !local_.retention().retained(RetentionClass::data, id))
+                    (void)local_.data().remove(id);
+                (void)local_.cache().remove(id);
             } else {
                 (void)n_.call(target, MessageType::delete_object, writer.data(),
                               FrameType::speculative);
@@ -2247,7 +2247,7 @@ void DistributedStore::erase_all(const ObjectId& id) {
 uint64_t DistributedStore::scrub_once(uint64_t byte_budget) {
     uint64_t checked = 0;
     while (!byte_budget || checked < byte_budget) {
-        auto step = n_.local_store().scrub_step(byte_budget ? byte_budget - checked : 0, 256);
+        auto step = local_.data().scrub_step(byte_budget ? byte_budget - checked : 0, 256);
         checked += step.bytes;
         if (step.complete || step.yielded)
             break;
@@ -2421,7 +2421,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             uint64_t skipped = 0;
             while (skipped < *repair_push_resume_) {
                 bool pass_complete = false;
-                if (!n_.local_store().next_object(repair_push_cursor_, pass_complete)) {
+                if (!local_.data().next_object(repair_push_cursor_, pass_complete)) {
                     if (pass_complete)
                         repair_push_cursor_exhausted_ = true;
                     break;
@@ -2435,7 +2435,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
         }
         while (repair_push_window_.size() < scan_budget && !repair_push_cursor_exhausted_) {
             bool pass_complete = false;
-            auto next = n_.local_store().next_object(repair_push_cursor_, pass_complete);
+            auto next = local_.data().next_object(repair_push_cursor_, pass_complete);
             if (!next) {
                 if (pass_complete)
                     repair_push_cursor_exhausted_ = true;
@@ -2552,7 +2552,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                         // Index presence: corrupt local copies are found and
                         // removed by scrub and reads, after which repair sees
                         // them absent.
-                        present = n_.local_store().has(id);
+                        present = local_.data().has(id);
                     } else if (auto found = repair_push_presence_.find({peer.id, id});
                                found != repair_push_presence_.end()) {
                         present = found->second;
@@ -2569,7 +2569,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                             stop = true;
                             break;
                         }
-                        auto read = n_.local_store().get(id);
+                        auto read = local_.data().get(id);
                         if (!read) {
                             note_repair_local_unreadable(id);
                             unreadable = true;
@@ -2585,7 +2585,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                             stop = true;
                             break;
                         }
-                        if (n_.local_store().put(id, *source))
+                        if (local_.data().put(id, *source))
                             plan.keepers.insert(peer.id);
                         continue;
                     }
@@ -2665,12 +2665,12 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     continue; // retried from the same place next step
                 if (plan.live && plan.keepers.size() >= plan.target &&
                     !plan.keepers.contains(n_.node_id()) &&
-                    !n_.claims().retained(RetentionClass::data, plan.id)) {
+                    !local_.retention().retained(RetentionClass::data, plan.id)) {
                     auto resource = data_resources_.acquire(
                         DataWorkContext(FrameType::speculative, n_.config().extent_size),
                         n_.config().extent_size);
                     if (resource) {
-                        n_.local_store().remove(plan.id);
+                        local_.data().remove(plan.id);
                         trace_repair("drop-local " + to_string(plan.id));
                     }
                 }
@@ -2700,7 +2700,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             if (should_own(id)) {
                 // Index lookup, as in the push: reading every held extent would
                 // never reach the missing ones. Scrub and reads own corruption.
-                local_valid = n_.local_store().has(id);
+                local_valid = local_.data().has(id);
             }
             if (!should_own(id) || local_valid) {
                 repair_pull_after_ = id;
@@ -2712,12 +2712,12 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 
             // Promote a copy playback already cached before any network I/O,
             // so convergence never downloads twice.
-            if (auto cached = n_.block_cache().get(id)) {
+            if (auto cached = local_.cache().get(id)) {
                 auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, cached->size()), cached->size());
                 if (!resource)
                     break;
-                (void)n_.local_store().put(id, *cached);
+                (void)local_.data().put(id, *cached);
                 trace_repair("pull " + to_string(id) + " from-cache");
                 repair_pull_after_ = id;
                 ++it;
@@ -2742,7 +2742,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     data->bytes.size());
                 if (!resource)
                     break;
-                if (n_.local_store().put(id, data->bytes))
+                if (local_.data().put(id, data->bytes))
                     transferred += data->bytes.size();
                 trace_repair("pull " + to_string(id) + " fetched");
             } else {
@@ -2783,14 +2783,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
 }
 void DistributedStore::enqueue_local_copy(const ObjectId& id, std::span<const uint8_t> data,
                                           bool promote) {
-    bool cache = false;
-    try {
-        cache = n_.block_cache().enabled();
-    } catch (const std::exception&) {
-        // The cache is still recovering: nothing to fill.
-    }
-    if (promote && !n_.readiness().data_storage_ready)
-        promote = false;
+    const bool cache = local_.cache().enabled();
     if (!cache && !promote)
         return;
 
@@ -2866,7 +2859,7 @@ void DistributedStore::local_writer_loop(std::stop_token stop) {
         }
         bool cached = false;
         if (job.cache) {
-            cached = n_.block_cache().put(job.id, job.data);
+            cached = local_.cache().put(job.id, job.data);
             if (!cached)
                 Log::debug("opportunistic persistence skipped object=" + to_string(job.id) +
                            " reason=cache_put_failed");
@@ -2875,7 +2868,7 @@ void DistributedStore::local_writer_loop(std::stop_token stop) {
         // and HDD promotion is left to idle maintenance. If the cache write
         // fails (or there is no cache), promote here rather than fetch again.
         if (job.promote && (!job.cache || !cached)) {
-            auto& local = n_.local_store();
+            auto& local = local_.data();
             (void)local.put(job.id, job.data);
             n_.advertise_storage(local.used(), local.limit());
         }

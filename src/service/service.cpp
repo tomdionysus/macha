@@ -74,6 +74,8 @@ StatusSources Service::status_sources() {
     sources.maintenance = &maintenance_port_;
     sources.registry = &registry_;
     sources.http = catalogue_http_.get();
+    if (node_.readiness().local_state_ready)
+        sources.local = &node_.local_state();
     if (services_ready_.load(std::memory_order_acquire)) {
         sources.metadata = &services_->metadata();
         sources.subsystems = &services_->subsystems();

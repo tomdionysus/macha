@@ -907,9 +907,9 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     // persistence or gossip.
     Json::Object diagnostics;
     Json::Object metadata_diagnostics;
-    metadata_diagnostics["available"] = readiness.metadata_ready;
-    if (readiness.metadata_ready) {
-        const auto values = node_.metadata_replica().diagnostics();
+    metadata_diagnostics["available"] = sources.local != nullptr;
+    if (sources.local) {
+        const auto values = sources.local->replica().diagnostics();
         metadata_diagnostics["historical_requests"] = values.historical_requests;
         metadata_diagnostics["historical_reconstructions"] = values.historical_reconstructions;
         metadata_diagnostics["historical_deltas_applied"] = values.historical_deltas_applied;
@@ -1073,9 +1073,9 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
 
     Json::Object data_store_diagnostics;
     data_store_diagnostics["available"] = false;
-    if (readiness.data_storage_ready) {
+    if (sources.local) {
         try {
-            const auto data_store = node_.local_store().diagnostics();
+            const auto data_store = sources.local->data().diagnostics();
             data_store_diagnostics["available"] = true;
             data_store_diagnostics["loose_reaffirmation_fast_paths"] =
                 data_store.loose_reaffirmation_fast_paths;

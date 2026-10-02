@@ -58,6 +58,7 @@ struct MaintenancePort {
 // reference outlives the pass.
 struct MaintenanceDependencies {
     NodeRuntime& node;
+    LocalState& local;
     DistributedStore& store;
     MetadataView& metadata;
     MetadataMaintenance& metadata_upkeep;
@@ -107,6 +108,7 @@ class Maintenance final {
                                    const std::vector<GarbageRef>& stamp);
 
     NodeRuntime& node_;
+    LocalState& local_;
     DistributedStore& store_;
     MetadataView& metadata_;
     MetadataMaintenance& metadata_upkeep_;

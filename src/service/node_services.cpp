@@ -26,16 +26,16 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageR
                            NodeServicesInstruments instruments)
     : node_(node), resources_(resources), routes_(routes), registry_(registry), port_(port),
       instruments_(std::move(instruments)),
-      store_(node_, resources_.activity, resources_.data, resources_.memory, resources_.events,
+      store_(node_, node_.local_state(), resources_.activity, resources_.data, resources_.memory, resources_.events,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
                                             instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
-      metadata_(node_, &store_,
+      metadata_(node_, node_.local_state(), &store_,
                 [this](const MetadataPublicationContext& context) {
                     retain_metadata_publication(context);
                 }),
-      catalogue_(node_, store_, metadata_), filesystem_(node_, store_, metadata_, resources_.memory, &playback_),
+      catalogue_(node_, node_.local_state(), store_, metadata_), filesystem_(node_, node_.local_state(), store_, metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
       scanner_(node_, filesystem_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner,
@@ -84,9 +84,10 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageR
                  },
                  &media_information_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      ledger_(node_.claims(), node_.local_store(), node_.control_store()),
-      horizon_builder_(filesystem_, catalogue_, node_, store_),
-      maintenance_(MaintenanceDependencies{node_, store_, metadata_, metadata_, catalogue_,
+      ledger_(node_.local_state().retention(), node_.local_state().data(),
+              node_.local_state().control()),
+      horizon_builder_(filesystem_, catalogue_, node_.local_state().control(), store_),
+      maintenance_(MaintenanceDependencies{node_, node_.local_state(), store_, metadata_, metadata_, catalogue_,
                                            horizon_builder_, ledger_, media_information_,
                                            resources_.events, port_, instruments_.clock,
                                            instruments_.trace, instruments_.maintenance_stage_hook,
@@ -147,6 +148,7 @@ void NodeServices::start() {
     context.data_resources = &resources_.data;
     context.retained_memory = &resources_.memory;
     context.routes = &routes_;
+    context.local_state = &node_.local_state();
     context.ingest = &ingest_;
     context.registry = &registry_;
     context.filesystem = &filesystem_;
@@ -257,7 +259,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     // Either namespace may be a tree, so reads go through the namespace
     // primitives. An entry missed here never gets liveness evidence and can be
     // collected while still referenced.
-    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(node_, store_);
+    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(node_.local_state().control(), store_);
     const bool establish_baseline =
         !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
     if (establish_baseline) {
