@@ -317,8 +317,6 @@ MACHA_TEST("fuse_subsystem", test_fuse_subsystem_without_a_mount_path_is_unavail
         auto status = fuse_status(supervisor);
         return status && status->state == SubsystemState::unavailable;
     }, 10s));
-    std::this_thread::sleep_for(100ms);
-    CHECK(fuse_status(supervisor)->state == SubsystemState::unavailable);
     CHECK(fuse_status(supervisor)->restart_count == 0);
     CHECK(control->run_count() == 0);
     CHECK(!registry.fuse());

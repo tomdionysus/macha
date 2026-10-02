@@ -33,7 +33,8 @@ struct SubsystemSupervisor::Entry {
 
     mutable std::mutex mutex;
     std::condition_variable_any cv;
-    SubsystemState state{SubsystemState::unavailable};
+    // Not yet tried until the first attempt decides.
+    SubsystemState state{SubsystemState::starting};
     size_t restart_count{};
     std::string last_fault;
     std::unique_ptr<Subsystem> instance;
