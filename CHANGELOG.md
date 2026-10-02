@@ -1,5 +1,44 @@
 # Current release
 
+## 0.76.0 — T5: the node's parts move into the root (experiment)
+
+The object ledger experiment's T5 so far: parts that lived inside the node
+are now built, owned and stopped by the node's root, and handed to whoever
+uses them. No wire format, protocol or on-disk format changes; either node
+can go back to 0.75.0 by reinstalling it. Running mid-restructure, to see
+the shape working on hardware.
+
+**A subsystem reports `starting` until its first attempt decides.** Status
+`subsystems[].state` read `unavailable` before the supervisor had tried a
+subsystem, the same as one that declined, so the two could not be told
+apart. `unavailable` now always means decided: no plugin, or not enabled on
+this node. (Clients told on 2026-10-02.)
+
+**A torrent subsystem rebuilt after a fault can no longer be called after
+its manager is freed.** Peers' job requests reached the torrent manager
+through a handler copied under a lock and called outside it; one in flight
+during a rebuild ran against freed memory. Job requests now go through the
+node's message routes, and unbinding a route waits for any call in flight.
+
+**A storage or metadata change no longer waits for the pass's deadline to
+be noticed.** The maintenance pass's wake could be lost when an event
+landed between its check and its wait.
+
+**Peers asking for something a node does not answer get "<message> is not
+available on this node".** This replaces the fixed texts for the legacy
+metadata RPCs and for job requests on a node without that capability.
+
+Inside, unchanged in behaviour: the DATA arbiter, the memory ledger, the
+transcode rate book and the activity clocks are built and stopped by the
+root (stopped just before the node, as before); node events (storage,
+metadata, topology) are counted, and the maintenance pass turns them into
+work; Status reads the node it is built with and is handed everything else
+per request; inbound requests dispatch through a route table each part
+binds; opportunistic local copies of fetched objects belong to the store;
+node identity is a value the root builds; local-state figures are
+advertised to the control plane. Every code comment was cut to describe
+the code as it is.
+
 ## 0.75.0 — The object ledger experiment through T4, and T5's first step (experiment)
 
 The object ledger experiment's first deploy since 0.74.0 (T0): its steps T1
