@@ -411,8 +411,8 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(n1.wait_local_state_ready(10s));
     REQUIRE(n2.wait_local_state_ready(10s));
 
-    DistributedStore source(n1, n1.resources.activity, n1.resources.data, n1.resources.memory);
-    DistributedStore target(n2, n2.resources.activity, n2.resources.data, n2.resources.memory);
+    DistributedStore source(n1, n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
+    DistributedStore target(n2, n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
     auto make_remote = [&](uint8_t value) {
         Bytes data(128 * 1024, value);
         auto id = object_id(data);
@@ -1915,7 +1915,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
 
@@ -3680,7 +3680,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // genesis while its bootstrap peer has not yet entered active membership.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    DistributedStore store1(n1, n1.resources.activity, n1.resources.data, n1.resources.memory);
+    DistributedStore store1(n1, n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
     MetadataManager metadata1(n1);
     CatalogueManager catalogue1(n1, store1, metadata1);
 
@@ -3692,7 +3692,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    DistributedStore store2(n2, n2.resources.activity, n2.resources.data, n2.resources.memory);
+    DistributedStore store2(n2, n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
     MetadataManager metadata2(n2);
     CatalogueManager catalogue2(n2, store2, metadata2);
 
@@ -4557,7 +4557,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
 
@@ -4602,7 +4602,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node);
     FileSystem filesystem(node, store, metadata, node.resources.memory);
 
@@ -4664,7 +4664,7 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node);
     FileSystem filesystem(node, store, metadata, node.resources.memory);
 
@@ -5000,14 +5000,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     std::atomic_bool gate_metadata{};
     std::atomic_bool gate_once{};
     std::atomic_uint64_t catalogue_repairs{};
-    std::atomic_bool capture_catalogue_repair{};
-    std::atomic_bool catalogue_repair_capture_claimed{};
-    std::atomic_bool catalogue_repair_captured{};
-    std::atomic_uint64_t catalogue_repair_runs_scheduled{};
-    std::atomic_uint64_t catalogue_repair_runs_completed{};
-    std::atomic_uint64_t catalogue_repair_requested_epoch{};
-    std::atomic_uint64_t catalogue_repair_completed_epoch{};
-    Service* observed_service = nullptr;
     Service s1(c1, keys, {}, [&](std::string_view stage) {
         if (stage == "metadata-repair-begin" &&
             gate_metadata.load(std::memory_order_acquire) &&
@@ -5015,23 +5007,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
             metadata_gate.enter_and_wait();
         } else if (stage == "catalogue-repair-begin") {
             catalogue_repairs.fetch_add(1, std::memory_order_relaxed);
-            if (observed_service && capture_catalogue_repair.load(std::memory_order_acquire) &&
-                !catalogue_repair_capture_claimed.exchange(true, std::memory_order_acq_rel)) {
-                const auto convergence =
-                    observed_service->metadata_convergence_diagnostics();
-                catalogue_repair_runs_scheduled.store(convergence.runs_scheduled,
-                                                       std::memory_order_release);
-                catalogue_repair_runs_completed.store(convergence.runs_completed,
-                                                       std::memory_order_release);
-                catalogue_repair_requested_epoch.store(convergence.requested_epoch,
-                                                        std::memory_order_release);
-                catalogue_repair_completed_epoch.store(convergence.completed_epoch,
-                                                        std::memory_order_release);
-                catalogue_repair_captured.store(true, std::memory_order_release);
-            }
         }
     });
-    observed_service = &s1;
     Service s2(c2, keys);
     struct GateOpener {
         TestGate& gate;
@@ -5076,6 +5053,11 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         convergence_before = d;
         return true;
     }, 5s));
+    const auto convergence_events = [&] {
+        return s1.resources().events.count(NodeEvent::metadata) +
+               s1.resources().events.count(NodeEvent::topology);
+    };
+    const auto events_before = convergence_events();
 
     const auto repairs_before = catalogue_repairs.load(std::memory_order_acquire);
     gate_metadata.store(true, std::memory_order_release);
@@ -5111,11 +5093,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     // asserted at the end over the whole window, gate included.
     const auto gated_repairs = catalogue_repairs.load(std::memory_order_acquire);
 
-    // Capture the convergence state at the first catalogue repair after the
-    // gate opens: that repair processes the accumulated burst, which the
-    // run-count assertions below are about. Latching earlier could capture a
-    // repair for the single pre-burst upsert instead.
-    capture_catalogue_repair.store(true, std::memory_order_release);
     metadata_gate.open();
     const bool final_state_ready = wait_until([&] {
         try {
@@ -5171,47 +5148,35 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     REQUIRE(final_artwork.has_value());
     CHECK(final_artwork->bytes == initial_bytes);
 
-    REQUIRE(catalogue_repair_captured.load(std::memory_order_acquire));
-    const auto repair_runs_scheduled =
-        catalogue_repair_runs_scheduled.load(std::memory_order_acquire);
-    const auto repair_runs_completed =
-        catalogue_repair_runs_completed.load(std::memory_order_acquire);
-    const auto repair_requested_epoch =
-        catalogue_repair_requested_epoch.load(std::memory_order_acquire);
-    const auto repair_completed_epoch =
-        catalogue_repair_completed_epoch.load(std::memory_order_acquire);
-    const auto scheduled_delta = repair_runs_scheduled - convergence_before.runs_scheduled;
-    const auto completed_delta = repair_runs_completed - convergence_before.runs_completed;
-    const auto requested_delta = repair_requested_epoch - convergence_before.requested_epoch;
-    // The gated owner and its coalesced follow-up are mandatory. Accept at most
-    // one additional run caused by reconciliation publishing its own accepted
-    // metadata edge; the many external burst events must never become one run
-    // each. The pure one-follow-up state-machine contract is covered by the
-    // dedicated ConvergenceDemand test.
-    if (scheduled_delta < 2 || scheduled_delta > 3 ||
-        completed_delta != scheduled_delta || repair_completed_epoch != repair_requested_epoch ||
-        scheduled_delta >= requested_delta) {
-        const auto convergence_after = s1.metadata_convergence_diagnostics();
+    // Measured over the whole window once convergence settles: the gated run
+    // and its coalesced follow-up are mandatory, and at most one more run may
+    // come from reconciliation publishing its own accepted metadata. The many
+    // burst events must never become one run each. The pure one-follow-up
+    // state-machine contract is covered by the dedicated ConvergenceDemand test.
+    ConvergenceDemandDiagnostics settled{};
+    REQUIRE(wait_until([&] {
+        settled = s1.metadata_convergence_diagnostics();
+        return !settled.scheduled && settled.runs_scheduled == settled.runs_completed;
+    }, 5s));
+    const auto scheduled_delta = settled.runs_scheduled - convergence_before.runs_scheduled;
+    const auto completed_delta = settled.runs_completed - convergence_before.runs_completed;
+    const auto events_delta = convergence_events() - events_before;
+    if (scheduled_delta < 2 || scheduled_delta > 3 || completed_delta != scheduled_delta ||
+        settled.completed_epoch != settled.requested_epoch || scheduled_delta >= events_delta) {
         throw std::runtime_error(
-            "unexpected convergence run count at catalogue repair: before_scheduled=" +
+            "unexpected convergence run count for one coalesced burst: before_scheduled=" +
             std::to_string(convergence_before.runs_scheduled) +
             " before_completed=" + std::to_string(convergence_before.runs_completed) +
-            " before_requested=" + std::to_string(convergence_before.requested_epoch) +
-            " before_completed_epoch=" + std::to_string(convergence_before.completed_epoch) +
-            " repair_scheduled=" + std::to_string(repair_runs_scheduled) +
-            " repair_completed=" + std::to_string(repair_runs_completed) +
-            " repair_requested=" + std::to_string(repair_requested_epoch) +
-            " repair_completed_epoch=" + std::to_string(repair_completed_epoch) +
-            " current_scheduled=" + std::to_string(convergence_after.runs_scheduled) +
-            " current_completed=" + std::to_string(convergence_after.runs_completed) +
-            " after_requested=" + std::to_string(convergence_after.requested_epoch) +
-            " after_completed_epoch=" + std::to_string(convergence_after.completed_epoch) +
-            " repairs_before=" + std::to_string(repairs_before) +
-            " repairs_after=" +
+            " settled_scheduled=" + std::to_string(settled.runs_scheduled) +
+            " settled_completed=" + std::to_string(settled.runs_completed) +
+            " settled_requested_epoch=" + std::to_string(settled.requested_epoch) +
+            " settled_completed_epoch=" + std::to_string(settled.completed_epoch) +
+            " events=" + std::to_string(events_delta) +
+            " repairs_before=" + std::to_string(repairs_before) + " repairs_after=" +
             std::to_string(catalogue_repairs.load(std::memory_order_acquire)));
     }
-    // Nine catalogue mutations, arriving as ~20 convergence demand events, must
-    // not become ~20 catalogue repairs. A quarter of the demand events is a
+    // Nine catalogue mutations, arriving as ~20 node events, must not become
+    // ~20 catalogue repairs. A quarter of the demand events is a
     // generous ceiling on "coalesced" and still far below a per-event storm.
     // Not pinned to exactly one: each convergence run that advances the
     // committed generation correctly dirties the catalogue, and whether the
@@ -5219,14 +5184,14 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     // a timing accident.
     const auto repairs_after = catalogue_repairs.load(std::memory_order_acquire);
     const auto repairs_delta = repairs_after - repairs_before;
-    if (repairs_delta < 1 || repairs_delta * 4 > requested_delta) {
+    if (repairs_delta < 1 || repairs_delta * 4 > events_delta) {
         throw std::runtime_error(
             "unexpected catalogue repair count for one coalesced burst: repairs_before=" +
             std::to_string(repairs_before) + " repairs_after=" + std::to_string(repairs_after) +
             " gated_repairs=" + std::to_string(gated_repairs) +
             " scheduled_delta=" + std::to_string(scheduled_delta) +
             " completed_delta=" + std::to_string(completed_delta) +
-            " requested_delta=" + std::to_string(requested_delta));
+            " events=" + std::to_string(events_delta));
     }
 
     const auto unreclaimed = [&] {

@@ -23,11 +23,10 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 
 NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, JobRoutes& job_routes,
                            SubsystemRegistry& registry, MaintenancePort& port,
-                           std::function<void(ServiceEvent)> signal_maintenance,
                            NodeServicesInstruments instruments)
     : node_(node), resources_(resources), job_routes_(job_routes), registry_(registry), port_(port),
-      signal_maintenance_(std::move(signal_maintenance)), instruments_(std::move(instruments)),
-      store_(node_, resources_.activity, resources_.data, resources_.memory,
+      instruments_(std::move(instruments)),
+      store_(node_, resources_.activity, resources_.data, resources_.memory, resources_.events,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
                                             instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
@@ -88,7 +87,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, JobRoute
       ledger_(node_.claims(), node_.local_store(), node_.control_store()),
       horizon_builder_(filesystem_, catalogue_, node_, store_),
       maintenance_(MaintenanceDependencies{node_, store_, metadata_, metadata_, catalogue_,
-                                           horizon_builder_, ledger_, port_, instruments_.clock,
+                                           horizon_builder_, ledger_, media_information_,
+                                           resources_.events, port_, instruments_.clock,
                                            instruments_.trace, instruments_.maintenance_stage_hook,
                                            instruments_.constructed}) {
     using Route = JobRoutes::Route;
@@ -354,7 +354,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
         throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
     }
     report("ok");
-    signal_maintenance_(ServiceEvent::storage);
+    resources_.events.notify(NodeEvent::storage);
 }
 
 

@@ -866,7 +866,7 @@ class StorageClusterNode {
         started_ = true;
         REQUIRE(node_->wait_local_state_ready(10s));
         store_ = std::make_unique<DistributedStore>(*node_, node_->resources.activity,
-                                                    node_->resources.data, node_->resources.memory);
+                                                    node_->resources.data, node_->resources.memory, node_->resources.events);
         metadata_ = std::make_unique<MetadataManager>(*node_);
         catalogue_ = std::make_unique<CatalogueManager>(*node_, *store_, *metadata_);
     }

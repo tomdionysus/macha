@@ -3932,7 +3932,7 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     REQUIRE(s1.node().local_store().put(id, bytes));
     REQUIRE(!s2.node().local_store().has(id));
     std::vector<ObjectId> live{id};
-    DistributedStore repair(s1.node(), s1.resources().activity, s1.resources().data, s1.resources().memory);
+    DistributedStore repair(s1.node(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
     const auto full_lists_before = s1.node().local_store().full_list_scans();
 
     auto yielded =

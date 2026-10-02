@@ -120,6 +120,7 @@ class DistributedStore final : public Placement {
     ActivityClocks& activity_;
     DataResourceArbiter& data_resources_;
     RetainedMemoryLedger& retained_memory_;
+    NodeEvents& events_;
     StoragePool::Cursor repair_push_cursor_;
     // Objects taken from the push cursor and not yet settled, in cursor order,
     // with one batched presence round's findings. A step that stops leaves
@@ -259,7 +260,8 @@ class DistributedStore final : public Placement {
 
   public:
     DistributedStore(NodeRuntime& n, ActivityClocks& activity, DataResourceArbiter& data_resources,
-                     RetainedMemoryLedger& retained_memory, DistributedStoreOptions options = {});
+                     RetainedMemoryLedger& retained_memory, NodeEvents& events,
+                     DistributedStoreOptions options = {});
     ~DistributedStore();
     struct PromptReplicationStats {
         uint64_t queued{};

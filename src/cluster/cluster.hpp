@@ -5,6 +5,7 @@
 #include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/job_routes.hpp"
+#include "cluster/node_events.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
 #include "metadata/metadata.hpp"
@@ -26,12 +27,6 @@
 #include <string_view>
 
 namespace macha {
-enum class ServiceEvent : uint8_t {
-    storage,
-    metadata,
-    topology,
-};
-
 // How this node answers "can peers connect to me?" and "do I host extents?",
 // with the configured modes beside the resolved values. `source` decided the
 // inbound answer: "configured", "persisted", "default" (auto, no evidence yet,
@@ -98,6 +93,9 @@ class NodeRuntime {
     TranscodeRateBook& transcode_rates_;
     // Job RPCs pass through opaque to whichever component the root bound.
     JobRoutes& job_routes_;
+    // Storage, metadata and topology changes are counted here for whoever
+    // watches; the node never calls a consumer.
+    NodeEvents& events_;
     // Declared before members_ so the roster is built with the right flags.
     mutable std::mutex inbound_mutex_;
     InboundResolution inbound_;
@@ -171,10 +169,7 @@ class NodeRuntime {
     std::condition_variable local_copy_settled_cv_;
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
-    mutable std::mutex service_event_mutex_;
-    std::function<void(ServiceEvent)> service_event_;
 
-    void signal_service_event(ServiceEvent);
 
     bool ready(ReadyBit bit) const noexcept {
         return (ready_bits_.load(std::memory_order_acquire) & static_cast<uint32_t>(bit)) != 0;
@@ -207,7 +202,7 @@ class NodeRuntime {
   public:
     // The caller holds state_path's StorageLock for this node's life.
     NodeRuntime(Config, ClusterKeys, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
-                TranscodeRateBook&, JobRoutes&, StartupStageHook startup_stage_hook = {});
+                TranscodeRateBook&, JobRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
     void request_stop();
@@ -215,8 +210,6 @@ class NodeRuntime {
     // Service-owned workers can leave an RPC wait before Service joins them.
     void cancel_outbound_calls();
     void stop();
-    void set_service_event_callback(std::function<void(ServiceEvent)> callback);
-    void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;
     const Config& config() const {

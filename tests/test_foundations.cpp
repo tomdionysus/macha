@@ -1817,3 +1817,15 @@ MACHA_FAST_TEST("foundations", test_job_routes_answer_only_while_bound) {
     routes.unbind(Route::ingest_jobs);
     CHECK(!routes.call(Route::ingest_jobs, request));
 }
+
+MACHA_FAST_TEST("foundations", test_node_events_count_each_kind) {
+    NodeEvents events;
+    CHECK(events.total() == 0);
+    events.notify(NodeEvent::metadata);
+    events.notify(NodeEvent::metadata);
+    events.notify(NodeEvent::storage);
+    CHECK(events.count(NodeEvent::metadata) == 2);
+    CHECK(events.count(NodeEvent::storage) == 1);
+    CHECK(events.count(NodeEvent::topology) == 0);
+    CHECK(events.total() == 3);
+}

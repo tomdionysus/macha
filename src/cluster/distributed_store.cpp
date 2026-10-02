@@ -323,7 +323,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         if (owner.id == n_.node_id()) {
             const auto started = Clock::now();
             if (!n_.local_store().has(id))
-                n_.notify_storage_mutation();
+                events_.notify(NodeEvent::storage);
             if (batch) {
                 if (const auto token = n_.local_store().put_deferred(id, data)) {
                     ++success;
@@ -1167,10 +1167,10 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
 
 DistributedStore::DistributedStore(NodeRuntime& n, ActivityClocks& activity,
                                    DataResourceArbiter& data_resources,
-                                   RetainedMemoryLedger& retained_memory,
+                                   RetainedMemoryLedger& retained_memory, NodeEvents& events,
                                    DistributedStoreOptions options)
     : n_(n), activity_(activity), data_resources_(data_resources),
-      retained_memory_(retained_memory), repair_trace_(std::move(options.repair_trace)) {
+      retained_memory_(retained_memory), events_(events), repair_trace_(std::move(options.repair_trace)) {
     if (options.repair_position) {
         repair_position_path_ = std::move(*options.repair_position);
         std::ifstream in(repair_position_path_);
@@ -1323,7 +1323,7 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
             if (!data) continue;
             if (put_on(*destination, *id, *data, false)) {
                 prompt_copies_.fetch_add(1, std::memory_order_relaxed);
-                n_.notify_storage_mutation();
+                events_.notify(NodeEvent::storage);
             } else {
                 retry_later();
             }
@@ -1347,7 +1347,7 @@ bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
         return false;
     if (target.id == n_.node_id()) {
         if (!n_.local_store().has(id))
-            n_.notify_storage_mutation();
+            events_.notify(NodeEvent::storage);
         return n_.local_store().put(id, data);
     }
     Writer writer;
