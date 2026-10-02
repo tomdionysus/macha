@@ -482,7 +482,7 @@ inline std::string raw_http_post(uint16_t port, std::string_view path, std::stri
 // creation over HTTP.
 inline std::map<std::string, std::string> bearer_header(Service& service) {
     // All roles, so no test asserts against a 403 instead of its handler.
-    auto minted = service.node().sessions().create(all_roles());
+    auto minted = service.accounts().sessions().create(all_roles());
     REQUIRE(minted.has_value());
     return {{"Authorization", "Bearer " + minted->bearer_token}};
 }

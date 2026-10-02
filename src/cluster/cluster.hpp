@@ -90,18 +90,6 @@ class NodeRuntime {
     Membership members_;
     PublicConnectivity public_connectivity_;
     TelemetryStore telemetry_;
-    SessionManager sessions_;
-    UserStore users_;
-    // The last gossiped table and which peers have been told it. A set of ids,
-    // not a count, so membership churn does not re-broadcast.
-    Hash256 gossiped_user_table_{};
-    std::set<NodeId> gossiped_user_peers_;
-    Clock::time_point gossip_users_retry_after_{};
-    Clock::time_point gossiped_users_at_{};
-    Hash256 gossiped_sessions_{};
-    std::set<NodeId> gossiped_session_peers_;
-    Clock::time_point gossip_sessions_retry_after_{};
-    Clock::time_point gossiped_sessions_at_{};
     RpcClient client_;
     RpcServer server_;
 
@@ -215,28 +203,11 @@ class NodeRuntime {
     const TelemetryStore& telemetry() const {
         return telemetry_;
     }
-    SessionManager& sessions() {
-        return sessions_;
+    // A no-dial notification on established routes; never blocks. Returns
+    // how many peers it was queued for.
+    size_t broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
+        return client_.broadcast_best_effort(message, frame_type);
     }
-    const SessionManager& sessions() const {
-        return sessions_;
-    }
-    UserStore& users() {
-        return users_;
-    }
-    const UserStore& users() const {
-        return users_;
-    }
-    bool apply_session(const AuthSession&);
-    // Notify-only: merge locally, queue on already-usable control-lane
-    // connections, and return. No HTTP request path waits on a peer; an
-    // unreachable peer converges on the next gossip tick.
-    void propagate_session(const AuthSession&);
-    bool apply_user(const UserRecord&);
-    void propagate_users();
-    // Periodic repair, not a heartbeat: sends only when the table changed or
-    // a peer appeared that may not have seen it.
-    void gossip_users_if_changed();
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);

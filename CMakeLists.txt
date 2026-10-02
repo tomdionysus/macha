@@ -322,6 +322,7 @@ set(MACHA_CORE_SOURCES
     src/metadata/metadata_server.cpp
     src/auth/session.cpp
     src/auth/users.cpp
+    src/auth/accounts.cpp
     src/http/http.cpp
     src/http/http_compression.cpp
     src/api/status_api.cpp

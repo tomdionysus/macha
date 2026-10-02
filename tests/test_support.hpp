@@ -275,7 +275,7 @@ struct BareNodeResources {
 // resources first, then the node; start() brings the control plane online
 // and recovers local state on its own thread; stop() stops the resources,
 // the node and that recovery, in that order. The store accessors are the
-// tests' convenience; each throws until local state has recovered.
+// tests' convenience; each waits, bounded, for local state to recover.
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
@@ -288,6 +288,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     BareNode& operator=(const BareNode&) = delete;
     void start() {
         NodeRuntime::start();
+        accounts_.start();
         if (recovery_.joinable())
             return;
         recovery_ = std::jthread([this](std::stop_token stop) {
@@ -307,12 +308,14 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     }
     void request_stop() {
         resources.stop();
+        accounts_.stop();
         NodeRuntime::request_stop();
         if (recovery_.joinable())
             recovery_.request_stop();
     }
     void stop() {
         resources.stop();
+        accounts_.stop();
         NodeRuntime::stop();
         if (recovery_.joinable()) {
             recovery_.request_stop();
@@ -320,6 +323,13 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         }
     }
 
+    Accounts& accounts() { return accounts_; }
+    UserStore& users() { return accounts_.users(); }
+    SessionManager& sessions() { return accounts_.sessions(); }
+    bool apply_session(const AuthSession& session) { return accounts_.apply_session(session); }
+    void propagate_session(const AuthSession& session) { accounts_.propagate_session(session); }
+    bool apply_user(const UserRecord& user) { return accounts_.apply_user(user); }
+    void propagate_users() { accounts_.propagate_users(); }
     LocalState& local_state() { return local("local state").state(); }
     MetadataServer& metadata_server() { return local("metadata replica").metadata(); }
     StoragePool& local_store() { return local("data storage").state().data(); }
@@ -333,12 +343,15 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     }
 
   private:
+    // Waits, bounded, for recovery: a test reaching for the stores means "once
+    // they exist", and recovery runs on its own thread.
     LocalServices& local(std::string_view what) {
-        if (!progress.complete())
+        if (!progress.wait_complete(std::chrono::seconds(10)))
             throw std::runtime_error(std::string(what) + " is still recovering");
         return *local_;
     }
 
+    Accounts accounts_{config(), identity, *this, resources.events, routes};
     // Declared in this order so the recovery thread goes before what it built.
     std::unique_ptr<LocalServices> local_;
     std::jthread recovery_;

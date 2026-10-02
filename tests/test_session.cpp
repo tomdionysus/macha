@@ -8,9 +8,9 @@ using namespace macha::test_support;
 
 namespace {
 
-// Anonymous access is an ordinary account created at genesis; a bare
-// NodeRuntime in a test must be given one before it can mint anonymous sessions.
-UserRecord give_anonymous_account(NodeRuntime& node) {
+// Anonymous access is an ordinary account created at genesis; a bare node in
+// a test must be given one before it can mint anonymous sessions.
+UserRecord give_anonymous_account(BareNode& node) {
     auto created = node.users().create_without_password(
         anonymous_username, {std::string(role_media_viewer)}, node.node_id());
     REQUIRE(created.has_value());
@@ -29,7 +29,7 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
     TestCluster cluster;
     BareNode node(cluster.node_config("n1"), cluster.keys());
     const auto anonymous = give_anonymous_account(node);
-    SessionApi api(node);
+    SessionApi api(node, node.accounts());
 
     auto created = api.handle(session_request("POST"));
     REQUIRE(created.status == 201);
@@ -75,7 +75,7 @@ MACHA_FAST_TEST("session", test_session_create_and_validate) {
 MACHA_FAST_TEST("session", test_session_rejects_non_anonymous_credentials) {
     TestCluster cluster;
     BareNode node(cluster.node_config("n1"), cluster.keys());
-    SessionApi api(node);
+    SessionApi api(node, node.accounts());
 
     auto request = session_request("POST");
     Json::Object credentials{{"username", "someone"}};
@@ -93,7 +93,7 @@ MACHA_FAST_TEST("session", test_session_revoke_invalidates_immediately) {
     TestCluster cluster;
     BareNode node(cluster.node_config("n1"), cluster.keys());
     const auto anonymous = give_anonymous_account(node);
-    SessionApi api(node);
+    SessionApi api(node, node.accounts());
 
     auto created = api.handle(session_request("POST"));
     REQUIRE(created.status == 201);

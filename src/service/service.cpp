@@ -36,8 +36,9 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       node_(std::move(config), identity_, progress_, resources_.memory,
             resources_.transcode_rates, routes_, resources_.events,
             std::move(startup_stage_hook)),
-      cluster_status_(node_, resources_.activity, resources_.data, resources_.memory),
-      session_api_(node_), users_api_(node_),
+      accounts_(node_.config(), identity_, node_, resources_.events, routes_),
+      cluster_status_(node_, accounts_, resources_.activity, resources_.data, resources_.memory),
+      session_api_(node_, accounts_), users_api_(node_, accounts_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
       startup_stall_handler_(std::move(startup_stall_handler)) {
@@ -47,13 +48,13 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
             [this](const HttpRequest& request) { return handle_http(request); },
             [this](const HttpRequest& request) { return capability_request(request); },
             [this](std::string_view token) -> std::optional<SessionIdentity> {
-                auto session = node_.sessions().validate(token);
+                auto session = accounts_.sessions().validate(token);
                 if (!session)
                     return std::nullopt;
                 // A user-bound session is only as live as its account. Both lookups are
                 // O(1) against local replicas, so an isolated node still answers.
                 if (!session->user_id.empty()) {
-                    auto user = node_.users().find(session->user_id);
+                    auto user = accounts_.users().find(session->user_id);
                     if (!user || user->credential_generation != session->credential_generation)
                         return std::nullopt;
                 }
@@ -560,6 +561,7 @@ void Service::start() {
 
     note_lifecycle("start node");
     node_.start();
+    accounts_.start();
     note_lifecycle("start startup");
     startup_ = std::jthread([this](std::stop_token stop) {
         run_supervised_once("service-startup", [this, stop] { initialise_services(stop); });
@@ -616,6 +618,7 @@ void Service::stop() {
     note_lifecycle("stop status");
     cluster_status_.stop();
     Log::debug("shutdown: NodeRuntime::stop calling");
+    accounts_.stop();
     note_lifecycle("stop node");
     node_.stop();
     Log::debug("shutdown: Service::stop complete");
