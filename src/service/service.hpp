@@ -106,6 +106,7 @@ class Service {
     void wait_services_ready();
     std::string describe_readiness_stall() const;
     HttpResponse handle_http(const HttpRequest&);
+    StatusSources status_sources();
     // Unauthenticated liveness: whether this node is serving, and nothing more.
     HttpResponse health_response() const;
     bool capability_request(const HttpRequest&);
