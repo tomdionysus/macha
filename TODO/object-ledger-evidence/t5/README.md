@@ -88,3 +88,25 @@ install: 703 + 17 + 21, all passing (`6901443`). Tarball md5
   no "not available" refusals and no warnings or errors after the install.
 - Reads through fi-1's FUSE: 16 MiB in 3.8 s and 6.0 s for the two
   readable films sampled earlier.
+
+## 0.78.0 smoke test on fi-1 (2026-10-02, late)
+
+T5.12-T5.14: LocalState recovered in one construction, consumers taking it
+directly, and the root owning it (LocalServices: local state, then the
+metadata and storage servers). Suites on fi-1 before install: 703 + 17 +
+21, all passing (`8a316b4`). Tarball md5 `927dc7fb92fdd3adc08aeb7c9af3d321`;
+backup `/root/macha-0.77.0-installed.tgz`.
+
+- Installed 22:42:15Z with one playback session on fi-1: 0.77.0 stopped in
+  2 s; listening 22:42:18; DATA backend online 22:42:20 (355 GB used);
+  metadata ready, local services built and services ready 22:42:30 (12 s);
+  writable 22:42:31; healthy 22:42:33.
+- Status on both nodes: every startup plane ready (the root's recovery
+  record reads as the node's bits did), both nodes ready, subsystems
+  running with no restarts, diagnostics answering. gbni-1 (0.75.0) logged
+  no "not available" refusals and no warnings or errors after the install.
+- Reads through fi-1's FUSE: 16 MiB in 4.3 s and 8.6 s for the two
+  readable films sampled earlier.
+- fi-1's data disk had one USB reset with a single failed read at
+  21:54:06Z (0.77.0); the device recovered at once and the backend stayed
+  online.
