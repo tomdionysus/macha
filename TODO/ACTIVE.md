@@ -100,6 +100,12 @@ resumes from `develop` and the experiment's version line ceases to exist.
     first. T0's diff touches no catalogue or metadata code, so this is
     0.73 behaviour the baseline recorded. fi-1's restart at 21:59Z did not
     clear it: 21 more failures by 22:27Z.
+    T4b found that every maintenance pass runs the catalogue's repair
+    twice: in its `catalogue-repair` stage and again inside the inventory
+    build (now the explicit `maintenance_repair()` step). Each run
+    reconciles at most one catalogue-root conflict and may commit. Whether
+    that second commit per pass feeds the loop is not established; removing
+    it is a behaviour change, for the operator.
 - **T4 next** (plan, T4): the metadata contract; the catalogue's hidden
   repair split out of the inventory build into an explicit step (which the
   conflict loop gives a second reason to watch).
