@@ -575,7 +575,92 @@ void walk_subtree(const ObjectId& id, const NamespaceNodeStore& store,
         walk_subtree(child, store, visit);
 }
 
+// Visits the entries of the subtree after `after` until `take` says stop;
+// returns whether it stopped. A child holds the keys from its own first key
+// up to the next child's, so a child whose successor starts at or before
+// `after` holds nothing after it and is not read.
+bool walk_subtree_after(const ObjectId& id, const NamespaceNodeStore& store,
+                        const std::optional<std::string>& after,
+                        const std::function<bool(NamespaceItem&&)>& take) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    const auto magic = reader.fixed<4>();
+    if (magic == leaf_magic) {
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i) {
+            auto item = decode_leaf_entry(reader, store, true);
+            if (after && item.first <= *after)
+                continue;
+            if (!take(std::move(item)))
+                return true;
+        }
+        reader.finish();
+        return false;
+    }
+    if (magic != branch_magic)
+        throw DecodeError("not a namespace tree node");
+    (void)reader.u8(); // level
+    const auto count = reader.u32();
+    std::vector<std::pair<std::string, ObjectId>> children;
+    children.reserve(std::min<size_t>(count, reader.remaining() / 44));
+    for (uint32_t i = 0; i < count; ++i) {
+        auto key = reader.string(8192);
+        children.emplace_back(std::move(key), ObjectId{reader.fixed<32>()});
+        (void)reader.u64();
+    }
+    reader.finish();
+    for (size_t i = 0; i < children.size(); ++i) {
+        if (after && i + 1 < children.size() && children[i + 1].first <= *after)
+            continue;
+        if (walk_subtree_after(children[i].second, store, after, take))
+            return true;
+    }
+    return false;
+}
+
 } // namespace
+
+Page<NamespaceItem, std::string> namespace_entries(const MetadataSnapshot& snapshot,
+                                                   const NamespaceNodeStore* store,
+                                                   Cursor<std::string> from, Budget& budget) {
+    Page<NamespaceItem, std::string> page;
+    page.next = from;
+    // Each entry costs one operation; the walk stops before an entry it
+    // cannot pay for, and before any entry once the budget says stop.
+    const auto take = [&](NamespaceItem&& item) {
+        if (const auto stop = budget.must_stop()) {
+            page.stopped = *stop;
+            return false;
+        }
+        if (!budget.take_operation()) {
+            page.stopped = Stop::budget;
+            return false;
+        }
+        page.next.after = item.first;
+        page.items.push_back(std::move(item));
+        return true;
+    };
+    bool stopped = false;
+    if (!snapshot.namespace_root) {
+        auto it = from.after ? snapshot.entries.upper_bound(*from.after) : snapshot.entries.begin();
+        for (; it != snapshot.entries.end(); ++it)
+            if (!take(NamespaceItem(it->first, it->second))) {
+                stopped = true;
+                break;
+            }
+    } else {
+        if (!store)
+            throw DecodeError("namespace is a tree and no node store was supplied");
+        stopped = walk_subtree_after(*snapshot.namespace_root, *store, from.after, take);
+    }
+    if (!stopped) {
+        page.next = {};
+        page.stopped = Stop::end;
+    }
+    return page;
+}
 
 void walk_namespace_tree(const ObjectId& root, const NamespaceNodeStore& store,
                          const NamespaceVisitor& visit) {
