@@ -91,7 +91,8 @@ void log_slow_stage(std::string_view stage, Clock::time_point started,
 Maintenance::Maintenance(MaintenanceDependencies dependencies)
     : node_(dependencies.contracts.get<NodeRuntime>()),
       store_(dependencies.contracts.get<DistributedStore>()),
-      metadata_(dependencies.contracts.get<MetadataManager>()),
+      metadata_(dependencies.contracts.get<MetadataView>()),
+      metadata_upkeep_(dependencies.contracts.get<MetadataMaintenance>()),
       catalogue_(dependencies.contracts.get<CatalogueManager>()),
       builder_(dependencies.contracts.get<HorizonBuilder>()),
       ledger_(dependencies.contracts.get<ObjectLedger>()),
@@ -411,15 +412,15 @@ void Maintenance::run(std::stop_token stop) {
                             try {
                                 if (maintenance_stage_hook_)
                                     maintenance_stage_hook_("metadata-repair-begin");
-                                metadata_.repair_once();
-                                metadata_.note_replica_validation(true);
+                                metadata_upkeep_.repair_step();
+                                metadata_upkeep_.note_replica_validation(true);
                                 metadata_dirty = port_.metadata_convergence.complete(*convergence_run);
                                 metadata_ready_for_dependants = !metadata_dirty;
                                 catalogue_dirty = true;
                                 metadata_retry_due = Clock::time_point{};
                                 metadata_retry_backoff = maintenance_background_interval(policy);
                             } catch (const std::exception& error) {
-                                metadata_.note_replica_validation(false, error.what());
+                                metadata_upkeep_.note_replica_validation(false, error.what());
                                 metadata_ready_for_dependants = false;
                                 metadata_retry_due = clock_->now() + metadata_retry_backoff;
                                 metadata_retry_backoff =
@@ -440,7 +441,7 @@ void Maintenance::run(std::stop_token stop) {
                                            "maintenance: " +
                                            std::string(error.what()));
                             } catch (...) {
-                                metadata_.note_replica_validation(false,
+                                metadata_upkeep_.note_replica_validation(false,
                                                                    "metadata validation failed");
                                 metadata_ready_for_dependants = false;
                                 metadata_retry_due = clock_->now() + metadata_retry_backoff;
@@ -698,7 +699,7 @@ void Maintenance::run(std::stop_token stop) {
 
                 const bool cluster_gc_healthy = node_.membership().all_known_reachable();
                 const bool metadata_stable =
-                    cluster_gc_healthy && metadata_.cluster_status().stable;
+                    cluster_gc_healthy && metadata_.status().stable;
                 const bool cluster_gc_stable = cluster_gc_healthy && metadata_stable;
                 if (cluster_gc_stable && !cluster_stable_observed_) {
                     // Recovery after a restart: every known node reached and
@@ -758,14 +759,14 @@ void Maintenance::run(std::stop_token stop) {
                 // sweep the control store using such a stale set: with a zero/short
                 // grace period it could delete a newly-published manifest or shard
                 // before the next maintenance pass observes the successor generation.
-                const auto current_metadata_view = metadata_.available_snapshot_view();
-                const auto release_metadata_view = metadata_.retention_release_view();
+                const auto current_metadata_view = metadata_.current();
+                const auto release_metadata_view = metadata_.release_head();
 
                 // Retention release is local and causal. A sole accepted head
                 // provides a complete live-object set plus the mutation clock of
                 // claim dots it has actually observed. Claims from unseen concurrent
                 // branches are not dominated by that clock and therefore survive.
-                if (auto floor = metadata_.retention_release_view();
+                if (auto floor = metadata_.release_head();
                     floor && floor->hash != (release ? release->head() : Hash256{})) {
                     ObservedDuration horizon_build(
                         observations().histogram("maintenance.release_horizon.build_us"));
@@ -999,7 +1000,7 @@ void Maintenance::run(std::stop_token stop) {
             // is actually flagged.
             try {
                 enter_stage("head-repair");
-                (void)metadata_.repair_unreconstructable_heads();
+                (void)metadata_upkeep_.repair_unreconstructable_heads();
             } catch (const std::exception& error) {
                 Log::debug("maintenance: metadata head repair failed: " +
                            std::string(error.what()));
@@ -1008,7 +1009,7 @@ void Maintenance::run(std::stop_token stop) {
             if (!busy) {
                 try {
                     enter_stage("history-checkpoint");
-                    metadata_.attempt_history_checkpoint();
+                    metadata_upkeep_.attempt_history_checkpoint();
                 } catch (const std::exception& error) {
                     Log::debug("maintenance: history checkpoint attempt failed: " +
                                std::string(error.what()));

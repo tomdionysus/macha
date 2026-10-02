@@ -1465,7 +1465,7 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
-FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataManager& m, PlaybackTracker* playback)
+FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataView& m, PlaybackTracker* playback)
     : n_(n), s_(s), m_(m), playback_(playback) {
     extent_worker_limit_ = std::max<size_t>(1, n_.config().fuse.commit_workers);
     extent_task_limit_ = extent_worker_limit_ * 2;
@@ -1541,11 +1541,11 @@ ExtentExecutorDiagnostics FileSystem::extent_executor_diagnostics() const {
             extent_tasks_submitted_.load(std::memory_order_relaxed)};
 }
 MetadataSnapshot FileSystem::snap() {
-    return m_.snapshot();
+    return *m_.converged().snapshot;
 }
 
 std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() {
-    auto view = m_.snapshot_view();
+    auto view = m_.converged();
     {
         std::lock_guard lock(namespace_index_mutex_);
         if (namespace_index_ && namespace_index_->generation == view.generation &&
@@ -2137,7 +2137,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
     // doing any quorum read. A hit is safe even if the view is slightly old
     // because media IDs are content-derived. A miss is definitive only when the
     // available view has caught up with every generation this node knows about.
-    if (auto available = m_.available_snapshot_view()) {
+    if (auto available = m_.current()) {
         if (auto found = install_and_lookup(*available))
             return found;
         if (available->generation >= n_.known_metadata_generation())
@@ -2147,7 +2147,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
     // Only a genuinely stale/missing decoded view may require authoritative
     // metadata I/O. This preserves correctness for a just-published media ID
     // without putting routine cold playback behind a multi-second quorum read.
-    const auto authoritative = m_.snapshot_view();
+    const auto authoritative = m_.converged();
     return install_and_lookup(authoritative);
 }
 
@@ -2380,7 +2380,7 @@ MetadataSnapshotView FileSystem::local_snapshot_view() {
 }
 
 std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const {
-    return m_.available_snapshot_view();
+    return m_.current();
 }
 
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
@@ -2421,14 +2421,14 @@ std::vector<ObjectId> FileSystem::live_objects() {
 }
 
 Hash256 FileSystem::namespace_signature(uint64_t* metadata_generation) {
-    const auto view = m_.snapshot_view();
+    const auto view = m_.converged();
     if (metadata_generation) *metadata_generation = view.generation;
     return metadata_namespace_signature(*view.snapshot);
 }
 
 std::optional<Hash256> FileSystem::available_namespace_signature(
     uint64_t* metadata_generation) const {
-    auto view = m_.available_snapshot_view();
+    auto view = m_.current();
     if (!view)
         return {};
     if (metadata_generation) *metadata_generation = view->generation;
@@ -2443,7 +2443,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
             return maintenance_index_;
     }
 
-    auto view = m_.snapshot_view();
+    auto view = m_.converged();
     const auto& snapshot = *view.snapshot;
     std::vector<ObjectId> live;
     size_t extents = 0;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/metadata_view.hpp"
 #include "contract/work.hpp"
 #include "cluster/cluster.hpp"
 
@@ -24,12 +25,6 @@ class MetadataNotReady final : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-struct MetadataSnapshotView {
-    uint64_t generation{};
-    uint64_t namespace_revision{};
-    Hash256 hash{};
-    std::shared_ptr<const MetadataSnapshot> snapshot;
-};
 
 
 // A snapshot carries its namespace one way or the other, never both, and this
@@ -51,11 +46,6 @@ void require_coherent_namespace(const MetadataSnapshot&);
 
 class DistributedStore;
 
-enum class MetadataAvailability : uint8_t {
-    unavailable = 0,
-    read_only = 1,
-    writable = 2,
-};
 
 const char* metadata_availability_name(MetadataAvailability) noexcept;
 
@@ -68,24 +58,7 @@ struct MetadataPublicationContext {
     const MetadataDelta* delta{};
 };
 
-struct MetadataClusterStatus {
-    uint64_t generation{};
-    uint64_t observed_unix_ms{};
-    uint32_t replicas{};
-    uint32_t replicas_online{};
-    uint32_t write_replicas_required{};
-    MetadataAvailability availability{MetadataAvailability::unavailable};
-    bool stable{};
-    bool write_available{};
-};
 
-// See MetadataManager::mutate_delta(). `origin` is any NodeId-shaped key the
-// caller owns (a node's own id, or one derived from it for a sub-system);
-// `sequence` must increase across that caller's mutations.
-struct MetadataMutationIdentity {
-    NodeId origin{};
-    uint64_t sequence{};
-};
 
 struct MetadataHistoryTransferDiagnostics {
     uint64_t transfers{};
@@ -93,7 +66,7 @@ struct MetadataHistoryTransferDiagnostics {
     uint64_t peak_in_flight{};
 };
 
-class MetadataManager {
+class MetadataManager final : public MetadataView, public MetadataMaintenance {
     NodeRuntime& node_;
     DistributedStore* namespace_store_{};
     std::mutex mutation_mutex_;
@@ -228,6 +201,7 @@ class MetadataManager {
         publication_retention_ = std::move(guard);
     }
     MetadataRecord read_record();
+    MetadataRecord record() override { return read_record(); }
     MetadataSnapshot snapshot();
     MetadataSnapshotView snapshot_view();
     // The same, for a caller that says who it is: it may refresh a stale
@@ -244,24 +218,18 @@ class MetadataManager {
             history_peak_in_flight_.load(std::memory_order_relaxed),
         };
     }
-    struct MutationTiming {
-        uint64_t mutations{};
-        uint64_t retention_ms_total{};
-        uint64_t retention_ms_max{};
-        uint64_t publish_ms_total{};
-        uint64_t publish_ms_max{};
-    };
-    MutationTiming mutation_timing() const noexcept {
+    using MutationTiming = MetadataMutationTiming;
+    MutationTiming mutation_timing() const noexcept override {
         return {mutations_.load(std::memory_order_relaxed),
                 mutation_retention_ms_total_.load(std::memory_order_relaxed),
                 mutation_retention_ms_max_.load(std::memory_order_relaxed),
                 mutation_publish_ms_total_.load(std::memory_order_relaxed),
                 mutation_publish_ms_max_.load(std::memory_order_relaxed)};
     }
-    uint64_t conflicts_superseded() const noexcept {
+    uint64_t conflicts_superseded() const noexcept override {
         return conflicts_superseded_.load(std::memory_order_relaxed);
     }
-    uint64_t conflicts_resolved() const noexcept {
+    uint64_t conflicts_resolved() const noexcept override {
         return conflicts_resolved_.load(std::memory_order_relaxed);
     }
     // Operator resolution of one standing conflict: install the chosen
@@ -269,8 +237,8 @@ class MetadataManager {
     // record, in one metadata commit. Returns false when no conflict with
     // that id stands (already superseded, resolved, or never existed);
     // throws std::invalid_argument for an unknown choice.
-    bool resolve_conflict(const std::string& id, std::string_view choice);
-    void note_replica_validation(bool available, std::string_view reason = {}) {
+    bool resolve_conflict(const std::string& id, std::string_view choice) override;
+    void note_replica_validation(bool available, std::string_view reason = {}) override {
         publish_replica_state(available, reason);
     }
     uint64_t available_snapshot_generation() const noexcept {
@@ -279,7 +247,14 @@ class MetadataManager {
     uint64_t available_namespace_revision() const noexcept {
         return available_namespace_revision_.load(std::memory_order_acquire);
     }
-    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t retries = 8);
+    uint64_t current_generation() const noexcept override {
+        return available_snapshot_generation();
+    }
+    uint64_t current_namespace_revision() const noexcept override {
+        return available_namespace_revision();
+    }
+    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&,
+                          size_t retries = 8) override;
     // Fast path for callers that can describe the exact delta as they mutate the
     // decoded snapshot. Avoids retaining a second deep copy of the namespace.
     // `identity`, when given, is an idempotency key in the snapshot's
@@ -290,7 +265,7 @@ class MetadataManager {
     // batches) reads the clock instead of re-deriving per-operation effects.
     MetadataRecord mutate_delta(
         const std::function<void(MetadataSnapshot&, MetadataDelta&)>&, size_t retries = 8,
-        std::optional<MetadataMutationIdentity> identity = {});
+        std::optional<MetadataMutationIdentity> identity = {}) override;
     // Snapshot at the last causal stability horizon. Retention release may use
     // this view; ordinary reads must use snapshot_view()/available_snapshot_view().
     std::optional<MetadataSnapshotView> retention_release_view() const;
@@ -306,7 +281,7 @@ class MetadataManager {
     // the same reason that method's do: so tests can force an otherwise
     // rare, size-gated round deterministically.
     void attempt_history_checkpoint(size_t record_threshold = 256,
-                                    uint64_t byte_threshold = 64ULL * 1024 * 1024);
+                                    uint64_t byte_threshold = 64ULL * 1024 * 1024) override;
     // Live repair for accepted heads the local replica has flagged as
     // unreconstructable (MetadataReplica::unreconstructable_heads()): ask each
     // reachable peer for the record as a self-contained full body
@@ -314,6 +289,21 @@ class MetadataManager {
     // (MetadataReplica::reanchor_history()). No restart, no quarantine. Driven
     // by the maintenance cycle; a no-op when nothing is flagged. Returns the
     // number of heads repaired this call.
-    size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control);
+    size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control) override;
+
+    // MetadataView (spec B2): the operations above under the contract's
+    // names, each calling the one it names.
+    std::optional<MetadataSnapshotView> current() const override {
+        return available_snapshot_view();
+    }
+    MetadataSnapshotView converged() override { return snapshot_view(); }
+    MetadataSnapshotView converged(const WorkContext& context) override {
+        return snapshot_view(context);
+    }
+    std::optional<MetadataSnapshotView> release_head() const override {
+        return retention_release_view();
+    }
+    MetadataClusterStatus status() const noexcept override { return cluster_status(); }
+    void repair_step() override { repair_once(); }
 };
 } // namespace macha

@@ -147,7 +147,7 @@ std::string magnet_display_name(std::string_view magnet) {
     return decoded.substr(0, 1024);
 }
 
-TorrentCoordinator::TorrentCoordinator(NodeRuntime& node, MetadataManager& metadata, SubsystemRegistry& registry,
+TorrentCoordinator::TorrentCoordinator(NodeRuntime& node, MetadataView& metadata, SubsystemRegistry& registry,
                                        ClusterJobView& view, const std::filesystem::path& state_path,
                                        std::chrono::milliseconds claim_lease)
     : node_(node), metadata_(metadata), registry_(registry), view_(view), claim_lease_(claim_lease),
@@ -196,7 +196,7 @@ void TorrentCoordinator::loop(std::stop_token stop) {
 // appears after the next background convergence. A node that has no
 // snapshot yet establishes one first.
 std::optional<MetadataSnapshotView> TorrentCoordinator::served_view() const {
-    if (auto view = metadata_.available_snapshot_view())
+    if (auto view = metadata_.current())
         return view;
     return current_view();
 }
@@ -205,9 +205,9 @@ std::optional<MetadataSnapshotView> TorrentCoordinator::served_view() const {
 // the cached view is the fallback when metadata cannot be read right now.
 std::optional<MetadataSnapshotView> TorrentCoordinator::current_view() const {
     try {
-        return metadata_.snapshot_view();
+        return metadata_.converged();
     } catch (const std::exception&) {
-        return metadata_.available_snapshot_view();
+        return metadata_.current();
     }
 }
 
@@ -215,7 +215,7 @@ std::optional<MetadataSnapshotView> TorrentCoordinator::current_view() const {
 // has been computed once there is no answer, and the write itself is tried
 // (its failure is still a 503).
 bool TorrentCoordinator::write_available() const {
-    const auto status = metadata_.cluster_status();
+    const auto status = metadata_.status();
     return status.observed_unix_ms == 0 || status.write_available;
 }
 

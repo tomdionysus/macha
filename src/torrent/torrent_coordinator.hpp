@@ -37,7 +37,7 @@ class TorrentCoordinator {
     static constexpr auto tombstone_grace = std::chrono::hours(24 * 7);
     static constexpr auto pass_interval = std::chrono::seconds(2);
 
-    TorrentCoordinator(NodeRuntime&, MetadataManager&, SubsystemRegistry&, ClusterJobView&,
+    TorrentCoordinator(NodeRuntime&, MetadataView&, SubsystemRegistry&, ClusterJobView&,
                        const std::filesystem::path& state_path,
                        std::chrono::milliseconds claim_lease = default_claim_lease);
     ~TorrentCoordinator();
@@ -102,7 +102,7 @@ class TorrentCoordinator {
     std::optional<std::chrono::milliseconds> default_remove_after() const;
 
     NodeRuntime& node_;
-    MetadataManager& metadata_;
+    MetadataView& metadata_;
     SubsystemRegistry& registry_;
     ClusterJobView& view_;
     const std::chrono::milliseconds claim_lease_;

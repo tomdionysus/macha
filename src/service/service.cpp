@@ -704,13 +704,14 @@ void Service::initialise_services(std::stop_token stop) {
         // What Service still builds and hands to the root's components.
         root_.external<NodeRuntime>();
         root_.external<DistributedStore>();
-        root_.external<MetadataManager>();
+        root_.external<MetadataView>();
+        root_.external<MetadataMaintenance>();
         root_.external<CatalogueManager>();
         root_.external<HorizonBuilder>();
         root_.external<ObjectLedger>();
         root_.external<MaintenancePort>();
         root_.add(std::make_unique<Maintenance>(MaintenanceDependencies{
-            MaintenanceContracts(node_, *store_, *metadata_, *catalogue_, *horizon_builder_, *ledger_,
+            MaintenanceContracts(node_, *store_, *metadata_, *metadata_, *catalogue_, *horizon_builder_, *ledger_,
                                  maintenance_port_),
             clock_, maintenance_trace_, maintenance_stage_hook_, constructed_}));
         root_.start();

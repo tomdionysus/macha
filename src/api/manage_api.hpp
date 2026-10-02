@@ -20,7 +20,7 @@ namespace macha {
 // than maintaining a second management database.
 class ManageApi {
     NodeRuntime& node_;
-    MetadataManager& metadata_;
+    MetadataView& metadata_;
     FileSystem& fs_;
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
@@ -35,7 +35,7 @@ class ManageApi {
     void identity_reset_audit_loop(std::stop_token);
 
   public:
-    ManageApi(NodeRuntime& node, MetadataManager& metadata, FileSystem& fs,
+    ManageApi(NodeRuntime& node, MetadataView& metadata, FileSystem& fs,
               CatalogueManager& catalogue, CatalogueHintQueue& hints, CatalogueScanner& scanner);
     ~ManageApi();
     void request_stop();

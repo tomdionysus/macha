@@ -627,7 +627,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     uint64_t metadata_generation = 0;
     if (metadata_manager) {
         try {
-            if (auto available = metadata_manager->available_snapshot_view()) {
+            if (auto available = metadata_manager->current()) {
                 metadata = available->snapshot;
                 metadata_generation = available->generation;
             }
@@ -815,7 +815,7 @@ HttpResponse ClusterStatusService::status_response(const std::optional<NodeId>& 
     }
 
     const auto published_metadata =
-        metadata_manager ? metadata_manager->cluster_status() : MetadataClusterStatus{};
+        metadata_manager ? metadata_manager->status() : MetadataClusterStatus{};
     const size_t metadata_replicas = known_nodes == 0 ? published_metadata.replicas : known_nodes;
     const size_t active_metadata_replicas = online_nodes;
     const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
@@ -1025,7 +1025,7 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     std::shared_ptr<const MetadataSnapshot> metadata;
     if (metadata_manager) {
         try {
-            if (auto available = metadata_manager->available_snapshot_view())
+            if (auto available = metadata_manager->current())
                 metadata = available->snapshot;
         } catch (const std::exception& error) {
             Log::debug("status metadata unavailable: " + std::string(error.what()));
