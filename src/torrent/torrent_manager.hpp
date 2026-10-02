@@ -134,12 +134,11 @@ class TorrentManager final : public TorrentService {
     void parse_add_uri(std::string uri, bool allow_fetch, ParsedAdd& out);
     std::string add_parsed(std::string id, ParsedAdd& parsed, bool held);
 
-    // NodeRuntime::set_torrent_bridge() handlers: this node's own jobs only;
-    // ClusterJobView is built from these replies.
+  public:
+    // The torrent job routes' handlers (JobRoutes): this node's own jobs
+    // only; ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
-
-  public:
     TorrentManager(NodeRuntime&, DataResourceArbiter&, IngestManager&, TorrentConfig,
                    const std::filesystem::path& state_path);
     ~TorrentManager() override;

@@ -66,6 +66,8 @@ class Service {
     }
     // Built, and stopped, before the node that waits on them.
     NodeResources resources_;
+    // The node routes job RPCs here; NodeServices binds them.
+    JobRoutes job_routes_;
     NodeRuntime node_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin and FUSE as a supervised builtin. Each publishes

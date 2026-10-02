@@ -25,6 +25,8 @@ class NodeRuntime;
 // progress back. One per node, plugin or not; a node without it never claims.
 class TorrentCoordinator {
   public:
+    // The torrent intent route's handler (JobRoutes).
+    Bytes handle_intent(std::span<const uint8_t> payload);
     // A claim outlives a node's absence from membership for this long, so a
     // restart or a brief wifi drop does not move a download.
     static constexpr auto default_claim_lease = std::chrono::minutes(10);
@@ -86,7 +88,6 @@ class TorrentCoordinator {
     void pass();
     Outcome write_desired(const TorrentRequest&, TorrentDesired);
     Outcome apply_intent_locally(const std::string& id, TorrentDesired, uint64_t changed_unix_ms);
-    Bytes handle_intent(std::span<const uint8_t> payload);
     TorrentDesired effective_desired(const TorrentRequest&) const;
     void publish_intents();
     void load_intents();

@@ -2597,6 +2597,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_se
     context.node = &fixture.node();
     context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
+    context.job_routes = &fixture.node().job_routes;
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2737,6 +2738,7 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     context.node = &fixture.node();
     context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
+    context.job_routes = &fixture.node().job_routes;
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2826,6 +2828,7 @@ MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resum
     context.node = &fixture.node();
     context.data_resources = &fixture.node().resources.data;
     context.retained_memory = &fixture.node().resources.memory;
+    context.job_routes = &fixture.node().job_routes;
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2910,6 +2913,7 @@ struct TorrentPluginFixture {
         context.node = &fixture.node();
         context.data_resources = &fixture.node().resources.data;
         context.retained_memory = &fixture.node().resources.memory;
+        context.job_routes = &fixture.node().job_routes;
         context.ingest = ingest.get();
         context.registry = &registry;
         plugin = std::make_unique<LoadedTorrentPlugin>(context);

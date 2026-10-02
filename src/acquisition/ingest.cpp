@@ -508,9 +508,6 @@ IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, CatalogueHintQue
         if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
         load_state();
     }
-    node_.set_ingest_bridge(
-        [this](std::span<const uint8_t> payload) { return handle_jobs_query(payload); },
-        [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
 }
 
 IngestManager::~IngestManager() { stop(); }

@@ -152,11 +152,9 @@ TorrentCoordinator::TorrentCoordinator(NodeRuntime& node, MetadataView& metadata
     : node_(node), metadata_(metadata), registry_(registry), view_(view), claim_lease_(claim_lease),
       intents_path_(state_path / "torrent" / "intents.json") {
     load_intents();
-    node_.set_torrent_intent_handler([this](std::span<const uint8_t> payload) { return handle_intent(payload); });
 }
 
 TorrentCoordinator::~TorrentCoordinator() {
-    node_.set_torrent_intent_handler({});
     stop();
 }
 

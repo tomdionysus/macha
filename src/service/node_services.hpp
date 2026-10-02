@@ -34,7 +34,9 @@
 // pinning the one ordering the graph leaves free (see stop()).
 //
 // The graph, provider -> dependants:
-//   node, resources, registry, port (outside, outlive this)
+//   node, resources, job routes, registry, port (outside, outlive this)
+//   job routes     <- ingest, torrent coordinator (bound here once built,
+//                     unbound before they are destroyed)
 //   resources      -> store (activity, DATA, memory), filesystem (memory),
 //                     playback (rate book, memory), subsystems (DATA, memory)
 //   playback       -> filesystem, hydration
@@ -74,7 +76,7 @@ class NodeServices {
   public:
     // `signal_maintenance` rings the node's maintenance pass (Service's
     // handler for node events), which the claims barrier does after it.
-    NodeServices(NodeRuntime&, NodeResources&, SubsystemRegistry&, MaintenancePort&,
+    NodeServices(NodeRuntime&, NodeResources&, JobRoutes&, SubsystemRegistry&, MaintenancePort&,
                  std::function<void(ServiceEvent)> signal_maintenance, NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
@@ -117,6 +119,7 @@ class NodeServices {
 
     NodeRuntime& node_;
     NodeResources& resources_;
+    JobRoutes& job_routes_;
     SubsystemRegistry& registry_;
     MaintenancePort& port_;
     std::function<void(ServiceEvent)> signal_maintenance_;
