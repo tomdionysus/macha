@@ -6,6 +6,7 @@
 #include "cluster/data_work.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
+#include "cluster/node_identity.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
 #include "metadata/metadata.hpp"
@@ -74,9 +75,8 @@ class NodeRuntime {
     };
 
     Config cfg_;
-    ClusterKeys keys_;
-    NodeId id_;
-    NodeId durability_epoch_;
+    // Owned by the root, which built it under the state path's lock.
+    const NodeIdentity& identity_;
     // Owned by the root (NodeResources), which stops them before this node.
     ActivityClocks& activity_;
     DataResourceArbiter& data_resources_;
@@ -189,7 +189,7 @@ class NodeRuntime {
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
-    NodeRuntime(Config, ClusterKeys, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
+    NodeRuntime(Config, const NodeIdentity&, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
                 TranscodeRateBook&, MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
@@ -204,13 +204,13 @@ class NodeRuntime {
         return cfg_;
     }
     const ClusterKeys& keys() const {
-        return keys_;
+        return identity_.keys;
     }
     NodeId node_id() const {
-        return id_;
+        return identity_.id;
     }
     NodeId durability_epoch() const {
-        return durability_epoch_;
+        return identity_.durability_epoch;
     }
     StoragePool& local_store();
     const StoragePool& local_store() const;
