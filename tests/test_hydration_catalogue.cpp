@@ -411,8 +411,8 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     REQUIRE(n1.wait_local_state_ready(10s));
     REQUIRE(n2.wait_local_state_ready(10s));
 
-    DistributedStore source(n1);
-    DistributedStore target(n2);
+    DistributedStore source(n1, n1.resources.activity, n1.resources.data, n1.resources.memory);
+    DistributedStore target(n2, n2.resources.activity, n2.resources.data, n2.resources.memory);
     auto make_remote = [&](uint8_t value) {
         Bytes data(128 * 1024, value);
         auto id = object_id(data);
@@ -1915,7 +1915,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
 
@@ -2595,6 +2595,8 @@ MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_se
     SubsystemContext context;
     context.config = &plugin_config;
     context.node = &fixture.node();
+    context.data_resources = &fixture.node().resources.data;
+    context.retained_memory = &fixture.node().resources.memory;
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2733,6 +2735,8 @@ MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_int
     SubsystemContext context;
     context.config = &plugin_config;
     context.node = &fixture.node();
+    context.data_resources = &fixture.node().resources.data;
+    context.retained_memory = &fixture.node().resources.memory;
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2820,6 +2824,8 @@ MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resum
     SubsystemContext context;
     context.config = &plugin_config;
     context.node = &fixture.node();
+    context.data_resources = &fixture.node().resources.data;
+    context.retained_memory = &fixture.node().resources.memory;
     context.ingest = &ingest;
     context.registry = &registry;
     LoadedTorrentPlugin plugin(context);
@@ -2902,6 +2908,8 @@ struct TorrentPluginFixture {
         plugin_config.state_path = state_path;
         context.config = &plugin_config;
         context.node = &fixture.node();
+        context.data_resources = &fixture.node().resources.data;
+        context.retained_memory = &fixture.node().resources.memory;
         context.ingest = ingest.get();
         context.registry = &registry;
         plugin = std::make_unique<LoadedTorrentPlugin>(context);
@@ -3668,7 +3676,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // genesis while its bootstrap peer has not yet entered active membership.
     n1.start();
     REQUIRE(n1.wait_local_state_ready(10s));
-    DistributedStore store1(n1);
+    DistributedStore store1(n1, n1.resources.activity, n1.resources.data, n1.resources.memory);
     MetadataManager metadata1(n1);
     CatalogueManager catalogue1(n1, store1, metadata1);
 
@@ -3680,7 +3688,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
 
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    DistributedStore store2(n2);
+    DistributedStore store2(n2, n2.resources.activity, n2.resources.data, n2.resources.memory);
     MetadataManager metadata2(n2);
     CatalogueManager catalogue2(n2, store2, metadata2);
 
@@ -3718,10 +3726,10 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // into quorum reads. FUSE may adopt a newer snapshot only after some control-
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
-    FileSystem fs2(n2, store2, metadata2);
+    FileSystem fs2(n2, store2, metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
-    auto frontend = std::make_shared<FuseFrontend>(fs2, fuse_config);
+    auto frontend = std::make_shared<FuseFrontend>(fs2, n2.resources.memory, fuse_config);
     const auto available_before_fuse = metadata2.available_snapshot_view();
     REQUIRE(available_before_fuse.has_value());
     const auto namespace_revision_before = metadata2.available_namespace_revision();
@@ -4545,7 +4553,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
 
@@ -4590,9 +4598,9 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     MetadataManager metadata(node);
-    FileSystem filesystem(node, store, metadata);
+    FileSystem filesystem(node, store, metadata, node.resources.memory);
 
     filesystem.mkdir("/Music", 0755, getuid(), getgid());
 
@@ -4652,9 +4660,9 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     MetadataManager metadata(node);
-    FileSystem filesystem(node, store, metadata);
+    FileSystem filesystem(node, store, metadata, node.resources.memory);
 
     filesystem.mkdir("/media", 0755, getuid(), getgid());
     filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());

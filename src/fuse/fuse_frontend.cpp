@@ -575,6 +575,7 @@ struct FuseFrontend::State {
     };
 
     FileSystem& fs;
+    RetainedMemoryLedger& retained_memory;
     FuseConfig config;
     // Cancels the initial-namespace wait in start(); see the constructor.
     std::stop_token startup_stop;
@@ -786,8 +787,9 @@ struct FuseFrontend::State {
     std::atomic_uint64_t journal_records_appended{};
     std::atomic_uint64_t journal_durability_barriers{};
 
-    State(FileSystem& filesystem, FuseConfig policy, std::stop_token startup_cancel = {})
-        : fs(filesystem), config(std::move(policy)), startup_stop(std::move(startup_cancel)),
+    State(FileSystem& filesystem, RetainedMemoryLedger& memory, FuseConfig policy,
+          std::stop_token startup_cancel = {})
+        : fs(filesystem), retained_memory(memory), config(std::move(policy)), startup_stop(std::move(startup_cancel)),
           weighted_loader(config.viewer_weight,
                           config.suspend_loader_for_tests ? 0 : config.loader_weight),
           spool_dir(config.spool_path.value_or(fs.node().config().state_path / "fuse-spool")),
@@ -897,7 +899,7 @@ struct FuseFrontend::State {
         MemoryClass memory_class, MemoryOwner owner, uint64_t bytes, Clock::time_point) {
         const auto since = Clock::now();
         for (;;) {
-            auto lease = fs.node().retained_memory().acquire(memory_class, owner, bytes,
+            auto lease = retained_memory.acquire(memory_class, owner, bytes,
                                                              Clock::now() + admission_slice);
             if (lease)
                 return std::make_shared<RetainedMemoryLedger::Lease>(std::move(*lease));
@@ -4507,7 +4509,7 @@ struct FuseFrontend::State {
                         std::max(inode->next_data_sequence, op.sequence + 1);
                     if (op.sequence > done) {
                         auto recovered_op = op;
-                        auto memory = fs.node().retained_memory().restore(
+                        auto memory = retained_memory.restore(
                             MemoryClass::loader, MemoryOwner::fuse_operation,
                             recovered_op.metadata_charge);
                         recovered_op.process_memory =
@@ -5032,8 +5034,10 @@ struct FuseFrontend::State {
     }
 };
 
-FuseFrontend::FuseFrontend(FileSystem& filesystem, FuseConfig config, std::stop_token stop)
-    : state_(std::make_unique<State>(filesystem, std::move(config), std::move(stop))) {
+FuseFrontend::FuseFrontend(FileSystem& filesystem, RetainedMemoryLedger& retained_memory,
+                           FuseConfig config, std::stop_token stop)
+    : state_(std::make_unique<State>(filesystem, retained_memory, std::move(config),
+                                     std::move(stop))) {
     state_->start();
 }
 

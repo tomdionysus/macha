@@ -21,12 +21,14 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 
 } // namespace
 
-NodeServices::NodeServices(NodeRuntime& node, SubsystemRegistry& registry, MaintenancePort& port,
+NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources,
+                           SubsystemRegistry& registry, MaintenancePort& port,
                            std::function<void(ServiceEvent)> signal_maintenance,
                            NodeServicesInstruments instruments)
-    : node_(node), registry_(registry), port_(port),
+    : node_(node), resources_(resources), registry_(registry), port_(port),
       signal_maintenance_(std::move(signal_maintenance)), instruments_(std::move(instruments)),
-      store_(node_, DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
+      store_(node_, resources_.activity, resources_.data, resources_.memory,
+             DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
                                             instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
@@ -34,7 +36,7 @@ NodeServices::NodeServices(NodeRuntime& node, SubsystemRegistry& registry, Maint
                 [this](const MetadataPublicationContext& context) {
                     retain_metadata_publication(context);
                 }),
-      catalogue_(node_, store_, metadata_), filesystem_(node_, store_, metadata_, &playback_),
+      catalogue_(node_, store_, metadata_), filesystem_(node_, store_, metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
       scanner_(node_, filesystem_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner,
@@ -75,7 +77,8 @@ NodeServices::NodeServices(NodeRuntime& node, SubsystemRegistry& registry, Maint
                                                        Clock::now() + std::chrono::seconds(30));
           }),
       manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_),
-      streaming_(filesystem_, catalogue_, node_.config().catalogue.api, node_.config().streaming,
+      streaming_(filesystem_, resources_.transcode_rates, resources_.memory, catalogue_,
+                 node_.config().catalogue.api, node_.config().streaming,
                  media_engine_,
                  [this](const std::vector<std::string>& media_ids) {
                      return scanner_.request_media_profiles(media_ids);
@@ -123,6 +126,8 @@ void NodeServices::start() {
     SubsystemContext context;
     context.config = &node_.config();
     context.node = &node_;
+    context.data_resources = &resources_.data;
+    context.retained_memory = &resources_.memory;
     context.ingest = &ingest_;
     context.registry = &registry_;
     context.filesystem = &filesystem_;

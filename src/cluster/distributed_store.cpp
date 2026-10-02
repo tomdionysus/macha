@@ -104,7 +104,7 @@ void DistributedStore::DurabilityBatch::add(DurabilityRequirement next) {
 }
 
 void DistributedStore::note_foreground(uint64_t bytes) {
-    n_.note_activity(FrameType::foreground, bytes);
+    activity_.note(FrameType::foreground, bytes);
 }
 
 void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
@@ -121,7 +121,7 @@ void DistributedStore::note_network(uint64_t bytes, Clock::duration duration) {
 }
 
 std::chrono::milliseconds DistributedStore::foreground_idle_for() const {
-    return n_.activity_idle_for(FrameType::foreground);
+    return activity_.idle_for(FrameType::foreground);
 }
 
 std::vector<NodeInfo> DistributedStore::hosting_nodes() const {
@@ -218,7 +218,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         throw std::runtime_error("object hash mismatch");
     if (data.size() > n_.config().extent_size)
         throw std::runtime_error("DATA object exceeds configured extent size");
-    n_.note_activity(frame_type, data.size());
+    activity_.note(frame_type, data.size());
     const auto operation_started = Clock::now();
 
     auto nodes = ranked(id);
@@ -314,7 +314,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     };
 
     auto launch = [&](const NodeInfo& owner) {
-        auto resource = n_.data_resources().acquire(
+        auto resource = data_resources_.acquire(
             DataWorkContext(frame_type, data.size(), {}, cancelled), data.size());
         if (!resource) {
             ++replacement_needed;
@@ -1165,8 +1165,12 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     return true;
 }
 
-DistributedStore::DistributedStore(NodeRuntime& n, DistributedStoreOptions options)
-    : n_(n), repair_trace_(std::move(options.repair_trace)) {
+DistributedStore::DistributedStore(NodeRuntime& n, ActivityClocks& activity,
+                                   DataResourceArbiter& data_resources,
+                                   RetainedMemoryLedger& retained_memory,
+                                   DistributedStoreOptions options)
+    : n_(n), activity_(activity), data_resources_(data_resources),
+      retained_memory_(retained_memory), repair_trace_(std::move(options.repair_trace)) {
     if (options.repair_position) {
         repair_position_path_ = std::move(*options.repair_position);
         std::ifstream in(repair_position_path_);
@@ -1337,7 +1341,7 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
                               std::span<const uint8_t> data, bool foreground) {
     const auto frame_type = foreground ? FrameType::foreground : FrameType::speculative;
-    auto resource = n_.data_resources().acquire(
+    auto resource = data_resources_.acquire(
         DataWorkContext(frame_type, data.size()), data.size());
     if (!resource)
         return false;
@@ -1365,13 +1369,13 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                            Clock::time_point deadline, std::atomic_bool* cancelled,
                            const std::function<bool()>& abort) {
     try {
-        auto resource = n_.data_resources().acquire(
+        auto resource = data_resources_.acquire(
             DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
             n_.config().extent_size);
         if (!resource)
             return {};
         if (target.id == n_.node_id()) {
-            auto memory = n_.retained_memory().acquire(
+            auto memory = retained_memory_.acquire(
                 object_memory_class(frame_type), MemoryOwner::object_payload,
                 n_.config().extent_size, deadline, cancelled);
             if (!memory)
@@ -1705,12 +1709,12 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
         }
         return elapsed;
     };
-    auto local_resource = n_.data_resources().acquire(
+    auto local_resource = data_resources_.acquire(
         DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
         n_.config().extent_size);
     if (!local_resource)
         return {};
-    auto local_memory = n_.retained_memory().acquire(
+    auto local_memory = retained_memory_.acquire(
         object_memory_class(frame_type), MemoryOwner::object_payload,
         n_.config().extent_size, deadline, cancelled);
     if (!local_memory)
@@ -1719,7 +1723,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     local_resource.reset();
     if (auto data = std::move(local_data)) {
         if (interactive)
-            n_.note_activity(frame_type, data->size());
+            activity_.note(frame_type, data->size());
         auto elapsed = log_playback_read("owned", data->size(), true);
         if (Log::enabled(LogLevel::all))
             Log::trace("DIAG object-get id=" + to_string(id) +
@@ -1734,12 +1738,12 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     }
     local_memory.reset();
 
-    auto cache_resource = n_.data_resources().acquire(
+    auto cache_resource = data_resources_.acquire(
         DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
         n_.config().extent_size);
     if (!cache_resource)
         return {};
-    auto cache_memory = n_.retained_memory().acquire(
+    auto cache_memory = retained_memory_.acquire(
         object_memory_class(frame_type), MemoryOwner::object_payload,
         n_.config().extent_size, deadline, cancelled);
     if (!cache_memory)
@@ -1748,7 +1752,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     cache_resource.reset();
     if (auto cached = std::move(cache_data)) {
         if (interactive)
-            n_.note_activity(frame_type, cached->size());
+            activity_.note(frame_type, cached->size());
         if (should_own(id))
             n_.enqueue_fetched(id, *cached, true);
         auto elapsed = log_playback_read("cache", cached->size(), true);
@@ -1770,7 +1774,7 @@ DistributedStore::get_shared(const ObjectId& id, size_t stripe, FrameType frame_
     auto data = get_remote(id, stripe, frame_type,
                            foreground, interactive, deadline, cancelled);
     if (data && frame_type == FrameType::read_ahead)
-        n_.note_activity(frame_type, data->bytes.size());
+        activity_.note(frame_type, data->bytes.size());
     auto elapsed = log_playback_read("remote", data ? data->bytes.size() : 0,
                                      static_cast<bool>(data));
     if (Log::enabled(LogLevel::all))
@@ -2103,7 +2107,7 @@ bool DistributedStore::cache_local(const ObjectId& id, std::span<const uint8_t> 
     if (!n_.block_cache().enabled())
         return false;
     try {
-        auto resource = n_.data_resources().acquire(
+        auto resource = data_resources_.acquire(
             DataWorkContext(FrameType::speculative, data.size()), data.size());
         if (!resource)
             return false;
@@ -2126,7 +2130,7 @@ bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType fram
     auto data = get_remote(id, stripe, frame_type, false, false);
     if (!data)
         return false;
-    auto resource = n_.data_resources().acquire(
+    auto resource = data_resources_.acquire(
         DataWorkContext(frame_type, data->bytes.size()), data->bytes.size());
     return resource && n_.block_cache().put(id, data->bytes);
 }
@@ -2134,7 +2138,7 @@ bool DistributedStore::hydrate(const ObjectId& id, size_t stripe, FrameType fram
 bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
     const auto local_class = foreground ? FrameType::foreground : FrameType::speculative;
     {
-        auto resource = n_.data_resources().acquire(
+        auto resource = data_resources_.acquire(
             DataWorkContext(local_class, n_.config().extent_size), n_.config().extent_size);
         if (!resource)
             return false;
@@ -2142,7 +2146,7 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
             return true;
     }
     if (auto cached = n_.block_cache().get(id)) {
-        auto resource = n_.data_resources().acquire(
+        auto resource = data_resources_.acquire(
             DataWorkContext(local_class, cached->size()), cached->size());
         if (resource && n_.local_store().put(id, *cached))
             return true;
@@ -2152,7 +2156,7 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
                            foreground, false);
     if (!data)
         return false;
-    auto resource = n_.data_resources().acquire(
+    auto resource = data_resources_.acquire(
         DataWorkContext(local_class, data->bytes.size()), data->bytes.size());
     return resource && n_.local_store().put(id, data->bytes);
 }
@@ -2214,7 +2218,7 @@ void DistributedStore::erase_all(const ObjectId& id) {
     for (const auto& target : n_.membership().active()) {
         try {
             if (target.id == n_.node_id()) {
-                auto resource = n_.data_resources().acquire(
+                auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, n_.config().extent_size),
                     n_.config().extent_size);
                 if (resource && !n_.claims().retained(RetentionClass::data, id))
@@ -2548,7 +2552,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                         continue;
                     }
                     if (!source) {
-                        auto resource = n_.data_resources().acquire(
+                        auto resource = data_resources_.acquire(
                             DataWorkContext(FrameType::speculative, n_.config().extent_size),
                             n_.config().extent_size);
                         if (!resource) {
@@ -2564,7 +2568,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                         source = std::make_shared<const Bytes>(std::move(*read));
                     }
                     if (peer.id == n_.node_id()) {
-                        auto resource = n_.data_resources().acquire(
+                        auto resource = data_resources_.acquire(
                             DataWorkContext(FrameType::speculative, source->size()),
                             source->size());
                         if (!resource) {
@@ -2652,7 +2656,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                 if (plan.live && plan.keepers.size() >= plan.target &&
                     !plan.keepers.contains(n_.node_id()) &&
                     !n_.claims().retained(RetentionClass::data, plan.id)) {
-                    auto resource = n_.data_resources().acquire(
+                    auto resource = data_resources_.acquire(
                         DataWorkContext(FrameType::speculative, n_.config().extent_size),
                         n_.config().extent_size);
                     if (resource) {
@@ -2699,7 +2703,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             // Promote a copy playback already cached before any network I/O,
             // so convergence never downloads twice.
             if (auto cached = n_.block_cache().get(id)) {
-                auto resource = n_.data_resources().acquire(
+                auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, cached->size()), cached->size());
                 if (!resource)
                     break;
@@ -2723,7 +2727,7 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
             // so a node that is never quiet still pulls.
             auto data = get_remote(id, 0, FrameType::speculative, false, false, {}, nullptr);
             if (data) {
-                auto resource = n_.data_resources().acquire(
+                auto resource = data_resources_.acquire(
                     DataWorkContext(FrameType::speculative, data->bytes.size()),
                     data->bytes.size());
                 if (!resource)

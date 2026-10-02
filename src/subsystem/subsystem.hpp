@@ -27,6 +27,8 @@ class FileSystem;
 class HydrationManager;
 class IngestManager;
 class NodeRuntime;
+class DataResourceArbiter;
+class RetainedMemoryLedger;
 class SubsystemRegistry;
 
 // The core references a subsystem may use: `node` and `ingest` for Torrent,
@@ -36,6 +38,8 @@ class SubsystemRegistry;
 struct SubsystemContext {
     const Config* config{};
     NodeRuntime* node{};
+    DataResourceArbiter* data_resources{};
+    RetainedMemoryLedger* retained_memory{};
     IngestManager* ingest{};
     SubsystemRegistry* registry{};
     FileSystem* filesystem{};

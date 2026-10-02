@@ -19,6 +19,9 @@ namespace macha {
 
 class ClusterStatusService {
     NodeRuntime& node_;
+    const ActivityClocks& activity_;
+    const DataResourceArbiter& data_resources_;
+    const RetainedMemoryLedger& retained_memory_;
     std::atomic<MetadataView*> metadata_{nullptr};
     std::jthread persistence_;
     std::mutex wait_mutex_;
@@ -40,7 +43,8 @@ class ClusterStatusService {
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
-    explicit ClusterStatusService(NodeRuntime&);
+    ClusterStatusService(NodeRuntime&, const ActivityClocks&, const DataResourceArbiter&,
+                         const RetainedMemoryLedger&);
     void attach_metadata(MetadataView& metadata) {
         metadata_.store(&metadata, std::memory_order_release);
     }

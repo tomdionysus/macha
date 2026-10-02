@@ -807,6 +807,8 @@ struct PlaybackManager::Impl {
     };
 
     FileSystem& fs;
+    TranscodeRateBook& transcode_rates;
+    RetainedMemoryLedger& retained_memory;
     CatalogueManager& catalogue;
     StreamingConfig config;
     // Node-global fairness and memory bound across all sessions.
@@ -944,11 +946,12 @@ struct PlaybackManager::Impl {
     size_t start_workers{};
     std::condition_variable_any start_workers_cv;
 
-    Impl(FileSystem& filesystem, CatalogueManager& cat, CatalogueApiConfig api,
-         StreamingConfig streaming, std::shared_ptr<MediaEngine> media_engine,
+    Impl(FileSystem& filesystem, TranscodeRateBook& rates, RetainedMemoryLedger& memory,
+         CatalogueManager& cat, CatalogueApiConfig api, StreamingConfig streaming,
+         std::shared_ptr<MediaEngine> media_engine,
          std::function<size_t(const std::vector<std::string>&)> request_profiles,
          MediaInformationService* information)
-        : fs(filesystem), catalogue(cat), config(std::move(streaming)),
+        : fs(filesystem), transcode_rates(rates), retained_memory(memory), catalogue(cat), config(std::move(streaming)),
           engine(media_engine ? std::move(media_engine) :
                 (config.enabled ? make_libav_media_engine(config) : nullptr)),
           request_media_profiles(std::move(request_profiles)), media_information(information) {
@@ -1958,7 +1961,7 @@ struct PlaybackManager::Impl {
         if (state.produced_media_ms < 60000 || state.producing_ms == 0) return;
         const double rate = static_cast<double>(state.produced_media_ms) / static_cast<double>(state.producing_ms);
         const auto concurrent = running_transcodes.load();
-        auto& book = fs.node().transcode_rates();
+        auto& book = transcode_rates;
         if (session.plan.video == MediaTransform::transcode) {
             if (const auto* video = stream_at(session.probe, session.plan.video_stream))
                 book.record("video", video->codec, static_cast<uint32_t>(std::max(0, video->bit_depth)),
@@ -2146,7 +2149,7 @@ struct PlaybackManager::Impl {
                                               config.max_ahead_segments, config.segment_memory_bytes,
                                               session.generation_dir);
             auto segment_store = launched->segments();
-            if (!segment_store || !segment_store->attach_memory_ledger(fs.node().retained_memory())) {
+            if (!segment_store || !segment_store->attach_memory_ledger(retained_memory)) {
                 launched->stop();
                 throw std::runtime_error("viewer fragment memory admission unavailable");
             }
@@ -3759,11 +3762,13 @@ struct PlaybackManager::Impl {
     }
 };
 
-PlaybackManager::PlaybackManager(FileSystem& fs, CatalogueManager& catalogue, CatalogueApiConfig api,
+PlaybackManager::PlaybackManager(FileSystem& fs, TranscodeRateBook& transcode_rates,
+                                 RetainedMemoryLedger& retained_memory,
+                                 CatalogueManager& catalogue, CatalogueApiConfig api,
                                  StreamingConfig streaming, std::shared_ptr<MediaEngine> engine,
                                  std::function<size_t(const std::vector<std::string>&)> request_profiles,
                                  MediaInformationService* media_information)
-    : impl_(std::make_unique<Impl>(fs, catalogue, std::move(api), std::move(streaming),
+    : impl_(std::make_unique<Impl>(fs, transcode_rates, retained_memory, catalogue, std::move(api), std::move(streaming),
                                   std::move(engine), std::move(request_profiles),
                                   media_information)) {}
 

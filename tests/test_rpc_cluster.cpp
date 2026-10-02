@@ -352,14 +352,14 @@ MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
     auto& node = fixture.start();
 
     // Clear startup accounting; a loader write must not refresh the viewer clock.
-    (void)node.take_activity_bytes(FrameType::read_ahead);
-    (void)node.take_activity_bytes(FrameType::foreground);
-    (void)node.take_activity_bytes(FrameType::loader);
-    DistributedStore store(node);
+    (void)node.resources.activity.take_bytes(FrameType::read_ahead);
+    (void)node.resources.activity.take_bytes(FrameType::foreground);
+    (void)node.resources.activity.take_bytes(FrameType::loader);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     auto bytes = pattern(256 * 1024, 91);
     REQUIRE(store.put(bytes) == object_id(bytes));
-    CHECK(node.take_activity_bytes(FrameType::read_ahead) == 0);
-    CHECK(node.take_activity_bytes(FrameType::foreground) == 0);
+    CHECK(node.resources.activity.take_bytes(FrameType::read_ahead) == 0);
+    CHECK(node.resources.activity.take_bytes(FrameType::foreground) == 0);
 }
 
 MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_own_class) {
@@ -372,10 +372,10 @@ MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_o
     config.metadata_min_write_replicas = 1;
     auto& node = fixture.start();
 
-    (void)node.take_activity_bytes(FrameType::loader);
-    (void)node.take_activity_bytes(FrameType::foreground);
-    (void)node.take_activity_bytes(FrameType::read_ahead);
-    DistributedStore store(node);
+    (void)node.resources.activity.take_bytes(FrameType::loader);
+    (void)node.resources.activity.take_bytes(FrameType::foreground);
+    (void)node.resources.activity.take_bytes(FrameType::read_ahead);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     auto bytes = pattern(256 * 1024, 91);
     REQUIRE(store.put(bytes) == object_id(bytes));
 
@@ -423,11 +423,11 @@ MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retaine
             }
             return RpcMessage{MessageType::ok, {}};
         },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
     server.start();
     node.membership().observe(peer, true);
 
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     auto first = std::async(std::launch::async, [&] {
         return store.get_shared(id, 0, FrameType::foreground);
     });
@@ -446,15 +446,15 @@ MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retaine
     CHECK(a->bytes == bytes);
     CHECK(fetches.load() == 1);
 
-    const auto held = node.retained_memory().stats()
+    const auto held = node.resources.memory.stats()
                           .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)];
     CHECK(held >= bytes.size());
     a.reset();
-    CHECK(node.retained_memory().stats()
+    CHECK(node.resources.memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] >= bytes.size());
     b.reset();
     REQUIRE(wait_until([&] {
-        return node.retained_memory().stats()
+        return node.resources.memory.stats()
                    .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] < bytes.size();
     }));
 
@@ -494,7 +494,7 @@ MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
             if (request.type == MessageType::put_object) ++puts;
             return RpcMessage{MessageType::ok, {}};
         },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
     server.start();
     node.membership().observe(peer, true);
 
@@ -502,7 +502,7 @@ MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
     const auto id = object_id(bytes);
     REQUIRE(node.local_store().put(id, bytes));
     const std::vector<ObjectId> live{id};
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     for (int pass = 0; pass < 4; ++pass)
         (void)store.repair_step(8ULL * 1024 * 1024, 16, live);
     CHECK(probes.load() == 0);
@@ -572,12 +572,12 @@ MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_w
             if (request.type == MessageType::put_object) ++puts;
             return RpcMessage{MessageType::ok, {}};
         },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
     server.start();
     node.membership().observe(peer, true);
 
     REQUIRE(node.local_store().put(held, held_bytes));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     REQUIRE(store.should_own(wanted));
     const auto short_of_an_extent = node.config().extent_size - 1;
 
@@ -597,7 +597,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_w
     // missing one waits for credit, and the cursor stays on it.
     std::vector<ObjectId> pull_live{held, wanted};
     std::sort(pull_live.begin(), pull_live.end());
-    DistributedStore puller(node);
+    DistributedStore puller(node, node.resources.activity, node.resources.data, node.resources.memory);
     DistributedStore::RepairResult pull;
     for (int step = 0; step < 8 && !pull.credit_limited; ++step)
         pull = puller.repair_step(short_of_an_extent, 16, pull_live);
@@ -626,7 +626,7 @@ struct RepairPeer {
     NodeInfo info;
     std::unique_ptr<RpcServer> server;
 
-    RepairPeer(TestNode& fixture, NodeRuntime& node) {
+    RepairPeer(TestNode& fixture, BareNode& node) {
         info.id = random_node_id();
         info.host = "127.0.0.1";
         info.port = free_port();
@@ -668,7 +668,7 @@ struct RepairPeer {
                 return RpcMessage{MessageType::ok, {}};
             },
             [](const NodeInfo&) {}, 4ULL * 1024 * 1024, RpcServerExecutionLimits{},
-            &node.retained_memory());
+            &node.resources.memory);
         server->start();
         node.membership().observe(info, true);
     }
@@ -717,7 +717,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object
     }
     std::sort(live.begin(), live.end());
 
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     const auto step = store.repair_step(8ULL * 1024 * 1024, 16, live);
     CHECK(step.push_examined == live.size());
     CHECK(peer.batch_requests.load() == 3); // 16 + 16 + 8
@@ -726,7 +726,7 @@ MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object
 
     // A peer without have_valid_objects is asked one object at a time.
     peer.knows_batch = false;
-    DistributedStore older(node);
+    DistributedStore older(node, node.resources.activity, node.resources.data, node.resources.memory);
     const auto fallback = older.repair_step(8ULL * 1024 * 1024, 16, live);
     CHECK(fallback.push_examined == live.size());
     CHECK(peer.single_probes.load() == live.size());
@@ -750,7 +750,7 @@ MACHA_TEST("rpc_cluster", test_repair_pushes_several_objects_at_once) {
     }
     std::sort(live.begin(), live.end());
 
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     const auto started = Clock::now();
     const auto step = store.repair_step(64ULL * 1024 * 1024, 16, live);
     const auto elapsed = Clock::now() - started;
@@ -782,7 +782,8 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
     const auto position = fixture.config().state_path / "repair" / "push-position";
 
     {
-        DistributedStore store(node, DistributedStoreOptions{position, {}});
+        DistributedStore store(node, node.resources.activity, node.resources.data,
+                           node.resources.memory, DistributedStoreOptions{position, {}});
         const auto first = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 1);
         CHECK(first.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
@@ -799,13 +800,15 @@ MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_an
     const auto restart_position = fixture.config().state_path / "repair" / "restart-position";
     peer.batch_requests = 0;
     {
-        DistributedStore store(node, DistributedStoreOptions{restart_position, {}});
+        DistributedStore store(node, node.resources.activity, node.resources.data,
+                           node.resources.memory, DistributedStoreOptions{restart_position, {}});
         const auto before = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 3);
         CHECK(before.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
     }
     peer.batch_requests = 0;
-    DistributedStore restarted(node, DistributedStoreOptions{restart_position, {}});
+    DistributedStore restarted(node, node.resources.activity, node.resources.data,
+                           node.resources.memory, DistributedStoreOptions{restart_position, {}});
     const auto resumed = restarted.repair_step(64ULL * 1024 * 1024, 16, live, {}, 3);
     CHECK(resumed.push_examined == 36);
     CHECK(peer.batch_requests.load() == 3);
@@ -833,7 +836,7 @@ MACHA_TEST("rpc_cluster", test_repair_without_a_generation_tells_live_sets_apart
     // Steps until a pass ends; returns whether that pass was reported
     // settled. `second` is the live set from the second step on.
     const auto pass_settles = [&](const std::vector<ObjectId>& second) {
-        DistributedStore store(node);
+        DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
         REQUIRE(!store.repair_step(64ULL * 1024 * 1024, 16, live).complete);
         for (int step = 0; step < 20; ++step) {
             const auto passes = store.repair_diagnostics().passes_completed;
@@ -860,7 +863,7 @@ MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers
     const auto small_bytes = pattern(16 * 1024, 71);
     const auto small = object_id(small_bytes);
     REQUIRE(node.local_store().put(small, small_bytes));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     const std::vector<ObjectId> small_live{small};
     (void)store.repair_step(64ULL * 1024 * 1024, 16, small_live);
     REQUIRE(peer.puts.load() == 1);
@@ -869,7 +872,7 @@ MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers
     const auto large_bytes = pattern(node.config().extent_size / 2, 72);
     const auto large = object_id(large_bytes);
     REQUIRE(node.local_store().put(large, large_bytes));
-    DistributedStore extents(node);
+    DistributedStore extents(node, node.resources.activity, node.resources.data, node.resources.memory);
     const std::vector<ObjectId> large_live{large};
     (void)extents.repair_step(64ULL * 1024 * 1024, 16, large_live);
     REQUIRE(peer.puts.load() == 2);
@@ -971,15 +974,15 @@ MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_e
     }
     std::sort(live.begin(), live.end());
 
-    DistributedStore store(node);
-    const auto before = node.data_resources().stats().speculative_admissions;
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
+    const auto before = node.resources.data.stats().speculative_admissions;
     size_t examined = 0;
     for (int pass = 0; pass < 8 && examined < live.size(); ++pass) {
         const auto result = store.repair_step(8ULL * 1024 * 1024, 16, live);
         examined += result.pull_examined;
     }
     CHECK(examined >= live.size());
-    CHECK(node.data_resources().stats().speculative_admissions == before);
+    CHECK(node.resources.data.stats().speculative_admissions == before);
     // The progress shows in the diagnostics.
     CHECK(store.repair_diagnostics().pull_examined == examined);
 }
@@ -1021,11 +1024,11 @@ MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_t
             }
             return RpcMessage{MessageType::ok, {}};
         },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.retained_memory());
+        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
     server.start();
     node.membership().observe(peer, true);
 
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     REQUIRE(store.should_own(id));
     REQUIRE(!node.local_store().has(id));
     const std::vector<ObjectId> live{id};
@@ -2473,7 +2476,7 @@ MACHA_TEST("rpc_cluster", test_a_local_control_object_is_found_while_data_credit
     const auto id = object_id(bytes);
     REQUIRE(service.node().control_store().put(id, bytes));
 
-    auto held = service.node().data_resources().acquire(DataWorkContext(FrameType::loader, extent), extent);
+    auto held = service.resources().data.acquire(DataWorkContext(FrameType::loader, extent), extent);
     REQUIRE(held.has_value());
     auto found = std::async(std::launch::async,
                             [&] { return service.filesystem().store().ensure_control_local(id); });
@@ -2499,9 +2502,9 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     REQUIRE(node.local_store().put(id, bytes));
 
     auto loader_context = DataWorkContext(FrameType::loader, extent);
-    auto first = node.data_resources().acquire(loader_context, extent);
-    auto second = node.data_resources().acquire(loader_context, extent);
-    auto third = node.data_resources().acquire(loader_context, extent);
+    auto first = node.resources.data.acquire(loader_context, extent);
+    auto second = node.resources.data.acquire(loader_context, extent);
+    auto third = node.resources.data.acquire(loader_context, extent);
     REQUIRE(first.has_value());
     REQUIRE(second.has_value());
     REQUIRE(third.has_value());
@@ -2529,7 +2532,7 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
 
     auto blocked_loader = client.call_async(endpoint, MessageType::get_object, request.data(),
                                             FrameType::loader);
-    REQUIRE(wait_until([&] { return node.data_resources().stats().loader_waits >= 1; }, 1s));
+    REQUIRE(wait_until([&] { return node.resources.data.stats().loader_waits >= 1; }, 1s));
 
     // The viewer request uses the reserved DATA credit; fast CONTROL is outside the arbiter.
     auto viewer_started = Clock::now();
@@ -2559,7 +2562,7 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     CHECK(client.call(endpoint, MessageType::have_object, request.data(), 500ms).message.type ==
           MessageType::bool_reply);
 
-    const auto stats = node.data_resources().stats();
+    const auto stats = node.resources.data.stats();
     CHECK(stats.viewer_admissions >= 1);
     CHECK(stats.loader_waits >= 1);
     CHECK(stats.peak_used_bytes == config.data_inflight_bytes);
@@ -2632,7 +2635,7 @@ MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
     s1.node().membership().observe(slow_info, true);
     REQUIRE(s1.node().membership().active().size() == 3);
 
-    DistributedStore store(s1.node());
+    DistributedStore store(s1.node(), s1.resources().activity, s1.resources().data, s1.resources().memory);
     auto data = pattern(256 * 1024);
     auto started = Clock::now();
     REQUIRE(store.put(data) == object_id(data));
@@ -2693,7 +2696,7 @@ MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_
 
     // R=3 is a convergence target, not a foreground quorum: with W=1 the local
     // copy publishes at once, and slow replicas stay off the critical path.
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     auto data = pattern(128 * 1024);
     auto id = object_id(data);
     auto started = Clock::now();
@@ -2746,7 +2749,7 @@ MACHA_TEST("rpc_cluster", test_prompt_replication_sends_nothing_to_a_full_owner)
     node.membership().observe(full, true);
     REQUIRE(node.membership().active().size() == 2);
 
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     auto data = pattern(128 * 1024, 7);
     auto id = object_id(data);
     CHECK(store.put(id, data));
@@ -2806,7 +2809,7 @@ MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
             cancelled.store(true, std::memory_order_relaxed);
     });
 
-    DistributedStore store(service.node());
+    DistributedStore store(service.node(), service.resources().activity, service.resources().data, service.resources().memory);
     auto id = object_id(data);
     const bool stored = store.put(id, data, &cancelled);
     watchdog.request_stop();
@@ -4094,7 +4097,7 @@ MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_qui
     std::atomic_bool loading{true};
     std::thread loader([&] {
         while (loading.load()) {
-            s2.node().note_activity(FrameType::loader, 64 * 1024);
+            s2.resources().activity.note(FrameType::loader, 64 * 1024);
             std::this_thread::sleep_for(5ms);
         }
     });
@@ -4110,11 +4113,11 @@ MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_qui
 
     // The loader thread may not have run yet: wait for its first note.
     REQUIRE(wait_until([&] {
-        return s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
+        return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
     }, 5s));
     const bool restored = wait_until([&] { return s2.node().local_store().valid(id); }, 10s);
     // The loader never paused: this copy came back during a busy period.
-    CHECK(s2.node().activity_idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
     loading = false;
     loader.join();
     REQUIRE(restored);
@@ -4485,8 +4488,8 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         CHECK(snapshot.metadata_write_replicas_required == 2);
         CHECK(s2.filesystem().getattr("/after-grow").type == EntryType::directory);
 
-        DistributedStore r1(s1.node());
-        DistributedStore r2(s2.node());
+        DistributedStore r1(s1.node(), s1.resources().activity, s1.resources().data, s1.resources().memory);
+        DistributedStore r2(s2.node(), s2.resources().activity, s2.resources().data, s2.resources().memory);
         REQUIRE(wait_until([&] {
             r1.repair_once(1024 * 1024);
             r2.repair_once(1024 * 1024);
@@ -4578,7 +4581,7 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
     REQUIRE(ranked.size() == 4);
 
     auto id = object_id(data);
-    DistributedStore store(s2.node());
+    DistributedStore store(s2.node(), s2.resources().activity, s2.resources().data, s2.resources().memory);
     REQUIRE(store.put(id, data));
     CHECK(!s1.node().local_store().has(id));
 
@@ -4593,7 +4596,8 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
         for (auto* service : services) {
             if (!service->node().local_store().has(id))
                 continue;
-            DistributedStore repair(service->node());
+            DistributedStore repair(service->node(), service->resources().activity,
+                           service->resources().data, service->resources().memory);
             repair.repair_once(8ULL * 1024 * 1024);
         }
         return (*fallback)->node().local_store().has(id);
@@ -4656,7 +4660,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     }));
     // R=2 is convergence, W=1 the floor; drive repair directly rather than
     // waiting on the maintenance scheduler.
-    DistributedStore initial_convergence(s2->node());
+    DistributedStore initial_convergence(s2->node(), s2->resources().activity,
+                           s2->resources().data, s2->resources().memory);
     REQUIRE(wait_until([&] {
         initial_convergence.repair_once(16ULL * 1024 * 1024, objects);
         return std::all_of(objects.begin(), objects.end(),
@@ -4713,7 +4718,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         10s));
 
     // With the namespace recovered, repair repopulates the replacement from the survivor.
-    DistributedStore replacement_convergence(replacement->node());
+    DistributedStore replacement_convergence(replacement->node(), replacement->resources().activity,
+                           replacement->resources().data, replacement->resources().memory);
     REQUIRE(wait_until(
         [&] {
             replacement_convergence.repair_once(16ULL * 1024 * 1024, objects);
@@ -4899,7 +4905,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_read_of_a_corrupt_local_copy_comes_from_a
     corrupt_object(trio.configs[1].storage_backends.front().path, id);
     REQUIRE(!node.local_store().get(id).has_value());
 
-    DistributedStore store(node);
+    DistributedStore store(node, trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory);
     const auto fetched = store.get(id);
     REQUIRE(fetched.has_value());
     CHECK(object_id(*fetched) == id);
@@ -4920,7 +4926,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_scrub_discards_a_corrupt_copy_and_repair_re
     auto& node = trio[1].node();
     corrupt_object(trio.configs[1].storage_backends.front().path, id);
 
-    DistributedStore store(node);
+    DistributedStore store(node, trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory);
     store.scrub_once(128ULL * 1024 * 1024);
     CHECK(!node.local_store().has(id));
     // Repair pulls what the node's live inventory says it should hold.
@@ -4961,7 +4967,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_runtime_cache_keeps_a_playback_fetch) {
     REQUIRE(node.local_store().remove(id));
     REQUIRE(!node.block_cache().has(id));
 
-    DistributedStore store(node);
+    DistributedStore store(node, trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory);
     const auto fetched = store.get(id, 0, true);
     REQUIRE(fetched.has_value());
     node.wait_local_copies_settled();

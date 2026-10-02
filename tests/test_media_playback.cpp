@@ -430,7 +430,8 @@ MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_
     streaming.segment_hold_window = 8;
     auto engine = std::make_unique<ObservableHlsMediaEngine>();
     auto* engine_ptr = engine.get();
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(engine));
     playback.start();
 
@@ -810,7 +811,8 @@ MACHA_TEST("media_playback", test_direct_play_serves_a_matroska_source) {
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
     streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<HdrFakeMediaEngine>());
     playback.start();
 
@@ -865,7 +867,8 @@ MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_
     streaming.segment_timeout = 1500ms;
     auto engine = std::make_unique<ObservableHlsMediaEngine>();
     auto* engine_ptr = engine.get();
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(engine));
     playback.start();
 
@@ -1172,7 +1175,8 @@ MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.probe_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<FailingProbeMediaEngine>());
     playback.start();
 
@@ -1247,7 +1251,8 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
     {
         auto engine = std::make_unique<FakeMediaEngine>();
         auto* observed = engine.get();
-        PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+        PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                                  std::move(engine));
         playback.start();
         auto created = playback.handle(request_for(first_media_id));
@@ -1295,7 +1300,8 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
     {
         auto engine = std::make_unique<FakeMediaEngine>();
         auto* observed = engine.get();
-        PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+        PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                                  std::move(engine));
         playback.start();
         auto created = playback.handle(request_for(first_media_id));
@@ -1326,7 +1332,8 @@ MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback
     {
         auto engine = std::make_unique<FakeMediaEngine>();
         auto* observed = engine.get();
-        PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+        PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                                  std::move(engine));
         playback.start();
         auto created = playback.handle(request_for(second_media_id));
@@ -1365,7 +1372,8 @@ MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) 
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.probe_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(engine));
     playback.start();
 
@@ -1460,7 +1468,8 @@ MACHA_TEST("media_playback", test_failed_idempotent_creation_releases_joiners_an
     streaming.temp_path = t.path() / "playback-failure";
     streaming.probe_timeout = 2s;
     streaming.max_sessions = 1;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(engine));
     playback.start();
 
@@ -1538,7 +1547,8 @@ MACHA_TEST("media_playback", test_profile_endpoint_pending_does_not_gate_session
     StreamingConfig streaming;
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback-pending";
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              engine, queue, &information);
     playback.start();
     Json::Object preferences{{"mode", "direct"}};
@@ -1596,7 +1606,8 @@ MACHA_TEST("media_playback", test_unavailable_profile_queue_uses_media_engine_fa
     StreamingConfig streaming;
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback-fallback";
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              engine, unavailable);
     playback.start();
 
@@ -1656,7 +1667,8 @@ MACHA_TEST("media_playback", test_failed_profile_job_retry_falls_back_and_replay
     StreamingConfig streaming;
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback-retry";
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              engine, pending_then_failed);
     playback.start();
 
@@ -1944,7 +1956,8 @@ MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_befo
     // overrun between two of them.
     streaming.pipeline_idle = 500ms;
     streaming.session_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
@@ -2070,7 +2083,8 @@ MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_
     // Clamped into [pipeline_idle, session_idle].
     streaming.transcode_entitlement_idle = 600ms;
     streaming.session_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
@@ -2161,7 +2175,8 @@ MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_o
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.session_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
@@ -2255,7 +2270,8 @@ MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_
     streaming.session_unused_idle = 150ms;
     streaming.session_idle = 5min;
     streaming.pipeline_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
@@ -2338,7 +2354,8 @@ MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_
     StreamingConfig streaming;
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<GatedSubtitleMediaEngine>(gate));
     playback.start();
 
@@ -2428,7 +2445,8 @@ MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
     StreamingConfig streaming;
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<AttachedPictureAudioEngine>());
     playback.start();
 
@@ -2531,7 +2549,8 @@ MACHA_TEST("media_playback", test_the_server_plays_what_it_is_told_and_chooses_n
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
     streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<TwoAudioFakeMediaEngine>());
     playback.start();
 
@@ -2650,7 +2669,8 @@ MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
     streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<HdrFakeMediaEngine>());
     playback.start();
 
@@ -2777,7 +2797,8 @@ MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_qualit
     streaming.startup_timeout = 2s;
     auto fake_engine = std::make_unique<FakeMediaEngine>();
     auto* fake_engine_ptr = fake_engine.get();
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(fake_engine));
     playback.start();
 
@@ -2905,7 +2926,8 @@ MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
     streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<HdrFakeMediaEngine>());
     playback.start();
 
@@ -3010,7 +3032,8 @@ MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
     streaming.startup_timeout = 2s;
     auto engine = std::make_unique<BlockingMediaEngine>();
     auto* blocking = engine.get();
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(engine));
     playback.start();
 
@@ -3180,7 +3203,8 @@ struct AsyncStartFixture {
         streaming.start_failed_retention = 1s;
         auto owned = std::make_unique<ProgressingMediaEngine>();
         engine = owned.get();
-        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->catalogue(), api,
+        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->resources().transcode_rates,
+                                                     service->resources().memory, service->catalogue(), api,
                                                      streaming, std::move(owned));
         playback->start();
     }
@@ -3434,7 +3458,8 @@ struct SingleSlotPlayback {
         streaming.max_video_transcodes = 1;
         streaming.max_audio_transcodes = 1;
         streaming.startup_timeout = 2s;
-        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->catalogue(),
+        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->resources().transcode_rates,
+                                                     service->resources().memory, service->catalogue(),
                                                      api, streaming,
                                                      std::make_unique<FakeMediaEngine>());
         playback->start();
@@ -3561,7 +3586,8 @@ MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_ent
     streaming.max_video_transcodes = 1;
     streaming.max_audio_transcodes = 1;
     streaming.startup_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<FakeMediaEngine>());
     playback.start();
 
@@ -3667,7 +3693,8 @@ MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bod
     streaming.startup_timeout = 2s;
     auto fake_engine = std::make_unique<FakeMediaEngine>();
     auto* fake_engine_ptr = fake_engine.get();
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::move(fake_engine));
     playback.start();
 
@@ -4260,7 +4287,8 @@ struct PlaybackFixture {
         streaming.max_sessions_per_account = per_account;
         streaming.max_video_transcodes = 4;
         streaming.max_audio_transcodes = 4;
-        playback.emplace(service->filesystem(), service->catalogue(), api, streaming,
+        playback.emplace(service->filesystem(), service->resources().transcode_rates,
+                         service->resources().memory, service->catalogue(), api, streaming,
                          std::make_unique<FakeMediaEngine>());
         playback->start();
     }
@@ -4526,7 +4554,8 @@ MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_ac
     // Not the defaults, so the assertion cannot pass by coincidence.
     streaming.max_ahead_segments = 3;
     streaming.segment_duration = 2000ms;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<ObservableHlsMediaEngine>());
     playback.start();
 
@@ -4663,7 +4692,8 @@ MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
     streaming.enabled = true;
     streaming.temp_path = t.path() / "playback";
     streaming.startup_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.catalogue(), api, streaming,
+    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
+                            service.resources().memory, service.catalogue(), api, streaming,
                              std::make_unique<KeyframedRemuxMediaEngine>());
     playback.start();
 

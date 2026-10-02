@@ -1236,7 +1236,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
             auto data = local_store().get(id);
             if (!data)
                 return error_reply("object not found");
-            note_activity(frame_type, data->size());
+            activity_.note(frame_type, data->size());
             Writer writer;
             writer.fixed(id.bytes);
             writer.bytes(*data);
@@ -1266,7 +1266,7 @@ RpcMessage NodeRuntime::handle(const NodeInfo& peer, FrameType frame_type,
                 DataWorkContext(frame_type, data.size()), data.size());
             if (!resource)
                 return error_reply("DATA resource admission stopping");
-            note_activity(frame_type, data.size());
+            activity_.note(frame_type, data.size());
             if (!local_store().has(id))
                 notify_storage_mutation();
             if (request.type == MessageType::put_object_deferred) {

@@ -34,7 +34,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       resources_(config, [clock = clock_] { return clock->now(); }),
       node_(std::move(config), keys, resources_.activity, resources_.data, resources_.memory,
             resources_.transcode_rates, std::move(startup_stage_hook)),
-      cluster_status_(node_),
+      cluster_status_(node_, resources_.activity, resources_.data, resources_.memory),
       session_api_(node_), users_api_(node_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
@@ -503,7 +503,7 @@ void Service::initialise_services(std::stop_token stop) {
             return;
 
         auto services = std::make_unique<NodeServices>(
-            node_, registry_, maintenance_port_,
+            node_, resources_, registry_, maintenance_port_,
             [this](ServiceEvent event) { signal_maintenance(event); },
             NodeServicesInstruments{clock_, maintenance_trace_, maintenance_stage_hook_, lifecycle_,
                                     constructed_});

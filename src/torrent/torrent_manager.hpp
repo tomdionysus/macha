@@ -31,6 +31,7 @@ class TorrentManager final : public TorrentService {
     struct Impl;
 
     NodeRuntime& node_;
+    DataResourceArbiter& data_resources_;
     IngestManager& ingest_;
     TorrentConfig config_;
     std::filesystem::path state_file_;
@@ -139,7 +140,7 @@ class TorrentManager final : public TorrentService {
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
 
   public:
-    TorrentManager(NodeRuntime&, IngestManager&, TorrentConfig,
+    TorrentManager(NodeRuntime&, DataResourceArbiter&, IngestManager&, TorrentConfig,
                    const std::filesystem::path& state_path);
     ~TorrentManager() override;
 

@@ -18,10 +18,12 @@ class TorrentSubsystem final : public Subsystem {
     std::shared_ptr<TorrentManager> manager_;
 
   public:
-    TorrentSubsystem(SubsystemRegistry& registry, NodeRuntime& node, IngestManager& ingest,
+    TorrentSubsystem(SubsystemRegistry& registry, NodeRuntime& node,
+                     DataResourceArbiter& data_resources, IngestManager& ingest,
                      TorrentConfig config, const std::filesystem::path& state_path)
         : registry_(registry),
-          manager_(std::make_shared<TorrentManager>(node, ingest, std::move(config), state_path)) {
+          manager_(std::make_shared<TorrentManager>(node, data_resources, ingest,
+                                                    std::move(config), state_path)) {
         // Published at construction, which makes the engine usable; start()
         // only runs the worker. A failed start destroys this, withdrawing it.
         registry_.publish_torrent(manager_);
@@ -50,16 +52,18 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
     static const macha::SubsystemPluginEntry entry{
         macha::kBuildIdentity,
         [](const macha::SubsystemContext& context) -> std::unique_ptr<macha::Subsystem> {
-            if (!context.config || !context.node || !context.ingest || !context.registry)
-                throw std::runtime_error("torrent subsystem requires config, node, ingest and "
-                                         "registry in its context");
+            if (!context.config || !context.node || !context.data_resources ||
+                !context.ingest || !context.registry)
+                throw std::runtime_error("torrent subsystem requires config, node, DATA "
+                                         "resources, ingest and registry in its context");
             if (!context.config->torrent.enabled) {
                 // Disabled, not a fault: no instance, and no supervisor retry.
                 macha::Log::info("torrent subsystem not started: torrent.enabled is false");
                 return {};
             }
             return std::make_unique<macha::TorrentSubsystem>(
-                *context.registry, *context.node, *context.ingest, context.config->torrent,
+                *context.registry, *context.node, *context.data_resources, *context.ingest,
+                context.config->torrent,
                 context.config->state_path);
         }};
     return &entry;

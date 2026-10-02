@@ -258,6 +258,7 @@ class FileSystem {
     friend class WriteHandle;
 
     NodeRuntime& n_;
+    RetainedMemoryLedger& retained_memory_;
     DistributedStore& s_;
     MetadataView& m_;
     PlaybackTracker* playback_{};
@@ -333,7 +334,8 @@ class FileSystem {
         const FilesystemNamespaceMutation&);
 
   public:
-    FileSystem(NodeRuntime&, DistributedStore&, MetadataView&, PlaybackTracker* = nullptr);
+    FileSystem(NodeRuntime&, DistributedStore&, MetadataView&, RetainedMemoryLedger&,
+               PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
     void mkdir(const std::string&, uint32_t, uint32_t, uint32_t);

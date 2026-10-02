@@ -461,7 +461,11 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 
 } // namespace
 
-ClusterStatusService::ClusterStatusService(NodeRuntime& node) : node_(node) {}
+ClusterStatusService::ClusterStatusService(NodeRuntime& node, const ActivityClocks& activity,
+                                           const DataResourceArbiter& data_resources,
+                                           const RetainedMemoryLedger& retained_memory)
+    : node_(node), activity_(activity), data_resources_(data_resources),
+      retained_memory_(retained_memory) {}
 
 void ClusterStatusService::attach_fuse_diagnostics(
     std::function<std::optional<FuseFrontendDiagnostics>()> provider) {
@@ -539,8 +543,8 @@ void ClusterStatusService::persist_local_status() {
     // lock or enter publication CAS. The small durable write (with its fsync) is
     // deferred while viewer-critical work is active.
     constexpr auto idle_before_persist = std::chrono::seconds(30);
-    if (node_.activity_idle_for(FrameType::foreground) < idle_before_persist ||
-        node_.activity_idle_for(FrameType::read_ahead) < idle_before_persist)
+    if (activity_.idle_for(FrameType::foreground) < idle_before_persist ||
+        activity_.idle_for(FrameType::read_ahead) < idle_before_persist)
         return;
     node_.telemetry().persist();
     node_.sessions().persist();
@@ -1042,7 +1046,7 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     transport_diagnostics["canonical_connections"] = transport.canonical_connections;
     diagnostics["rpc_transport"] = std::move(transport_diagnostics);
 
-    const auto data_resource = node_.data_resources().stats();
+    const auto data_resource = data_resources_.stats();
     Json::Object data_resource_diagnostics;
     data_resource_diagnostics["capacity_bytes"] = data_resource.capacity_bytes;
     data_resource_diagnostics["viewer_reserve_bytes"] = data_resource.viewer_reserve_bytes;
@@ -1072,7 +1076,7 @@ HttpResponse ClusterStatusService::diagnostics_response() {
     data_resource_diagnostics["cancelled_waits"] = data_resource.cancelled_waits;
     diagnostics["data_resources"] = std::move(data_resource_diagnostics);
 
-    const auto retained_memory = node_.retained_memory().stats();
+    const auto retained_memory = retained_memory_.stats();
     Json::Object retained_memory_diagnostics;
     retained_memory_diagnostics["capacity_bytes"] = retained_memory.capacity_bytes;
     retained_memory_diagnostics["control_reserve_bytes"] =

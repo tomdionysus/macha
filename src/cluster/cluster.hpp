@@ -245,11 +245,6 @@ class NodeRuntime {
     NodeId durability_epoch() const {
         return durability_epoch_;
     }
-    DataResourceArbiter& data_resources() noexcept { return data_resources_; }
-    const DataResourceArbiter& data_resources() const noexcept { return data_resources_; }
-    RetainedMemoryLedger& retained_memory() noexcept { return retained_memory_; }
-    TranscodeRateBook& transcode_rates() noexcept { return transcode_rates_; }
-    const RetainedMemoryLedger& retained_memory() const noexcept { return retained_memory_; }
     StoragePool& local_store();
     const StoragePool& local_store() const;
     LocalStore& control_store();
@@ -321,17 +316,12 @@ class NodeRuntime {
     // dropped: returns once the queue is empty and nothing is being written.
     void wait_local_copies_settled();
     void reconfigure_local(const Config&);
-    void note_activity(FrameType type, uint64_t bytes = 0) { activity_.note(type, bytes); }
     // Cluster bytes by frame class since start (dialled and served together).
     TrafficTotals traffic_totals() const;
     // Whether another node reports viewer-class traffic in a sample no older
     // than `fresh_for`. Repair paces against it as against local viewers,
     // since its transfers share their links.
     bool peer_viewers_active(std::chrono::milliseconds fresh_for) const;
-    uint64_t take_activity_bytes(FrameType type) { return activity_.take_bytes(type); }
-    std::chrono::milliseconds activity_idle_for(FrameType type) const {
-        return activity_.idle_for(type);
-    }
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
     }

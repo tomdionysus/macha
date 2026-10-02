@@ -29,7 +29,7 @@ MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_cou
     config.fuse.publication_quiet = 0ms;
     auto& service = fixture.start();
 
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     service.registry().publish_fuse(frontend);
     frontend->mkdir("/status-counter", 0755, getuid(), getgid());
     REQUIRE(frontend->wait_for_idle(10s));
@@ -165,7 +165,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_pending_overlay_reads_only_intersecting_
     config.fuse.max_spool_bytes = 64ULL * 1024 * 1024;
     config.fuse.spool_reserve_free = 0;
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
     auto handle = frontend->create("/append-verify.bin", 0644, getuid(), getgid(), true, true,
                                    false);
@@ -237,7 +237,7 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
 
     service.filesystem().create_file("/copy.mkv", 0644, getuid(), getgid());
     auto writer = service.filesystem().open_write("/copy.mkv", true);
-    CHECK(service.node().retained_memory().stats()
+    CHECK(service.resources().memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] == 0);
     auto input = pattern(3 * config.extent_size + 12345);
     size_t offset = 0;
@@ -246,7 +246,7 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
         REQUIRE(writer->write(offset, {input.data() + offset, n}) == n);
         offset += n;
     }
-    CHECK(service.node().retained_memory().stats()
+    CHECK(service.resources().memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] > 0);
 
     // macOS copyfile/cp can apply mode/ownership/timestamps through the still-open
@@ -257,7 +257,7 @@ MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
     service.filesystem().chown("/copy.mkv", getuid(), getgid(), true, true);
     service.filesystem().utimens("/copy.mkv", preserved_mtime);
     writer->commit();
-    CHECK(service.node().retained_memory().stats()
+    CHECK(service.resources().memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] == 0);
 
     auto entry = service.filesystem().getattr("/copy.mkv");
@@ -310,7 +310,7 @@ MACHA_TEST("filesystem_fuse", test_publication_buffer_admission_fails_only_witho
     // Hold the whole non-control budget, which is the state a wedged
     // publication pipeline puts the ledger in: its own predecessors' buffers
     // fill it and no admission can succeed until one of them is released.
-    auto& ledger = service.node().retained_memory();
+    auto& ledger = service.resources().memory;
     const auto capacity = ledger.stats().capacity_bytes;
     // Viewer class, because it is bounded only by the non-control capacity: a
     // loader-class lease could not take the whole budget it is meant to fill.
@@ -589,7 +589,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_overwrite_materialization_yields_between
     seed->commit();
     seed.reset();
 
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->open("/overwrite.bin", true, true, false, false);
     const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x39);
     contents[17] = replacement;
@@ -640,7 +640,7 @@ MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_is_bounded_and_at
     CHECK(staged.peak_pending_extent_puts == 2);
     CHECK(staged.pending_extent_puts == 2);
     CHECK(staged.new_extent_puts == 2);
-    CHECK(service.node().retained_memory().stats()
+    CHECK(service.resources().memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] ==
           2 * config.extent_size);
     CHECK(service.filesystem().getattr("/pipeline.bin").size == 0);
@@ -651,7 +651,7 @@ MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_is_bounded_and_at
     staged = writer->diagnostics();
     CHECK(staged.pending_extent_puts == 0);
     CHECK(staged.new_extent_puts == 4);
-    CHECK(service.node().retained_memory().stats()
+    CHECK(service.resources().memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] == 0);
     CHECK(service.filesystem().getattr("/pipeline.bin").size == 0);
 
@@ -966,8 +966,8 @@ MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_f
         return s2.filesystem().local_snapshot_view().generation > local_record.generation;
     }));
 
-    auto f1 = std::make_shared<FuseFrontend>(s1.filesystem(), c1.fuse);
-    auto f2 = std::make_shared<FuseFrontend>(s2.filesystem(), c2.fuse);
+    auto f1 = std::make_shared<FuseFrontend>(s1.filesystem(), s1.resources().memory, c1.fuse);
+    auto f2 = std::make_shared<FuseFrontend>(s2.filesystem(), s2.resources().memory, c2.fuse);
     CHECK(s1.node().metadata_replica().current().generation > 1);
     CHECK(s2.node().metadata_replica().current().generation > 1);
 
@@ -1187,7 +1187,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->create("/.rsync.tmp", 0600, getuid(), getgid(), true, true, false);
         const auto inode = handle.inode;
         REQUIRE(inode != 0);
@@ -1293,7 +1293,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_sp
     config.fuse.publication_quiet = 0ms;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle =
         frontend->create("/retire-spool.bin", 0600, getuid(), getgid(), true, true, false);
     const auto payload = pattern(2 * 1024 * 1024 + 17, 71);
@@ -1320,7 +1320,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_capacity_backpressures_until_publi
     config.fuse.spool_reserve_free = 0;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle =
         frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(), true, true, false);
     const auto first = pattern(128 * 1024, 41);
@@ -1371,7 +1371,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_threshold_bootstraps_from_partial_
     config.fuse.spool_reserve_free = 0;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto first = frontend->create("/large-open.bin", 0600, getuid(), getgid(), true, true,
                                   false);
     auto follower = frontend->create("/follower.bin", 0600, getuid(), getgid(), true, true,
@@ -1425,7 +1425,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_stalled_publisher_blocks_without_e
     config.fuse.spool_reserve_free = 0;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/stalled-spool.bin", 0600, getuid(), getgid(), true, true,
                                    false);
     // Viewer demand comes from the HTTP playback path, never from the mount:
@@ -1470,7 +1470,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_journal_admission_is_bounded_w
     config.fuse.max_operation_journal_bytes = 12 * 1024;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
     // Keep one durable DATA operation outstanding so unrelated namespace work
     // cannot take the normal "pending == 0" journal reset fast path.
@@ -1540,7 +1540,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_orphan_quarantine_is_byte_bounded_on_rec
     std::filesystem::last_write_time(older, now - 2h);
     std::filesystem::last_write_time(newer, now - 1h);
 
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
     uint64_t orphan_bytes = 0;
     size_t orphan_files = 0;
@@ -1573,7 +1573,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle =
             frontend->create("/playback-yield.bin", 0600, getuid(), getgid(), true, true, false);
         const auto inode = handle.inode;
@@ -1615,7 +1615,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_w
     config.fuse.publication_quiet = 500ms;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     constexpr size_t files = 4;
     std::vector<FuseOpenHandle> handles;
     handles.reserve(files);
@@ -1676,7 +1676,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_pending_write_payloads_are_byte_bounded)
     config.fuse.timeouts.write = 2s;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/write-byte-bound.bin", 0600, getuid(), getgid(), true,
                                    true, false);
     // A zero loader weight is an active-viewer policy, not an idle-system stop:
@@ -1737,7 +1737,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_metadata_backpressures_at_heap
     config.fuse.spool_reserve_free = 0;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/metadata-bound.bin", 0600, getuid(), getgid(), true, true,
                                    false);
     service.filesystem().note_foreground_activity();
@@ -1780,7 +1780,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_metadata_retirement_wakes_bloc
     config.fuse.spool_reserve_free = 0;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/metadata-retirement.bin", 0600, getuid(), getgid(), true,
                                    true, false);
     const auto payload = pattern(4096, 73);
@@ -1801,7 +1801,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_operation_metadata_retirement_wakes_bloc
     REQUIRE(frontend->wait_for_idle(10s));
     REQUIRE(wait_until(
         [&] {
-            const auto memory = service.node().retained_memory().stats();
+            const auto memory = service.resources().memory.stats();
             return memory.owner_bytes[static_cast<size_t>(MemoryOwner::fuse_request)] == 0 &&
                    memory.owner_bytes[static_cast<size_t>(MemoryOwner::fuse_operation)] == 0;
         },
@@ -1821,7 +1821,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_notifications_coalesce_to_du
     config.fuse.publication_quiet = 30s;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle =
         frontend->create("/notification-watermark.bin", 0600, getuid(), getgid(), true, true,
                          false);
@@ -1865,7 +1865,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_lo
     config.fuse.suspend_loader_for_tests = true;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto open_large = frontend->create("/open-large.bin", 0644, getuid(), getgid(), false, true,
                                        false);
     auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
@@ -1902,7 +1902,7 @@ MACHA_TEST("filesystem_fuse", test_an_fsync_waiting_for_publication_ends_when_wa
     config.metadata_min_write_replicas = 1;
     config.extent_size = 1024 * 1024;
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/fsync-held.bin", 0644, getuid(), getgid(), false, true, false);
     REQUIRE(frontend->wait_for_idle(10s));
     // A viewer holds loader publication, so the fsync's publication cannot
@@ -1945,7 +1945,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retiremen
     config.fuse.spool_reserve_free = 0;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto pathological = frontend->create("/open-pathological.bin", 0644, getuid(), getgid(),
                                          false, true, false);
     auto closed_large = frontend->create("/closed-large.bin", 0644, getuid(), getgid(), false,
@@ -2025,7 +2025,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bou
     config.fuse.publication_pipeline_bytes = config.extent_size;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto large_handle =
         frontend->create("/quantum-large.bin", 0644, getuid(), getgid(), false, true, false);
     auto small_handle =
@@ -2110,7 +2110,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_co
     config.fuse.publication_max_open_writers = 4;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
     constexpr size_t files = 20;
     const auto contents = pattern(2 * 1024 * 1024 + 12345, 91);
@@ -2141,7 +2141,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_co
         CHECK(service.filesystem().getattr("/backlog-" + std::to_string(i) + ".bin").size ==
               contents.size());
     // Every lease taken for publication is back.
-    CHECK(service.node().retained_memory().stats().owner_bytes[static_cast<size_t>(
+    CHECK(service.resources().memory.stats().owner_bytes[static_cast<size_t>(
               MemoryOwner::publication)] == 0);
     frontend->stop();
 }
@@ -2166,7 +2166,7 @@ MACHA_TEST("filesystem_fuse", test_publication_progress_counts_releases_not_admi
     config.fuse.publication_pipeline_bytes = config.extent_size;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/progress-counter.bin", 0644, getuid(), getgid(), false,
                                    true, false);
     const auto contents = pattern(4 * config.extent_size, 77);
@@ -2197,7 +2197,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_
     config.fuse.fail_publication_once_after_spool_bytes_for_tests = config.extent_size;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/transient-cursor.bin", 0644, getuid(), getgid(), false,
                                    true, false);
     REQUIRE(frontend->wait_for_idle(10s));
@@ -2282,7 +2282,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failing_repeatedly_is_report
     config.fuse.publication_retry.max_failing_duration = 60s;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/noisy.bin", 0644, getuid(), getgid(), true, true, false);
     const auto payload = pattern(64 * 1024 + 3, 51);
     REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
@@ -2313,7 +2313,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_backs_off_then_parks_for_ope
     config.fuse.publication_retry = RetryPolicy{3, 60s, 5ms, 20ms};
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     auto handle = frontend->create("/parked.bin", 0644, getuid(), getgid(), true, true, false);
     const auto payload = pattern(64 * 1024 + 3, 44);
     REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
@@ -2377,7 +2377,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmit
         // frontend stops: a viewer is active and the loader's share is zero.
         auto held = config.fuse;
         held.suspend_loader_for_tests = true;
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), held);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, held);
         frontend->set_viewer_active_for_tests(true);
         auto handle = frontend->open("/removed-before-replay.bin", true, true, false, false);
         REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
@@ -2393,7 +2393,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmit
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(wait_until([&] { return recovered->status().backend_failures >= 1; }, 10s));
     REQUIRE(recovered->wait_for_idle(2s));
 
@@ -2418,7 +2418,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
     config.min_write_replicas = 1;
     config.fuse.publication_quiet = 0ms;
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
     constexpr int titles = 60;
     frontend->mkdir("/Movies", 0755, getuid(), getgid());
@@ -2513,7 +2513,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace
     uint64_t inode = 0;
     auto payload = pattern(384 * 1024 + 17);
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
         // Publication is held behind a quiet window, yet the operations below
         // succeeded and must be reconstructable from local state.
@@ -2539,7 +2539,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace
     auto replay_config = config.fuse;
     replay_config.publication_quiet = 0ms;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay_config);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay_config);
         REQUIRE(recovered->inode_for_path("/TV").has_value());
         REQUIRE(recovered->inode_for_path("/TV/Buffy").has_value());
         auto recovered_inode = recovered->inode_for_path("/TV/Buffy/S07E01.mp4");
@@ -2595,7 +2595,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
     constexpr std::string_view removed_path = "/TV/Buffy The Vampire Slayer/S07E02.mp4";
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
 
         frontend->mkdir("/TV", 0755, getuid(), getgid());
@@ -2628,7 +2628,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
     // First recovery stays publication-blocked, so these assertions see only
     // reconstruction from committed metadata plus the local journal.
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         CHECK(!recovered->inode_for_path(old_path).has_value());
         auto recovered_inode = recovered->inode_for_path(new_path);
         REQUIRE(recovered_inode.has_value());
@@ -2646,7 +2646,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_m
     auto replay_config = config.fuse;
     replay_config.publication_quiet = 0ms;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay_config);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay_config);
         REQUIRE(recovered->wait_for_idle(20s));
 
         bool old_missing = false;
@@ -2698,7 +2698,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_a
     // behind the foreground quiet boundary, then cross a frontend restart so
     // the ordinary recovery path owns the entire backlog.
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < operations; ++i)
             frontend->mkdir("/pending-" + std::to_string(i), 0755, getuid(), getgid());
@@ -2710,7 +2710,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_a
     replay.publication_quiet = 0ms;
     replay.namespace_batch_operations = 3;
     const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
     constexpr size_t expected_batches = (operations + 3 - 1) / 3;
@@ -2755,7 +2755,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounde
     CHECK(service.filesystem().apply_namespace_batch(creates).applied == operations);
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < operations; ++i)
             frontend->unlink("/bulk-" + std::to_string(i));
@@ -2767,7 +2767,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounde
     replay.publication_quiet = 0ms;
     replay.namespace_batch_operations = batch_limit;
     const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(30s));
     const auto status = recovered->status();
     constexpr size_t expected_batches = (operations + batch_limit - 1) / batch_limit;
@@ -2796,7 +2796,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_encoded_size_limit_is_ha
     constexpr size_t operations = 4;
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < operations; ++i)
             frontend->mkdir("/byte-limited-" + std::to_string(i), 0755, getuid(), getgid());
@@ -2806,7 +2806,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_encoded_size_limit_is_ha
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
     replay.namespace_batch_bytes = 1;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
@@ -2831,7 +2831,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmd
     service.filesystem().create_file("/doomed/two", 0644, getuid(), getgid());
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->unlink("/doomed/one");
         frontend->unlink("/doomed/two");
@@ -2842,7 +2842,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmd
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
     const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
@@ -2874,7 +2874,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_all_idempotent_batch_uses_no_ge
     constexpr size_t operations = 4;
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < operations; ++i)
             frontend->mkdir("/already-" + std::to_string(i), 0755, getuid(), getgid());
@@ -2886,7 +2886,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_all_idempotent_batch_uses_no_ge
     const auto generation_before = service.filesystem().local_committed_metadata_generation();
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
@@ -2911,7 +2911,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
     auto& service = fixture.start();
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/prefix", 0755, getuid(), getgid());
         frontend->mkdir("/concurrent", 0755, getuid(), getgid());
@@ -2926,7 +2926,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace
     const auto generation_before = service.filesystem().local_committed_metadata_generation();
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
@@ -2964,7 +2964,7 @@ MACHA_TEST("filesystem_fuse",
     auto& service = fixture.start();
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/wedge", 0755, getuid(), getgid());
         frontend->stop();
@@ -2973,7 +2973,7 @@ MACHA_TEST("filesystem_fuse",
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     service.registry().publish_fuse(recovered);
 
     REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
@@ -3024,7 +3024,7 @@ MACHA_TEST("filesystem_fuse",
     // A second wedge queued behind the first stops the journal compacting once
     // the first is skipped, so the lone namespace_done is still there to replay.
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/wedge", 0755, getuid(), getgid());
         frontend->mkdir("/wedge2", 0755, getuid(), getgid());
@@ -3037,7 +3037,7 @@ MACHA_TEST("filesystem_fuse",
     replay.publication_quiet = 0ms;
     uint64_t skipped_sequence = 0;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
         service.registry().publish_fuse(recovered);
         REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
         auto blocked = recovered->blocked_namespace_operation();
@@ -3055,7 +3055,7 @@ MACHA_TEST("filesystem_fuse",
 
     // Restart replays namespace_done for the skipped sequence with no
     // namespace_published recorded for it.
-    auto restarted = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto restarted = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     service.registry().publish_fuse(restarted);
     REQUIRE(wait_until([&] {
         auto blocked = restarted->blocked_namespace_operation();
@@ -3080,7 +3080,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/pending", 0755, getuid(), getgid());
         REQUIRE(frontend->inode_for_path("/pending").has_value());
@@ -3100,7 +3100,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
     REQUIRE(std::filesystem::file_size(journal) == valid_size + 3);
 
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         REQUIRE(recovered->inode_for_path("/pending").has_value());
         CHECK(std::filesystem::file_size(journal) == valid_size);
         recovered->stop();
@@ -3120,7 +3120,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_checksum_invalid_c
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/pending-checksum", 0755, getuid(), getgid());
         frontend->stop();
@@ -3141,7 +3141,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_checksum_invalid_c
     REQUIRE(std::filesystem::file_size(journal) == valid_size + 37);
 
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         REQUIRE(recovered->inode_for_path("/pending-checksum").has_value());
         CHECK(std::filesystem::file_size(journal) == valid_size);
         recovered->stop();
@@ -3244,7 +3244,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_preserves_unreferenced_s
     }
 
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         recovered->stop();
     }
 
@@ -3288,7 +3288,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
     auto& service = fixture.start();
     constexpr size_t dirty_inodes = 16;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         const auto before_dirty = linux_open_fd_count();
         for (size_t i = 0; i < dirty_inodes; ++i) {
@@ -3308,7 +3308,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
 
     const auto before_recovery = linux_open_fd_count();
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         const auto after_recovery = linux_open_fd_count();
         CHECK(after_recovery <= before_recovery + 8);
         recovered->stop();
@@ -3318,7 +3318,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) 
     drain.publication_quiet = 0ms;
     const auto before_drain = linux_open_fd_count();
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), drain);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, drain);
         REQUIRE(recovered->wait_for_idle(30s));
         const auto after_drain = linux_open_fd_count();
         CHECK(after_drain <= before_drain + 8);
@@ -3343,7 +3343,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append
     expected.insert(expected.end(), second.begin(), second.end());
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         auto created =
             frontend->create("/append-after-idle.bin", 0644, getuid(), getgid(), true, true, false);
@@ -3376,7 +3376,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append
     auto drain = config.fuse;
     drain.publication_quiet = 0ms;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), drain);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, drain);
         REQUIRE(recovered->wait_for_idle(15s));
         auto committed = service.filesystem().getattr("/append-after-idle.bin");
         CHECK(committed.size == expected.size());
@@ -3415,7 +3415,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_ne
         // the frontend stops, however the host schedules threads.
         auto staging_fuse = config.fuse;
         staging_fuse.publication_quiet = 5s;
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), staging_fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, staging_fuse);
         for (size_t i = 0; i < files; ++i) {
             auto created = frontend->create("/recover-autostart-" + std::to_string(i) + ".bin",
                                             0644, getuid(), getgid(), true, true, false);
@@ -3451,7 +3451,7 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_ne
     // recovered files may use loader capacity beyond recovery_commit_workers.
     size_t max_recovery_active = 0;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         const auto deadline = Clock::now() + 3s;
         while (Clock::now() < deadline) {
             const auto status = recovered->status();
@@ -3486,7 +3486,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovered_loader_uses_loader_worker_boun
 
     // Foreground activity holds publication so the first frontend leaves a durable backlog.
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (size_t i = 0; i < files; ++i) {
             auto handle =
@@ -3502,7 +3502,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovered_loader_uses_loader_worker_boun
     drain.publication_quiet = 0ms;
     size_t max_recovery_active = 0;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), drain);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, drain);
         const auto deadline = Clock::now() + 30s;
         while (Clock::now() < deadline) {
             auto status = recovered->status();
@@ -3599,7 +3599,7 @@ MACHA_TEST("filesystem_fuse",
     constexpr uint64_t published_prefix = 3;
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (uint64_t i = 0; i < operations; ++i)
             frontend->mkdir("/published-crash-" + std::to_string(i), 0755, getuid(), getgid());
@@ -3629,7 +3629,7 @@ MACHA_TEST("filesystem_fuse",
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
@@ -3659,7 +3659,7 @@ MACHA_TEST("filesystem_fuse",
     auto& service = fixture.start();
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/superseded", 0755, getuid(), getgid());
         frontend->stop();
@@ -3688,7 +3688,7 @@ MACHA_TEST("filesystem_fuse",
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
     CHECK(status.pending_namespace == 0);
@@ -3720,7 +3720,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done
     constexpr uint64_t done_prefix = 2;
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         for (uint64_t i = 0; i < operations; ++i)
             frontend->mkdir("/done-crash-" + std::to_string(i), 0755, getuid(), getgid());
@@ -3750,7 +3750,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done
 
     auto replay = config.fuse;
     replay.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, replay);
     REQUIRE(recovered->wait_for_idle(20s));
     const auto status = recovered->status();
 
@@ -3785,7 +3785,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publicati
     constexpr size_t recovered_operations = 4;
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(fixture.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(fixture.filesystem(), fixture.resources().memory, config.fuse);
         fixture.store().foreground_activity(1);
         for (size_t i = 0; i < recovered_operations; ++i)
             frontend->mkdir("/recovery-live-" + std::to_string(i), 0755, getuid(), getgid());
@@ -3802,7 +3802,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publicati
     replay.publication_quiet = 0ms;
     replay.namespace_batch_operations = recovered_operations;
     const auto generation_before = fixture.filesystem().local_committed_metadata_generation();
-    auto recovered = std::make_shared<FuseFrontend>(fixture.filesystem(), replay);
+    auto recovered = std::make_shared<FuseFrontend>(fixture.filesystem(), fixture.resources().memory, replay);
     const bool publication_entered = publication_gate.wait_for_entries(1, 5s);
     CHECK(publication_entered);
 
@@ -3849,7 +3849,7 @@ MACHA_TEST("filesystem_fuse",
 
     uint64_t inode = 0;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->create("/done-authoritative.bin", 0644, getuid(), getgid(), true,
                                        true, false);
         inode = handle.inode;
@@ -3884,7 +3884,7 @@ MACHA_TEST("filesystem_fuse",
     append_fuse_journal_test_record(journal, done.data());
 
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         CHECK(recovered->inode_for_path("/done-authoritative.bin").has_value());
         recovered->stop();
     }
@@ -3898,7 +3898,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_skips_unbacked_data_done
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         frontend->stop();
     }
 
@@ -3913,7 +3913,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_skips_unbacked_data_done
 
     // A completion marker with no operation behind it retires nothing, so it
     // is skipped and counted, and the frontend starts.
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 1);
     recovered->stop();
 }
@@ -3931,7 +3931,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_mi
     service.filesystem().create_file("/recover.bin", 0600, getuid(), getgid());
     uint64_t inode = 0;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->open("/recover.bin", true, true, false, false);
         inode = handle.inode;
         auto payload = pattern(128 * 1024);
@@ -3950,7 +3950,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_mi
     // that generation, not the complete filesystem. Recovery journals the
     // abandonment and falls back to the last committed manifest (empty here).
     config.fuse.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     REQUIRE(recovered->wait_for_idle(10s));
     CHECK(service.filesystem().getattr("/recover.bin").size == 0);
     recovered->stop();
@@ -3972,7 +3972,7 @@ MACHA_TEST("filesystem_fuse",
 
     uint64_t inode = 0;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->open("/recover-corrupt.bin", true, true, false, false);
         inode = handle.inode;
         const auto replacement = pattern(published.size(), 62);
@@ -3999,7 +3999,7 @@ MACHA_TEST("filesystem_fuse",
     }
 
     config.fuse.publication_quiet = 0ms;
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     REQUIRE(recovered->wait_for_idle(10s));
 
     const auto committed = service.filesystem().getattr("/recover-corrupt.bin");
@@ -4027,7 +4027,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_read_only_release_does_not_publish_write
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto writer = frontend->create("/growing.bin", 0600, getuid(), getgid(), true, true, false);
         auto bytes = pattern(256 * 1024);
         REQUIRE(frontend->write(writer.inode, 0, bytes) == bytes.size());
@@ -4070,7 +4070,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_unlink_and_rename_over_open_ino
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
         // A dirty inode that is unlinked before release must never recreate its
         // old pathname when the data-publication worker eventually sees it.
@@ -4148,7 +4148,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_inode_ownership_reclaims_only_after_all_
     config.fuse.publication_quiet = 0ms;
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     const auto baseline = frontend->status().inode_count;
 
     // A detached inode remains owned by an open descriptor even after the
@@ -4206,7 +4206,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydra
     REQUIRE(base_entry.extents.size() >= 5);
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->open("/read.bin", true, true, false, false);
 
         auto patch = pattern(16384);
@@ -4289,7 +4289,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_buffered_writes_batch_until_close_durabi
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->create("/batch.bin", 0644, getuid(), getgid(), true, true, false);
 
         // write() does not wait for a local fsync pair, so one sequential writer
@@ -4333,7 +4333,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_fsync_waits_for_distributed_publication)
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->create("/sync.bin", 0644, getuid(), getgid(), true, true, false);
         auto bytes = pattern(2 * 1024 * 1024 + 12345);
         REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
@@ -4375,13 +4375,13 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_c
     REQUIRE(entry.extents.size() >= 2);
 
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->open("/read-cache.bin", true, false, false, false);
 
         Bytes first(4096);
         REQUIRE(frontend->read(handle, 0, first) == first.size());
         CHECK(std::equal(first.begin(), first.end(), bytes.begin()));
-        CHECK(service.node().retained_memory().stats()
+        CHECK(service.resources().memory.stats()
                   .owner_bytes[static_cast<size_t>(MemoryOwner::object_payload)] >=
               config.extent_size);
 
@@ -4407,7 +4407,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_c
         frontend->release(fresh.inode, false);
         frontend->release(handle.inode, false);
     }
-    CHECK(service.node().retained_memory().stats()
+    CHECK(service.resources().memory.stats()
               .owner_bytes[static_cast<size_t>(MemoryOwner::object_payload)] == 0);
 }
 
@@ -4420,7 +4420,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_dri
 
     auto& service = fixture.start();
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
 
         bool missing = false;
         try {
@@ -4506,7 +4506,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
     service.filesystem().mkdir("/fz-seeded", 0755, getuid(), getgid());
     uint64_t inode_a = 0;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/fz", 0755, getuid(), getgid());
         auto a = frontend->create("/fz/a.bin", 0600, getuid(), getgid(), true, true, false);
@@ -4548,7 +4548,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
         write_all_bytes(journal, bytes);
         std::shared_ptr<FuseFrontend> frontend;
         try {
-            frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+            frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         } catch (const std::exception& e) {
             const auto message = name + ": frontend refused to start: " + e.what();
             ::macha::test::check(false, message.c_str(), __FILE__, __LINE__);
@@ -4605,7 +4605,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_
     // The pristine journal still recovers everything.
     restore_directory(pristine_spool, spool_dir);
     write_all_bytes(journal, pristine);
-    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     CHECK(recovered->inode_for_path("/fz/b.bin").has_value());
     CHECK(recovered->inode_for_path("/fz/sub").has_value());
     CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 0);
@@ -4629,7 +4629,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_int
     auto& service = fixture.start();
     constexpr size_t files = 24;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         service.filesystem().store().foreground_activity(1);
         frontend->mkdir("/album", 0755, getuid(), getgid());
         for (size_t i = 0; i < files; ++i) {
@@ -4648,7 +4648,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_int
     // The recovered queue (mkdir + 3 ops per file) publishes in a handful of commits.
     config.fuse.suspend_loader_for_tests = false;
     config.fuse.publication_quiet = 0ms;
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     REQUIRE(frontend->wait_for_idle(30s));
     const auto status = frontend->status();
     std::cout << "batching: admitted=" << status.namespace_operations_admitted
@@ -4687,7 +4687,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_utimens_after_write_survives_async_publi
     config.fuse.publication_quiet = 2s; // namespace ops publish now, data after the quiet window
 
     auto& service = fixture.start();
-    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+    auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
     service.filesystem().store().foreground_activity(1);
     auto handle = frontend->create("/.song.tmp", 0600, getuid(), getgid(), true, true, false);
     const auto payload = pattern(48 * 1024, 5);
@@ -4720,7 +4720,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_i
     auto& service = fixture.start();
     const auto payload = pattern(32 * 1024, 77);
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->create("/.film.tmp", 0600, getuid(), getgid(), true, true, false);
         REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
         frontend->release(handle.inode, true);
@@ -4756,7 +4756,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_i
     } else {
         REQUIRE(kept_batches >= 1);
         write_all_bytes(journal, stripped);
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         REQUIRE(recovered->wait_for_idle(30s));
         const auto status = recovered->status();
         CHECK(status.namespace_publication_attempts == 0); // nothing re-applied
@@ -4788,7 +4788,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_r
     service.filesystem().create_file("/gone.bin", 0600, getuid(), getgid());
     uint64_t inode = 0;
     {
-        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto frontend = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         auto handle = frontend->open("/gone.bin", true, true, false, false);
         inode = handle.inode;
         const auto payload = pattern(256 * 1024, 73);
@@ -4809,7 +4809,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_r
 
     config.fuse.publication_quiet = 0ms;
     {
-        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto recovered = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         REQUIRE(recovered->wait_for_idle(10s));
         const auto diagnostics = recovered->diagnostics();
         CHECK(diagnostics.publications_abandoned == 1);
@@ -4822,7 +4822,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_r
     CHECK(!std::filesystem::exists(spool) || std::filesystem::file_size(spool) == 0);
     CHECK(std::filesystem::file_size(journal) == 8);
     {
-        auto again = std::make_shared<FuseFrontend>(service.filesystem(), config.fuse);
+        auto again = std::make_shared<FuseFrontend>(service.filesystem(), service.resources().memory, config.fuse);
         REQUIRE(again->wait_for_idle(10s));
         CHECK(again->diagnostics().publications_abandoned == 0);
         CHECK(again->status().pending_data == 0);
