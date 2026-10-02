@@ -16,7 +16,10 @@
 // every frame. --stats materializes each reconstructible head and prints
 // what its snapshot is made of (entries, extents, tombstones, conflicts,
 // node status) and how many encoded bytes each part accounts for -- the
-// measurement behind discipline 4 of the self-healing plan.
+// measurement behind discipline 4 of the self-healing plan. --entries-check
+// (with --objects, implies --stats) pages each tree-backed head's namespace
+// with the resumable walk at several bounds and checks it visits exactly
+// what the whole-pass walk visits, in the same order.
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
@@ -116,12 +119,13 @@ class ReplayNodeStore final : public NamespaceNodeStore {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] "
-                     "[--all] [--stats] [--tree] [--objects <path>]\n";
+                     "[--all] [--stats] [--tree] [--entries-check] [--objects <path>]\n";
         return 2;
     }
     bool all = false;
     bool stats = false;
     bool tree = false;
+    bool entries_check = false;
     std::filesystem::path objects;
     // Replay writing reconstructed nodes into the store, the way a replica
     // does, rather than into memory. Point it at a COPY of a node's store: the
@@ -145,6 +149,9 @@ int main(int argc, char** argv) {
                 return 2;
             }
             objects = argv[i];
+        } else if (std::string(argv[i]) == "--entries-check") {
+            entries_check = true;
+            stats = true;
         } else if (std::string(argv[i]) == "--tree") {
             // Implies --stats: the tree is built from the materialised head,
             // which is what --stats already produces.
@@ -464,6 +471,32 @@ int main(int argc, char** argv) {
                 // A stat against the tree, which is what a getattr now costs:
                 // one path from the root, no extent node fetched.
                 nodes_read_probe(nodes, *snapshot.namespace_root);
+                if (entries_check) {
+                    std::vector<NamespaceItem> whole;
+                    for_each_namespace_entry(snapshot, &nodes,
+                                             [&](const std::string& path, const FsEntry& entry) {
+                                                 whole.emplace_back(path, entry);
+                                             });
+                    for (size_t bound : {1U, 7U, 64U, 4096U}) {
+                        std::vector<NamespaceItem> paged;
+                        Cursor<std::string> cursor;
+                        size_t pages = 0;
+                        for (;;) {
+                            Budget budget;
+                            budget.operations(bound);
+                            auto page = namespace_entries(snapshot, &nodes, cursor, budget);
+                            ++pages;
+                            for (auto& item : page.items)
+                                paged.push_back(std::move(item));
+                            if (page.complete())
+                                break;
+                            cursor = page.next;
+                        }
+                        std::cout << "  entries-check bound=" << bound << " pages=" << pages
+                                  << " entries=" << paged.size() << " whole=" << whole.size()
+                                  << " equal=" << (paged == whole ? "yes" : "NO") << '\n';
+                    }
+                }
             } catch (const std::exception& error) {
                 std::cout << "  tree unavailable: " << error.what() << '\n';
             }
