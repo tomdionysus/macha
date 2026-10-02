@@ -232,12 +232,11 @@ class IngestManager {
     void set_blocked(IngestJob&, std::string code, std::string message);
     void cleanup_partials(const IngestJob&);
 
-    // NodeRuntime::set_ingest_bridge() handlers: this node's own jobs only;
+  public:
+    // The ingest job routes' handlers (JobRoutes): this node's own jobs only;
     // ClusterJobView is built from these replies.
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
-
-  public:
     IngestManager(NodeRuntime&, FileSystem&, CatalogueHintQueue&, IngestConfig,
                   MediaInformationService* media_information = nullptr);
     ~IngestManager();

@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
+#include "cluster/job_routes.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
 #include "metadata/metadata.hpp"
@@ -65,10 +66,6 @@ struct NodeReadiness {
 class NodeRuntime {
   public:
     using StartupStageHook = std::function<void(std::string_view)>;
-    // Opaque JSON bridge between the RPC wire and the owner of ingest/torrent
-    // job state (IngestManager / TorrentManager).
-    using JobsQueryHandler = std::function<Bytes(std::span<const uint8_t> request_payload)>;
-    using JobActionHandler = std::function<Bytes(std::span<const uint8_t> request_payload)>;
 
   private:
     struct LocalCopyJob {
@@ -99,6 +96,8 @@ class NodeRuntime {
     RetainedMemoryLedger& retained_memory_;
     // Playback records, telemetry publishes.
     TranscodeRateBook& transcode_rates_;
+    // Job RPCs pass through opaque to whichever component the root bound.
+    JobRoutes& job_routes_;
     // Declared before members_ so the roster is built with the right flags.
     mutable std::mutex inbound_mutex_;
     InboundResolution inbound_;
@@ -174,12 +173,6 @@ class NodeRuntime {
     std::atomic_bool outbound_calls_stopped_{};
     mutable std::mutex service_event_mutex_;
     std::function<void(ServiceEvent)> service_event_;
-    mutable std::mutex job_bridge_mutex_;
-    JobsQueryHandler ingest_jobs_handler_;
-    JobActionHandler ingest_action_handler_;
-    JobsQueryHandler torrent_jobs_handler_;
-    JobActionHandler torrent_action_handler_;
-    JobActionHandler torrent_intent_handler_;
 
     void signal_service_event(ServiceEvent);
 
@@ -214,7 +207,7 @@ class NodeRuntime {
   public:
     // The caller holds state_path's StorageLock for this node's life.
     NodeRuntime(Config, ClusterKeys, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
-                TranscodeRateBook&, StartupStageHook startup_stage_hook = {});
+                TranscodeRateBook&, JobRoutes&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
     void request_stop();
@@ -223,13 +216,6 @@ class NodeRuntime {
     void cancel_outbound_calls();
     void stop();
     void set_service_event_callback(std::function<void(ServiceEvent)> callback);
-    // Registered once by the owning component. Handlers must answer from that
-    // component's local state only, never surveying peers, or one
-    // cluster-wide query fans out unboundedly.
-    void set_ingest_bridge(JobsQueryHandler jobs, JobActionHandler action);
-    void set_torrent_bridge(JobsQueryHandler jobs, JobActionHandler action);
-    // The torrent coordinator's torrent_intent handler.
-    void set_torrent_intent_handler(JobActionHandler);
     void notify_storage_mutation();
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;

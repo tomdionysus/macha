@@ -15,21 +15,34 @@ namespace {
 
 class TorrentSubsystem final : public Subsystem {
     SubsystemRegistry& registry_;
+    JobRoutes& job_routes_;
     std::shared_ptr<TorrentManager> manager_;
 
   public:
-    TorrentSubsystem(SubsystemRegistry& registry, NodeRuntime& node,
+    TorrentSubsystem(SubsystemRegistry& registry, JobRoutes& job_routes, NodeRuntime& node,
                      DataResourceArbiter& data_resources, IngestManager& ingest,
                      TorrentConfig config, const std::filesystem::path& state_path)
-        : registry_(registry),
+        : registry_(registry), job_routes_(job_routes),
           manager_(std::make_shared<TorrentManager>(node, data_resources, ingest,
                                                     std::move(config), state_path)) {
         // Published at construction, which makes the engine usable; start()
         // only runs the worker. A failed start destroys this, withdrawing it.
         registry_.publish_torrent(manager_);
+        job_routes_.bind(JobRoutes::Route::torrent_jobs, [this](std::span<const uint8_t> payload) {
+            return manager_->handle_jobs_query(payload);
+        });
+        job_routes_.bind(JobRoutes::Route::torrent_action,
+                         [this](std::span<const uint8_t> payload) {
+                             return manager_->handle_job_action(payload);
+                         });
     }
 
-    ~TorrentSubsystem() override { stop(); }
+    // The manager is rebuilt on fault: unbinding waits out any call in flight.
+    ~TorrentSubsystem() override {
+        job_routes_.unbind(JobRoutes::Route::torrent_action);
+        job_routes_.unbind(JobRoutes::Route::torrent_jobs);
+        stop();
+    }
 
     std::string_view name() const noexcept override { return "torrent"; }
 
@@ -53,16 +66,18 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
         macha::kBuildIdentity,
         [](const macha::SubsystemContext& context) -> std::unique_ptr<macha::Subsystem> {
             if (!context.config || !context.node || !context.data_resources ||
-                !context.ingest || !context.registry)
+                !context.ingest || !context.registry || !context.job_routes)
                 throw std::runtime_error("torrent subsystem requires config, node, DATA "
-                                         "resources, ingest and registry in its context");
+                                         "resources, ingest, registry and job routes in its "
+                                         "context");
             if (!context.config->torrent.enabled) {
                 // Disabled, not a fault: no instance, and no supervisor retry.
                 macha::Log::info("torrent subsystem not started: torrent.enabled is false");
                 return {};
             }
             return std::make_unique<macha::TorrentSubsystem>(
-                *context.registry, *context.node, *context.data_resources, *context.ingest,
+                *context.registry, *context.job_routes, *context.node, *context.data_resources,
+                *context.ingest,
                 context.config->torrent,
                 context.config->state_path);
         }};

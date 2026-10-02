@@ -140,9 +140,6 @@ TorrentManager::TorrentManager(NodeRuntime& node, DataResourceArbiter& data_reso
     : node_(node), data_resources_(data_resources), ingest_(ingest), config_(std::move(config)),
       state_file_(state_path / "torrent" / "jobs.json"),
       resume_dir_(state_path / "torrent" / "resume") {
-    node_.set_torrent_bridge(
-        [this](std::span<const uint8_t> payload) { return handle_jobs_query(payload); },
-        [this](std::span<const uint8_t> payload) { return handle_job_action(payload); });
     if (!config_.enabled) return;
     // The only signal that a failed job's ingest runs again; a settled manager
     // otherwise sleeps.
@@ -158,9 +155,6 @@ TorrentManager::TorrentManager(NodeRuntime& node, DataResourceArbiter& data_reso
 }
 
 TorrentManager::~TorrentManager() {
-    // The bridge's lambdas bind `this`, which is rebuilt on fault: clear them
-    // before stopping so no call reaches freed memory.
-    node_.set_torrent_bridge({}, {});
     ingest_.set_resume_listener({});
     stop();
 }

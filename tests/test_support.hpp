@@ -261,6 +261,7 @@ class TestService {
 // The root parts a NodeRuntime takes, built before it (a base is built first).
 struct BareNodeResources {
     NodeResources resources;
+    JobRoutes job_routes;
     explicit BareNodeResources(const Config& config) : resources(config) {}
 };
 
@@ -271,7 +272,8 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
         : BareNodeResources(config),
           NodeRuntime(std::move(config), keys, resources.activity, resources.data,
-                      resources.memory, resources.transcode_rates, std::move(hook)) {}
+                      resources.memory, resources.transcode_rates, job_routes,
+                      std::move(hook)) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;

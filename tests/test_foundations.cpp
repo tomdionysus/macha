@@ -1794,3 +1794,26 @@ MACHA_FAST_TEST("foundations", test_coverage_child_profile_name) {
     CHECK(coverage::child_profile_name("/p/%m.profraw", 7, "x") == "/p/%m.profraw");
     CHECK(coverage::child_profile_name("", 7, "x").empty());
 }
+
+MACHA_FAST_TEST("foundations", test_job_routes_answer_only_while_bound) {
+    JobRoutes routes;
+    const Bytes request{1, 2, 3};
+    using Route = JobRoutes::Route;
+    CHECK(!routes.call(Route::ingest_jobs, request));
+
+    routes.bind(Route::ingest_jobs, [](std::span<const uint8_t> payload) {
+        return Bytes(payload.rbegin(), payload.rend());
+    });
+    const auto reply = routes.call(Route::ingest_jobs, request);
+    REQUIRE(reply);
+    CHECK(*reply == Bytes({3, 2, 1}));
+    // Each route is its own binding.
+    CHECK(!routes.call(Route::torrent_jobs, request));
+
+    // A second bind replaces the first.
+    routes.bind(Route::ingest_jobs, [](std::span<const uint8_t>) { return Bytes{9}; });
+    CHECK(routes.call(Route::ingest_jobs, request) == std::optional<Bytes>(Bytes{9}));
+
+    routes.unbind(Route::ingest_jobs);
+    CHECK(!routes.call(Route::ingest_jobs, request));
+}
