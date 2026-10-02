@@ -3294,7 +3294,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         acceptance.hash = sibling.hash;
         acceptance.required = 1;
         acceptance.replicas = {node.node_id()};
-        REQUIRE(node.accept_metadata_commit(acceptance));
+        REQUIRE(node.metadata_server().accept_commit(acceptance));
         return sibling;
     };
 
@@ -3331,7 +3331,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     duplicate.hash = right.hash;
     duplicate.required = 1;
     duplicate.replicas = {s2.node().node_id()};
-    REQUIRE(s2.node().accept_metadata_commit(duplicate));
+    REQUIRE(s2.node().metadata_server().accept_commit(duplicate));
     CHECK(s2.node().metadata_announcements() == announcements_before_duplicate);
     std::this_thread::sleep_for(100ms);
     CHECK(convergence_events(s1) == before_duplicate1);
@@ -3453,7 +3453,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
         acceptance.hash = sibling.hash;
         acceptance.required = 1;
         acceptance.replicas = {node.node_id()};
-        REQUIRE(node.accept_metadata_commit(acceptance));
+        REQUIRE(node.metadata_server().accept_commit(acceptance));
         return sibling;
     };
 

@@ -19,6 +19,13 @@ namespace macha {
 // so no call reaches a destroyed part. A request whose type is unbound, or
 // whose handler throws, gets an error reply. Thread-safe; a handler runs under
 // the route lock and must not bind or unbind.
+// The reply a handler gives when it refuses a request: the reason as text.
+inline RpcMessage error_reply(const std::string& text) {
+    Writer writer;
+    writer.string(text);
+    return {MessageType::error, writer.take()};
+}
+
 class MessageRoutes {
   public:
     using Handler =
@@ -36,16 +43,16 @@ class MessageRoutes {
     RpcMessage dispatch(const NodeInfo& peer, FrameType frame_type,
                         const RpcMessage& request) const {
         if (static_cast<size_t>(request.type) >= route_count)
-            return error("unsupported request");
+            return error_reply("unsupported request");
         std::shared_lock lock(mutex_);
         const auto& handler = handlers_[index(request.type)];
         if (!handler)
-            return error(std::string(message_type_name(request.type)) +
-                         " is not available on this node");
+            return error_reply(std::string(message_type_name(request.type)) +
+                               " is not available on this node");
         try {
             return handler(peer, frame_type, request);
         } catch (const std::exception& failure) {
-            return error(failure.what());
+            return error_reply(failure.what());
         }
     }
 
@@ -57,11 +64,6 @@ class MessageRoutes {
         if (value >= route_count)
             throw std::out_of_range("message type beyond the route table");
         return value;
-    }
-    static RpcMessage error(const std::string& text) {
-        Writer writer;
-        writer.string(text);
-        return {MessageType::error, writer.take()};
     }
 
     mutable std::shared_mutex mutex_;
