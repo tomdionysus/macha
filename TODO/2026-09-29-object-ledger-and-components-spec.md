@@ -417,6 +417,19 @@ Known case: `CatalogueManager::maintenance_objects()` runs the catalogue's
 repair while building the maintenance inventory (`src/service/service.cpp:1430`).
 It is split into an explicit catalogue repair step and a side-effect-free
 inventory read, called in that order at the same point in the pass.
+**Done (T4b, 2026-10-02)** in three steps, not two: `maintenance_head()`
+captures the metadata head before the repair, as the combined call did,
+because the read's completeness compares against that head (capturing it
+after the repair would call an inventory complete that today's code calls
+incomplete under a race); then `maintenance_repair()`; then
+`maintenance_objects(head, repaired)`.
+
+Found by the T4b audit: the read still has one effect. It fetches any
+catalogue manifest or shard it lacks into the control store
+(`DistributedStore::ensure_control_local`) before reading it. A fetch that
+fills a local copy is a repair of the store, not of the catalogue; it stays
+at stage 0, declared on the read, and is the place a later stage moves it
+to repair.
 
 Every operation moved behind a contract is audited for others, and each
 finding is recorded here before its contract is written.
