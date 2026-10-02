@@ -63,14 +63,6 @@ class NodeRuntime {
     using StartupStageHook = std::function<void(std::string_view)>;
 
   private:
-    struct LocalCopyJob {
-        ObjectId id;
-        Bytes data;
-        bool promote{};
-        bool cache{};
-        RetainedMemoryLedger::Lease memory;
-    };
-
     enum ReadyBit : uint32_t {
         ready_control_plane = 1U << 0,
         ready_data_storage = 1U << 1,
@@ -160,15 +152,6 @@ class NodeRuntime {
     std::condition_variable_any telemetry_wait_cv_;
     std::mutex maintenance_wait_mutex_;
     std::condition_variable_any maintenance_wait_cv_;
-    std::jthread local_writer_;
-    std::mutex local_copy_mutex_;
-    std::condition_variable local_copy_cv_;
-    std::deque<LocalCopyJob> local_copies_;
-    size_t local_copy_bytes_{};
-    // A dequeued job not yet written; with the queue empty and this false,
-    // every queued copy is settled.
-    bool local_copy_writing_{};
-    std::condition_variable local_copy_settled_cv_;
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
 
@@ -188,7 +171,6 @@ class NodeRuntime {
     void route(MessageType, MessageRoutes::Handler);
     void unbind_routes();
     void loop(std::stop_token);
-    void local_writer_loop(std::stop_token);
     // Public-endpoint discovery, then (for `inbound_capable: auto`) the
     // dial-back resolution state machine, for the node's life.
     void connectivity_loop(std::stop_token);
@@ -296,10 +278,6 @@ class NodeRuntime {
     bool accept_history_checkpoint_proposal(const HistoryCheckpointProof&);
     bool commit_history_checkpoint(const Hash256& floor_hash, const Hash256& epoch);
     void announce_metadata_generation(uint64_t);
-    void enqueue_fetched(const ObjectId&, std::span<const uint8_t>, bool promote);
-    // Waits until every copy queued by enqueue_fetched() so far is written or
-    // dropped: returns once the queue is empty and nothing is being written.
-    void wait_local_copies_settled();
     void reconfigure_local(const Config&);
     // Cluster bytes by frame class since start (dialled and served together).
     TrafficTotals traffic_totals() const;
