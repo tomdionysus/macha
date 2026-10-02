@@ -5,6 +5,8 @@
 #include "config.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -21,9 +23,11 @@ class PersistentBlockCache;
 class RetentionStore;
 class StoragePool;
 
-// How far this node's local state has recovered, plane by plane, and the
-// first failure. LocalState marks each plane as it completes; Status and the
-// startup diagnostics read it, and nothing gates on it. Thread-safe.
+// How far this node's local state has recovered: plane by plane, the first
+// failure, and completion once local state and the parts built from it
+// exist. LocalState marks the planes, whoever builds those parts marks
+// completion; the node's readiness, Status and the startup diagnostics read
+// it. Thread-safe.
 class RecoveryProgress {
   public:
     enum Plane : uint32_t {
@@ -39,9 +43,30 @@ class RecoveryProgress {
     }
     // Keeps the first failure.
     void fail(std::string error) {
-        std::lock_guard lock(mutex_);
-        if (!failed_.exchange(true, std::memory_order_acq_rel))
-            error_ = std::move(error);
+        {
+            std::lock_guard lock(mutex_);
+            if (!failed_.exchange(true, std::memory_order_acq_rel))
+                error_ = std::move(error);
+        }
+        cv_.notify_all();
+    }
+    void mark_complete(uint64_t now_unix_ms) {
+        {
+            std::lock_guard lock(mutex_);
+            ready_unix_ms_.store(now_unix_ms, std::memory_order_release);
+            complete_.store(true, std::memory_order_release);
+        }
+        cv_.notify_all();
+    }
+    bool complete() const noexcept { return complete_.load(std::memory_order_acquire); }
+    uint64_t ready_unix_ms() const noexcept {
+        return ready_unix_ms_.load(std::memory_order_acquire);
+    }
+    // Waits until complete, failed, or `timeout`; true when complete.
+    bool wait_complete(std::chrono::milliseconds timeout) const {
+        std::unique_lock lock(mutex_);
+        cv_.wait_for(lock, timeout, [this] { return complete() || failed(); });
+        return complete();
     }
     bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
     std::string error() const {
@@ -52,7 +77,10 @@ class RecoveryProgress {
   private:
     std::atomic_uint32_t planes_{};
     std::atomic_bool failed_{};
+    std::atomic_bool complete_{};
+    std::atomic_uint64_t ready_unix_ms_{};
     mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
     std::string error_;
 };
 
