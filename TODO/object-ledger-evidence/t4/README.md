@@ -120,3 +120,23 @@ compiler's guarantee, not the count's.
   A rebuild from consistent sources passed everything. Never edit sources
   under a running build.
 - Suites 708/708, 17/17; traces 240/240.
+
+## fi-1 and the live namespaces (2026-10-02)
+
+- GCC build of the `-t4` tip, no warnings. Suites 708 (one failure, below),
+  17/17, 21/21.
+- The failure, `storage_v18/test_distributed_r1_spills_preferred_full_node_to_next_candidate`,
+  was a test defect that predates the experiment: its helper's 4096
+  candidates were 256 distinct objects (the salt and the xor were both the
+  counter cast to a byte), and with the preferred node weighted ~2% of
+  capacity all 256 missed it about one run in 400. 11 in 3000 on the
+  laptop before the fix, 0 in 3000 after (`5234477`).
+- `entries` on each live node's namespace: `macha-metadata-dump
+  --entries-check` (new, `861d90a`) over a copy of each node's replica
+  state and control store, the head materialised through an in-memory
+  overlay (the tool's `--stats` could not materialise a tree-backed head
+  before; fixed in the same change). Both nodes, head generation 64579
+  (the cluster's single accepted head): 8,173 entries, a tree of depth 4;
+  paged at bounds 1, 7, 64 and 4096 (8,173, 1,168, 128 and 2 pages),
+  equal to the whole-pass walk in set and order every time. Copies
+  removed after.

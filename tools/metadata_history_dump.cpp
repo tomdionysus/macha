@@ -409,6 +409,25 @@ int main(int argc, char** argv) {
         // that part removed.
         MetadataSnapshot snapshot;
         size_t record_bytes = 0;
+        // With --objects, a tree-backed head is materialised the way a replica
+        // does it: each delta applied to the tree through the control store,
+        // the nodes it writes kept in memory (ReplayNodeStore) so the copy is
+        // never written. The walk below reads the same overlay, since the
+        // head's newest nodes exist only there.
+        std::optional<LocalStore> stats_store;
+        std::optional<ReplayNodeStore> stats_nodes;
+        NamespaceDeltaApplier stats_applier;
+        if (!objects.empty()) {
+            stats_store.emplace(objects,
+                                LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
+                                                  StoragePackingConfig{}.threshold,
+                                                  StoragePackingConfig{}.target_size},
+                                key);
+            stats_nodes.emplace(*stats_store);
+            stats_applier = [&](const ObjectId& root, const MetadataDelta& delta) {
+                return apply_delta_to_namespace_tree(root, *stats_nodes, delta);
+            };
+        }
         try {
             const auto anchor = load(cursor);
             record_bytes = anchor.payload.size();
@@ -416,7 +435,8 @@ int main(int argc, char** argv) {
             for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
                 const auto body = load(*it);
                 record_bytes = body.payload.size();
-                apply_metadata_delta_in_place(snapshot, decode_metadata_delta(body.payload));
+                apply_metadata_delta_in_place(snapshot, decode_metadata_delta(body.payload),
+                                              stats_applier);
             }
         } catch (const std::exception& error) {
             std::cout << "  stats unavailable: " << error.what() << '\n';
@@ -455,12 +475,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             try {
-                LocalStore store(objects,
-                                 LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
-                                                   StoragePackingConfig{}.threshold,
-                                                   StoragePackingConfig{}.target_size},
-                                 key);
-                ReplayNodeStore nodes(store);
+                auto& nodes = *stats_nodes;
                 const auto shape = namespace_tree_stats(*snapshot.namespace_root, nodes);
                 std::cout << "  tree: nodes=" << shape.leaves + shape.branches
                           << " leaves=" << shape.leaves << " branches=" << shape.branches
