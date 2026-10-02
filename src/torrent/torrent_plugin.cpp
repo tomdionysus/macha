@@ -15,32 +15,35 @@ namespace {
 
 class TorrentSubsystem final : public Subsystem {
     SubsystemRegistry& registry_;
-    JobRoutes& job_routes_;
+    MessageRoutes& routes_;
     std::shared_ptr<TorrentManager> manager_;
 
   public:
-    TorrentSubsystem(SubsystemRegistry& registry, JobRoutes& job_routes, NodeRuntime& node,
+    TorrentSubsystem(SubsystemRegistry& registry, MessageRoutes& routes, NodeRuntime& node,
                      DataResourceArbiter& data_resources, IngestManager& ingest,
                      TorrentConfig config, const std::filesystem::path& state_path)
-        : registry_(registry), job_routes_(job_routes),
+        : registry_(registry), routes_(routes),
           manager_(std::make_shared<TorrentManager>(node, data_resources, ingest,
                                                     std::move(config), state_path)) {
         // Published at construction, which makes the engine usable; start()
         // only runs the worker. A failed start destroys this, withdrawing it.
         registry_.publish_torrent(manager_);
-        job_routes_.bind(JobRoutes::Route::torrent_jobs, [this](std::span<const uint8_t> payload) {
-            return manager_->handle_jobs_query(payload);
-        });
-        job_routes_.bind(JobRoutes::Route::torrent_action,
-                         [this](std::span<const uint8_t> payload) {
-                             return manager_->handle_job_action(payload);
-                         });
+        routes_.bind(MessageType::get_torrent_jobs,
+                     [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                         return RpcMessage{MessageType::torrent_jobs_reply,
+                                           manager_->handle_jobs_query(request.payload)};
+                     });
+        routes_.bind(MessageType::torrent_job_action,
+                     [this](const NodeInfo&, FrameType, const RpcMessage& request) {
+                         return RpcMessage{MessageType::torrent_job_action_reply,
+                                           manager_->handle_job_action(request.payload)};
+                     });
     }
 
     // The manager is rebuilt on fault: unbinding waits out any call in flight.
     ~TorrentSubsystem() override {
-        job_routes_.unbind(JobRoutes::Route::torrent_action);
-        job_routes_.unbind(JobRoutes::Route::torrent_jobs);
+        routes_.unbind(MessageType::torrent_job_action);
+        routes_.unbind(MessageType::get_torrent_jobs);
         stop();
     }
 
@@ -66,9 +69,9 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
         macha::kBuildIdentity,
         [](const macha::SubsystemContext& context) -> std::unique_ptr<macha::Subsystem> {
             if (!context.config || !context.node || !context.data_resources ||
-                !context.ingest || !context.registry || !context.job_routes)
+                !context.ingest || !context.registry || !context.routes)
                 throw std::runtime_error("torrent subsystem requires config, node, DATA "
-                                         "resources, ingest, registry and job routes in its "
+                                         "resources, ingest, registry and routes in its "
                                          "context");
             if (!context.config->torrent.enabled) {
                 // Disabled, not a fault: no instance, and no supervisor retry.
@@ -76,7 +79,7 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
                 return {};
             }
             return std::make_unique<macha::TorrentSubsystem>(
-                *context.registry, *context.job_routes, *context.node, *context.data_resources,
+                *context.registry, *context.routes, *context.node, *context.data_resources,
                 *context.ingest,
                 context.config->torrent,
                 context.config->state_path);

@@ -34,9 +34,9 @@
 // pinning the one ordering the graph leaves free (see stop()).
 //
 // The graph, provider -> dependants:
-//   node, resources, job routes, registry, port (outside, outlive this)
-//   job routes     <- ingest, torrent coordinator (bound here once built,
-//                     unbound before they are destroyed)
+//   node, resources, routes, registry, port (outside, outlive this)
+//   routes         <- ingest, torrent coordinator (their job messages, bound
+//                     here once built, unbound before they are destroyed)
 //   resources      -> store (activity, DATA, memory, events), filesystem (memory),
 //                     playback (rate book, memory), subsystems (DATA, memory)
 //   playback       -> filesystem, hydration
@@ -74,7 +74,7 @@ struct NodeServicesInstruments {
 
 class NodeServices {
   public:
-    NodeServices(NodeRuntime&, NodeResources&, JobRoutes&, SubsystemRegistry&, MaintenancePort&,
+    NodeServices(NodeRuntime&, NodeResources&, MessageRoutes&, SubsystemRegistry&, MaintenancePort&,
                  NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
@@ -117,7 +117,7 @@ class NodeServices {
 
     NodeRuntime& node_;
     NodeResources& resources_;
-    JobRoutes& job_routes_;
+    MessageRoutes& routes_;
     SubsystemRegistry& registry_;
     MaintenancePort& port_;
     NodeServicesInstruments instruments_;
