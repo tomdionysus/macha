@@ -29,7 +29,15 @@ struct FakeMetadataView final : MetadataView {
     MetadataSnapshotView converged(const WorkContext&) override { return converged(); }
     uint64_t current_generation() const noexcept override { return view ? view->generation : 0; }
     uint64_t current_namespace_revision() const noexcept override { return 0; }
-    MetadataRecord record() override { throw std::runtime_error("metadata unavailable"); }
+    // When set, a committed read brings the view up to date (as a replica
+    // read does); otherwise it fails as an unreachable replica set does.
+    std::optional<MetadataSnapshotView> after_record;
+    MetadataRecord record() override {
+        if (!after_record)
+            throw std::runtime_error("metadata unavailable");
+        view = after_record;
+        return {};
+    }
     std::optional<MetadataSnapshotView> release_head() const override { return view; }
     MetadataClusterStatus status() const noexcept override { return {}; }
     MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
@@ -96,6 +104,23 @@ MACHA_TEST("catalogue_maintenance", test_the_read_is_complete_only_when_the_repa
     auto stale = head;
     stale.current = false;
     CHECK(!catalogue.maintenance_objects(stale, true).complete);
+}
+
+MACHA_TEST("catalogue_maintenance", test_a_head_behind_the_known_generation_reads_the_record_first) {
+    Node fixture;
+    FakeMetadataView metadata;
+    const auto known = fixture.node->known_metadata_generation();
+    REQUIRE(known > 0);
+    // The cached view is a generation behind; the committed read brings it
+    // to the known one, and the head is taken from that.
+    metadata.view = MetadataSnapshotView{known - 1, 0, Hash256{},
+                                         std::make_shared<const MetadataSnapshot>()};
+    metadata.after_record = MetadataSnapshotView{known, 0, Hash256{},
+                                                 std::make_shared<const MetadataSnapshot>()};
+    CatalogueManager catalogue(*fixture.node, *fixture.store, metadata);
+    const auto head = catalogue.maintenance_head();
+    CHECK(head.current);
+    CHECK(head.generation == known);
 }
 
 } // namespace
