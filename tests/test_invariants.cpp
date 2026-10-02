@@ -1412,11 +1412,12 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     // the durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
-    status.attach_metadata(metadata);
+    StatusSources sources;
+    sources.metadata = &metadata;
     HttpRequest request;
     request.method = "GET";
     request.path = "/api/v1/status";
-    auto response = status.handle(request);
+    auto response = status.handle(request, sources);
     REQUIRE(response.status == 200);
     auto root = Json::parse(
         std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1445,7 +1446,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     HttpRequest diagnostics_request;
     diagnostics_request.method = "GET";
     diagnostics_request.path = "/api/v1/status/diagnostics";
-    auto diagnostics_response = status.handle(diagnostics_request);
+    auto diagnostics_response = status.handle(diagnostics_request, sources);
     REQUIRE(diagnostics_response.status == 200);
     auto diagnostics_root =
         Json::parse(std::string(reinterpret_cast<const char*>(diagnostics_response.body.data()),
@@ -1532,7 +1533,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer_telemetry.traffic_window_ms = 10000;
     node.telemetry().observe(peer_telemetry, true);
 
-    response = status.handle(request);
+    response = status.handle(request, sources);
     REQUIRE(response.status == 200);
     root = Json::parse(
         std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1582,7 +1583,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     CHECK(found);
 
     metadata.note_replica_validation(true);
-    response = status.handle(request);
+    response = status.handle(request, sources);
     REQUIRE(response.status == 200);
     root = Json::parse(
         std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1728,7 +1729,8 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     node.telemetry().observe(peer_telemetry, true);
 
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
-    status.attach_metadata(metadata);
+    StatusSources sources;
+    sources.metadata = &metadata;
     HttpRequest request;
     request.method = "GET";
     request.path = "/api/v1/status";
@@ -1742,7 +1744,7 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
         return nullptr;
     };
 
-    auto fresh_response = status.handle(request);
+    auto fresh_response = status.handle(request, sources);
     REQUIRE(fresh_response.status == 200);
     auto fresh_root = Json::parse(std::string(
         reinterpret_cast<const char*>(fresh_response.body.data()), fresh_response.body.size()));
@@ -1758,7 +1760,7 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     // TelemetryStore has no injectable clock, so this really waits it out.
     std::this_thread::sleep_for(5200ms);
 
-    auto stale_response = status.handle(request);
+    auto stale_response = status.handle(request, sources);
     REQUIRE(stale_response.status == 200);
     auto stale_root = Json::parse(std::string(
         reinterpret_cast<const char*>(stale_response.body.data()), stale_response.body.size()));
@@ -1819,11 +1821,12 @@ MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresh
     node.telemetry().observe(peer_telemetry, true);
 
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
-    status.attach_metadata(metadata);
+    StatusSources sources;
+    sources.metadata = &metadata;
     HttpRequest request;
     request.method = "GET";
     request.path = "/api/v1/status";
-    const auto response = status.handle(request);
+    const auto response = status.handle(request, sources);
     REQUIRE(response.status == 200);
     const auto root = Json::parse(
         std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
@@ -1870,11 +1873,12 @@ MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster
     metadata.note_replica_validation(true);
 
     ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
-    status.attach_metadata(metadata);
+    StatusSources sources;
+    sources.metadata = &metadata;
     HttpRequest root_request;
     root_request.method = "GET";
     root_request.path = "/api/v1/status";
-    const auto root_response = status.handle(root_request);
+    const auto root_response = status.handle(root_request, sources);
     REQUIRE(root_response.status == 200);
     const auto root = Json::parse(std::string(
         reinterpret_cast<const char*>(root_response.body.data()), root_response.body.size()));
@@ -1890,7 +1894,7 @@ MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster
     HttpRequest detail_request;
     detail_request.method = "GET";
     detail_request.path = "/api/v1/status/nodes/" + to_string(stale_id);
-    const auto detail_response = status.handle(detail_request);
+    const auto detail_response = status.handle(detail_request, sources);
     REQUIRE(detail_response.status == 200);
     const auto detail = Json::parse(std::string(
         reinterpret_cast<const char*>(detail_response.body.data()), detail_response.body.size()));

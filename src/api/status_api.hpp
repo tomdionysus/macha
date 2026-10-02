@@ -17,59 +17,48 @@
 
 namespace macha {
 
+struct MaintenancePort;
+class SubsystemRegistry;
+
+// What a status request reads beyond the node: handed in per request by the
+// root, which keeps each alive for the call. Absent (null) when this node has
+// none: no API server, or services not yet built.
+struct StatusSources {
+    const MaintenancePort* maintenance{};
+    const SubsystemRegistry* registry{};
+    const HttpServer* http{};
+    MetadataView* metadata{};
+    const SubsystemSupervisor* subsystems{};
+    const DistributedStore* store{};
+};
+
+// Reads the node it is built with; everything else arrives per request.
 class ClusterStatusService {
     NodeRuntime& node_;
     const ActivityClocks& activity_;
     const DataResourceArbiter& data_resources_;
     const RetainedMemoryLedger& retained_memory_;
-    std::atomic<MetadataView*> metadata_{nullptr};
     std::jthread persistence_;
     std::mutex wait_mutex_;
     std::condition_variable_any wait_cv_;
-    mutable std::mutex operational_diagnostics_mutex_;
-    std::function<std::optional<FuseFrontendDiagnostics>()> fuse_diagnostics_;
-    std::function<ConvergenceDemandDiagnostics()> convergence_diagnostics_;
-    std::function<std::vector<SubsystemStatus>()> subsystem_diagnostics_;
-    std::function<DistributedStore::RepairDiagnostics()> repair_diagnostics_;
-    std::function<std::optional<HttpServerDiagnostics>()> http_diagnostics_;
 
     void persistence_loop(std::stop_token);
     void persist_local_status();
-    HttpResponse status_response(const std::optional<NodeId>& only = {});
+    HttpResponse status_response(const StatusSources&, const std::optional<NodeId>& only = {});
     // The expensive half, behind its own route: its counters sit behind most
     // subsystems' locks, some held by the busy paths an operator is investigating.
     // Ordinary polling must not pay that.
-    HttpResponse diagnostics_response();
+    HttpResponse diagnostics_response(const StatusSources&);
     HttpResponse connectivity_check(const std::optional<NodeId>& only);
 
   public:
     ClusterStatusService(NodeRuntime&, const ActivityClocks&, const DataResourceArbiter&,
                          const RetainedMemoryLedger&);
-    void attach_metadata(MetadataView& metadata) {
-        metadata_.store(&metadata, std::memory_order_release);
-    }
-    void detach_metadata() {
-        metadata_.store(nullptr, std::memory_order_release);
-    }
-    void attach_fuse_diagnostics(std::function<std::optional<FuseFrontendDiagnostics>()> provider);
-    void detach_fuse_diagnostics();
-    void attach_convergence_diagnostics(std::function<ConvergenceDemandDiagnostics()> provider);
-    // Replica repair's view of what it could not obtain. Arrives like the FUSE and
-    // convergence diagnostics, since this service holds a NodeRuntime, not the store.
-    void attach_repair_diagnostics(std::function<DistributedStore::RepairDiagnostics()> provider);
-    void detach_repair_diagnostics();
-    // Cheap per-subsystem health (see SubsystemSupervisor), in the lightweight
-    // part of the response.
-    void attach_subsystem_diagnostics(std::function<std::vector<SubsystemStatus>()> provider);
-    void detach_subsystem_diagnostics();
-    // The HTTP server's own counters: reactor stalls, open and idle
-    // connections, lane queues. Absent when the API is disabled.
-    void attach_http_diagnostics(std::function<std::optional<HttpServerDiagnostics>()> provider);
     ~ClusterStatusService();
     void start();
     void request_stop();
     void stop();
-    HttpResponse handle(const HttpRequest&);
+    HttpResponse handle(const HttpRequest&, const StatusSources& = {});
 };
 
 } // namespace macha

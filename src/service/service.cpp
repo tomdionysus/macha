@@ -40,17 +40,6 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
       startup_stall_handler_(std::move(startup_stall_handler)) {
-    cluster_status_.attach_convergence_diagnostics(
-        [this] { return maintenance_port_.metadata_convergence.diagnostics(); });
-    // Installed once for the Service's life: the registry answers whether a
-    // frontend exists right now, and a supervised FUSE may be rebuilt beneath it.
-    cluster_status_.attach_fuse_diagnostics(
-        [this]() -> std::optional<FuseFrontendDiagnostics> {
-            auto frontend = registry_.fuse();
-            if (!frontend)
-                return std::nullopt;
-            return frontend->diagnostics();
-        });
     if (node_.config().catalogue.api.enabled) {
         catalogue_http_ = std::make_unique<HttpServer>(
             node_.config().catalogue.api,
@@ -74,13 +63,22 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
         // still says what is wrong with it.
         catalogue_http_->set_control_prefixes(
             {"/api/v1/health", "/api/v1/status", "/api/v1/session", "/api/v1/users"});
-        cluster_status_.attach_http_diagnostics(
-            [this]() -> std::optional<HttpServerDiagnostics> {
-                if (!catalogue_http_)
-                    return std::nullopt;
-                return catalogue_http_->diagnostics();
-            });
     }
+}
+
+// Status's view beyond the node, for one request. The HTTP server stops before
+// the services, so they outlive any request that sees them ready.
+StatusSources Service::status_sources() {
+    StatusSources sources;
+    sources.maintenance = &maintenance_port_;
+    sources.registry = &registry_;
+    sources.http = catalogue_http_.get();
+    if (services_ready_.load(std::memory_order_acquire)) {
+        sources.metadata = &services_->metadata();
+        sources.subsystems = &services_->subsystems();
+        sources.store = &services_->store();
+    }
+    return sources;
 }
 
 // Each answers "nothing to report" when this node has no mount. The
@@ -181,7 +179,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     // After the gate, so required_role() applies; before the services_ready_
     // check, because a recovering node is exactly when Status is asked.
     if (request.path == "/api/v1/status" || request.path.starts_with("/api/v1/status/"))
-        return cluster_status_.handle(request);
+        return cluster_status_.handle(request, status_sources());
 
     // Account management works on a recovering node too, so an operator can fix
     // an account there.
@@ -510,13 +508,6 @@ void Service::initialise_services(std::stop_token stop) {
         if (stop.stop_requested())
             return;
         services->start();
-        // Status reads the graph through providers that outlive it: attached
-        // now, detached before the graph stops.
-        cluster_status_.attach_subsystem_diagnostics(
-            [subsystems = &services->subsystems()] { return subsystems->statuses(); });
-        cluster_status_.attach_repair_diagnostics(
-            [store = &services->store()] { return store->repair_diagnostics(); });
-        cluster_status_.attach_metadata(services->metadata());
         services_ = std::move(services);
 
         note_lifecycle("services ready");
@@ -612,12 +603,8 @@ void Service::stop() {
         note_lifecycle("stop catalogue-http");
         catalogue_http_->stop();
     }
-    if (services_) {
-        cluster_status_.detach_metadata();
-        cluster_status_.detach_subsystem_diagnostics();
-        cluster_status_.detach_repair_diagnostics();
+    if (services_)
         services_->stop();
-    }
     request_stop();
     note_lifecycle("stop status");
     cluster_status_.stop();
