@@ -3650,7 +3650,18 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
         },
         10s));
 
-    s1.filesystem().mkdir("/lagging-base", 0755, getuid(), getgid());
+    // The first write completes the replica set's formation, which a peer's
+    // transient RPC failure can report as not ready; callers retry that.
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                s1.filesystem().mkdir("/lagging-base", 0755, getuid(), getgid());
+                return true;
+            } catch (const MetadataNotReady&) {
+                return false;
+            }
+        },
+        10s));
     REQUIRE(wait_until(
         [&] {
             try {
