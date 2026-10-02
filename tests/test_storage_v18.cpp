@@ -837,7 +837,7 @@ namespace {
 class StorageClusterNode {
     Config config_;
     const ClusterKeys& keys_;
-    std::unique_ptr<NodeRuntime> node_;
+    std::unique_ptr<BareNode> node_;
     std::unique_ptr<DistributedStore> store_;
     std::unique_ptr<MetadataManager> metadata_;
     std::unique_ptr<CatalogueManager> catalogue_;
@@ -858,7 +858,7 @@ class StorageClusterNode {
             std::filesystem::create_directories(backend.path);
         if (!config_.metadata_store.path.empty())
             std::filesystem::create_directories(config_.metadata_store.path);
-        node_ = std::make_unique<NodeRuntime>(config_, keys_);
+        node_ = std::make_unique<BareNode>(config_, keys_);
     }
     void start() {
         if (!node_) prepare();
@@ -964,7 +964,7 @@ MACHA_TEST("storage_v18", test_unversioned_nonempty_state_namespace_is_refused) 
 
     bool refused = false;
     try {
-        NodeRuntime node(config, cluster.keys());
+        BareNode node(config, cluster.keys());
     } catch (const std::exception& e) {
         refused = std::string(e.what()).find("fresh namespace") != std::string::npos;
     }
@@ -984,7 +984,7 @@ MACHA_TEST("storage_v18", test_unversioned_nonempty_data_backend_is_refused) {
         old << "old namespace";
     }
 
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     CHECK(node.readiness().control_plane_online);

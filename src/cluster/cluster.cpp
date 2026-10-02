@@ -213,21 +213,14 @@ NodeId load_v18_node_id(const std::filesystem::path& state) {
 }
 } // namespace
 
-NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook startup_stage_hook,
-                         ActivityClock activity_clock)
-    : cfg_(normalize_config(std::move(config))), keys_(keys), state_lock_(cfg_.state_path),
+NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, ActivityClocks& activity,
+                         DataResourceArbiter& data_resources,
+                         RetainedMemoryLedger& retained_memory,
+                         TranscodeRateBook& transcode_rates, StartupStageHook startup_stage_hook)
+    : cfg_(normalize_config(std::move(config))), keys_(keys),
       id_(load_v18_node_id(cfg_.state_path)), durability_epoch_(random_node_id()),
-      data_resources_(cfg_.data_inflight_bytes, cfg_.data_viewer_reserve_bytes,
-                      cfg_.maintenance.background_concurrency
-                          ? cfg_.maintenance.background_concurrency
-                          : std::max<size_t>(1, std::thread::hardware_concurrency() / 2),
-                      cfg_.data_credit_no_progress_deadline),
-      retained_memory_(cfg_.runtime.retained_memory_bytes,
-                       cfg_.runtime.control_memory_reserve_bytes,
-                       cfg_.runtime.viewer_memory_reserve_bytes,
-                       cfg_.runtime.loader_memory_reserve_bytes,
-                       cfg_.runtime.reassembly_memory_reserve_bytes),
-      transcode_rates_(cfg_.state_path / "playback" / "transcode-rates.json"),
+      activity_(activity), data_resources_(data_resources), retained_memory_(retained_memory),
+      transcode_rates_(transcode_rates),
       inbound_(initial_inbound_resolution(cfg_)),
       members_(self_info(cfg_, id_, 0, 0, 0,
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
@@ -303,7 +296,6 @@ NodeRuntime::NodeRuntime(Config config, ClusterKeys keys, StartupStageHook start
           },
           cfg_.max_frame_size, {}, &retained_memory_),
       startup_stage_hook_(std::move(startup_stage_hook)), startup_unix_ms_(unix_ms()) {
-    activity_clock_ = activity_clock ? std::move(activity_clock) : [] { return Clock::now(); };
     server_.attach_client(client_);
     // While inbound-incapable, this node keeps both lanes dialled to every
     // capable peer (RpcClient::open_requested_lanes); membership names them.
@@ -459,12 +451,6 @@ void NodeRuntime::recover_storage(std::stop_token stop) {
                 cfg_.io_pressure_outlier_percent});
             data_resources_.observe_device(&local_->service_monitor(),
                                           cfg_.io_pressure_min_background);
-            // Law 3: viewer presence uses maintenance.foreground_quiet, the
-            // window the rest of the system uses, since playback holds no byte
-            // credit between extents. Set only with the monitor.
-            const auto viewer_window = cfg_.maintenance.foreground_quiet;
-            data_resources_.observe_viewers(
-                [this, viewer_window] { return viewer_recently_active(viewer_window); });
             Log::info("data io pressure gate enabled expected_ms=" +
                       std::to_string(cfg_.io_pressure_overhead_ms) + "+" +
                       std::to_string(cfg_.io_pressure_per_mib_ms) + "/MiB slowdown_percent=" +
@@ -804,12 +790,6 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
 }
 
 void NodeRuntime::request_stop() {
-    data_resources_.stop();
-    // The viewer-presence callback reads activity clocks declared after the
-    // arbiter, so destroyed first: drop it so no late admission reads them
-    // (law 4).
-    data_resources_.observe_viewers({});
-    retained_memory_.stop();
     if (storage_recovery_.joinable())
         storage_recovery_.request_stop();
     if (state_recovery_.joinable())
@@ -940,26 +920,6 @@ AsyncRpc NodeRuntime::call_async(const Endpoint& endpoint, MessageType type,
     return client_.call_async(endpoint, type, payload, frame_type);
 }
 
-int64_t NodeRuntime::activity_now_ms() const {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               activity_clock_().time_since_epoch())
-        .count();
-}
-
-void NodeRuntime::note_activity(FrameType type, uint64_t bytes) {
-    const auto now = activity_now_ms();
-    if (type == FrameType::foreground) {
-        playback_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-        last_playback_activity_ms_.store(now, std::memory_order_relaxed);
-    } else if (type == FrameType::read_ahead) {
-        interactive_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-        last_interactive_activity_ms_.store(now, std::memory_order_relaxed);
-    } else if (type == FrameType::loader) {
-        loader_activity_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-        last_loader_activity_ms_.store(now, std::memory_order_relaxed);
-    }
-}
-
 TrafficTotals NodeRuntime::traffic_totals() const {
     TrafficTotals totals;
     const auto& traffic = client_.traffic();
@@ -983,11 +943,6 @@ bool NodeRuntime::peer_viewers_active(std::chrono::milliseconds fresh_for) const
         }
     }
     return false;
-}
-
-bool NodeRuntime::viewer_recently_active(std::chrono::milliseconds window) const {
-    return activity_idle_for(FrameType::foreground) < window ||
-           activity_idle_for(FrameType::read_ahead) < window;
 }
 
 void NodeRuntime::set_service_event_callback(std::function<void(ServiceEvent)> callback) {
@@ -1024,29 +979,6 @@ void NodeRuntime::signal_service_event(ServiceEvent event) {
     }
     if (callback)
         callback(event);
-}
-
-uint64_t NodeRuntime::take_activity_bytes(FrameType type) {
-    if (type == FrameType::foreground)
-        return playback_activity_bytes_.exchange(0, std::memory_order_relaxed);
-    if (type == FrameType::read_ahead)
-        return interactive_activity_bytes_.exchange(0, std::memory_order_relaxed);
-    if (type == FrameType::loader)
-        return loader_activity_bytes_.exchange(0, std::memory_order_relaxed);
-    return 0;
-}
-
-std::chrono::milliseconds NodeRuntime::activity_idle_for(FrameType type) const {
-    int64_t last = 0;
-    if (type == FrameType::foreground)
-        last = last_playback_activity_ms_.load(std::memory_order_relaxed);
-    else if (type == FrameType::read_ahead)
-        last = last_interactive_activity_ms_.load(std::memory_order_relaxed);
-    else if (type == FrameType::loader)
-        last = last_loader_activity_ms_.load(std::memory_order_relaxed);
-    if (!last)
-        return std::chrono::hours(24);
-    return std::chrono::milliseconds(std::max<int64_t>(0, activity_now_ms() - last));
 }
 
 void NodeRuntime::announce_metadata_generation(uint64_t generation) {

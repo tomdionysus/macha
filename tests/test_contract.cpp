@@ -380,7 +380,7 @@ MACHA_TEST("contract", test_the_wait_guard_on_a_cold_catalogue) {
                                                   macha::test_support::free_port());
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
-    NodeRuntime node(config, cluster.keys());
+    test_support::BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);

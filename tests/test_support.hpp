@@ -258,12 +258,39 @@ class TestService {
     }
 };
 
+// The root parts a NodeRuntime takes, built before it (a base is built first).
+struct BareNodeResources {
+    NodeResources resources;
+    explicit BareNodeResources(const Config& config) : resources(config) {}
+};
+
+// A NodeRuntime that owns its root parts, as Service does: the resources are
+// built first and stopped before the node.
+class BareNode : public BareNodeResources, public NodeRuntime {
+  public:
+    BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
+        : BareNodeResources(config),
+          NodeRuntime(std::move(config), keys, resources.activity, resources.data,
+                      resources.memory, resources.transcode_rates, std::move(hook)) {}
+    ~BareNode() { stop(); }
+    BareNode(const BareNode&) = delete;
+    BareNode& operator=(const BareNode&) = delete;
+    void request_stop() {
+        resources.stop();
+        NodeRuntime::request_stop();
+    }
+    void stop() {
+        resources.stop();
+        NodeRuntime::stop();
+    }
+};
+
 class TestNode {
     TempDir temp_;
     std::filesystem::path keyfile_;
     ClusterKeys keys_;
     Config config_;
-    std::unique_ptr<NodeRuntime> node_;
+    std::unique_ptr<BareNode> node_;
     std::unique_ptr<DistributedStore> store_;
     std::function<void(const MetadataPublicationContext&)> publication_guard_;
     std::unique_ptr<MetadataManager> metadata_;
@@ -294,7 +321,7 @@ class TestNode {
 
     void prepare() {
         REQUIRE(!node_);
-        node_ = std::make_unique<NodeRuntime>(config_, keys_);
+        node_ = std::make_unique<BareNode>(config_, keys_);
     }
 
     NodeRuntime& start_control_plane() {
@@ -333,6 +360,7 @@ class TestNode {
     }
 
     NodeRuntime& node() { REQUIRE(node_); return *node_; }
+    NodeResources& resources() { REQUIRE(node_); return node_->resources; }
     DistributedStore& store() { REQUIRE(store_); return *store_; }
     MetadataManager& metadata() { REQUIRE(metadata_); return *metadata_; }
     FileSystem& filesystem() { REQUIRE(filesystem_); return *filesystem_; }

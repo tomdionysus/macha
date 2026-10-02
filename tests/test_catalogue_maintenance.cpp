@@ -58,7 +58,7 @@ struct FakeMetadataView final : MetadataView {
 struct Node {
     macha::test_support::TestCluster cluster;
     Config config;
-    std::optional<NodeRuntime> node;
+    std::optional<test_support::BareNode> node;
     std::optional<DistributedStore> store;
     Node() {
         config = macha::test_support::config_for(cluster.path() / "node", cluster.keyfile(),

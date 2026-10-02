@@ -846,9 +846,9 @@ MACHA_TEST("torrent_disk_io", test_loader_admission_waits_for_credit_and_yields_
     // pressured device with no viewer, waits while the loader ceiling is full,
     // proceeds when a lease is released, and gives up promptly on abort.
     DiskServiceMonitor monitor;
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 1, 500ms);
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 1, 500ms,
+                                [] { return false; });
     arbiter.observe_device(&monitor, 1);
-    arbiter.observe_viewers([] { return false; });
     for (int i = 0; i < 30; ++i)
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());

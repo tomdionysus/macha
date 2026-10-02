@@ -3873,8 +3873,8 @@ MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
     n1.start();
     n2.start();
     REQUIRE(n1.wait_local_state_ready(10s));

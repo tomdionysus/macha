@@ -30,8 +30,11 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
     : clock_(instruments.clock ? std::move(instruments.clock)
                                : std::make_shared<SystemMaintenanceClock>()),
       maintenance_trace_(std::move(instruments.trace)),
-      lifecycle_(std::move(instruments.lifecycle)), node_(std::move(config), keys, std::move(startup_stage_hook),
-            [clock = clock_] { return clock->now(); }), cluster_status_(node_),
+      lifecycle_(std::move(instruments.lifecycle)),
+      resources_(config, [clock = clock_] { return clock->now(); }),
+      node_(std::move(config), keys, resources_.activity, resources_.data, resources_.memory,
+            resources_.transcode_rates, std::move(startup_stage_hook)),
+      cluster_status_(node_),
       session_api_(node_), users_api_(node_),
       web_(node_.config().web, node_.config().catalogue.api.compression),
       maintenance_stage_hook_(std::move(maintenance_stage_hook)),
@@ -582,6 +585,7 @@ void Service::request_stop() {
         catalogue_http_->request_stop();
     }
     note_lifecycle("request_stop node");
+    resources_.stop();
     node_.request_stop();
     startup_cv_.notify_all();
 }
@@ -600,8 +604,10 @@ void Service::stop() {
     // waiting on recovery, which the node's stop request ends.
     if (startup_.joinable()) {
         startup_.request_stop();
-        if (!services_ready_.load(std::memory_order_acquire))
+        if (!services_ready_.load(std::memory_order_acquire)) {
+            resources_.stop();
             node_.request_stop();
+        }
         startup_.join();
     }
     // The HTTP server routes requests into the services, so it stops before

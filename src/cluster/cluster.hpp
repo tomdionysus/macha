@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
 #include "storage/local_store.hpp"
 #include "cluster/membership.hpp"
@@ -90,13 +91,14 @@ class NodeRuntime {
 
     Config cfg_;
     ClusterKeys keys_;
-    StorageLock state_lock_;
     NodeId id_;
     NodeId durability_epoch_;
-    DataResourceArbiter data_resources_;
-    RetainedMemoryLedger retained_memory_;
+    // Owned by the root (NodeResources), which stops them before this node.
+    ActivityClocks& activity_;
+    DataResourceArbiter& data_resources_;
+    RetainedMemoryLedger& retained_memory_;
     // Playback records, telemetry publishes.
-    TranscodeRateBook transcode_rates_;
+    TranscodeRateBook& transcode_rates_;
     // Declared before members_ so the roster is built with the right flags.
     mutable std::mutex inbound_mutex_;
     InboundResolution inbound_;
@@ -170,19 +172,6 @@ class NodeRuntime {
     std::condition_variable local_copy_settled_cv_;
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
-    std::atomic_uint64_t playback_activity_bytes_{};
-    std::atomic_uint64_t interactive_activity_bytes_{};
-    // A loader clock kept apart from the viewer clocks. Maintenance must see
-    // loader work to avoid taking an idle share of a disk an import needs;
-    // folding it into the viewer clocks would make an import look like a
-    // viewer, so the viewer reserves and DATA pressure gate would hold other
-    // loader work behind it.
-    std::atomic_uint64_t loader_activity_bytes_{};
-    std::atomic_int64_t last_playback_activity_ms_{};
-    std::atomic_int64_t last_interactive_activity_ms_{};
-    std::atomic_int64_t last_loader_activity_ms_{};
-    std::function<Clock::time_point()> activity_clock_;
-    int64_t activity_now_ms() const;
     mutable std::mutex service_event_mutex_;
     std::function<void(ServiceEvent)> service_event_;
     mutable std::mutex job_bridge_mutex_;
@@ -223,11 +212,9 @@ class NodeRuntime {
     std::chrono::milliseconds no_progress_deadline_for(MessageType) const;
 
   public:
-    // Activity times and maintenance deadlines read `activity_clock` (default:
-    // the steady clock).
-    using ActivityClock = std::function<Clock::time_point()>;
-    NodeRuntime(Config, ClusterKeys, StartupStageHook startup_stage_hook = {},
-                ActivityClock activity_clock = {});
+    // The caller holds state_path's StorageLock for this node's life.
+    NodeRuntime(Config, ClusterKeys, ActivityClocks&, DataResourceArbiter&, RetainedMemoryLedger&,
+                TranscodeRateBook&, StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
     void request_stop();
@@ -334,18 +321,17 @@ class NodeRuntime {
     // dropped: returns once the queue is empty and nothing is being written.
     void wait_local_copies_settled();
     void reconfigure_local(const Config&);
-    void note_activity(FrameType, uint64_t bytes = 0);
+    void note_activity(FrameType type, uint64_t bytes = 0) { activity_.note(type, bytes); }
     // Cluster bytes by frame class since start (dialled and served together).
     TrafficTotals traffic_totals() const;
     // Whether another node reports viewer-class traffic in a sample no older
     // than `fresh_for`. Repair paces against it as against local viewers,
     // since its transfers share their links.
     bool peer_viewers_active(std::chrono::milliseconds fresh_for) const;
-    uint64_t take_activity_bytes(FrameType);
-    std::chrono::milliseconds activity_idle_for(FrameType) const;
-    // Whether a viewer was active within `window`: law 3's "unless it would
-    // make the viewer wait", for callers that cannot reach the filesystem.
-    bool viewer_recently_active(std::chrono::milliseconds window) const;
+    uint64_t take_activity_bytes(FrameType type) { return activity_.take_bytes(type); }
+    std::chrono::milliseconds activity_idle_for(FrameType type) const {
+        return activity_.idle_for(type);
+    }
     uint64_t remote_metadata_generation() const {
         return remote_metadata_generation_.load();
     }

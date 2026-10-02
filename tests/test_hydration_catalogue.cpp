@@ -398,8 +398,8 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     c2.cache.path = temp.path() / "cache2";
     c2.cache.max_blocks = 32;
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
     n1.start();
     n2.start();
     REQUIRE(wait_until([&] {
@@ -1912,7 +1912,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
 
-    NodeRuntime node(config, keys);
+    BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
@@ -3660,8 +3660,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.metadata_cache = c2.metadata_cache = 30ms;
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
 
     // Form the initial namespace on the bootstrap-less founder before starting
     // the joiner. A configured joiner is intentionally forbidden from inventing
@@ -3797,8 +3797,8 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     c1.heartbeat = c2.heartbeat = 5s;
     c1.dead_after = c2.dead_after = 20s;
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
 
     // Establish genesis on the founder first. The joiner may legitimately reject
     // metadata reads with "waiting for bootstrap peer" during the brief interval
@@ -4542,7 +4542,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
 
-    NodeRuntime node(config, keys);
+    BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
@@ -4587,7 +4587,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
 
-    NodeRuntime node(config, keys);
+    BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
@@ -4649,7 +4649,7 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
 
-    NodeRuntime node(config, keys);
+    BareNode node(config, keys);
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node);
