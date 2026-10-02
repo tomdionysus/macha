@@ -250,9 +250,9 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
     // Law 3: the loader waits only if it would make a viewer wait. A slow
     // device with no viewer does not hold the loader back.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
+                                [] { return false; });
     arbiter.observe_device(&monitor, 1);
-    arbiter.observe_viewers([] { return false; });
     for (int i = 0; i < 30; ++i)
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
@@ -275,9 +275,9 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_runs_freely_under_pressure_with_n
 MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_device) {
     // With a viewer present the loader yields to a trickle, not a stop.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
+                                [] { return false; });
     arbiter.observe_device(&monitor, 1);
-    arbiter.observe_viewers([] { return false; });
     for (int i = 0; i < 30; ++i)
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
@@ -310,13 +310,12 @@ MACHA_FAST_TEST("io_pressure", test_the_loader_yields_to_a_viewer_on_a_slow_devi
 
 MACHA_FAST_TEST("io_pressure", test_a_viewer_between_two_extents_is_still_a_viewer) {
     // Playback holds no credit between extents, so viewer presence comes from
-    // the activity signal passed to observe_viewers(), not from held credit.
+    // the activity signal the arbiter is given, not from held credit.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
-    arbiter.observe_device(&monitor, 1);
-
     bool watching = true;
-    arbiter.observe_viewers([&] { return watching; });
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
+                                [&] { return watching; });
+    arbiter.observe_device(&monitor, 1);
     for (int i = 0; i < 30; ++i)
         monitor.note(9000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());
@@ -342,9 +341,9 @@ MACHA_FAST_TEST("io_pressure", test_background_work_always_drains_on_a_pressured
     // Law 4. min_background always admits one lease when nothing is active, so
     // background work keeps feeding the monitor and the average can fall.
     DiskServiceMonitor monitor(defaults);
-    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms);
+    DataResourceArbiter arbiter(16 * 1024 * 1024, 4 * 1024 * 1024, 8, 500ms,
+                                [] { return true; });
     arbiter.observe_device(&monitor, 1);
-    arbiter.observe_viewers([] { return true; });
     for (int i = 0; i < 200; ++i)
         monitor.note(30000ms, 4 * 1024 * 1024);
     REQUIRE(monitor.pressured());

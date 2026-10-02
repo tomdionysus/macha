@@ -386,7 +386,7 @@ MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_o
     CHECK(store.take_interactive_bytes() == 0);
 
     // Not a viewer to the DATA pressure gate or the torrent rate clamp.
-    CHECK(!node.viewer_recently_active(30s));
+    CHECK(!fixture.resources().activity.viewer_recently_active(30s));
 }
 
 MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retained_buffer) {
@@ -1424,8 +1424,8 @@ MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
     n1.start();
     n2.start();
 
@@ -2848,7 +2848,7 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     config.metadata_min_write_replicas = 1;
     config.dead_after = 10s;
 
-    NodeRuntime node(config, keys);
+    BareNode node(config, keys);
     node.start();
 
     // An unreachable peer in active membership, with an identity that makes
@@ -3399,8 +3399,8 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     // No cache TTL: every reader must actually read.
     c1.metadata_cache = std::chrono::milliseconds(0);
 
-    NodeRuntime n1(c1, keys);
-    NodeRuntime n2(c2, keys);
+    BareNode n1(c1, keys);
+    BareNode n2(c2, keys);
     n1.start();
     n2.start();
     REQUIRE(n1.wait_local_state_ready(10s));
@@ -6129,12 +6129,12 @@ MACHA_TEST("rpc_cluster", test_inbound_auto_resolves_from_dial_back_and_survives
     struct RuntimeNode {
         Config config;
         const ClusterKeys& keys;
-        std::unique_ptr<NodeRuntime> node;
+        std::unique_ptr<BareNode> node;
         RuntimeNode(Config c, const ClusterKeys& k) : config(std::move(c)), keys(k) {}
         NodeRuntime& start() {
             for (const auto& backend : config.storage_backends)
                 std::filesystem::create_directories(backend.path);
-            node = std::make_unique<NodeRuntime>(config, keys);
+            node = std::make_unique<BareNode>(config, keys);
             node->start();
             REQUIRE(node->wait_local_state_ready(10s));
             return *node;

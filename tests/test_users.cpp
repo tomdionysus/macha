@@ -332,7 +332,7 @@ MACHA_FAST_TEST("users", test_anonymous_is_an_ordinary_account) {
     TestCluster cluster;
     auto config = cluster.node_config("n1");
     config.session.allow_anonymous = true;
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     auto anonymous = node.users().create_without_password(
         anonymous_username, {std::string(role_media_viewer)}, node.node_id());
     REQUIRE(anonymous.has_value());
@@ -372,7 +372,7 @@ MACHA_FAST_TEST("users", test_anonymous_with_no_roles_still_mints_a_powerless_se
     TestCluster cluster;
     auto config = cluster.node_config("n1");
     config.session.allow_anonymous = true;
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     auto anonymous =
         node.users().create_without_password(anonymous_username, {}, node.node_id());
     REQUIRE(anonymous.has_value());
@@ -397,7 +397,7 @@ MACHA_FAST_TEST("users", test_anonymous_has_no_password_and_cannot_be_given_one)
     TestCluster cluster;
     auto config = cluster.node_config("n1");
     config.session.allow_anonymous = false;
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     UsersApi api(node);
     auto anonymous = node.users().create_without_password(
         anonymous_username, {std::string(role_media_viewer)}, node.node_id());
@@ -510,7 +510,7 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
 
 MACHA_FAST_TEST("users", test_root_and_anonymous_cannot_be_removed_or_recreated) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     UsersApi api(node);
     TempDir dir;
     auto genesis = create_initial_accounts(node.users(), cluster.keys(), dir.path(), node.node_id());
@@ -551,7 +551,7 @@ MACHA_FAST_TEST("users", test_root_and_anonymous_cannot_be_removed_or_recreated)
 MACHA_FAST_TEST("users", test_password_login_is_local_and_mints_a_bound_session) {
     TestCluster cluster;
     auto config = cluster.node_config("n1");
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     auto created =
         node.users().create("dave", "hunter2", {std::string(role_manager)}, node.node_id());
     REQUIRE(created.has_value());
@@ -596,7 +596,7 @@ MACHA_FAST_TEST("users", test_failed_logins_lock_out_then_recover) {
     auto config = cluster.node_config("n1");
     config.session.failed_login_attempts = 2;
     config.session.failed_login_lockout = 200ms;
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     REQUIRE(node.users()
                 .create("erin", "right", {std::string(role_media_viewer)}, node.node_id())
                 .has_value());
@@ -618,7 +618,7 @@ MACHA_FAST_TEST("users", test_failed_logins_lock_out_then_recover) {
 
 MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     UsersApi api(node);
 
     const auto create_body =
@@ -705,7 +705,7 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
 
 MACHA_FAST_TEST("users", test_anonymous_session_has_no_account) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     UsersApi api(node);
     SessionIdentity anonymous{"s", Hash256{}, {std::string(role_media_viewer)}, {}};
     auto response = api.handle(users_request("GET", "/api/v1/users/me", anonymous));
@@ -723,8 +723,8 @@ MACHA_TEST("users", test_users_replicate_and_login_works_on_the_other_node) {
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
-    NodeRuntime n1(c1, cluster.keys());
-    NodeRuntime n2(c2, cluster.keys());
+    BareNode n1(c1, cluster.keys());
+    BareNode n2(c2, cluster.keys());
     n1.start();
     n2.start();
     REQUIRE(wait_until([&] {
@@ -780,7 +780,7 @@ MACHA_TEST("users", test_a_node_that_was_down_learns_a_deletion_not_a_resurrecti
     // The gossip backstop rides the telemetry tick.
     c1.telemetry_interval = c2.telemetry_interval = 250ms;
 
-    NodeRuntime n1(c1, cluster.keys());
+    BareNode n1(c1, cluster.keys());
     n1.start();
 
     // Created and deleted while n2 is down: only the tombstone can reach it.
@@ -788,7 +788,7 @@ MACHA_TEST("users", test_a_node_that_was_down_learns_a_deletion_not_a_resurrecti
     REQUIRE(created.has_value());
     REQUIRE(n1.users().remove(created->id, n1.node_id()).has_value());
 
-    NodeRuntime n2(c2, cluster.keys());
+    BareNode n2(c2, cluster.keys());
     n2.start();
     REQUIRE(wait_until([&] {
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
@@ -813,7 +813,7 @@ MACHA_TEST("users", test_login_does_not_wait_on_an_unreachable_peer) {
     c1.replication = 1;
     c1.metadata_min_write_replicas = 1;
 
-    NodeRuntime n1(c1, cluster.keys());
+    BareNode n1(c1, cluster.keys());
     n1.start();
     REQUIRE(n1.users()
                 .create("ivan", "pw", {std::string(role_manage_users)}, n1.node_id())
@@ -891,7 +891,7 @@ MACHA_FAST_TEST("users", test_recovery_key_machinery_is_dormant_but_sound) {
 MACHA_FAST_TEST("users", test_the_last_user_manager_cannot_be_demoted_or_removed) {
     // Some account always holds manage_users: the protection follows the role, not root.
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     TempDir dir;
     auto genesis = create_initial_accounts(node.users(), cluster.keys(), dir.path(), node.node_id());
     REQUIRE(genesis.has_value());
@@ -951,7 +951,7 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
     TestCluster cluster;
     auto config = cluster.node_config("upgraded");
     config.bootstrap.push_back(Endpoint{"127.0.0.1", free_port()});
-    NodeRuntime node(config, cluster.keys());
+    BareNode node(config, cluster.keys());
     CHECK(node.users().all().empty());
 
     PasswordCredentialValidator validator(node.users(), config.session);
@@ -978,7 +978,7 @@ MACHA_FAST_TEST("users", test_an_upgraded_cluster_announces_that_it_has_no_accou
 // is written, so stored roles lacking an implied role still get it.
 MACHA_FAST_TEST("users", test_role_implications_reach_accounts_written_before_them) {
     TestCluster cluster;
-    NodeRuntime node(cluster.node_config("n1"), cluster.keys());
+    BareNode node(cluster.node_config("n1"), cluster.keys());
     auto created = node.users().create("olduser", "a-long-enough-pw",
                                        {std::string(role_manager)}, node.node_id());
     REQUIRE(created.has_value());
@@ -1058,7 +1058,7 @@ MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {
     c1.heartbeat = c2.heartbeat = 20ms;
     c1.telemetry_interval = c2.telemetry_interval = 250ms;
 
-    NodeRuntime n1(c1, cluster.keys());
+    BareNode n1(c1, cluster.keys());
     n1.start();
     auto created = n1.users().create("late", "long-enough-pw", {std::string(role_media_viewer)},
                                      n1.node_id());
@@ -1066,7 +1066,7 @@ MACHA_TEST("users", test_a_peer_that_joins_after_the_announcement_converges) {
     // Announce while n2 does not exist: n1 has no peer to tell.
     n1.propagate_users();
 
-    NodeRuntime n2(c2, cluster.keys());
+    BareNode n2(c2, cluster.keys());
     n2.start();
     REQUIRE(wait_until([&] {
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;

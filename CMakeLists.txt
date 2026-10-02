@@ -302,6 +302,8 @@ set(MACHA_CORE_SOURCES
     src/storage/persistent_cache.cpp
     src/cluster/telemetry.cpp
     src/cluster/transcode_rates.cpp
+    src/cluster/activity_clocks.cpp
+    src/cluster/node_resources.cpp
     src/cluster/public_connectivity.cpp
     src/cluster/placement.cpp
     src/cluster/membership.cpp
