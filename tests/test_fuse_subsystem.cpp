@@ -119,6 +119,8 @@ SubsystemContext context_for(Config& config, Service& service, SubsystemRegistry
     SubsystemContext context;
     context.config = &config;
     context.node = &service.node();
+    context.data_resources = &service.resources().data;
+    context.retained_memory = &service.resources().memory;
     context.registry = &registry;
     context.filesystem = &service.filesystem();
     context.hydration = &service.hydration();

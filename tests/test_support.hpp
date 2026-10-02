@@ -324,7 +324,7 @@ class TestNode {
         node_ = std::make_unique<BareNode>(config_, keys_);
     }
 
-    NodeRuntime& start_control_plane() {
+    BareNode& start_control_plane() {
         if (!node_) prepare();
         REQUIRE(!started_);
         node_->start();
@@ -338,28 +338,31 @@ class TestNode {
         publication_guard_ = std::move(guard);
     }
 
-    NodeRuntime& wait_ready() {
+    BareNode& wait_ready() {
         REQUIRE(node_);
         REQUIRE(started_);
         REQUIRE(node_->wait_local_state_ready(std::chrono::seconds{10}));
         if (!store_) {
-            store_ = std::make_unique<DistributedStore>(*node_);
+            store_ = std::make_unique<DistributedStore>(*node_, node_->resources.activity,
+                                                        node_->resources.data,
+                                                        node_->resources.memory);
             metadata_ = std::make_unique<MetadataManager>(
                 *node_, nullptr, [this](const MetadataPublicationContext& context) {
                     if (publication_guard_)
                         publication_guard_(context);
                 });
-            filesystem_ = std::make_unique<FileSystem>(*node_, *store_, *metadata_);
+            filesystem_ = std::make_unique<FileSystem>(*node_, *store_, *metadata_,
+                                                       node_->resources.memory);
         }
         return *node_;
     }
 
-    NodeRuntime& start() {
+    BareNode& start() {
         start_control_plane();
         return wait_ready();
     }
 
-    NodeRuntime& node() { REQUIRE(node_); return *node_; }
+    BareNode& node() { REQUIRE(node_); return *node_; }
     NodeResources& resources() { REQUIRE(node_); return node_->resources; }
     DistributedStore& store() { REQUIRE(store_); return *store_; }
     MetadataManager& metadata() { REQUIRE(metadata_); return *metadata_; }

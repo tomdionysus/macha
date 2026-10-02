@@ -10,6 +10,7 @@
 #include "catalogue/media_catalogue.hpp"
 #include "catalogue/media_information.hpp"
 #include "cluster/distributed_store.hpp"
+#include "cluster/node_resources.hpp"
 #include "filesystem/filesystem.hpp"
 #include "filesystem/hydration.hpp"
 #include "ledger/node_horizon_builder.hpp"
@@ -33,7 +34,9 @@
 // pinning the one ordering the graph leaves free (see stop()).
 //
 // The graph, provider -> dependants:
-//   node, registry, port (outside, outlive this)
+//   node, resources, registry, port (outside, outlive this)
+//   resources      -> store (activity, DATA, memory), filesystem (memory),
+//                     playback (rate book, memory), subsystems (DATA, memory)
 //   playback       -> filesystem, hydration
 //   store          -> metadata, catalogue, filesystem, hydration, builder, maintenance
 //   metadata       -> catalogue, filesystem, torrent coordinator, manage API, maintenance
@@ -71,7 +74,7 @@ class NodeServices {
   public:
     // `signal_maintenance` rings the node's maintenance pass (Service's
     // handler for node events), which the claims barrier does after it.
-    NodeServices(NodeRuntime&, SubsystemRegistry&, MaintenancePort&,
+    NodeServices(NodeRuntime&, NodeResources&, SubsystemRegistry&, MaintenancePort&,
                  std::function<void(ServiceEvent)> signal_maintenance, NodeServicesInstruments);
     ~NodeServices();
     NodeServices(const NodeServices&) = delete;
@@ -113,6 +116,7 @@ class NodeServices {
     void retain_metadata_publication(const MetadataPublicationContext&);
 
     NodeRuntime& node_;
+    NodeResources& resources_;
     SubsystemRegistry& registry_;
     MaintenancePort& port_;
     std::function<void(ServiceEvent)> signal_maintenance_;

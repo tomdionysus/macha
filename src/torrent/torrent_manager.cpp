@@ -134,9 +134,10 @@ struct TorrentManager::Impl {
         : session(make_session_params(config, advertise, std::move(disk_hooks))) {}
 };
 
-TorrentManager::TorrentManager(NodeRuntime& node, IngestManager& ingest, TorrentConfig config,
+TorrentManager::TorrentManager(NodeRuntime& node, DataResourceArbiter& data_resources,
+                               IngestManager& ingest, TorrentConfig config,
                                const std::filesystem::path& state_path)
-    : node_(node), ingest_(ingest), config_(std::move(config)),
+    : node_(node), data_resources_(data_resources), ingest_(ingest), config_(std::move(config)),
       state_file_(state_path / "torrent" / "jobs.json"),
       resume_dir_(state_path / "torrent" / "resume") {
     node_.set_torrent_bridge(
@@ -1124,7 +1125,7 @@ TorrentDiskHooks TorrentManager::disk_hooks() const {
     TorrentDiskHooks hooks;
     hooks.threads = config_.disk_threads;
     NodeRuntime* node = &node_;
-    hooks.admit = loader_admission(node_.data_resources());
+    hooks.admit = loader_admission(data_resources_);
     // Every verified extent is published durably at loader class into the
     // ingest's store and journalled; the ingest commits files by naming them.
     hooks.extent_size = node_.config().extent_size;

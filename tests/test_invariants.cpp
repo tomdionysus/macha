@@ -1258,7 +1258,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
         },
         10s));
 
-    ClusterStatusService status(peer);
+    ClusterStatusService status(peer, peer.resources.activity, peer.resources.data, peer.resources.memory);
     HttpRequest request;
     request.method = "GET";
     request.path = "/api/v1/status";
@@ -1300,7 +1300,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
     BareNode node(cluster.node_config("status-split"), cluster.keys());
-    ClusterStatusService status(node);
+    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
 
     const auto body_of = [](const HttpResponse& response) {
         return Json::parse(
@@ -1411,7 +1411,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     // A pending replica-set validation does not demote write capability while
     // the durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
-    ClusterStatusService status(node);
+    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     status.attach_metadata(metadata);
     HttpRequest request;
     request.method = "GET";
@@ -1611,7 +1611,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
-        ClusterStatusService status(node);
+        ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
         HttpRequest request;
         request.method = "GET";
         request.path = "/api/v1/status";
@@ -1640,7 +1640,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
-        ClusterStatusService status(node);
+        ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
         HttpRequest request;
         request.method = "GET";
         request.path = "/api/v1/status";
@@ -1668,7 +1668,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
-        ClusterStatusService status(node);
+        ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
         HttpRequest request;
         request.method = "GET";
         request.path = "/api/v1/status";
@@ -1727,7 +1727,7 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     peer_telemetry.rss_bytes = 123456;
     node.telemetry().observe(peer_telemetry, true);
 
-    ClusterStatusService status(node);
+    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     status.attach_metadata(metadata);
     HttpRequest request;
     request.method = "GET";
@@ -1818,7 +1818,7 @@ MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresh
     peer_telemetry.storage_backends_online = 1;
     node.telemetry().observe(peer_telemetry, true);
 
-    ClusterStatusService status(node);
+    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     status.attach_metadata(metadata);
     HttpRequest request;
     request.method = "GET";
@@ -1869,7 +1869,7 @@ MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster
     REQUIRE(node.apply_identity_reset(reset));
     metadata.note_replica_validation(true);
 
-    ClusterStatusService status(node);
+    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
     status.attach_metadata(metadata);
     HttpRequest root_request;
     root_request.method = "GET";
@@ -2066,7 +2066,7 @@ MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace
     write_file(fs, "/replace.bin", old_bytes);
     write_file(fs, "/unlink.bin", old_bytes);
 
-    FuseFrontend frontend(fs, config.fuse);
+    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse);
     const auto replaced_handle = frontend.open("/replace.bin", true, false, false, false);
     const auto unlinked_handle = frontend.open("/unlink.bin", true, false, false, false);
 
@@ -2100,7 +2100,7 @@ MACHA_TEST("invariants", test_dirty_open_inode_never_writes_remote_replacement) 
     write_file(fs, "/victim.bin", original);
     write_file(fs, "/incoming.bin", replacement);
 
-    FuseFrontend frontend(fs, config.fuse);
+    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse);
     const auto old = frontend.open("/victim.bin", true, true, false, false);
     REQUIRE(frontend.write(old.inode, 0, dirty) == dirty.size());
 
@@ -2335,7 +2335,7 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
         return n1.membership().active().size() >= 2 && n2.membership().active().size() >= 2;
     }));
 
-    DistributedStore distributed(n1);
+    DistributedStore distributed(n1, n1.resources.activity, n1.resources.data, n1.resources.memory);
     const auto bytes = pattern(128 * 1024, 9);
     const auto id = object_id(bytes);
     REQUIRE(distributed.put(id, bytes));
@@ -3614,7 +3614,7 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
         return found;
     };
 
-    ClusterStatusService streaming_status(streamer);
+    ClusterStatusService streaming_status(streamer, streamer.resources.activity, streamer.resources.data, streamer.resources.memory);
     std::optional<Json> entry;
     REQUIRE(wait_until([&] {
         entry = node_entry(streaming_status, streamer.node_id());
@@ -3634,7 +3634,7 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
     quiet.start();
     REQUIRE(quiet.wait_local_state_ready(10s));
 
-    ClusterStatusService quiet_status(quiet);
+    ClusterStatusService quiet_status(quiet, quiet.resources.activity, quiet.resources.data, quiet.resources.memory);
     std::optional<Json> quiet_entry;
     REQUIRE(wait_until([&] {
         quiet_entry = node_entry(quiet_status, quiet.node_id());
