@@ -4067,7 +4067,7 @@ MACHA_TEST("hydration_catalogue", test_a_media_index_is_stored_live_and_served_i
     CHECK(std::string(stored->begin(), stored->end()) == body);
 
     // Referenced DATA, so GC must see it as live.
-    const auto live = catalogue.maintenance_objects().live;
+    const auto live = maintenance_inventory(catalogue).live;
     CHECK(live.contains(object_id(Bytes(body.begin(), body.end()))));
 
     int calls = 0;
@@ -4788,7 +4788,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root
     (void)service.catalogue().upsert(item);
     std::this_thread::sleep_for(5ms);
 
-    auto maintenance = service.catalogue().maintenance_objects();
+    auto maintenance = maintenance_inventory(service.catalogue());
     REQUIRE(maintenance.complete);
     std::vector<ObjectId> live(maintenance.control_live.begin(),
                                maintenance.control_live.end());
