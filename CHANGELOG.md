@@ -1,5 +1,24 @@
 # Current release
 
+## 0.78.0 — T5: the root owns local state; the node is the control plane (experiment)
+
+The object ledger experiment's T5, continued. No wire format, protocol or
+on-disk format changes; either node can go back to 0.77.0 (or earlier) by
+reinstalling it.
+
+**A restarting node answers metadata requests once all its local state has
+recovered**, as it already did storage requests: local state is recovered
+in one step (the DATA pool alongside the control store, cache, retention
+claims and replica) and the metadata and storage servers are built from it
+together. Until then peers get "<message> is not available on this node",
+which writers treat as metadata not ready and retry.
+
+Inside, unchanged in behaviour: the node's root builds local state and the
+servers after the control plane is online and hands them to the services;
+the node keeps identity, transport, membership, accounts, telemetry and
+connectivity. Status reports the same startup fields from the root's record
+of recovery.
+
 ## 0.77.0 — T5: the replica and the stores are served by their own parts (experiment)
 
 The object ledger experiment's T5, continued. No wire format, protocol or
