@@ -21,26 +21,30 @@ std::shared_ptr<MediaEngine> media_engine_for(const Config& config) {
 
 } // namespace
 
-NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageRoutes& routes,
+NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalState& local,
+                           MetadataServer& metadata_server, MessageRoutes& routes,
                            SubsystemRegistry& registry, MaintenancePort& port,
                            NodeServicesInstruments instruments)
-    : node_(node), resources_(resources), routes_(routes), registry_(registry), port_(port),
-      instruments_(std::move(instruments)),
-      store_(node_, node_.local_state(), resources_.activity, resources_.data, resources_.memory, resources_.events,
+    : node_(node), resources_(resources), local_(local), metadata_server_(metadata_server),
+      routes_(routes), registry_(registry), port_(port), instruments_(std::move(instruments)),
+      store_(node_, local_, resources_.activity, resources_.data, resources_.memory,
+             resources_.events,
              DistributedStoreOptions{node_.config().state_path / "repair" / "push-position",
-                                            instruments_.trace}),
+                                     instruments_.trace}),
       // The guard reaches the catalogue, declared after this: it runs only
       // for a commit, which nothing makes before construction finishes.
-      metadata_(node_, node_.local_state(), node_.metadata_server(), &store_,
+      metadata_(node_, local_, metadata_server_, &store_,
                 [this](const MetadataPublicationContext& context) {
                     retain_metadata_publication(context);
                 }),
-      catalogue_(node_, node_.local_state(), node_.metadata_server(), store_, metadata_), filesystem_(node_, node_.local_state(), node_.metadata_server(), store_, metadata_, resources_.memory, &playback_),
+      catalogue_(node_, local_, metadata_server_, store_, metadata_),
+      filesystem_(node_, local_, metadata_server_, store_, metadata_, resources_.memory,
+                  &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
       media_information_(filesystem_, catalogue_, media_engine_, node_.config().state_path),
-      scanner_(node_, node_.metadata_server(), filesystem_, catalogue_, catalogue_hints_, node_.config().catalogue.scanner,
-               std::unique_ptr<HttpClient>{}, std::chrono::seconds(5), media_engine_,
-               &media_information_),
+      scanner_(node_, metadata_server_, filesystem_, catalogue_, catalogue_hints_,
+               node_.config().catalogue.scanner, std::unique_ptr<HttpClient>{},
+               std::chrono::seconds(5), media_engine_, &media_information_),
       hydration_(store_, playback_, filesystem_, catalogue_, node_.config().hydration,
                  node_.config().read_ahead_extents),
       ingest_(node_, filesystem_, catalogue_hints_, node_.config().ingest, &media_information_),
@@ -62,7 +66,7 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageR
               if (!found)
                   return std::nullopt;
               return media_information_.resolve_playback(media_id, found->first, found->second,
-                                                          Clock::now() + std::chrono::seconds(30));
+                                                         Clock::now() + std::chrono::seconds(30));
           },
           node_.config().catalogue.api.artwork_capability_ttl,
           [this](const std::string& media_id) -> std::optional<uint64_t> {
@@ -76,22 +80,21 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, MessageR
                                                        Clock::now() + std::chrono::seconds(30));
           }),
       manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_),
-      streaming_(filesystem_, resources_.transcode_rates, resources_.memory, catalogue_,
-                 node_.config().catalogue.api, node_.config().streaming,
-                 media_engine_,
-                 [this](const std::vector<std::string>& media_ids) {
-                     return scanner_.request_media_profiles(media_ids);
-                 },
-                 &media_information_),
+      streaming_(
+          filesystem_, resources_.transcode_rates, resources_.memory, catalogue_,
+          node_.config().catalogue.api, node_.config().streaming, media_engine_,
+          [this](const std::vector<std::string>& media_ids) {
+              return scanner_.request_media_profiles(media_ids);
+          },
+          &media_information_),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      ledger_(node_.local_state().retention(), node_.local_state().data(),
-              node_.local_state().control()),
-      horizon_builder_(filesystem_, catalogue_, node_.local_state().control(), store_),
-      maintenance_(MaintenanceDependencies{node_, node_.local_state(), node_.metadata_server(), store_, metadata_, metadata_, catalogue_,
-                                           horizon_builder_, ledger_, media_information_,
-                                           resources_.events, port_, instruments_.clock,
-                                           instruments_.trace, instruments_.maintenance_stage_hook,
-                                           instruments_.constructed}) {
+      ledger_(local_.retention(), local_.data(), local_.control()),
+      horizon_builder_(filesystem_, catalogue_, local_.control(), store_),
+      maintenance_(
+          MaintenanceDependencies{node_, local_, metadata_server_, store_, metadata_, metadata_,
+                                  catalogue_, horizon_builder_, ledger_, media_information_,
+                                  resources_.events, port_, instruments_.clock, instruments_.trace,
+                                  instruments_.maintenance_stage_hook, instruments_.constructed}) {
     routes_.bind(MessageType::get_ingest_jobs,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return RpcMessage{MessageType::ingest_jobs_reply,
@@ -148,7 +151,7 @@ void NodeServices::start() {
     context.data_resources = &resources_.data;
     context.retained_memory = &resources_.memory;
     context.routes = &routes_;
-    context.local_state = &node_.local_state();
+    context.local_state = &local_;
     context.ingest = &ingest_;
     context.registry = &registry_;
     context.filesystem = &filesystem_;
@@ -259,7 +262,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     // Either namespace may be a tree, so reads go through the namespace
     // primitives. An entry missed here never gets liveness evidence and can be
     // collected while still referenced.
-    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(node_.local_state().control(), store_);
+    auto namespace_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
     const bool establish_baseline =
         !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
     if (establish_baseline) {

@@ -32,8 +32,8 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       maintenance_trace_(std::move(instruments.trace)),
       lifecycle_(std::move(instruments.lifecycle)),
       resources_(config, [clock = clock_] { return clock->now(); }),
-      identity_(config.state_path, keys),
-      node_(std::move(config), identity_, progress_, resources_.activity, resources_.data, resources_.memory,
+      identity_(config.state_path, keys), recovery_stage_hook_(startup_stage_hook),
+      node_(std::move(config), identity_, progress_, resources_.memory,
             resources_.transcode_rates, routes_, resources_.events,
             std::move(startup_stage_hook)),
       cluster_status_(node_, resources_.activity, resources_.data, resources_.memory),
@@ -74,8 +74,8 @@ StatusSources Service::status_sources() {
     sources.maintenance = &maintenance_port_;
     sources.registry = &registry_;
     sources.http = catalogue_http_.get();
-    if (node_.readiness().local_state_ready)
-        sources.local = &node_.local_state();
+    if (progress_.complete())
+        sources.local = &local_->state();
     if (services_ready_.load(std::memory_order_acquire)) {
         sources.metadata = &services_->metadata();
         sources.subsystems = &services_->subsystems();
@@ -493,19 +493,23 @@ void Service::wait_services_ready() {
 
 void Service::initialise_services(std::stop_token stop) {
     try {
-        while (!stop.stop_requested()) {
-            if (node_.wait_local_state_ready(std::chrono::milliseconds(100)))
-                break;
-            const auto readiness = node_.readiness();
-            if (readiness.failed)
-                throw std::runtime_error(
-                    readiness.error.empty() ? "node local-state recovery failed" : readiness.error);
+        try {
+            local_ = std::make_unique<LocalServices>(node_.config(), identity_, progress_,
+                                                     recovery_stage_hook_, stop, node_,
+                                                     resources_, routes_);
+        } catch (const RecoveryCancelled&) {
+            return;
         }
+        progress_.mark_complete(unix_ms());
+        // Publish the phase now rather than up to a sampling interval later, so
+        // peers do not keep seeing "recovering" after the node is ready.
+        node_.signal_telemetry_refresh();
         if (stop.stop_requested())
             return;
 
         auto services = std::make_unique<NodeServices>(
-            node_, resources_, routes_, registry_, maintenance_port_,
+            node_, resources_, local_->state(), local_->metadata(), routes_, registry_,
+            maintenance_port_,
             NodeServicesInstruments{clock_, maintenance_trace_, maintenance_stage_hook_, lifecycle_,
                                     constructed_});
         if (stop.stop_requested())

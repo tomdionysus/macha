@@ -937,20 +937,20 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_v
 
     const auto bytes = pattern(96 * 1024 + 31);
     const auto id = object_id(bytes);
-    REQUIRE(s1.node().local_store().put(id, bytes));
+    REQUIRE(s1.local_state().data().put(id, bytes));
     const RetentionDot claim{s1.node().node_id(), 0xfeed};
-    s1.node().claims().retain(RetentionClass::data, id, claim);
-    s2.node().claims().retain(RetentionClass::data, id, claim);
-    REQUIRE(!s2.node().local_store().valid(id));
+    s1.local_state().retention().retain(RetentionClass::data, id, claim);
+    s2.local_state().retention().retain(RetentionClass::data, id, claim);
+    REQUIRE(!s2.local_state().data().valid(id));
     const auto share_before = s2.repair_diagnostics().gate_share;
     s2.resources().events.notify(NodeEvent::storage);
 
-    const bool restored = wait_until([&] { return s2.node().local_store().valid(id); }, 10s);
+    const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
     const auto share_after = s2.repair_diagnostics().gate_share;
     watching = false;
     viewer.join();
     REQUIRE(restored);
-    CHECK(*s2.node().local_store().get(id) == bytes);
+    CHECK(*s2.local_state().data().get(id) == bytes);
     // Paced: the weighted share turned passes away between repair's turns.
     CHECK(share_after > share_before);
 }
@@ -2474,7 +2474,7 @@ MACHA_TEST("rpc_cluster", test_a_local_control_object_is_found_while_data_credit
 
     const auto bytes = pattern(18 * 1024, 91);
     const auto id = object_id(bytes);
-    REQUIRE(service.node().control_store().put(id, bytes));
+    REQUIRE(service.local_state().control().put(id, bytes));
 
     auto held = service.resources().data.acquire(DataWorkContext(FrameType::loader, extent), extent);
     REQUIRE(held.has_value());
@@ -2816,7 +2816,7 @@ MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
 
     CHECK(stored);
     CHECK(!cancelled.load(std::memory_order_relaxed));
-    CHECK(service.node().local_store().has(id));
+    CHECK(service.local_state().data().has(id));
     service.stop();
 }
 
@@ -2830,7 +2830,7 @@ MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
     auto& service = fixture.start();
     // A pristine bootstrap node holds genesis only as local codec material,
     // never advertised as accepted authority.
-    CHECK(service.node().metadata_replica().accepted_heads().empty());
+    CHECK(service.local_state().replica().accepted_heads().empty());
     bool rejected = false;
     try {
         (void)service.filesystem().getattr("/");
@@ -2930,8 +2930,8 @@ MACHA_TEST("rpc_cluster", test_metadata_write_floor_policy_mismatch_fails_closed
     };
     CHECK(rejected_for_policy(s1));
     CHECK(rejected_for_policy(s2));
-    CHECK(s1.node().metadata_replica().committed().generation <= 1);
-    CHECK(s2.node().metadata_replica().committed().generation <= 1);
+    CHECK(s1.local_state().replica().committed().generation <= 1);
+    CHECK(s2.local_state().replica().committed().generation <= 1);
 
     s2.stop();
     s1.stop();
@@ -3088,8 +3088,8 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
 
     auto entry = s1.filesystem().getattr("/media/two-replicas.bin");
     REQUIRE(entry.extents.size() == 1);
-    CHECK(s1.node().local_store().has(entry.extents.front().id));
-    CHECK(s2.node().local_store().has(entry.extents.front().id));
+    CHECK(s1.local_state().data().has(entry.extents.front().id));
+    CHECK(s2.local_state().data().has(entry.extents.front().id));
 
     s2.stop();
     s1.stop();
@@ -3144,20 +3144,20 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
         [&] {
             const auto d1 = s1.metadata_convergence_diagnostics();
             const auto d2 = s2.metadata_convergence_diagnostics();
-            return s1.node().metadata_replica().committed_generation() > 1 &&
-                   s1.node().metadata_replica().committed_generation() ==
-                       s2.node().metadata_replica().committed_generation() &&
-                   s1.node().metadata_replica().committed().hash ==
-                       s2.node().metadata_replica().committed().hash &&
-                   s1.node().metadata_replica().accepted_heads().size() == 1 &&
-                   s2.node().metadata_replica().accepted_heads().size() == 1 &&
+            return s1.local_state().replica().committed_generation() > 1 &&
+                   s1.local_state().replica().committed_generation() ==
+                       s2.local_state().replica().committed_generation() &&
+                   s1.local_state().replica().committed().hash ==
+                       s2.local_state().replica().committed().hash &&
+                   s1.local_state().replica().accepted_heads().size() == 1 &&
+                   s2.local_state().replica().accepted_heads().size() == 1 &&
                    !d1.scheduled && d1.runs_scheduled == d1.runs_completed && !d2.scheduled &&
                    d2.runs_scheduled == d2.runs_completed;
         },
         10s));
 
     const auto before = s1.metadata_convergence_diagnostics();
-    const auto baseline_generation = s2.node().metadata_replica().committed_generation();
+    const auto baseline_generation = s2.local_state().replica().committed_generation();
     const auto announcements_before = s2.node().metadata_announcements();
     gate_repair.store(true, std::memory_order_release);
 
@@ -3176,10 +3176,10 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     for (size_t i = 1; i <= burst; ++i) {
         s2.filesystem().mkdir("/coalesced-" + std::to_string(i), 0755, getuid(), getgid());
     }
-    const auto final_generation = s2.node().metadata_replica().committed_generation();
+    const auto final_generation = s2.local_state().replica().committed_generation();
     CHECK(final_generation == baseline_generation + burst + 1);
     REQUIRE(
-        wait_until([&] { return s1.node().known_metadata_generation() >= final_generation; }, 5s));
+        wait_until([&] { return s1.metadata_server().known_generation() >= final_generation; }, 5s));
     CHECK(s2.node().metadata_announcements() == announcements_before + burst + 1);
 
     // While the run is held the node counts the burst; the pass turns it into
@@ -3195,7 +3195,7 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
             const auto diagnostics = s1.metadata_convergence_diagnostics();
             return !diagnostics.scheduled &&
                    diagnostics.runs_completed == before.runs_completed + 2 &&
-                   s1.node().metadata_replica().committed_generation() == final_generation;
+                   s1.local_state().replica().committed_generation() == final_generation;
         },
         10s));
 
@@ -3265,16 +3265,16 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
             const auto d2 = s2.metadata_convergence_diagnostics();
             return s1.node().membership().active().size() >= 2 &&
                    s2.node().membership().active().size() >= 2 &&
-                   s1.node().metadata_replica().committed_generation() > 1 &&
-                   s1.node().metadata_replica().committed().hash ==
-                       s2.node().metadata_replica().committed().hash &&
+                   s1.local_state().replica().committed_generation() > 1 &&
+                   s1.local_state().replica().committed().hash ==
+                       s2.local_state().replica().committed().hash &&
                    !d1.scheduled && d1.runs_scheduled == d1.runs_completed && !d2.scheduled &&
                    d2.runs_scheduled == d2.runs_completed;
         },
         10s));
 
-    const auto base = s1.node().metadata_replica().committed();
-    auto make_sibling = [&](NodeRuntime& node, const std::string& path) {
+    const auto base = s1.local_state().replica().committed();
+    auto make_sibling = [&](Service& service, const std::string& path) {
         auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
         entry.type = EntryType::directory;
@@ -3282,25 +3282,25 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         entry.uid = getuid();
         entry.gid = getgid();
         snapshot.entries[path] = entry;
-        ++snapshot.mutation_sequences[node.node_id()];
+        ++snapshot.mutation_sequences[service.node().node_id()];
 
         MetadataRecord sibling;
         sibling.generation = base.generation + 1;
         sibling.previous = base.hash;
         sibling.payload = encode_snapshot(snapshot);
         sibling.hash = metadata_hash(sibling.generation, sibling.previous, sibling.payload);
-        REQUIRE(node.metadata_replica().store_commit(sibling));
+        REQUIRE(service.local_state().replica().store_commit(sibling));
         MetadataAcceptance acceptance;
         acceptance.generation = sibling.generation;
         acceptance.hash = sibling.hash;
         acceptance.required = 1;
-        acceptance.replicas = {node.node_id()};
-        REQUIRE(node.metadata_server().accept_commit(acceptance));
+        acceptance.replicas = {service.node().node_id()};
+        REQUIRE(service.metadata_server().accept_commit(acceptance));
         return sibling;
     };
 
     gate_repairs.store(true, std::memory_order_release);
-    const auto left = make_sibling(s1.node(), "/left-sibling");
+    const auto left = make_sibling(s1, "/left-sibling");
     REQUIRE(repair_gate1.wait_for_entries(1, 5s));
     REQUIRE(repair_gate2.wait_for_entries(1, 5s));
 
@@ -3317,7 +3317,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     };
     const auto before_sibling_notice = convergence_events(s1);
 
-    const auto right = make_sibling(s2.node(), "/right-sibling");
+    const auto right = make_sibling(s2, "/right-sibling");
     REQUIRE(right.generation == left.generation);
     REQUIRE(right.hash != left.hash);
     REQUIRE(wait_until([&] { return convergence_events(s1) > before_sibling_notice; }, 2s));
@@ -3332,7 +3332,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     duplicate.hash = right.hash;
     duplicate.required = 1;
     duplicate.replicas = {s2.node().node_id()};
-    REQUIRE(s2.node().metadata_server().accept_commit(duplicate));
+    REQUIRE(s2.metadata_server().accept_commit(duplicate));
     CHECK(s2.node().metadata_announcements() == announcements_before_duplicate);
     std::this_thread::sleep_for(100ms);
     CHECK(convergence_events(s1) == before_duplicate1);
@@ -3342,7 +3342,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     REQUIRE(wait_until(
         [&] {
             try {
-                const auto heads = s1.node().metadata_replica().accepted_heads();
+                const auto heads = s1.local_state().replica().accepted_heads();
                 return heads.size() == 1 && heads.front().generation > left.generation &&
                        s1.filesystem().getattr("/left-sibling").type == EntryType::directory &&
                        s1.filesystem().getattr("/right-sibling").type == EntryType::directory;
@@ -3356,7 +3356,7 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     REQUIRE(wait_until(
         [&] {
             try {
-                return s2.node().metadata_replica().accepted_heads().size() == 1 &&
+                return s2.local_state().replica().accepted_heads().size() == 1 &&
                        s2.filesystem().getattr("/left-sibling").type == EntryType::directory &&
                        s2.filesystem().getattr("/right-sibling").type == EntryType::directory;
             } catch (...) {
@@ -3366,17 +3366,17 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
         10s));
 
     // The first write after a reconciliation is a compact delta over the merge commit.
-    auto merge_heads = s1.node().metadata_replica().accepted_heads();
+    auto merge_heads = s1.local_state().replica().accepted_heads();
     REQUIRE(merge_heads.size() == 1);
     const auto merge_head = merge_heads.front();
-    const auto merge_entry = s1.node().metadata_replica().history_entry(merge_head.hash);
+    const auto merge_entry = s1.local_state().replica().history_entry(merge_head.hash);
     REQUIRE(merge_entry.has_value());
     REQUIRE(merge_entry->merge_parents.size() == 1);
 
     s1.filesystem().mkdir("/after-merge", 0755, getuid(), getgid());
-    auto after_heads = s1.node().metadata_replica().accepted_heads();
+    auto after_heads = s1.local_state().replica().accepted_heads();
     REQUIRE(after_heads.size() == 1);
-    const auto after_entry = s1.node().metadata_replica().history_entry(after_heads.front().hash);
+    const auto after_entry = s1.local_state().replica().history_entry(after_heads.front().hash);
     REQUIRE(after_entry.has_value());
     CHECK(after_entry->previous == merge_head.hash);
     CHECK(after_entry->merge_parents.empty());
@@ -3433,7 +3433,7 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
 
     // A two-head divergence on node 1 alone, from a locally authored sibling.
     const auto base = n1.metadata_replica().committed();
-    auto make_sibling = [&](NodeRuntime& node, const std::string& path) {
+    auto make_sibling = [&](BareNode& node, const std::string& path) {
         auto snapshot = decode_snapshot(base.payload);
         FsEntry entry;
         entry.type = EntryType::directory;
@@ -3662,7 +3662,7 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
             }
         },
         10s));
-    const auto base = s3->node().metadata_replica().committed();
+    const auto base = s3->local_state().replica().committed();
 
     s3->stop();
     s3.reset();
@@ -3677,9 +3677,9 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     for (size_t index = 0; index < burst; ++index) {
         s1.filesystem().mkdir("/lagging-burst-" + std::to_string(index), 0755, getuid(), getgid());
     }
-    const auto final = s1.node().metadata_replica().committed();
+    const auto final = s1.local_state().replica().committed();
     CHECK(final.generation == base.generation + burst);
-    REQUIRE(wait_until([&] { return s2.node().metadata_replica().committed().hash == final.hash; },
+    REQUIRE(wait_until([&] { return s2.local_state().replica().committed().hash == final.hash; },
                        10s));
 
     s3 = std::make_unique<Service>(c3, keys);
@@ -3689,7 +3689,7 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
         [&] {
             try {
                 const auto diagnostics = s3->metadata_convergence_diagnostics();
-                return s3->node().metadata_replica().committed().hash == final.hash &&
+                return s3->local_state().replica().committed().hash == final.hash &&
                        s3->filesystem().getattr("/lagging-burst-63").type == EntryType::directory &&
                        !diagnostics.scheduled &&
                        diagnostics.runs_scheduled == diagnostics.runs_completed;
@@ -3703,11 +3703,11 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     CHECK(diagnostics.runs_scheduled <= 4);
     CHECK(diagnostics.runs_completed <= 4);
     CHECK(diagnostics.runs_completed < burst);
-    const auto heads = s3->node().metadata_replica().accepted_heads();
+    const auto heads = s3->local_state().replica().accepted_heads();
     REQUIRE(heads.size() == 1);
     CHECK(heads.front().hash == final.hash);
-    CHECK(s3->node().metadata_replica().history_contains(final.hash));
-    CHECK(s3->node().metadata_replica().history_is_ancestor(base.hash, final.hash));
+    CHECK(s3->local_state().replica().history_contains(final.hash));
+    CHECK(s3->local_state().replica().history_is_ancestor(base.hash, final.hash));
 
     const auto transfer1 = s1.metadata_manager().history_transfer_diagnostics();
     const auto transfer2 = s2.metadata_manager().history_transfer_diagnostics();
@@ -3838,15 +3838,15 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     REQUIRE(entry.extents.size() == 1);
     const auto extent = entry.extents.front().id;
     REQUIRE(wait_until([&] {
-        return s1.node().local_store().valid(extent) && s2.node().local_store().valid(extent) &&
-               s3->node().local_store().valid(extent);
+        return s1.local_state().data().valid(extent) && s2.local_state().data().valid(extent) &&
+               s3->local_state().data().valid(extent);
     }));
     // The accepted file reference has already installed a DATA claim.
-    CHECK(s1.node().claims().retained(RetentionClass::data, extent));
-    CHECK(s2.node().claims().retained(RetentionClass::data, extent));
-    CHECK(s3->node().claims().retained(RetentionClass::data, extent));
+    CHECK(s1.local_state().retention().retained(RetentionClass::data, extent));
+    CHECK(s2.local_state().retention().retained(RetentionClass::data, extent));
+    CHECK(s3->local_state().retention().retained(RetentionClass::data, extent));
 
-    const auto before = s1.node().metadata_replica().committed();
+    const auto before = s1.local_state().replica().committed();
     s3->stop();
     s3.reset();
     REQUIRE(wait_until([&] {
@@ -3865,7 +3865,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
         refused = true;
     }
     CHECK(refused);
-    CHECK(s1.node().metadata_replica().committed().hash == before.hash);
+    CHECK(s1.local_state().replica().committed().hash == before.hash);
     CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0644U);
 
     s3 = std::make_unique<Service>(c3, keys);
@@ -3892,7 +3892,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     }, 10s));
     s1.filesystem().chmod("/retained.bin", 0600);
     CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0600U);
-    CHECK(s1.node().metadata_replica().committed().hash != before.hash);
+    CHECK(s1.local_state().replica().committed().hash != before.hash);
 
     s3->stop();
     s2.stop();
@@ -3994,10 +3994,10 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
 
     // Record the claims and copies on the cohort that stays online: none may be
     // removed while a durably known node is unreachable.
-    const bool n1_claim_before = s1.node().claims().retained(RetentionClass::data, extent);
-    const bool n2_claim_before = s2.node().claims().retained(RetentionClass::data, extent);
-    const bool n1_copy_before = s1.node().local_store().valid(extent);
-    const bool n2_copy_before = s2.node().local_store().valid(extent);
+    const bool n1_claim_before = s1.local_state().retention().retained(RetentionClass::data, extent);
+    const bool n2_claim_before = s2.local_state().retention().retained(RetentionClass::data, extent);
+    const bool n1_copy_before = s1.local_state().data().valid(extent);
+    const bool n2_copy_before = s2.local_state().data().valid(extent);
     REQUIRE(n1_claim_before || n2_claim_before);
     REQUIRE(n1_copy_before || n2_copy_before);
 
@@ -4025,13 +4025,13 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     // Several zero-grace passes: neither the claim nor the bytes may go.
     std::this_thread::sleep_for(800ms);
     if (n1_claim_before)
-        CHECK(s1.node().claims().retained(RetentionClass::data, extent));
+        CHECK(s1.local_state().retention().retained(RetentionClass::data, extent));
     if (n2_claim_before)
-        CHECK(s2.node().claims().retained(RetentionClass::data, extent));
+        CHECK(s2.local_state().retention().retained(RetentionClass::data, extent));
     if (n1_copy_before)
-        CHECK(s1.node().local_store().valid(extent));
+        CHECK(s1.local_state().data().valid(extent));
     if (n2_copy_before)
-        CHECK(s2.node().local_store().valid(extent));
+        CHECK(s2.local_state().data().valid(extent));
 
     // The third node returns from its persistent state; metadata must converge
     // before GC may reclaim the delete.
@@ -4059,9 +4059,9 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         10s));
     REQUIRE(wait_until(
         [&] {
-            return !s1.node().claims().retained(RetentionClass::data, extent) &&
-                   !s2.node().claims().retained(RetentionClass::data, extent) &&
-                   !s1.node().local_store().valid(extent) && !s2.node().local_store().valid(extent);
+            return !s1.local_state().retention().retained(RetentionClass::data, extent) &&
+                   !s2.local_state().retention().retained(RetentionClass::data, extent) &&
+                   !s1.local_state().data().valid(extent) && !s2.local_state().data().valid(extent);
         },
         10s));
 
@@ -4110,24 +4110,24 @@ MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_qui
 
     const auto bytes = pattern(96 * 1024 + 29);
     const auto id = object_id(bytes);
-    REQUIRE(s1.node().local_store().put(id, bytes));
+    REQUIRE(s1.local_state().data().put(id, bytes));
     const RetentionDot claim{s1.node().node_id(), 0xbeef};
-    s1.node().claims().retain(RetentionClass::data, id, claim);
-    s2.node().claims().retain(RetentionClass::data, id, claim);
-    REQUIRE(!s2.node().local_store().valid(id));
+    s1.local_state().retention().retain(RetentionClass::data, id, claim);
+    s2.local_state().retention().retain(RetentionClass::data, id, claim);
+    REQUIRE(!s2.local_state().data().valid(id));
     s2.resources().events.notify(NodeEvent::storage);
 
     // The loader thread may not have run yet: wait for its first note.
     REQUIRE(wait_until([&] {
         return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
     }, 5s));
-    const bool restored = wait_until([&] { return s2.node().local_store().valid(id); }, 10s);
+    const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
     // The loader never paused: this copy came back during a busy period.
     CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
     loading = false;
     loader.join();
     REQUIRE(restored);
-    CHECK(*s2.node().local_store().get(id) == bytes);
+    CHECK(*s2.local_state().data().get(id) == bytes);
 }
 
 MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_reachability) {
@@ -4181,11 +4181,11 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
 
     const auto bytes = pattern(96 * 1024 + 13);
     const auto id = object_id(bytes);
-    REQUIRE(s1.node().local_store().put(id, bytes));
-    REQUIRE(s2.node().local_store().put(id, bytes));
+    REQUIRE(s1.local_state().data().put(id, bytes));
+    REQUIRE(s2.local_state().data().put(id, bytes));
     const RetentionDot claim{s1.node().node_id(), 0xf00d};
-    s1.node().claims().retain(RetentionClass::data, id, claim);
-    s2.node().claims().retain(RetentionClass::data, id, claim);
+    s1.local_state().retention().retain(RetentionClass::data, id, claim);
+    s2.local_state().retention().retain(RetentionClass::data, id, claim);
 
     // With a replica offline, install a claim dot the branch clock does not
     // dominate: unreachable from the namespace, it must still not be erased.
@@ -4196,20 +4196,20 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
                s2.node().membership().active().size() == 2;
     }));
 
-    REQUIRE(s2.node().local_store().remove(id));
-    CHECK(s2.node().claims().retained(RetentionClass::data, id));
-    CHECK(!s2.node().local_store().valid(id));
+    REQUIRE(s2.local_state().data().remove(id));
+    CHECK(s2.local_state().retention().retained(RetentionClass::data, id));
+    CHECK(!s2.local_state().data().valid(id));
     // A detector outside the storage wrappers must publish the mutation event;
     // heartbeats do not trigger maintenance.
     s2.resources().events.notify(NodeEvent::storage);
 
     // `id` is unreachable from namespace and catalogue; only its retention
     // claim tells maintenance to restore it.
-    REQUIRE(wait_until([&] { return s2.node().local_store().valid(id); }, 5s));
-    auto restored = s2.node().local_store().get(id);
+    REQUIRE(wait_until([&] { return s2.local_state().data().valid(id); }, 5s));
+    auto restored = s2.local_state().data().get(id);
     REQUIRE(restored.has_value());
     CHECK(*restored == bytes);
-    CHECK(s2.node().claims().retained(RetentionClass::data, id));
+    CHECK(s2.local_state().retention().retained(RetentionClass::data, id));
 
     s2.stop();
     s1.stop();
@@ -4251,18 +4251,18 @@ MACHA_TEST("rpc_cluster", test_held_retention_claims_cost_repair_no_credit) {
     for (int i = 0; i < 64; ++i) {
         const auto held_bytes = pattern(16 * 1024, 500 + i);
         const auto held = object_id(held_bytes);
-        REQUIRE(s2.node().local_store().put(held, held_bytes));
-        s2.node().claims().retain(RetentionClass::data, held, claim);
+        REQUIRE(s2.local_state().data().put(held, held_bytes));
+        s2.local_state().retention().retain(RetentionClass::data, held, claim);
     }
     const auto bytes = pattern(96 * 1024 + 7);
     const auto id = object_id(bytes);
-    REQUIRE(s1.node().local_store().put(id, bytes));
-    s2.node().claims().retain(RetentionClass::data, id, claim);
-    REQUIRE(!s2.node().local_store().valid(id));
+    REQUIRE(s1.local_state().data().put(id, bytes));
+    s2.local_state().retention().retain(RetentionClass::data, id, claim);
+    REQUIRE(!s2.local_state().data().valid(id));
     s2.resources().events.notify(NodeEvent::storage);
 
-    REQUIRE(wait_until([&] { return s2.node().local_store().valid(id); }, 5s));
-    CHECK(*s2.node().local_store().get(id) == bytes);
+    REQUIRE(wait_until([&] { return s2.local_state().data().valid(id); }, 5s));
+    CHECK(*s2.local_state().data().get(id) == bytes);
 }
 
 MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcile) {
@@ -4342,9 +4342,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
                 return false;
             }
         }));
-        left_head = s2.node().metadata_replica().committed().hash;
+        left_head = s2.local_state().replica().committed().hash;
         node2_id = s2.node().node_id();
-        CHECK(s2.node().metadata_replica().acceptance(left_head).has_value());
+        CHECK(s2.local_state().replica().acceptance(left_head).has_value());
 
         s2.stop();
         s1.stop();
@@ -4377,9 +4377,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
                 return false;
             }
         }));
-        right_head = s3.node().metadata_replica().committed().hash;
+        right_head = s3.local_state().replica().committed().hash;
         REQUIRE(right_head != left_head);
-        CHECK(s3.node().metadata_replica().acceptance(right_head).has_value());
+        CHECK(s3.local_state().replica().acceptance(right_head).has_value());
 
         // With one member of the other pair back, two accepted sibling histories
         // meet; reconciliation must descend from both.
@@ -4409,14 +4409,14 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
             3s));
 
         REQUIRE(wait_until([&] {
-            return s2.node().metadata_replica().accepted_heads().size() == 1 &&
-                   s3.node().metadata_replica().accepted_heads().size() == 1;
+            return s2.local_state().replica().accepted_heads().size() == 1 &&
+                   s3.local_state().replica().accepted_heads().size() == 1;
         }));
-        const auto merged = s2.node().metadata_replica().accepted_heads().front();
-        CHECK(s2.node().metadata_replica().history_is_ancestor(left_head, merged.hash));
-        CHECK(s2.node().metadata_replica().history_is_ancestor(right_head, merged.hash));
-        const auto local_history = s2.node().metadata_replica().history_entry(merged.hash);
-        const auto remote_history = s3.node().metadata_replica().history_entry(merged.hash);
+        const auto merged = s2.local_state().replica().accepted_heads().front();
+        CHECK(s2.local_state().replica().history_is_ancestor(left_head, merged.hash));
+        CHECK(s2.local_state().replica().history_is_ancestor(right_head, merged.hash));
+        const auto local_history = s2.local_state().replica().history_entry(merged.hash);
+        const auto remote_history = s3.local_state().replica().history_entry(merged.hash);
         REQUIRE(local_history.has_value());
         REQUIRE(remote_history.has_value());
         CHECK(local_history->body == MetadataHistoryEntry::Body::delta);
@@ -4500,7 +4500,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         REQUIRE(wait_until([&] {
             r1.repair_once(1024 * 1024);
             r2.repair_once(1024 * 1024);
-            return s1.node().local_store().has(object) && s2.node().local_store().has(object);
+            return s1.local_state().data().has(object) && s2.local_state().data().has(object);
         }));
 
         s2.stop();
@@ -4569,7 +4569,7 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
 
     auto filler = pattern(1800 * 1024);
     filler[0] ^= 0xa5;
-    REQUIRE(s1.node().local_store().put(object_id(filler), filler));
+    REQUIRE(s1.local_state().data().put(object_id(filler), filler));
 
     Bytes data;
     std::vector<NodeInfo> ranked;
@@ -4591,7 +4591,7 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
     auto id = object_id(data);
     DistributedStore store(s2.node(), s2.local_state(), s2.resources().activity, s2.resources().data, s2.resources().memory, s2.resources().events);
     REQUIRE(store.put(id, data));
-    CHECK(!s1.node().local_store().has(id));
+    CHECK(!s1.local_state().data().has(id));
 
     std::array<Service*, 4> services{&s1, &s2, &s3, &s4};
     auto fallback = std::find_if(services.begin(), services.end(), [&](Service* service) {
@@ -4602,18 +4602,18 @@ MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
     // put() commits at quorum; repair then spills the missing replica to the fallback.
     REQUIRE(wait_until([&] {
         for (auto* service : services) {
-            if (!service->node().local_store().has(id))
+            if (!service->local_state().data().has(id))
                 continue;
             DistributedStore repair(service->node(), service->local_state(), service->resources().activity,
                            service->resources().data, service->resources().memory, service->resources().events);
             repair.repair_once(8ULL * 1024 * 1024);
         }
-        return (*fallback)->node().local_store().has(id);
+        return (*fallback)->local_state().data().has(id);
     }));
 
     size_t copies = 0;
     for (auto* service : services)
-        copies += service->node().local_store().has(id) ? 1 : 0;
+        copies += service->local_state().data().has(id) ? 1 : 0;
     CHECK(copies == 3);
 
     s4.stop();
@@ -4673,13 +4673,13 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     REQUIRE(wait_until([&] {
         initial_convergence.repair_once(16ULL * 1024 * 1024, objects);
         return std::all_of(objects.begin(), objects.end(),
-                           [&](const auto& id) { return s2->node().local_store().has(id); });
+                           [&](const auto& id) { return s2->local_state().data().has(id); });
     }));
 
     // One metadata pass makes node 2 a durable checkpoint witness first.
     MetadataManager witness_repair(s2->node(), s2->local_state(), s2->metadata_server());
     witness_repair.repair_once();
-    CHECK(s2->node().metadata_replica().committed().generation > 1);
+    CHECK(s2->local_state().replica().committed().generation > 1);
 
     old_n1 = s1->node().node_id();
     s1->stop();
@@ -4732,7 +4732,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
         [&] {
             replacement_convergence.repair_once(16ULL * 1024 * 1024, objects);
             return std::all_of(objects.begin(), objects.end(), [&](const auto& id) {
-                return replacement->node().local_store().has(id);
+                return replacement->local_state().data().has(id);
             });
         },
         10s));
@@ -4910,15 +4910,16 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_read_of_a_corrupt_local_copy_comes_from_a
     REQUIRE(ids.size() == 1);
     const auto id = ids.front();
     auto& node = trio[1].node();
+    auto& local = trio[1].local_state();
     corrupt_object(trio.configs[1].storage_backends.front().path, id);
-    REQUIRE(!node.local_store().get(id).has_value());
+    REQUIRE(!local.data().get(id).has_value());
 
     DistributedStore store(node, trio[1].local_state(), trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
     const auto fetched = store.get(id);
     REQUIRE(fetched.has_value());
     CHECK(object_id(*fetched) == id);
     store.wait_local_copies_settled();
-    const auto healed = node.local_store().get(id);
+    const auto healed = local.data().get(id);
     REQUIRE(healed.has_value());
     CHECK(object_id(*healed) == id);
 }
@@ -4932,16 +4933,17 @@ MACHA_HEAVY_TEST("rpc_cluster", test_scrub_discards_a_corrupt_copy_and_repair_re
     REQUIRE(ids.size() == 1);
     const auto id = ids.front();
     auto& node = trio[1].node();
+    auto& local = trio[1].local_state();
     corrupt_object(trio.configs[1].storage_backends.front().path, id);
 
     DistributedStore store(node, trio[1].local_state(), trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
     store.scrub_once(128ULL * 1024 * 1024);
-    CHECK(!node.local_store().has(id));
+    CHECK(!local.data().has(id));
     // Repair pulls what the node's live inventory says it should hold.
     const auto live = trio[1].filesystem().maintenance_objects().live;
-    for (int step = 0; step < 4 && !node.local_store().has(id); ++step)
+    for (int step = 0; step < 4 && !local.data().has(id); ++step)
         store.repair_once(128ULL * 1024 * 1024, live);
-    const auto restored = node.local_store().get(id);
+    const auto restored = local.data().get(id);
     REQUIRE(restored.has_value());
     CHECK(object_id(*restored) == id);
 }
@@ -4953,7 +4955,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_read_falls_back_to_a_peer_when_the_local_
     const auto input = pattern(512 * 1024, 9);
     const auto ids = trio.write(0, "/media/file.bin", input);
     for (const auto& id : ids)
-        REQUIRE(trio[1].node().local_store().remove(id));
+        REQUIRE(trio[1].local_state().data().remove(id));
     CHECK(read_whole(trio[1], "/media/file.bin", input.size()) == input);
 }
 
@@ -4967,20 +4969,22 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_runtime_cache_keeps_a_playback_fetch) {
     REQUIRE(ids.size() == 1);
     const auto id = ids.front();
     auto& node = trio[1].node();
+    auto& local = trio[1].local_state();
     auto cached = trio.configs[1];
     cached.cache.path = trio.cluster.path() / "n2-cache";
     cached.cache.max_blocks = 8;
+    local.reconfigure(cached);
     node.reconfigure_local(cached);
     trio[1].store().wait_local_copies_settled();
-    REQUIRE(node.local_store().remove(id));
-    REQUIRE(!node.block_cache().has(id));
+    REQUIRE(local.data().remove(id));
+    REQUIRE(!local.cache().has(id));
 
     DistributedStore store(node, trio[1].local_state(), trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
     const auto fetched = store.get(id, 0, true);
     REQUIRE(fetched.has_value());
     store.wait_local_copies_settled();
-    CHECK(node.block_cache().has(id));
-    REQUIRE(!node.local_store().has(id));
+    CHECK(local.cache().has(id));
+    REQUIRE(!local.data().has(id));
     const auto again = store.get(id, 0, true);
     REQUIRE(again.has_value());
     CHECK(*again == *fetched);
@@ -5103,7 +5107,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
 
     const auto holds_all = [&] {
         return std::all_of(ids.begin(), ids.end(),
-                           [&](const ObjectId& id) { return n3.node().local_store().has(id); });
+                           [&](const ObjectId& id) { return n3.local_state().data().has(id); });
     };
     // Each step settles the pass, then moves its clock a second; bounded in steps.
     int steps = 0;
@@ -5259,7 +5263,7 @@ MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_p
     // Seeing the peer is not a formed metadata replica set; create_file needs
     // a committed generation past genesis (1).
     REQUIRE(wait_until([&] {
-        return s1.node().metadata_replica().committed_generation() > 1;
+        return s1.local_state().replica().committed_generation() > 1;
     }, 10s));
     s1.filesystem().create_file("/silent.bin", 0644, getuid(), getgid());
     const auto contents = pattern(64 * 1024);
@@ -5649,21 +5653,21 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
                s2.node().membership().all_known_reachable();
     }));
 
-    CHECK(s1.node().metadata_replica().diagnostics().history_records >= 3);
+    CHECK(s1.local_state().replica().diagnostics().history_records >= 3);
 
     // s1 proposes, both ack, s1 commits and compacts in this call; s2 holds a
     // committed proof and re-roots its history.log on its own next attempt.
     s1.metadata_manager().attempt_history_checkpoint(1, 1);
-    CHECK(s1.node().metadata_replica().diagnostics().history_records == 1);
-    auto proof1 = s1.node().metadata_replica().checkpoint_proof();
+    CHECK(s1.local_state().replica().diagnostics().history_records == 1);
+    auto proof1 = s1.local_state().replica().checkpoint_proof();
     REQUIRE(proof1.has_value());
     CHECK(proof1->status == HistoryCheckpointProof::Status::committed);
 
     REQUIRE(wait_until([&] {
         s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s2.node().metadata_replica().diagnostics().history_records == 1;
+        return s2.local_state().replica().diagnostics().history_records == 1;
     }));
-    auto proof2 = s2.node().metadata_replica().checkpoint_proof();
+    auto proof2 = s2.local_state().replica().checkpoint_proof();
     REQUIRE(proof2.has_value());
     CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
     CHECK(proof2->floor_hash == proof1->floor_hash);
@@ -5706,11 +5710,11 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
         }
     }));
 
-    auto& replica = s2.node().metadata_replica();
+    auto& replica = s2.local_state().replica();
     auto certificates = replica.accepted_head_certificates();
     REQUIRE(certificates.size() == 1);
     const auto head = certificates.front().hash;
-    CHECK(s1.node().metadata_replica().history_contains(head));
+    CHECK(s1.local_state().replica().history_contains(head));
 
     // The replica on s2 cannot reconstruct the head, so excludes and flags it.
     replica.set_force_unreconstructable_for_tests(
@@ -5788,18 +5792,18 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_concurrent_proposers_
     REQUIRE(wait_until([&] {
         s1.metadata_manager().attempt_history_checkpoint(1, 1);
         s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s1.node().metadata_replica().diagnostics().history_records == 1 &&
-               s2.node().metadata_replica().diagnostics().history_records == 1;
+        return s1.local_state().replica().diagnostics().history_records == 1 &&
+               s2.local_state().replica().diagnostics().history_records == 1;
     }));
 
-    auto proof1 = s1.node().metadata_replica().checkpoint_proof();
-    auto proof2 = s2.node().metadata_replica().checkpoint_proof();
+    auto proof1 = s1.local_state().replica().checkpoint_proof();
+    auto proof2 = s2.local_state().replica().checkpoint_proof();
     REQUIRE(proof1.has_value());
     REQUIRE(proof2.has_value());
     CHECK(proof1->floor_hash == proof2->floor_hash);
     CHECK(proof1->epoch == proof2->epoch);
-    CHECK(s1.node().metadata_replica().committed().hash == proof1->floor_hash);
-    CHECK(s2.node().metadata_replica().committed().hash == proof2->floor_hash);
+    CHECK(s1.local_state().replica().committed().hash == proof1->floor_hash);
+    CHECK(s2.local_state().replica().committed().hash == proof2->floor_hash);
 
     s2.stop();
     s1.stop();
@@ -5841,8 +5845,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_aborts_when_a_partici
     // (discover_accepted_heads_required(), independent of all_known_reachable()).
     s2.stop();
     s1.metadata_manager().attempt_history_checkpoint(1, 1);
-    CHECK(s1.node().metadata_replica().diagnostics().history_records > 1);
-    CHECK(!s1.node().metadata_replica().checkpoint_proof().has_value());
+    CHECK(s1.local_state().replica().diagnostics().history_records > 1);
+    CHECK(!s1.local_state().replica().checkpoint_proof().has_value());
 
     s1.stop();
 }
@@ -5881,29 +5885,29 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
 
     // A proposer that crashed after every ack but before the commit: an
     // acked-only proof on s2 for the (floor_hash, epoch) a round would produce.
-    const auto floor = s1.node().metadata_replica().accepted_heads();
+    const auto floor = s1.local_state().replica().accepted_heads();
     REQUIRE(floor.size() == 1);
     HistoryCheckpointProof stranded;
     stranded.floor_hash = floor.front().hash;
     stranded.floor_generation = floor.front().generation;
     stranded.epoch.bytes[0] = 0x99;
     stranded.participants = {s1.node().node_id(), s2.node().node_id()};
-    s2.node().metadata_replica().record_checkpoint_ack(stranded);
-    CHECK(s2.node().metadata_replica().checkpoint_proof()->status ==
+    s2.local_state().replica().record_checkpoint_ack(stranded);
+    CHECK(s2.local_state().replica().checkpoint_proof()->status ==
          HistoryCheckpointProof::Status::acked);
     // A stranded ack alone never re-roots s2's history.
-    CHECK(s2.node().metadata_replica().diagnostics().history_records > 1);
+    CHECK(s2.local_state().replica().diagnostics().history_records > 1);
 
     // The next maintenance cycle re-proposes and completes, superseding it.
     REQUIRE(wait_until([&] {
         s1.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s1.node().metadata_replica().diagnostics().history_records == 1;
+        return s1.local_state().replica().diagnostics().history_records == 1;
     }));
     REQUIRE(wait_until([&] {
         s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s2.node().metadata_replica().diagnostics().history_records == 1;
+        return s2.local_state().replica().diagnostics().history_records == 1;
     }));
-    auto proof2 = s2.node().metadata_replica().checkpoint_proof();
+    auto proof2 = s2.local_state().replica().checkpoint_proof();
     REQUIRE(proof2.has_value());
     CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
     CHECK(proof2->epoch != stranded.epoch);

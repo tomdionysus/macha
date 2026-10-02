@@ -175,13 +175,11 @@ std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uin
 } // namespace
 
 NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryProgress& progress,
-                         ActivityClocks& activity,
-                         DataResourceArbiter& data_resources,
                          RetainedMemoryLedger& retained_memory,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes, NodeEvents& events,
                          StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), identity_(identity), progress_(progress),
-      activity_(activity), data_resources_(data_resources), retained_memory_(retained_memory),
+      retained_memory_(retained_memory),
       transcode_rates_(transcode_rates), routes_(routes), events_(events),
       inbound_(initial_inbound_resolution(cfg_)),
       members_(self_info(cfg_, identity_.id, 0, 0, 0,
@@ -285,9 +283,6 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
 NodeRuntime::~NodeRuntime() {
     stop();
     unbind_routes();
-    storage_server_.reset();
-    metadata_server_.reset();
-    local_state_.reset();
 }
 
 bool NodeRuntime::all_local_state_ready() const noexcept {
@@ -308,6 +303,10 @@ NodeReadiness NodeRuntime::readiness() const {
     out.ready_unix_ms = progress_.ready_unix_ms();
     out.error = progress_.error();
     return out;
+}
+
+void NodeRuntime::publish_self() {
+    server_.set_local(members_.self());
 }
 
 void NodeRuntime::advertise_storage(uint64_t used, uint64_t capacity) {
@@ -337,97 +336,6 @@ bool NodeRuntime::wait_local_state_ready(std::chrono::milliseconds timeout) {
     if (!started_.load(std::memory_order_acquire) && !all_local_state_ready())
         return false;
     return progress_.wait_complete(timeout) && !progress_.failed();
-}
-
-StoragePool& NodeRuntime::local_store() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("data storage is still recovering");
-    return local_state_->data();
-}
-const StoragePool& NodeRuntime::local_store() const {
-    if (!all_local_state_ready())
-        throw std::runtime_error("data storage is still recovering");
-    return local_state_->data();
-}
-LocalStore& NodeRuntime::control_store() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("control storage is still recovering");
-    return local_state_->control();
-}
-const LocalStore& NodeRuntime::control_store() const {
-    if (!all_local_state_ready())
-        throw std::runtime_error("control storage is still recovering");
-    return local_state_->control();
-}
-LocalState& NodeRuntime::local_state() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("local state is still recovering");
-    return *local_state_;
-}
-
-MetadataServer& NodeRuntime::metadata_server() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("metadata replica is still recovering");
-    return *metadata_server_;
-}
-
-PersistentBlockCache& NodeRuntime::block_cache() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("persistent cache is still recovering");
-    return local_state_->cache();
-}
-ClaimStore& NodeRuntime::claims() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("retention state is still recovering");
-    return local_state_->retention();
-}
-const ClaimStore& NodeRuntime::claims() const {
-    if (!all_local_state_ready())
-        throw std::runtime_error("retention state is still recovering");
-    return local_state_->retention();
-}
-MetadataReplica& NodeRuntime::metadata_replica() {
-    if (!all_local_state_ready())
-        throw std::runtime_error("metadata replica is still recovering");
-    return local_state_->replica();
-}
-const MetadataReplica& NodeRuntime::metadata_replica() const {
-    if (!all_local_state_ready())
-        throw std::runtime_error("metadata replica is still recovering");
-    return local_state_->replica();
-}
-
-void NodeRuntime::recover_local(std::stop_token stop) {
-    try {
-        local_state_ = std::make_unique<LocalState>(cfg_, identity_, progress_,
-                                                    startup_stage_hook_, stop);
-    } catch (const RecoveryCancelled&) {
-        return;
-    } catch (const std::exception&) {
-        // LocalState recorded and logged the failure.
-        signal_telemetry_refresh();
-        return;
-    }
-    auto& data = local_state_->data();
-    if (cfg_.io_pressure_slowdown_percent)
-        data_resources_.observe_device(&data.service_monitor(), cfg_.io_pressure_min_background);
-    advertise_storage(data.used(), data.limit());
-    advertise_storage_backends(static_cast<uint32_t>(data.online_backends()));
-    metadata_server_ = std::make_unique<MetadataServer>(
-        *this, local_state_->replica(), local_state_->cache(), routes_,
-        cfg_.metadata_min_write_replicas, cfg_.heartbeat);
-    advertise_metadata_generation(local_state_->replica().committed().generation);
-    server_.set_local(members_.self());
-    storage_server_ = std::make_unique<StorageServer>(
-        *this, identity_,
-        StorageServer::Stores{data, local_state_->control(), local_state_->retention(),
-                              local_state_->cache()},
-        data_resources_, activity_, events_, routes_, cfg_.extent_size, cfg_.cache.max_blocks,
-        cfg_.heartbeat);
-    progress_.mark_complete(unix_ms());
-    // Publish the phase now rather than up to a sampling interval later, so
-    // peers do not keep seeing "recovering" after the node is ready.
-    signal_telemetry_refresh();
 }
 
 void NodeRuntime::start() {
@@ -492,9 +400,6 @@ void NodeRuntime::start() {
     });
     maintenance_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("cluster-maintenance", stop, [this, stop] { loop(stop); });
-    });
-    local_recovery_ = std::jthread([this](std::stop_token stop) {
-        run_supervised_once("cluster-state-recovery", [this, stop] { recover_local(stop); });
     });
     connectivity_worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("cluster-connectivity", stop, [this, stop] { connectivity_loop(stop); });
@@ -682,8 +587,6 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
 }
 
 void NodeRuntime::request_stop() {
-    if (local_recovery_.joinable())
-        local_recovery_.request_stop();
     if (connectivity_worker_.joinable()) {
         connectivity_worker_.request_stop();
         connectivity_wait_cv_.notify_all();
@@ -722,7 +625,7 @@ void NodeRuntime::stop() {
     cancel_outbound_calls();
     Log::debug("shutdown: RpcClient::stop returned");
 
-    for (auto* worker : {&connectivity_worker_, &local_recovery_,
+    for (auto* worker : {&connectivity_worker_,
                          &telemetry_worker_, &maintenance_}) {
         if (worker->joinable())
             worker->join();
@@ -1382,15 +1285,11 @@ void NodeRuntime::loop(std::stop_token stop) {
 
 void NodeRuntime::reconfigure_local(const Config& config) {
     auto updated = normalize_config(config);
-    if (!all_local_state_ready())
-        throw std::runtime_error("node local state is still recovering");
-    local_state_->reconfigure(updated);
     // Node-local policy, unused by the long-lived network/metadata threads:
     // keep the snapshot in sync with a live reload without changing cluster policy.
     cfg_.storage_backends = updated.storage_backends;
     cfg_.cache = updated.cache;
     cfg_.hydration = updated.hydration;
     cfg_.read_ahead_extents = updated.read_ahead_extents;
-    advertise_storage(local_store().used(), local_store().limit());
 }
 } // namespace macha
