@@ -295,6 +295,8 @@ The practical consequences for an operator:
   | state | meaning | action |
   |---|---|---|
   | `unavailable` | No plugin file, or the plugin declined to start because this node is configured not to run it (`torrent.enabled: false`, no `fuse.mount_path`). | None; this is the configured outcome. Install the plugin or turn the setting on if it was meant to run. Enabling a capability whose plugin is missing is not a configuration error: the node starts, reports the subsystem `unavailable`, and serves everything else. |
+  | `starting` | The first attempt to construct and start it has not finished; every subsystem begins here. | None; it settles into another state. |
+  | `restarting` | Being rebuilt after a fault. | None unless it repeats; see `faulted`. |
   | `running` | Loaded and started. | None. |
   | `faulted` | The last construct/start attempt threw; it is being retried with backoff. | Read `last_fault`; if it persists it becomes `disabled`. |
   | `disabled` | Too many failures in the window, or refused at load (build-stamp mismatch, unreadable file). | Needs an operator: fix the cause and restart the process. Nothing retries automatically. |

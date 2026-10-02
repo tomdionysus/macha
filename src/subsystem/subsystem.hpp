@@ -13,7 +13,7 @@ namespace macha {
 // Lifecycle state the supervisor tracks per subsystem; held by the supervisor,
 // not the instance, which may already be destroyed when asked.
 enum class SubsystemState {
-    unavailable, // no plugin file present for this capability
+    unavailable, // no plugin for this capability, or not enabled on this node
     starting,
     running,
     faulted,     // most recent attempt threw/crashed; may retry
