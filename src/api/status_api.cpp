@@ -463,10 +463,11 @@ std::optional<NodeId> parse_node_id(std::string_view text) {
 
 } // namespace
 
-ClusterStatusService::ClusterStatusService(NodeRuntime& node, const ActivityClocks& activity,
+ClusterStatusService::ClusterStatusService(NodeRuntime& node, Accounts& accounts,
+                                           const ActivityClocks& activity,
                                            const DataResourceArbiter& data_resources,
                                            const RetainedMemoryLedger& retained_memory)
-    : node_(node), activity_(activity), data_resources_(data_resources),
+    : node_(node), accounts_(accounts), activity_(activity), data_resources_(data_resources),
       retained_memory_(retained_memory) {}
 
 ClusterStatusService::~ClusterStatusService() {
@@ -504,7 +505,7 @@ void ClusterStatusService::persist_local_status() {
         activity_.idle_for(FrameType::read_ahead) < idle_before_persist)
         return;
     node_.telemetry().persist();
-    node_.sessions().persist();
+    accounts_.sessions().persist();
 }
 
 void ClusterStatusService::persistence_loop(std::stop_token stop) {
@@ -1392,15 +1393,15 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     // to check convergence (table_hash is stable for equal contents).
     Json::Object auth_diagnostics;
     // An empty user table means nobody can sign in; surfaced here so it is seen.
-    const auto user_count = node_.users().size();
+    const auto user_count = accounts_.users().size();
     auth_diagnostics["users"] = static_cast<uint64_t>(user_count);
     auth_diagnostics["accounts_initialised"] = user_count > 0;
-    auth_diagnostics["user_tombstones"] = static_cast<uint64_t>(node_.users().tombstones());
-    auth_diagnostics["user_table_hash"] = to_string(node_.users().table_hash());
+    auth_diagnostics["user_tombstones"] = static_cast<uint64_t>(accounts_.users().tombstones());
+    auth_diagnostics["user_table_hash"] = to_string(accounts_.users().table_hash());
     auth_diagnostics["allow_anonymous"] = node_.config().session.allow_anonymous;
     // What an anonymous visitor may do is the anonymous account's roles.
     Json::Array anonymous_roles;
-    if (auto anonymous = node_.users().find_by_username(anonymous_username))
+    if (auto anonymous = accounts_.users().find_by_username(anonymous_username))
         for (const auto& role : anonymous->roles)
             anonymous_roles.push_back(role);
     auth_diagnostics["anonymous_roles"] = std::move(anonymous_roles);

@@ -398,7 +398,7 @@ MACHA_FAST_TEST("users", test_anonymous_has_no_password_and_cannot_be_given_one)
     auto config = cluster.node_config("n1");
     config.session.allow_anonymous = false;
     BareNode node(config, cluster.keys());
-    UsersApi api(node);
+    UsersApi api(node, node.accounts());
     auto anonymous = node.users().create_without_password(
         anonymous_username, {std::string(role_media_viewer)}, node.node_id());
     REQUIRE(anonymous.has_value());
@@ -511,7 +511,7 @@ MACHA_FAST_TEST("users", test_genesis_creates_root_and_anonymous_once) {
 MACHA_FAST_TEST("users", test_root_and_anonymous_cannot_be_removed_or_recreated) {
     TestCluster cluster;
     BareNode node(cluster.node_config("n1"), cluster.keys());
-    UsersApi api(node);
+    UsersApi api(node, node.accounts());
     TempDir dir;
     auto genesis = create_initial_accounts(node.users(), cluster.keys(), dir.path(), node.node_id());
     REQUIRE(genesis.has_value());
@@ -556,7 +556,7 @@ MACHA_FAST_TEST("users", test_password_login_is_local_and_mints_a_bound_session)
         node.users().create("dave", "hunter2", {std::string(role_manager)}, node.node_id());
     REQUIRE(created.has_value());
 
-    SessionApi api(node);
+    SessionApi api(node, node.accounts());
     HttpRequest request;
     request.method = "POST";
     request.path = "/api/v1/session";
@@ -619,7 +619,7 @@ MACHA_FAST_TEST("users", test_failed_logins_lock_out_then_recover) {
 MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
     TestCluster cluster;
     BareNode node(cluster.node_config("n1"), cluster.keys());
-    UsersApi api(node);
+    UsersApi api(node, node.accounts());
 
     const auto create_body =
         R"({"username":"frank","password":"long-enough-pw","roles":["manager"]})";
@@ -706,7 +706,7 @@ MACHA_FAST_TEST("users", test_users_api_requires_admin_and_hides_hashes) {
 MACHA_FAST_TEST("users", test_anonymous_session_has_no_account) {
     TestCluster cluster;
     BareNode node(cluster.node_config("n1"), cluster.keys());
-    UsersApi api(node);
+    UsersApi api(node, node.accounts());
     SessionIdentity anonymous{"s", Hash256{}, {std::string(role_media_viewer)}, {}};
     auto response = api.handle(users_request("GET", "/api/v1/users/me", anonymous));
     CHECK(response.status == 404);
@@ -744,7 +744,7 @@ MACHA_TEST("users", test_users_replicate_and_login_works_on_the_other_node) {
 
     // A password change invalidates sessions minted against the old one, on
     // every node, by replicating one record.
-    SessionApi api2(n2);
+    SessionApi api2(n2, n2.accounts());
     auto minted = n2.sessions().create(check.roles, check.user_id, check.credential_generation);
     REQUIRE(minted.has_value());
     REQUIRE(n2.users().find(check.user_id)->credential_generation ==
@@ -819,7 +819,7 @@ MACHA_TEST("users", test_login_does_not_wait_on_an_unreachable_peer) {
                 .create("ivan", "pw", {std::string(role_manage_users)}, n1.node_id())
                 .has_value());
 
-    SessionApi api(n1);
+    SessionApi api(n1, n1.accounts());
     HttpRequest request;
     request.method = "POST";
     request.path = "/api/v1/session";
@@ -895,7 +895,7 @@ MACHA_FAST_TEST("users", test_the_last_user_manager_cannot_be_demoted_or_removed
     TempDir dir;
     auto genesis = create_initial_accounts(node.users(), cluster.keys(), dir.path(), node.node_id());
     REQUIRE(genesis.has_value());
-    UsersApi api(node);
+    UsersApi api(node, node.accounts());
 
     const auto root_id = genesis->root.id;
     CHECK(node.users().sole_user_manager(root_id));
@@ -1009,7 +1009,7 @@ MACHA_TEST("users", test_status_needs_view_status_and_health_needs_nothing) {
     const auto port = fixture.config().catalogue.api.port;
 
     const auto token_for = [&](std::vector<std::string> roles) {
-        auto minted = service.node().sessions().create(expand_roles(roles));
+        auto minted = service.accounts().sessions().create(expand_roles(roles));
         REQUIRE(minted.has_value());
         return std::map<std::string, std::string>{
             {"Authorization", "Bearer " + minted->bearer_token}};

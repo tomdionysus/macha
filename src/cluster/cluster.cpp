@@ -16,17 +16,6 @@
 #include <unistd.h>
 
 namespace macha {
-namespace {
-// Retry delay for a gossip broadcast that missed a peer: long enough not to
-// become a load source, short enough for a rejoining node to converge promptly.
-constexpr auto gossip_retry_floor = std::chrono::seconds(1);
-// Re-announce this often even when nothing changed and every peer is
-// believed told: broadcast_best_effort() counts frames QUEUED, not applied,
-// so a peer whose inbound route is not yet usable (as while it restarts) can
-// be marked told without receiving anything. Announcing on change is the
-// optimisation; this is the guarantee.
-constexpr auto gossip_reannounce_interval = std::chrono::seconds(30);
-} // namespace
 
 namespace {
 NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64_t capacity,
@@ -187,12 +176,6 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
                cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, identity_.id, Endpoint{members_.self().host, members_.self().port}),
       telemetry_(identity_.id, cfg_.state_path / "telemetry" / "last-known.bin"),
-      sessions_(cfg_.session.anonymous_ttl, cfg_.session.max_sessions,
-               cfg_.state_path / "sessions" / "sessions.bin"),
-      users_(cfg_.session.max_users, cfg_.state_path / "users" / "users.bin",
-             hkdf_sha256(identity_.keys.master, {},
-                         std::span<const uint8_t>(
-                             reinterpret_cast<const uint8_t*>("macha/users/v1"), 14))),
       client_(
           identity_.keys, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
@@ -369,31 +352,6 @@ void NodeRuntime::start() {
     Log::info("node " + to_string(identity_.id).substr(0, 12) + " listening on " +
               std::to_string(server_.bound_port()) + " domain=" + members_.self().failure_domain +
               " state=recovering");
-
-    // A node with no bootstrap peers founds the cluster (the same test
-    // MetadataReplica uses for genesis authority, see below): the only moment
-    // an account may be created without one to authorise it.
-    // A joining node with bootstrap peers and an empty user table cannot
-    // authenticate anything (403 everywhere), so it says so loudly.
-    if (!cfg_.bootstrap.empty() && users_.all().empty()) {
-        Log::warn("accounts: this node holds no user accounts, so nothing can sign in and "
-                  "every API route will refuse with 403");
-        Log::warn("accounts: if this cluster has just been upgraded, stop one node and run: "
-                  "macha-users " + cfg_.state_path.string() + " <cluster.key> init");
-        Log::warn("accounts: if it has not, this node has simply not received the user table "
-                  "yet and will converge shortly");
-    }
-
-    if (cfg_.bootstrap.empty()) {
-        if (auto initial = create_initial_accounts(users_, identity_.keys, cfg_.state_path, identity_.id)) {
-            // The password is in the 0600 file, never in a log line.
-            Log::warn("accounts: created the '" + initial->root.username + "' and '" +
-                      initial->anonymous.username + "' accounts for this new cluster");
-            Log::warn("accounts: the generated " + initial->root.username + " password is in " +
-                      initial->path.string() + " -- sign in, change it, delete that file");
-            propagate_users();
-        }
-    }
 
     telemetry_worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("cluster-telemetry", stop, [this, stop] { telemetry_loop(stop); });
@@ -837,24 +795,6 @@ void NodeRuntime::bind_control_routes() {
               return {MessageType::identity_resets_reply,
                       encode_identity_resets(identity_resets())};
           });
-    route(MessageType::user_sync,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              if (!request.payload.empty())
-                  (void)users_.apply_all(decode_users(request.payload));
-              return {MessageType::user_sync_reply, encode_users(users_.all())};
-          });
-    route(MessageType::session_sync,
-          [this]([[maybe_unused]] const NodeInfo& peer, [[maybe_unused]] FrameType frame_type,
-                 [[maybe_unused]] const RpcMessage& request) -> RpcMessage {
-              if (!request.payload.empty())
-                  for (const auto& session : decode_sessions(request.payload))
-                      apply_session(session);
-              const auto gossip_ttl =
-                  std::max(cfg_.dead_after * 2, std::chrono::milliseconds(60000));
-              return {MessageType::session_sync_reply,
-                      encode_sessions(sessions_.recent(gossip_ttl, 64))};
-          });
 }
 
 
@@ -1051,48 +991,6 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         } catch (const std::exception& error) {
             Log::debug("telemetry refresh skipped: " + std::string(error.what()));
         }
-        // Sessions are pushed on mutation (propagate_session); this is the
-        // backstop for a peer unreachable at the time, on the existing tick.
-        try {
-            sessions_.prune_expired(unix_ms());
-            auto values = sessions_.recent(gossip_ttl, 64);
-            if (!values.empty()) {
-                // As for the user table: each notification costs every peer a
-                // bounded queue admission, so an unchanged set is not resent.
-                auto payload = encode_sessions(values);
-                const auto digest = sha256(payload);
-                std::set<NodeId> peers;
-                for (const auto& peer : members_.active())
-                    if (peer.id != identity_.id)
-                        peers.insert(peer.id);
-                const auto now = Clock::now();
-                const bool sessions_due =
-                    digest != gossiped_sessions_ || peers != gossiped_session_peers_ ||
-                    now - gossiped_sessions_at_ >= gossip_reannounce_interval;
-                if (sessions_due && now >= gossip_sessions_retry_after_) {
-                    const auto reached = client_.broadcast_best_effort(
-                        {MessageType::session_sync, std::move(payload)}, FrameType::control);
-                    // Record it only once it reached everyone: a best-effort
-                    // notify queues nothing for a busy or not-yet-usable peer
-                    // (as when a peer rejoins), and recording anyway would
-                    // retire the retry before it ran.
-                    if (reached >= peers.size()) {
-                        gossiped_sessions_ = digest;
-                        gossiped_session_peers_ = std::move(peers);
-                        gossiped_sessions_at_ = now;
-                    } else {
-                        // Retry on a floor, not every tick: an unreached peer
-                        // is usually busy, and gossip must not add load to it.
-                        gossip_sessions_retry_after_ = Clock::now() + gossip_retry_floor;
-                    }
-                }
-            }
-        } catch (const std::exception& error) {
-            Log::debug("session gossip skipped: " + std::string(error.what()));
-        }
-        // The whole user table, tombstones included, so a node that missed a
-        // deletion learns the tombstone rather than resurrecting the account.
-        gossip_users_if_changed();
         handled_demand = demand;
         cpu_reporter.tick();
         std::unique_lock lock(telemetry_wait_mutex_);
@@ -1133,80 +1031,6 @@ void NodeRuntime::propagate_identity_reset(const IdentityAssociationReset& reset
         } catch (const std::exception& error) {
             Log::debug("identity reset propagation to " + peer.host + ": " + error.what());
         }
-    }
-}
-
-bool NodeRuntime::apply_session(const AuthSession& session) {
-    return sessions_.apply(session);
-}
-
-void NodeRuntime::propagate_session(const AuthSession& session) {
-    (void)apply_session(session);
-    // Notify, never call: a synchronous call would stall every login on an
-    // unreachable-but-not-dead peer, exactly when logging in matters. The
-    // local merge is done and the gossip tick is the backstop.
-    try {
-        (void)client_.broadcast_best_effort({MessageType::session_sync, encode_sessions({session})},
-                                            FrameType::control);
-    } catch (const std::exception& error) {
-        Log::debug("session propagation skipped: " + std::string(error.what()));
-    }
-}
-
-bool NodeRuntime::apply_user(const UserRecord& user) {
-    return users_.apply(user);
-}
-
-void NodeRuntime::gossip_users_if_changed() {
-    // Every notification costs each peer an admission slot in its bounded
-    // request queue, most on a busy node, so an unchanged table sends
-    // nothing. A broadcast goes out when the table changed here or a peer
-    // appeared that may have missed it (how a node that was down converges:
-    // the whole table, tombstones included, goes out once).
-    try {
-        const auto table = users_.table_hash();
-        std::set<NodeId> peers;
-        for (const auto& peer : members_.active())
-            if (peer.id != identity_.id)
-                peers.insert(peer.id);
-        // Unchanged, nobody new, re-announce not due: send nothing.
-        const auto now = Clock::now();
-        if (table == gossiped_user_table_ && peers == gossiped_user_peers_ &&
-            now - gossiped_users_at_ < gossip_reannounce_interval)
-            return;
-        if (now < gossip_users_retry_after_)
-            return;
-
-        auto values = users_.all();
-        if (values.empty())
-            return;
-        const auto reached = client_.broadcast_best_effort(
-            {MessageType::user_sync, encode_users(values)}, FrameType::control);
-        // Commit only when it reached everyone, so a not-yet-usable peer is
-        // retried next tick rather than marked told.
-        if (reached >= peers.size()) {
-            gossiped_user_table_ = table;
-            gossiped_user_peers_ = std::move(peers);
-            gossiped_users_at_ = now;
-        } else {
-            gossip_users_retry_after_ = Clock::now() + gossip_retry_floor;
-        }
-    } catch (const std::exception& error) {
-        Log::debug("user gossip skipped: " + std::string(error.what()));
-    }
-}
-
-void NodeRuntime::propagate_users() {
-    // Always the full table: a peer offline longer than the gossip TTL must
-    // still converge, and at tens of records it is smaller than the telemetry set.
-    try {
-        auto values = users_.all();
-        if (values.empty())
-            return;
-        (void)client_.broadcast_best_effort({MessageType::user_sync, encode_users(values)},
-                                            FrameType::control);
-    } catch (const std::exception& error) {
-        Log::debug("user propagation skipped: " + std::string(error.what()));
     }
 }
 

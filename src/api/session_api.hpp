@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "auth/accounts.hpp"
 #include "cluster/cluster.hpp"
 #include "http/http.hpp"
 #include "json.hpp"
@@ -70,11 +71,12 @@ class PasswordCredentialValidator final : public CredentialValidator {
 // (see capability_request).
 class SessionApi {
     SessionManager& sessions_;
-    NodeRuntime& node_;
+    Accounts& accounts_;
     std::unique_ptr<CredentialValidator> validator_;
 
   public:
-    explicit SessionApi(NodeRuntime& node, std::unique_ptr<CredentialValidator> validator = {});
+    SessionApi(NodeRuntime& node, Accounts& accounts,
+               std::unique_ptr<CredentialValidator> validator = {});
     HttpResponse handle(const HttpRequest&);
     static bool capability_request(const HttpRequest&);
 };

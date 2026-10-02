@@ -112,11 +112,12 @@ CredentialResult PasswordCredentialValidator::validate(const Json& credentials) 
             {std::move(check.roles), std::move(check.user_id), check.credential_generation}};
 }
 
-SessionApi::SessionApi(NodeRuntime& node, std::unique_ptr<CredentialValidator> validator)
-    : sessions_(node.sessions()), node_(node),
+SessionApi::SessionApi(NodeRuntime& node, Accounts& accounts,
+                       std::unique_ptr<CredentialValidator> validator)
+    : sessions_(accounts.sessions()), accounts_(accounts),
       validator_(validator ? std::move(validator)
                            : std::make_unique<PasswordCredentialValidator>(
-                                 node.users(), node.config().session)) {}
+                                 accounts.users(), node.config().session)) {}
 
 bool SessionApi::capability_request(const HttpRequest& request) {
     return request.method == "POST" && request.path == "/api/v1/session";
@@ -159,8 +160,8 @@ HttpResponse SessionApi::handle(const HttpRequest& request) {
             if (!minted)
                 return http_error(429, "too_many_sessions",
                                   "this node's session capacity is exhausted; retry shortly");
-            node_.propagate_session(minted->session);
-            return http_json(201, session_json(minted->session, node_.users(), minted->bearer_token).dump());
+            accounts_.propagate_session(minted->session);
+            return http_json(201, session_json(minted->session, accounts_.users(), minted->bearer_token).dump());
         }
 
         // Every other route under /api/v1/session acts on the caller's current
@@ -172,13 +173,13 @@ HttpResponse SessionApi::handle(const HttpRequest& request) {
             auto session = sessions_.find(request.session->token_hash);
             if (!session)
                 return http_error(401, "unauthorized", "session is no longer valid");
-            return http_json(200, session_json(*session, node_.users()).dump());
+            return http_json(200, session_json(*session, accounts_.users()).dump());
         }
 
         if (request.method == "DELETE") {
             auto revoked = sessions_.revoke(request.session->token_hash);
             if (revoked)
-                node_.propagate_session(*revoked);
+                accounts_.propagate_session(*revoked);
             return {204, "application/json; charset=utf-8", {}, {}};
         }
 

@@ -23,6 +23,7 @@
 #include "service/maintenance.hpp"
 #include "service/maintenance_clock.hpp"
 #include "service/node_services.hpp"
+#include "auth/accounts.hpp"
 #include "cluster/local_services.hpp"
 #include "cluster/node_resources.hpp"
 #include <atomic>
@@ -76,6 +77,9 @@ class Service {
     // Local recovery's stages, reported as the node's are.
     LocalState::StageHook recovery_stage_hook_;
     NodeRuntime node_;
+    // After the node, whose transport carries its gossip; started after the
+    // node and stopped before it.
+    Accounts accounts_;
     ClusterStatusService cluster_status_;
     // Torrent runs as a plugin and FUSE as a supervised builtin. Each publishes
     // what it provides in `registry_`, declared first and destroyed last so a
@@ -145,6 +149,9 @@ class Service {
     }
     NodeResources& resources() {
         return resources_;
+    }
+    Accounts& accounts() {
+        return accounts_;
     }
     LocalState& local_state() {
         wait_services_ready();

@@ -1258,7 +1258,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
         },
         10s));
 
-    ClusterStatusService status(peer, peer.resources.activity, peer.resources.data, peer.resources.memory);
+    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity, peer.resources.data, peer.resources.memory);
     HttpRequest request;
     request.method = "GET";
     request.path = "/api/v1/status";
@@ -1300,7 +1300,7 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
 MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_own_route) {
     TestCluster cluster;
     BareNode node(cluster.node_config("status-split"), cluster.keys());
-    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
 
     const auto body_of = [](const HttpResponse& response) {
         return Json::parse(
@@ -1411,7 +1411,7 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     // A pending replica-set validation does not demote write capability while
     // the durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
-    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
     sources.metadata = &metadata;
@@ -1613,7 +1613,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
-        ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+        ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
         HttpRequest request;
         request.method = "GET";
         request.path = "/api/v1/status";
@@ -1642,7 +1642,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
-        ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+        ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
         HttpRequest request;
         request.method = "GET";
         request.path = "/api/v1/status";
@@ -1670,7 +1670,7 @@ MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
         auto& node = fixture.start();
         REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
 
-        ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+        ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
         HttpRequest request;
         request.method = "GET";
         request.path = "/api/v1/status";
@@ -1729,7 +1729,7 @@ MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_n
     peer_telemetry.rss_bytes = 123456;
     node.telemetry().observe(peer_telemetry, true);
 
-    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
     sources.metadata = &metadata;
@@ -1822,7 +1822,7 @@ MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresh
     peer_telemetry.storage_backends_online = 1;
     node.telemetry().observe(peer_telemetry, true);
 
-    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
     sources.metadata = &metadata;
@@ -1875,7 +1875,7 @@ MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster
     REQUIRE(node.apply_identity_reset(reset));
     metadata.note_replica_validation(true);
 
-    ClusterStatusService status(node, node.resources.activity, node.resources.data, node.resources.memory);
+    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
     StatusSources sources;
     sources.local = &node.local_state();
     sources.metadata = &metadata;
@@ -3622,7 +3622,7 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
         return found;
     };
 
-    ClusterStatusService streaming_status(streamer, streamer.resources.activity, streamer.resources.data, streamer.resources.memory);
+    ClusterStatusService streaming_status(streamer, streamer.accounts(), streamer.resources.activity, streamer.resources.data, streamer.resources.memory);
     std::optional<Json> entry;
     REQUIRE(wait_until([&] {
         entry = node_entry(streaming_status, streamer.node_id());
@@ -3642,7 +3642,7 @@ MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
     quiet.start();
     REQUIRE(quiet.wait_local_state_ready(10s));
 
-    ClusterStatusService quiet_status(quiet, quiet.resources.activity, quiet.resources.data, quiet.resources.memory);
+    ClusterStatusService quiet_status(quiet, quiet.accounts(), quiet.resources.activity, quiet.resources.data, quiet.resources.memory);
     std::optional<Json> quiet_entry;
     REQUIRE(wait_until([&] {
         quiet_entry = node_entry(quiet_status, quiet.node_id());
