@@ -4,8 +4,9 @@
 // `entries(view, cursor, budget)`; T4c). Its acceptance: it visits exactly
 // the set and order of the callback walk, across budget boundaries, on every
 // shape of tree, and on a map-backed snapshot.
+#include "metadata/namespace_control_store.hpp"
 #include "metadata/namespace_tree.hpp"
-#include "test_framework.hpp"
+#include "test_support.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -179,6 +180,48 @@ MACHA_FAST_TEST("namespace_entries", test_a_missing_node_or_store_throws) {
         threw = true;
     }
     CHECK(threw);
+}
+
+} // namespace
+
+// The contract's `entries` on a running node: the manager pages its own
+// namespace (map-backed on a fresh node, which migrates to a tree only when
+// told; the tree is covered above), equal to the callback walk over the
+// same view.
+namespace {
+
+MACHA_TEST("namespace_entries", test_the_metadata_view_pages_a_live_namespace) {
+    macha::test_support::TestService fixture("entries-live");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.catalogue.scanner.enabled = false;
+    config.catalogue.api.enabled = false;
+    config.ingest.enabled = false;
+    config.torrent.enabled = false;
+    auto& service = fixture.start();
+    for (int i = 0; i < 12; ++i)
+        macha::test_support::write_file(service.filesystem(), "/f" + std::to_string(i),
+                                        macha::test_support::pattern(1024, i));
+    MetadataView& metadata = service.metadata_manager();
+    const auto view = metadata.converged();
+
+    auto nodes = ControlNamespaceNodeStore::for_reading(service.node(), service.filesystem().store());
+    const auto expected = by_callback(*view.snapshot, &nodes);
+    CHECK(expected.size() >= 12);
+    std::vector<NamespaceItem> paged;
+    Cursor<std::string> cursor;
+    for (int pages = 0; pages < 100; ++pages) {
+        Budget budget;
+        budget.operations(5);
+        auto page = metadata.entries(view, cursor, budget);
+        for (auto& item : page.items)
+            paged.push_back(std::move(item));
+        if (page.complete())
+            break;
+        cursor = page.next;
+    }
+    CHECK(paged == expected);
 }
 
 } // namespace

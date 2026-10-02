@@ -96,3 +96,27 @@ compiler's guarantee, not the count's.
   node's namespace (the acceptance's second half), which needs an
   operator-side check over a state directory.
 - Suites 707/707.
+
+## T4d: the store at construction; `entries` on the contract (2026-10-02)
+
+- `MetadataManager::set_namespace_store` is gone: the manager takes its
+  namespace store at construction, and construction installs the replica's
+  commit application for tree deltas through it (B2: declared, unchanged).
+  In `Service` that installs it when the manager is built rather than ~70
+  lines later in startup: earlier, never later. Tests that build a manager
+  with no store serve map-backed namespaces, as before.
+- Recorded, not fixed: the applier captures the manager and nothing removes
+  it when the manager is destroyed, so the replica could call into a
+  destroyed manager at shutdown. It predates T4; a fix is a destructor that
+  clears it, for the operator.
+- `MetadataView::entries(view, cursor, budget)`: the manager pages a view
+  with T4c's walk over its own control store.
+  `namespace_entries/test_the_metadata_view_pages_a_live_namespace` pages a
+  running node's namespace through the contract and matches the callback
+  walk.
+- A false alarm, recorded for the method: one run reported 250 failures
+  with segfaults. A header adding a virtual method was edited while a
+  background build was compiling, so objects disagreed about the vtable.
+  A rebuild from consistent sources passed everything. Never edit sources
+  under a running build.
+- Suites 708/708, 17/17; traces 240/240.

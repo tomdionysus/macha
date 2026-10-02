@@ -185,7 +185,12 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     void publish_replica_state(bool validated, std::string_view reason = {});
 
   public:
-    explicit MetadataManager(NodeRuntime&);
+    // `namespace_store`, when given, is where tree-backed namespaces' nodes
+    // are read and written; construction installs the replica's commit
+    // application for tree deltas through it (spec B2: commit application
+    // is declared here, unchanged). Without one the manager serves
+    // map-backed namespaces only, as the tests that need no store do.
+    explicit MetadataManager(NodeRuntime&, DistributedStore* namespace_store = nullptr);
 
     // Where namespace tree nodes live, for a snapshot whose namespace is a
     // tree. Supplied rather than constructed here because the manager has a
@@ -196,7 +201,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     //
     // Unset until Service has a store, and irrelevant while no snapshot
     // carries a root -- which is every snapshot today.
-    void set_namespace_store(DistributedStore* store);
     void set_publication_retention(std::function<void(const MetadataPublicationContext&)> guard) {
         publication_retention_ = std::move(guard);
     }
@@ -305,5 +309,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     }
     MetadataClusterStatus status() const noexcept override { return cluster_status(); }
     void repair_step() override { repair_once(); }
+    Page<std::pair<std::string, FsEntry>, std::string>
+    entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) override;
 };
 } // namespace macha

@@ -562,7 +562,7 @@ void Service::initialise_services(std::stop_token stop) {
 
         auto store = std::make_unique<DistributedStore>(node_);
         store->persist_repair_position(node_.config().state_path / "repair" / "push-position");
-        auto metadata = std::make_unique<MetadataManager>(node_);
+        auto metadata = std::make_unique<MetadataManager>(node_, store.get());
         auto catalogue = std::make_unique<CatalogueManager>(node_, *store, *metadata);
         auto fs = std::make_unique<FileSystem>(node_, *store, *metadata, &playback_);
         auto catalogue_hints = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
@@ -631,7 +631,6 @@ void Service::initialise_services(std::stop_token stop) {
 
         store_ = std::move(store);
         store_->set_repair_trace(maintenance_trace_);
-        metadata->set_namespace_store(store_.get());
         // Repair is the only component that learns an object is unobtainable,
         // and it learns it in the ordinary course of a maintenance pass. Wire
         // its counters to Status now that the store exists.
