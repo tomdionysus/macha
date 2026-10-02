@@ -49,7 +49,7 @@ resumes from `develop` and the experiment's version line ceases to exist.
   | `universal` | `-universal` | merged |
   | T2 slice | `-t2` | merged; assessed |
   | T3 ledger | `-t3` | merged; assessed (`t3/assessment.md`) |
-  | T4 metadata | `-t4` | next |
+  | T4 metadata | `-t4` | built, assessed; fi-1 run owed |
 
 - **T0's baseline is filled** (2026-10-01): soak plus a six-hour top-up,
   2026-09-30 07:04Z to 2026-10-01 20:43Z,
@@ -106,9 +106,11 @@ resumes from `develop` and the experiment's version line ceases to exist.
     reconciles at most one catalogue-root conflict and may commit. Whether
     that second commit per pass feeds the loop is not established; removing
     it is a behaviour change, for the operator.
-- **T4 next** (plan, T4): the metadata contract; the catalogue's hidden
-  repair split out of the inventory build into an explicit step (which the
-  conflict loop gives a second reason to watch).
+- **T4 is built and assessed** (`object-ledger-evidence/t4/assessment.md`:
+  no kill criterion met). Owed before acceptance: fi-1's GCC build, suites
+  and coverage, and `entries` against a copy of each live node's
+  namespace. Then merge `-t4` and cut T5, the first deploy since T0 (plan:
+  nothing deploys between T0 and T5).
 - **Future experiment: memoised horizon builds** (spec, Later stages):
   subtree referenced sets kept by subtree id, partial builds merging in any
   order; first measure how often the inventory and release heads coincide.
@@ -238,6 +240,23 @@ glibc heap checking on. Items the experiment absorbs say so.
    730 route need cases of their own before the list is complete. T4 splits
    `snapshot_view()` into `current()` and `converged()`. The fixes stay this
    item's.
+   **T4's list (2026-10-02), every `MetadataView::converged()` call outside
+   `src/metadata/`** (`converged()` reads the replicas when the cache is
+   behind, so it may wait on the network):
+   - `manage_api.cpp` 730, `POST /api/v1/manage/nodes/{id}`: control context,
+     guarded; the known violation.
+   - `FileSystem::namespace_index()`, reached from `resolve_existing_path`,
+     `resolve_new_path`, `getattr` and `readdir`: FUSE and HTTP request
+     paths, unguarded (no work context). Memory-only while the cache is
+     current; a stale cache makes them read the replicas.
+   - `FileSystem::find_media()` (playback's media lookup): reads the
+     replicas only when the decoded view is missing or behind the known
+     generation; unguarded.
+   - Background, not this item's: `FileSystem::namespace_signature()`
+     (catalogue scanner), `FileSystem::maintenance_objects_cached()` (the
+     maintenance pass), `TorrentCoordinator::current_view()` (its own
+     passes).
+   - `FileSystem::snap()` has no callers left: dead code, to delete.
 
 3. **Unexplained on fi-1, 2026-09-29 ~12:00Z** (a viewer reported skips and
    pauses): a playback `PATCH` answered 503 after 19.9 s, a `DELETE` took
