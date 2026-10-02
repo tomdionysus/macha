@@ -1,5 +1,40 @@
 # Current release
 
+## 0.75.0 — The object ledger experiment through T4, and T5's first step (experiment)
+
+The object ledger experiment's first deploy since 0.74.0 (T0): its steps T1
+to T4 and the first of T5's, judged in-process until now, and two FUSE
+fixes. No API, wire format, protocol or on-disk format changes; either node
+can go back to 0.74.0 by reinstalling it.
+
+**A node stops cleanly while an fsync waits for its data.** An fsync waits,
+with no deadline once started, for its data to be published to the
+cluster. On a stopping node that publication can never finish, the mount
+cannot exit with the fsync outstanding, and the stop waited until systemd
+killed the process (2 of 6 restarts under load on 2026-10-01). The stop now
+ends those waits first: the fsync returns EIO, and the data, already
+journalled, publishes after the restart.
+
+**The FUSE publication writer cap holds.** The cap on publications open at
+once (what keeps the retained-memory ledger from deadlocking against
+itself) was read when a file was selected and taken when its publication
+opened, under different locks, so several workers could each open one and
+pass it. A worker now reserves its slot at selection.
+
+**The node's services are one composition root.** Everything built once
+local state recovers is constructed in dependency order and stopped in
+reverse: hydration now starts before the plugins that use it; maintenance
+stops first among the consumers; the HTTP server stops before the services
+it routes into; the plugins, torrent coordinator and cluster job view still
+stop first, while the node still takes their writes, and then outbound
+calls are cancelled; the service's stop runs once.
+
+Inside, unchanged in behaviour (decision traces identical at every step):
+the object ledger (horizons, gates, claims, predicate queries), the horizon
+builder, the metadata contract, the catalogue's repair split out of the
+maintenance inventory, a resumable namespace walk, and
+`macha-metadata-dump --entries-check`.
+
 ## 0.74.0 — The node measures itself to a local file (experiment)
 
 The object ledger experiment's first version (T0 in
