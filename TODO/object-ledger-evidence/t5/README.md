@@ -57,3 +57,34 @@ at ~16:21Z for reasons outside Macha, before the install.
 Repair on fi-1 (0.75.0, 15:47-16:08Z): unsourceable objects rising with
 the pull walk (5,323 to 5,662), reachable at a steady 3.04x unsourceable;
 the walk had covered ~2.6% of the id space (samples in build/obs/).
+
+### fi-1's disk lost and recovered (0.76.0), 17:38-17:56Z
+
+fi-1's USB data disk dropped at 17:38:03Z (kernel: USB disconnect, ext4
+journal aborted, filesystem shut down); Macha marked the backend offline
+one second later and kept serving. After the operator's power cycles the
+disk was absent at first (Macha up degraded in 16 s, metadata writable),
+then present: systemd mounted it at 17:55:47Z and Macha brought the
+backend online by itself at 17:56:37Z (probe 48.9 s, accounting
+reconciling). No hand on Macha.
+
+Found on the way: while the disk was absent (since ~16:21Z, the earlier
+reset), torrent staging wrote 671 MB into `/mnt/diskB/ingest/torrents` on
+the SD card, now hidden under the mount. Staging has no equivalent of the
+backend's marker check. Product gap, left for after T5; the hidden files
+are untouched.
+
+## 0.77.0 smoke test on fi-1 (2026-10-02)
+
+T5.10 (MetadataServer) and T5.11 (StorageServer). Suites on fi-1 before
+install: 703 + 17 + 21, all passing (`6901443`). Tarball md5
+`a0ef102d7e1a5e9e9b6dc40de9335ea5`; backup `/root/macha-0.76.0-installed.tgz`.
+
+- Installed 18:19:21Z with one playback session on fi-1: 0.76.0 stopped in
+  2 s; DATA backend online 18:19:30 (350 GB used of 8 TB); metadata ready,
+  services ready and writable 18:19:36 (12 s); healthy 18:19:39.
+- Status on both nodes: every plane ready, both nodes ready, subsystems
+  running with no restarts, diagnostics answering. gbni-1 (0.75.0) logged
+  no "not available" refusals and no warnings or errors after the install.
+- Reads through fi-1's FUSE: 16 MiB in 3.8 s and 6.0 s for the two
+  readable films sampled earlier.
