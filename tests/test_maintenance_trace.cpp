@@ -597,13 +597,11 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     peer = std::make_unique<Service>(config_b, cluster.keys());
     peer->start();
     // Rejoining runs on real time and restarts GC's quiet window, so step only
-    // once the cluster has settled.
-    REQUIRE(wait_until(
-        [&] {
-            return service.node().membership().all_known_reachable() &&
-                   service.metadata_manager().cluster_status().stable;
-        },
-        10s));
+    // once the cluster has settled. The rejoin's convergence retry is
+    // debounced on the pass's clock, which this fixture moves.
+    REQUIRE(wait_until([&] { return service.node().membership().all_known_reachable(); }, 10s));
+    node.advance(100ms);
+    REQUIRE(wait_until([&] { return service.metadata_manager().cluster_status().stable; }, 10s));
     node.settle();
     node.advance(100ms);
     node.step("peer back");
