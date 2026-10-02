@@ -24,7 +24,8 @@ class PlaybackManager {
     std::unique_ptr<Impl> impl_;
 
   public:
-    PlaybackManager(FileSystem&, CatalogueManager&, CatalogueApiConfig, StreamingConfig,
+    PlaybackManager(FileSystem&, TranscodeRateBook&, RetainedMemoryLedger&, CatalogueManager&,
+                    CatalogueApiConfig, StreamingConfig,
                     std::shared_ptr<MediaEngine> = {},
                     std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
                     MediaInformationService* media_information = nullptr);

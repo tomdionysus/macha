@@ -131,6 +131,9 @@ class Service {
     NodeRuntime& node() {
         return node_;
     }
+    NodeResources& resources() {
+        return resources_;
+    }
     MetadataManager& metadata_manager() {
         wait_services_ready();
         return services_->metadata();

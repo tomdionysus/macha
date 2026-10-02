@@ -117,6 +117,9 @@ class DistributedStore final : public Placement {
     };
 
     NodeRuntime& n_;
+    ActivityClocks& activity_;
+    DataResourceArbiter& data_resources_;
+    RetainedMemoryLedger& retained_memory_;
     StoragePool::Cursor repair_push_cursor_;
     // Objects taken from the push cursor and not yet settled, in cursor order,
     // with one batched presence round's findings. A step that stops leaves
@@ -255,7 +258,8 @@ class DistributedStore final : public Placement {
     void note_network(uint64_t, Clock::duration);
 
   public:
-    explicit DistributedStore(NodeRuntime& n, DistributedStoreOptions options = {});
+    DistributedStore(NodeRuntime& n, ActivityClocks& activity, DataResourceArbiter& data_resources,
+                     RetainedMemoryLedger& retained_memory, DistributedStoreOptions options = {});
     ~DistributedStore();
     struct PromptReplicationStats {
         uint64_t queued{};
@@ -313,8 +317,8 @@ class DistributedStore final : public Placement {
                  FrameType frame_type = FrameType::speculative);
     void erase_all(const ObjectId&);
     void foreground_activity(uint64_t bytes) { note_foreground(bytes); }
-    void interactive_activity(uint64_t bytes) { n_.note_activity(FrameType::read_ahead, bytes); }
-    void loader_activity(uint64_t bytes) { n_.note_activity(FrameType::loader, bytes); }
+    void interactive_activity(uint64_t bytes) { activity_.note(FrameType::read_ahead, bytes); }
+    void loader_activity(uint64_t bytes) { activity_.note(FrameType::loader, bytes); }
 
     // Pushes local objects to their owners and pulls live objects this node
     // should own. repair_step() keeps push/pull cursors across calls and never
@@ -334,21 +338,20 @@ class DistributedStore final : public Placement {
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 
-    uint64_t take_foreground_bytes() { return n_.take_activity_bytes(FrameType::foreground); }
-    uint64_t take_interactive_bytes() { return n_.take_activity_bytes(FrameType::read_ahead); }
-    uint64_t take_loader_bytes() { return n_.take_activity_bytes(FrameType::loader); }
+    uint64_t take_foreground_bytes() { return activity_.take_bytes(FrameType::foreground); }
+    uint64_t take_interactive_bytes() { return activity_.take_bytes(FrameType::read_ahead); }
+    uint64_t take_loader_bytes() { return activity_.take_bytes(FrameType::loader); }
     std::chrono::milliseconds foreground_idle_for() const;
     std::chrono::milliseconds interactive_idle_for() const {
-        return n_.activity_idle_for(FrameType::read_ahead);
+        return activity_.idle_for(FrameType::read_ahead);
     }
     // Durable user-requested work (FUSE publication, ingest, acquisition);
     // law 3 ranks it above background maintenance, which must see it.
     std::chrono::milliseconds loader_idle_for() const {
-        return n_.activity_idle_for(FrameType::loader);
+        return activity_.idle_for(FrameType::loader);
     }
     double estimated_network_bps() const {
         return network_bps_.load();
     }
-    RetainedMemoryLedger& retained_memory() noexcept { return n_.retained_memory(); }
 };
 } // namespace macha

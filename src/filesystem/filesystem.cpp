@@ -303,7 +303,7 @@ void WriteHandle::ensure_buffer_memory() {
     if (buffer_memory_)
         return;
     const auto memory_class = filesystem_memory_class(work_context_.frame_type());
-    auto& ledger = fs_.node().retained_memory();
+    auto& ledger = fs_.retained_memory_;
 
     // Without a no-progress budget, wait on the caller's deadline alone.
     const auto* progress = work_context_.progress();
@@ -1436,8 +1436,9 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
-FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataView& m, PlaybackTracker* playback)
-    : n_(n), s_(s), m_(m), playback_(playback) {
+FileSystem::FileSystem(NodeRuntime& n, DistributedStore& s, MetadataView& m,
+                       RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
+    : n_(n), retained_memory_(retained_memory), s_(s), m_(m), playback_(playback) {
     extent_worker_limit_ = std::max<size_t>(1, n_.config().fuse.commit_workers);
     extent_task_limit_ = extent_worker_limit_ * 2;
     extent_workers_.reserve(extent_worker_limit_);

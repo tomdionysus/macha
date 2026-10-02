@@ -383,7 +383,7 @@ MACHA_TEST("contract", test_the_wait_guard_on_a_cold_catalogue) {
     test_support::BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node);
+    DistributedStore store(node, node.resources.activity, node.resources.data, node.resources.memory);
     MetadataManager metadata(node);
     CatalogueManager catalogue(node, store, metadata);
 

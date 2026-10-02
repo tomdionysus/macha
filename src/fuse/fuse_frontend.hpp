@@ -574,7 +574,7 @@ class FuseFrontend final : public HydrationHintProvider {
     // The stop token cancels the wait for the initial namespace, the one
     // unbounded wait in construction, so Service::stop() can join the
     // lifecycle thread if the metadata replica never arrives.
-    FuseFrontend(FileSystem&, FuseConfig, std::stop_token = {});
+    FuseFrontend(FileSystem&, RetainedMemoryLedger&, FuseConfig, std::stop_token = {});
     ~FuseFrontend() override;
     FuseFrontend(const FuseFrontend&) = delete;
     FuseFrontend& operator=(const FuseFrontend&) = delete;
