@@ -949,9 +949,15 @@ Bytes preferred_for(NodeRuntime& observer, const NodeId& preferred, size_t bytes
         return std::any_of(active.begin(), active.end(),
                            [&](const NodeInfo& node) { return node.id == preferred; });
     }, 10s));
-    for (unsigned i = 0; i < 4096; ++i) {
-        auto data = pattern(bytes, static_cast<uint8_t>(salt_start + i));
-        data[0] ^= static_cast<uint8_t>(i);
+    // Every candidate is distinct: the whole counter is written into the
+    // object. Until 2026-10-02 the salt and the xor were both the counter cast
+    // to a byte, so the 4096 iterations made only 256 distinct objects; with a
+    // node weighted 2% of the capacity, all 256 missed it about 1 run in 400
+    // (fi-1's suite on 2026-10-02, 11 in 3000 on the laptop).
+    auto data = pattern(bytes, salt_start);
+    for (uint32_t i = 0; i < 4096; ++i) {
+        for (size_t b = 0; b < 4 && b < data.size(); ++b)
+            data[b] = static_cast<uint8_t>(i >> (8 * b));
         const auto id = object_id(data);
         auto ranked = capacity_placement_nodes(id.bytes, observer.membership().active(), 1);
         if (!ranked.empty() && ranked.front().id == preferred)
