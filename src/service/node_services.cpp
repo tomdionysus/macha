@@ -37,7 +37,9 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                 [this](const MetadataPublicationContext& context) {
                     retain_metadata_publication(context);
                 }),
-      catalogue_(node_, local_, metadata_server_, store_, metadata_),
+      ledger_(local_.retention(), local_.data(), local_.control()),
+      availability_(node_, local_, store_, ledger_, resources_.events, routes_),
+      catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
       filesystem_(node_.config(), node_.node_id(), node_.membership(), local_, metadata_server_,
                   store_, metadata_, resources_.memory, &playback_),
       catalogue_hints_(node_.config().state_path), media_engine_(media_engine_for(node_.config())),
@@ -86,13 +88,17 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
           [this](const std::vector<std::string>& media_ids) {
               return scanner_.request_media_profiles(media_ids);
           },
-          &media_information_),
+          &media_information_,
+          [this](Json::Object& entry, std::string_view media_id) {
+              put_media_availability(entry, availability_.snapshot().get(), media_id);
+          }),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
-      ledger_(local_.retention(), local_.data(), local_.control()),
       horizon_builder_(filesystem_, catalogue_, local_.control(), store_),
+      files_api_(filesystem_, availability_),
       maintenance_(
           MaintenanceDependencies{node_, local_, metadata_server_, store_, metadata_, metadata_,
-                                  catalogue_, horizon_builder_, ledger_, media_information_,
+                                  catalogue_, horizon_builder_, ledger_, availability_,
+                                  media_information_,
                                   resources_.events, port_, instruments_.clock, instruments_.trace,
                                   instruments_.maintenance_stage_hook, instruments_.constructed}) {
     routes_.bind(MessageType::get_ingest_jobs,

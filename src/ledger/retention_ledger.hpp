@@ -25,6 +25,9 @@ class RetentionLedger final : public ObjectLedger {
     Page<ObjectId, ObjectId> claimed(RetentionClass, Cursor<ObjectId> from,
                                      Budget&) const override;
     bool held(RetentionClass, const ObjectId&) const override;
+    uint64_t held_losses(RetentionClass type) const noexcept override {
+        return (type == RetentionClass::data ? data_ : control_).losses();
+    }
     InventoryHandle inventory() const override { return inventory_.handle(); }
     ReleaseHandle release() const override { return release_.handle(); }
     void publish(InventoryHandle) override;

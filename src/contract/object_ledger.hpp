@@ -30,6 +30,9 @@ class ObjectLedger {
     static constexpr Waits held_waits = ObjectStore::has_waits;
     static constexpr ThreadSafety held_safety = ThreadSafety::thread_safe;
     virtual bool held(RetentionClass, const ObjectId&) const = 0;
+    // The class's object store's losses(): advances when something held may
+    // no longer be.
+    virtual uint64_t held_losses(RetentionClass) const noexcept = 0;
 
     // The published horizons, null until first published. A held handle's
     // snapshot never changes. A pointer copy.

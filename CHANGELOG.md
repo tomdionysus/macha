@@ -1,5 +1,53 @@
 # Current release
 
+## 0.82.0 — what the cluster holds, by Merkle descent (experiment)
+
+The object ledger experiment's first consumer. One new cluster message
+(`tree_holdings`); no on-disk format changes. A node on 0.82.0 asks only
+peers that advertise 0.82.0 or later, so nodes may be upgraded one at a
+time, and either can go back to 0.81.0 by reinstalling it.
+
+**Every file says how much of it the reachable cluster holds.** Each node
+keeps, per node of the namespace tree, how many extents lie beneath it and
+how many it holds, and nodes compare by tree node id from the root down: a
+subtree a peer holds whole is settled by its id, only partial subtrees are
+descended, and no extent id is sent. The result is the set of extents no
+reachable node holds.
+
+**A files resource**, readable by any signed-in viewer:
+`GET /api/v1/files/<path>` is a file, or a directory with its entries, and
+`GET /api/v1/files?hash=macha:<id>` the files with that content. Each
+carries `extents`, `extents_local`, `extents_unavailable`,
+`extents_unknown`, `availability` (`complete`, `partial`, `unknown`),
+`surveyed_generation` and `surveyed_unix_ms`; a directory sums what is
+beneath it. `GET /api/v1/playback/media` carries the same seven fields on
+each media. These are facts: playback of a `partial` file is not refused.
+See [Files and availability](docs/files.md).
+
+**Repair no longer retries what nobody can supply.** An extent the survey
+found on no reachable node is passed over by repair's pull pass, without a
+fetch and without the "cannot source" warning. The survey asks again when
+the membership changes, a peer's storage shrinks, or a peer's storage grows
+while something is unavailable; once an extent is found, repair pulls it.
+
+**Two nodes writing at once no longer wait on each other.** A node kept
+one of its background DATA slots while it sent an extent to a peer or
+fetched one from it, and the peer needed one of its own to serve it. With
+both nodes importing or repairing toward each other, every slot was held
+by a transfer waiting on the other node, and nothing moved until the
+120-second no-progress timeout: writes through the mount stalled for
+minutes or failed. A slot is now held only for work on the node's own
+disk; a transfer to or from a peer is admitted by the peer.
+
+Also fixed: a write whose accounting marker could not be written kept its
+space reservation until restart; an RPC session being closed read its
+writer thread's handle while the session's own thread could be setting it.
+
+Inside, unchanged in behaviour: the catalogue asks the ledger, not the
+claim store, whether a staged object is claimed; object stores count their
+losses, so anything derived from what a store held can tell it has been
+overtaken.
+
 ## 0.81.0 — S: every lock checked by the compiler (experiment)
 
 The object ledger experiment's final sweep, begun. No wire format, protocol

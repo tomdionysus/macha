@@ -778,6 +778,70 @@ ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore&
     return updated;
 }
 
+std::vector<NamespaceTreeChild> namespace_tree_children(std::span<const uint8_t> node) {
+    std::vector<NamespaceTreeChild> children;
+    Reader reader(node);
+    const auto magic = reader.fixed<4>();
+    const auto extent = [&] {
+        const auto ref = decode_extent(reader);
+        if (!ref.hole)
+            children.push_back({true, ref.id});
+    };
+    if (magic == leaf_magic) {
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i) {
+            (void)reader.string(8192);
+            (void)reader.u8();
+            (void)reader.u32();
+            (void)reader.u32();
+            (void)reader.u32();
+            (void)reader.u64();
+            (void)reader.i64();
+            (void)reader.i64();
+            (void)reader.u64();
+            switch (static_cast<ExtentForm>(reader.u8())) {
+            case ExtentForm::none:
+                break;
+            case ExtentForm::inlined: {
+                const auto inlined = reader.u32();
+                for (uint32_t x = 0; x < inlined; ++x)
+                    extent();
+                break;
+            }
+            case ExtentForm::external:
+                (void)reader.u64();
+                children.push_back({false, ObjectId{reader.fixed<32>()}});
+                break;
+            default:
+                throw DecodeError("bad namespace tree extent form");
+            }
+        }
+    } else if (magic == branch_magic) {
+        (void)reader.u8();
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i) {
+            (void)reader.string(8192);
+            children.push_back({false, ObjectId{reader.fixed<32>()}});
+            (void)reader.u64();
+        }
+    } else if (magic == extent_leaf_magic) {
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i)
+            extent();
+    } else if (magic == extent_branch_magic) {
+        (void)reader.u8();
+        const auto count = reader.u32();
+        for (uint32_t i = 0; i < count; ++i) {
+            children.push_back({false, ObjectId{reader.fixed<32>()}});
+            (void)reader.u64();
+        }
+    } else {
+        throw DecodeError("not a namespace tree node");
+    }
+    reader.finish();
+    return children;
+}
+
 void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
                                           const NamespaceNodeStore* store,
                                           std::string_view prefix,

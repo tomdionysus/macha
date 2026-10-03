@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/object_ledger.hpp"
 #include "contract/thread_safety.hpp"
 #include "metadata/metadata_server.hpp"
 #include "cluster/distributed_store.hpp"
@@ -161,6 +162,7 @@ class CatalogueUnavailable : public std::runtime_error {
 class CatalogueManager {
     NodeRuntime& node_;
     LocalState& local_;
+    const ObjectLedger& ledger_;
     MetadataServer& metadata_server_;
     DistributedStore& store_;
     MetadataView& metadata_;
@@ -221,7 +223,8 @@ class CatalogueManager {
                 std::optional<std::pair<std::string, MetadataConflict>> resolved_conflict = {});
 
   public:
-    CatalogueManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&);
+    CatalogueManager(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&,
+                     const ObjectLedger&);
 
     const ClusterKeys& cluster_keys() const noexcept { return node_.keys(); }
 

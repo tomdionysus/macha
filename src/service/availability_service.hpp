@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+#include "cluster/message_routes.hpp"
+#include "cluster/node_events.hpp"
+#include "contract/metadata_view.hpp"
+#include "contract/object_ledger.hpp"
+#include "contract/published.hpp"
+#include "contract/work.hpp"
+#include "ledger/availability.hpp"
+#include "types.hpp"
+
+#include <chrono>
+#include <functional>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace macha {
+
+class DistributedStore;
+class LocalState;
+class NodeRuntime;
+
+// What is known of one path's extents. A directory sums what is beneath it.
+struct PathAvailability {
+    bool directory{};
+    uint64_t size{};
+    uint64_t extents{};
+    uint64_t extents_local{};
+    // Held by no reachable node.
+    uint64_t extents_unavailable{};
+    // Not held here, and a peer that might hold them could not be asked.
+    uint64_t extents_unknown{};
+    // A file's content identity ("macha:<hash>"); empty for a directory.
+    std::string hash;
+    auto operator<=>(const PathAvailability&) const = default;
+};
+
+// One survey's result: immutable once published.
+struct AvailabilitySnapshot {
+    uint64_t generation{};
+    uint64_t surveyed_unix_ms{};
+    AvailabilitySurvey survey;
+    // Every file and directory, by path.
+    std::map<std::string, PathAvailability, std::less<>> paths;
+    // Each file's paths, by content identity.
+    std::multimap<std::string, std::string, std::less<>> by_hash;
+};
+
+// The path table of a namespace against a survey: one walk of the namespace,
+// one `held` per extent reference. Throws DecodeError if the namespace cannot
+// be read.
+void fill_path_table(AvailabilitySnapshot&, const MetadataSnapshot&, const NamespaceNodeStore&,
+                     const HeldFn& held, const std::function<void()>& pause = {});
+
+// Keeps this node's holdings roll-up and the cluster's availability survey
+// current, answers peers' questions about this node's holdings, and tells
+// readers what the last survey found. Built by the root.
+class AvailabilityService {
+  public:
+    AvailabilityService(NodeRuntime&, LocalState&, DistributedStore&, const ObjectLedger&,
+                        const NodeEvents&, MessageRoutes&);
+    ~AvailabilityService();
+    AvailabilityService(const AvailabilityService&) = delete;
+    AvailabilityService& operator=(const AvailabilityService&) = delete;
+
+    // Brings the roll-up and the survey up to `head` if something that could
+    // change the answer has happened since the last. The roll-up is rebuilt
+    // when the namespace or this node's holdings changed, held to a
+    // `rollup_share` duty cycle. Peers are asked again when the roll-up was
+    // rebuilt, the membership changed, a peer's storage shrank, a peer's
+    // storage grew while something was unavailable or unknown, or a peer that
+    // could not answer is due another try. Returns
+    // whether a survey ran. `pause` is called between tree nodes. Reads tree
+    // nodes, fetching from peers those this node lacks, and asks peers about
+    // theirs. Single owner: the maintenance pass.
+    static constexpr Waits refresh_waits =
+        Waits::state_device | Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety refresh_safety = ThreadSafety::single_owner;
+    bool refresh(const MetadataSnapshotView& head, Clock::time_point now, uint64_t now_unix_ms,
+                 const std::function<void()>& pause = {});
+
+    // The last survey, or null before the first. A pointer copy.
+    static constexpr Waits snapshot_waits = Waits::none;
+    static constexpr ThreadSafety snapshot_safety = ThreadSafety::thread_safe;
+    std::shared_ptr<const AvailabilitySnapshot> snapshot() const { return snapshot_.handle(); }
+
+    // When refresh() next has something to do without a new event: a roll-up
+    // its duty cycle deferred, or a peer to ask again. The pass wakes for it.
+    std::optional<Clock::time_point> due() const noexcept { return due_; }
+
+    // Whether the last survey found no reachable node holding the extent.
+    bool unavailable(const ObjectId& id) const {
+        const auto current = snapshot_.handle();
+        return current && current->survey.is_unavailable(id);
+    }
+
+    // A roll-up walks the whole namespace, so the next waits this many times
+    // the last one's cost: a twentieth of the pass's time at most.
+    static constexpr int rollup_share = 20;
+    static constexpr std::chrono::seconds retry_floor{1};
+    static constexpr std::chrono::minutes retry_ceiling{5};
+
+  private:
+    RpcMessage answer(const RpcMessage& request) const;
+
+    NodeRuntime& node_;
+    LocalState& local_;
+    DistributedStore& store_;
+    const ObjectLedger& ledger_;
+    const NodeEvents& events_;
+    MessageRoutes& routes_;
+
+    // This node's holdings, and for a namespace kept inline in its snapshot
+    // the tree built from it: every node derives the same tree from the same
+    // entries, so its node ids mean the same on a peer.
+    struct Holdings {
+        HoldingsRollup rollup;
+        std::shared_ptr<const MemoryNamespaceNodeStore> built;
+        // The DATA store's losses() when the roll-up began: once it moves,
+        // a subtree this roll-up calls whole may not be.
+        uint64_t losses{};
+        // The head it was rolled up at; the survey and the path table read
+        // the same one.
+        uint64_t generation{};
+        std::shared_ptr<const MetadataSnapshot> snapshot;
+    };
+    // What peers are answered from; replaced whole by each roll-up.
+    Published<Holdings> holdings_;
+    Published<AvailabilitySnapshot> snapshot_;
+
+    // The maintenance pass's own: what the last roll-up and survey saw.
+    // The head the roll-up was built at: its namespace root, or its record
+    // hash when the namespace is inline.
+    Hash256 rolled_head_{};
+    uint64_t rolled_storage_events_{};
+    Clock::time_point rolled_at_{};
+    Clock::duration rolled_cost_{};
+    // A peer that could not answer is asked again after this, doubling to
+    // retry_ceiling; an answer clears it.
+    Clock::duration retry_backoff_{};
+    std::optional<Clock::time_point> retry_at_;
+    std::optional<Clock::time_point> due_;
+    uint64_t surveyed_topology_events_{};
+    // Each extent-hosting peer and the storage it advertised.
+    std::vector<std::pair<NodeId, uint64_t>> surveyed_peers_;
+};
+
+} // namespace macha

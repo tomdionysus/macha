@@ -175,6 +175,14 @@ class Service {
         wait_services_ready();
         return services_->catalogue();
     }
+    AvailabilityService& availability() {
+        wait_services_ready();
+        return services_->availability();
+    }
+    FilesApi& files_api() {
+        wait_services_ready();
+        return services_->files_api();
+    }
     CatalogueHintQueue& catalogue_hints() {
         wait_services_ready();
         return services_->catalogue_hints();

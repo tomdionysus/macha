@@ -562,9 +562,9 @@ std::vector<CatalogueArtwork> effective_catalogue_artwork(const CatalogueSnapsho
 
 CatalogueManager::CatalogueManager(NodeRuntime& node, LocalState& local,
                                    MetadataServer& metadata_server, DistributedStore& store,
-                                   MetadataView& metadata)
-    : node_(node), local_(local), metadata_server_(metadata_server), store_(store),
-      metadata_(metadata) {}
+                                   MetadataView& metadata, const ObjectLedger& ledger)
+    : node_(node), local_(local), ledger_(ledger), metadata_server_(metadata_server),
+      store_(store), metadata_(metadata) {}
 
 std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& snapshot) {
     std::set<ObjectId> ids;
@@ -1843,7 +1843,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
 
             // cache() takes this mutex to publish a new root, so GC never races
             // a root transition and deletes its staging.
-            if (local_.retention().retained(RetentionClass::control, *id))
+            if (ledger_.retained(RetentionClass::control, *id))
                 continue;
             if (local_.control().remove_if_older_than(*id, grace)) {
                 control_gc_unreferenced_epoch_.erase(seen);

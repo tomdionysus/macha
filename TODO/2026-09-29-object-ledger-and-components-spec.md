@@ -891,9 +891,12 @@ Repair stays paced by `repair_share`, never gated.
 - No component reaches a collaborator through `NodeRuntime` or `Service`;
   every dependency is declared and wired by the root. Anything remaining is
   listed here with its reason.
-  - `CatalogueManager`'s staging GC reads `ClaimStore::retained` through
-    `NodeRuntime` (T3e): the catalogue is above the ledger and should take
-    it; the catalogue's construction moves to the root at T5.
+  - `DistributedStore` and `StorageServer` use the claim store directly:
+    both are below the ledger (decision log, T3e). The catalogue, above it,
+    takes the ledger.
+  - Consumers that need the control plane (configuration, membership, an
+    RPC call) take `NodeRuntime&` whole; only `FileSystem` takes the three
+    values it uses. Narrowing the rest is for a later stage.
 - On the cluster, one node at a time and spaced for viewers: repair's bytes
   and examined counts in the same range under the same load; resident
   memory and latency the same or better; no law breached.
@@ -1015,6 +1018,30 @@ supersede earlier ones where they conflict.
   horizon; it never builds. Only the pass calls the builder. Builds stay
   sequential. Memoised, mergeable builds are a future experiment, not stage
   0 (Later stages).
+- **2026-10-03. Availability by Merkle descent** (operator, over three
+  rounds: `have_objects` "was the original plan; the purpose of this
+  experiment was to make it cheap"; "I thought we were going to use merkle
+  trees"). Whether a file can be played is answered without reading data
+  and without shipping ids:
+  - Each node rolls up, per namespace tree node id, the extents beneath it
+    and how many it holds. Nodes compare by subtree id from the root: a
+    complete subtree is one id, only partial ones are descended, and
+    subtree ids are content addresses, so nodes at different generations
+    still share them. An extent no reachable node's descent covers is
+    unavailable. Published as an immutable snapshot; requests read it and
+    never compute or probe, answering `unknown` rather than wait (laws 1
+    and 2). The roll-up is recomputed per pass at stage 0; the on-disk
+    store later keeps it by delta.
+  - API: the namespace as `GET /api/v1/files/<path>` (the path in the URL,
+    never a query parameter; a directory carries the roll-up of what is
+    beneath it), and by content identity as a filter,
+    `GET /api/v1/files?hash=macha:<hash>` ("for now"). The same facts ride
+    on the catalogue and playback media responses, which already carry the
+    hash. Facts only: the server does not refuse playback on the survey.
+  - Repair does no work that cannot complete (law 4): it skips what the
+    survey marks unavailable, and the survey probes those subtrees again
+    only on a topology or storage event, through `NodeEvents`. The set is
+    not persisted; a restart probes afresh.
 - **2026-10-03 (T5). The node is the control plane, and telemetry and
   public connectivity stay in it** (operator: "continue", after it was
   recommended). `NodeRuntime` keeps identity, transport (RPC client and

@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "filesystem/filesystem.hpp"
 #include "http/http.hpp"
+#include "json.hpp"
 #include "media/media_engine.hpp"
 
 #include <map>
@@ -24,11 +25,15 @@ class PlaybackManager {
     std::unique_ptr<Impl> impl_;
 
   public:
+    // Adds what else is known of a media file to its entry in the media
+    // listing (its availability); reads only, never waits.
+    using MediaFacts = std::function<void(Json::Object& entry, std::string_view media_id)>;
     PlaybackManager(FileSystem&, TranscodeRateBook&, RetainedMemoryLedger&, CatalogueManager&,
                     CatalogueApiConfig, StreamingConfig,
                     std::shared_ptr<MediaEngine> = {},
                     std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
-                    MediaInformationService* media_information = nullptr);
+                    MediaInformationService* media_information = nullptr,
+                    MediaFacts media_facts = {});
     ~PlaybackManager();
     PlaybackManager(const PlaybackManager&) = delete;
     PlaybackManager& operator=(const PlaybackManager&) = delete;

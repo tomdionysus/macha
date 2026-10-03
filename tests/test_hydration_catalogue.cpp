@@ -1917,7 +1917,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadat
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
 
     CatalogueItem item;
     item.id = "test:movie:1";
@@ -3687,7 +3687,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     REQUIRE(n1.wait_local_state_ready(10s));
     DistributedStore store1(n1, n1.local_state(), n1.resources.activity, n1.resources.data, n1.resources.memory, n1.resources.events);
     MetadataManager metadata1(n1, n1.local_state(), n1.metadata_server());
-    CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1);
+    CatalogueManager catalogue1(n1, n1.local_state(), n1.metadata_server(), store1, metadata1, n1.ledger());
 
     CatalogueItem first;
     first.id = "test:movie:remote-first";
@@ -3699,7 +3699,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     REQUIRE(n2.wait_local_state_ready(10s));
     DistributedStore store2(n2, n2.local_state(), n2.resources.activity, n2.resources.data, n2.resources.memory, n2.resources.events);
     MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server());
-    CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2);
+    CatalogueManager catalogue2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2, n2.ledger());
 
     // Cold-load node two from node one's committed catalogue. There is no Service
     // here, so no catalogue maintenance thread can refresh it behind the test.
@@ -4564,7 +4564,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
 
     CatalogueItem item;
     item.id = "test:movie:artwork-missing";
@@ -4581,7 +4581,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwor
     // Force a cold catalogue load from the sharded CONTROL representation. The
     // referenced artwork DATA is deliberately absent locally and must not be a
     // prerequisite for catalogue readiness.
-    CatalogueManager reloaded(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager reloaded(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
     reloaded.repair_once();
 
     auto status = reloaded.status();

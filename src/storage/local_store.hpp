@@ -103,6 +103,7 @@ class LocalStore final : public ObjectStore {
     const std::array<uint8_t, 32> key_{};
     const LocalStoreMode mode_{LocalStoreMode::authoritative};
     std::atomic<uint64_t> used_{};
+    mutable std::atomic<uint64_t> losses_{};
     // The index mutex: memory work only. A holder that reaches the device
     // releases it first (Unlocked in local_store.cpp).
     mutable Mutex m_;
@@ -249,6 +250,9 @@ class LocalStore final : public ObjectStore {
     // disk under the object's lock and a zero-byte file is pruned. Never
     // verifies content: use get()/valid() for that.
     bool has(const ObjectId&) const noexcept override;
+    uint64_t losses() const noexcept override {
+        return losses_.load(std::memory_order_acquire);
+    }
     // Whether warm-up has finished and has() answers from the index alone.
     bool presence_authoritative() const {
         Lock lock(m_);
