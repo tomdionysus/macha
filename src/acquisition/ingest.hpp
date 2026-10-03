@@ -131,16 +131,19 @@ struct StagingStatus {
 Json staging_capacity_json(const StagingStatus&);
 
 class StagingArea {
-    IngestConfig config_;
-    mutable std::mutex mutex_;
-    std::map<std::string, uint64_t, std::less<>> reservations_;
+    // staging_path is fixed at construction; the limit lives in limit_.
+    const IngestConfig config_;
+    std::atomic<uint64_t> limit_;
+    // Held across the staging directory walk (disk_usage_locked).
+    mutable IoMutex mutex_;
+    std::map<std::string, uint64_t, std::less<>> reservations_ MACHA_GUARDED_BY(mutex_);
 
-    uint64_t disk_usage_unlocked() const;
+    uint64_t disk_usage_locked() const MACHA_REQUIRES(mutex_);
 
   public:
     explicit StagingArea(IngestConfig);
     const std::filesystem::path& path() const noexcept { return config_.staging_path; }
-    uint64_t limit() const noexcept { return config_.staging_limit; }
+    uint64_t limit() const noexcept { return limit_.load(std::memory_order_relaxed); }
     void reconfigure_limit(uint64_t limit);
     bool contains(const std::filesystem::path&) const;
     bool reserve(std::string owner, uint64_t bytes);
@@ -159,9 +162,9 @@ class StagingArea {
     void wait_for_trash(std::stop_token, std::chrono::milliseconds);
 
   private:
-    std::mutex trash_mutex_;
+    Mutex trash_mutex_;
     std::condition_variable_any trash_cv_;
-    bool trash_pending_{true};
+    bool trash_pending_ MACHA_GUARDED_BY(trash_mutex_){true};
 };
 
 class IngestManager {
@@ -169,29 +172,37 @@ class IngestManager {
     FileSystem& fs_;
     CatalogueHintQueue& hints_;
     MediaInformationService* media_information_{};
-    IngestConfig config_;
+    // Held across the job state file's write and fsync (save_state_locked).
+    mutable IoMutex mutex_;
+    // Reconfigurable; enabled, staging_path and max_concurrent_jobs are fixed
+    // at construction and also kept in the const members below.
+    IngestConfig config_ MACHA_GUARDED_BY(mutex_);
+    const bool enabled_;
+    const size_t max_concurrent_jobs_;
     StagingArea staging_;
-    std::filesystem::path state_file_;
-    mutable std::mutex mutex_;
-    std::mutex resume_listener_mutex_;
-    std::function<void(std::string_view)> resume_listener_;
-    bool resume_locked(std::string_view id);
+    const std::filesystem::path state_file_;
+    // Held across the resume listener callback.
+    IoMutex resume_listener_mutex_;
+    std::function<void(std::string_view)> resume_listener_ MACHA_GUARDED_BY(resume_listener_mutex_);
+    bool resume_locked(std::string_view id) MACHA_REQUIRES(mutex_);
     std::condition_variable_any cv_;
-    std::map<std::string, IngestJob, std::less<>> jobs_;
+    std::map<std::string, IngestJob, std::less<>> jobs_ MACHA_GUARDED_BY(mutex_);
     // Jobs claimed by a worker, inserted under mutex_ in the section that
     // selects them: no job is claimed twice, and cancel() knows whether
     // cleanup is its own or the worker's.
-    std::set<std::string, std::less<>> active_job_ids_;
+    std::set<std::string, std::less<>> active_job_ids_ MACHA_GUARDED_BY(mutex_);
     // Cleanup owed by a clear() of a claimed job: the worker removes its
     // partials (and, per the clear, its source) as it releases the job.
     struct ClearedWhileActive {
         IngestJob job;
         bool delete_source{};
     };
-    std::map<std::string, ClearedWhileActive, std::less<>> cleared_while_active_;
+    std::map<std::string, ClearedWhileActive, std::less<>> cleared_while_active_
+        MACHA_GUARDED_BY(mutex_);
     // High-water mark of concurrently claimed jobs; shows parallelism without
     // catching it in a sample.
-    size_t peak_active_jobs_{};
+    size_t peak_active_jobs_ MACHA_GUARDED_BY(mutex_){};
+    // The worker threads belong to the instantiator's thread (start/stop).
     std::vector<std::jthread> workers_;
     // Polls the hint queue for catalogue completion; its own thread so busy
     // import workers cannot starve it.
@@ -199,11 +210,11 @@ class IngestManager {
     std::jthread trash_worker_;
 
     void load_state();
-    void save_state_locked() const;
+    void save_state_locked() const MACHA_REQUIRES(mutex_);
     void loop(std::stop_token);
     void catalogue_loop(std::stop_token);
     // Picks the next job no worker holds, or empty. Caller must hold mutex_.
-    std::string select_job_locked() const;
+    std::string select_job_locked() const MACHA_REQUIRES(mutex_);
     void process_job(const std::string&, std::stop_token);
     bool plan_job(IngestJob&, std::stop_token);
     bool import_job(IngestJob&, std::stop_token);
@@ -215,9 +226,11 @@ class IngestManager {
     // disk backend has published, from the job's TorrentExtentJournal.
     std::optional<std::vector<ExtentRef>> published_extents(const IngestJob&,
                                                             const IngestFileProgress&);
-    std::mutex extent_journals_mutex_;
+    // Held across loading a torrent extent journal from the source directory.
+    IoMutex extent_journals_mutex_;
     // By job id; see process_job.
-    std::map<std::string, std::map<std::string, TorrentExtentJournal::File>> extent_journals_;
+    std::map<std::string, std::map<std::string, TorrentExtentJournal::File>> extent_journals_
+        MACHA_GUARDED_BY(extent_journals_mutex_);
     void refresh_progress(IngestJob&, uint64_t sample_bytes = 0,
                           std::chrono::steady_clock::duration sample_time = {});
     void refresh_catalogue_jobs();
@@ -245,7 +258,7 @@ class IngestManager {
     void request_stop();
     void stop();
     void reconfigure(IngestConfig);
-    bool enabled() const noexcept { return config_.enabled; }
+    bool enabled() const noexcept { return enabled_; }
 
     std::string submit_path(const std::filesystem::path& source,
                             std::string source_type = "filesystem",
@@ -273,7 +286,7 @@ class IngestManager {
     // extents through it.
     FileSystem& filesystem() noexcept { return fs_; }
     const StagingArea& staging() const noexcept { return staging_; }
-    size_t max_concurrent_jobs() const noexcept { return config_.max_concurrent_jobs; }
+    size_t max_concurrent_jobs() const noexcept { return max_concurrent_jobs_; }
     size_t active_jobs() const;
     size_t peak_active_jobs() const;
 

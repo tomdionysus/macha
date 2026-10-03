@@ -397,15 +397,15 @@ Json staging_capacity_json(const StagingStatus& status) {
     return Json(std::move(out));
 }
 
-StagingArea::StagingArea(IngestConfig config) : config_(std::move(config)) {
+StagingArea::StagingArea(IngestConfig config)
+    : config_(std::move(config)), limit_(config_.staging_limit) {
     if (!config_.staging_path.empty()) std::filesystem::create_directories(config_.staging_path);
 }
 
-uint64_t StagingArea::disk_usage_unlocked() const { return directory_bytes(config_.staging_path); }
+uint64_t StagingArea::disk_usage_locked() const { return directory_bytes(config_.staging_path); }
 
 void StagingArea::reconfigure_limit(uint64_t limit) {
-    std::lock_guard lock(mutex_);
-    config_.staging_limit = limit;
+    limit_.store(limit, std::memory_order_relaxed);
 }
 
 bool StagingArea::contains(const std::filesystem::path& path) const {
@@ -413,28 +413,28 @@ bool StagingArea::contains(const std::filesystem::path& path) const {
 }
 
 bool StagingArea::reserve(std::string owner, uint64_t bytes) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     uint64_t reserved = 0;
     for (const auto& [id, value] : reservations_) {
         if (id == owner) continue;
         if (value > UINT64_MAX - reserved) return false;
         reserved += value;
     }
-    const auto disk = disk_usage_unlocked();
-    if (disk > config_.staging_limit || reserved > config_.staging_limit - disk ||
-        bytes > config_.staging_limit - disk - reserved)
+    const auto disk = disk_usage_locked();
+    const auto limit = limit_.load(std::memory_order_relaxed);
+    if (disk > limit || reserved > limit - disk || bytes > limit - disk - reserved)
         return false;
     reservations_[std::move(owner)] = bytes;
     return true;
 }
 
 void StagingArea::release(std::string_view owner) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     reservations_.erase(std::string(owner));
 }
 
 uint64_t StagingArea::reservation(std::string_view owner) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = reservations_.find(std::string(owner));
     return it == reservations_.end() ? 0 : it->second;
 }
@@ -454,7 +454,7 @@ bool StagingArea::discard(const std::filesystem::path& path) {
         return false;
     }
     {
-        std::lock_guard lock(trash_mutex_);
+        Lock lock(trash_mutex_);
         trash_pending_ = true;
     }
     trash_cv_.notify_all();
@@ -479,17 +479,18 @@ size_t StagingArea::empty_trash() {
 }
 
 void StagingArea::wait_for_trash(std::stop_token stop, std::chrono::milliseconds interval) {
-    std::unique_lock lock(trash_mutex_);
-    trash_cv_.wait_for(lock, stop, interval, [this] { return trash_pending_; });
+    Lock lock(trash_mutex_);
+    trash_cv_.wait_for(lock.native(), stop, interval,
+                       [this]() MACHA_REQUIRES(trash_mutex_) { return trash_pending_; });
     trash_pending_ = false;
 }
 
 StagingStatus StagingArea::status() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     StagingStatus out;
     out.path = config_.staging_path;
-    out.limit = config_.staging_limit;
-    out.disk_bytes = disk_usage_unlocked();
+    out.limit = limit_.load(std::memory_order_relaxed);
+    out.disk_bytes = disk_usage_locked();
     for (const auto& [_, value] : reservations_)
         if (value <= UINT64_MAX - out.reserved_bytes) out.reserved_bytes += value;
     out.accounted_bytes = out.disk_bytes > UINT64_MAX - out.reserved_bytes
@@ -501,7 +502,8 @@ StagingStatus StagingArea::status() const {
 IngestManager::IngestManager(NodeRuntime& node, FileSystem& fs, CatalogueHintQueue& hints,
                              IngestConfig config, MediaInformationService* media_information)
     : node_(node), fs_(fs), hints_(hints), media_information_(media_information),
-      config_(std::move(config)), staging_(config_),
+      config_(std::move(config)), enabled_(config_.enabled),
+      max_concurrent_jobs_(config_.max_concurrent_jobs), staging_(config_),
       state_file_(node_.config().state_path / "ingest" / "jobs.json") {
     if (config_.enabled) {
         std::filesystem::create_directories(state_file_.parent_path());
@@ -571,7 +573,7 @@ Bytes IngestManager::handle_job_action(std::span<const uint8_t> request_payload)
 void IngestManager::load_state() {
     std::vector<std::pair<std::string, std::string>> migration_hints;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         std::ifstream in(state_file_, std::ios::binary);
         if (!in) return;
         std::ostringstream text;
@@ -613,7 +615,7 @@ void IngestManager::load_state() {
 }
 
 void IngestManager::save_state_locked() const {
-    if (!config_.enabled) return;
+    if (!enabled_) return;
     Json::Array jobs;
     jobs.reserve(jobs_.size());
     for (const auto& [_, job] : jobs_) jobs.push_back(job_json(job));
@@ -624,8 +626,8 @@ void IngestManager::save_state_locked() const {
 }
 
 void IngestManager::start() {
-    if (!config_.enabled || !workers_.empty()) return;
-    const size_t count = std::max<size_t>(1, config_.max_concurrent_jobs);
+    if (!enabled_ || !workers_.empty()) return;
+    const size_t count = std::max<size_t>(1, max_concurrent_jobs_);
     workers_.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         workers_.emplace_back([this](std::stop_token stop) {
@@ -667,7 +669,7 @@ void IngestManager::stop() {
 }
 
 void IngestManager::reconfigure(IngestConfig config) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     // Paths define persisted/resumable job identity and cannot safely move live.
     if (config.staging_path != config_.staging_path || config.enabled != config_.enabled)
         Log::warn("ingest enabled/staging_path changes require restart");
@@ -687,7 +689,12 @@ void IngestManager::reconfigure(IngestConfig config) {
 }
 
 bool IngestManager::allowed_external_source(const std::filesystem::path& path) const {
-    for (const auto& root : config_.source_roots)
+    std::vector<std::filesystem::path> roots;
+    {
+        Lock lock(mutex_);
+        roots = config_.source_roots;
+    }
+    for (const auto& root : roots)
         if (path_under(path, existing_real_path(root))) return true;
     return false;
 }
@@ -697,7 +704,7 @@ std::string IngestManager::submit_path(const std::filesystem::path& source,
                                        std::string display_name,
                                        std::optional<bool> delete_source_on_clear,
                                        bool trusted_internal_source, bool source_owned) {
-    if (!config_.enabled) throw std::runtime_error("ingest is disabled");
+    if (!enabled_) throw std::runtime_error("ingest is disabled");
     const auto normalized = existing_real_path(source);
     if (!trusted_internal_source && !allowed_external_source(normalized))
         throw std::runtime_error("source path is outside ingest.source_roots");
@@ -716,11 +723,11 @@ std::string IngestManager::submit_path(const std::filesystem::path& source,
     job.source_path = normalized;
     job.source_owned = source_owned;
     job.delete_source_on_clear = delete_source_on_clear.value_or(
-        source_owned ? config_.delete_owned_source_on_clear : config_.delete_external_source_on_clear);
+        source_owned ? delete_owned_source_on_clear() : delete_external_source_on_clear());
     job.created_unix_ms = job.updated_unix_ms = now_ms();
 
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         jobs_[job.id] = job;
         try {
             save_state_locked();
@@ -735,17 +742,17 @@ std::string IngestManager::submit_path(const std::filesystem::path& source,
 }
 
 size_t IngestManager::active_jobs() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return active_job_ids_.size();
 }
 
 size_t IngestManager::peak_active_jobs() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return peak_active_jobs_;
 }
 
 std::vector<IngestJob> IngestManager::jobs() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<IngestJob> out;
     out.reserve(jobs_.size());
     for (const auto& [_, job] : jobs_) out.push_back(job);
@@ -756,14 +763,14 @@ std::vector<IngestJob> IngestManager::jobs() const {
 }
 
 std::optional<IngestJob> IngestManager::job(std::string_view id) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return {};
     return it->second;
 }
 
 bool IngestManager::pause(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     if (it->second.state == IngestJobState::cataloguing ||
@@ -787,16 +794,16 @@ bool IngestManager::pause(std::string_view id) {
 }
 
 void IngestManager::set_resume_listener(std::function<void(std::string_view)> listener) {
-    std::lock_guard lock(resume_listener_mutex_);
+    Lock lock(resume_listener_mutex_);
     resume_listener_ = std::move(listener);
 }
 
 bool IngestManager::resume(std::string_view id) {
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!resume_locked(id)) return false;
     }
-    std::lock_guard listener_lock(resume_listener_mutex_);
+    Lock listener_lock(resume_listener_mutex_);
     if (resume_listener_) resume_listener_(id);
     return true;
 }
@@ -894,7 +901,7 @@ bool IngestManager::cancel(std::string_view id) {
     IngestJob cancelled;
     bool active = false;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(std::string(id));
         if (it == jobs_.end()) return false;
         if (it->second.state == IngestJobState::completed || it->second.state == IngestJobState::cancelled)
@@ -915,7 +922,7 @@ bool IngestManager::cancel(std::string_view id) {
     }
     if (!active) {
         cleanup_partials(cancelled);
-        if (cancelled.source_owned && config_.delete_owned_source_on_cancel) {
+        if (cancelled.source_owned && delete_owned_source_on_cancel()) {
             try { cleanup_source(cancelled); }
             catch (const std::exception& e) {
                 Log::warn("ingest cancel source cleanup failed id=" + cancelled.id + ": " + e.what());
@@ -930,7 +937,7 @@ bool IngestManager::clear(std::string_view id) {
     IngestJob terminal_job;
     bool active = false;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(std::string(id));
         if (it == jobs_.end()) return false;
         if (it->second.state != IngestJobState::completed &&
@@ -953,7 +960,7 @@ bool IngestManager::clear(std::string_view id) {
 
     bool owed = false;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(std::string(id));
         if (it == jobs_.end()) return false;
         if (it->second.state != terminal_job.state) return false;
@@ -980,24 +987,24 @@ CatalogueHintSummary IngestManager::catalogue_summary(std::string_view id) const
 }
 
 bool IngestManager::delete_owned_source_on_clear() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return config_.delete_owned_source_on_clear;
 }
 
 bool IngestManager::delete_external_source_on_clear() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return config_.delete_external_source_on_clear;
 }
 
 bool IngestManager::delete_owned_source_on_cancel() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return config_.delete_owned_source_on_cancel;
 }
 
 void IngestManager::refresh_catalogue_jobs() {
     std::vector<std::string> ids;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (const auto& [id, job] : jobs_)
             if (job.state == IngestJobState::cataloguing) ids.push_back(id);
     }
@@ -1007,7 +1014,7 @@ void IngestManager::refresh_catalogue_jobs() {
         if (!summary.total) {
             IngestJob job;
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 auto it = jobs_.find(id);
                 if (it == jobs_.end() || it->second.state != IngestJobState::cataloguing) continue;
                 job = it->second;
@@ -1016,7 +1023,7 @@ void IngestManager::refresh_catalogue_jobs() {
             summary = hints_.summary("ingest", id);
         }
 
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(id);
         if (it == jobs_.end() || it->second.state != IngestJobState::cataloguing) continue;
         auto& job = it->second;
@@ -1078,7 +1085,7 @@ void IngestManager::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         std::string selected;
         {
-            std::unique_lock lock(mutex_);
+            Lock lock(mutex_);
             selected = select_job_locked();
             if (selected.empty()) {
                 std::optional<uint64_t> blocked_ready_ms;
@@ -1092,14 +1099,17 @@ void IngestManager::loop(std::stop_token stop) {
 
                 // Wake only for a job this worker could claim, not one another
                 // worker already holds.
-                auto claimable = [&] { return !select_job_locked().empty(); };
+                auto claimable = [&]() MACHA_REQUIRES(mutex_) {
+                    return !select_job_locked().empty();
+                };
 
                 if (blocked_ready_ms) {
                     const auto remaining_ms = *blocked_ready_ms > now ? *blocked_ready_ms - now : 0;
-                    cv_.wait_for(lock, stop, std::chrono::milliseconds(remaining_ms), claimable);
+                    cv_.wait_for(lock.native(), stop, std::chrono::milliseconds(remaining_ms),
+                                 claimable);
                 } else {
                     // Only terminal or paused jobs: new work and API changes notify.
-                    cv_.wait(lock, stop, claimable);
+                    cv_.wait(lock.native(), stop, claimable);
                 }
                 continue;
             }
@@ -1112,7 +1122,7 @@ void IngestManager::loop(std::stop_token stop) {
         bool have_after = false;
         std::optional<ClearedWhileActive> cleared;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             active_job_ids_.erase(selected);
             if (auto it = jobs_.find(selected); it != jobs_.end()) {
                 after = it->second;
@@ -1135,7 +1145,7 @@ void IngestManager::loop(std::stop_token stop) {
         cv_.notify_all();
         if (have_after && after.state == IngestJobState::cancelled) {
             cleanup_partials(after);
-            if (after.source_owned && config_.delete_owned_source_on_cancel) {
+            if (after.source_owned && delete_owned_source_on_cancel()) {
                 try { cleanup_source(after); }
                 catch (const std::exception& e) {
                     Log::warn("ingest cancel source cleanup failed id=" + after.id + ": " + e.what());
@@ -1148,8 +1158,8 @@ void IngestManager::loop(std::stop_token stop) {
 void IngestManager::catalogue_loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         refresh_catalogue_jobs();
-        std::unique_lock lock(mutex_);
-        auto cataloguing = [&] {
+        Lock lock(mutex_);
+        auto cataloguing = [&]() MACHA_REQUIRES(mutex_) {
             return std::any_of(jobs_.begin(), jobs_.end(), [](const auto& pair) {
                 return pair.second.state == IngestJobState::cataloguing;
             });
@@ -1157,10 +1167,10 @@ void IngestManager::catalogue_loop(std::stop_token stop) {
         if (cataloguing()) {
             // The hint queue records catalogue completion; poll only while a
             // copied job awaits it.
-            cv_.wait_for(lock, stop, std::chrono::milliseconds(500),
+            cv_.wait_for(lock.native(), stop, std::chrono::milliseconds(500),
                          [&] { return stop.stop_requested(); });
         } else {
-            cv_.wait(lock, stop, cataloguing);
+            cv_.wait(lock.native(), stop, cataloguing);
         }
     }
 }
@@ -1171,13 +1181,13 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         IngestManager& self;
         const std::string& id;
         ~ForgetExtentJournal() {
-            std::lock_guard lock(self.extent_journals_mutex_);
+            Lock lock(self.extent_journals_mutex_);
             self.extent_journals_.erase(id);
         }
     } forget_extent_journal{*this, id};
     IngestJob job;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(id);
         if (it == jobs_.end()) return;
         job = it->second;
@@ -1212,7 +1222,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.error_code.clear();
         job.updated_unix_ms = now_ms();
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (auto it = jobs_.find(id); it != jobs_.end()) {
                 it->second = job;
                 save_state_locked();
@@ -1227,7 +1237,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
     } catch (const std::exception& e) {
         if (stop.stop_requested()) {
             job.updated_unix_ms = now_ms();
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (auto it = jobs_.find(id); it != jobs_.end()) {
                 it->second = job;
                 try { save_state_locked(); } catch (...) {}
@@ -1262,7 +1272,7 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.rate_bytes_per_second = 0;
         job.eta_seconds.reset();
         job.updated_unix_ms = now_ms();
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(id);
         // A cancel stands over a failure met before the worker noticed it.
         if (it == jobs_.end() || it->second.state == IngestJobState::cancelled)
@@ -1284,7 +1294,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     job.error_code.clear();
     job.updated_unix_ms = now_ms();
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(job.id);
         if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
             it->second.state == IngestJobState::cancelled)
@@ -1307,7 +1317,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
         while (it != end) {
             if (stop.stop_requested()) return false;
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 auto it = jobs_.find(job.id);
                 if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
                     it->second.state == IngestJobState::cancelled)
@@ -1424,7 +1434,7 @@ bool IngestManager::plan_job(IngestJob& job, std::stop_token stop) {
     job.state = IngestJobState::queued;
     job.updated_unix_ms = now_ms();
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(job.id);
         if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
             it->second.state == IngestJobState::cancelled)
@@ -1642,18 +1652,25 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
     }
 
     auto output = fs_.open_write(file.temporary_path, false, true);
-    std::vector<uint8_t> buffer(config_.copy_chunk_bytes);
+    size_t copy_chunk_bytes = 0;
+    {
+        Lock lock(mutex_);
+        copy_chunk_bytes = config_.copy_chunk_bytes;
+    }
+    std::vector<uint8_t> buffer(copy_chunk_bytes);
     uint64_t checkpoint_start = file.copied;
     auto sample_start = std::chrono::steady_clock::now();
     uint64_t sample_start_bytes = job.bytes_completed;
 
     while (file.copied < file.size && !stop.stop_requested()) {
         IngestJobState control = IngestJobState::importing;
+        uint64_t checkpoint_bytes = 0;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             auto it = jobs_.find(job.id);
             if (it == jobs_.end()) return false;
             control = it->second.state;
+            checkpoint_bytes = config_.checkpoint_bytes;
         }
         if (control == IngestJobState::paused || control == IngestJobState::cancelled) {
             output->commit();
@@ -1668,7 +1685,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
                 file.copied = 0;
                 refresh_progress(job);
             }
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (auto it = jobs_.find(job.id); it != jobs_.end()) {
                 it->second = job;
                 save_state_locked();
@@ -1689,7 +1706,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         if (written != got) throw IngestError("namespace_short_write", "short namespace write during ingest");
         file.copied += written;
 
-        if (file.copied - checkpoint_start >= config_.checkpoint_bytes || file.copied == file.size) {
+        if (file.copied - checkpoint_start >= checkpoint_bytes || file.copied == file.size) {
             output->commit();
             file.copied = output->size();
             checkpoint_start = file.copied;
@@ -1702,7 +1719,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
             sample_start = sample_now;
             sample_start_bytes = job.bytes_completed;
             job.updated_unix_ms = now_ms();
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             auto it = jobs_.find(job.id);
             if (it == jobs_.end()) return false;
             if (it->second.state == IngestJobState::paused || it->second.state == IngestJobState::cancelled)
@@ -1717,7 +1734,7 @@ bool IngestManager::copy_file(IngestJob& job, IngestFileProgress& file, std::sto
         file.copied = output->size();
         refresh_progress(job);
         job.updated_unix_ms = now_ms();
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (auto it = jobs_.find(job.id); it != jobs_.end()) {
             it->second = job;
             save_state_locked();
@@ -1744,7 +1761,7 @@ std::optional<std::vector<ExtentRef>> IngestManager::published_extents(
     const IngestJob& job, const IngestFileProgress& file) {
     std::error_code ec;
     if (!std::filesystem::is_directory(job.source_path, ec)) return std::nullopt;
-    std::lock_guard lock(extent_journals_mutex_);
+    Lock lock(extent_journals_mutex_);
     auto found = extent_journals_.find(job.id);
     // Loaded once per run, released when process_job returns: a torrent's
     // ingest is submitted only once publication is done or stalled, so the
@@ -1837,7 +1854,7 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
     job.error.clear();
     job.error_code.clear();
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(job.id);
         if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
             it->second.state == IngestJobState::cancelled)
@@ -1853,7 +1870,7 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
         job.current_destination = file.destination_path;
         job.updated_unix_ms = now_ms();
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             auto it = jobs_.find(job.id);
             if (it == jobs_.end() || it->second.state == IngestJobState::paused ||
                 it->second.state == IngestJobState::cancelled)
@@ -1864,7 +1881,7 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
         if (!copy_file(job, file, stop)) return false;
         job.updated_unix_ms = now_ms();
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (auto it = jobs_.find(job.id); it != jobs_.end()) {
                 it->second = job;
                 save_state_locked();
@@ -1881,7 +1898,7 @@ void IngestManager::set_blocked(IngestJob& job, std::string code, std::string me
     job.rate_bytes_per_second = 0;
     job.eta_seconds.reset();
     job.updated_unix_ms = now_ms();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (auto it = jobs_.find(job.id); it != jobs_.end()) {
         it->second = job;
         save_state_locked();
@@ -1902,7 +1919,7 @@ void IngestManager::cleanup_partials(const IngestJob& job) {
 }
 
 bool IngestManager::should_pause_or_cancel(const IngestJob& job) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(job.id);
     return it == jobs_.end() || it->second.state == IngestJobState::paused ||
            it->second.state == IngestJobState::cancelled;

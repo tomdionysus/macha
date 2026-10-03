@@ -175,9 +175,9 @@ void TorrentCoordinator::stop() {
 void TorrentCoordinator::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         pass_now();
-        std::mutex wait_mutex;
-        std::unique_lock lock(wait_mutex);
-        wake_.wait_for(lock, stop, pass_interval, [] { return false; });
+        Mutex wait_mutex; // guards nothing: the wait's own lock
+        Lock lock(wait_mutex);
+        wake_.wait_for(lock.native(), stop, pass_interval, [] { return false; });
     }
 }
 
@@ -668,7 +668,7 @@ TorrentCoordinator::Outcome TorrentCoordinator::apply_intent_locally(const std::
     else if (desired == TorrentDesired::active) (void)local->resume(id);
     else (void)local->cancel(id);
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto& intent = intents_[id];
         if (changed_unix_ms >= intent.changed_unix_ms || desired == TorrentDesired::cancelled) {
             intent.desired = desired;
@@ -712,7 +712,7 @@ Bytes TorrentCoordinator::handle_intent(std::span<const uint8_t> payload) {
 }
 
 TorrentDesired TorrentCoordinator::effective_desired(const TorrentRequest& request) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto found = intents_.find(request.id);
     if (found == intents_.end()) return request.desired;
     if (request.desired == TorrentDesired::cancelled) return request.desired;
@@ -725,7 +725,7 @@ TorrentDesired TorrentCoordinator::effective_desired(const TorrentRequest& reque
 void TorrentCoordinator::publish_intents() {
     std::map<std::string, Intent, std::less<>> pending;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         pending = intents_;
     }
     if (pending.empty() || !write_available()) return;
@@ -752,7 +752,7 @@ void TorrentCoordinator::publish_intents() {
         Log::debug("torrent intents not published yet: " + std::string(e.what()));
         return;
     }
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [id, intent] : pending) {
         const auto found = intents_.find(id);
         if (found != intents_.end() && found->second.changed_unix_ms == intent.changed_unix_ms &&
@@ -770,7 +770,7 @@ void TorrentCoordinator::load_intents() {
     text << in.rdbuf();
     try {
         auto parsed = Json::parse(text.str());
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (const auto& [id, value] : parsed.asObject()) {
             const auto* desired = value.find("desired");
             const auto* changed = value.find("changed_unix_ms");
@@ -832,7 +832,7 @@ TorrentCoordinator::resolve_remote(std::string_view uri, bool search_result, std
 }
 
 void TorrentCoordinator::pass_now() {
-    std::lock_guard serial(pass_mutex_);
+    Lock serial(pass_mutex_);
     try {
         pass();
     } catch (const std::exception& e) {
@@ -856,7 +856,7 @@ void TorrentCoordinator::pass() {
         return id == self || std::any_of(active.begin(), active.end(), [&](const NodeInfo& n) { return n.id == id; });
     };
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         std::set<NodeId> claimants;
         for (const auto& [_, r] : requests)
             if (r.claim) claimants.insert(r.claim->node_id);
@@ -867,7 +867,7 @@ void TorrentCoordinator::pass() {
     }
     const auto lapsed = [&](const TorrentRequest& r) {
         if (!r.claim) return false;
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         const auto found = absent_since_.find(r.claim->node_id);
         return found != absent_since_.end() &&
                now - found->second >= static_cast<uint64_t>(claim_lease_.count());
@@ -884,7 +884,7 @@ void TorrentCoordinator::pass() {
         for (const auto& job : local->jobs()) {
             if (requests.contains(job.id)) continue;
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 if (migrated_.contains(job.id)) continue;
             }
             if (job.info_hash.empty() || held_hashes.contains(job.info_hash)) continue;
@@ -911,7 +911,7 @@ void TorrentCoordinator::pass() {
             if (r.phase == TorrentPhase::completed) r.completed_unix_ms = job.updated_unix_ms ? job.updated_unix_ms : now;
             held_hashes.insert(r.info_hash);
             updates.push_back(std::move(r));
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             migrated_.insert(job.id);
         }
     }
@@ -941,7 +941,7 @@ void TorrentCoordinator::pass() {
                 (!r.pinned_node_id || *r.pinned_node_id == self))
                 claimable.push_back(&r);
             else {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 claimable_since_.erase(id);
             }
             continue;
@@ -1033,7 +1033,7 @@ void TorrentCoordinator::pass() {
             while (rank < ranked.size() && ranked[rank].second != self) ++rank;
             uint64_t since;
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 since = claimable_since_.try_emplace(r->id, now).first->second;
             }
             if (now - since < rank * static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1050,7 +1050,7 @@ void TorrentCoordinator::pass() {
             updates.push_back(std::move(claimed));
             ++offer.active_jobs;
             if (offer.max_active && offer.active_jobs >= offer.max_active) offer.accepting = false;
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             claimable_since_.erase(r->id);
         }
     }

@@ -51,15 +51,15 @@ size_t profile_weight(std::string_view media_id, const MediaProbeResult& probe) 
 } // namespace
 
 struct MediaInformationService::Flight {
-    std::mutex mutex;
+    Mutex mutex;
     std::condition_variable cv;
-    bool owner{};
-    bool owner_foreground{};
-    bool foreground_takeover{};
-    bool complete{};
-    std::optional<MediaProbeResult> result;
-    std::exception_ptr error;
-    std::shared_ptr<std::atomic_bool> cancelled;
+    bool owner MACHA_GUARDED_BY(mutex){};
+    bool owner_foreground MACHA_GUARDED_BY(mutex){};
+    bool foreground_takeover MACHA_GUARDED_BY(mutex){};
+    bool complete MACHA_GUARDED_BY(mutex){};
+    std::optional<MediaProbeResult> result MACHA_GUARDED_BY(mutex);
+    std::exception_ptr error MACHA_GUARDED_BY(mutex);
+    std::shared_ptr<std::atomic_bool> cancelled MACHA_GUARDED_BY(mutex);
 };
 
 MediaInformationService::MediaInformationService(
@@ -210,7 +210,7 @@ MediaProbeResult MediaInformationService::resolve(
 
     std::shared_ptr<Flight> flight;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto [it, _] = flights_.try_emplace(media_id, std::make_shared<Flight>());
         flight = it->second;
     }
@@ -218,7 +218,7 @@ MediaProbeResult MediaInformationService::resolve(
     for (;;) {
         bool owner = false;
         {
-            std::unique_lock lock(flight->mutex);
+            Lock lock(flight->mutex);
             if (flight->complete) {
                 if (flight->error) std::rethrow_exception(flight->error);
                 return *flight->result;
@@ -232,14 +232,18 @@ MediaProbeResult MediaInformationService::resolve(
             } else if (foreground && !flight->owner_foreground) {
                 flight->foreground_takeover = true;
                 if (flight->cancelled) flight->cancelled->store(true);
-                flight->cv.wait_until(lock, deadline, [&] {
+                flight->cv.wait_until(lock.native(), deadline,
+                                      [&]() MACHA_REQUIRES(flight->mutex) {
                     return flight->complete || !flight->owner;
                 });
                 if (!flight->complete && flight->owner)
                     throw std::runtime_error("timed out taking over speculative media scan");
                 continue;
             } else {
-                if (!flight->cv.wait_until(lock, deadline, [&] { return flight->complete; }))
+                if (!flight->cv.wait_until(lock.native(), deadline,
+                                           [&]() MACHA_REQUIRES(flight->mutex) {
+                                               return flight->complete;
+                                           }))
                     throw std::runtime_error("timed out waiting for concurrent media scan");
                 if (flight->error) std::rethrow_exception(flight->error);
                 return *flight->result;
@@ -249,7 +253,11 @@ MediaProbeResult MediaInformationService::resolve(
 
         try {
             const auto frame = foreground ? FrameType::foreground : FrameType::speculative;
-            auto cancellation = flight->cancelled;
+            std::shared_ptr<std::atomic_bool> cancellation;
+            {
+                Lock lock(flight->mutex);
+                cancellation = flight->cancelled;
+            }
             MediaSource source{
                 media_id, path, entry.size,
                 [this, entry, path, frame](MediaReadPurpose) -> std::shared_ptr<MediaInput> {
@@ -263,7 +271,7 @@ MediaProbeResult MediaInformationService::resolve(
                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()));
             auto result = engine_->probe(source, remaining);
             {
-                std::lock_guard lock(flight->mutex);
+                Lock lock(flight->mutex);
                 if (!foreground && flight->foreground_takeover)
                     throw InformationPreempted();
                 flight->result = result;
@@ -272,23 +280,24 @@ MediaProbeResult MediaInformationService::resolve(
             }
             flight->cv.notify_all();
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 queue_publication_locked(media_id, result);
             }
             cv_.notify_all();
             return result;
         } catch (const InformationPreempted&) {
             {
-                std::lock_guard lock(flight->mutex);
+                Lock lock(flight->mutex);
                 flight->owner = false;
             }
             flight->cv.notify_all();
             throw;
         } catch (...) {
-            const bool preempted = !foreground && flight->cancelled &&
-                                   flight->cancelled->load() && flight->foreground_takeover;
+            bool preempted = false;
             {
-                std::lock_guard lock(flight->mutex);
+                Lock lock(flight->mutex);
+                preempted = !foreground && flight->cancelled && flight->cancelled->load() &&
+                            flight->foreground_takeover;
                 flight->owner = false;
                 if (!preempted) {
                     flight->error = std::current_exception();
@@ -298,7 +307,7 @@ MediaProbeResult MediaInformationService::resolve(
             flight->cv.notify_all();
             if (preempted) throw InformationPreempted();
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 auto it = flights_.find(media_id);
                 if (it != flights_.end() && it->second == flight) flights_.erase(it);
             }
@@ -356,7 +365,7 @@ void MediaInformationService::process_hint(const CatalogueHint& hint,
 void MediaInformationService::publish_one(std::string media_id, MediaProbeResult probe) {
     if (!media_is_live(media_id)) {
         request_prune();
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         flights_.erase(media_id);
         return;
     }
@@ -364,7 +373,7 @@ void MediaInformationService::publish_one(std::string media_id, MediaProbeResult
         profile_publisher_(media_id, std::move(probe));
     else
         catalogue_.put_media_profile(media_id, std::move(probe));
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     flights_.erase(media_id);
 }
 
@@ -400,7 +409,7 @@ std::optional<Bytes> MediaInformationService::keyframe_index(const std::string& 
                                                              Clock::time_point deadline) {
     if (auto stored = catalogue_.media_index(media_id)) return stored;
     if (!engine_ || !engine_->status().available) return {};
-    std::lock_guard build(keyframe_index_mutex_);
+    Lock build(keyframe_index_mutex_);
     if (auto stored = catalogue_.media_index(media_id)) return stored;
     auto found = fs_.find_media(media_id);
     if (!found) return {};
@@ -423,7 +432,7 @@ std::optional<Bytes> MediaInformationService::keyframe_index(const std::string& 
 
 void MediaInformationService::request_prune() {
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         prune_requested_ = true;
     }
     cv_.notify_all();
@@ -449,7 +458,7 @@ void MediaInformationService::loop(std::stop_token stop) {
         std::optional<std::pair<std::string, MediaProbeResult>> publication;
         bool do_prune = false;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             const auto now = Clock::now();
             if (!pending_publications_.empty() &&
                 (!publication_retry_at_ || now >= *publication_retry_at_)) {
@@ -471,7 +480,7 @@ void MediaInformationService::loop(std::stop_token stop) {
             } catch (const std::exception& e) {
                 Log::warn("media information publication failed: " + std::string(e.what()));
                 {
-                    std::lock_guard lock(mutex_);
+                    Lock lock(mutex_);
                     queue_publication_locked(publication->first, publication->second);
                     publication_retry_at_ = Clock::now() + publication_retry_delay_;
                 }
@@ -490,9 +499,9 @@ void MediaInformationService::loop(std::stop_token stop) {
             process_hint(*hint, stop);
             continue;
         }
-        std::unique_lock lock(mutex_);
+        Lock lock(mutex_);
         const auto ready_delay = hints_.next_ready_delay();
-        const auto changed = [&] {
+        const auto changed = [&]() MACHA_REQUIRES(mutex_) {
             return prune_requested_ ||
                    (!pending_publications_.empty() &&
                     (!publication_retry_at_ || Clock::now() >= *publication_retry_at_));
@@ -506,9 +515,9 @@ void MediaInformationService::loop(std::stop_token stop) {
             if (!wait_delay || retry_delay < *wait_delay) wait_delay = retry_delay;
         }
         if (wait_delay)
-            cv_.wait_for(lock, stop, *wait_delay, changed);
+            cv_.wait_for(lock.native(), stop, *wait_delay, changed);
         else
-            cv_.wait(lock, stop, changed);
+            cv_.wait(lock.native(), stop, changed);
     }
 }
 

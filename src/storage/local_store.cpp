@@ -19,6 +19,18 @@
 #include <unistd.h>
 namespace macha {
 namespace {
+// Releases a held Mutex through the caller's Lock for its scope and retakes
+// it on exit, including on unwinding.
+class MACHA_SCOPED_CAPABILITY Unlocked {
+    Lock& lock_;
+
+  public:
+    Unlocked(Lock& lock, [[maybe_unused]] Mutex& mutex) MACHA_RELEASE(mutex) : lock_(lock) { lock_.unlock(); }
+    ~Unlocked() MACHA_RELEASE() { lock_.lock(); }
+    Unlocked(const Unlocked&) = delete;
+    Unlocked& operator=(const Unlocked&) = delete;
+};
+
 constexpr std::array<uint8_t, 8> M{'D', 'H', 'T', 'O', 'B', 'J', '0', '1'};
 constexpr std::array<uint8_t, 8> A{'M', 'A', 'C', 'H', 'A', 'A', 'C', '1'};
 constexpr std::array<uint8_t, 8> P{'M', 'A', 'C', 'H', 'P', 'K', '0', '1'};
@@ -329,10 +341,7 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
 
     std::filesystem::create_directories(objects_);
     std::filesystem::create_directories(packs_);
-    {
-        std::lock_guard lock(m_);
-        rebuild_pack_index_locked(true);
-    }
+    rebuild_pack_index(true);
 
     if (mode_ == LocalStoreMode::ephemeral) {
         durability_domain_.reset();
@@ -432,8 +441,13 @@ LocalStore::~LocalStore() {
                                                   DurabilityUrgency::immediate);
             } catch (...) { can_checkpoint = false; }
         }
-        if (can_checkpoint) {
-            try { checkpoint_accounting_locked(); } catch (...) {}
+        // Every other thread has stopped: no lock is needed.
+        if (can_checkpoint && mode_ != LocalStoreMode::ephemeral && accounting_dirty_) {
+            try {
+                ObjectId none{};
+                persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none,
+                                   0, true);
+            } catch (...) {}
         }
         close(accounting_fd_);
         accounting_fd_ = -1;
@@ -477,34 +491,26 @@ bool LocalStore::restore_accounting(bool* clean) {
     return true;
 }
 
-void LocalStore::ensure_accounting_dirty(std::unique_lock<std::mutex>& lock) {
+void LocalStore::ensure_accounting_dirty(Lock& lock) {
     if (mode_ == LocalStoreMode::ephemeral || accounting_dirty_) return;
-    accounting_state_cv_.wait(lock, [this] { return !accounting_dirty_in_progress_; });
+    accounting_state_cv_.wait(lock.native(), [this]() MACHA_REQUIRES(m_) {
+        return !accounting_dirty_in_progress_;
+    });
     if (accounting_dirty_) return;
     accounting_dirty_in_progress_ = true;
     const auto used = used_.load(std::memory_order_relaxed);
-    lock.unlock();
     try {
+        Unlocked unlocked(lock, m_);
         ObjectId none{};
         persist_accounting(used, accounting_dirty, none, 0, true);
     } catch (...) {
-        lock.lock();
         accounting_dirty_in_progress_ = false;
         accounting_state_cv_.notify_all();
         throw;
     }
-    lock.lock();
     accounting_dirty_ = true;
     accounting_dirty_in_progress_ = false;
     accounting_state_cv_.notify_all();
-}
-
-void LocalStore::checkpoint_accounting_locked() {
-    if (mode_ == LocalStoreMode::ephemeral || !accounting_dirty_) return;
-    ObjectId none{};
-    persist_accounting(used_.load(std::memory_order_relaxed), accounting_none, none, 0, true);
-    accounting_dirty_ = false;
-    accounting_trusted_.store(true, std::memory_order_release);
 }
 
 void LocalStore::reap_durable_generations_locked() {
@@ -534,7 +540,7 @@ bool LocalStore::physical_space_available_locked(uint64_t need) const {
 bool LocalStore::filesystem_space_available_for_reservations() const {
     uint64_t reserved = 0;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         reserved = reserved_write_bytes_;
     }
     std::error_code error;
@@ -566,14 +572,14 @@ LocalStore::loose_stamp(const std::filesystem::path& path) {
                       static_cast<uint64_t>(value.st_size), modified, changed};
 }
 
-std::shared_ptr<std::mutex> LocalStore::object_mutex(const ObjectId& id) const {
-    std::lock_guard lock(object_mutex_map_mutex_);
+std::shared_ptr<IoMutex> LocalStore::object_mutex(const ObjectId& id) const {
+    Lock lock(object_mutex_map_mutex_);
     if (auto found = object_mutexes_.find(id); found != object_mutexes_.end()) {
         if (auto existing = found->second.lock())
             return existing;
         object_mutexes_.erase(found);
     }
-    auto created = std::make_shared<std::mutex>();
+    auto created = std::make_shared<IoMutex>();
     object_mutexes_[id] = created;
     if (object_mutexes_.size() > 4096) {
         std::erase_if(object_mutexes_, [](const auto& item) { return item.second.expired(); });
@@ -614,7 +620,7 @@ bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::pa
     if (!std::filesystem::remove(p, error) || error)
         return false;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         verified_loose_.erase(id);
         presence_.pruned(id);
     }
@@ -633,73 +639,81 @@ void LocalStore::select_active_pack_locked(uint64_t next_record_size) {
 
 bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
                                            std::span<const uint8_t> data, uint64_t touched_ms,
-                                           PackEntry* entry, uint64_t* record_size,
-                                           std::unique_lock<std::mutex>& lock) {
+                                           PackEntry* entry, uint64_t* record_size, Lock& lock) {
     PackHeader h;
     h.type = type;
     h.touched_ms = touched_ms;
     h.id = id;
     const auto before_write = before_packed_write_for_tests_;
-    lock.unlock();
-    Bytes payload;
     Bytes header;
     uint64_t total = 0;
     std::filesystem::path target;
     uint64_t start = 0;
-    int fd = -1;
-    std::unique_lock<std::mutex> pack_io_lock;
-    try {
-        if (before_write)
-            before_write(id);
-        if (type == pack_put) {
-            auto sealed = aes_gcm_seal(key_, data, id.bytes);
-            payload = std::move(sealed.ciphertext);
-            h.plain_size = data.size();
-            h.payload_size = payload.size();
-            h.nonce = sealed.nonce;
-            h.tag = sealed.tag;
+    {
+        Unlocked unlocked(lock, m_);
+        Bytes payload;
+        try {
+            if (before_write)
+                before_write(id);
+            if (type == pack_put) {
+                auto sealed = aes_gcm_seal(key_, data, id.bytes);
+                payload = std::move(sealed.ciphertext);
+                h.plain_size = data.size();
+                h.payload_size = payload.size();
+                h.nonce = sealed.nonce;
+                h.tag = sealed.tag;
+            }
+            header = encode_pack_header(h);
+            total = header.size() + payload.size();
+        } catch (...) {
+            // A failure before the append abandons the active pack, as a
+            // failed rollback does.
+            Lock pack_io_lock(pack_io_mutex_);
+            active_pack_.clear();
+            active_pack_size_ = 0;
+            throw;
         }
-        header = encode_pack_header(h);
-        total = header.size() + payload.size();
 
         // The pack stream has its own single-writer lock; m_ stays free during
         // encryption and I/O so unrelated reads are not trapped behind an append.
-        pack_io_lock = std::unique_lock(pack_io_mutex_);
-        select_active_pack_locked(total);
-        target = active_pack_;
-        start = active_pack_size_;
-        fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-        if (fd < 0)
-            throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
-        wa(fd, header);
-        if (!payload.empty()) wa(fd, payload);
-        if (::close(fd) != 0)
-            throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
-        fd = -1;
-        active_pack_size_ += total;
-    } catch (...) {
-        if (fd >= 0) ::close(fd);
-        // A failed append (ENOSPC, EIO, short write) must not poison the live
-        // process with a torn record. Restore the previous durable boundary when
-        // possible; if rollback itself fails, abandon this pack so later writes
-        // never append behind the torn bytes. Restart recovery will truncate it.
-        int rollback = target.empty() ? -1 : ::open(target.c_str(), O_WRONLY);
-        if (rollback >= 0) {
-            if (::ftruncate(rollback, static_cast<off_t>(start)) == 0)
-                active_pack_size_ = start;
-            else {
+        Lock pack_io_lock(pack_io_mutex_);
+        int fd = -1;
+        try {
+            select_active_pack_locked(total);
+            target = active_pack_;
+            start = active_pack_size_;
+            fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+            if (fd < 0)
+                throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+            wa(fd, header);
+            if (!payload.empty()) wa(fd, payload);
+            if (::close(fd) != 0)
+                throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+            fd = -1;
+            active_pack_size_ += total;
+        } catch (...) {
+            if (fd >= 0) ::close(fd);
+            // A failed append (ENOSPC, EIO, short write) must not poison the live
+            // process with a torn record. Restore the previous durable boundary
+            // when possible; if rollback itself fails, abandon this pack so later
+            // writes never append behind the torn bytes. Restart recovery will
+            // truncate it.
+            int rollback = target.empty() ? -1 : ::open(target.c_str(), O_WRONLY);
+            if (rollback >= 0) {
+                if (::ftruncate(rollback, static_cast<off_t>(start)) == 0)
+                    active_pack_size_ = start;
+                else {
+                    active_pack_.clear();
+                    active_pack_size_ = 0;
+                }
+                ::close(rollback);
+            } else {
                 active_pack_.clear();
                 active_pack_size_ = 0;
             }
-            ::close(rollback);
-        } else {
-            active_pack_.clear();
-            active_pack_size_ = 0;
+            throw;
         }
-        lock.lock();
-        throw;
     }
-    lock.lock();
     if (entry) {
         entry->file = target;
         entry->payload_offset = start + header.size();
@@ -714,8 +728,7 @@ bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
     return true;
 }
 
-std::optional<Bytes> LocalStore::get_packed_locked(
-    const ObjectId& id, std::unique_lock<std::mutex>& lock) const {
+std::optional<Bytes> LocalStore::get_packed_locked(const ObjectId& id, Lock& lock) const {
     auto found = packed_.find(id);
     if (found == packed_.end()) return {};
     const auto entry = found->second;
@@ -725,11 +738,7 @@ std::optional<Bytes> LocalStore::get_packed_locked(
     // A reader lease pins the indexed pack against compaction before any
     // filesystem call, keeping even open(2) outside m_; compaction switches the
     // index and waits for old readers before unlinking the victim.
-    lock.unlock();
-    int fd = -1;
-    auto release_reader = [&] {
-        if (!lock.owns_lock())
-            lock.lock();
+    auto release_reader = [&]() MACHA_REQUIRES(m_) {
         auto active = active_pack_readers_.find(entry.file);
         if (active == active_pack_readers_.end() || active->second == 0)
             throw std::logic_error("local store pack reader underflow");
@@ -737,34 +746,41 @@ std::optional<Bytes> LocalStore::get_packed_locked(
             active_pack_readers_.erase(active);
         pack_readers_cv_.notify_all();
     };
+    Bytes plain;
     try {
-        if (before_read)
-            before_read(id);
-        fd = ::open(entry.file.c_str(), O_RDONLY);
-        if (fd < 0)
-            throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
-        auto payload = pra_exact(fd, static_cast<size_t>(entry.payload_size),
-                                 entry.payload_offset);
-        const int close_rc = ::close(fd);
-        fd = -1;
-        if (!payload)
-            throw std::runtime_error("short packed object read");
-        if (close_rc != 0)
-            throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
-        auto plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
-        if (plain.size() != entry.plain_size || object_id(plain) != id)
-            throw std::runtime_error("packed object integrity failure");
-        release_reader();
-        return plain;
+        Unlocked unlocked(lock, m_);
+        int fd = -1;
+        try {
+            if (before_read)
+                before_read(id);
+            fd = ::open(entry.file.c_str(), O_RDONLY);
+            if (fd < 0)
+                throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+            auto payload = pra_exact(fd, static_cast<size_t>(entry.payload_size),
+                                     entry.payload_offset);
+            const int close_rc = ::close(fd);
+            fd = -1;
+            if (!payload)
+                throw std::runtime_error("short packed object read");
+            if (close_rc != 0)
+                throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+            plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
+            if (plain.size() != entry.plain_size || object_id(plain) != id)
+                throw std::runtime_error("packed object integrity failure");
+        } catch (...) {
+            if (fd >= 0)
+                ::close(fd);
+            throw;
+        }
     } catch (...) {
-        if (fd >= 0)
-            ::close(fd);
         release_reader();
         throw;
     }
+    release_reader();
+    return plain;
 }
 
-void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
+void LocalStore::rebuild_pack_index(bool truncate_incomplete_tail) {
     packed_.clear();
     pack_dead_bytes_ = 0;
     next_pack_sequence_ = 1;
@@ -903,8 +919,7 @@ void LocalStore::rebuild_pack_index_locked(bool truncate_incomplete_tail) {
 }
 
 bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> data,
-                                  StoreWriteDurability durability, uint64_t* deferred_generation,
-                                  std::unique_lock<std::mutex>& lock) {
+                                  uint64_t& generation, Lock& lock) {
     // Reserve capacity and mark accounting dirty under m_, then seal and
     // install under the object's lock only.
     constexpr uint64_t loose_header_size = M.size() + sizeof(uint64_t) + 12 + 16;
@@ -913,48 +928,60 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
     reserved_write_bytes_ += need;
     auto before_write = before_loose_write_for_tests_;
-    lock.unlock();
-    if (!filesystem_space_available_for_reservations()) {
-        lock.lock();
+    bool space = false;
+    {
+        Unlocked unlocked(lock, m_);
+        space = filesystem_space_available_for_reservations();
+    }
+    if (!space) {
         reserved_write_bytes_ -= need;
         return false;
     }
-    if (!ephemeral) {
-        lock.lock();
+    if (!ephemeral)
         ensure_accounting_dirty(lock);
-        lock.unlock();
-    }
-    std::string temp;
-    int fd = -1;
     bool reserved = true;
     try {
-        if (before_write)
-            before_write(id);
-        auto sealed = aes_gcm_seal(key_, data, id.bytes);
-        Writer header;
-        header.raw(M);
-        header.u64(data.size());
-        header.fixed(sealed.nonce);
-        header.fixed(sealed.tag);
-        if (header.data().size() + sealed.ciphertext.size() != need)
-            throw std::logic_error("local store loose object size mismatch");
+        const auto p = path(id);
+        std::optional<LooseStamp> installed_stamp;
+        {
+            Unlocked unlocked(lock, m_);
+            std::string temp;
+            int fd = -1;
+            try {
+                if (before_write)
+                    before_write(id);
+                auto sealed = aes_gcm_seal(key_, data, id.bytes);
+                Writer header;
+                header.raw(M);
+                header.u64(data.size());
+                header.fixed(sealed.nonce);
+                header.fixed(sealed.tag);
+                if (header.data().size() + sealed.ciphertext.size() != need)
+                    throw std::logic_error("local store loose object size mismatch");
 
-        auto p = path(id);
-        std::filesystem::create_directories(p.parent_path());
-        temp = p.string() + ".tmp." + std::to_string(getpid()) + "." +
-               std::to_string(unix_ms());
-        fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) throw std::runtime_error(strerror(errno));
-        wa(fd, header.data());
-        wa(fd, sealed.ciphertext);
-        if (::close(fd) != 0) throw std::runtime_error(strerror(errno));
-        fd = -1;
-        if (::rename(temp.c_str(), p.c_str()) != 0) throw std::runtime_error(strerror(errno));
-        temp.clear();
-        const auto installed_stamp = loose_stamp(p);
-        if (!installed_stamp)
-            throw std::runtime_error("cannot stat installed local object");
-        lock.lock();
+                std::filesystem::create_directories(p.parent_path());
+                temp = p.string() + ".tmp." + std::to_string(getpid()) + "." +
+                       std::to_string(unix_ms());
+                fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (fd < 0) throw std::runtime_error(strerror(errno));
+                wa(fd, header.data());
+                wa(fd, sealed.ciphertext);
+                if (::close(fd) != 0) throw std::runtime_error(strerror(errno));
+                fd = -1;
+                if (::rename(temp.c_str(), p.c_str()) != 0)
+                    throw std::runtime_error(strerror(errno));
+                temp.clear();
+                installed_stamp = loose_stamp(p);
+                if (!installed_stamp)
+                    throw std::runtime_error("cannot stat installed local object");
+            } catch (...) {
+                if (fd >= 0) ::close(fd);
+                std::error_code remove_error;
+                if (!temp.empty())
+                    std::filesystem::remove(temp, remove_error);
+                throw;
+            }
+        }
         if (reserved_write_bytes_ < need)
             throw std::logic_error("local store write reservation underflow");
         reserved_write_bytes_ -= need;
@@ -962,7 +989,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         used_.fetch_add(need, std::memory_order_relaxed);
         remember_verified_loose_locked(id, *installed_stamp);
         presence_.installed(id);
-        uint64_t generation = 0;
+        generation = 0;
         if (!ephemeral && durability_domain_) {
             generation = durability_domain_->complete_mutation(p, p.parent_path());
             last_mutation_generation_ = std::max(last_mutation_generation_, generation);
@@ -970,19 +997,8 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
             provisional_order_.push_back({generation, id});
             reap_durable_generations_locked();
         }
-        if (deferred_generation) *deferred_generation = generation;
-        if (!ephemeral && durability == StoreWriteDurability::immediate && generation) {
-            lock.unlock();
-            durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
-        }
         return true;
     } catch (...) {
-        if (fd >= 0) ::close(fd);
-        std::error_code remove_error;
-        if (!temp.empty())
-            std::filesystem::remove(temp, remove_error);
-        if (!lock.owns_lock())
-            lock.lock();
         if (reserved) {
             if (reserved_write_bytes_ < need)
                 throw std::logic_error("local store write reservation underflow during failure");
@@ -993,19 +1009,20 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
 }
 
 bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> data,
-                                   StoreWriteDurability durability, uint64_t* deferred_generation,
-                                   std::unique_lock<std::mutex>& lock) {
+                                   uint64_t& generation, Lock& lock) {
     const uint64_t need = pack_header_size + data.size();
     if (!physical_space_available_locked(need)) return false;
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
     reserved_write_bytes_ += need;
-    lock.unlock();
-    if (!filesystem_space_available_for_reservations()) {
-        lock.lock();
+    bool space = false;
+    {
+        Unlocked unlocked(lock, m_);
+        space = filesystem_space_available_for_reservations();
+    }
+    if (!space) {
         reserved_write_bytes_ -= need;
         return false;
     }
-    lock.lock();
     if (!ephemeral) ensure_accounting_dirty(lock);
     PackEntry entry;
     uint64_t record_size = 0;
@@ -1025,18 +1042,13 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
     packed_[id] = entry;
     used_.fetch_add(record_size, std::memory_order_relaxed);
 
-    uint64_t generation = 0;
+    generation = 0;
     if (!ephemeral && durability_domain_) {
         generation = durability_domain_->complete_mutation(entry.file, packs_);
         last_mutation_generation_ = std::max(last_mutation_generation_, generation);
         provisional_generations_[id] = generation;
         provisional_order_.push_back({generation, id});
         reap_durable_generations_locked();
-    }
-    if (deferred_generation) *deferred_generation = generation;
-    if (!ephemeral && durability == StoreWriteDurability::immediate && generation) {
-        lock.unlock();
-        durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
     }
     return true;
 }
@@ -1045,9 +1057,10 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
                           StoreWriteDurability durability, uint64_t* deferred_generation) {
     if (object_id(data) != id) throw std::runtime_error("object hash mismatch");
     ObjectLock object_guard(object_mutex(id));
-    std::unique_lock lock(m_);
+    Lock lock(m_);
     wait_for_accounting(lock);
 
+    bool pack = false;
     if (packed_.contains(id)) {
         std::optional<Bytes> existing;
         try {
@@ -1059,15 +1072,16 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
             std::equal(existing->begin(), existing->end(), data.begin())) {
             // A compact touch record makes the re-affirmation age crash-recoverable.
             uint64_t record_size = 0;
+            PackEntry record;
             if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
             const auto touched = unix_ms();
-            append_pack_record_locked(pack_touch, id, {}, touched, nullptr, &record_size, lock);
+            append_pack_record_locked(pack_touch, id, {}, touched, &record, &record_size, lock);
             packed_.at(id).touched_unix_ms = touched;
             pack_dead_bytes_ += record_size;
             used_.fetch_add(record_size, std::memory_order_relaxed);
             uint64_t generation = 0;
             if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
-                generation = durability_domain_->complete_mutation(active_pack_, packs_);
+                generation = durability_domain_->complete_mutation(record.file, packs_);
                 last_mutation_generation_ = std::max(last_mutation_generation_, generation);
                 provisional_generations_[id] = generation;
                 provisional_order_.push_back({generation, id});
@@ -1081,91 +1095,100 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
         }
         // A corrupt packed record is superseded by the new record. The old bytes
         // remain dead until compaction; no in-place rewrite can damage neighbours.
-        return put_packed_locked(id, data, durability, deferred_generation, lock);
-    }
-
-    const auto loose_path = path(id);
-    lock.unlock();
-    const bool loose_exists = std::filesystem::exists(loose_path);
-    lock.lock();
-    if (loose_exists) {
-        std::optional<LooseStamp> remembered;
-        if (auto verified = verified_loose_.find(id); verified != verified_loose_.end())
-            remembered = verified->second.stamp;
-        std::optional<Bytes> existing;
+        pack = true;
+    } else {
+        const auto loose_path = path(id);
         lock.unlock();
-        const auto current_stamp = loose_stamp(loose_path);
-        const bool verified_fast = remembered && current_stamp && *remembered == *current_stamp;
-        if (verified_fast) {
-            loose_reaffirmation_fast_paths_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            loose_reaffirmation_full_validations_.fetch_add(1, std::memory_order_relaxed);
-            try {
-                auto encoded = rf(loose_path);
-                Reader r(encoded);
-                auto magic = r.raw(M.size());
-                if (!std::equal(magic.begin(), magic.end(), M.begin()))
-                    throw std::runtime_error("bad object header");
-                auto size = r.u64();
-                auto nonce = r.fixed<12>();
-                auto tag = r.fixed<16>();
-                auto cipher = r.raw(r.remaining());
-                auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
-                if (plain.size() != size || object_id(plain) != id)
-                    throw std::runtime_error("object integrity failure");
-                existing = std::move(plain);
-            } catch (...) {
-                existing.reset();
-            }
-        }
-        if (verified_fast ||
-            (existing && existing->size() == data.size() &&
-             std::equal(existing->begin(), existing->end(), data.begin()))) {
-            std::error_code touch_error;
-            std::filesystem::last_write_time(loose_path,
-                                             std::filesystem::file_time_type::clock::now(),
-                                             touch_error);
-            const auto touched_stamp = loose_stamp(loose_path);
-            lock.lock();
-            if (touched_stamp)
-                remember_verified_loose_locked(id, *touched_stamp);
-            else
-                forget_verified_loose_locked(id);
-            reap_durable_generations_locked();
-            uint64_t generation = 0;
-            if (auto found = provisional_generations_.find(id);
-                found != provisional_generations_.end())
-                generation = found->second;
-            if (deferred_generation) *deferred_generation = generation;
-            if (durability == StoreWriteDurability::immediate && durability_domain_ &&
-                generation > durability_domain_->durable_generation()) {
-                lock.unlock();
-                durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
-            }
-            return true;
-        }
-
-        // Preserve the strong PUT acknowledgement contract: an externally
-        // corrupted object is replaced by the supplied bytes rather than being
-        // trusted merely because its content-addressed pathname exists.
+        const bool loose_exists = std::filesystem::exists(loose_path);
         lock.lock();
-        if (!remove_locked(id, lock)) {
+        if (loose_exists) {
+            std::optional<LooseStamp> remembered;
+            if (auto verified = verified_loose_.find(id); verified != verified_loose_.end())
+                remembered = verified->second.stamp;
+            std::optional<Bytes> existing;
             lock.unlock();
-            const bool still_exists = std::filesystem::exists(loose_path);
+            const auto current_stamp = loose_stamp(loose_path);
+            const bool verified_fast =
+                remembered && current_stamp && *remembered == *current_stamp;
+            if (verified_fast) {
+                loose_reaffirmation_fast_paths_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                loose_reaffirmation_full_validations_.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    auto encoded = rf(loose_path);
+                    Reader r(encoded);
+                    auto magic = r.raw(M.size());
+                    if (!std::equal(magic.begin(), magic.end(), M.begin()))
+                        throw std::runtime_error("bad object header");
+                    auto size = r.u64();
+                    auto nonce = r.fixed<12>();
+                    auto tag = r.fixed<16>();
+                    auto cipher = r.raw(r.remaining());
+                    auto plain = aes_gcm_open(key_, nonce, tag, cipher, id.bytes);
+                    if (plain.size() != size || object_id(plain) != id)
+                        throw std::runtime_error("object integrity failure");
+                    existing = std::move(plain);
+                } catch (...) {
+                    existing.reset();
+                }
+            }
+            if (verified_fast ||
+                (existing && existing->size() == data.size() &&
+                 std::equal(existing->begin(), existing->end(), data.begin()))) {
+                std::error_code touch_error;
+                std::filesystem::last_write_time(loose_path,
+                                                 std::filesystem::file_time_type::clock::now(),
+                                                 touch_error);
+                const auto touched_stamp = loose_stamp(loose_path);
+                lock.lock();
+                if (touched_stamp)
+                    remember_verified_loose_locked(id, *touched_stamp);
+                else
+                    forget_verified_loose_locked(id);
+                reap_durable_generations_locked();
+                uint64_t generation = 0;
+                if (auto found = provisional_generations_.find(id);
+                    found != provisional_generations_.end())
+                    generation = found->second;
+                if (deferred_generation) *deferred_generation = generation;
+                if (durability == StoreWriteDurability::immediate && durability_domain_ &&
+                    generation > durability_domain_->durable_generation()) {
+                    lock.unlock();
+                    durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
+                }
+                return true;
+            }
+
+            // Preserve the strong PUT acknowledgement contract: an externally
+            // corrupted object is replaced by the supplied bytes rather than being
+            // trusted merely because its content-addressed pathname exists.
             lock.lock();
-            if (still_exists)
-                throw std::runtime_error("cannot replace corrupt local object");
+            if (!remove_locked(id, lock)) {
+                lock.unlock();
+                const bool still_exists = std::filesystem::exists(loose_path);
+                lock.lock();
+                if (still_exists)
+                    throw std::runtime_error("cannot replace corrupt local object");
+            }
         }
+        pack = pack_threshold_ && data.size() <= pack_threshold_;
     }
 
-    if (pack_threshold_ && data.size() <= pack_threshold_)
-        return put_packed_locked(id, data, durability, deferred_generation, lock);
-    return put_loose_locked(id, data, durability, deferred_generation, lock);
+    uint64_t generation = 0;
+    const bool stored = pack ? put_packed_locked(id, data, generation, lock)
+                             : put_loose_locked(id, data, generation, lock);
+    if (!stored) return false;
+    if (deferred_generation) *deferred_generation = generation;
+    if (durability == StoreWriteDurability::immediate && generation) {
+        lock.unlock();
+        durability_domain_->await_durable(generation, DurabilityUrgency::immediate);
+    }
+    return true;
 }
 
 std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     ObjectLock object_guard(object_mutex(id));
-    std::unique_lock lock(m_);
+    Lock lock(m_);
     if (packed_.contains(id))
         return get_packed_locked(id, lock);
     const auto p = path(id);
@@ -1196,7 +1219,7 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
 
 std::optional<bool> LocalStore::presence_from_index(const ObjectId& id) const {
     NoIoRegion no_io_region;
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     if (packed_.contains(id))
         return true;
     if (const auto known = presence_.answer(id); known != PresenceIndex::Answer::unknown)
@@ -1215,7 +1238,7 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         // device, under the object's lock so a put of it is not seen midway.
         ObjectLock object_guard(object_mutex(id));
         {
-            std::lock_guard lock(m_);
+            Lock lock(m_);
             if (packed_.contains(id) ||
                 presence_.answer(id) == PresenceIndex::Answer::present)
                 return true;
@@ -1225,7 +1248,7 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         const auto size = std::filesystem::file_size(p, error);
         const bool present = !error && size > 0;
         if (present) {
-            std::lock_guard lock(m_);
+            Lock lock(m_);
             presence_.observed(id);
         }
         return present;
@@ -1238,36 +1261,41 @@ bool LocalStore::valid(const ObjectId& id) const noexcept {
     try { return get(id).has_value(); } catch (...) { return false; }
 }
 
-bool LocalStore::remove_locked(const ObjectId& id, std::unique_lock<std::mutex>& lock) {
+bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
     forget_verified_loose_locked(id);
     if (auto found = packed_.find(id); found != packed_.end()) {
         if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
         uint64_t tomb_size = 0;
-        append_pack_record_locked(pack_remove, id, {}, unix_ms(), nullptr, &tomb_size, lock);
+        PackEntry tomb;
+        append_pack_record_locked(pack_remove, id, {}, unix_ms(), &tomb, &tomb_size, lock);
         pack_dead_bytes_ += found->second.record_size + tomb_size;
         packed_.erase(found);
         used_.fetch_add(tomb_size, std::memory_order_relaxed);
         provisional_generations_.erase(id);
         if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
-            const auto generation = durability_domain_->complete_mutation(active_pack_, packs_);
+            const auto generation = durability_domain_->complete_mutation(tomb.file, packs_);
             last_mutation_generation_ = std::max(last_mutation_generation_, generation);
         }
         return true;
     }
 
     auto p = path(id);
-    lock.unlock();
     std::error_code error;
-    const auto size = std::filesystem::file_size(p, error);
-    lock.lock();
+    uintmax_t size = 0;
+    {
+        Unlocked unlocked(lock, m_);
+        size = std::filesystem::file_size(p, error);
+    }
     if (error) return false;
     if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
-    lock.unlock();
-    const bool removed = std::filesystem::remove(p, error);
+    bool removed = false;
     uint64_t generation = 0;
-    if (removed && !error && mode_ != LocalStoreMode::ephemeral && durability_domain_)
-        generation = durability_domain_->complete_mutation({}, p.parent_path());
-    lock.lock();
+    {
+        Unlocked unlocked(lock, m_);
+        removed = std::filesystem::remove(p, error);
+        if (removed && !error && mode_ != LocalStoreMode::ephemeral && durability_domain_)
+            generation = durability_domain_->complete_mutation({}, p.parent_path());
+    }
     if (error || !removed) return false;
     const auto before = used_.fetch_sub(size, std::memory_order_relaxed);
     if (size > before) {
@@ -1301,7 +1329,7 @@ void LocalStore::durability_barrier() {
     if (mode_ == LocalStoreMode::ephemeral || !durability_domain_) return;
     uint64_t generation = 0;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         generation = last_mutation_generation_;
     }
     if (generation)
@@ -1318,14 +1346,14 @@ uint64_t LocalStore::durability_domain_id() const noexcept {
 
 bool LocalStore::remove(const ObjectId& id) {
     ObjectLock object_guard(object_mutex(id));
-    std::unique_lock lock(m_);
+    Lock lock(m_);
     wait_for_accounting(lock);
     return remove_locked(id, lock);
 }
 
 bool LocalStore::remove_if_older_than(const ObjectId& id, std::chrono::milliseconds age) {
     ObjectLock object_guard(object_mutex(id));
-    std::unique_lock lock(m_);
+    Lock lock(m_);
     wait_for_accounting(lock);
     if (auto found = packed_.find(id); found != packed_.end()) {
         const auto now = unix_ms();
@@ -1355,7 +1383,7 @@ std::vector<ObjectId> LocalStore::list() const {
 std::optional<ObjectId> LocalStore::next_object(Cursor& cursor, bool& exhausted) const {
     exhausted = false;
     if (!cursor.packed_done) {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         auto it = cursor.packed_after ? packed_.upper_bound(*cursor.packed_after) : packed_.begin();
         if (it != packed_.end()) {
             cursor.packed_after = it->first;
@@ -1400,7 +1428,7 @@ std::optional<ObjectId> LocalStore::next_object(Cursor& cursor, bool& exhausted)
 }
 
 std::filesystem::path LocalStore::object_path(const ObjectId& id) const {
-    std::unique_lock lock(m_);
+    Lock lock(m_);
     if (auto found = packed_.find(id); found != packed_.end()) return found->second.file;
     return path(id);
 }
@@ -1408,7 +1436,7 @@ std::filesystem::path LocalStore::object_path(const ObjectId& id) const {
 uint64_t LocalStore::stored_size(const ObjectId& id) const {
     ObjectLock object_guard(object_mutex(id));
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (auto found = packed_.find(id); found != packed_.end())
             return found->second.record_size;
     }
@@ -1420,7 +1448,7 @@ uint64_t LocalStore::stored_size(const ObjectId& id) const {
 std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const {
     ObjectLock object_guard(object_mutex(id));
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (auto found = packed_.find(id); found != packed_.end())
             return file_time_from_unix_ms(found->second.touched_unix_ms);
     }
@@ -1431,17 +1459,18 @@ std::filesystem::file_time_type LocalStore::last_write(const ObjectId& id) const
 
 void LocalStore::touch(const ObjectId& id) {
     ObjectLock object_guard(object_mutex(id));
-    std::unique_lock lock(m_);
+    Lock lock(m_);
     if (auto found = packed_.find(id); found != packed_.end()) {
         uint64_t record_size = 0;
+        PackEntry record;
         const auto touched = unix_ms();
         if (mode_ != LocalStoreMode::ephemeral) ensure_accounting_dirty(lock);
-        append_pack_record_locked(pack_touch, id, {}, touched, nullptr, &record_size, lock);
+        append_pack_record_locked(pack_touch, id, {}, touched, &record, &record_size, lock);
         found->second.touched_unix_ms = touched;
         pack_dead_bytes_ += record_size;
         used_.fetch_add(record_size, std::memory_order_relaxed);
         if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
-            const auto generation = durability_domain_->complete_mutation(active_pack_, packs_);
+            const auto generation = durability_domain_->complete_mutation(record.file, packs_);
             last_mutation_generation_ = std::max(last_mutation_generation_, generation);
         }
         return;
@@ -1454,7 +1483,7 @@ void LocalStore::touch(const ObjectId& id) {
 bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) const {
     ObjectLock object_guard(object_mutex(id));
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (auto found = packed_.find(id); found != packed_.end()) {
             const auto now = unix_ms();
             return now >= found->second.touched_unix_ms &&
@@ -1469,11 +1498,11 @@ bool LocalStore::older_than(const ObjectId& id, std::chrono::milliseconds age) c
 
 bool LocalStore::is_packed(const ObjectId& id) const {
     ObjectLock object_guard(object_mutex(id));
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     return packed_.contains(id);
 }
 
-bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
+bool LocalStore::compact_packs_locked(Lock& lock) {
     if (!pack_threshold_ || pack_dead_bytes_ == 0)
         return true;
 
@@ -1493,57 +1522,66 @@ bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
     }
     const auto packed_snapshot = packed_;
     const auto before_compaction = before_pack_compaction_for_tests_;
-    lock.unlock();
-    if (before_compaction)
-        before_compaction();
 
     std::vector<PackUsage> packs;
     uint64_t total_dead = 0;
-    std::error_code enumerate_error;
-    for (const auto& entry : std::filesystem::directory_iterator(packs_, enumerate_error)) {
-        if (enumerate_error)
-            break;
-        if (!entry.is_regular_file() || !pack_sequence(entry.path().filename().string()))
-            continue;
-        std::error_code size_error;
-        const auto size = entry.file_size(size_error);
-        if (size_error)
-            throw std::runtime_error("cannot size source pack: " + size_error.message());
-        const auto found = live_by_pack.find(entry.path());
-        const uint64_t live = found == live_by_pack.end() ? 0 : found->second;
-        if (live > size)
-            throw std::runtime_error("pack live accounting exceeds physical pack size");
-        const uint64_t dead = size - live;
-        if (dead > std::numeric_limits<uint64_t>::max() - total_dead)
-            throw std::runtime_error("pack dead-size overflow");
-        total_dead += dead;
-        packs.push_back({entry.path(), size, live, dead});
-    }
-    if (enumerate_error)
-        throw std::runtime_error("cannot enumerate source packs: " + enumerate_error.message());
+    std::optional<PackUsage> victim;
+    bool space_available = true;
+    {
+        Unlocked unlocked(lock, m_);
+        if (before_compaction)
+            before_compaction();
 
-    // The cached counter is only an admission hint; recompute from the index
-    // so an interrupted compaction cannot leave dead bytes hidden.
-    auto victim = std::max_element(packs.begin(), packs.end(), [](const PackUsage& a,
-                                                                  const PackUsage& b) {
-        if (a.dead != b.dead)
-            return a.dead < b.dead;
-        return a.size < b.size;
-    });
-    if (victim == packs.end() || victim->dead == 0) {
-        lock.lock();
+        std::error_code enumerate_error;
+        for (const auto& entry : std::filesystem::directory_iterator(packs_, enumerate_error)) {
+            if (enumerate_error)
+                break;
+            if (!entry.is_regular_file() || !pack_sequence(entry.path().filename().string()))
+                continue;
+            std::error_code size_error;
+            const auto size = entry.file_size(size_error);
+            if (size_error)
+                throw std::runtime_error("cannot size source pack: " + size_error.message());
+            const auto found = live_by_pack.find(entry.path());
+            const uint64_t live = found == live_by_pack.end() ? 0 : found->second;
+            if (live > size)
+                throw std::runtime_error("pack live accounting exceeds physical pack size");
+            const uint64_t dead = size - live;
+            if (dead > std::numeric_limits<uint64_t>::max() - total_dead)
+                throw std::runtime_error("pack dead-size overflow");
+            total_dead += dead;
+            packs.push_back({entry.path(), size, live, dead});
+        }
+        if (enumerate_error)
+            throw std::runtime_error("cannot enumerate source packs: " +
+                                     enumerate_error.message());
+
+        // The cached counter is only an admission hint; recompute from the index
+        // so an interrupted compaction cannot leave dead bytes hidden.
+        auto most_dead = std::max_element(packs.begin(), packs.end(), [](const PackUsage& a,
+                                                                         const PackUsage& b) {
+            if (a.dead != b.dead)
+                return a.dead < b.dead;
+            return a.size < b.size;
+        });
+        if (most_dead != packs.end() && most_dead->dead != 0) {
+            victim = *most_dead;
+            // At most one source pack per call, so temporary space is bounded by
+            // that pack's live bytes.
+            std::error_code space_error;
+            const auto space = std::filesystem::space(root_, space_error);
+            if (space_error)
+                throw std::runtime_error("cannot inspect free space for pack compaction: " +
+                                         space_error.message());
+            space_available =
+                victim->live <= space.available && reserve_free_ <= space.available - victim->live;
+        }
+    }
+    if (!victim) {
         pack_dead_bytes_ = 0;
         return true;
     }
-
-    // At most one source pack per call, so temporary space is bounded by that
-    // pack's live bytes.
-    std::error_code space_error;
-    const auto space = std::filesystem::space(root_, space_error);
-    if (space_error)
-        throw std::runtime_error("cannot inspect free space for pack compaction: " +
-                                 space_error.message());
-    if (victim->live > space.available || reserve_free_ > space.available - victim->live)
+    if (!space_available)
         return false;
 
     std::vector<std::pair<ObjectId, PackEntry>> victim_entries;
@@ -1552,27 +1590,14 @@ bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
             victim_entries.push_back({id, entry});
 
     std::filesystem::path replacement;
-    std::filesystem::path temp;
-    int fd = -1;
     uint64_t replacement_size = 0;
     std::map<ObjectId, PackEntry> rebuilt;
-
-    auto cleanup_temp = [&] {
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
-        if (!temp.empty()) {
-            std::error_code error;
-            std::filesystem::remove(temp, error);
-        }
-    };
-
-    try {
-        if (!victim_entries.empty()) {
-            lock.lock();
+    if (!victim_entries.empty()) {
+        Unlocked unlocked(lock, m_);
+        std::filesystem::path temp;
+        int fd = -1;
+        try {
             const auto sequence = next_pack_sequence_++;
-            lock.unlock();
             replacement = packs_ / pack_name(sequence);
             temp = packs_ / (".compact-" + std::to_string(getpid()) + "-" +
                              std::to_string(sequence) + ".tmp");
@@ -1618,101 +1643,98 @@ bool LocalStore::compact_packs_locked(std::unique_lock<std::mutex>& lock) {
                                          std::string(strerror(errno)));
             temp.clear();
             syncdir(packs_);
+        } catch (...) {
+            if (fd >= 0)
+                ::close(fd);
+            if (!temp.empty()) {
+                std::error_code error;
+                std::filesystem::remove(temp, error);
+            }
+            throw;
         }
+    }
 
-        lock.lock();
-        if (mode_ != LocalStoreMode::ephemeral)
-            ensure_accounting_dirty(lock);
+    if (mode_ != LocalStoreMode::ephemeral)
+        ensure_accounting_dirty(lock);
 
-        const auto before = used_.load(std::memory_order_relaxed);
-        if (replacement_size > std::numeric_limits<uint64_t>::max() - before)
-            throw std::runtime_error("pack compaction accounting overflow");
-        used_.store(before + replacement_size, std::memory_order_relaxed);
+    const auto before = used_.load(std::memory_order_relaxed);
+    if (replacement_size > std::numeric_limits<uint64_t>::max() - before)
+        throw std::runtime_error("pack compaction accounting overflow");
+    used_.store(before + replacement_size, std::memory_order_relaxed);
 
-        // The installed replacement has a strictly newer sequence than every
-        // existing pack. Point the live index at it before removing the victim;
-        // a failed unlink then leaves only harmless dead duplicate bytes.
-        for (auto& [id, entry] : rebuilt)
-            packed_[id] = std::move(entry);
+    // The installed replacement has a strictly newer sequence than every
+    // existing pack. Point the live index at it before removing the victim;
+    // a failed unlink then leaves only harmless dead duplicate bytes.
+    for (auto& [id, entry] : rebuilt)
+        packed_[id] = std::move(entry);
 
-        if (!replacement.empty() && replacement_size < pack_target_size_) {
-            active_pack_ = replacement;
-            active_pack_size_ = replacement_size;
-        } else {
-            active_pack_.clear();
-            active_pack_size_ = 0;
-        }
-        lock.unlock();
+    if (!replacement.empty() && replacement_size < pack_target_size_) {
+        active_pack_ = replacement;
+        active_pack_size_ = replacement_size;
+    } else {
+        active_pack_.clear();
+        active_pack_size_ = 0;
+    }
 
-        // Readers which selected the victim before the atomic index switch may
-        // not have opened it yet. Wait without retaining m_; no new reader can
-        // select the victim after the switch above.
-        lock.lock();
-        pack_readers_cv_.wait(lock, [&] {
-            auto active = active_pack_readers_.find(victim->file);
-            return active == active_pack_readers_.end() || active->second == 0;
-        });
-        lock.unlock();
+    // Readers which selected the victim before the index switch may not have
+    // opened it yet; no new reader can select it after the switch above.
+    pack_readers_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(m_) {
+        auto active = active_pack_readers_.find(victim->file);
+        return active == active_pack_readers_.end() || active->second == 0;
+    });
 
-        std::error_code remove_error;
-        const bool removed = std::filesystem::remove(victim->file, remove_error);
+    std::error_code remove_error;
+    bool removed = false;
+    uint64_t generation = 0;
+    {
+        Unlocked unlocked(lock, m_);
+        removed = std::filesystem::remove(victim->file, remove_error);
         if (remove_error || !removed) {
             // All records in the old victim are now superseded by the newer
             // representation (or were already dead), so the entire old pack is
             // dead and can be retried by a later bounded compaction pass.
             Log::warn("cannot remove compacted source pack path=" + victim->file.string() +
                       (remove_error ? " error=" + remove_error.message() : ""));
-        } else {
         }
         syncdir(packs_);
-
-        uint64_t generation = 0;
-        if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
+        if (mode_ != LocalStoreMode::ephemeral && durability_domain_)
             generation = durability_domain_->complete_mutation({}, packs_);
-        }
-        lock.lock();
-        if (remove_error || !removed) {
-            pack_dead_bytes_ = total_dead - victim->dead + victim->size;
-        } else {
-            const auto current_used = used_.fetch_sub(victim->size, std::memory_order_relaxed);
-            if (victim->size > current_used) {
-                used_.fetch_add(victim->size, std::memory_order_relaxed);
-                throw std::runtime_error("pack compaction accounting underflow");
-            }
-            pack_dead_bytes_ = total_dead - victim->dead;
-        }
-        if (generation) {
-            last_mutation_generation_ = std::max(last_mutation_generation_, generation);
-        }
-        return !remove_error && removed;
-    } catch (...) {
-        cleanup_temp();
-        if (!lock.owns_lock())
-            lock.lock();
-        throw;
     }
+    if (remove_error || !removed) {
+        pack_dead_bytes_ = total_dead - victim->dead + victim->size;
+    } else {
+        const auto current_used = used_.fetch_sub(victim->size, std::memory_order_relaxed);
+        if (victim->size > current_used) {
+            used_.fetch_add(victim->size, std::memory_order_relaxed);
+            throw std::runtime_error("pack compaction accounting underflow");
+        }
+        pack_dead_bytes_ = total_dead - victim->dead;
+    }
+    if (generation) {
+        last_mutation_generation_ = std::max(last_mutation_generation_, generation);
+    }
+    return !remove_error && removed;
 }
 
 bool LocalStore::compact_packs(std::stop_token stop) {
-    std::unique_lock pack_io_lock(pack_io_mutex_);
-    std::unique_lock lock(m_);
+    Lock pack_io_lock(pack_io_mutex_);
+    Lock lock(m_);
     if (!wait_for_accounting(lock, stop, true)) return false;
     return compact_packs_locked(lock);
 }
 
-void LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock) const {
+void LocalStore::wait_for_accounting(Lock& lock) const {
     (void)wait_for_accounting(lock, {});
 }
 
-bool LocalStore::wait_for_accounting(std::unique_lock<std::mutex>& lock,
-                                     std::stop_token stop, bool exact) const {
+bool LocalStore::wait_for_accounting(Lock& lock, std::stop_token stop, bool exact) const {
     // Ordinary puts/removes proceed on a checkpoint estimate; only callers
     // that need the reconciled figure (compaction) wait for the walk.
     if (!exact && accounting_estimate_.load(std::memory_order_acquire) &&
         !scan_failed_.load(std::memory_order_acquire))
         return true;
     std::stop_callback wake_waiter(stop, [this] { accounting_cv_.notify_all(); });
-    accounting_cv_.wait(lock, [this, stop] {
+    accounting_cv_.wait(lock.native(), [this, stop] {
         return scan_complete_.load(std::memory_order_acquire) ||
                scan_failed_.load(std::memory_order_acquire) || stop.stop_requested();
     });
@@ -1756,7 +1778,7 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
         uint64_t entries = 0;
         const auto flush = [&] {
             if (batch.empty()) return;
-            std::lock_guard lock(m_);
+            Lock lock(m_);
             presence_.listed(batch);
             entries += batch.size();
             batch.clear();
@@ -1778,7 +1800,7 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
                                     Clock::now() - started).count();
         if (!error) {
             {
-                std::lock_guard lock(m_);
+                Lock lock(m_);
                 presence_.warmed();
             }
             Log::debug("storage presence index warmed path=" + root_.string() +
@@ -1788,10 +1810,11 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
         }
         Log::warn("storage presence index walk failed path=" + root_.string() +
                   " error=" + error.message() + " retry_s=" + std::to_string(backoff.count()));
-        std::mutex wait_mutex;
+        // A stoppable sleep: the mutex guards nothing.
+        Mutex wait_mutex;
         std::condition_variable_any wait_cv;
-        std::unique_lock wait_lock(wait_mutex);
-        wait_cv.wait_for(wait_lock, stop, backoff, [] { return false; });
+        Lock wait_lock(wait_mutex);
+        wait_cv.wait_for(wait_lock.native(), stop, backoff, [] { return false; });
         backoff = std::min<std::chrono::seconds>(backoff * 2, std::chrono::minutes(5));
     }
 }
@@ -1827,7 +1850,7 @@ void LocalStore::scan(std::stop_token stop) {
                         ObjectLock object_guard(object_mutex(*id));
                         std::error_code exists_error;
                         if (std::filesystem::exists(it->path(), exists_error)) {
-                            std::lock_guard lock(m_);
+                            Lock lock(m_);
                             presence_.observed(*id);
                         }
                     }
@@ -1848,7 +1871,7 @@ void LocalStore::scan(std::stop_token stop) {
             const auto baseline = durability_domain_->complete_mutation();
             durability_domain_->await_durable(baseline, DurabilityUrgency::immediate);
             {
-                std::lock_guard lock(m_);
+                Lock lock(m_);
                 last_mutation_generation_ = std::max(last_mutation_generation_, baseline);
             }
         } catch (const std::exception& ex) {
@@ -1860,7 +1883,7 @@ void LocalStore::scan(std::stop_token stop) {
         }
     }
     {
-        std::unique_lock lock(m_);
+        Lock lock(m_);
         // Writes admitted against the estimate during the walk may or may
         // not have been seen by it; keep the larger figure (over-counting is
         // the safe direction, and bounded by what was written meanwhile).
@@ -1874,7 +1897,9 @@ void LocalStore::scan(std::stop_token stop) {
             // The clean checkpoint is written without m_, as
             // ensure_accounting_dirty writes its marker: a writer meanwhile
             // finds the store clean, waits for this write, then marks it dirty.
-            accounting_state_cv_.wait(lock, [this] { return !accounting_dirty_in_progress_; });
+            accounting_state_cv_.wait(lock.native(), [this]() MACHA_REQUIRES(m_) {
+                return !accounting_dirty_in_progress_;
+            });
             accounting_dirty_in_progress_ = true;
             accounting_dirty_ = false;
             const auto used = used_.load(std::memory_order_relaxed);

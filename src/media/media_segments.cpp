@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media/media_engine.hpp"
 
+#include "contract/thread_safety.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -8,7 +10,6 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
-#include <mutex>
 #include <optional>
 #include <sstream>
 
@@ -22,35 +23,38 @@ struct MediaSegmentStore::Impl {
         std::filesystem::path spill;
     };
 
-    mutable std::mutex mutex;
+    // Held across spilling fragments to files (maybe_spill_locked).
+    mutable IoMutex mutex;
     mutable std::condition_variable_any cv;
-    std::shared_ptr<Bytes> init;
-    std::vector<Segment> segments;
+    std::shared_ptr<Bytes> init MACHA_GUARDED_BY(mutex);
+    std::vector<Segment> segments MACHA_GUARDED_BY(mutex);
+    // This and the settings up to memory_limit, and spill_directory and
+    // target_duration, are fixed at construction.
     std::vector<double> vod_segment_durations;
     MediaContainer container{MediaContainer::fmp4};
-    bool finished{};
-    bool cancelled{};
-    bool superseded{};
-    std::string error;
-    uint64_t highest_requested{};
+    bool finished MACHA_GUARDED_BY(mutex){};
+    bool cancelled MACHA_GUARDED_BY(mutex){};
+    bool superseded MACHA_GUARDED_BY(mutex){};
+    std::string error MACHA_GUARDED_BY(mutex);
+    uint64_t highest_requested MACHA_GUARDED_BY(mutex){};
     size_t max_ahead{8};
     uint64_t memory_limit{64ULL * 1024 * 1024};
-    uint64_t memory_bytes{};
+    uint64_t memory_bytes MACHA_GUARDED_BY(mutex){};
     // Media produced and encoder time spent, parked intervals excluded (see
     // Snapshot). Both cover the same fragments: the clock starts at construction
     // so the first fragment is timed too. Timing only gaps between publications
     // would overstate the rate by n/(n-1); including start-up reads low early,
     // the conservative direction (a deferred handover, not a stalled viewer).
-    std::chrono::duration<double> produced_media{};
-    std::chrono::duration<double> producing{};
-    std::optional<std::chrono::steady_clock::time_point> produced_since;
-    uint64_t spill_bytes{};
+    std::chrono::duration<double> produced_media MACHA_GUARDED_BY(mutex){};
+    std::chrono::duration<double> producing MACHA_GUARDED_BY(mutex){};
+    std::optional<std::chrono::steady_clock::time_point> produced_since MACHA_GUARDED_BY(mutex);
+    uint64_t spill_bytes MACHA_GUARDED_BY(mutex){};
     std::filesystem::path spill_directory;
     std::chrono::milliseconds target_duration{4000};
-    std::optional<RetainedMemoryLedger::Lease> retained_memory;
+    std::optional<RetainedMemoryLedger::Lease> retained_memory MACHA_GUARDED_BY(mutex);
     // Deferred requests awaiting the next publication or ending; each fires once.
-    // Registered under `mutex`, fired after it is released.
-    mutable std::vector<std::function<void()>> wakers;
+    // Fired after `mutex` is released.
+    mutable std::vector<std::function<void()>> wakers MACHA_GUARDED_BY(mutex);
 
     // Collects owed wakers and fires them at scope end: declared before the lock,
     // destroyed after it, so no waker runs under the store mutex.
@@ -69,7 +73,7 @@ struct MediaSegmentStore::Impl {
         }
     };
 
-    void notify_locked(Wakeups& wakeups) {
+    void notify_locked(Wakeups& wakeups) MACHA_REQUIRES(mutex) {
         cv.notify_all();
         if (!wakers.empty()) {
             for (auto& wake : wakers) wakeups.list.push_back(std::move(wake));
@@ -77,7 +81,7 @@ struct MediaSegmentStore::Impl {
         }
     }
 
-    void maybe_spill_locked() {
+    void maybe_spill_locked() MACHA_REQUIRES(mutex) {
         if (!memory_limit || memory_bytes <= memory_limit || spill_directory.empty()) return;
         std::error_code ec;
         std::filesystem::create_directories(spill_directory, ec);
@@ -109,7 +113,7 @@ struct MediaSegmentStore::Impl {
 
     bool publish_init(Bytes bytes) {
         Wakeups wakeups;
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         if (cancelled) return false;
         init = std::make_shared<Bytes>(std::move(bytes));
         memory_bytes += init->size();
@@ -122,7 +126,7 @@ struct MediaSegmentStore::Impl {
         // Encode time is the gap since the previous call returned; the demand wait
         // comes after this point, so parked time is excluded.
         const auto entered = std::chrono::steady_clock::now();
-        std::unique_lock lock(mutex);
+        Lock lock(mutex);
         if (produced_since) producing += entered - *produced_since;
         const auto index = static_cast<uint64_t>(segments.size());
         if (!vod_segment_durations.empty() && index >= vod_segment_durations.size()) {
@@ -131,7 +135,7 @@ struct MediaSegmentStore::Impl {
             notify_locked(wakeups);
             return false;
         }
-        cv.wait(lock, [&] {
+        cv.wait(lock.native(), [&]() MACHA_REQUIRES(mutex) {
             return cancelled || index <= highest_requested + static_cast<uint64_t>(max_ahead);
         });
         if (cancelled) return false;
@@ -150,7 +154,7 @@ struct MediaSegmentStore::Impl {
 
     void mark_finished() {
         Wakeups wakeups;
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         // The invariant is planned media published, not fragment count: a boundary
         // can pass without a fragment (the delayed-moov flush) and its length is
         // carried into the next. publish_duration() consumes the plan, so equal
@@ -175,7 +179,7 @@ struct MediaSegmentStore::Impl {
 
     void mark_failed(std::string message) {
         Wakeups wakeups;
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         if (error.empty()) error = std::move(message);
         finished = true;
         notify_locked(wakeups);
@@ -222,7 +226,7 @@ std::optional<uint64_t> segment_number(std::string_view name) {
 } // namespace
 
 bool MediaSegmentStore::attach_memory_ledger(RetainedMemoryLedger& ledger) {
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     if (impl_->retained_memory)
         return true;
     auto lease = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment,
@@ -234,8 +238,8 @@ bool MediaSegmentStore::attach_memory_ledger(RetainedMemoryLedger& ledger) {
 }
 
 bool MediaSegmentStore::wait_ready(std::chrono::milliseconds timeout) {
-    std::unique_lock lock(impl_->mutex);
-    impl_->cv.wait_for(lock, timeout, [&] {
+    Lock lock(impl_->mutex);
+    impl_->cv.wait_for(lock.native(), timeout, [&]() MACHA_REQUIRES(impl_->mutex) {
         return impl_->cancelled || !impl_->error.empty() ||
                ((impl_->init || impl_->container == MediaContainer::mpegts) &&
                 !impl_->segments.empty()) ||
@@ -245,7 +249,7 @@ bool MediaSegmentStore::wait_ready(std::chrono::milliseconds timeout) {
 }
 
 std::string MediaSegmentStore::playlist() const {
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     if (!impl_->error.empty()) return {};
     const auto& durations = impl_->vod_segment_durations;
     if (durations.empty()) return {};
@@ -279,7 +283,7 @@ std::optional<Bytes> MediaSegmentStore::object(std::string_view name) const {
     std::shared_ptr<Bytes> resident;
     std::filesystem::path spill;
     {
-        std::lock_guard lock(impl_->mutex);
+        Lock lock(impl_->mutex);
         if (name == "init.mp4") {
             if (!impl_->init) return {};
             return *impl_->init;
@@ -315,25 +319,28 @@ std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
     if (!parsed && !init_object) return object(name);
     const uint64_t index = parsed ? *parsed : 0;
 
-    std::unique_lock lock(impl_->mutex);
-    if (!init_object && !impl_->vod_segment_durations.empty() &&
-        index >= impl_->vod_segment_durations.size())
-        return {};
-    // Kinds differ only in presence; everything that ends a wait is shared.
-    const auto present = [&] {
-        return init_object ? static_cast<bool>(impl_->init) : index < impl_->segments.size();
-    };
-    const auto ready = [&] {
-        return impl_->cancelled || impl_->superseded || !impl_->error.empty() || present() ||
-               impl_->finished;
-    };
-    if (timeout.count() > 0) impl_->cv.wait_for(lock, timeout, ready);
-    else impl_->cv.wait(lock, ready);
-    if (!present()) return {};
-    if (init_object) return *impl_->init;
-    auto resident = impl_->segments[static_cast<size_t>(index)].memory;
-    auto spill = impl_->segments[static_cast<size_t>(index)].spill;
-    lock.unlock();
+    std::shared_ptr<Bytes> resident;
+    std::filesystem::path spill;
+    {
+        Lock lock(impl_->mutex);
+        if (!init_object && !impl_->vod_segment_durations.empty() &&
+            index >= impl_->vod_segment_durations.size())
+            return {};
+        // Kinds differ only in presence; everything that ends a wait is shared.
+        const auto present = [&]() MACHA_REQUIRES(impl_->mutex) {
+            return init_object ? static_cast<bool>(impl_->init) : index < impl_->segments.size();
+        };
+        const auto ready = [&]() MACHA_REQUIRES(impl_->mutex) {
+            return impl_->cancelled || impl_->superseded || !impl_->error.empty() || present() ||
+                   impl_->finished;
+        };
+        if (timeout.count() > 0) impl_->cv.wait_for(lock.native(), timeout, ready);
+        else impl_->cv.wait(lock.native(), ready);
+        if (!present()) return {};
+        if (init_object) return *impl_->init;
+        resident = impl_->segments[static_cast<size_t>(index)].memory;
+        spill = impl_->segments[static_cast<size_t>(index)].spill;
+    }
     if (resident) return *resident;
     if (spill.empty()) return {};
     std::ifstream in(spill, std::ios::binary);
@@ -349,7 +356,7 @@ std::optional<Bytes> MediaSegmentStore::wait_object(std::string_view name,
 }
 
 void MediaSegmentStore::note_requested(uint64_t index) {
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     if (!impl_->vod_segment_durations.empty() && index >= impl_->vod_segment_durations.size()) return;
     impl_->highest_requested = std::max(impl_->highest_requested, index);
     impl_->maybe_spill_locked();
@@ -357,7 +364,7 @@ void MediaSegmentStore::note_requested(uint64_t index) {
 }
 
 MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     return {static_cast<bool>(impl_->init), impl_->finished, impl_->error,
             static_cast<uint64_t>(impl_->segments.size()), impl_->highest_requested,
             impl_->memory_bytes, impl_->spill_bytes,
@@ -379,14 +386,14 @@ MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
 
 void MediaSegmentStore::cancel() {
     Impl::Wakeups wakeups;
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     impl_->cancelled = true;
     impl_->notify_locked(wakeups);
 }
 
 void MediaSegmentStore::mark_superseded(bool superseded) {
     Impl::Wakeups wakeups;
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     impl_->superseded = superseded;
     impl_->notify_locked(wakeups);
 }
@@ -404,7 +411,7 @@ MediaSegmentStore::Awaited MediaSegmentStore::object_or_subscribe(
     std::shared_ptr<Bytes> resident;
     std::filesystem::path spill;
     {
-        std::lock_guard lock(impl_->mutex);
+        Lock lock(impl_->mutex);
         if (!init_object && !impl_->vod_segment_durations.empty() &&
             index >= impl_->vod_segment_durations.size())
             return {std::nullopt, true};

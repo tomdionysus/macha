@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/thread_safety.hpp"
 #include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/message_routes.hpp"
@@ -82,8 +83,9 @@ class NodeRuntime {
     // watches; the node never calls a consumer.
     NodeEvents& events_;
     // Declared before members_ so the roster is built with the right flags.
-    mutable std::mutex inbound_mutex_;
-    InboundResolution inbound_;
+    // Held across the resolution file's durable replace and its failure log.
+    mutable IoMutex inbound_mutex_;
+    InboundResolution inbound_ MACHA_GUARDED_BY(inbound_mutex_);
 
     // The control plane is constructed before storage and metadata, so the
     // node is reachable while its durable state recovers.
@@ -97,13 +99,14 @@ class NodeRuntime {
     std::atomic_bool control_plane_online_{};
     uint64_t startup_unix_ms_{};
     std::jthread connectivity_worker_;
-    std::mutex connectivity_wait_mutex_;
+    // Guards no state: the connectivity worker's wait lock.
+    Mutex connectivity_wait_mutex_;
     std::condition_variable_any connectivity_wait_cv_;
     std::atomic_uint64_t connectivity_wake_{};
     // One dial-back probe in flight per requesting peer, and one per 10 s: a
     // peer cannot use the probe to make this node hammer an address.
-    std::mutex dial_back_mutex_;
-    std::map<NodeId, Clock::time_point> dial_back_last_;
+    Mutex dial_back_mutex_;
+    std::map<NodeId, Clock::time_point> dial_back_last_ MACHA_GUARDED_BY(dial_back_mutex_);
 
     std::atomic_uint64_t remote_metadata_generation_{};
     std::atomic_uint64_t remote_metadata_epoch_{};
@@ -124,9 +127,11 @@ class NodeRuntime {
     std::atomic_uint64_t telemetry_demand_{1};
     std::jthread maintenance_;
     std::jthread telemetry_worker_;
-    std::mutex telemetry_wait_mutex_;
+    // Guards no state: the telemetry worker's wait lock.
+    Mutex telemetry_wait_mutex_;
     std::condition_variable_any telemetry_wait_cv_;
-    std::mutex maintenance_wait_mutex_;
+    // Guards no state: the maintenance thread's wait lock.
+    Mutex maintenance_wait_mutex_;
     std::condition_variable_any maintenance_wait_cv_;
     std::atomic_bool started_{};
     std::atomic_bool outbound_calls_stopped_{};
@@ -143,7 +148,7 @@ class NodeRuntime {
     void connectivity_loop(std::stop_token);
     bool resolve_hosts_extents_for(bool inbound_capable) const;
     void apply_inbound_resolution(bool inbound_capable, std::string source);
-    void persist_inbound_resolution_locked() const;
+    void persist_inbound_resolution_locked() const MACHA_REQUIRES(inbound_mutex_);
     void refuse_impossible_cluster() const;
     void exchange(const Endpoint&);
     void exchange(const NodeInfo&);

@@ -618,7 +618,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
     std::sort(active_nodes.begin(), active_nodes.end());
 
     if (!root) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         control_converged_root_.reset();
         control_converged_nodes_ = std::move(active_nodes);
         control_convergence_retry_ = {};
@@ -626,7 +626,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
     }
 
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (control_converged_root_ == root && control_converged_nodes_ == active_nodes)
             return true;
         if (Clock::now() < control_convergence_retry_)
@@ -662,7 +662,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
                 complete = false;
         }
 
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (complete) {
             control_converged_root_ = root;
             control_converged_nodes_ = std::move(active_nodes);
@@ -676,7 +676,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
         }
         return complete;
     } catch (...) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         control_converged_root_.reset();
         control_converged_nodes_.clear();
         control_convergence_retry_ = Clock::now() + std::chrono::seconds(5);
@@ -686,7 +686,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
 void CatalogueManager::cache(uint64_t metadata_generation, const MetadataSnapshot& metadata,
                              CatalogueSnapshot snapshot) {
     auto cached = std::make_shared<const CatalogueSnapshot>(std::move(snapshot));
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const bool root_changed = !control_gc_root_epoch_initialized_ ||
                               cached_root_ != metadata.catalogue_root;
     cached_ = std::move(cached);
@@ -728,10 +728,10 @@ bool CatalogueManager::reconcile_catalogue_conflict(const MetadataSnapshotView& 
 void CatalogueManager::repair_once() {
     // Single-flight: of the API workers seeing the same notice or TTL expiry,
     // only one does the replica I/O and decodes the new root.
-    std::lock_guard refresh_lock(refresh_mutex_);
+    Lock refresh_lock(refresh_mutex_);
     try {
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             const auto now = Clock::now();
             if (ready_ && cached_metadata_generation_ >= metadata_server_.known_generation() &&
                 now < cache_until_ && control_converged_root_ == cached_root_) {
@@ -773,7 +773,7 @@ void CatalogueManager::repair_once() {
         const auto& metadata = *view->snapshot;
         const bool control_converged = converge_control_replicas(metadata);
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (ready_ && cached_root_ == metadata.catalogue_root) {
                 // The root is content-addressed: unchanged, the cached snapshot
                 // is current, whatever the generation did.
@@ -793,7 +793,7 @@ void CatalogueManager::repair_once() {
         auto snapshot = load_root(metadata.catalogue_root);
         cache(generation, metadata, std::move(snapshot));
     } catch (const std::exception& e) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         // A failed attempt keeps the loaded snapshot; warm reads continue on it
         // while a later pass retries.
         error_code_ = "unavailable";
@@ -804,7 +804,7 @@ void CatalogueManager::repair_once() {
 
 std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         // Warm reads are memory-only: convergence is background work, and a GET
         // never blocks on replica I/O for an expired TTL.
         if (ready_ && cached_)
@@ -814,14 +814,14 @@ std::shared_ptr<const CatalogueSnapshot> CatalogueManager::current_snapshot() {
     // A cold manager's first read loads a snapshot synchronously.
     repair_once();
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (!ready_ || !cached_)
         throw std::runtime_error("catalogue unavailable");
     return cached_;
 }
 
 bool CatalogueManager::refresh_needed() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (!ready_ || !cached_)
         return true;
     return cached_metadata_generation_ < metadata_server_.known_generation() ||
@@ -832,7 +832,7 @@ CatalogueStatus CatalogueManager::status() const {
     CatalogueStatus status;
     std::shared_ptr<const CatalogueSnapshot> cached;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         status.enabled = true;
         status.metadata_generation = cached_metadata_generation_;
         status.known_metadata_generation = metadata_server_.known_generation();
@@ -871,7 +871,7 @@ std::shared_ptr<const CatalogueSnapshot>
 CatalogueManager::snapshot_view(const WorkContext& context) {
     bool warm = false;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         warm = ready_ && cached_;
     }
     if (!warm)
@@ -907,7 +907,7 @@ ResolvedMediaProfile CatalogueManager::resolve_media_profile(
     std::shared_ptr<MediaProfileFlight> flight;
     bool owner = false;
     {
-        std::lock_guard lock(media_profile_mutex_);
+        Lock lock(media_profile_mutex_);
         if (auto cached = resolved_media_profiles_.find(media_id);
             cached != resolved_media_profiles_.end())
             return {cached->second, false, false};
@@ -917,8 +917,9 @@ ResolvedMediaProfile CatalogueManager::resolve_media_profile(
         owner = inserted;
     }
     if (!owner) {
-        std::unique_lock lock(flight->mutex);
-        if (!flight->cv.wait_until(lock, deadline, [&] { return flight->complete; }))
+        Lock lock(flight->mutex);
+        if (!flight->cv.wait_until(lock.native(), deadline,
+                                   [&]() MACHA_REQUIRES(flight->mutex) { return flight->complete; }))
             throw std::runtime_error("timed out waiting for concurrent immutable media profiling");
         if (flight->error) std::rethrow_exception(flight->error);
         return {*flight->result, false, true};
@@ -926,17 +927,17 @@ ResolvedMediaProfile CatalogueManager::resolve_media_profile(
 
     auto finish = [&](std::optional<MediaProbeResult> result, std::exception_ptr error = {}) {
         {
-            std::lock_guard lock(flight->mutex);
+            Lock lock(flight->mutex);
             flight->result = result;
             flight->error = error;
             flight->complete = true;
         }
         if (result) {
-            std::lock_guard lock(media_profile_mutex_);
+            Lock lock(media_profile_mutex_);
             resolved_media_profiles_[media_id] = *result;
         }
         flight->cv.notify_all();
-        std::lock_guard lock(media_profile_mutex_);
+        Lock lock(media_profile_mutex_);
         auto it = media_profile_flights_.find(media_id);
         if (it != media_profile_flights_.end() && it->second == flight)
             media_profile_flights_.erase(it);
@@ -959,7 +960,7 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
     CatalogueSnapshot::MediaProfile profile{catalogue_media_profile_schema, true, std::move(probe)};
     if (!valid_catalogue_media_profile(media_id, profile))
         throw std::invalid_argument("invalid immutable media profile");
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     if (auto it = current.media_profiles.find(media_id);
@@ -967,7 +968,7 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
         return;
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     auto old_art = data_object_ids(current);
@@ -978,7 +979,7 @@ void CatalogueManager::put_media_profile(std::string media_id, MediaProbeResult 
 void CatalogueManager::put_media_profiles(
     std::map<std::string, MediaProbeResult, std::less<>> profiles) {
     if (profiles.empty()) return;
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     bool changed = false;
@@ -993,7 +994,7 @@ void CatalogueManager::put_media_profiles(
     if (!changed) return;
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     commit(expected_root, current, data_object_ids(current));
@@ -1012,7 +1013,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
     const auto id = object_id(bytes);
     if (!store_.put(id, bytes, FrameType::speculative))
         throw CatalogueUnavailable("cannot store media index in distributed DATA storage");
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     if (auto it = current.media_indexes.find(media_id);
@@ -1020,7 +1021,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
         return;
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     auto old_data = data_object_ids(current);
@@ -1030,7 +1031,7 @@ void CatalogueManager::put_media_index(std::string media_id, std::span<const uin
 
 size_t CatalogueManager::prune_media_profiles(
     const std::set<std::string>& live_media_ids) {
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     const auto before = current.media_profiles.size();
@@ -1045,12 +1046,12 @@ size_t CatalogueManager::prune_media_profiles(
     if (!removed && indexes_before == current.media_indexes.size()) return 0;
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     commit(expected_root, current, data_object_ids(current));
     {
-        std::lock_guard lock(media_profile_mutex_);
+        Lock lock(media_profile_mutex_);
         std::erase_if(resolved_media_profiles_, [&](const auto& item) {
             return !live_media_ids.contains(item.first);
         });
@@ -1218,7 +1219,7 @@ void CatalogueManager::commit(
     auto committed_record = metadata_.record();
     auto committed_metadata = decode_snapshot(committed_record.payload);
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         control_converged_root_.reset();
         control_converged_nodes_.clear();
         control_convergence_retry_ = {};
@@ -1228,12 +1229,12 @@ void CatalogueManager::commit(
 
 CatalogueItem CatalogueManager::upsert(CatalogueItem item,
                                         std::optional<uint64_t> expected_revision) {
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     auto old_art = data_object_ids(current);
@@ -1257,12 +1258,12 @@ CatalogueItem CatalogueManager::upsert(CatalogueItem item,
 
 std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueItem> items) {
     if (items.empty()) return {};
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     auto old_art = data_object_ids(current);
@@ -1280,12 +1281,12 @@ std::vector<CatalogueItem> CatalogueManager::upsert_many(std::vector<CatalogueIt
 }
 
 bool CatalogueManager::erase(std::string_view id, std::optional<uint64_t> expected_revision) {
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     auto it = current.items.find(std::string(id));
@@ -1303,7 +1304,7 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
     std::optional<ObjectId> cached_root;
     uint64_t cached_generation{};
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!ready_ || !cached_)
             return false;
         if (cached_->items.contains(std::string(id)))
@@ -1330,12 +1331,12 @@ bool CatalogueManager::definitely_absent(std::string_view id) const {
 
 CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     std::string_view id, std::optional<uint64_t> expected_revision) {
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
 
@@ -1415,12 +1416,12 @@ void CatalogueManager::reconcile_scanner(const std::vector<CatalogueItem>& disco
                                          std::optional<Hash256> expected_namespace,
                                          const std::map<std::string, MediaProbeResult, std::less<>>& profiles,
                                          const std::set<std::string>& vanished_media) {
-    DiagnosticLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
     repair_once();
     auto current = *current_snapshot();
     std::optional<ObjectId> expected_root;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         expected_root = cached_root_;
     }
     auto old_art = data_object_ids(current);
@@ -1719,7 +1720,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     std::optional<ObjectId> root;
     std::shared_ptr<const CatalogueSnapshot> cached;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         root = cached_root_;
         cached = cached_;
     }
@@ -1774,7 +1775,7 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
     }
 
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         const bool root_converged = cached_root_ == metadata_root &&
                                     cached_metadata_generation_ >= metadata_generation;
         out.complete = metadata_current && repair_ok && root_converged &&
@@ -1799,7 +1800,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
     Clock::time_point root_epoch;
     uint64_t root_epoch_sequence = 0;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!control_gc_root_epoch_initialized_)
             return 0;
         root_epoch = control_gc_root_epoch_;
@@ -1816,7 +1817,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
         if (!id) continue;
 
         if (std::binary_search(live.begin(), live.end(), *id)) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             control_gc_unreferenced_epoch_.erase(*id);
             continue;
         }
@@ -1824,7 +1825,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
         // A content-addressed object may be reused by the current publication;
         // put() touches it, so keep any object touched since this root was seen.
         if (!local_.control().older_than(*id, staged_since_root)) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
                 continue;
             control_gc_unreferenced_epoch_[*id] = root_epoch_sequence;
@@ -1832,7 +1833,7 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
         }
 
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (control_gc_root_epoch_sequence_ != root_epoch_sequence)
                 continue;
             auto [seen, inserted] =

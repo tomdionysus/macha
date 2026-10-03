@@ -3,6 +3,7 @@
 
 #include "metadata/metadata_server.hpp"
 #include "contract/metadata_view.hpp"
+#include "contract/thread_safety.hpp"
 #include "contract/work.hpp"
 #include "cluster/cluster.hpp"
 
@@ -10,7 +11,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -58,25 +58,29 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     LocalState& local_;
     MetadataServer& metadata_server_;
     DistributedStore* namespace_store_{};
-    std::mutex mutation_mutex_;
-    // Guards the multi-head merge-and-publish branch of read_group(). Separate
-    // from mutation_mutex_, which mutate_impl() holds while calling read_group().
-    std::mutex reconciliation_mutex_;
+    // Guards no state: serialises mutations, repair and history checkpoints.
+    // Held across replica RPCs and metadata commits.
+    IoMutex mutation_mutex_;
+    // Guards no state: serialises the multi-head merge-and-publish branch of
+    // read_group(), held across its history imports and commit fan-out.
+    // mutate_impl() holds mutation_mutex_ while calling read_group().
+    IoMutex reconciliation_mutex_ MACHA_ACQUIRED_AFTER(mutation_mutex_);
     // Retry cooldown for peer certificates this replica cannot accept (record
     // fails to materialise locally). read_group() runs on nearly every read;
     // without it each call rejects and logs them afresh.
-    mutable std::mutex unacceptable_head_mutex_;
-    mutable std::map<Hash256, Clock::time_point> unacceptable_head_retry_at_;
-    mutable std::mutex cache_mutex_;
-    std::optional<MetadataRecord> cache_;
-    Clock::time_point cache_until_{};
-    uint64_t cache_remote_epoch_{};
-    std::shared_ptr<const MetadataSnapshot> decoded_cache_;
-    uint64_t decoded_generation_{};
+    mutable Mutex unacceptable_head_mutex_;
+    mutable std::map<Hash256, Clock::time_point>
+        unacceptable_head_retry_at_ MACHA_GUARDED_BY(unacceptable_head_mutex_);
+    mutable Mutex cache_mutex_;
+    std::optional<MetadataRecord> cache_ MACHA_GUARDED_BY(cache_mutex_);
+    Clock::time_point cache_until_ MACHA_GUARDED_BY(cache_mutex_){};
+    uint64_t cache_remote_epoch_ MACHA_GUARDED_BY(cache_mutex_){};
+    std::shared_ptr<const MetadataSnapshot> decoded_cache_ MACHA_GUARDED_BY(cache_mutex_);
+    uint64_t decoded_generation_ MACHA_GUARDED_BY(cache_mutex_){};
     std::atomic_uint64_t available_generation_{};
-    uint64_t decoded_namespace_revision_{};
+    uint64_t decoded_namespace_revision_ MACHA_GUARDED_BY(cache_mutex_){};
     std::atomic_uint64_t available_namespace_revision_{};
-    Hash256 decoded_hash_{};
+    Hash256 decoded_hash_ MACHA_GUARDED_BY(cache_mutex_){};
     std::function<void(const MetadataPublicationContext&)> publication_retention_;
 
     // Observational replica state: lock-free reads, no I/O. Refreshed by the

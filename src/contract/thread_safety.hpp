@@ -21,6 +21,11 @@
 //   written [&]() MACHA_REQUIRES(mutex_) { ... }, as is any lambda that
 //   touches guarded state under the lock.
 // - A mutex that guards nothing (a wait or ordering lock) says so.
+//
+// A no-I/O region refuses IoMutex::lock() and ObjectLock. It cannot refuse a
+// scoped lock on an IoMutex: Clang folds a scoped lock's constructor
+// attributes into what the lock manages, so excluding no_io there breaks
+// unlock(). Review holds that case, as it does across contracts.
 #if defined(__clang__)
 #define MACHA_THREAD_ANNOTATION(x) __attribute__((x))
 #else
@@ -82,6 +87,8 @@ class MACHA_CAPABILITY("I/O mutex") IoMutex {
   public:
     void lock() MACHA_ACQUIRE() MACHA_EXCLUDES(no_io) { mutex_.lock(); }
     void unlock() MACHA_RELEASE() { mutex_.unlock(); }
+    // Never waits, so it is allowed anywhere.
+    bool try_lock() MACHA_TRY_ACQUIRE(true) { return mutex_.try_lock(); }
     std::mutex& native() noexcept { return mutex_; }
 };
 
@@ -117,8 +124,13 @@ class MACHA_SCOPED_CAPABILITY Lock {
 
   public:
     explicit Lock(Mutex& mutex) MACHA_ACQUIRE(mutex) : lock_(mutex.native()) {}
-    explicit Lock(IoMutex& mutex) MACHA_ACQUIRE(mutex) MACHA_EXCLUDES(no_io)
+    explicit Lock(IoMutex& mutex) MACHA_ACQUIRE(mutex)
         : lock_(mutex.native()) {}
+    // Adopts a mutex the caller already holds, as after a successful try_lock().
+    Lock(Mutex& mutex, std::adopt_lock_t) MACHA_REQUIRES(mutex)
+        : lock_(mutex.native(), std::adopt_lock) {}
+    Lock(IoMutex& mutex, std::adopt_lock_t) MACHA_REQUIRES(mutex)
+        : lock_(mutex.native(), std::adopt_lock) {}
     ~Lock() MACHA_RELEASE() {}
     Lock(const Lock&) = delete;
     Lock& operator=(const Lock&) = delete;
@@ -135,7 +147,7 @@ class MACHA_SCOPED_CAPABILITY WriteLock {
 
   public:
     explicit WriteLock(SharedMutex& mutex) MACHA_ACQUIRE(mutex) : lock_(mutex.native()) {}
-    explicit WriteLock(IoSharedMutex& mutex) MACHA_ACQUIRE(mutex) MACHA_EXCLUDES(no_io)
+    explicit WriteLock(IoSharedMutex& mutex) MACHA_ACQUIRE(mutex)
         : lock_(mutex.native()) {}
     ~WriteLock() MACHA_RELEASE() {}
     WriteLock(const WriteLock&) = delete;
@@ -148,7 +160,7 @@ class MACHA_SCOPED_CAPABILITY ReadLock {
 
   public:
     explicit ReadLock(SharedMutex& mutex) MACHA_ACQUIRE_SHARED(mutex) : lock_(mutex.native()) {}
-    explicit ReadLock(IoSharedMutex& mutex) MACHA_ACQUIRE_SHARED(mutex) MACHA_EXCLUDES(no_io)
+    explicit ReadLock(IoSharedMutex& mutex) MACHA_ACQUIRE_SHARED(mutex)
         : lock_(mutex.native()) {}
     ~ReadLock() MACHA_RELEASE() {}
     ReadLock(const ReadLock&) = delete;
@@ -159,12 +171,12 @@ class MACHA_SCOPED_CAPABILITY ReadLock {
 // object_mutex), so waiting for it is waiting on that I/O. Keeps the mutex
 // alive and held for the guard's lifetime.
 class ObjectLock {
-    std::shared_ptr<std::mutex> mutex_;
+    std::shared_ptr<IoMutex> mutex_;
     std::lock_guard<std::mutex> guard_;
 
   public:
-    explicit ObjectLock(std::shared_ptr<std::mutex> mutex) MACHA_EXCLUDES(no_io)
-        : mutex_(std::move(mutex)), guard_(*mutex_) {}
+    explicit ObjectLock(std::shared_ptr<IoMutex> mutex) MACHA_EXCLUDES(no_io)
+        : mutex_(std::move(mutex)), guard_(mutex_->native()) {}
     ~ObjectLock() = default;
     ObjectLock(const ObjectLock&) = delete;
     ObjectLock& operator=(const ObjectLock&) = delete;
