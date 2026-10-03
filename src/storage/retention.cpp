@@ -565,7 +565,7 @@ void RetentionStore::load_journal_locked() {
 }
 
 void RetentionStore::load() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     load_checkpoint_generation_locked();
     load_journal_locked();
 }
@@ -584,7 +584,7 @@ void RetentionStore::retain_batch(RetentionClass type, const std::vector<ObjectI
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (size_t begin = 0; begin < ids.size(); begin += retain_ids_per_frame) {
         const auto end = std::min(ids.size(), begin + retain_ids_per_frame);
         Writer writer;
@@ -603,14 +603,14 @@ void RetentionStore::retain_batch(RetentionClass type, const std::vector<ObjectI
 }
 
 bool RetentionStore::retained(RetentionClass type, const ObjectId& id) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto& state = state_for(type);
     const auto found = state.find(id);
     return found != state.end() && !found->second.adds.empty();
 }
 
 RetentionStore::Claims RetentionStore::claims(RetentionClass type, const ObjectId& id) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto& state = state_for(type);
     const auto found = state.find(id);
     if (found == state.end())
@@ -619,7 +619,7 @@ RetentionStore::Claims RetentionStore::claims(RetentionClass type, const ObjectI
 }
 
 std::vector<ObjectId> RetentionStore::retained_ids(RetentionClass type) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<ObjectId> ids;
     for (const auto& [id, state] : state_for(type))
         if (!state.adds.empty())
@@ -629,7 +629,7 @@ std::vector<ObjectId> RetentionStore::retained_ids(RetentionClass type) const {
 
 std::optional<ObjectId> RetentionStore::next_retained(
     RetentionClass type, std::optional<ObjectId>& cursor, bool& complete) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto& state = state_for(type);
     auto it = cursor ? state.upper_bound(*cursor) : state.begin();
     while (it != state.end() && it->second.adds.empty())
@@ -651,7 +651,7 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
     if (!operation_budget || observed.empty())
         return 0;
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& state = state_for(type);
     auto& cursor = cursor_for(type);
     if (state.empty()) {
@@ -705,7 +705,7 @@ size_t RetentionStore::release_unreferenced(RetentionClass type,
 }
 
 size_t RetentionStore::claim_objects(RetentionClass type) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     size_t count = 0;
     for (const auto& [_, state] : state_for(type))
         if (!state.adds.empty())
@@ -714,7 +714,7 @@ size_t RetentionStore::claim_objects(RetentionClass type) const {
 }
 
 bool RetentionStore::compact_if_needed(size_t record_threshold) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (journal_records_ < record_threshold && journal_bytes_ < journal_compact_bytes)
         return false;
 
@@ -757,7 +757,7 @@ size_t RetentionStore::prune_unclaimed(
     // erase under the lock only what is still unclaimed.
     std::vector<ObjectId> unclaimed;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto& state = state_for(type);
         auto& cursor = prune_cursor_for(type);
         if (state.empty()) {
@@ -792,7 +792,7 @@ size_t RetentionStore::prune_unclaimed(
     if (unclaimed.empty())
         return 0;
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& state = state_for(type);
     size_t removed = 0;
     for (const auto& id : unclaimed) {

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "contract/claim_store.hpp"
+#include "contract/thread_safety.hpp"
 #include "crypto.hpp"
 
 #include <filesystem>
@@ -37,30 +38,34 @@ class RetentionStore final : public ClaimStore {
     std::filesystem::path checkpoint_manifest_path_;
     std::filesystem::path journal_path_;
     std::array<uint8_t, 32> key_{};
-    mutable std::mutex mutex_;
-    StateMap data_;
-    StateMap control_;
-    std::optional<ObjectId> data_release_after_;
-    std::optional<ObjectId> control_release_after_;
-    std::optional<ObjectId> data_prune_after_;
-    std::optional<ObjectId> control_prune_after_;
-    size_t journal_records_{};
-    uint64_t journal_bytes_{};
+    // Held across the journal's fsync and compaction's shard writes.
+    mutable IoMutex mutex_;
+    StateMap data_ MACHA_GUARDED_BY(mutex_);
+    StateMap control_ MACHA_GUARDED_BY(mutex_);
+    std::optional<ObjectId> data_release_after_ MACHA_GUARDED_BY(mutex_);
+    std::optional<ObjectId> control_release_after_ MACHA_GUARDED_BY(mutex_);
+    std::optional<ObjectId> data_prune_after_ MACHA_GUARDED_BY(mutex_);
+    std::optional<ObjectId> control_prune_after_ MACHA_GUARDED_BY(mutex_);
+    size_t journal_records_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t journal_bytes_ MACHA_GUARDED_BY(mutex_){};
 
-    StateMap& state_for(RetentionClass);
-    const StateMap& state_for(RetentionClass) const;
-    std::optional<ObjectId>& cursor_for(RetentionClass);
-    std::optional<ObjectId>& prune_cursor_for(RetentionClass);
-    void apply_add_locked(RetentionClass, const RetentionDot&, const std::vector<ObjectId>&);
+    StateMap& state_for(RetentionClass) MACHA_REQUIRES(mutex_);
+    const StateMap& state_for(RetentionClass) const MACHA_REQUIRES(mutex_);
+    std::optional<ObjectId>& cursor_for(RetentionClass) MACHA_REQUIRES(mutex_);
+    std::optional<ObjectId>& prune_cursor_for(RetentionClass) MACHA_REQUIRES(mutex_);
+    void apply_add_locked(RetentionClass, const RetentionDot&, const std::vector<ObjectId>&)
+        MACHA_REQUIRES(mutex_);
     size_t apply_release_locked(RetentionClass, const RetentionClock&,
-                                const std::vector<ObjectId>&);
-    void append_frame_locked(std::span<const uint8_t>);
-    Bytes encode_checkpoint_shard_locked(uint8_t shard) const;
-    void decode_checkpoint_shard_locked(uint8_t shard, std::span<const uint8_t>);
-    void decode_legacy_checkpoint_locked(std::span<const uint8_t>);
-    void load_checkpoint_generation_locked();
-    void load_journal_locked();
-    void cleanup_checkpoint_generations_locked(std::string_view keep) const;
+                                const std::vector<ObjectId>&) MACHA_REQUIRES(mutex_);
+    void append_frame_locked(std::span<const uint8_t>) MACHA_REQUIRES(mutex_);
+    Bytes encode_checkpoint_shard_locked(uint8_t shard) const MACHA_REQUIRES(mutex_);
+    void decode_checkpoint_shard_locked(uint8_t shard, std::span<const uint8_t>)
+        MACHA_REQUIRES(mutex_);
+    void decode_legacy_checkpoint_locked(std::span<const uint8_t>) MACHA_REQUIRES(mutex_);
+    void load_checkpoint_generation_locked() MACHA_REQUIRES(mutex_);
+    void load_journal_locked() MACHA_REQUIRES(mutex_);
+    void cleanup_checkpoint_generations_locked(std::string_view keep) const
+        MACHA_REQUIRES(mutex_);
     void load();
 
   public:

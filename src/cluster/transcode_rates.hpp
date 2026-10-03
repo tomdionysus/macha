@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "cluster/telemetry.hpp"
 
 #include <compare>
@@ -44,11 +46,11 @@ class TranscodeRateBook {
         uint32_t concurrent{};
     };
     std::filesystem::path path_;
-    mutable std::mutex mutex_;
-    std::map<Key, std::deque<Observation>> observations_;
+    mutable IoMutex mutex_;
+    std::map<Key, std::deque<Observation>> observations_ MACHA_GUARDED_BY(mutex_);
 
-    void load();
-    void persist_locked() const;
+    void load() MACHA_REQUIRES(mutex_);
+    void persist_locked() const MACHA_REQUIRES(mutex_);
 };
 
 } // namespace macha

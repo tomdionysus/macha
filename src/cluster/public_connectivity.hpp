@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "config.hpp"
 #include "types.hpp"
 
@@ -56,16 +58,17 @@ class PublicConnectivity {
     ConnectivityCheckConfig check_config_;
     Endpoint configured_;
     NodeId node_id_;
-    mutable std::mutex mutex_;
-    PublicConnectivityStatus status_;
+    // Held across UPnP discovery, mapping and the reachability probe.
+    mutable IoMutex mutex_;
+    PublicConnectivityStatus status_ MACHA_GUARDED_BY(mutex_);
 #ifdef MACHA_HAVE_MINIUPNPC
-    bool mapping_owned_{};
-    uint16_t owned_external_port_{};
+    bool mapping_owned_ MACHA_GUARDED_BY(mutex_){};
+    uint16_t owned_external_port_ MACHA_GUARDED_BY(mutex_){};
 #endif
 
-    void refresh_locked();
-    void probe_locked(bool force);
-    void remove_owned_mapping_locked() noexcept;
+    void refresh_locked() MACHA_REQUIRES(mutex_);
+    void probe_locked(bool force) MACHA_REQUIRES(mutex_);
+    void remove_owned_mapping_locked() noexcept MACHA_REQUIRES(mutex_);
 
   public:
     PublicConnectivity(const Config&, NodeId, Endpoint configured);

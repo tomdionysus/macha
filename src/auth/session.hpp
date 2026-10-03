@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "types.hpp"
 
 #include <chrono>
@@ -80,11 +82,11 @@ class SessionManager {
         Clock::time_point received{Clock::now()};
     };
 
-    mutable std::shared_mutex mutex_;
-    std::map<Hash256, Record> by_token_hash_;
-    std::chrono::milliseconds anonymous_ttl_;
-    size_t max_sessions_;
-    std::filesystem::path persisted_path_;
+    mutable SharedMutex mutex_;
+    std::map<Hash256, Record> by_token_hash_ MACHA_GUARDED_BY(mutex_);
+    const std::chrono::milliseconds anonymous_ttl_;
+    const size_t max_sessions_;
+    const std::filesystem::path persisted_path_;
 };
 
 } // namespace macha

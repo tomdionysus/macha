@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "storage/io_pressure.hpp"
 #include "log.hpp"
 #include "cluster/net.hpp"
@@ -149,24 +151,24 @@ class DataResourceArbiter {
     std::chrono::milliseconds no_progress_deadline_{};
     uint64_t releases_{};
     uint64_t no_progress_failures_{};
-    mutable std::mutex mutex_;
+    mutable Mutex mutex_;
     std::condition_variable cv_;
-    uint64_t used_bytes_{};
-    uint64_t lower_used_bytes_{};
-    uint64_t lower_active_{};
-    uint64_t peak_lower_active_{};
-    uint64_t peak_used_bytes_{};
-    uint64_t waiting_viewers_{};
-    uint64_t waiting_loaders_{};
-    uint64_t waiting_speculative_{};
-    bool stopping_{};
-    uint64_t viewer_admissions_{};
-    uint64_t loader_admissions_{};
-    uint64_t speculative_admissions_{};
-    uint64_t viewer_waits_{};
-    uint64_t loader_waits_{};
-    uint64_t speculative_waits_{};
-    uint64_t cancelled_waits_{};
+    uint64_t used_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t lower_used_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t lower_active_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t peak_lower_active_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t peak_used_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t waiting_viewers_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t waiting_loaders_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t waiting_speculative_ MACHA_GUARDED_BY(mutex_){};
+    bool stopping_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t viewer_admissions_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t loader_admissions_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t speculative_admissions_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t viewer_waits_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t loader_waits_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t speculative_waits_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t cancelled_waits_ MACHA_GUARDED_BY(mutex_){};
 
     static bool viewer(FrameType frame_type) noexcept {
         return frame_type == FrameType::foreground || frame_type == FrameType::read_ahead;
@@ -178,7 +180,7 @@ class DataResourceArbiter {
     // `refused_for_pressure` reports whether a false answer was the pressure
     // gate's doing. Callers count it once per waiter, not per wakeup.
     bool available(FrameType frame_type, uint64_t bytes,
-                   bool* refused_for_pressure = nullptr) const;
+                   bool* refused_for_pressure = nullptr) const MACHA_REQUIRES(mutex_);
     void release(FrameType frame_type, uint64_t bytes);
 
   public:
@@ -189,7 +191,7 @@ class DataResourceArbiter {
     // Set once when the node's DATA store recovers, before it admits work.
     void observe_device(const DiskServiceMonitor* monitor,
                         uint64_t min_background_under_pressure) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         service_monitor_ = monitor;
         min_background_under_pressure_ = std::max<uint64_t>(1, min_background_under_pressure);
     }
@@ -260,13 +262,13 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
     // Larger than the whole class budget: never admissible, fail now.
     if (bytes > class_capacity)
         return {};
-    std::unique_lock lock(mutex_);
+    Lock lock(mutex_);
     bool counted_wait = false;
     auto& waiters = viewer(frame_type)   ? waiting_viewers_
                     : loader(frame_type) ? waiting_loaders_
                                          : waiting_speculative_;
     bool refused_for_pressure = false;
-    auto wait_predicate = [&] {
+    auto wait_predicate = [&]() MACHA_REQUIRES(mutex_) {
         return stopping_ || context.cancelled() || context.expired() ||
                available(frame_type, bytes, &refused_for_pressure);
     };
@@ -285,15 +287,15 @@ DataResourceArbiter::acquire(const DataWorkContext& context, uint64_t requested_
                 ++speculative_waits_;
         }
         if (context.deadline() != Clock::time_point{}) {
-            cv_.wait_until(lock, context.deadline(), wait_predicate);
+            cv_.wait_until(lock.native(), context.deadline(), wait_predicate);
         } else if (no_progress_deadline_ == std::chrono::milliseconds{}) {
-            cv_.wait(lock, wait_predicate);
+            cv_.wait(lock.native(), wait_predicate);
         } else {
             // Wait in no-progress windows: any release anywhere re-arms the
             // window, so only a wholly stalled arbiter gives up.
             const auto seen = releases_;
-            if (!cv_.wait_for(lock, no_progress_deadline_,
-                              [&] { return wait_predicate() || releases_ != seen; })) {
+            if (!cv_.wait_for(lock.native(), no_progress_deadline_,
+                              [&]() MACHA_REQUIRES(mutex_) { return wait_predicate() || releases_ != seen; })) {
                 ++no_progress_failures_;
                 if (counted_wait)
                     --waiters;
@@ -347,7 +349,7 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
                                     : capacity_bytes_ - viewer_reserve_bytes_;
     if (bytes > class_capacity || context.cancelled() || context.expired())
         return {};
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     bool refused_for_pressure = false;
     if (stopping_ || !available(frame_type, bytes, &refused_for_pressure)) {
         if (refused_for_pressure)
@@ -371,7 +373,7 @@ DataResourceArbiter::try_acquire(const DataWorkContext& context, uint64_t reques
 }
 
 inline void DataResourceArbiter::release(FrameType frame_type, uint64_t bytes) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     ++releases_;
     used_bytes_ -= std::min(used_bytes_, bytes);
     if (!viewer(frame_type)) {
@@ -390,13 +392,13 @@ inline void DataResourceArbiter::Lease::reset() {
 }
 
 inline void DataResourceArbiter::stop() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     stopping_ = true;
     cv_.notify_all();
 }
 
 inline DataResourceStats DataResourceArbiter::stats() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto device = service_monitor_ ? service_monitor_->sample() : DiskServiceMonitor::Sample{};
     return {capacity_bytes_,           viewer_reserve_bytes_,
             used_bytes_,               peak_used_bytes_,

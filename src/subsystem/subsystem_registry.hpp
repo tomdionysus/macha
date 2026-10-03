@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include <memory>
 #include <shared_mutex>
 
@@ -28,9 +30,9 @@ class SubsystemRegistry {
     std::shared_ptr<FuseFrontend> fuse() const;
 
   private:
-    mutable std::shared_mutex mutex_;
-    std::shared_ptr<TorrentService> torrent_;
-    std::shared_ptr<FuseFrontend> fuse_;
+    mutable SharedMutex mutex_;
+    std::shared_ptr<TorrentService> torrent_ MACHA_GUARDED_BY(mutex_);
+    std::shared_ptr<FuseFrontend> fuse_ MACHA_GUARDED_BY(mutex_);
 };
 
 } // namespace macha
