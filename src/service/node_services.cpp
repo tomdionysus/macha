@@ -38,7 +38,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                     retain_metadata_publication(context);
                 }),
       ledger_(local_.retention(), local_.data(), local_.control()),
-      availability_(node_, local_, store_, ledger_, resources_.events, routes_),
+      availability_(node_, local_, store_, ledger_, resources_.events, routes_,
+                    node_.config().state_path / "availability" / "last-survey.bin"),
       catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
       filesystem_(node_.config(), node_.node_id(), node_.membership(), local_, metadata_server_,
                   store_, metadata_, resources_.memory, &playback_),

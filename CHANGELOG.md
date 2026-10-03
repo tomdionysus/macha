@@ -1,5 +1,20 @@
 # Current release
 
+## 0.84.0 — availability is the last known answer, not `unknown` (experiment)
+
+No wire format or protocol changes. New on-disk file
+`<state_path>/availability/last-survey.bin`; 0.83.0 ignores it, so either
+node can go back by reinstalling.
+
+**A node answers from its last survey.** Each survey's path table is kept
+on disk and read back at startup, so the files resource, catalogue items
+and the playback media listing answer straight away after a restart instead
+of reporting `unknown` until the presence index has filled and a survey
+has run. A survey that cannot ask a peer takes each undecided file's counts
+from the last survey that decided them, matched by content identity, never
+lowering a count of unavailable extents found now. `unknown` is left for
+files no survey has decided. The response shape is unchanged.
+
 ## 0.83.0 — every catalogue item says how much of it can be played (experiment)
 
 No wire format, protocol or on-disk format changes; either node can go

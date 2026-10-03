@@ -24,9 +24,9 @@ A file or directory is:
 | `extents` | the extents it refers to |
 | `extents_local` | those this node holds |
 | `extents_unavailable` | those no reachable node holds |
-| `extents_unknown` | those this node lacks, where a node that might hold them could not be asked |
+| `extents_unknown` | those this node lacks, where a node that might hold them could not be asked and no earlier survey decided them |
 | `availability` | `complete`, `partial`, `unavailable` or `unknown` (below) |
-| `surveyed_generation`, `surveyed_unix_ms` | the metadata generation and time of the survey these came from; `null` before the first |
+| `surveyed_generation`, `surveyed_unix_ms` | the metadata generation and time of the survey these came from; `null` before this node's first |
 
 A directory also carries `entries`: its direct children, each in the same
 form (without their own `entries`), in no promised order. A directory's extent
@@ -47,7 +47,7 @@ identity), `400 bad_request` (`?hash=` on anything but the collection),
 | `complete` | every extent is held by a reachable node |
 | `partial` | some extents are held by a reachable node and some by none |
 | `unavailable` | no extent is held by a reachable node |
-| `unknown` | not surveyed yet (a file written since the last survey, or no survey since this node started), or some extents could not be decided |
+| `unknown` | not surveyed yet (a file written since the last survey), or some extents could not be decided now or by any earlier survey |
 
 These are facts about extents being **held**, from each node's index of what
 it stores. They do not say the bytes read back intact, and "no reachable
@@ -100,6 +100,12 @@ than a twentieth of the pass's time, when a peer's storage grows while
 something is unavailable. After a restart the first survey waits for the
 store's presence index to fill. Requests read the last result and never
 wait for a survey.
+
+Each node keeps its last survey on disk and answers from it after a restart
+until its first new survey. A survey that cannot ask a peer leaves a file's
+counts to its last decided survey, matched by content identity: the answer
+is the best this node knows, and `surveyed_unix_ms` says when the survey
+ran.
 
 Repair uses the same result: it does not try to fetch an extent the survey
 found on no reachable node, and takes it up again once a survey finds it.

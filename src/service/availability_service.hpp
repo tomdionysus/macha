@@ -11,6 +11,7 @@
 #include "types.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -50,18 +51,28 @@ struct AvailabilitySnapshot {
 };
 
 // The path table of a namespace against a survey: one walk of the namespace,
-// one `held` per extent reference. Throws DecodeError if the namespace cannot
-// be read.
+// one `held` per extent reference. A file with extents the survey could not
+// decide takes its count from `last_known`, by content identity, when that
+// decided it: the best this node knows. Throws DecodeError if the namespace
+// cannot be read.
 void fill_path_table(AvailabilitySnapshot&, const MetadataSnapshot&, const NamespaceNodeStore&,
-                     const HeldFn& held, const std::function<void()>& pause = {});
+                     const HeldFn& held, const AvailabilitySnapshot* last_known = nullptr,
+                     const std::function<void()>& pause = {});
+
+// A snapshot's path table, generation and survey time as kept on disk; the
+// extent lists are not kept. Decoding throws DecodeError.
+Bytes encode_availability_paths(const AvailabilitySnapshot&);
+AvailabilitySnapshot decode_availability_paths(std::span<const uint8_t>);
 
 // Keeps this node's holdings roll-up and the cluster's availability survey
 // current, answers peers' questions about this node's holdings, and tells
-// readers what the last survey found. Built by the root.
+// readers what the last survey found. Each survey's path table is kept at
+// `persisted`, and read back at construction: until its first survey a node
+// answers with the last one it made. Built by the root.
 class AvailabilityService {
   public:
     AvailabilityService(NodeRuntime&, LocalState&, DistributedStore&, const ObjectLedger&,
-                        const NodeEvents&, MessageRoutes&);
+                        const NodeEvents&, MessageRoutes&, std::filesystem::path persisted);
     ~AvailabilityService();
     AvailabilityService(const AvailabilityService&) = delete;
     AvailabilityService& operator=(const AvailabilityService&) = delete;
@@ -85,7 +96,8 @@ class AvailabilityService {
     bool refresh(const MetadataSnapshotView& head, Clock::time_point now, uint64_t now_unix_ms,
                  const std::function<void()>& pause = {});
 
-    // The last survey, or null before the first. A pointer copy.
+    // The last survey, or the one read back at construction, or null when
+    // there is neither. A pointer copy.
     static constexpr Waits snapshot_waits = Waits::none;
     static constexpr ThreadSafety snapshot_safety = ThreadSafety::thread_safe;
     std::shared_ptr<const AvailabilitySnapshot> snapshot() const { return snapshot_.handle(); }
@@ -119,6 +131,7 @@ class AvailabilityService {
     const ObjectLedger& ledger_;
     const NodeEvents& events_;
     MessageRoutes& routes_;
+    const std::filesystem::path persisted_;
 
     // This node's holdings, and for a namespace kept inline in its snapshot
     // the tree built from it: every node derives the same tree from the same
@@ -139,6 +152,7 @@ class AvailabilityService {
     Published<AvailabilitySnapshot> snapshot_;
 
     // The maintenance pass's own: what the last roll-up and survey saw.
+    bool surveyed_{};
     // The head the roll-up was built at: its namespace root, or its record
     // hash when the namespace is inline.
     Hash256 rolled_head_{};
