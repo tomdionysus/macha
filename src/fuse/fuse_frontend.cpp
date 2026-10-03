@@ -792,7 +792,7 @@ struct FuseFrontend::State {
         : fs(filesystem), retained_memory(memory), config(std::move(policy)), startup_stop(std::move(startup_cancel)),
           weighted_loader(config.viewer_weight,
                           config.suspend_loader_for_tests ? 0 : config.loader_weight),
-          spool_dir(config.spool_path.value_or(fs.node().config().state_path / "fuse-spool")),
+          spool_dir(config.spool_path.value_or(fs.config().state_path / "fuse-spool")),
           journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
           journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
                                                          : journal_path.parent_path()) {
@@ -809,9 +809,9 @@ struct FuseFrontend::State {
                 static_cast<uint64_t>(fs.extent_size()) + config.publication_pipeline_bytes;
             config.publication_max_open_writers = static_cast<size_t>(std::max<uint64_t>(
                 config.commit_workers,
-                fs.node().config().runtime.loader_memory_reserve_bytes / per_writer));
+                fs.config().runtime.loader_memory_reserve_bytes / per_writer));
         }
-        fuse_namespace_origin = derive_fuse_namespace_origin(fs.node().node_id());
+        fuse_namespace_origin = derive_fuse_namespace_origin(fs.node_id());
     }
 
     ~State() {

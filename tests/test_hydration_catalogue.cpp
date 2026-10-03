@@ -3735,7 +3735,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     // into quorum reads. FUSE may adopt a newer snapshot only after some control-
     // plane owner has already decoded it locally. Repeated getattr therefore
     // leaves MetadataManager's available generation unchanged.
-    FileSystem fs2(n2, n2.local_state(), n2.metadata_server(), store2, metadata2, n2.resources.memory);
+    FileSystem fs2(n2.config(), n2.node_id(), n2.membership(), n2.local_state(), n2.metadata_server(), store2, metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
     auto frontend = std::make_shared<FuseFrontend>(fs2, n2.resources.memory, fuse_config);
@@ -4609,7 +4609,7 @@ MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    FileSystem filesystem(node, node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
+    FileSystem filesystem(node.config(), node.node_id(), node.membership(), node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
 
     filesystem.mkdir("/Music", 0755, getuid(), getgid());
 
@@ -4671,7 +4671,7 @@ MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_chur
     REQUIRE(node.wait_local_state_ready(10s));
     DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
     MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    FileSystem filesystem(node, node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
+    FileSystem filesystem(node.config(), node.node_id(), node.membership(), node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
 
     filesystem.mkdir("/media", 0755, getuid(), getgid());
     filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());
