@@ -106,7 +106,7 @@ void TorrentExtentJournal::append(const std::string& relative_path, uint64_t fil
     line << line_version << '\t' << to_string(extent.id) << '\t' << extent.offset << '\t'
          << extent.length << '\t' << file_size << '\t' << relative_path << '\n';
     const auto text = line.str();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     size_t done = 0;
     while (done < text.size()) {
         const auto wrote = ::write(fd_, text.data() + done, text.size() - done);

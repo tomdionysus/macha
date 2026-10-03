@@ -2,6 +2,7 @@
 #pragma once
 
 #include "catalogue/catalogue.hpp"
+#include "contract/thread_safety.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "filesystem/filesystem.hpp"
 #include "media/media_engine.hpp"
@@ -10,7 +11,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <stop_token>
 #include <thread>
@@ -38,30 +38,35 @@ class MediaInformationService {
     CatalogueManager& catalogue_;
     std::shared_ptr<MediaEngine> engine_;
     CatalogueHintQueue hints_;
+    // worker_ and started_ belong to the instantiator's thread (start/stop).
     std::jthread worker_;
 
-    mutable std::mutex mutex_;
+    // Held across hints_.next_ready_delay(), which waits on the hint queue's
+    // I/O mutex.
+    mutable IoMutex mutex_;
     std::condition_variable_any cv_;
-    std::map<std::string, std::shared_ptr<Flight>, std::less<>> flights_;
-    std::map<std::string, MediaProbeResult, std::less<>> pending_publications_;
-    size_t pending_publication_bytes_{};
+    std::map<std::string, std::shared_ptr<Flight>, std::less<>> flights_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, MediaProbeResult, std::less<>> pending_publications_
+        MACHA_GUARDED_BY(mutex_);
+    size_t pending_publication_bytes_ MACHA_GUARDED_BY(mutex_){};
     static constexpr size_t max_pending_publications_ = 128;
     static constexpr size_t max_pending_publication_bytes_ = 4ULL * 1024 * 1024;
-    std::optional<Clock::time_point> publication_retry_at_;
-    std::chrono::milliseconds publication_retry_delay_{250};
-    bool prune_requested_{true};
+    std::optional<Clock::time_point> publication_retry_at_ MACHA_GUARDED_BY(mutex_);
+    const std::chrono::milliseconds publication_retry_delay_{250};
+    bool prune_requested_ MACHA_GUARDED_BY(mutex_){true};
     bool started_{};
-    std::function<void(std::string, MediaProbeResult)> profile_publisher_;
+    const std::function<void(std::string, MediaProbeResult)> profile_publisher_;
     // One keyframe index build at a time per node; a second request for the
-    // same file waits here, then finds it stored.
-    std::mutex keyframe_index_mutex_;
+    // same file waits here, then finds it stored. Guards nothing; held across
+    // the media read, keyframe probe and catalogue commit.
+    IoMutex keyframe_index_mutex_;
 
     std::optional<std::pair<std::string, FsEntry>> source_for(std::string_view media_id) const;
     bool media_is_live(std::string_view media_id) const;
     MediaProbeResult resolve(std::string media_id, std::string path, FsEntry entry,
                              bool foreground, Clock::time_point deadline);
     void process_hint(const CatalogueHint&, std::stop_token);
-    void queue_publication_locked(std::string media_id, MediaProbeResult);
+    void queue_publication_locked(std::string media_id, MediaProbeResult) MACHA_REQUIRES(mutex_);
     void publish_one(std::string media_id, MediaProbeResult);
     void prune();
     void loop(std::stop_token);

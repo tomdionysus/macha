@@ -5,6 +5,7 @@
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "config.hpp"
+#include "contract/thread_safety.hpp"
 #include "filesystem/filesystem.hpp"
 #include "metadata/namespace_tree.hpp"
 #include "json.hpp"
@@ -151,9 +152,10 @@ struct ProviderRequestError : std::runtime_error {
 // MusicBrainz allows one request a second per client: every MusicBrainzProvider
 // on a node shares this gate and its circuit.
 struct MusicBrainzGate {
-    std::mutex mutex;
-    std::chrono::steady_clock::time_point last_request{};
-    std::chrono::steady_clock::time_point unavailable_until{};
+    // Held across the pacing sleep and the MusicBrainz HTTP request.
+    IoMutex mutex;
+    std::chrono::steady_clock::time_point last_request MACHA_GUARDED_BY(mutex){};
+    std::chrono::steady_clock::time_point unavailable_until MACHA_GUARDED_BY(mutex){};
 };
 
 // The numbers a provider reference needs to name one playable item: a TV
@@ -399,23 +401,30 @@ class CatalogueScanner {
     FileSystem& fs_;
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
-    CatalogueScannerConfig config_;
+    // Held across probe_unmatched()'s media probe and the namespace walks
+    // of request_media_rescan() and request_media_profiles().
+    mutable IoMutex config_mutex_;
+    CatalogueScannerConfig config_ MACHA_GUARDED_BY(config_mutex_);
     std::unique_ptr<HttpClient> http_;
     std::unique_ptr<HttpClient> provider_http_;
     std::shared_ptr<MediaEngine> profile_engine_;
     MediaInformationService* media_information_{};
-    std::vector<std::unique_ptr<CatalogueScanProvider>> providers_;
+    // Replaced only by reconfigure(), with the worker stopped: the worker
+    // reads it under config_mutex_ and uses the providers outside it.
+    std::vector<std::unique_ptr<CatalogueScanProvider>> providers_ MACHA_GUARDED_BY(config_mutex_);
     // The editor's providers over the unbudgeted client, so an operator's
     // request never waits on a scan's budget. One editor request at a time.
-    std::vector<std::unique_ptr<CatalogueScanProvider>> editor_providers_;
-    std::mutex editor_mutex_;
+    // Held across the editor's provider HTTP requests.
+    IoMutex editor_mutex_;
+    std::vector<std::unique_ptr<CatalogueScanProvider>> editor_providers_
+        MACHA_GUARDED_BY(editor_mutex_);
     std::shared_ptr<MusicBrainzGate> musicbrainz_gate_{std::make_shared<MusicBrainzGate>()};
     std::atomic_bool rescan_requested_{};
+    // Owned by the instantiator's thread (start/stop/reconfigure).
     std::jthread worker_;
-    mutable std::mutex config_mutex_;
-    std::chrono::milliseconds diagnostic_interval_{std::chrono::seconds(5)};
+    const std::chrono::milliseconds diagnostic_interval_{std::chrono::seconds(5)};
 
-    void configure_providers();
+    void configure_providers() MACHA_REQUIRES(config_mutex_);
     bool coordinator() const;
     void loop(std::stop_token);
     size_t scan_once(std::stop_token, bool force, std::string_view hint_source,
@@ -436,17 +445,19 @@ class CatalogueScanner {
     };
 
     HintBatchResult process_hint_batch(std::stop_token, size_t max_hints);
-    CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const;
+    CatalogueScanProvider* provider_for_path(std::string_view path, std::string& root) const
+        MACHA_REQUIRES(config_mutex_);
     // Fetch and stage the provider artwork `match` names onto its items. An
     // item `locked` names keeps its artwork. False when `stop` interrupted it.
     bool stage_remote_artwork(ProviderMatch& match,
                               const std::function<bool(std::string_view)>& locked,
                               std::stop_token stop, size_t max_artwork_bytes,
                               DistributedStore::DurabilityBatch& artwork_batch);
-    // Under editor_mutex_: the editor's metadata provider for a scan provider
-    // ("movies", "tv", "music") and a metadata provider name.
+    // The editor's metadata provider for a scan provider ("movies", "tv",
+    // "music") and a metadata provider name.
     MetadataProvider* editor_metadata(std::string_view scan_provider,
-                                      std::string_view metadata_provider);
+                                      std::string_view metadata_provider)
+        MACHA_REQUIRES(editor_mutex_);
 
   public:
     // One hint against one namespace snapshot. A hint created after

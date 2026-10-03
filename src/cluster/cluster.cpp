@@ -391,7 +391,7 @@ bool NodeRuntime::resolve_hosts_extents_for(bool inbound_capable) const {
 }
 
 InboundResolution NodeRuntime::inbound_resolution() const {
-    std::lock_guard lock(inbound_mutex_);
+    Lock lock(inbound_mutex_);
     return inbound_;
 }
 
@@ -413,7 +413,7 @@ void NodeRuntime::apply_inbound_resolution(bool inbound_capable, std::string sou
     bool hosts = false;
     InboundResolution before;
     {
-        std::lock_guard lock(inbound_mutex_);
+        Lock lock(inbound_mutex_);
         before = inbound_;
         hosts = resolve_hosts_extents_for(inbound_capable);
         changed = inbound_.inbound_capable != inbound_capable || inbound_.hosts_extents != hosts ||
@@ -462,10 +462,10 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
     uint64_t wake_seen = connectivity_wake_.load(std::memory_order_acquire);
     while (!stop.stop_requested()) {
         {
-            std::unique_lock lock(connectivity_wait_mutex_);
+            Lock lock(connectivity_wait_mutex_);
             const auto now = Clock::now();
             if (next_probe > now)
-                connectivity_wait_cv_.wait_for(lock, stop, next_probe - now, [&] {
+                connectivity_wait_cv_.wait_for(lock.native(), stop, next_probe - now, [&] {
                     return connectivity_wake_.load(std::memory_order_acquire) != wake_seen;
                 });
             wake_seen = connectivity_wake_.load(std::memory_order_acquire);
@@ -517,7 +517,7 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
         bool currently_capable = false;
         unsigned failures = 0;
         {
-            std::lock_guard lock(inbound_mutex_);
+            Lock lock(inbound_mutex_);
             inbound_.last_probe_unix_ms = unix_ms();
             inbound_.last_probe_peer = to_string(peer->id);
             inbound_.last_probe_error = reachable ? std::string{} : error;
@@ -742,7 +742,7 @@ void NodeRuntime::bind_control_routes() {
               if (target.host.empty() || !target.port)
                   return error_reply("dial-back probe needs a host and port");
               {
-                  std::lock_guard lock(dial_back_mutex_);
+                  Lock lock(dial_back_mutex_);
                   const auto now = Clock::now();
                   auto& last = dial_back_last_[peer.id];
                   if (last != Clock::time_point{} && now - last < cfg_.dial_back_probe_min_interval)
@@ -993,8 +993,8 @@ void NodeRuntime::telemetry_loop(std::stop_token stop) {
         }
         handled_demand = demand;
         cpu_reporter.tick();
-        std::unique_lock lock(telemetry_wait_mutex_);
-        telemetry_wait_cv_.wait_for(lock, stop, interval, [&] {
+        Lock lock(telemetry_wait_mutex_);
+        telemetry_wait_cv_.wait_for(lock.native(), stop, interval, [&] {
             return telemetry_demand_.load(std::memory_order_acquire) != handled_demand;
         });
     }
@@ -1102,8 +1102,9 @@ void NodeRuntime::loop(std::stop_token stop) {
         }
         telemetry_peers_active_.store(active_peers, std::memory_order_relaxed);
         cpu_reporter.tick();
-        std::unique_lock wait_lock(maintenance_wait_mutex_);
-        maintenance_wait_cv_.wait_for(wait_lock, stop, cfg_.heartbeat, [] { return false; });
+        Lock wait_lock(maintenance_wait_mutex_);
+        maintenance_wait_cv_.wait_for(wait_lock.native(), stop, cfg_.heartbeat,
+                                      [] { return false; });
     }
 }
 

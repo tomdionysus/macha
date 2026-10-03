@@ -2,6 +2,7 @@
 #pragma once
 #include "metadata/metadata_server.hpp"
 #include "cluster/data_work.hpp"
+#include "contract/thread_safety.hpp"
 #include "cluster/membership.hpp"
 #include "cluster/distributed_store.hpp"
 #include "metadata/metadata_manager.hpp"
@@ -106,15 +107,17 @@ struct FilesystemNamespaceBatchResult {
 
 class ReadHandle {
     DistributedStore& s_;
-    FsEntry e_;
-    PlaybackTracker* playback_{};
+    // e_, playback_ and playback_session_ are fixed at construction.
+    const FsEntry e_;
+    PlaybackTracker* const playback_{};
     uint64_t playback_session_{};
     std::atomic<FrameType> frame_type_{FrameType::read_ahead};
-    std::mutex m_;
-    uint64_t last_{};
-    size_t cached_index_{static_cast<size_t>(-1)};
-    DistributedStore::ObjectData cached_extent_;
-    const Bytes& extent(size_t, Clock::time_point, std::atomic_bool*);
+    // Held across extent fetches from the store.
+    IoMutex m_;
+    uint64_t last_ MACHA_GUARDED_BY(m_){};
+    size_t cached_index_ MACHA_GUARDED_BY(m_){static_cast<size_t>(-1)};
+    DistributedStore::ObjectData cached_extent_ MACHA_GUARDED_BY(m_);
+    const Bytes& extent(size_t, Clock::time_point, std::atomic_bool*) MACHA_REQUIRES(m_);
 
   public:
     ReadHandle(DistributedStore&, FsEntry, PlaybackTracker* = nullptr,
@@ -133,15 +136,21 @@ class WriteHandle {
     friend class FileSystem;
 class PlaybackTracker;
 
+    // Held across the temp file's I/O, extent puts and fetches, durability
+    // barriers and the metadata commit.
+    mutable IoMutex m_;
     FileSystem& fs_;
+    // Written by FileSystem under fs_.open_writes_mutex_; read through
+    // current_path(), which takes it.
     std::string path_;
-    FsEntry base_;
-    uint64_t expected_{};
-    bool sequential_{}, dirty_{};
-    bool cache_puts_{};
-    WriteDurability durability_{WriteDurability::immediate};
-    DataWorkContext work_context_{};
-    DistributedStore::DurabilityBatch durability_batch_;
+    FsEntry base_ MACHA_GUARDED_BY(m_);
+    uint64_t expected_ MACHA_GUARDED_BY(m_){};
+    bool sequential_ MACHA_GUARDED_BY(m_){};
+    bool dirty_ MACHA_GUARDED_BY(m_){};
+    const bool cache_puts_{};
+    const WriteDurability durability_{WriteDurability::immediate};
+    const DataWorkContext work_context_{};
+    DistributedStore::DurabilityBatch durability_batch_ MACHA_GUARDED_BY(m_);
     struct StagedExtentResult {
         ExtentRef extent;
         DistributedStore::DurabilityBatch durability;
@@ -155,74 +164,76 @@ class PlaybackTracker;
         std::future<StagedExtentResult> result;
         std::optional<RetainedMemoryLedger::Lease> memory;
     };
-    std::deque<PendingExtent> pending_extents_;
-    uint64_t pending_extent_bytes_{};
-    uint64_t publication_pipeline_bytes_{};
-    size_t peak_pending_extents_{};
-    uint64_t logical_{}, staged_{};
-    std::vector<ExtentRef> extents_;
-    Bytes buffer_;
-    std::optional<RetainedMemoryLedger::Lease> buffer_memory_;
-    std::optional<ExtentRef> append_tail_;
-    int temp_{-1};
-    std::filesystem::path temp_path_;
-    mutable std::mutex m_;
-    uint64_t diagnostic_id_{};
-    uint64_t diagnostic_write_sequence_{};
-    size_t diagnostic_completed_extents_{};
-    size_t append_tail_fetches_{};
-    size_t materialize_source_reads_{};
-    uint64_t materialize_source_bytes_{};
-    size_t materialize_steps_{};
-    bool materializing_{};
-    uint64_t materialize_offset_{};
-    size_t materialize_extent_index_{};
-    size_t new_extent_puts_{};
-    size_t rebuild_reused_extents_{};
-    size_t rebuild_put_extents_{};
-    uint64_t rebuild_source_bytes_{};
-    size_t rebuild_steps_{};
-    bool rebuilding_{};
-    bool rebuild_prepared_{};
+    std::deque<PendingExtent> pending_extents_ MACHA_GUARDED_BY(m_);
+    uint64_t pending_extent_bytes_ MACHA_GUARDED_BY(m_){};
+    const uint64_t publication_pipeline_bytes_{};
+    size_t peak_pending_extents_ MACHA_GUARDED_BY(m_){};
+    uint64_t logical_ MACHA_GUARDED_BY(m_){};
+    uint64_t staged_ MACHA_GUARDED_BY(m_){};
+    std::vector<ExtentRef> extents_ MACHA_GUARDED_BY(m_);
+    Bytes buffer_ MACHA_GUARDED_BY(m_);
+    std::optional<RetainedMemoryLedger::Lease> buffer_memory_ MACHA_GUARDED_BY(m_);
+    std::optional<ExtentRef> append_tail_ MACHA_GUARDED_BY(m_);
+    int temp_ MACHA_GUARDED_BY(m_){-1};
+    std::filesystem::path temp_path_ MACHA_GUARDED_BY(m_);
+    const uint64_t diagnostic_id_{};
+    uint64_t diagnostic_write_sequence_ MACHA_GUARDED_BY(m_){};
+    size_t diagnostic_completed_extents_ MACHA_GUARDED_BY(m_){};
+    size_t append_tail_fetches_ MACHA_GUARDED_BY(m_){};
+    size_t materialize_source_reads_ MACHA_GUARDED_BY(m_){};
+    uint64_t materialize_source_bytes_ MACHA_GUARDED_BY(m_){};
+    size_t materialize_steps_ MACHA_GUARDED_BY(m_){};
+    bool materializing_ MACHA_GUARDED_BY(m_){};
+    uint64_t materialize_offset_ MACHA_GUARDED_BY(m_){};
+    size_t materialize_extent_index_ MACHA_GUARDED_BY(m_){};
+    size_t new_extent_puts_ MACHA_GUARDED_BY(m_){};
+    size_t rebuild_reused_extents_ MACHA_GUARDED_BY(m_){};
+    size_t rebuild_put_extents_ MACHA_GUARDED_BY(m_){};
+    uint64_t rebuild_source_bytes_ MACHA_GUARDED_BY(m_){};
+    size_t rebuild_steps_ MACHA_GUARDED_BY(m_){};
+    bool rebuilding_ MACHA_GUARDED_BY(m_){};
+    bool rebuild_prepared_ MACHA_GUARDED_BY(m_){};
     // Edit a canonical committed manifest as a sparse changed-range overlay;
     // unchanged extents stay references and are never copied to the temp file.
-    bool sparse_overlay_{};
-    std::optional<int64_t> committed_mtime_;
+    bool sparse_overlay_ MACHA_GUARDED_BY(m_){};
+    std::optional<int64_t> committed_mtime_ MACHA_GUARDED_BY(m_);
     struct ChangedRange {
         uint64_t begin{};
         uint64_t end{};
     };
-    std::vector<ChangedRange> changed_ranges_;
-    uint64_t rebuild_offset_{};
-    size_t rebuild_index_{};
-    std::vector<ExtentRef> rebuild_handle_extents_;
+    std::vector<ChangedRange> changed_ranges_ MACHA_GUARDED_BY(m_);
+    uint64_t rebuild_offset_ MACHA_GUARDED_BY(m_){};
+    size_t rebuild_index_ MACHA_GUARDED_BY(m_){};
+    std::vector<ExtentRef> rebuild_handle_extents_ MACHA_GUARDED_BY(m_);
     struct DiagnosticWriteRange {
         uint64_t sequence{};
         uint64_t offset{};
         size_t length{};
         Hash256 hash{};
     };
-    std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_;
+    std::map<std::pair<uint64_t, size_t>, std::pair<uint64_t, Hash256>> diagnostic_exact_writes_
+        MACHA_GUARDED_BY(m_);
     // Trace-only; bounded so it never records every write of a bulk transfer.
-    std::deque<DiagnosticWriteRange> diagnostic_writes_;
+    std::deque<DiagnosticWriteRange> diagnostic_writes_ MACHA_GUARDED_BY(m_);
     static constexpr size_t diagnostic_write_limit_ = 4096;
-    std::chrono::milliseconds flush();
-    std::chrono::milliseconds drain_one_extent();
-    std::chrono::milliseconds drain_staging_locked();
-    void prepare_append_tail();
-    bool canonical_base() const;
-    void begin_sparse_overlay();
-    void note_changed_range(uint64_t, uint64_t);
-    bool range_changed(uint64_t, uint64_t) const;
-    WritePreparation materialize_step(uint64_t);
-    void materialize();
-    WritePreparation rebuild_step(uint64_t);
-    void rebuild();
-    void cleanup();
-    void diagnostic_stage_extent(const char*, size_t, uint64_t, size_t);
-    void diagnostic_stage_checkpoint(const char*);
-    void launch_pending_extent(PendingExtent&);
-    void ensure_buffer_memory();
+    std::chrono::milliseconds flush() MACHA_REQUIRES(m_);
+    std::chrono::milliseconds drain_one_extent() MACHA_REQUIRES(m_);
+    std::chrono::milliseconds drain_staging_locked() MACHA_REQUIRES(m_);
+    void prepare_append_tail() MACHA_REQUIRES(m_);
+    bool canonical_base() const MACHA_REQUIRES(m_);
+    void begin_sparse_overlay() MACHA_REQUIRES(m_);
+    void note_changed_range(uint64_t, uint64_t) MACHA_REQUIRES(m_);
+    bool range_changed(uint64_t, uint64_t) const MACHA_REQUIRES(m_);
+    WritePreparation materialize_step(uint64_t) MACHA_REQUIRES(m_);
+    void materialize() MACHA_REQUIRES(m_);
+    WritePreparation rebuild_step(uint64_t) MACHA_REQUIRES(m_);
+    void rebuild() MACHA_REQUIRES(m_);
+    void cleanup() MACHA_REQUIRES(m_);
+    void diagnostic_stage_extent(const char*, size_t, uint64_t, size_t) MACHA_REQUIRES(m_);
+    void diagnostic_stage_checkpoint(const char*) MACHA_REQUIRES(m_);
+    void launch_pending_extent(PendingExtent&) MACHA_REQUIRES(m_);
+    void ensure_buffer_memory() MACHA_REQUIRES(m_);
+    std::string current_path() const;
 
   public:
     WriteHandle(FileSystem&, std::string, FsEntry, bool, bool cache_puts = false,
@@ -242,17 +253,17 @@ class PlaybackTracker;
     // visible mtime so a utimens after the writes (rsync's order) is not
     // overwritten by the asynchronous publication's own timestamp.
     void set_committed_mtime(int64_t mtime_ns) {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         committed_mtime_ = mtime_ns;
     }
     void drain_staging();
     WriteHandleDiagnostics diagnostics() const;
-    FsEntry committed_entry() const { std::lock_guard lock(m_); return base_; }
+    FsEntry committed_entry() const { Lock lock(m_); return base_; }
     uint64_t diagnostic_id() const noexcept {
         return diagnostic_id_;
     }
     uint64_t size() const {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         return logical_;
     }
 };
@@ -268,8 +279,10 @@ class FileSystem {
     DistributedStore& s_;
     MetadataView& m_;
     PlaybackTracker* playback_{};
-    std::mutex open_writes_mutex_;
-    std::vector<std::weak_ptr<WriteHandle>> open_writes_;
+    // Held across open_write()'s path resolution and getattr, and the rename
+    // fix-up's logging.
+    IoMutex open_writes_mutex_;
+    std::vector<std::weak_ptr<WriteHandle>> open_writes_ MACHA_GUARDED_BY(open_writes_mutex_);
     // Cooperative cancellation of mount I/O at shutdown; extent transfers carry
     // it into DistributedStore.
     std::atomic_bool io_cancelled_{};
@@ -277,9 +290,10 @@ class FileSystem {
     // extent makes glibc's per-thread arenas retain gigabytes. The queue holds
     // two tasks per worker, matching the default per-publication pipeline.
     using ExtentTask = std::packaged_task<WriteHandle::StagedExtentResult()>;
-    mutable std::mutex extent_tasks_mutex_;
+    mutable Mutex extent_tasks_mutex_;
     std::condition_variable_any extent_tasks_cv_;
-    std::deque<std::shared_ptr<ExtentTask>> extent_tasks_;
+    std::deque<std::shared_ptr<ExtentTask>> extent_tasks_ MACHA_GUARDED_BY(extent_tasks_mutex_);
+    // Fixed at construction.
     size_t extent_worker_limit_{};
     size_t extent_task_limit_{};
     std::atomic_uint64_t extent_tasks_active_{};
@@ -291,7 +305,7 @@ class FileSystem {
     // retained-memory admission wait. Admitted quanta must not count, or a
     // failing node re-arms every no-progress deadline and never parks.
     std::atomic_uint64_t write_progress_{};
-    std::vector<std::jthread> extent_workers_;
+    std::vector<std::jthread> extent_workers_ MACHA_GUARDED_BY(extent_tasks_mutex_);
     void extent_worker(std::stop_token);
     std::future<WriteHandle::StagedExtentResult> submit_extent_task(
         std::function<WriteHandle::StagedExtentResult()>);
@@ -307,29 +321,36 @@ class FileSystem {
         std::map<std::string, std::string, std::less<>> canonical_paths;
         std::set<std::string, std::less<>> ambiguous_canonical_paths;
     };
-    std::mutex namespace_index_mutex_;
-    std::shared_ptr<const NamespaceIndex> namespace_index_;
+    Mutex namespace_index_mutex_;
+    std::shared_ptr<const NamespaceIndex> namespace_index_ MACHA_GUARDED_BY(namespace_index_mutex_);
     std::shared_ptr<const NamespaceIndex> namespace_index();
     std::optional<std::string> resolve_existing_path(const std::string&);
     std::string resolve_new_path(const std::string&);
 
-    std::mutex media_index_mutex_;
-    uint64_t media_index_namespace_revision_{};
-    bool media_index_valid_{};
+    // Held across namespace walks and entry lookups that read tree nodes
+    // from the control store, which may fetch them from peers.
+    IoMutex media_index_mutex_;
+    uint64_t media_index_namespace_revision_ MACHA_GUARDED_BY(media_index_mutex_){};
+    bool media_index_valid_ MACHA_GUARDED_BY(media_index_mutex_){};
     // Owns the entries media_index_ refers to. Content-addressed media ids stay
     // valid across generations; only a miss inspects newer metadata.
-    std::shared_ptr<const MetadataSnapshot> media_index_snapshot_;
+    std::shared_ptr<const MetadataSnapshot> media_index_snapshot_
+        MACHA_GUARDED_BY(media_index_mutex_);
     // Media id -> path.
-    std::map<std::string, std::string> media_index_;
-    std::mutex maintenance_index_mutex_;
-    uint64_t maintenance_index_generation_{};
-    std::shared_ptr<const MaintenanceObjects> maintenance_index_;
+    std::map<std::string, std::string> media_index_ MACHA_GUARDED_BY(media_index_mutex_);
+    Mutex maintenance_index_mutex_;
+    uint64_t maintenance_index_generation_ MACHA_GUARDED_BY(maintenance_index_mutex_){};
+    std::shared_ptr<const MaintenanceObjects> maintenance_index_
+        MACHA_GUARDED_BY(maintenance_index_mutex_);
     // Decoded local replica record, cached apart from MetadataManager's
     // authoritative read path, which local snapshot views must never enter.
-    std::mutex local_snapshot_mutex_;
-    uint64_t local_snapshot_generation_{};
-    Hash256 local_snapshot_hash_{};
-    std::shared_ptr<const MetadataSnapshot> local_snapshot_cache_;
+    // Held across the replica's materialisation, which reads history frames
+    // from disk.
+    IoMutex local_snapshot_mutex_;
+    uint64_t local_snapshot_generation_ MACHA_GUARDED_BY(local_snapshot_mutex_){};
+    Hash256 local_snapshot_hash_ MACHA_GUARDED_BY(local_snapshot_mutex_){};
+    std::shared_ptr<const MetadataSnapshot> local_snapshot_cache_
+        MACHA_GUARDED_BY(local_snapshot_mutex_);
     MetadataSnapshot snap();
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*,

@@ -55,7 +55,7 @@ void atomic_write(const std::filesystem::path& path, std::span<const uint8_t> by
 
 PersistentBlockCache::PersistentBlockCache(CacheConfig config, std::array<uint8_t, 32> key)
     : config_(std::move(config)), key_(key) {
-    std::lock_guard lock(state_mutex_);
+    Lock lock(state_mutex_);
     open_locked();
 }
 
@@ -81,14 +81,14 @@ void PersistentBlockCache::open_locked() {
 }
 
 void PersistentBlockCache::reconfigure(CacheConfig config) {
-    std::lock_guard writer(writer_mutex_);
-    std::lock_guard metadata_lock(metadata_mutex_);
+    Lock writer(writer_mutex_);
+    Lock metadata_lock(metadata_mutex_);
     cached_metadata_hash_.reset();
 
     std::shared_ptr<LocalStore> store;
     size_t limit = 0;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         bool reopen = config.path != config_.path;
         config_ = std::move(config);
         if (config_.path.empty() || !config_.max_blocks) {
@@ -108,7 +108,7 @@ void PersistentBlockCache::reconfigure(CacheConfig config) {
 }
 
 bool PersistentBlockCache::enabled() const {
-    std::lock_guard lock(state_mutex_);
+    Lock lock(state_mutex_);
     return static_cast<bool>(store_) && config_.max_blocks;
 }
 
@@ -128,7 +128,7 @@ void PersistentBlockCache::rebuild_lru_locked() {
 
 void PersistentBlockCache::mark_used(const std::shared_ptr<LocalStore>& store,
                                      const ObjectId& id) {
-    std::lock_guard lock(state_mutex_);
+    Lock lock(state_mutex_);
     if (!store_ || store_ != store)
         return;
     auto found = lru_index_.find(id);
@@ -146,7 +146,7 @@ void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& stor
     while (true) {
         std::optional<ObjectId> victim;
         {
-            std::lock_guard lock(state_mutex_);
+            Lock lock(state_mutex_);
             if (!store_ || store_ != store || lru_.size() <= limit)
                 return;
             victim = lru_.front();
@@ -165,12 +165,12 @@ void PersistentBlockCache::trim_to_limit(const std::shared_ptr<LocalStore>& stor
 bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data) {
     // Writers are serialised apart from reads, so two cannot both take the
     // last slot and exceed max_blocks.
-    std::lock_guard writer(writer_mutex_);
+    Lock writer(writer_mutex_);
 
     std::shared_ptr<LocalStore> store;
     size_t limit = 0;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         store = store_;
         limit = config_.max_blocks;
     }
@@ -188,7 +188,7 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
         while (true) {
             std::optional<ObjectId> victim;
             {
-                std::lock_guard lock(state_mutex_);
+                Lock lock(state_mutex_);
                 if (!store_ || store_ != store || !config_.max_blocks)
                     return false;
                 limit = config_.max_blocks;
@@ -209,7 +209,7 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
         if (!ok)
             return false;
         {
-            std::lock_guard lock(state_mutex_);
+            Lock lock(state_mutex_);
             if (store_ != store)
                 return true; // Reconfigured concurrently after the physical put.
             auto existing = lru_index_.find(id);
@@ -232,7 +232,7 @@ bool PersistentBlockCache::put(const ObjectId& id, std::span<const uint8_t> data
 std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
     std::shared_ptr<LocalStore> store;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         store = store_;
     }
     if (!store)
@@ -252,17 +252,17 @@ std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
         // A corrupt cache entry is disposable, but only remove it from the
         // same cache instance that produced the failed read.  A live
         // reconfiguration may already have installed a different cache root.
-        std::lock_guard writer(writer_mutex_);
+        Lock writer(writer_mutex_);
         bool current = false;
         {
-            std::lock_guard lock(state_mutex_);
+            Lock lock(state_mutex_);
             current = store_ == store;
         }
         // A read that threw is a miss, so a failing cache looks broken, not idle.
         misses_.fetch_add(1, std::memory_order_relaxed);
         if (current) {
             (void)store->remove(id);
-            std::lock_guard lock(state_mutex_);
+            Lock lock(state_mutex_);
             if (store_ == store) {
                 auto found = lru_index_.find(id);
                 if (found != lru_index_.end()) {
@@ -279,17 +279,17 @@ std::optional<Bytes> PersistentBlockCache::get(const ObjectId& id) {
 bool PersistentBlockCache::has(const ObjectId& id) const {
     std::shared_ptr<LocalStore> store;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         store = store_;
     }
     return store && store->has(id);
 }
 
 bool PersistentBlockCache::remove(const ObjectId& id) {
-    std::lock_guard writer(writer_mutex_);
+    Lock writer(writer_mutex_);
     std::shared_ptr<LocalStore> store;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         store = store_;
     }
     if (!store)
@@ -297,7 +297,7 @@ bool PersistentBlockCache::remove(const ObjectId& id) {
 
     const bool removed = store->remove(id);
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         if (store_ == store) {
             auto found = lru_index_.find(id);
             if (found != lru_index_.end()) {
@@ -326,13 +326,13 @@ std::filesystem::path PersistentBlockCache::metadata_path(const CacheConfig& con
 }
 
 void PersistentBlockCache::remember_metadata(const MetadataRecord& record) {
-    std::lock_guard metadata_lock(metadata_mutex_);
+    Lock metadata_lock(metadata_mutex_);
     if (cached_metadata_hash_ && *cached_metadata_hash_ == record.hash)
         return;
     CacheConfig config;
     std::shared_ptr<LocalStore> store;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         config = config_;
         store = store_;
     }
@@ -354,11 +354,11 @@ void PersistentBlockCache::remember_metadata(const MetadataRecord& record) {
 }
 
 std::optional<MetadataRecord> PersistentBlockCache::metadata() const {
-    std::lock_guard metadata_lock(metadata_mutex_);
+    Lock metadata_lock(metadata_mutex_);
     CacheConfig config;
     std::shared_ptr<LocalStore> store;
     {
-        std::lock_guard lock(state_mutex_);
+        Lock lock(state_mutex_);
         config = config_;
         store = store_;
     }

@@ -1812,7 +1812,7 @@ bool MusicBrainzProvider::supports(MediaProbeKind kind) const {
 
 Json MusicBrainzProvider::api(std::string_view path,
                               const std::vector<std::pair<std::string, std::string>>& query) {
-    std::unique_lock gate(gate_->mutex);
+    Lock gate(gate_->mutex);
     const auto now = std::chrono::steady_clock::now();
     if (gate_->unavailable_until > now)
         throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz circuit open");
@@ -2628,7 +2628,7 @@ CatalogueScanner::CatalogueScanner(NodeRuntime& node, MetadataServer& metadata_s
 CatalogueScanner::~CatalogueScanner() { stop(); }
 
 void CatalogueScanner::configure_providers() {
-    auto build = [&](HttpClient& http) {
+    auto build = [&](HttpClient& http) MACHA_REQUIRES(config_mutex_) {
         std::vector<std::unique_ptr<CatalogueScanProvider>> out;
         if (config_.movies.enabled)
             out.push_back(std::make_unique<MovieScanProvider>(http, config_.movies));
@@ -2640,7 +2640,7 @@ void CatalogueScanner::configure_providers() {
         return out;
     };
     providers_ = build(*provider_http_);
-    std::lock_guard editor(editor_mutex_);
+    Lock editor(editor_mutex_);
     editor_providers_ = build(*http_);
 }
 
@@ -2659,7 +2659,7 @@ bool CatalogueScanner::coordinator() const {
 }
 
 void CatalogueScanner::start() {
-    std::lock_guard lock(config_mutex_);
+    Lock lock(config_mutex_);
     if (!config_.enabled || worker_.joinable()) return;
     http_->reset_stop();
     hints_.requeue_processing();
@@ -2683,7 +2683,7 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     if (media_ids.empty())
         return 0;
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         if (!config_.enabled)
             return 0;
     }
@@ -2708,20 +2708,24 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     }
 
     auto rescan_nodes = fs_.namespace_nodes();
-    for_each_namespace_entry(*snapshot, &rescan_nodes,
-                             [&](const std::string& path, const FsEntry& entry) {
-        if (entry.type != EntryType::file)
-            return;
-        const auto media_id = file_media_id(entry);
-        if (!wanted.contains(media_id))
-            return;
-        std::string root;
-        auto* provider = provider_for_path(path, root);
-        if (!provider || !provider->accepts_path(path))
-            return;
-        submissions.push_back({path, "manual", media_id,
-                               CatalogueHintPriority::manual_rescan});
-    });
+    {
+        Lock lock(config_mutex_);
+        for_each_namespace_entry(*snapshot, &rescan_nodes,
+                                 [&](const std::string& path, const FsEntry& entry)
+                                     MACHA_REQUIRES(config_mutex_) {
+            if (entry.type != EntryType::file)
+                return;
+            const auto media_id = file_media_id(entry);
+            if (!wanted.contains(media_id))
+                return;
+            std::string root;
+            auto* provider = provider_for_path(path, root);
+            if (!provider || !provider->accepts_path(path))
+                return;
+            submissions.push_back({path, "manual", media_id,
+                                   CatalogueHintPriority::manual_rescan});
+        });
+    }
 
     const auto queued = hints_.submit_many(std::move(submissions)).size();
     Log::debug("catalogue metadata clear targeted rematch media_ids=" +
@@ -2735,7 +2739,7 @@ size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& 
                                            "media-information-request");
     if (media_ids.empty()) return 0;
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         if (!config_.enabled || !profile_engine_ || !profile_engine_->status().available)
             return 0;
     }
@@ -2749,35 +2753,39 @@ size_t CatalogueScanner::request_media_profiles(const std::vector<std::string>& 
     std::vector<CatalogueHintSubmission> submissions;
     size_t pending = 0;
     auto pending_nodes = fs_.namespace_nodes();
-    for_each_namespace_entry(*available->snapshot, &pending_nodes,
-                             [&](const std::string& path, const FsEntry& entry) {
-        if (entry.type != EntryType::file || !entry.size) return;
-        const auto media_id = file_media_id(entry);
-        if (!wanted.contains(media_id)) return;
-        std::string root;
-        auto* provider = provider_for_path(path, root);
-        if (!provider || !provider->accepts_path(path)) return;
+    {
+        Lock lock(config_mutex_);
+        for_each_namespace_entry(*available->snapshot, &pending_nodes,
+                                 [&](const std::string& path, const FsEntry& entry)
+                                     MACHA_REQUIRES(config_mutex_) {
+            if (entry.type != EntryType::file || !entry.size) return;
+            const auto media_id = file_media_id(entry);
+            if (!wanted.contains(media_id)) return;
+            std::string root;
+            auto* provider = provider_for_path(path, root);
+            if (!provider || !provider->accepts_path(path)) return;
 
-        // One background job per media id: a live job counts as pending; a
-        // terminal one returns zero so playback uses its engine fallback. A
-        // changed media id is a new origin.
-        if (auto it = existing_by_path.find(path); it != existing_by_path.end()) {
-            const auto& hint = it->second;
-            const bool same_profile_request = std::any_of(
-                hint.origins.begin(), hint.origins.end(), [&](const auto& origin) {
-                    return origin.source == "media-profile" && origin.source_ref == media_id;
-                });
-            if (same_profile_request) {
-                if (hint.state == CatalogueHintState::queued ||
-                    hint.state == CatalogueHintState::processing ||
-                    hint.state == CatalogueHintState::deferred)
-                    ++pending;
-                return;
+            // One background job per media id: a live job counts as pending; a
+            // terminal one returns zero so playback uses its engine fallback. A
+            // changed media id is a new origin.
+            if (auto it = existing_by_path.find(path); it != existing_by_path.end()) {
+                const auto& hint = it->second;
+                const bool same_profile_request = std::any_of(
+                    hint.origins.begin(), hint.origins.end(), [&](const auto& origin) {
+                        return origin.source == "media-profile" && origin.source_ref == media_id;
+                    });
+                if (same_profile_request) {
+                    if (hint.state == CatalogueHintState::queued ||
+                        hint.state == CatalogueHintState::processing ||
+                        hint.state == CatalogueHintState::deferred)
+                        ++pending;
+                    return;
+                }
             }
-        }
-        submissions.push_back({path, "media-profile", media_id,
-                               CatalogueHintPriority::periodic_scan});
-    });
+            submissions.push_back({path, "media-profile", media_id,
+                                   CatalogueHintPriority::periodic_scan});
+        });
+    }
     const auto queued = hints_.submit_many(std::move(submissions)).size();
     pending += queued;
     Log::debug("catalogue media profile requested media_ids=" +
@@ -2792,7 +2800,7 @@ std::vector<MediaProbeCandidate> CatalogueScanner::probe_unmatched(std::string_v
     if (!hint || hint->state != CatalogueHintState::no_match || hint->media_id.empty())
         return {};
 
-    std::lock_guard lock(config_mutex_);
+    Lock lock(config_mutex_);
     std::string root;
     auto* provider = provider_for_path(hint->path, root);
     if (!provider || !provider->accepts_path(hint->path)) return {};
@@ -2806,7 +2814,7 @@ std::vector<MediaProbeCandidate> CatalogueScanner::probe_unmatched(std::string_v
 void CatalogueScanner::reconfigure(CatalogueScannerConfig config) {
     stop();
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         config_ = std::move(config);
         configure_providers();
     }
@@ -2984,7 +2992,7 @@ std::vector<ProviderSearchResult> CatalogueScanner::search_providers(
     const auto kind = source->probe_kind;
     std::vector<ProviderSearchResult> results;
     {
-        std::lock_guard editor(editor_mutex_);
+        Lock editor(editor_mutex_);
         auto* metadata = editor_metadata(scan_provider, metadata_provider);
         if (!metadata || !metadata->supports(kind))
             throw ProviderRequestError(400, "provider_not_configured",
@@ -3043,12 +3051,12 @@ ProviderRefMatch CatalogueScanner::match_unmatched_ref(std::string_view hint_id,
 
     size_t max_artwork_bytes = 0;
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         max_artwork_bytes = config_.max_artwork_bytes;
     }
     std::optional<ProviderMatch> match;
     {
-        std::lock_guard editor(editor_mutex_);
+        Lock editor(editor_mutex_);
         auto* metadata = editor_metadata(scan_provider, parsed->provider);
         if (!metadata || !metadata->supports(probe.kind))
             throw ProviderRequestError(400, "provider_not_configured",
@@ -3137,7 +3145,7 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
         throw ProviderRequestError(400, "bad_role", "role must be " + allowed + " for this reference");
     }
     const auto scan_provider = scan_provider_for(*parsed);
-    std::lock_guard editor(editor_mutex_);
+    Lock editor(editor_mutex_);
     auto* metadata = editor_metadata(scan_provider, parsed->provider);
     if (!metadata)
         throw ProviderRequestError(400, "provider_not_configured",
@@ -3214,7 +3222,7 @@ CatalogueItem CatalogueScanner::choose_artwork(std::string_view item_id, std::st
 
     size_t max_artwork_bytes = 0;
     {
-        std::lock_guard config_lock(config_mutex_);
+        Lock config_lock(config_mutex_);
         max_artwork_bytes = config_.max_artwork_bytes;
     }
     RemoteHttpResponse response;
@@ -3248,13 +3256,13 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
                                DistributedStore::DurabilityBatch& artwork_batch) {
     if (stop.stop_requested()) return {};
     CatalogueScannerConfig config;
-    {
-        std::lock_guard lock(config_mutex_);
-        config = config_;
-    }
-
     std::string root;
-    auto* provider = provider_for_path(hint.path, root);
+    CatalogueScanProvider* provider = nullptr;
+    {
+        Lock lock(config_mutex_);
+        config = config_;
+        provider = provider_for_path(hint.path, root);
+    }
     if (!provider) {
         hints_.mark_no_match(hint.id, {}, {},
                              path_has_ignored_term(hint.path, config.ignore_terms)
@@ -3394,12 +3402,16 @@ CatalogueScanner::prepare_hint(const CatalogueHint& hint, std::stop_token stop,
         // would be probed locally only to meet the same open circuit.
         const auto retry_delay = std::max(config.provider_batch_delay, e.retry_after());
         const auto retry_at = unix_ms() + static_cast<uint64_t>(retry_delay.count());
-        const auto deferred = hints_.defer_matching(
-            [&](const CatalogueHint& queued) {
-                std::string queued_root;
-                return provider_for_path(queued.path, queued_root) == provider;
-            },
-            "provider_unavailable", e.what(), retry_at);
+        size_t deferred = 0;
+        {
+            Lock lock(config_mutex_);
+            deferred = hints_.defer_matching(
+                [&](const CatalogueHint& queued) MACHA_REQUIRES(config_mutex_) {
+                    std::string queued_root;
+                    return provider_for_path(queued.path, queued_root) == provider;
+                },
+                "provider_unavailable", e.what(), retry_at);
+        }
         Log::warn("catalogue hint provider temporarily unavailable provider=" +
                   std::string(provider->name()) + " path=" + hint.path +
                   " deferred_hints=" + std::to_string(deferred) +
@@ -3480,7 +3492,7 @@ CatalogueScanner::HintBatchResult
 CatalogueScanner::process_hint_batch(std::stop_token stop, size_t max_hints) {
     CatalogueScannerConfig config;
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         config = config_;
     }
     auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
@@ -3627,7 +3639,7 @@ size_t CatalogueScanner::scan_once() {
     (void)scan_once({}, false, "manual", CatalogueHintPriority::manual_rescan, true);
     CatalogueScannerConfig config;
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         config = config_;
     }
     auto* budget_http = dynamic_cast<BudgetHttpClient*>(provider_http_.get());
@@ -3641,9 +3653,11 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
                                    std::string_view hint_source, int hint_priority,
                                    bool unique_source_ref) {
     CatalogueScannerConfig config;
+    std::vector<CatalogueScanProvider*> providers;
     {
-        std::lock_guard lock(config_mutex_);
+        Lock lock(config_mutex_);
         config = config_;
+        for (const auto& provider : providers_) providers.push_back(provider.get());
     }
     if (!config.enabled || (!force && !coordinator()) || stop.stop_requested()) return 0;
 
@@ -3658,7 +3672,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
     std::vector<ProviderFile> files;
     size_t roots_scanned = 0;
     size_t roots_unavailable = 0;
-    for (auto& provider : providers_) {
+    for (auto* provider : providers) {
         for (const auto& root : provider->roots()) {
             try {
                 auto scan_nodes = fs_.namespace_nodes();
@@ -3667,7 +3681,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
                 if (stop.stop_requested()) return 0;
                 ++roots_scanned;
                 for (auto& [path, entry] : root_files)
-                    files.push_back({provider.get(), normalize_path(root),
+                    files.push_back({provider, normalize_path(root),
                                      std::move(path), std::move(entry)});
             } catch (const FsError& e) {
                 if (e.code() != ENOENT) throw;
@@ -3750,7 +3764,7 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
 void CatalogueScanner::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-catalogue", diagnostic_interval_, true);
     CatalogueScannerConfig initial_config;
-    { std::lock_guard lock(config_mutex_); initial_config = config_; }
+    { Lock lock(config_mutex_); initial_config = config_; }
     const auto persisted = load_scanner_state(node_.config().state_path);
     std::optional<Hash256> scanned_namespace = persisted.namespace_signature;
     bool scanner_state_reconciled = !persisted.namespace_signature || persisted.reconciled;
@@ -3786,7 +3800,7 @@ void CatalogueScanner::loop(std::stop_token stop) {
 
     while (!stop.stop_requested()) {
         CatalogueScannerConfig config;
-        { std::lock_guard lock(config_mutex_); config = config_; }
+        { Lock lock(config_mutex_); config = config_; }
         const auto now = std::chrono::steady_clock::now();
 
         // On start, compare the last reconciled namespace signature with the

@@ -3,6 +3,7 @@
 #include "cluster/cluster.hpp"
 #include "cluster/control_objects.hpp"
 #include "contract/predicates.hpp"
+#include "contract/thread_safety.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/replica_selector.hpp"
 #include <atomic>
@@ -102,19 +103,23 @@ class DistributedStore final : public Placement, public ControlObjectSource {
 
   private:
     struct SharedFetch {
-        std::mutex mutex;
+        SharedFetch(bool foreground_, FrameType frame_type_, bool opportunistic_persist_)
+            : foreground(foreground_), frame_type(frame_type_),
+              opportunistic_persist(opportunistic_persist_) {}
+        // Waiters hold it across the caller's abort predicate.
+        IoMutex mutex;
         std::condition_variable cv;
-        bool done{};
-        bool foreground{};
-        FrameType frame_type{FrameType::speculative};
-        std::function<void(FrameType)> promote_network;
-        bool opportunistic_persist{};
-        bool foreground_accounted{};
-        bool persist_queued{};
+        bool done MACHA_GUARDED_BY(mutex){};
+        bool foreground MACHA_GUARDED_BY(mutex){};
+        FrameType frame_type MACHA_GUARDED_BY(mutex){FrameType::speculative};
+        std::function<void(FrameType)> promote_network MACHA_GUARDED_BY(mutex);
+        bool opportunistic_persist MACHA_GUARDED_BY(mutex){};
+        bool foreground_accounted MACHA_GUARDED_BY(mutex){};
+        bool persist_queued MACHA_GUARDED_BY(mutex){};
         std::atomic_size_t waiters{};
-        std::optional<NodeInfo> active_peer;
-        ReplicaWorkClass active_class{ReplicaWorkClass::speculative};
-        ObjectData result;
+        std::optional<NodeInfo> active_peer MACHA_GUARDED_BY(mutex);
+        ReplicaWorkClass active_class MACHA_GUARDED_BY(mutex){ReplicaWorkClass::speculative};
+        ObjectData result MACHA_GUARDED_BY(mutex);
     };
 
     NodeRuntime& n_;
@@ -154,10 +159,10 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // reached only that floor are queued here and pushed to the next owner by
     // one worker as speculative DATA work, so a writer's death does not
     // strand recent data until the repair cursor comes round.
-    std::mutex prompt_mutex_;
+    mutable Mutex prompt_mutex_;
     std::condition_variable_any prompt_cv_;
-    std::deque<ObjectId> prompt_queue_;
-    std::set<ObjectId> prompt_queued_;
+    std::deque<ObjectId> prompt_queue_ MACHA_GUARDED_BY(prompt_mutex_);
+    std::set<ObjectId> prompt_queued_ MACHA_GUARDED_BY(prompt_mutex_);
     std::jthread prompt_thread_;
     // Opportunistic local copies of fetched objects (cache fill and
     // promotion), written by one worker so a read never waits on them.
@@ -168,13 +173,14 @@ class DistributedStore final : public Placement, public ControlObjectSource {
         bool cache{};
         RetainedMemoryLedger::Lease memory;
     };
-    std::mutex local_copy_mutex_;
+    // Held across the queue-full debug log.
+    IoMutex local_copy_mutex_;
     std::condition_variable local_copy_cv_;
-    std::deque<LocalCopyJob> local_copies_;
-    size_t local_copy_bytes_{};
+    std::deque<LocalCopyJob> local_copies_ MACHA_GUARDED_BY(local_copy_mutex_);
+    size_t local_copy_bytes_ MACHA_GUARDED_BY(local_copy_mutex_){};
     // A dequeued job not yet written; with the queue empty and this false,
     // every queued copy is settled.
-    bool local_copy_writing_{};
+    bool local_copy_writing_ MACHA_GUARDED_BY(local_copy_mutex_){};
     std::condition_variable local_copy_settled_cv_;
     // Set by the destructor so a writer waiting for DATA credit gives up.
     std::atomic_bool local_copy_cancelled_{};
@@ -226,18 +232,20 @@ class DistributedStore final : public Placement, public ControlObjectSource {
 
   private:
     std::atomic_uint64_t repair_local_unreadable_{};
-    mutable std::mutex repair_sample_mutex_;
-    std::deque<ObjectId> repair_unsourceable_sample_;
-    Clock::time_point repair_unsourceable_last_log_{};
-    Clock::time_point repair_unreadable_last_log_{};
+    mutable Mutex repair_sample_mutex_;
+    std::deque<ObjectId> repair_unsourceable_sample_ MACHA_GUARDED_BY(repair_sample_mutex_);
+    Clock::time_point repair_unsourceable_last_log_ MACHA_GUARDED_BY(repair_sample_mutex_){};
+    Clock::time_point repair_unreadable_last_log_ MACHA_GUARDED_BY(repair_sample_mutex_){};
     void note_repair_unsourceable(const ObjectId&);
     void note_repair_local_unreadable(const ObjectId&);
     void queue_prompt_replication(const ObjectId&);
     void prompt_replication_loop(std::stop_token);
     void enqueue_local_copy(const ObjectId&, std::span<const uint8_t>, bool promote);
     void local_writer_loop(std::stop_token);
-    mutable std::mutex fetch_mutex_;
-    std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_;
+    // Held while taking a SharedFetch's mutex, which waiters hold across their
+    // abort predicate.
+    mutable IoMutex fetch_mutex_;
+    std::map<ObjectId, std::weak_ptr<SharedFetch>> fetches_ MACHA_GUARDED_BY(fetch_mutex_);
     ReplicaSelector replica_selector_;
 
     bool put_impl(const ObjectId&, std::span<const uint8_t>, FrameType, std::atomic_bool*,

@@ -2400,27 +2400,27 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
 }
 
 MetadataRecord MetadataReplica::current() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return cur_;
 }
 
 MetadataRecord MetadataReplica::committed() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return committed_;
 }
 
 MetadataIdentity MetadataReplica::current_identity() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return {cur_.generation, cur_.hash};
 }
 
 MetadataIdentity MetadataReplica::committed_identity() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return {committed_.generation, committed_.hash};
 }
 
 uint64_t MetadataReplica::generation() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return cur_.generation;
 }
 
@@ -2429,12 +2429,12 @@ uint64_t MetadataReplica::committed_generation() const noexcept {
 }
 
 bool MetadataReplica::recovery_required() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return recovery_required_;
 }
 
 void MetadataReplica::mark_recovered() {
-    std::lock_guard g(m_);
+    Lock g(m_);
     if (!recovery_required_)
         return;
     std::error_code error;
@@ -2450,7 +2450,7 @@ void MetadataReplica::mark_recovered() {
 }
 
 uint64_t MetadataReplica::reserve_mutation_sequence(uint64_t observed_floor) {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     if (!mutation_sequence_loaded_) {
         mutation_sequence_ = 0;
         if (std::filesystem::exists(mutation_sequence_p_)) {
@@ -2683,8 +2683,8 @@ void MetadataReplica::load_journal() {
                 const bool known_descendant =
                     history_.contains(record.hash) &&
                     history_is_ancestor_locked(committed_.hash, record.hash);
-                const bool parent_descends_from_committed =
-                    std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) {
+                const bool parent_descends_from_committed = std::any_of(
+                    parents.begin(), parents.end(), [&](const Hash256& parent) MACHA_REQUIRES(m_) {
                         return history_.contains(parent) &&
                                history_is_ancestor_locked(committed_.hash, parent);
                     });
@@ -3096,14 +3096,14 @@ void MetadataReplica::persist_checkpoint_proof_locked() {
 }
 
 std::optional<HistoryCheckpointProof> MetadataReplica::checkpoint_proof() const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     return checkpoint_proof_;
 }
 
 bool MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
-    std::lock_guard durable_lock(durable_mutation_m_);
+    Lock durable_lock(durable_mutation_m_);
     proposal.status = HistoryCheckpointProof::Status::acked;
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     // Ack only while the floor is the sole accepted head (as
     // compact_history_if_safe() requires); the proposer's survey may be stale.
     if (accepted_heads_.size() != 1 || !accepted_heads_.contains(proposal.floor_hash))
@@ -3115,8 +3115,8 @@ bool MetadataReplica::record_checkpoint_ack(HistoryCheckpointProof proposal) {
 }
 
 bool MetadataReplica::record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch) {
-    std::lock_guard durable_lock(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable_lock(durable_mutation_m_);
+    Lock lock(m_);
     if (!checkpoint_proof_ || checkpoint_proof_->floor_hash != floor_hash ||
         checkpoint_proof_->epoch != epoch)
         return false;
@@ -3294,7 +3294,7 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     // Cooldown bounds how often a broken head re-throws; this runs on every
     // read (see unreconstructable_head_retry_at_).
     const auto now = Clock::now();
-    std::erase_if(unreconstructable_head_retry_at_, [&](const auto& item) {
+    std::erase_if(unreconstructable_head_retry_at_, [&](const auto& item) MACHA_REQUIRES(m_) {
         return !accepted_heads_.contains(item.first);
     });
     std::optional<MetadataRecord> selected;
@@ -3524,7 +3524,7 @@ std::optional<MetadataRecord> MetadataReplica::historical_locked(const Hash256& 
 }
 
 MetadataReplicaDiagnostics MetadataReplica::diagnostics() const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     return {
         historical_requests_.load(std::memory_order_relaxed),
         historical_reconstructions_.load(std::memory_order_relaxed),
@@ -3648,7 +3648,7 @@ std::optional<Hash256> MetadataReplica::history_common_ancestor_locked(const Has
 std::optional<MetadataHistoryEntry> MetadataReplica::history_entry(const Hash256& hash) const {
     HistoryIndexEntry index;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         auto found = history_.find(hash);
         if (found == history_.end())
             return {};
@@ -3662,7 +3662,7 @@ std::optional<MetadataHistoryEntry> MetadataReplica::history_entry(const Hash256
 }
 
 std::optional<MetadataHistoryLinks> MetadataReplica::history_links(const Hash256& hash) const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     const auto found = history_.find(hash);
     if (found == history_.end())
         return {};
@@ -3689,7 +3689,7 @@ std::optional<MetadataHistoryEntry> MetadataReplica::full_history_record(
 }
 
 std::vector<Hash256> MetadataReplica::unreconstructable_heads() const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     std::vector<Hash256> out;
     for (const auto& [hash, _] : unreconstructable_head_retry_at_)
         if (accepted_heads_.contains(hash))
@@ -3783,10 +3783,10 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
         return false;
 
     auto entry = entry_value;
-    std::lock_guard durable(durable_mutation_m_);
+    Lock durable(durable_mutation_m_);
     uint64_t file_offset;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (auto existing = history_.find(entry.hash); existing != history_.end()) {
             if (existing->second.generation != entry.generation ||
                 existing->second.previous != entry.previous)
@@ -3804,7 +3804,7 @@ bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) 
     auto frame = encode_history_frame(entry);
     write_history_frame(frame);
 
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     const bool superseded = history_.contains(entry.hash);
     history_[entry.hash] = index_history_entry(entry, file_offset, frame.size());
     ++history_records_;
@@ -3885,9 +3885,9 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     }
     auto frame = encode_history_frame(entry);
 
-    std::lock_guard durable(durable_mutation_m_);
+    Lock durable(durable_mutation_m_);
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (history_.contains(entry.hash))
             return true;
         if (entry.body == MetadataHistoryEntry::Body::delta &&
@@ -3896,11 +3896,11 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
     }
     uint64_t file_offset;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         file_offset = history_bytes_;
     }
     write_history_frame(frame);
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     history_.emplace(entry.hash,
                      index_history_entry(entry, file_offset, frame.size()));
     ++history_records_;
@@ -3915,7 +3915,7 @@ bool MetadataReplica::import_history(const MetadataHistoryEntry& entry_value) {
 }
 
 bool MetadataReplica::history_contains(const Hash256& hash) const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     return history_.contains(hash);
 }
 
@@ -3987,9 +3987,9 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     }
     auto frame = encode_history_frame(entry_value);
 
-    std::lock_guard durable(durable_mutation_m_);
+    Lock durable(durable_mutation_m_);
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (history_.contains(record.hash))
             return true;
         if (entry_value.body == MetadataHistoryEntry::Body::delta &&
@@ -3998,11 +3998,11 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
     }
     uint64_t file_offset;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         file_offset = history_bytes_;
     }
     write_history_frame(frame);
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     history_.emplace(entry_value.hash,
                      index_history_entry(entry_value, file_offset, frame.size()));
     ++history_records_;
@@ -4038,92 +4038,90 @@ bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads
     for (const auto& parent : metadata_record_parents(prepared->record))
         (void)materialized(parent);
 
-    std::lock_guard durable(durable_mutation_m_);
-    std::unique_lock lock(m_);
-    auto materialized = materialized_locked(value.hash);
-    if (!materialized || materialized->record.generation != value.generation)
-        return false;
-    if (!acceptance_matches_record_policy_locked(value, *materialized))
-        return false;
-
+    Lock durable(durable_mutation_m_);
     // A head change rewrites the checkpoint (possibly hundreds of MB): write it
     // after releasing `m_`, under `durable_mutation_m_` only, so readers on the
     // RPC path do not stall behind the fsync.
     std::optional<MetadataRecord> pending_checkpoint;
+    {
+        Lock lock(m_);
+        auto materialized = materialized_locked(value.hash);
+        if (!materialized || materialized->record.generation != value.generation)
+            return false;
+        if (!acceptance_matches_record_policy_locked(value, *materialized))
+            return false;
 
-    bool changed = false;
-    // An accepted ancestor is not a head: remove it if already present.
-    bool incoming_is_ancestor = false;
-    for (const auto& [head, _] : accepted_heads_) {
-        if (head != value.hash && accepted_head_is_ancestor_locked(value.hash, head)) {
-            incoming_is_ancestor = true;
-            break;
-        }
-    }
-    if (incoming_is_ancestor) {
-        if (accepted_heads_.erase(value.hash)) {
-            if (heads_changed)
-                *heads_changed = true;
-            persist_heads_locked();
-            if (refresh_materialized_head_in_memory_locked()) {
-                reset_checkpoint_journal_locked();
-                pending_checkpoint = committed_;
+        bool changed = false;
+        // An accepted ancestor is not a head: remove it if already present.
+        bool incoming_is_ancestor = false;
+        for (const auto& [head, _] : accepted_heads_) {
+            if (head != value.hash && accepted_head_is_ancestor_locked(value.hash, head)) {
+                incoming_is_ancestor = true;
+                break;
             }
         }
-        lock.unlock();
-        if (pending_checkpoint) persist(checkpoint_p_, *pending_checkpoint);
-        return true;
-    }
-
-    for (auto it = accepted_heads_.begin(); it != accepted_heads_.end();) {
-        if (it->first != value.hash &&
-            accepted_head_is_ancestor_locked(it->first, value.hash)) {
-            it = accepted_heads_.erase(it);
-            changed = true;
+        if (incoming_is_ancestor) {
+            if (accepted_heads_.erase(value.hash)) {
+                if (heads_changed)
+                    *heads_changed = true;
+                persist_heads_locked();
+                if (refresh_materialized_head_in_memory_locked()) {
+                    reset_checkpoint_journal_locked();
+                    pending_checkpoint = committed_;
+                }
+            }
         } else {
-            ++it;
-        }
-    }
+            for (auto it = accepted_heads_.begin(); it != accepted_heads_.end();) {
+                if (it->first != value.hash &&
+                    accepted_head_is_ancestor_locked(it->first, value.hash)) {
+                    it = accepted_heads_.erase(it);
+                    changed = true;
+                } else {
+                    ++it;
+                }
+            }
 
-    auto found = accepted_heads_.find(value.hash);
-    if (found == accepted_heads_.end()) {
-        accepted_heads_.emplace(value.hash, value);
-        changed = true;
-    } else {
-        auto merged = found->second;
-        if (!merged.required && value.required) {
-            merged = value;
-        } else if (merged.required && value.required) {
-            merged.required = std::min(merged.required, value.required);
-            merged.replicas.insert(merged.replicas.end(), value.replicas.begin(),
-                                   value.replicas.end());
-            std::sort(merged.replicas.begin(), merged.replicas.end());
-            merged.replicas.erase(std::unique(merged.replicas.begin(), merged.replicas.end()),
-                                  merged.replicas.end());
-        }
-        if (merged != found->second) {
-            found->second = std::move(merged);
-            changed = true;
-        }
-    }
+            auto found = accepted_heads_.find(value.hash);
+            if (found == accepted_heads_.end()) {
+                accepted_heads_.emplace(value.hash, value);
+                changed = true;
+            } else {
+                auto merged = found->second;
+                if (!merged.required && value.required) {
+                    merged = value;
+                } else if (merged.required && value.required) {
+                    merged.required = std::min(merged.required, value.required);
+                    merged.replicas.insert(merged.replicas.end(), value.replicas.begin(),
+                                           value.replicas.end());
+                    std::sort(merged.replicas.begin(), merged.replicas.end());
+                    merged.replicas.erase(
+                        std::unique(merged.replicas.begin(), merged.replicas.end()),
+                        merged.replicas.end());
+                }
+                if (merged != found->second) {
+                    found->second = std::move(merged);
+                    changed = true;
+                }
+            }
 
-    changed = prune_accepted_heads_locked() || changed;
-    if (heads_changed)
-        *heads_changed = changed;
-    if (changed) {
-        persist_heads_locked();
-        if (refresh_materialized_head_in_memory_locked()) {
-            reset_checkpoint_journal_locked();
-            pending_checkpoint = committed_;
+            changed = prune_accepted_heads_locked() || changed;
+            if (heads_changed)
+                *heads_changed = changed;
+            if (changed) {
+                persist_heads_locked();
+                if (refresh_materialized_head_in_memory_locked()) {
+                    reset_checkpoint_journal_locked();
+                    pending_checkpoint = committed_;
+                }
+            }
         }
     }
-    lock.unlock();
     if (pending_checkpoint) persist(checkpoint_p_, *pending_checkpoint);
     return true;
 }
 
 std::vector<MetadataAcceptance> MetadataReplica::accepted_head_certificates() const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     std::vector<MetadataAcceptance> out;
     out.reserve(accepted_heads_.size());
     for (const auto& [_, value] : accepted_heads_)
@@ -4134,7 +4132,7 @@ std::vector<MetadataAcceptance> MetadataReplica::accepted_head_certificates() co
 std::vector<MetadataRecord> MetadataReplica::accepted_heads() const {
     std::vector<Hash256> hashes;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         hashes.reserve(accepted_heads_.size());
         for (const auto& [hash, _] : accepted_heads_)
             hashes.push_back(hash);
@@ -4147,13 +4145,13 @@ std::vector<MetadataRecord> MetadataReplica::accepted_heads() const {
     out.reserve(hashes.size());
     for (const auto& hash : hashes) {
         {
-            std::lock_guard lock(m_);
+            Lock lock(m_);
             auto found = unreconstructable_head_retry_at_.find(hash);
             if (found != unreconstructable_head_retry_at_.end() && now < found->second)
                 continue;
         }
         auto value = materialized(hash);
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         if (!value) {
             (void)flag_unreconstructable_locked(hash, now, "accepted head enumeration");
             continue;
@@ -4165,7 +4163,7 @@ std::vector<MetadataRecord> MetadataReplica::accepted_heads() const {
 }
 
 std::optional<MetadataAcceptance> MetadataReplica::acceptance(const Hash256& hash) const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     auto found = accepted_heads_.find(hash);
     if (found == accepted_heads_.end())
         return {};
@@ -4174,13 +4172,13 @@ std::optional<MetadataAcceptance> MetadataReplica::acceptance(const Hash256& has
 
 bool MetadataReplica::history_is_ancestor(const Hash256& ancestor,
                                           const Hash256& descendant) const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     return history_is_ancestor_locked(ancestor, descendant);
 }
 
 std::optional<Hash256> MetadataReplica::history_common_ancestor(const Hash256& left,
                                                                 const Hash256& right) const {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     return history_common_ancestor_locked(left, right);
 }
 
@@ -4196,20 +4194,20 @@ MetadataReplica::materialized(const Hash256& hash) const {
     {
         std::function<bool(const Hash256&)> forced;
         {
-            std::lock_guard lock(m_);
+            Lock lock(m_);
             forced = force_unreconstructable_for_tests_;
         }
         if (forced && forced(hash))
             return {};
     }
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard computation(materialization_compute_m_);
+    Lock computation(materialization_compute_m_);
 
     std::vector<HistoryIndexEntry> delta_indexes;
     HistoryIndexEntry anchor_index;
     std::shared_ptr<const MetadataMaterialization> base;
     {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         auto found = history_.find(hash);
         if (found == history_.end())
             return {};
@@ -4289,7 +4287,7 @@ MetadataReplica::materialized(const Hash256& hash) const {
         std::move(working_record),
         std::make_shared<const MetadataSnapshot>(std::move(working_snapshot)));
 
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     // Cache only the requested result, and only if compaction has not removed it.
     if (history_.contains(value->record.hash))
         value = cache_materialization_locked(value->record, value->snapshot,
@@ -4337,8 +4335,8 @@ bool MetadataReplica::cas(uint64_t generation, const Hash256& hash,
     (void)decode_snapshot(next.payload);
     next.hash = metadata_hash(next.generation, next.previous, next.payload);
 
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if (!legacy_write_api_allowed_locked())
         return false;
     if (cur_.generation != generation || cur_.hash != hash) {
@@ -4390,8 +4388,8 @@ bool MetadataReplica::cas(uint64_t generation, const Hash256& hash,
 
 bool MetadataReplica::cas_delta(uint64_t generation, const Hash256& hash,
                                 std::span<const uint8_t> encoded_delta, MetadataRecord* out) {
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if (!legacy_write_api_allowed_locked())
         return false;
 
@@ -4458,8 +4456,8 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
                                               const MetadataRecord& committed) {
     if (!valid_metadata_record(committed))
         return false;
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if (!legacy_write_api_allowed_locked())
         return false;
 
@@ -4509,8 +4507,8 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
                                             const std::string& reason) {
     if (!valid_metadata_record(record))
         return false;
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
 
     const auto stamp = ".pre-migration." + std::to_string(wall_time_ns());
     std::vector<std::filesystem::path> quarantined;
@@ -4582,8 +4580,8 @@ bool MetadataReplica::seed(const MetadataRecord& record) {
     if (!valid_metadata_record(record))
         return false;
     const auto parents = metadata_record_parents(record);
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if (!legacy_write_api_allowed_locked())
         return false;
     if (record.hash == cur_.hash)
@@ -4604,7 +4602,7 @@ bool MetadataReplica::seed(const MetadataRecord& record) {
     const bool known_descendant =
         history_.contains(record.hash) && history_is_ancestor_locked(committed_.hash, record.hash);
     const bool parent_descends_from_committed =
-        std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) {
+        std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) MACHA_REQUIRES(m_) {
             return history_.contains(parent) && history_is_ancestor_locked(committed_.hash, parent);
         });
     if (!fresh && !direct_parent && !known_descendant && !parent_descends_from_committed)
@@ -4623,8 +4621,8 @@ bool MetadataReplica::remember_committed(const MetadataRecord& record) {
     if (!valid_metadata_record(record))
         return false;
     const auto parents = metadata_record_parents(record);
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if (!legacy_write_api_allowed_locked())
         return false;
     if (record.hash == committed_.hash)
@@ -4638,8 +4636,8 @@ bool MetadataReplica::remember_committed(const MetadataRecord& record) {
             std::find(parents.begin(), parents.end(), committed_.hash) != parents.end();
         const bool known_descendant = history_.contains(record.hash) &&
                                       history_is_ancestor_locked(committed_.hash, record.hash);
-        const bool parent_descends_from_committed =
-            std::any_of(parents.begin(), parents.end(), [&](const Hash256& parent) {
+        const bool parent_descends_from_committed = std::any_of(
+            parents.begin(), parents.end(), [&](const Hash256& parent) MACHA_REQUIRES(m_) {
                 return history_.contains(parent) &&
                        history_is_ancestor_locked(committed_.hash, parent);
             });
@@ -4665,8 +4663,8 @@ bool MetadataReplica::remember_committed(const MetadataRecord& record) {
 }
 
 bool MetadataReplica::remember_current_committed(uint64_t generation, const Hash256& hash) {
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if (!legacy_write_api_allowed_locked())
         return false;
     if (cur_.generation != generation || cur_.hash != hash)
@@ -4692,14 +4690,14 @@ bool MetadataReplica::remember_current_committed(uint64_t generation, const Hash
 }
 
 void MetadataReplica::compact() {
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     compact_if_needed();
 }
 
 bool MetadataReplica::compact_history_if_safe(size_t record_threshold, uint64_t byte_threshold) {
-    std::lock_guard durable(durable_mutation_m_);
-    std::lock_guard lock(m_);
+    Lock durable(durable_mutation_m_);
+    Lock lock(m_);
     if ((history_records_ < record_threshold && history_bytes_ < byte_threshold) ||
         cur_.generation != committed_.generation || cur_.hash != committed_.hash ||
         pending_history_ || accepted_heads_.size() != 1 ||

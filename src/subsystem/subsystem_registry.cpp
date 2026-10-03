@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "subsystem/subsystem_registry.hpp"
 
-// std::unique_lock over the header's shared_mutex. libc++ happens to reach it
-// through <shared_mutex>; libstdc++ (the cluster's compiler) does not.
-#include <mutex>
-
 namespace macha {
 
 void SubsystemRegistry::publish_torrent(std::shared_ptr<TorrentService> service) {

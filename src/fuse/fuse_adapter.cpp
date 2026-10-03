@@ -527,16 +527,17 @@ class CoveredMountpointGuard {
 // Mount, serve, unmount. No policy: retry and fault handling belong to
 // FuseSubsystem and the supervisor.
 class LibfuseMountDriver final : public FuseMountDriver {
-    std::mutex mutex_;
-    struct fuse* instance_{};
-    struct fuse_session* session_{};
-    bool exit_requested_{};
-    bool unmounted_{};
+    // Held across fuse_unmount (the unmount system call).
+    IoMutex mutex_;
+    struct fuse* instance_ MACHA_GUARDED_BY(mutex_){};
+    struct fuse_session* session_ MACHA_GUARDED_BY(mutex_){};
+    bool exit_requested_ MACHA_GUARDED_BY(mutex_){};
+    bool unmounted_ MACHA_GUARDED_BY(mutex_){};
 
     // fuse_session_exit() only sets a flag an idle worker sees on its next
     // request; unmounting fails the blocked /dev/fuse reads and returns the
     // loop. Signals belong to core's sigwait loop, not libfuse.
-    void wake_locked() {
+    void wake_locked() MACHA_REQUIRES(mutex_) {
         if (session_)
             fuse_session_exit(session_);
         if (instance_ && !unmounted_) {
@@ -547,7 +548,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
 
   public:
     void request_exit() override {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         exit_requested_ = true;
         wake_locked();
     }
@@ -594,7 +595,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
 
         auto* session = fuse_get_session(instance);
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             instance_ = instance;
             session_ = session;
             unmounted_ = false;
@@ -677,7 +678,7 @@ class LibfuseMountDriver final : public FuseMountDriver {
 
         bool requested = false;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             requested = exit_requested_;
             session_ = nullptr;
             if (!unmounted_) {

@@ -164,7 +164,7 @@ uint64_t PlaybackTracker::open(std::string path, const FsEntry& entry) {
     std::function<void()> callback;
     uint64_t session{};
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         session = next_session_++;
         sessions_.emplace(session, PlaybackObservation{session, std::move(path), entry, {}, Clock::now()});
         callback = change_callback_;
@@ -176,7 +176,7 @@ uint64_t PlaybackTracker::open(std::string path, const FsEntry& entry) {
 void PlaybackTracker::progress(uint64_t session, size_t extent_index) {
     std::function<void()> callback;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = sessions_.find(session);
         if (it == sessions_.end())
             return;
@@ -190,7 +190,7 @@ void PlaybackTracker::progress(uint64_t session, size_t extent_index) {
 void PlaybackTracker::close(uint64_t session) {
     std::function<void()> callback;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!sessions_.erase(session)) return;
         callback = change_callback_;
     }
@@ -198,13 +198,13 @@ void PlaybackTracker::close(uint64_t session) {
 }
 
 void PlaybackTracker::set_change_callback(std::function<void()> callback) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     change_callback_ = std::move(callback);
 }
 
 std::vector<PlaybackObservation> PlaybackTracker::active(std::chrono::milliseconds timeout) const {
     const auto now = Clock::now();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<PlaybackObservation> out;
     for (const auto& [_, observation] : sessions_) {
         if (observation.current_extent && now - observation.last_activity <= timeout)
@@ -452,7 +452,7 @@ CacheHydrator::~CacheHydrator() {
     stop();
     std::vector<std::shared_ptr<HydrationHintProvider>> providers;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         providers.swap(providers_);
     }
     for (const auto& provider : providers) provider->set_wake_callback({});
@@ -462,7 +462,7 @@ void CacheHydrator::add_provider(std::shared_ptr<HydrationHintProvider> provider
     if (!provider) return;
     provider->set_wake_callback([this] { wake(); });
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (std::none_of(providers_.begin(), providers_.end(), [&](const auto& existing) {
                 return existing.get() == provider.get();
             }))
@@ -474,7 +474,7 @@ void CacheHydrator::add_provider(std::shared_ptr<HydrationHintProvider> provider
 void CacheHydrator::remove_provider(const HydrationHintProvider* provider) {
     std::shared_ptr<HydrationHintProvider> removed;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto found = std::find_if(providers_.begin(), providers_.end(),
                                   [&](const auto& existing) { return existing.get() == provider; });
         if (found != providers_.end()) {
@@ -489,13 +489,13 @@ void CacheHydrator::remove_provider(const HydrationHintProvider* provider) {
 void CacheHydrator::start() {
     size_t workers = 0;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (worker_.joinable())
             return;
         workers = config_.max_inflight;
     }
     {
-        std::lock_guard lock(fetch_mutex_);
+        Lock lock(fetch_mutex_);
         fetch_stopping_ = false;
         fetch_queue_.clear();
         fetch_queued_.store(0, std::memory_order_relaxed);
@@ -506,7 +506,7 @@ void CacheHydrator::start() {
             fetch_workers_.emplace_back([this](std::stop_token stop) {
                 run_supervised_loop("hydration-fetch", stop, [this, stop] { fetch_loop(stop); });
             });
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         worker_ = std::jthread([this](std::stop_token stop) {
             run_supervised_loop("hydration", stop, [this, stop] { loop(stop); });
         });
@@ -521,24 +521,29 @@ void CacheHydrator::start() {
 
 void CacheHydrator::stop() {
     request_stop();
-    if (worker_.joinable())
-        worker_.join();
+    std::jthread worker;
+    {
+        Lock lock(mutex_);
+        worker = std::move(worker_);
+    }
+    if (worker.joinable())
+        worker.join();
     for (auto& fetch : fetch_workers_)
         if (fetch.joinable()) fetch.join();
     fetch_workers_.clear();
-    std::lock_guard lock(fetch_mutex_);
+    Lock lock(fetch_mutex_);
     fetch_queue_.clear();
     fetch_queued_.store(0, std::memory_order_relaxed);
 }
 
 void CacheHydrator::request_stop() {
-    if (worker_.joinable()) {
-        worker_.request_stop();
-        cv_.notify_all();
+    {
+        Lock lock(mutex_);
+        if (worker_.joinable()) worker_.request_stop();
     }
     std::deque<std::shared_ptr<FetchTask>> cancelled;
     {
-        std::lock_guard lock(fetch_mutex_);
+        Lock lock(fetch_mutex_);
         fetch_stopping_ = true;
         cancelled.swap(fetch_queue_);
         fetch_queued_.store(0, std::memory_order_relaxed);
@@ -559,13 +564,13 @@ void CacheHydrator::request_stop() {
 void CacheHydrator::reconfigure(HydrationConfig config) {
     bool restart = false;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         restart = worker_.joinable() && config.max_inflight != config_.max_inflight;
     }
     if (restart)
         stop();
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         config_ = std::move(config);
         status_.enabled = config_.enabled;
     }
@@ -578,8 +583,10 @@ void CacheHydrator::fetch_loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         std::shared_ptr<FetchTask> task;
         {
-            std::unique_lock lock(fetch_mutex_);
-            fetch_cv_.wait(lock, stop, [&] { return fetch_stopping_ || !fetch_queue_.empty(); });
+            Lock lock(fetch_mutex_);
+            fetch_cv_.wait(lock.native(), stop, [&]() MACHA_REQUIRES(fetch_mutex_) {
+                return fetch_stopping_ || !fetch_queue_.empty();
+            });
             if (stop.stop_requested() || fetch_stopping_)
                 break;
             task = std::move(fetch_queue_.front());
@@ -606,7 +613,7 @@ std::optional<std::future<bool>> CacheHydrator::submit(HydrationRequest request)
     task->request = std::move(request);
     auto future = task->result.get_future();
     {
-        std::lock_guard lock(fetch_mutex_);
+        Lock lock(fetch_mutex_);
         if (fetch_stopping_) {
             fetch_rejected_.fetch_add(1, std::memory_order_relaxed);
             return {};
@@ -630,7 +637,7 @@ std::optional<std::future<bool>> CacheHydrator::submit(HydrationRequest request)
 std::vector<HydrationHint> CacheHydrator::collect_hints() {
     std::vector<std::shared_ptr<HydrationHintProvider>> providers;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         providers = providers_;
     }
     std::vector<HydrationHint> out;
@@ -649,7 +656,7 @@ std::vector<HydrationHint> CacheHydrator::collect_hints() {
 
 bool CacheHydrator::run_once() {
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!config_.enabled)
             return false;
         const auto now = Clock::now();
@@ -664,7 +671,7 @@ bool CacheHydrator::run_once() {
         hints,
         [&](const ObjectId& id) { return store_.locally_available(id); },
         [&](const ObjectId& id) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             auto it = failed_until_.find(id);
             return it != failed_until_.end() && it->second > now;
         });
@@ -672,21 +679,21 @@ bool CacheHydrator::run_once() {
         return false;
 
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         ++status_.requests;
         status_.last_object = request->object;
         status_.last_reason = request->reason;
     }
 
     if (store_.hydrate(request->object, request->sequence_index, request->frame_type)) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         ++status_.fetched;
         failed_until_.erase(request->object);
         return true;
     }
 
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         ++status_.unavailable;
         failed_until_[request->object] = Clock::now() + std::chrono::seconds(2);
     }
@@ -694,7 +701,7 @@ bool CacheHydrator::run_once() {
 }
 
 HydrationStatus CacheHydrator::status() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto result = status_;
     result.executor_workers = worker_.joinable() ? config_.max_inflight : 0;
     result.executor_queued = fetch_queued_.load(std::memory_order_relaxed);
@@ -730,7 +737,7 @@ void CacheHydrator::loop(std::stop_token stop) {
             Log::debug("hydration fetch " + to_string(item.request.object) + ": unknown error");
         }
 
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (status_.in_flight)
             --status_.in_flight;
         if (fetched) {
@@ -754,7 +761,7 @@ void CacheHydrator::loop(std::stop_token stop) {
 
         HydrationConfig config;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             config = config_;
             const auto now = Clock::now();
             std::erase_if(failed_until_, [&](const auto& item) { return item.second <= now; });
@@ -774,7 +781,7 @@ void CacheHydrator::loop(std::stop_token stop) {
                         });
                     },
                     [&](const ObjectId& id) {
-                        std::lock_guard lock(mutex_);
+                        Lock lock(mutex_);
                         auto it = failed_until_.find(id);
                         return it != failed_until_.end() && it->second > now;
                     });
@@ -782,7 +789,7 @@ void CacheHydrator::loop(std::stop_token stop) {
                     break;
 
                 {
-                    std::lock_guard lock(mutex_);
+                    Lock lock(mutex_);
                     ++status_.requests;
                     ++status_.in_flight;
                     status_.peak_in_flight = std::max(status_.peak_in_flight, status_.in_flight);
@@ -792,7 +799,7 @@ void CacheHydrator::loop(std::stop_token stop) {
 
                 auto future = submit(*request);
                 if (!future) {
-                    std::lock_guard lock(mutex_);
+                    Lock lock(mutex_);
                     if (status_.in_flight)
                         --status_.in_flight;
                     break;
@@ -802,7 +809,7 @@ void CacheHydrator::loop(std::stop_token stop) {
         }
 
         cpu_reporter.tick();
-        std::unique_lock lock(mutex_);
+        Lock lock(mutex_);
         const auto wake_changed = [&] {
             return wake_revision_.load(std::memory_order_acquire) != observed_wake_revision;
         };
@@ -817,7 +824,7 @@ void CacheHydrator::loop(std::stop_token stop) {
         if (!pending.empty()) {
             // std::future has no completion notification: poll while I/O is
             // outstanding; provider wakes still interrupt the wait.
-            cv_.wait_for(lock, stop, config_.interval, wake_changed);
+            cv_.wait_for(lock.native(), stop, config_.interval, wake_changed);
             observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
             continue;
         }
@@ -826,9 +833,9 @@ void CacheHydrator::loop(std::stop_token stop) {
         for (const auto& [_, deadline] : failed_until_)
             if (!retry_at || deadline < *retry_at) retry_at = deadline;
         if (retry_at)
-            cv_.wait_until(lock, stop, *retry_at, wake_changed);
+            cv_.wait_until(lock.native(), stop, *retry_at, wake_changed);
         else
-            cv_.wait(lock, stop, wake_changed);
+            cv_.wait(lock.native(), stop, wake_changed);
         observed_wake_revision = wake_revision_.load(std::memory_order_acquire);
     }
 

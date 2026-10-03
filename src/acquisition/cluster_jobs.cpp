@@ -81,21 +81,21 @@ void ClusterJobView::stop() {
 void ClusterJobView::loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         refresh_now();
-        std::mutex wait_mutex;
-        std::unique_lock lock(wait_mutex);
-        wake_.wait_for(lock, stop, refresh_interval_, [] { return false; });
+        Mutex wait_mutex; // guards nothing: the wait's own lock
+        Lock lock(wait_mutex);
+        wake_.wait_for(lock.native(), stop, refresh_interval_, [] { return false; });
     }
 }
 
 void ClusterJobView::refresh_now() {
-    std::lock_guard polling(poll_mutex_);
+    Lock polling(poll_mutex_);
     const auto self = node_.node_id();
     std::vector<NodeInfo> peers;
     for (const auto& peer : node_.membership().active())
         if (peer.id != self) peers.push_back(peer);
     {
         // A node that left membership keeps its last jobs, marked unreachable.
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (auto& [id, peer] : peers_)
             if (std::none_of(peers.begin(), peers.end(), [&](const NodeInfo& p) { return p.id == id; }))
                 peer.reachable = false;
@@ -145,7 +145,7 @@ void ClusterJobView::poll(const NodeInfo& info) {
         Log::debug("cluster job view: ingest query to " + info.host + ": " + error.what());
     }
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& peer = peers_[info.id];
     peer.host = info.host;
     if (!reached) {
@@ -184,7 +184,7 @@ ClusterJobView::TorrentListing ClusterJobView::torrent_jobs() const {
         for (auto& job : local->jobs()) out.jobs.push_back({self, std::move(job)});
         out.sources.push_back({self, true, true, unix_ms()});
     }
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [id, peer] : peers_) {
         if (!peer.torrent_known || !peer.torrent_capable) continue;
         for (const auto& job : peer.torrents) out.jobs.push_back({id, job});
@@ -196,7 +196,7 @@ ClusterJobView::TorrentListing ClusterJobView::torrent_jobs() const {
 std::optional<ClusterTorrentJob> ClusterJobView::torrent_job(std::string_view id) const {
     if (auto local = registry_.torrent())
         if (auto job = local->job(id)) return ClusterTorrentJob{node_.node_id(), std::move(*job)};
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [node, peer] : peers_)
         for (const auto& job : peer.torrents)
             if (job.id == id) return ClusterTorrentJob{node, job};
@@ -241,7 +241,7 @@ TorrentActionResult ClusterJobView::torrent_action(std::string_view id, std::str
         if (const auto* job = parsed.find("job"); job && !job->isNull()) updated = parse_torrent_job_wire(*job);
         if (updated) result.updated = ClusterTorrentJob{owner->node_id, *updated};
         // The owner's answer is the newest thing known about this job.
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto& jobs = peers_[owner->node_id].torrents;
         auto it = std::find_if(jobs.begin(), jobs.end(), [&](const TorrentJob& j) { return j.id == id; });
         if (it != jobs.end()) {
@@ -268,7 +268,7 @@ std::vector<ClusterJobView::TorrentNode> ClusterJobView::torrent_nodes() const {
         entry.staging = ingest_.staging().status();
         out.push_back(std::move(entry));
     }
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [id, peer] : peers_) {
         if (!peer.torrent_known || !peer.torrent_capable) continue;
         TorrentNode entry;
@@ -297,7 +297,7 @@ ClusterJobView::IngestListing ClusterJobView::ingest_jobs() const {
         out.jobs.push_back({self, std::move(job), std::move(summary)});
     }
     out.sources.push_back({self, true, true, unix_ms()});
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [id, peer] : peers_) {
         if (!peer.ingest_known) {
             if (!peer.reachable) out.sources.push_back({id, false, false, 0});
@@ -311,7 +311,7 @@ ClusterJobView::IngestListing ClusterJobView::ingest_jobs() const {
 
 std::optional<ClusterIngestJob> ClusterJobView::ingest_job(std::string_view id) const {
     if (auto job = ingest_.job(id)) return ClusterIngestJob{node_.node_id(), std::move(*job), ingest_.catalogue_summary(id)};
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [node, peer] : peers_)
         for (const auto& job : peer.ingests)
             if (job.id == id) return ClusterIngestJob{node, job, {}};
@@ -355,7 +355,7 @@ IngestActionResult ClusterJobView::ingest_action(std::string_view id, std::strin
         std::optional<IngestJob> updated;
         if (const auto* job = parsed.find("job"); job && !job->isNull()) updated = parse_ingest_job_wire(*job);
         if (updated) result.updated = ClusterIngestJob{owner->node_id, *updated, {}};
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto& jobs = peers_[owner->node_id].ingests;
         auto it = std::find_if(jobs.begin(), jobs.end(), [&](const IngestJob& j) { return j.id == id; });
         if (it != jobs.end()) {

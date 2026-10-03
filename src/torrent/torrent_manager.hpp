@@ -14,7 +14,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -34,11 +33,18 @@ class TorrentManager final : public TorrentService {
     LocalState& local_;
     DataResourceArbiter& data_resources_;
     IngestManager& ingest_;
-    TorrentConfig config_;
+    // Held across jobs.json's durable write, libtorrent session and handle
+    // calls, the ingest's calls and log lines.
+    mutable IoMutex mutex_;
+    // reconfigure() changes the live limits under mutex_.
+    TorrentConfig config_ MACHA_GUARDED_BY(mutex_);
+    const bool enabled_; // torrent.enabled, fixed until restart
     std::filesystem::path state_file_;
-    mutable std::mutex mutex_;
     std::condition_variable_any cv_;
-    std::map<std::string, TorrentJob, std::less<>> jobs_;
+    std::map<std::string, TorrentJob, std::less<>> jobs_ MACHA_GUARDED_BY(mutex_);
+    // Set at construction. impl_->handles is guarded by mutex_ (not
+    // expressible to the analysis); the session is libtorrent's and
+    // thread-safe.
     std::unique_ptr<Impl> impl_;
     // Routes verified pieces from the alert drain to the disk backend.
     std::shared_ptr<TorrentPieceVerifications> verifications_ =
@@ -47,7 +53,8 @@ class TorrentManager final : public TorrentService {
     // torrent.log_level, readable from the alert drain without the mutex.
     std::atomic<LogLevel> alert_log_level_{LogLevel::info};
     // Non-loopback listen endpoints libtorrent reported succeeding; with none
-    // the session reaches no peer and must say so.
+    // the session reaches no peer and must say so. This and the three flags
+    // below are the worker thread's (drain_alerts).
     size_t routable_listen_endpoints_{};
     bool warned_loopback_only_{};
     // "No inbound port" is logged above debug once per session, not repeatedly.
@@ -55,19 +62,19 @@ class TorrentManager final : public TorrentService {
     bool warned_portmap_failed_{};
     std::jthread worker_;
     // SubsystemSupervisor's fault sink: a fault the worker cannot contain to
-    // one job rebuilds the manager from durable state. Guarded by mutex_.
-    std::function<void(std::string)> fault_sink_;
+    // one job rebuilds the manager from durable state.
+    std::function<void(std::string)> fault_sink_ MACHA_GUARDED_BY(mutex_);
 
     // Each job's libtorrent resume data, so a restart does not re-hash every
     // staged byte.
     std::filesystem::path resume_dir_;
     std::filesystem::path resume_path(std::string_view id) const;
     static constexpr auto resume_save_interval = std::chrono::minutes(5);
-    Clock::time_point last_resume_save_{};
+    Clock::time_point last_resume_save_{}; // worker thread only
     // jobs.json is saved when a job's record changes; transfer counters alone
     // are saved at most this often.
     static constexpr auto progress_save_interval = std::chrono::seconds(30);
-    Clock::time_point last_progress_save_{};
+    Clock::time_point last_progress_save_{}; // worker thread only
     // Asks libtorrent for a job's resume data; it arrives as an alert.
     static void request_resume_save(const libtorrent::torrent_handle&);
     // At stop: request resume data for every torrent and wait, bounded, for it.
@@ -79,10 +86,10 @@ class TorrentManager final : public TorrentService {
         Clock::time_point at{};
         double rate{};
     };
-    std::map<std::string, CheckSample, std::less<>> check_samples_;
+    std::map<std::string, CheckSample, std::less<>> check_samples_ MACHA_GUARDED_BY(mutex_);
 
     void load_state();
-    void save_state_locked() const;
+    void save_state_locked() const MACHA_REQUIRES(mutex_);
     void restore_jobs();
     void loop(std::stop_token);
     // The disk backend's admission and measurement: loader-class DATA credit,
@@ -92,10 +99,11 @@ class TorrentManager final : public TorrentService {
     // sees whether the session bound a usable interface.
     void drain_alerts();
     // Reports every piece in the torrent's bitfield to the disk backend;
-    // repeats are harmless. Caller holds mutex_.
-    void report_held_pieces_locked(const TorrentJob&, const libtorrent::torrent_handle&);
+    // repeats are harmless.
+    void report_held_pieces_locked(const TorrentJob&, const libtorrent::torrent_handle&)
+        MACHA_REQUIRES(mutex_);
     static constexpr auto held_pieces_report_interval = std::chrono::seconds(10);
-    Clock::time_point last_held_pieces_report_{};
+    Clock::time_point last_held_pieces_report_{}; // worker thread only
     // A downloaded torrent goes to the ingest once every extent is published,
     // so the ingest adopts rather than copies. Per job: progress last seen and
     // when it last advanced.
@@ -103,28 +111,30 @@ class TorrentManager final : public TorrentService {
         size_t published{};
         Clock::time_point advanced{};
     };
-    std::map<std::string, PublicationWait, std::less<>> publication_waits_;
+    std::map<std::string, PublicationWait, std::less<>> publication_waits_ MACHA_GUARDED_BY(mutex_);
     // Per job, the published count last seen and when it last moved, for
     // `publication`.
-    std::map<std::string, PublicationWait, std::less<>> publication_seen_;
-    void refresh_publication_locked(const std::string& id, TorrentJob& job);
+    std::map<std::string, PublicationWait, std::less<>> publication_seen_ MACHA_GUARDED_BY(mutex_);
+    void refresh_publication_locked(const std::string& id, TorrentJob& job) MACHA_REQUIRES(mutex_);
     // Publication stalled this long is given up: the ingest copies what is missing.
     static constexpr auto publication_stall_limit = std::chrono::minutes(10);
-    bool publication_settled_locked(const std::string& id, const TorrentJob& job);
-    // The job a session handle belongs to, if any. Caller holds mutex_.
-    TorrentJob* job_of_locked(const libtorrent::torrent_handle&);
+    bool publication_settled_locked(const std::string& id, const TorrentJob& job)
+        MACHA_REQUIRES(mutex_);
+    // The job a session handle belongs to, if any.
+    TorrentJob* job_of_locked(const libtorrent::torrent_handle&) MACHA_REQUIRES(mutex_);
     // The job, in any state, holding this info hash. One job per torrent:
     // libtorrent hands a second add of a hash the first one's handle, so two
     // jobs would share, and cancel, one torrent.
-    std::optional<std::string> job_holding_locked(std::string_view info_hash) const;
+    std::optional<std::string> job_holding_locked(std::string_view info_hash) const
+        MACHA_REQUIRES(mutex_);
     // The one way a torrent leaves the session and impl_->handles, so no
-    // handle is ever left naming a removed torrent. Caller holds mutex_.
-    void retire_torrent_locked(const std::string& id, bool delete_payload);
+    // handle is ever left naming a removed torrent.
+    void retire_torrent_locked(const std::string& id, bool delete_payload) MACHA_REQUIRES(mutex_);
     // A fault on one job fails that job and retires its torrent; the worker
-    // carries on with the rest. Caller holds mutex_.
-    void isolate_fault_locked(const std::string& id, std::string_view what);
+    // carries on with the rest.
+    void isolate_fault_locked(const std::string& id, std::string_view what) MACHA_REQUIRES(mutex_);
     void update_jobs();
-    bool has_active_jobs_locked() const;
+    bool has_active_jobs_locked() const MACHA_REQUIRES(mutex_);
     // A failed job whose ingest was resumed follows it back rather than stay
     // failed with its staging held.
     bool linked_ingest_revived(const TorrentJob&) const;
@@ -150,7 +160,7 @@ class TorrentManager final : public TorrentService {
     void request_stop();
     void stop();
 
-    bool enabled() const noexcept override { return config_.enabled; }
+    bool enabled() const noexcept override { return enabled_; }
     void reconfigure(TorrentConfig) override;
 
     std::string add(std::string magnet_uri) override;

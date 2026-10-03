@@ -183,12 +183,13 @@ struct Event {
 // The only route into the reactor from another thread. A pipe, not eventfd
 // (absent on macOS); one byte signals something to drain.
 class Inbox {
-    std::mutex mutex_;
-    std::deque<Event> events_;
+    Mutex mutex_;
+    std::deque<Event> events_ MACHA_GUARDED_BY(mutex_);
+    // Set in the constructor, closed in the destructor.
     int wake_read_{-1};
     int wake_write_{-1};
     std::atomic_bool signalled_{false};
-    bool closed_{};
+    bool closed_ MACHA_GUARDED_BY(mutex_){};
 
   public:
     Inbox() {
@@ -216,7 +217,7 @@ class Inbox {
 
     void post(Event event) {
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (closed_)
                 return;
             events_.push_back(std::move(event));
@@ -235,13 +236,13 @@ class Inbox {
         // Cleared before taking events, so a post landing between rewrites the pipe.
         signalled_.store(false);
         std::deque<Event> out;
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         out.swap(events_);
         return out;
     }
 
     void close() {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         closed_ = true;
         events_.clear();
     }
@@ -257,9 +258,9 @@ struct Lane {
     const char* name;
     const char* thread_name;
     size_t max_queued{};
-    std::mutex mutex;
+    Mutex mutex;
     std::condition_variable_any cv;
-    std::deque<Job> queue;
+    std::deque<Job> queue MACHA_GUARDED_BY(mutex);
     std::vector<std::jthread> threads;
     std::atomic<uint64_t> busy{};
     std::atomic<uint64_t> peak_queued{};
@@ -288,7 +289,7 @@ struct Lane {
             if (thread.joinable())
                 thread.join();
         threads.clear();
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         queue.clear();
     }
 
@@ -296,7 +297,7 @@ struct Lane {
     // bypass the cap: admitted connections' staging windows already bound them.
     bool post(std::function<void()> run, bool bypass_cap = false) {
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             if (!bypass_cap && max_queued && queue.size() >= max_queued)
                 return false;
             queue.push_back({std::move(run), Clock::now()});
@@ -311,7 +312,7 @@ struct Lane {
     }
 
     size_t queued() {
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         return queue.size();
     }
 
@@ -320,8 +321,8 @@ struct Lane {
         while (!stop.stop_requested()) {
             Job job;
             {
-                std::unique_lock lock(mutex);
-                cv.wait(lock, stop, [this] { return !queue.empty(); });
+                Lock lock(mutex);
+                cv.wait(lock.native(), stop, [this]() MACHA_REQUIRES(mutex) { return !queue.empty(); });
                 if (stop.stop_requested())
                     break;
                 job = std::move(queue.front());
@@ -515,7 +516,7 @@ std::string http_url_decode(std::string_view value) {
 void HttpWaker::fire() {
     std::function<void()> wake;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (fired_)
             return;
         fired_ = true;
@@ -528,7 +529,7 @@ void HttpWaker::fire() {
 void HttpWaker::arm(std::function<void()> wake) {
     bool now = false;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (fired_)
             now = true;
         else
@@ -541,9 +542,9 @@ void HttpWaker::arm(std::function<void()> wake) {
 HttpResponse http_resolve(const std::function<HttpResponse(const HttpRequest&)>& handler,
                           HttpRequest request) {
     struct Flag {
-        std::mutex mutex;
+        Mutex mutex;
         std::condition_variable cv;
-        bool woken{};
+        bool woken MACHA_GUARDED_BY(mutex){};
     };
     while (true) {
         auto response = handler(request);
@@ -553,14 +554,15 @@ HttpResponse http_resolve(const std::function<HttpResponse(const HttpRequest&)>&
         auto flag = std::make_shared<Flag>();
         if (deferral.waker)
             deferral.waker->arm([flag] {
-                std::lock_guard lock(flag->mutex);
+                Lock lock(flag->mutex);
                 flag->woken = true;
                 flag->cv.notify_all();
             });
         {
-            std::unique_lock lock(flag->mutex);
+            Lock lock(flag->mutex);
             while (!flag->woken && Clock::now() < deferral.deadline)
-                flag->cv.wait_for(lock, 1s, [&] { return flag->woken; });
+                flag->cv.wait_for(lock.native(), 1s,
+                                  [&]() MACHA_REQUIRES(flag->mutex) { return flag->woken; });
         }
         request.resumed = true;
         request.resumed_state = std::move(deferral.state);
@@ -583,10 +585,10 @@ struct HttpServer::Impl {
     std::atomic_bool running{};
     std::atomic_bool stopping{};
     std::atomic<uint16_t> bound_port{};
-    std::mutex startup_mutex;
+    Mutex startup_mutex;
     std::condition_variable startup_cv;
-    bool startup_complete{};
-    std::string startup_error;
+    bool startup_complete MACHA_GUARDED_BY(startup_mutex){};
+    std::string startup_error MACHA_GUARDED_BY(startup_mutex);
 
     // Reactor-owned; touched from no other thread.
     std::map<uint64_t, std::unique_ptr<Connection>> connections;
@@ -840,7 +842,7 @@ struct HttpServer::Impl {
             listen_fd = bind_listener();
         } catch (const std::exception& e) {
             {
-                std::lock_guard lock(startup_mutex);
+                Lock lock(startup_mutex);
                 startup_error = e.what();
                 startup_complete = true;
             }
@@ -848,7 +850,7 @@ struct HttpServer::Impl {
             return;
         }
         {
-            std::lock_guard lock(startup_mutex);
+            Lock lock(startup_mutex);
             startup_complete = true;
         }
         startup_cv.notify_all();
@@ -1428,7 +1430,7 @@ void HttpServer::start() {
         return;
     impl_->stopping = false;
     {
-        std::lock_guard lock(impl_->startup_mutex);
+        Lock lock(impl_->startup_mutex);
         impl_->startup_complete = false;
         impl_->startup_error.clear();
     }
@@ -1440,8 +1442,9 @@ void HttpServer::start() {
     impl_->reactor = std::jthread([this](std::stop_token stop) {
         run_supervised_once("http-reactor", [this, stop] { impl_->reactor_loop(stop); });
     });
-    std::unique_lock lock(impl_->startup_mutex);
-    impl_->startup_cv.wait(lock, [this] { return impl_->startup_complete; });
+    Lock lock(impl_->startup_mutex);
+    impl_->startup_cv.wait(lock.native(),
+                           [this]() MACHA_REQUIRES(impl_->startup_mutex) { return impl_->startup_complete; });
     if (!impl_->startup_error.empty()) {
         const auto error = impl_->startup_error;
         lock.unlock();

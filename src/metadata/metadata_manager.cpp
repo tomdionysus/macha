@@ -220,7 +220,7 @@ MetadataRecord MetadataManager::cache_record(
     for (const auto& [_, reset] : decoded->identity_resets)
         node_.apply_identity_reset(reset);
 
-    std::lock_guard lock(cache_mutex_);
+    Lock lock(cache_mutex_);
     // Reads can complete out of order; never move the cache back to an older
     // record.
     if (cache_ && newer_than(*cache_, record))
@@ -246,7 +246,7 @@ MetadataRecord MetadataManager::cache_record(
 
 MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
     {
-        std::lock_guard lock(cache_mutex_);
+        Lock lock(cache_mutex_);
         if (cache_ && newer_than(*cache_, record))
             return *cache_;
         cache_ = record;
@@ -267,7 +267,7 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
 }
 
 std::optional<MetadataRecord> MetadataManager::cached_record() {
-    std::lock_guard lock(cache_mutex_);
+    Lock lock(cache_mutex_);
     if (!cache_ || Clock::now() >= cache_until_ ||
         cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
@@ -294,7 +294,7 @@ MetadataSnapshotView coherent(MetadataSnapshotView view) {
 } // namespace
 
 std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
-    std::lock_guard lock(cache_mutex_);
+    Lock lock(cache_mutex_);
     // The decoded snapshot is valid for its record but not proof the record is
     // current: honour cached_record()'s TTL so missed generation notices
     // eventually force replica validation.
@@ -962,7 +962,7 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
                                                  uint64_t byte_threshold) {
     // Serialise the whole round against foreground mutations: it depends on
     // accepted-head state as read_group()/repair_once() do.
-    std::unique_lock mutation_lock(mutation_mutex_);
+    Lock mutation_lock(mutation_mutex_);
 
     const auto diagnostics = local_.replica().diagnostics();
     if (diagnostics.history_records < record_threshold &&
@@ -1086,7 +1086,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         // Skip hashes recently confirmed unacceptable (see
         // unacceptable_head_retry_at_).
         {
-            std::lock_guard lock(unacceptable_head_mutex_);
+            Lock lock(unacceptable_head_mutex_);
             auto found = unacceptable_head_retry_at_.find(hash);
             if (found != unacceptable_head_retry_at_.end() && Clock::now() < found->second)
                 continue;
@@ -1119,14 +1119,14 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (!accepted) {
             constexpr auto retry_cooldown = std::chrono::seconds(30);
             {
-                std::lock_guard lock(unacceptable_head_mutex_);
+                Lock lock(unacceptable_head_mutex_);
                 unacceptable_head_retry_at_[hash] = Clock::now() + retry_cooldown;
             }
             Log::warn("ignoring metadata head without a valid acceptance certificate hash=" +
                       to_string(hash));
         } else {
             {
-                std::lock_guard lock(unacceptable_head_mutex_);
+                Lock lock(unacceptable_head_mutex_);
                 unacceptable_head_retry_at_.erase(hash);
             }
             // This certificate may expose a second head whose common ancestry crosses
@@ -1143,7 +1143,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     // Serialises only merge-and-publish, so concurrent readers seeing one
     // divergence do not each mint a reconciliation commit. Taken lazily on
     // seeing more than one head; heads are re-read once held.
-    std::optional<std::unique_lock<std::mutex>> reconciliation_lock;
+    // Guards no state, so the analysis need not see it held.
+    std::optional<Lock> reconciliation_lock;
     for (;;) {
         auto heads = local_.replica().accepted_heads();
         if (heads.empty())
@@ -1555,7 +1556,7 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
     // That is not an error: return the coherent snapshot just obtained; the
     // next operation refreshes.
     {
-        std::lock_guard lock(cache_mutex_);
+        Lock lock(cache_mutex_);
         if (decoded_cache_ &&
             (decoded_generation_ > record.generation ||
              (decoded_generation_ == record.generation && decoded_hash_ >= record.hash))) {
@@ -1574,7 +1575,7 @@ MetadataSnapshotView MetadataManager::snapshot_view() {
 std::optional<MetadataSnapshotView> MetadataManager::available_snapshot_view() const {
     // No I/O: adopts a snapshot already obtained and decoded, never turns an OS
     // lookup into metadata traffic.
-    std::lock_guard lock(cache_mutex_);
+    Lock lock(cache_mutex_);
     if (!decoded_cache_)
         return {};
     return coherent(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
@@ -1615,7 +1616,7 @@ std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() co
 MetadataRecord MetadataManager::mutate_impl(
     const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
     size_t retries, std::optional<MetadataMutationIdentity> identity) {
-    std::unique_lock lock(mutation_mutex_);
+    Lock lock(mutation_mutex_);
     const auto origin = node_.node_id();
     std::optional<uint64_t> sequence;
     if (identity && !identity->sequence)
@@ -1919,45 +1920,44 @@ bool MetadataManager::resolve_conflict(const std::string& id, std::string_view c
 void MetadataManager::repair_once() {
     // Must not race a foreground mutation through discovery, head selection
     // or reconfiguration.
-    std::unique_lock mutation_lock(mutation_mutex_);
-    const auto all_active = node_.membership().active();
-    const auto active = compatible_replicas(all_active);
-    if (active.empty())
-        throw MetadataNotReady("metadata replicas unavailable");
-
+    std::vector<NodeInfo> active;
     MetadataRecord record;
-    if (local_.replica().committed().generation <= 1) {
-        // Do not bypass virgin-cluster policy fencing: read_group() can filter
-        // incompatible peers before a protocol-20 policy exists and let a
-        // mismatched cohort form.
-        record = discover_or_form();
-    } else {
-        std::vector<NodeId> ids;
-        ids.reserve(all_active.size());
-        for (const auto& peer : all_active)
-            ids.push_back(peer.id);
-        record = maybe_reconfigure(read_group(ids, FrameType::speculative));
+    std::optional<MetadataAcceptance> acceptance;
+    {
+        Lock mutation_lock(mutation_mutex_);
+        const auto all_active = node_.membership().active();
+        active = compatible_replicas(all_active);
+        if (active.empty())
+            throw MetadataNotReady("metadata replicas unavailable");
+
+        if (local_.replica().committed().generation <= 1) {
+            // Do not bypass virgin-cluster policy fencing: read_group() can
+            // filter incompatible peers before a protocol-20 policy exists and
+            // let a mismatched cohort form.
+            record = discover_or_form();
+        } else {
+            std::vector<NodeId> ids;
+            ids.reserve(all_active.size());
+            for (const auto& peer : all_active)
+                ids.push_back(peer.id);
+            record = maybe_reconfigure(read_group(ids, FrameType::speculative));
+        }
+        acceptance = local_.replica().acceptance(record.hash);
+        if (!acceptance)
+            throw MetadataNotReady("selected metadata head has no acceptance certificate");
     }
-    auto acceptance = local_.replica().acceptance(record.hash);
-    if (!acceptance)
-        throw MetadataNotReady("selected metadata head has no acceptance certificate");
 
     // Convergence is replication, not head replacement: every active node is
     // offered the head and proof; a node on another branch keeps it as a
-    // second head for read_group() to reconcile.
+    // second head for read_group() to reconcile. Runs without the mutation
+    // lock.
     const auto selected_generation = record.generation;
     size_t converged = 0;
-    mutation_lock.unlock();
-    try {
-        for (const auto& owner : active) {
-            if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
-                ++converged;
-        }
-    } catch (...) {
-        mutation_lock.lock();
-        throw;
+    for (const auto& owner : active) {
+        if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
+            ++converged;
     }
-    mutation_lock.lock();
+    Lock mutation_lock(mutation_mutex_);
     if (converged < active.size())
         throw MetadataNotReady("metadata accepted-head replication incomplete");
     if (local_.replica().committed_generation() > selected_generation)

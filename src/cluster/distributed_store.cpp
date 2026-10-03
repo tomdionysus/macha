@@ -1223,7 +1223,7 @@ DistributedStore::~DistributedStore() {
 DistributedStore::PromptReplicationStats DistributedStore::prompt_replication_stats() const {
     PromptReplicationStats out;
     {
-        std::lock_guard lock(const_cast<std::mutex&>(prompt_mutex_));
+        Lock lock(prompt_mutex_);
         out.queued = prompt_queue_.size();
     }
     out.copies = prompt_copies_.load(std::memory_order_relaxed);
@@ -1233,7 +1233,7 @@ DistributedStore::PromptReplicationStats DistributedStore::prompt_replication_st
 
 void DistributedStore::queue_prompt_replication(const ObjectId& id) {
     {
-        std::lock_guard lock(prompt_mutex_);
+        Lock lock(prompt_mutex_);
         if (!prompt_queued_.insert(id).second)
             return;
         prompt_queue_.push_back(id);
@@ -1259,8 +1259,8 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
         std::optional<ObjectId> id;
         unsigned attempts = 0;
         {
-            std::unique_lock lock(prompt_mutex_);
-            prompt_cv_.wait(lock, stop, [&] {
+            Lock lock(prompt_mutex_);
+            prompt_cv_.wait(lock.native(), stop, [&]() MACHA_REQUIRES(prompt_mutex_) {
                 return !prompt_queue_.empty() ||
                        (!retry.empty() && retry.front().due <= Clock::now());
             });
@@ -1408,7 +1408,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
         if (shared) {
             FrameType effective;
             {
-                std::lock_guard lock(shared->mutex);
+                Lock lock(shared->mutex);
                 shared->promote_network = rpc.promotion_callback();
                 effective = shared->frame_type;
             }
@@ -1426,7 +1426,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                     continue;
                 rpc.cancel();
                 if (shared) {
-                    std::lock_guard lock(shared->mutex);
+                    Lock lock(shared->mutex);
                     shared->promote_network = {};
                 }
                 return {};
@@ -1434,7 +1434,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
         }
         auto reply = rpc.get();
         if (shared) {
-            std::lock_guard lock(shared->mutex);
+            Lock lock(shared->mutex);
             shared->promote_network = {};
         }
         if (reply.message.type != MessageType::object_reply)
@@ -1444,7 +1444,7 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
         return data;
     } catch (const std::exception& e) {
         if (shared) {
-            std::lock_guard lock(shared->mutex);
+            Lock lock(shared->mutex);
             shared->promote_network = {};
         }
         Log::debug("object read: " + std::string(e.what()));
@@ -1509,17 +1509,14 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
     std::shared_ptr<SharedFetch> shared;
     bool leader = false;
     {
-        std::lock_guard lock(fetch_mutex_);
+        Lock lock(fetch_mutex_);
         if (auto it = fetches_.find(id); it != fetches_.end()) {
             shared = it->second.lock();
             if (shared)
                 shared->waiters.fetch_add(1, std::memory_order_relaxed);
         }
         if (!shared) {
-            shared = std::make_shared<SharedFetch>();
-            shared->foreground = foreground;
-            shared->frame_type = frame_type;
-            shared->opportunistic_persist = opportunistic_persist;
+            shared = std::make_shared<SharedFetch>(foreground, frame_type, opportunistic_persist);
             fetches_[id] = shared;
             leader = true;
         }
@@ -1527,29 +1524,28 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
 
     if (!leader) {
         std::function<void(FrameType)> promote_network;
-        std::unique_lock lock(shared->mutex);
-        if (frame_type_priority(frame_type) < frame_type_priority(shared->frame_type)) {
-            shared->frame_type = frame_type;
-            promote_network = shared->promote_network;
-        }
-        if (foreground && !shared->foreground) {
-            shared->foreground = true;
-            if (shared->active_peer &&
-                shared->active_class == ReplicaWorkClass::speculative) {
-                replica_selector_.promoted(*shared->active_peer);
-                shared->active_class = ReplicaWorkClass::foreground;
+        {
+            Lock lock(shared->mutex);
+            if (frame_type_priority(frame_type) < frame_type_priority(shared->frame_type)) {
+                shared->frame_type = frame_type;
+                promote_network = shared->promote_network;
             }
+            if (foreground && !shared->foreground) {
+                shared->foreground = true;
+                if (shared->active_peer && shared->active_class == ReplicaWorkClass::speculative) {
+                    replica_selector_.promoted(*shared->active_peer);
+                    shared->active_class = ReplicaWorkClass::foreground;
+                }
+            }
+            if (opportunistic_persist)
+                shared->opportunistic_persist = true;
         }
-        if (opportunistic_persist)
-            shared->opportunistic_persist = true;
-        if (promote_network) {
-            lock.unlock();
+        if (promote_network)
             promote_network(frame_type);
-            lock.lock();
-        }
 
+        Lock lock(shared->mutex);
         while (!shared->done && !read_aborted(deadline, cancelled, abort))
-            shared->cv.wait_for(lock, std::chrono::milliseconds(25));
+            shared->cv.wait_for(lock.native(), std::chrono::milliseconds(25));
         shared->waiters.fetch_sub(1, std::memory_order_relaxed);
         if (!shared->done)
             return {};
@@ -1573,8 +1569,8 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
             // Hold the fetch-table lock until the result is published: an
             // earlier caller is guaranteed to be a waiter, a later one starts a
             // new fetch only after this transfer completes.
-            std::lock_guard fetch_lock(fetch_mutex_);
-            std::lock_guard shared_lock(shared->mutex);
+            Lock fetch_lock(fetch_mutex_);
+            Lock shared_lock(shared->mutex);
             const bool has_waiters = shared->waiters.load(std::memory_order_relaxed) != 0;
             if (has_waiters)
                 shared->result = result;
@@ -1609,7 +1605,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
         while (!candidates.empty() && !read_aborted(deadline, cancelled, abort)) {
             ReplicaWorkClass work;
             {
-                std::lock_guard lock(shared->mutex);
+                Lock lock(shared->mutex);
                 work = shared->foreground ? ReplicaWorkClass::foreground
                                           : ReplicaWorkClass::speculative;
             }
@@ -1626,7 +1622,7 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
 
             Clock::time_point started;
             {
-                std::lock_guard lock(shared->mutex);
+                Lock lock(shared->mutex);
                 shared->active_peer = target;
                 shared->active_class = shared->foreground ? ReplicaWorkClass::foreground
                                                           : ReplicaWorkClass::speculative;
@@ -1636,14 +1632,14 @@ DistributedStore::get_remote(const ObjectId& id, size_t stripe, FrameType frame_
 
             FrameType transfer_type;
             {
-                std::lock_guard lock(shared->mutex);
+                Lock lock(shared->mutex);
                 transfer_type = shared->frame_type;
             }
             // The transfer belongs to the ObjectId, not its leader: a cancelled
             // leader may abort the RPC only while no other reader has joined.
             auto data = get_from(target, id, transfer_type, shared, {}, cancelled, abort);
             {
-                std::lock_guard lock(shared->mutex);
+                Lock lock(shared->mutex);
                 replica_selector_.finished(target, shared->active_class,
                                            data ? data->bytes.size() : 0,
                                            Clock::now() - started, static_cast<bool>(data));
@@ -2226,7 +2222,7 @@ void DistributedStore::note_repair_unsourceable(const ObjectId& id) {
     const auto total = repair_pull_unsourceable_.fetch_add(1, std::memory_order_relaxed) + 1;
     bool warn = false;
     {
-        std::lock_guard lock(repair_sample_mutex_);
+        Lock lock(repair_sample_mutex_);
         if (std::find(repair_unsourceable_sample_.begin(), repair_unsourceable_sample_.end(), id) ==
             repair_unsourceable_sample_.end()) {
             repair_unsourceable_sample_.push_back(id);
@@ -2250,7 +2246,7 @@ void DistributedStore::note_repair_local_unreadable(const ObjectId& id) {
     const auto total = repair_local_unreadable_.fetch_add(1, std::memory_order_relaxed) + 1;
     bool warn = false;
     {
-        std::lock_guard lock(repair_sample_mutex_);
+        Lock lock(repair_sample_mutex_);
         const auto now = Clock::now();
         if (repair_unreadable_last_log_ == Clock::time_point{} ||
             now - repair_unreadable_last_log_ >= repair_warning_interval) {
@@ -2284,7 +2280,7 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
     out.prompt_failures = prompt.failures;
     out.prompt_skipped_no_room = prompt_skipped_no_room_.load(std::memory_order_relaxed);
     out.prompt_dropped = prompt_dropped_.load(std::memory_order_relaxed);
-    std::lock_guard lock(repair_sample_mutex_);
+    Lock lock(repair_sample_mutex_);
     out.unsourceable_sample.assign(repair_unsourceable_sample_.begin(),
                                    repair_unsourceable_sample_.end());
     return out;
@@ -2754,7 +2750,7 @@ void DistributedStore::enqueue_local_copy(const ObjectId& id, std::span<const ui
     // Opportunistic persistence must not back-pressure playback: when the
     // bounded queue is full the copy is dropped and repair converges later.
     constexpr size_t max_queued_bytes = 256ULL * 1024 * 1024;
-    std::lock_guard lock(local_copy_mutex_);
+    Lock lock(local_copy_mutex_);
     if (data.size() > max_queued_bytes || local_copy_bytes_ + data.size() > max_queued_bytes) {
         Log::debug("opportunistic persistence skipped object=" + to_string(id) +
                    " reason=queue_full queued_bytes=" + std::to_string(local_copy_bytes_));
@@ -2772,8 +2768,10 @@ void DistributedStore::enqueue_local_copy(const ObjectId& id, std::span<const ui
 }
 
 void DistributedStore::wait_local_copies_settled() {
-    std::unique_lock lock(local_copy_mutex_);
-    local_copy_settled_cv_.wait(lock, [&] { return local_copies_.empty() && !local_copy_writing_; });
+    Lock lock(local_copy_mutex_);
+    local_copy_settled_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(local_copy_mutex_) {
+        return local_copies_.empty() && !local_copy_writing_;
+    });
 }
 
 void DistributedStore::local_writer_loop(std::stop_token stop) {
@@ -2781,9 +2779,10 @@ void DistributedStore::local_writer_loop(std::stop_token stop) {
     while (true) {
         LocalCopyJob job;
         {
-            std::unique_lock lock(local_copy_mutex_);
-            local_copy_cv_.wait(lock,
-                                [&] { return stop.stop_requested() || !local_copies_.empty(); });
+            Lock lock(local_copy_mutex_);
+            local_copy_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(local_copy_mutex_) {
+                return stop.stop_requested() || !local_copies_.empty();
+            });
             if (stop.stop_requested() && local_copies_.empty())
                 return;
             job = std::move(local_copies_.front());
@@ -2795,7 +2794,7 @@ void DistributedStore::local_writer_loop(std::stop_token stop) {
             DistributedStore& store;
             ~Settled() {
                 {
-                    std::lock_guard lock(store.local_copy_mutex_);
+                    Lock lock(store.local_copy_mutex_);
                     store.local_copy_writing_ = false;
                 }
                 store.local_copy_settled_cv_.notify_all();

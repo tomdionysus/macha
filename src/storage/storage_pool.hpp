@@ -11,7 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
+#include "contract/thread_safety.hpp"
 #include <optional>
 #include <set>
 
@@ -56,17 +56,20 @@ class StoragePool final : public ObjectStore {
         ObjectId id;
     };
 
-    std::filesystem::path state_path_;
-    NodeId node_id_;
-    std::array<uint8_t, 32> key_{};
-    std::chrono::milliseconds durability_batch_window_{500};
-    StoragePackingConfig packing_{};
-    mutable std::mutex mutex_;
-    std::vector<std::shared_ptr<Backend>> backends_;
-    mutable std::mutex domain_mutex_;
-    uint64_t next_domain_id_{1};
-    uint64_t next_backend_instance_{1};
-    std::map<uint64_t, std::shared_ptr<DurabilityDomain>> domains_by_device_;
+    // Fixed at construction.
+    const std::filesystem::path state_path_;
+    const NodeId node_id_;
+    const std::array<uint8_t, 32> key_{};
+    const std::chrono::milliseconds durability_batch_window_{500};
+    const StoragePackingConfig packing_{};
+    mutable Mutex mutex_;
+    std::vector<std::shared_ptr<Backend>> backends_ MACHA_GUARDED_BY(mutex_);
+    mutable Mutex domain_mutex_;
+    uint64_t next_domain_id_ MACHA_GUARDED_BY(domain_mutex_){1};
+    uint64_t next_backend_instance_ MACHA_GUARDED_BY(domain_mutex_){1};
+    std::map<uint64_t, std::shared_ptr<DurabilityDomain>>
+        domains_by_device_ MACHA_GUARDED_BY(domain_mutex_);
+    // Each cursor is owned by the maintenance thread that runs its step.
     Cursor rebalance_cursor_;
     Cursor scrub_cursor_;
     Cursor gc_cursor_;
@@ -80,7 +83,7 @@ class StoragePool final : public ObjectStore {
 
     void observe_get(size_t, uint64_t) const;
 
-    std::vector<std::shared_ptr<Backend>> snapshot() const;
+    std::vector<std::shared_ptr<Backend>> snapshot() const MACHA_EXCLUDES(mutex_);
     std::filesystem::path identity_path(const std::filesystem::path&) const;
     bool activate(const std::shared_ptr<Backend>&);
     void deactivate(const std::shared_ptr<Backend>&, const std::shared_ptr<LocalStore>&,

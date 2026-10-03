@@ -66,7 +66,7 @@ class MACHA_SCOPED_CAPABILITY TimedLock {
         : lock_(mutex.native(), name, threshold) {}
     TimedLock(IoMutex& mutex, std::string_view name,
               std::chrono::milliseconds threshold = std::chrono::milliseconds(10))
-        MACHA_ACQUIRE(mutex) MACHA_EXCLUDES(no_io)
+        MACHA_ACQUIRE(mutex)
         : lock_(mutex.native(), name, threshold) {}
     ~TimedLock() MACHA_RELEASE() {}
     TimedLock(const TimedLock&) = delete;

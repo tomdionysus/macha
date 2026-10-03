@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/thread_safety.hpp"
 #include "types.hpp"
 
 #include <atomic>
@@ -54,9 +55,9 @@ class HttpBodySource {
 // One-shot wake for a deferred request: the producer calls fire(), the server
 // arm(). Either order works, so a racing producer cannot lose the wakeup.
 class HttpWaker {
-    std::mutex mutex_;
-    bool fired_{};
-    std::function<void()> wake_;
+    Mutex mutex_;
+    bool fired_ MACHA_GUARDED_BY(mutex_){};
+    std::function<void()> wake_ MACHA_GUARDED_BY(mutex_);
 
   public:
     void fire();

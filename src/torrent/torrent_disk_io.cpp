@@ -29,7 +29,6 @@
 #include <deque>
 #include <filesystem>
 #include <map>
-#include <mutex>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -108,18 +107,21 @@ struct Storage {
     // Set by remove_torrent: queued publications are dropped, not retried, as
     // nothing will adopt them and retries would keep the torrent alive.
     std::atomic_bool removed{false};
-    // Empty when publication is off.
+    // Empty when publication is off. Planned before the storage is shared and
+    // fixed after, except each extent's published and queued flags, which
+    // publish_mutex guards.
     std::vector<PlannedExtent> extents;
     std::vector<std::vector<size_t>> piece_extents;
-    std::mutex publish_mutex;
-    std::vector<bool> verified; // guarded by publish_mutex
-    size_t published_count{};   // guarded by publish_mutex
+    // Held across a log line when the last extent publishes.
+    IoMutex publish_mutex;
+    std::vector<bool> verified MACHA_GUARDED_BY(publish_mutex);
+    size_t published_count MACHA_GUARDED_BY(publish_mutex){};
     // Touched only by the publisher thread.
     std::unique_ptr<TorrentExtentJournal> journal;
     // Touched only by the job currently running for this storage, and jobs
     // for one storage never run concurrently (see MachaDiskIo::worker).
     std::map<lt::file_index_t, OpenFile> open;
-    // Guarded by MachaDiskIo::mutex_.
+    // Guarded by MachaDiskIo::mutex_ (not expressible to the analysis).
     std::deque<std::function<void()>> jobs;
     bool scheduled{};
 
@@ -182,7 +184,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             storages_.push_back(std::move(storage));
         }
         if (publishing()) {
-            std::lock_guard lock(by_path_mutex_);
+            Lock lock(by_path_mutex_);
             by_path_[storages_[static_cast<size_t>(index)]->save_path] = storages_[static_cast<size_t>(index)];
         }
         return lt::storage_holder(lt::storage_index_t(static_cast<std::uint32_t>(index)), *this);
@@ -193,7 +195,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         // when the last of them has run.
         if (storages_[slot(index)]) storages_[slot(index)]->removed.store(true);
         if (publishing() && storages_[slot(index)]) {
-            std::lock_guard lock(by_path_mutex_);
+            Lock lock(by_path_mutex_);
             by_path_.erase(storages_[slot(index)]->save_path);
         }
         storages_[slot(index)].reset();
@@ -232,7 +234,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         const auto queued = queued_write_bytes_.fetch_add(size) + size;
         const bool exceeded = queued > queue_limit_.load(std::memory_order_relaxed);
         if (exceeded && observer) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             observers_.push_back(std::move(observer));
         }
         auto storage = at(index);
@@ -411,12 +413,12 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     std::vector<std::shared_ptr<Storage>> storages_;
     std::vector<int> free_slots_;
 
-    std::mutex mutex_;
+    Mutex mutex_;
     std::condition_variable cv_;
     // Storages with at least one queued job and none running, in turn order.
-    std::deque<std::shared_ptr<Storage>> ready_;
-    std::vector<std::shared_ptr<lt::disk_observer>> observers_;
-    bool stopping_{};
+    std::deque<std::shared_ptr<Storage>> ready_ MACHA_GUARDED_BY(mutex_);
+    std::vector<std::shared_ptr<lt::disk_observer>> observers_ MACHA_GUARDED_BY(mutex_);
+    bool stopping_ MACHA_GUARDED_BY(mutex_){};
     std::atomic_bool aborting_{false};
     std::vector<std::thread> workers_;
 
@@ -424,17 +426,17 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     std::atomic<uint64_t> queue_limit_{0};
 
     // Publication has its own thread, so a slow put never holds up disk writes.
-    std::mutex by_path_mutex_;
-    std::unordered_map<std::string, std::weak_ptr<Storage>> by_path_;
+    Mutex by_path_mutex_;
+    std::unordered_map<std::string, std::weak_ptr<Storage>> by_path_ MACHA_GUARDED_BY(by_path_mutex_);
     struct PublishJob {
         std::shared_ptr<Storage> storage;
         size_t extent{};
         Clock::time_point not_before{};
     };
-    std::mutex publish_queue_mutex_;
+    Mutex publish_queue_mutex_;
     std::condition_variable publish_cv_;
-    std::deque<PublishJob> publish_queue_;
-    bool publisher_stopping_{};
+    std::deque<PublishJob> publish_queue_ MACHA_GUARDED_BY(publish_queue_mutex_);
+    bool publisher_stopping_ MACHA_GUARDED_BY(publish_queue_mutex_){};
     std::thread publisher_;
 
     bool publishing() const {
@@ -447,7 +449,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         const auto& files = storage.files;
         const auto extent_size = hooks_.extent_size;
         storage.piece_extents.resize(static_cast<size_t>(files.num_pieces()));
-        storage.verified.assign(static_cast<size_t>(files.num_pieces()), false);
+        size_t published = 0;
         const auto recorded = TorrentExtentJournal::load(storage.save_path);
         for (const auto file : files.file_range()) {
             if (files.pad_file_at(file)) continue;
@@ -469,27 +471,31 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
                     const auto it = known->second.extents.find(offset);
                     extent.published = it != known->second.extents.end() && it->second.length == extent.length;
                 }
-                if (extent.published) ++storage.published_count;
+                if (extent.published) ++published;
                 const auto index = storage.extents.size();
                 storage.extents.push_back(std::move(extent));
                 for (int piece = storage.extents[index].first_piece; piece <= storage.extents[index].last_piece; ++piece)
                     storage.piece_extents[static_cast<size_t>(piece)].push_back(index);
             }
         }
+        Lock lock(storage.publish_mutex);
+        storage.verified.assign(static_cast<size_t>(files.num_pieces()), false);
+        storage.published_count = published;
     }
 
     // Queues, once, every extent whose covering pieces have now all verified.
     void piece_verified(const std::string& save_path, int piece) {
         std::shared_ptr<Storage> storage;
         {
-            std::lock_guard lock(by_path_mutex_);
+            Lock lock(by_path_mutex_);
             const auto found = by_path_.find(save_path);
             if (found != by_path_.end()) storage = found->second.lock();
         }
-        if (!storage || piece < 0 || static_cast<size_t>(piece) >= storage->verified.size()) return;
+        if (!storage || piece < 0 || static_cast<size_t>(piece) >= storage->piece_extents.size())
+            return;
         std::vector<size_t> ready;
         {
-            std::lock_guard lock(storage->publish_mutex);
+            Lock lock(storage->publish_mutex);
             storage->verified[static_cast<size_t>(piece)] = true;
             for (const auto index : storage->piece_extents[static_cast<size_t>(piece)]) {
                 auto& extent = storage->extents[index];
@@ -504,7 +510,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         }
         if (ready.empty()) return;
         {
-            std::lock_guard lock(publish_queue_mutex_);
+            Lock lock(publish_queue_mutex_);
             for (const auto index : ready) publish_queue_.push_back({storage, index, Clock::now()});
         }
         publish_cv_.notify_one();
@@ -514,19 +520,21 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
         std::shared_ptr<Storage> storage;
         {
-            std::lock_guard lock(by_path_mutex_);
+            Lock lock(by_path_mutex_);
             const auto found = by_path_.find(save_path);
             if (found != by_path_.end()) storage = found->second.lock();
         }
         if (!storage) return std::nullopt;
-        std::lock_guard lock(storage->publish_mutex);
+        Lock lock(storage->publish_mutex);
         return TorrentPublicationProgress{storage->published_count, storage->extents.size()};
     }
 
     void publisher() {
-        std::unique_lock lock(publish_queue_mutex_);
+        Lock lock(publish_queue_mutex_);
         while (true) {
-            publish_cv_.wait(lock, [this] { return publisher_stopping_ || !publish_queue_.empty(); });
+            publish_cv_.wait(lock.native(), [this]() MACHA_REQUIRES(publish_queue_mutex_) {
+                return publisher_stopping_ || !publish_queue_.empty();
+            });
             if (publisher_stopping_) return;
             const auto now = Clock::now();
             auto due = std::find_if(publish_queue_.begin(), publish_queue_.end(),
@@ -534,7 +542,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             if (due == publish_queue_.end()) {
                 auto next = publish_queue_.front().not_before;
                 for (const auto& job : publish_queue_) next = std::min(next, job.not_before);
-                publish_cv_.wait_until(lock, next);
+                publish_cv_.wait_until(lock.native(), next);
                 continue;
             }
             auto job = std::move(*due);
@@ -591,7 +599,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             Log::warn("torrent extent journal append failed path=" + extent.relative_path + ": " + e.what());
             return false;
         }
-        std::lock_guard lock(storage.publish_mutex);
+        Lock lock(storage.publish_mutex);
         storage.extents[job.extent].published = true;
         storage.extents[job.extent].queued = false;
         if (++storage.published_count == storage.extents.size())
@@ -652,7 +660,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     // requested before its blocks' writes complete, and must read them.
     void enqueue(const std::shared_ptr<Storage>& storage, std::function<void()> job) {
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             storage->jobs.push_back(std::move(job));
             if (!storage->scheduled) {
                 storage->scheduled = true;
@@ -663,9 +671,10 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
     }
 
     void worker() {
-        std::unique_lock lock(mutex_);
+        Lock lock(mutex_);
         while (true) {
-            cv_.wait(lock, [this] { return stopping_ || !ready_.empty(); });
+            cv_.wait(lock.native(),
+                     [this]() MACHA_REQUIRES(mutex_) { return stopping_ || !ready_.empty(); });
             if (ready_.empty()) return;
             auto storage = std::move(ready_.front());
             ready_.pop_front();
@@ -691,7 +700,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         if (publishing()) {
             hooks_.verifications->detach();
             {
-                std::lock_guard lock(publish_queue_mutex_);
+                Lock lock(publish_queue_mutex_);
                 publisher_stopping_ = true;
                 publish_queue_.clear();
             }
@@ -699,7 +708,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
             if (publisher_.joinable()) publisher_.join();
         }
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (stopping_) return;
             stopping_ = true;
         }
@@ -713,7 +722,7 @@ class MachaDiskIo final : public lt::disk_interface, public lt::buffer_allocator
         if (queued > queue_limit_.load(std::memory_order_relaxed) / 2) return;
         std::vector<std::shared_ptr<lt::disk_observer>> waiting;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             waiting.swap(observers_);
         }
         for (auto& observer : waiting)

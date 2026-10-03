@@ -2,6 +2,7 @@
 #pragma once
 
 #include "acquisition/ingest.hpp"
+#include "contract/thread_safety.hpp"
 #include "subsystem/subsystem_registry.hpp"
 #include "torrent/torrent.hpp"
 
@@ -9,7 +10,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <thread>
@@ -109,10 +109,11 @@ class ClusterJobView {
     // this section, and HTTP threads read it.
     std::atomic<int64_t> default_remove_after_ms_{-1};
 
-    mutable std::mutex mutex_;
-    std::map<NodeId, Peer> peers_;
-    // Serialises polls between the loop and refresh_now().
-    std::mutex poll_mutex_;
+    mutable Mutex mutex_;
+    std::map<NodeId, Peer> peers_ MACHA_GUARDED_BY(mutex_);
+    // Serialises polls between the loop and refresh_now(); guards nothing.
+    // Held across the peer RPCs.
+    IoMutex poll_mutex_;
     std::condition_variable_any wake_;
     std::jthread worker_;
 };

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "cluster/frame_type.hpp"
+#include "contract/thread_safety.hpp"
 #include "crypto.hpp"
 #include "types.hpp"
 
@@ -270,6 +271,7 @@ class MessageAssembler {
 };
 
 class SecureChannel {
+    // Fixed from construction until the destructor closes it.
     int fd_{-1};
     ClusterKeys keys_;
     NodeInfo local_;
@@ -280,8 +282,9 @@ class SecureChannel {
     size_t negotiated_max_frame_size_{};
     TransportLane lane_{TransportLane::control};
     bool ready_{};
-    std::mutex close_mutex_;
-    bool shutdown_{};
+    // Held across shutdown(2), close(2) and setsockopt(2) on the socket.
+    IoMutex close_mutex_;
+    bool shutdown_ MACHA_GUARDED_BY(close_mutex_){};
     std::shared_ptr<TransportTraffic> traffic_;
     void close_fd();
 
@@ -380,51 +383,58 @@ class RpcClient {
     size_t max_frame_size_{};
     RetainedMemoryLedger* retained_memory_{};
     std::shared_ptr<TransportTraffic> traffic_{std::make_shared<TransportTraffic>()};
-    mutable std::mutex mutex_;
+    // Held across the local_ callback, inbound routes' usable() callbacks and
+    // logging.
+    mutable IoMutex mutex_;
     std::condition_variable connection_cv_;
     // Dialling is expensive (two persistent threads, multi-megabyte DATA
     // buffers): concurrent cold callers for one peer/lane share one dial.
-    std::set<std::string> connection_dials_;
-    std::map<std::string, std::shared_ptr<PeerConnection>> connections_;
-    std::vector<std::shared_ptr<PeerConnection>> retired_connections_;
-    std::map<std::string, InboundRoute> inbound_routes_;
-    std::map<std::string, NodeId> endpoint_peers_;
+    std::set<std::string> connection_dials_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, std::shared_ptr<PeerConnection>> connections_ MACHA_GUARDED_BY(mutex_);
+    std::vector<std::shared_ptr<PeerConnection>> retired_connections_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, InboundRoute> inbound_routes_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, NodeId> endpoint_peers_ MACHA_GUARDED_BY(mutex_);
     // Test fixture for an unresponsive peer: calls to a listed peer (all
     // messages, or one type) return an AsyncRpc that never resolves until
     // released, with idle_for() advancing as for a dead link.
-    std::map<NodeId, std::optional<MessageType>> stalled_peers_for_tests_;
-    std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_for_tests_;
-    AsyncRpc stalled_call_for_tests_locked();
+    std::map<NodeId, std::optional<MessageType>> stalled_peers_for_tests_ MACHA_GUARDED_BY(mutex_);
+    std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_for_tests_
+        MACHA_GUARDED_BY(mutex_);
+    AsyncRpc stalled_call_for_tests_locked() MACHA_REQUIRES(mutex_);
     // Test-only: inbound routes from these peers are parked, not registered,
     // until release_inbound_for_tests(); and a hook run after every dial.
-    std::set<NodeId> held_inbound_peers_for_tests_;
-    std::vector<InboundRoute> held_inbound_routes_for_tests_;
-    std::function<void()> after_dial_for_tests_;
+    std::set<NodeId> held_inbound_peers_for_tests_ MACHA_GUARDED_BY(mutex_);
+    std::vector<InboundRoute> held_inbound_routes_for_tests_ MACHA_GUARDED_BY(mutex_);
+    std::function<void()> after_dial_for_tests_ MACHA_GUARDED_BY(mutex_);
     // Waits, up to the connect timeout, for any usable route to `peer`.
     bool await_route(const NodeId& peer, TransportLane lane);
-    std::map<std::string, PeerHealth> health_;
-    std::map<std::string, Endpoint> endpoints_;
-    std::map<std::string, IdentityAssociationReset> identity_resets_;
+    std::map<std::string, PeerHealth> health_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, Endpoint> endpoints_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, IdentityAssociationReset> identity_resets_ MACHA_GUARDED_BY(mutex_);
     // Each authenticated peer's NodeInfo::flags, from the handshake and from
     // note_peer(). A peer without inbound_capable is never dialled; it is asked
-    // to dial instead. Guarded by mutex_.
-    std::map<NodeId, uint8_t> peer_flags_;
+    // to dial instead.
+    std::map<NodeId, uint8_t> peer_flags_ MACHA_GUARDED_BY(mutex_);
     // Lanes the health thread must open from this side (a peer's dial_request,
     // or the maintained peers when this node is inbound-incapable). Keyed by route_key.
-    std::map<std::string, std::pair<NodeInfo, TransportLane>> requested_lanes_;
-    std::function<std::vector<NodeInfo>()> maintained_peers_;
+    std::map<std::string, std::pair<NodeInfo, TransportLane>> requested_lanes_
+        MACHA_GUARDED_BY(mutex_);
+    std::function<std::vector<NodeInfo>()> maintained_peers_ MACHA_GUARDED_BY(mutex_);
     std::atomic_uint64_t lane_wakeups_{};
     std::atomic_uint64_t dial_requests_sent_{};
     std::atomic_uint64_t dial_requests_received_{};
     std::atomic_uint64_t connections_created_{};
     std::atomic_uint64_t connections_reused_{};
     std::jthread health_thread_;
-    std::mutex health_wait_mutex_;
+    // Guards nothing: the health thread's wait lock; wakes are counted in
+    // lane_wakeups_.
+    Mutex health_wait_mutex_;
     std::condition_variable_any health_wait_cv_;
-    std::mutex inbound_mutex_;
-    InboundHandler inbound_handler_;
-    InboundPromoter inbound_promoter_;
-    InboundCanceller inbound_canceller_;
+    // Held across the inbound handler, promoter and canceller callbacks.
+    IoMutex inbound_mutex_;
+    InboundHandler inbound_handler_ MACHA_GUARDED_BY(inbound_mutex_);
+    InboundPromoter inbound_promoter_ MACHA_GUARDED_BY(inbound_mutex_);
+    InboundCanceller inbound_canceller_ MACHA_GUARDED_BY(inbound_mutex_);
 
     static std::string endpoint_key(const Endpoint&);
     static std::string peer_key(const NodeId&);
@@ -442,13 +452,14 @@ class RpcClient {
                                           std::span<const uint8_t>, FrameType,
                                           std::string* why = nullptr);
     bool local_inbound_capable() const;
-    bool peer_inbound_capable_locked(const NodeId&) const;
-    bool route_usable_locked(const NodeId&, TransportLane) const;
-    void note_peer_locked(const NodeInfo&);
+    bool peer_inbound_capable_locked(const NodeId&) const MACHA_REQUIRES(mutex_);
+    bool route_usable_locked(const NodeId&, TransportLane) const MACHA_REQUIRES(mutex_);
+    void note_peer_locked(const NodeInfo&) MACHA_REQUIRES(mutex_);
     // Waits (bounded by connect_timeout) for a non-dialable peer to open
-    // `lane` to us after a dial_request; throws with the reason if it never does.
-    void await_reverse_dial(std::unique_lock<std::mutex>& lock, const NodeId& peer,
-                            TransportLane lane, const std::string& retry_key);
+    // `lane` to us after a dial_request; throws with the reason if it never
+    // does. `lock` holds mutex_ on entry and on return; released when it throws.
+    void await_reverse_dial(Lock& lock, const NodeId& peer, TransportLane lane,
+                            const std::string& retry_key) MACHA_REQUIRES(mutex_);
     void open_requested_lanes(std::stop_token);
     void observe_result(const std::string&, bool, std::chrono::milliseconds,
                         bool latency_sample = false);
@@ -462,7 +473,12 @@ class RpcClient {
     void register_inbound(InboundRoute);
     void unregister_inbound(const NodeId&, TransportLane,
                             const std::array<uint8_t, 32>& session_id);
-    void reconcile_locked(const NodeId&, TransportLane, std::vector<std::function<void()>>& retire);
+    void reconcile_locked(const NodeId&, TransportLane, std::vector<std::function<void()>>& retire)
+        MACHA_REQUIRES(mutex_);
+    // Snapshots the CONTROL routes unless mutex_ is busy; false if it was.
+    bool try_control_routes(
+        std::vector<std::shared_ptr<PeerConnection>>& outbound,
+        std::vector<std::function<bool(const RpcMessage&, FrameType)>>& inbound);
     void reap_retired();
 
   public:
@@ -566,8 +582,8 @@ class RpcServer {
     std::string host_;
     uint16_t port_;
     ClusterKeys keys_;
-    NodeInfo local_;
-    mutable std::mutex local_mutex_;
+    NodeInfo local_ MACHA_GUARDED_BY(local_mutex_);
+    mutable Mutex local_mutex_;
     Handler handler_;
     Observer observer_;
     size_t max_frame_size_{};
@@ -579,22 +595,22 @@ class RpcServer {
     std::vector<std::jthread> control_workers_;
     std::vector<std::jthread> metadata_workers_;
     std::vector<std::jthread> data_workers_;
-    mutable std::mutex request_mutex_;
+    mutable Mutex request_mutex_;
     std::condition_variable request_cv_;
-    std::deque<RequestJob> fast_control_requests_;
-    std::deque<RequestJob> control_requests_;
-    std::deque<RequestJob> metadata_requests_;
-    std::deque<RequestJob> foreground_requests_;
-    std::deque<RequestJob> read_ahead_requests_;
-    std::deque<RequestJob> loader_requests_;
-    std::deque<RequestJob> speculative_requests_;
+    std::deque<RequestJob> fast_control_requests_ MACHA_GUARDED_BY(request_mutex_);
+    std::deque<RequestJob> control_requests_ MACHA_GUARDED_BY(request_mutex_);
+    std::deque<RequestJob> metadata_requests_ MACHA_GUARDED_BY(request_mutex_);
+    std::deque<RequestJob> foreground_requests_ MACHA_GUARDED_BY(request_mutex_);
+    std::deque<RequestJob> read_ahead_requests_ MACHA_GUARDED_BY(request_mutex_);
+    std::deque<RequestJob> loader_requests_ MACHA_GUARDED_BY(request_mutex_);
+    std::deque<RequestJob> speculative_requests_ MACHA_GUARDED_BY(request_mutex_);
     RpcServerExecutionLimits execution_limits_;
     RetainedMemoryLedger* retained_memory_{};
-    size_t metadata_request_bytes_{};
-    size_t fast_control_request_bytes_{};
-    size_t control_request_bytes_{};
-    size_t data_request_bytes_{};
-    std::set<NodeId> metadata_active_peers_;
+    size_t metadata_request_bytes_ MACHA_GUARDED_BY(request_mutex_){};
+    size_t fast_control_request_bytes_ MACHA_GUARDED_BY(request_mutex_){};
+    size_t control_request_bytes_ MACHA_GUARDED_BY(request_mutex_){};
+    size_t data_request_bytes_ MACHA_GUARDED_BY(request_mutex_){};
+    std::set<NodeId> metadata_active_peers_ MACHA_GUARDED_BY(request_mutex_);
     std::atomic_size_t active_metadata_requests_{};
     std::atomic_uint64_t rejected_metadata_requests_{};
     std::atomic_uint64_t rejected_requests_{};
@@ -602,9 +618,9 @@ class RpcServer {
     // allocation-free on the handler path.
     std::array<AtomicTiming, 6> frame_timings_{};
     std::array<AtomicTiming, 256> message_timings_{};
-    size_t active_nonforeground_data_{};
-    std::mutex sessions_mutex_;
-    std::vector<std::shared_ptr<Session>> sessions_;
+    size_t active_nonforeground_data_ MACHA_GUARDED_BY(request_mutex_){};
+    Mutex sessions_mutex_;
+    std::vector<std::shared_ptr<Session>> sessions_ MACHA_GUARDED_BY(sessions_mutex_);
     std::atomic_size_t pre_auth_sessions_{};
     RpcClient* shared_client_{};
     std::shared_ptr<TransportTraffic> traffic_{std::make_shared<TransportTraffic>()};
@@ -612,10 +628,10 @@ class RpcServer {
     static RequestClass request_class(FrameType);
     static bool fast_control_request(const RpcFrame&);
     static bool metadata_mutation_request(const RpcFrame&);
-    std::deque<RequestJob>& queue(RequestClass);
-    bool admit_locked(RequestJob);
-    bool data_ready() const;
-    RequestClass next_data_class() const;
+    std::deque<RequestJob>& queue(RequestClass) MACHA_REQUIRES(request_mutex_);
+    bool admit_locked(RequestJob) MACHA_REQUIRES(request_mutex_);
+    bool data_ready() const MACHA_REQUIRES(request_mutex_);
+    RequestClass next_data_class() const MACHA_REQUIRES(request_mutex_);
     void accept_loop(std::stop_token);
     void session_loop(Session*);
     void fast_control_worker_loop(std::stop_token);

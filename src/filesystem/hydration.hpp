@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/thread_safety.hpp"
 #include "metadata/metadata.hpp"
 #include "cluster/net.hpp"
 
@@ -12,7 +13,6 @@
 #include <future>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -35,10 +35,10 @@ struct PlaybackObservation {
 };
 
 class PlaybackTracker {
-    mutable std::mutex mutex_;
-    std::map<uint64_t, PlaybackObservation> sessions_;
-    uint64_t next_session_{1};
-    std::function<void()> change_callback_;
+    mutable Mutex mutex_;
+    std::map<uint64_t, PlaybackObservation> sessions_ MACHA_GUARDED_BY(mutex_);
+    uint64_t next_session_ MACHA_GUARDED_BY(mutex_){1};
+    std::function<void()> change_callback_ MACHA_GUARDED_BY(mutex_);
 
   public:
     uint64_t open(std::string path, const FsEntry&);
@@ -154,30 +154,33 @@ struct HydrationStatus {
 
 class CacheHydrator {
     DistributedStore& store_;
-    mutable std::mutex mutex_;
+    mutable Mutex mutex_;
     std::condition_variable_any cv_;
     std::atomic_uint64_t wake_revision_{};
-    HydrationConfig config_;
-    std::vector<std::shared_ptr<HydrationHintProvider>> providers_;
+    HydrationConfig config_ MACHA_GUARDED_BY(mutex_);
+    std::vector<std::shared_ptr<HydrationHintProvider>> providers_ MACHA_GUARDED_BY(mutex_);
+    // Owned by the hydration thread (loop), or run_once()'s caller when not started.
     HydrationScheduler scheduler_;
-    std::map<ObjectId, Clock::time_point> failed_until_;
-    std::jthread worker_;
+    std::map<ObjectId, Clock::time_point> failed_until_ MACHA_GUARDED_BY(mutex_);
+    std::jthread worker_ MACHA_GUARDED_BY(mutex_);
     struct FetchTask {
         HydrationRequest request;
         std::promise<bool> result;
     };
-    std::mutex fetch_mutex_;
+    Mutex fetch_mutex_;
     std::condition_variable_any fetch_cv_;
-    std::deque<std::shared_ptr<FetchTask>> fetch_queue_;
+    std::deque<std::shared_ptr<FetchTask>> fetch_queue_ MACHA_GUARDED_BY(fetch_mutex_);
+    // Owned by the instantiator's thread (start/stop); the hydration thread
+    // reads its size only between start() and stop()'s join.
     std::vector<std::jthread> fetch_workers_;
-    bool fetch_stopping_{true};
+    bool fetch_stopping_ MACHA_GUARDED_BY(fetch_mutex_){true};
     std::atomic_size_t fetch_queued_{};
     std::atomic_size_t fetch_peak_queued_{};
     std::atomic_uint64_t fetch_submitted_{};
     std::atomic_uint64_t fetch_completed_{};
     std::atomic_uint64_t fetch_cancelled_{};
     std::atomic_uint64_t fetch_rejected_{};
-    HydrationStatus status_;
+    HydrationStatus status_ MACHA_GUARDED_BY(mutex_);
 
     std::vector<HydrationHint> collect_hints();
     void loop(std::stop_token);

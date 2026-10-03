@@ -4,11 +4,11 @@
 #include "config.hpp"
 #include "acquisition/ingest.hpp"
 #include "catalogue/media_catalogue.hpp"
+#include "contract/thread_safety.hpp"
 
 #include <filesystem>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -153,8 +153,8 @@ class TorrentSearchManager {
         uint64_t expires_unix_ms{};
     };
     std::vector<std::unique_ptr<TorrentSearchProvider>> providers_;
-    mutable std::mutex mutex_;
-    std::map<std::string, CachedAcquisition, std::less<>> acquisitions_;
+    mutable Mutex mutex_;
+    std::map<std::string, CachedAcquisition, std::less<>> acquisitions_ MACHA_GUARDED_BY(mutex_);
     static constexpr size_t max_acquisitions_ = 4096;
 
   public:

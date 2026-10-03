@@ -3,6 +3,7 @@
 #include "media/media_containers.hpp"
 #include "media/subtitle_text.hpp"
 
+#include "contract/thread_safety.hpp"
 #include "log.hpp"
 #include "supervised.hpp"
 #include "media/media_timestamps.hpp"
@@ -1463,8 +1464,8 @@ class LibavSession final : public MediaEngineSession {
     std::atomic_bool cancelled_{};
     std::atomic_bool running_{true};
     std::atomic_int exit_code_{-1};
-    mutable std::mutex diagnostics_mutex_;
-    std::string diagnostics_;
+    mutable Mutex diagnostics_mutex_;
+    std::string diagnostics_ MACHA_GUARDED_BY(diagnostics_mutex_);
     MediaStartProgress progress_;
 
     void run(std::stop_token stop) {
@@ -1479,7 +1480,7 @@ class LibavSession final : public MediaEngineSession {
                 store_->finish();
                 auto state = store_->snapshot();
                 if (!state.error.empty()) {
-                    std::lock_guard lock(diagnostics_mutex_);
+                    Lock lock(diagnostics_mutex_);
                     diagnostics_ = state.error;
                     exit_code_.store(1);
                 } else {
@@ -1489,7 +1490,7 @@ class LibavSession final : public MediaEngineSession {
         } catch (const std::exception& e) {
             if (!cancelled_.load()) {
                 {
-                    std::lock_guard lock(diagnostics_mutex_);
+                    Lock lock(diagnostics_mutex_);
                     diagnostics_ = e.what();
                 }
                 store_->fail(e.what());
@@ -1529,7 +1530,7 @@ class LibavSession final : public MediaEngineSession {
         return code < 0 ? std::optional<int>{} : std::optional<int>{code};
     }
     std::string diagnostics() const override {
-        std::lock_guard lock(diagnostics_mutex_);
+        Lock lock(diagnostics_mutex_);
         return diagnostics_;
     }
     std::shared_ptr<MediaSegmentStore> segments() const override { return store_; }
