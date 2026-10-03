@@ -15,15 +15,19 @@
 // thread), background class.
 namespace macha {
 
+// Every build reads the control store under each object's lock, which a
+// put holds across its write, and fetches what it lacks from peers.
 class HorizonBuilder {
   public:
     virtual ~HorizonBuilder() = default;
+    static constexpr ThreadSafety safety = ThreadSafety::single_owner;
 
     // The namespace's objects and tombstones at the current metadata
     // generation: the filesystem's cached walk, cheap while the generation
     // holds. The pass reads its generation to decide whether to build an
     // inventory from it.
-    static constexpr Waits namespace_objects_waits = Waits::state_device | Waits::network;
+    static constexpr Waits namespace_objects_waits =
+        Waits::state_device | Waits::network | Waits::locks;
     virtual std::shared_ptr<const MaintenanceObjects> namespace_objects() = 0;
 
     // The inventory at that generation: the namespace's objects and the
@@ -31,14 +35,15 @@ class HorizonBuilder {
     // repair ran) and whether that repair succeeded. Fetches missing
     // catalogue objects into the control store; repairs and commits nothing
     // (spec A4).
-    static constexpr Waits inventory_waits = Waits::state_device | Waits::network;
+    static constexpr Waits inventory_waits = namespace_objects_waits;
     virtual std::shared_ptr<const InventoryHorizon>
     inventory(const MaintenanceObjects&, const CatalogueMaintenanceHead& head, bool repaired) = 0;
 
     // The release horizon at a head: its files' extents, the conflict roots,
     // every catalogue root's retained objects and the namespace tree's own
     // nodes. Incomplete when a catalogue root or a tree node is unreadable.
-    static constexpr Waits release_waits = Waits::state_device | Waits::network;
+    // Fetches missing catalogue objects and tree nodes into the control store.
+    static constexpr Waits release_waits = namespace_objects_waits;
     virtual ReleaseBuild release(const MetadataSnapshotView& head) = 0;
 };
 

@@ -62,6 +62,14 @@ constexpr bool includes(Waits declared, Waits wait) noexcept {
     return (static_cast<uint8_t>(declared) & static_cast<uint8_t>(wait)) != 0;
 }
 
+// Who may call an operation, declared beside what it waits on (A2):
+// `thread_safe` from any thread, synchronised inside the component;
+// `single_owner` from one caller, named where the operation is declared.
+enum class ThreadSafety : uint8_t {
+    thread_safe,
+    single_owner,
+};
+
 // Control work must never wait on the DATA device or the network (law 1);
 // this is the only combination refused. State-device waits are control's own;
 // a lock wait is refused only through what its declaration names.

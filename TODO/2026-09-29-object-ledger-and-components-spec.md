@@ -434,6 +434,40 @@ to repair.
 Every operation moved behind a contract is audited for others, and each
 finding is recorded here before its contract is written.
 
+**The end-of-T5 audit (2026-10-03).** Every operation of the five
+contracts (`ObjectStore`, `ClaimStore`, `ObjectLedger`, `MetadataView` with
+`MetadataMaintenance`, `HorizonBuilder`) was traced to the locks it takes,
+who holds each across I/O, and the I/O it reaches. Each now declares its
+waits and its `ThreadSafety` (`src/contract/work.hpp`) beside it, and the
+declarations match the code. Fixed rather than declared:
+
+- `MetadataView::current()` waited behind a peer commit's fsync: its cache
+  lock's holders read the replica's committed generation under the
+  replica's lock, which `accept_commit` holds across the heads file. The
+  generation is now an atomic beside the record.
+- Every claim read could wait on the DATA device: `prune_unclaimed` held
+  the claim store's lock while it asked the object store. It now picks
+  rows under the lock, asks without it, and erases under it only what is
+  still unclaimed. The lock is held across state-device I/O only.
+- `LocalStore::has` unlinked empty files (an effect, from a `const` read);
+  it no longer does, and `get` and the scan still prune them. A failed
+  presence warm-up left `has` on the device path for the store's life; the
+  walk is now retried with backoff. The scan's clean accounting checkpoint
+  is written outside the store's lock, as the dirty marker already was.
+- A loose put that failed after its rename removed the renamed path and
+  released its reservation twice; both are fixed.
+
+Declared rather than fixed, each off the viewer path: `release_head`
+rebuilds a head from the history file on a cache miss; a horizon build
+fetches catalogue objects and tree nodes it lacks into the control store;
+`note_replica_validation` takes the membership lock, which membership
+holds while persisting its peers; `attempt_history_checkpoint` holds the
+mutation lock for its round, so commits wait for it. `ClaimStore`'s
+release and prune keep their walk position inside the store, so they are
+single-owner (the maintenance pass) until A3's caller-owned cursors reach
+them. The mutexes are not yet annotated, so none of this is checked by
+the compiler; that is S.
+
 ### A5. The component model and the composition root
 
 In inversion of control the composition root owns construction, start,
