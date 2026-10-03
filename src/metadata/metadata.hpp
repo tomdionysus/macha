@@ -429,6 +429,13 @@ class MetadataReplica {
     mutable std::mutex materialization_compute_m_;
     MetadataRecord cur_;
     MetadataRecord committed_;
+    // committed_.generation, readable without m_; set_committed_locked keeps
+    // the two together.
+    std::atomic_uint64_t committed_generation_{};
+    void set_committed_locked(MetadataRecord record) {
+        committed_ = std::move(record);
+        committed_generation_.store(committed_.generation, std::memory_order_release);
+    }
     // Payloads live in history.log; memory holds ancestry and frame offsets.
     std::map<Hash256, HistoryIndexEntry> history_;
     std::map<Hash256, MetadataAcceptance> accepted_heads_;
@@ -524,7 +531,8 @@ class MetadataReplica {
     MetadataIdentity current_identity() const;
     MetadataIdentity committed_identity() const;
     uint64_t generation() const;
-    uint64_t committed_generation() const;
+    // Lock-free; any thread.
+    uint64_t committed_generation() const noexcept;
     bool recovery_required() const;
     void mark_recovered();
 
