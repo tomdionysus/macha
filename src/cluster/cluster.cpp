@@ -166,7 +166,7 @@ std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uin
 NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryProgress& progress,
                          RetainedMemoryLedger& retained_memory,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes, NodeEvents& events,
-                         StartupStageHook startup_stage_hook)
+                         RpcLinks& links, StartupStageHook startup_stage_hook)
     : cfg_(normalize_config(std::move(config))), identity_(identity), progress_(progress),
       retained_memory_(retained_memory),
       transcode_rates_(transcode_rates), routes_(routes), events_(events),
@@ -177,7 +177,7 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
       public_connectivity_(cfg_, identity_.id, Endpoint{members_.self().host, members_.self().port}),
       telemetry_(identity_.id, cfg_.state_path / "telemetry" / "last-known.bin"),
       client_(
-          identity_.keys, [this] { return members_.self(); },
+          links, identity_.keys, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
               const auto active_before = members_.active();
               const auto previous =
@@ -459,16 +459,14 @@ void NodeRuntime::connectivity_loop(std::stop_token stop) {
     // handshake. Sticky: capable -> incapable needs two consecutive failures,
     // incapable -> capable one success. An unaskable peer is no evidence.
     auto next_probe = Clock::now();
-    uint64_t wake_seen = connectivity_wake_.load(std::memory_order_acquire);
     while (!stop.stop_requested()) {
         {
+            // Until the next probe is due, or stop.
             Lock lock(connectivity_wait_mutex_);
             const auto now = Clock::now();
             if (next_probe > now)
-                connectivity_wait_cv_.wait_for(lock.native(), stop, next_probe - now, [&] {
-                    return connectivity_wake_.load(std::memory_order_acquire) != wake_seen;
-                });
-            wake_seen = connectivity_wake_.load(std::memory_order_acquire);
+                connectivity_wait_cv_.wait_for(lock.native(), stop, next_probe - now,
+                                               [] { return false; });
         }
         if (stop.stop_requested())
             return;
