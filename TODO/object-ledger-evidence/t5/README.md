@@ -245,3 +245,13 @@ Suites on fi-1 before install: 717 + 17 + 21 (`6c94ece`). Tarball md5
 - This is the figure the 15-day repair walk was approaching by one
   warning a minute, and matches the 0.9 TB repair was short when es-1
   left (CHANGELOG 0.59.0).
+
+## Viewer continuity: the operator's finding (2026-10-03, late)
+
+Watching media throughout the 0.84.0 deploy (fi-1 stopped 22:21:07Z,
+serving again 22:21:12Z; gbni-1 after it), the operator saw playback carry
+on through each node's restart, apart from blips of about half a second as
+the stream switched nodes. Their judgement: failover was brittle before the
+experiment and is solid now. The K table has no viewer-continuity measure
+and T0 recorded none, so this stands as qualitative evidence, from the
+person who has watched the cluster's failover throughout.
