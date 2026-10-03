@@ -459,7 +459,8 @@ class MetadataReplica {
     size_t history_records_{};
     uint64_t history_bytes_{};
     bool recovery_required_{};
-    NamespaceDeltaApplier namespace_applier_;
+    // Edits a tree-backed namespace; fixed for the replica's lifetime.
+    const NamespaceDeltaApplier namespace_applier_;
     bool accept_pristine_genesis_authority_{true};
     mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_;
     mutable uint64_t materialized_history_clock_{};
@@ -516,7 +517,8 @@ class MetadataReplica {
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>,
                     std::optional<MetadataRecord> recovery_seed = {},
                     bool accept_pristine_genesis_authority = true,
-                    uint64_t materialization_cache_limit_bytes = 128ULL * 1024ULL * 1024ULL);
+                    uint64_t materialization_cache_limit_bytes = 128ULL * 1024ULL * 1024ULL,
+                    NamespaceDeltaApplier namespace_applier = {});
     MetadataRecord current() const;
     MetadataRecord committed() const;
     MetadataIdentity current_identity() const;
@@ -526,10 +528,6 @@ class MetadataReplica {
     bool recovery_required() const;
     void mark_recovered();
 
-    // Set once by MetadataManager during node construction, before any replay.
-    void set_namespace_delta_applier(NamespaceDeltaApplier applier) {
-        namespace_applier_ = std::move(applier);
-    }
     uint64_t reserve_mutation_sequence(uint64_t observed_floor);
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);

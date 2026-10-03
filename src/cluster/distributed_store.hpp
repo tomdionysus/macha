@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "cluster/cluster.hpp"
+#include "cluster/control_objects.hpp"
 #include "contract/predicates.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/replica_selector.hpp"
@@ -26,7 +27,7 @@ struct DistributedStoreOptions {
     std::function<void(std::string_view, std::string_view)> repair_trace;
 };
 
-class DistributedStore final : public Placement {
+class DistributedStore final : public Placement, public ControlObjectSource {
   public:
     struct ObjectBuffer {
         Bytes bytes;
@@ -337,7 +338,7 @@ class DistributedStore final : public Placement {
     size_t replicate_all(const ObjectId&, std::span<const uint8_t>, bool foreground = false);
     size_t replicate_control(const ObjectId&, std::span<const uint8_t>);
     bool ensure_local(const ObjectId&, bool foreground = false);
-    bool ensure_control_local(const ObjectId&);
+    bool ensure_control_local(const ObjectId&) override;
     bool locally_available(const ObjectId&) const;
     bool cache_local(const ObjectId&, std::span<const uint8_t>);
     bool hydration_available() const;
