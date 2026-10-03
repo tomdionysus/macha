@@ -43,9 +43,10 @@ namespace macha {
 
 
 // What a test injects into a Service. Production passes none of it: the
-// system clock, no trace and no lifecycle record.
+// system clock, the network's links, no trace and no lifecycle record.
 struct ServiceInstruments {
     std::shared_ptr<MaintenanceClock> clock;
+    std::shared_ptr<RpcLinks> links;
     MaintenanceTraceHook trace;
     LifecycleHook lifecycle;
 };
@@ -63,6 +64,7 @@ class Service {
     Clock::time_point constructed_{Clock::now()};
     // Before node_, which is constructed after them.
     std::shared_ptr<MaintenanceClock> clock_;
+    std::shared_ptr<RpcLinks> links_;
     MaintenanceTraceHook maintenance_trace_;
     LifecycleHook lifecycle_;
     void note_lifecycle(std::string_view event) {
