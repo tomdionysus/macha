@@ -960,6 +960,15 @@ supersede earlier ones where they conflict.
   horizon; it never builds. Only the pass calls the builder. Builds stay
   sequential. Memoised, mergeable builds are a future experiment, not stage
   0 (Later stages).
+- **2026-10-03 (T5). The node is the control plane, and telemetry and
+  public connectivity stay in it** (operator: "continue", after it was
+  recommended). `NodeRuntime` keeps identity, transport (RPC client and
+  server, route dispatch), membership, telemetry, public connectivity,
+  identity resets and metadata announcements: each is transport-level, and
+  splitting them out would move state without removing a dependency. The
+  local stores, both serving sides, accounts and every service are built
+  by the root and handed what they use; nothing reaches them through the
+  node.
 - **2026-10-02. T0 accepted** (operator: "accept T0 if this isn't a
   problem", of the catalogue conflict loop Macha Client reported). The
   baseline is `object-ledger-evidence/t0/baseline.md`; its thin series are
