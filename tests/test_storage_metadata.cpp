@@ -121,6 +121,38 @@ MACHA_FAST_TEST("storage_metadata", test_retention_prune_cursor_cannot_starve_la
     CHECK(!retention.retained(RetentionClass::data, objects[0]));
 }
 
+// The presence check runs without the store's lock, so a claim made while it
+// runs is seen, and the row it revived is kept.
+MACHA_FAST_TEST("storage_metadata", test_retention_prune_keeps_a_row_claimed_while_it_checks_presence) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    RetentionStore retention(t.path() / "state", keys.storage);
+    const auto origin = random_node_id();
+
+    std::array<ObjectId, 2> objects{};
+    for (size_t i = 0; i < objects.size(); ++i)
+        objects[i].bytes.back() = static_cast<uint8_t>(i + 1);
+    for (const auto& id : objects)
+        retention.retain(RetentionClass::data, id, {origin, 1});
+    CHECK(retention.release_unreferenced(RetentionClass::data, {}, RetentionClock{{origin, 1}},
+                                         32) == objects.size());
+
+    auto exists = [&](const ObjectId& id) {
+        // Reads and writes the store from inside the check.
+        CHECK(!retention.retained(RetentionClass::data, id));
+        if (id == objects[0])
+            retention.retain(RetentionClass::data, id, {origin, 2});
+        return false;
+    };
+    CHECK(retention.prune_unclaimed(RetentionClass::data, exists, 8) == 1);
+    CHECK(retention.retained(RetentionClass::data, objects[0]));
+    // objects[1]'s row is gone: its old dot is no longer suppressed.
+    retention.retain(RetentionClass::data, objects[1], {origin, 1});
+    CHECK(retention.retained(RetentionClass::data, objects[1]));
+}
+
 MACHA_FAST_TEST("storage_metadata", test_retention_checkpoint_is_hash_sharded_and_restartable) {
     TempDir t;
     auto keyfile = t.path() / "key";

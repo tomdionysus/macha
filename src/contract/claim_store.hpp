@@ -38,21 +38,28 @@ class ClaimStore {
   public:
     virtual ~ClaimStore() = default;
 
-    // Claim writes: one durable journal frame each. Waits on the state device.
-    static constexpr Waits write_waits = Waits::state_device;
+    // Every operation takes the store's lock, which writes and compaction
+    // hold across their state-device I/O and nothing holds across DATA or
+    // network I/O.
+
+    // Claim writes: one durable journal frame per 65,536 ids.
+    static constexpr Waits write_waits = Waits::state_device | Waits::locks;
+    static constexpr ThreadSafety write_safety = ThreadSafety::thread_safe;
     virtual void retain(RetentionClass, const ObjectId&, const RetentionDot&) = 0;
     virtual void retain_batch(RetentionClass, const std::vector<ObjectId>&,
                               const RetentionDot&) = 0;
 
-    // Claim reads, from the in-memory map. Thread-safe; wait on nothing.
-    static constexpr Waits read_waits = Waits::none;
+    // Claim reads, from the in-memory map; `retained_ids` and
+    // `claim_objects` are linear in the class's claims.
+    static constexpr Waits read_waits = Waits::locks;
+    static constexpr ThreadSafety read_safety = ThreadSafety::thread_safe;
     virtual bool retained(RetentionClass, const ObjectId&) const = 0;
     virtual std::optional<ObjectId> next_retained(RetentionClass, std::optional<ObjectId>& cursor,
                                                   bool& complete) const = 0;
     virtual std::vector<ObjectId> retained_ids(RetentionClass) const = 0;
     virtual size_t claim_objects(RetentionClass) const = 0;
     // Diagnostic: the observed-remove state of one object, `adds` and
-    // `removed` keyed by origin. Empty when the object has no state.
+    // `removed` keyed by origin. Empty when the object has no state. A read.
     struct Claims {
         std::map<NodeId, uint64_t> adds;
         std::map<NodeId, uint64_t> removed;
@@ -61,16 +68,25 @@ class ClaimStore {
 
     // Release the claims a complete horizon no longer refers to and that its
     // clock has observed; `live` sorted and unique. Bounded; one journal
-    // frame per slice.
+    // frame per slice. Single owner (the maintenance pass): the store keeps
+    // the walk's position.
+    static constexpr Waits release_waits = write_waits;
+    static constexpr ThreadSafety release_safety = ThreadSafety::single_owner;
     virtual size_t release_unreferenced(RetentionClass, std::span<const ObjectId> live,
                                         const RetentionClock& observed,
                                         size_t operation_budget) = 0;
     // Forget causality tombstones once no claim remains and the object is
-    // absent. Bounded, cursor-based.
+    // absent. Bounded; journals nothing. `exists` is called without the lock,
+    // so this also waits on whatever `exists` waits on. Single owner (the
+    // maintenance pass): the store keeps the walk's position.
+    static constexpr Waits prune_waits = Waits::locks;
+    static constexpr ThreadSafety prune_safety = ThreadSafety::single_owner;
     virtual size_t prune_unclaimed(RetentionClass,
                                    const std::function<bool(const ObjectId&)>& exists,
                                    size_t operation_budget) = 0;
     // Compact the journal into checkpoint shards past a threshold.
+    static constexpr Waits compact_waits = Waits::state_device | Waits::locks;
+    static constexpr ThreadSafety compact_safety = ThreadSafety::thread_safe;
     virtual bool compact_if_needed(size_t record_threshold = 4096) = 0;
 };
 

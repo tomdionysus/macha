@@ -2261,7 +2261,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
         try {
             if (auto checkpoint = load(checkpoint_p_)) {
                 cur_ = *checkpoint;
-                committed_ = *checkpoint;
+                set_committed_locked(*checkpoint);
                 load_history();
                 ensure_history_root(committed_);
                 load_journal();
@@ -2292,7 +2292,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
     try {
         if (auto checkpoint = load(checkpoint_p_)) {
             cur_ = *checkpoint;
-            committed_ = *checkpoint;
+            set_committed_locked(*checkpoint);
             load_history();
             ensure_history_root(committed_);
             load_journal();
@@ -2316,7 +2316,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
 
         if (!current) {
             cur_ = genesis_metadata();
-            committed_ = cur_;
+            set_committed_locked(cur_);
             reset_checkpoint(committed_);
             load_history();
             ensure_history_root(committed_);
@@ -2333,7 +2333,7 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
             throw std::runtime_error("metadata current/committed generation conflict");
 
         cur_ = *committed;
-        committed_ = *committed;
+        set_committed_locked(*committed);
         if (current->hash != committed->hash) {
             writefile(journal_p_, {});
             journal_records_ = 0;
@@ -2376,7 +2376,7 @@ void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::s
     }
 
     cur_ = seed;
-    committed_ = seed;
+    set_committed_locked(seed);
     reset_checkpoint(seed);
     load_history();
     ensure_history_root(seed);
@@ -2424,9 +2424,8 @@ uint64_t MetadataReplica::generation() const {
     return cur_.generation;
 }
 
-uint64_t MetadataReplica::committed_generation() const {
-    std::lock_guard g(m_);
-    return committed_.generation;
+uint64_t MetadataReplica::committed_generation() const noexcept {
+    return committed_generation_.load(std::memory_order_acquire);
 }
 
 bool MetadataReplica::recovery_required() const {
@@ -2701,7 +2700,7 @@ void MetadataReplica::load_journal() {
                     break;
                 if (record.generation != cur_.generation || record.hash != cur_.hash)
                     throw std::runtime_error("commit does not match current");
-                committed_ = cur_;
+                set_committed_locked(cur_);
                 pending_history_.reset();
                 break;
             default:
@@ -3319,7 +3318,7 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
 
     // `committed_` is only the preferred materialised head; authority is the
     // accepted-head set, and moving it deletes no branch from history.
-    committed_ = *selected;
+    set_committed_locked(*selected);
     cur_ = committed_;
     pending_history_.reset();
     pending_recovered_ = false;
@@ -4474,7 +4473,7 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
                 append_history(history_for_current());
         }
         append_journal(JOURNAL_COMMIT, cur_);
-        committed_ = cur_;
+        set_committed_locked(cur_);
         pending_history_.reset();
         set_legacy_committed_head_locked(committed_);
         return true;
@@ -4499,7 +4498,7 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
     pending_history_ = history_for_current(encoded_delta);
     append_history(*pending_history_);
     append_journal(JOURNAL_COMMIT, cur_);
-    committed_ = cur_;
+    set_committed_locked(cur_);
     pending_history_.reset();
     set_legacy_committed_head_locked(committed_);
     return true;
@@ -4522,7 +4521,7 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     }
 
     cur_ = record;
-    committed_ = record;
+    set_committed_locked(record);
     reset_checkpoint(record);
     load_history();
     ensure_history_root(record);
@@ -4658,7 +4657,7 @@ bool MetadataReplica::remember_committed(const MetadataRecord& record) {
             append_history(history_for_current());
     }
     append_journal(JOURNAL_COMMIT, cur_);
-    committed_ = cur_;
+    set_committed_locked(cur_);
     pending_history_.reset();
     pending_recovered_ = false;
     set_legacy_committed_head_locked(committed_);
@@ -4685,7 +4684,7 @@ bool MetadataReplica::remember_current_committed(uint64_t generation, const Hash
             append_history(history_for_current());
     }
     append_journal(JOURNAL_COMMIT, cur_);
-    committed_ = cur_;
+    set_committed_locked(cur_);
     pending_history_.reset();
     pending_recovered_ = false;
     set_legacy_committed_head_locked(committed_);

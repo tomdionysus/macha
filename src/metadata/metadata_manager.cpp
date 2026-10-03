@@ -1539,7 +1539,7 @@ MetadataRecord MetadataManager::read_record() {
 }
 
 MetadataSnapshotView MetadataManager::snapshot_view(const WorkContext& context) {
-    (void)WaitGuard::enter(context, Waits::state_device | Waits::network,
+    (void)WaitGuard::enter(context, MetadataView::converged_waits,
                            "MetadataManager::snapshot_view");
     return snapshot_view();
 }
@@ -2052,6 +2052,7 @@ MetadataManager::entries(const MetadataSnapshotView& view, Cursor<std::string> f
                          Budget& budget) {
     if (!namespace_store_)
         return namespace_entries(*view.snapshot, nullptr, std::move(from), budget);
+    (void)WaitGuard::enter(budget.context(), entries_waits, "MetadataManager::entries");
     auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_);
     return namespace_entries(*view.snapshot, &nodes, std::move(from), budget);
 }

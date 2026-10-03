@@ -60,24 +60,30 @@ struct MetadataMutationTiming {
     uint64_t publish_ms_max{};
 };
 
+// Every operation is thread-safe. "Locks" are the replica's, which its
+// commits hold across state-device I/O, and the manager's mutation lock,
+// which repair and history checkpoints hold across network calls.
 class MetadataView {
   public:
     virtual ~MetadataView() = default;
+    static constexpr ThreadSafety safety = ThreadSafety::thread_safe;
 
     // The newest decoded snapshot this node holds, or none before the first.
-    // Never reads: thread-safe, waits on nothing.
+    // Never reads.
     static constexpr Waits current_waits = Waits::none;
     virtual std::optional<MetadataSnapshotView> current() const = 0;
 
     // The snapshot at the newest generation known: the cache when current,
     // else read from the replicas. With a work context, the wait guard
     // refuses work that may not wait on the network.
-    static constexpr Waits converged_waits = Waits::state_device | Waits::network;
+    static constexpr Waits converged_waits =
+        Waits::state_device | Waits::network | Waits::locks;
     virtual MetadataSnapshotView converged() = 0;
     virtual MetadataSnapshotView converged(const WorkContext&) = 0;
 
     // The generation and namespace revision of current(), without taking the
-    // view. Waits on nothing.
+    // view. Atomic reads.
+    static constexpr Waits generation_waits = Waits::none;
     virtual uint64_t current_generation() const noexcept = 0;
     virtual uint64_t current_namespace_revision() const noexcept = 0;
 
@@ -88,22 +94,27 @@ class MetadataView {
 
     // A page of `view`'s namespace entries after `from`, in path order, one
     // budget operation per entry (namespace_entries over this node's control
-    // store). Waits on the state device for tree nodes.
-    static constexpr Waits entries_waits = Waits::state_device;
+    // store). Tree nodes this node lacks are fetched from peers.
+    static constexpr Waits entries_waits = Waits::state_device | Waits::network | Waits::locks;
     virtual Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) = 0;
 
     // The snapshot at the sole accepted head, which retention release reads;
-    // none while heads diverge. Waits on nothing.
-    static constexpr Waits release_head_waits = Waits::none;
+    // none while heads diverge. A head not yet materialised is rebuilt from
+    // the replica's history file.
+    static constexpr Waits release_head_waits = Waits::state_device | Waits::locks;
     virtual std::optional<MetadataSnapshotView> release_head() const = 0;
 
     // Whether the cluster's metadata is stable, available and writable.
+    // Atomic reads, each field current on its own.
     static constexpr Waits status_waits = Waits::none;
     virtual MetadataClusterStatus status() const noexcept = 0;
 
     // A metadata commit through the replicas, retried on a concurrent one.
-    static constexpr Waits mutate_waits = Waits::state_device | Waits::network;
+    // Its publication barrier checks DATA presence and re-replicates objects
+    // short of their floor.
+    static constexpr Waits mutate_waits =
+        Waits::state_device | Waits::data_device | Waits::network | Waits::locks;
     virtual MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&,
                                   size_t retries = 8) = 0;
     virtual MetadataRecord mutate_delta(
@@ -115,7 +126,8 @@ class MetadataView {
     virtual bool resolve_conflict(const std::string& id, std::string_view choice) = 0;
 
     // Diagnostics for Status: conflicts superseded and resolved since start,
-    // and where mutation time goes. Waits on nothing.
+    // and where mutation time goes. Atomic reads.
+    static constexpr Waits diagnostics_waits = Waits::none;
     virtual uint64_t conflicts_superseded() const noexcept = 0;
     virtual uint64_t conflicts_resolved() const noexcept = 0;
     virtual MetadataMutationTiming mutation_timing() const noexcept = 0;
@@ -128,21 +140,27 @@ class MetadataView {
 class MetadataMaintenance {
   public:
     virtual ~MetadataMaintenance() = default;
+    static constexpr ThreadSafety safety = ThreadSafety::single_owner;
 
     // One repair step: converge the replicas toward the accepted heads.
-    static constexpr Waits repair_step_waits = Waits::state_device | Waits::network;
+    static constexpr Waits repair_step_waits =
+        Waits::state_device | Waits::network | Waits::locks;
     virtual void repair_step() = 0;
     // Records whether the last replica-set validation succeeded, and why
-    // not; Status reads it.
-    static constexpr Waits note_validation_waits = Waits::none;
+    // not; Status reads it. Takes the membership lock, which membership holds
+    // while it persists the known peers.
+    static constexpr Waits note_validation_waits = Waits::locks;
     virtual void note_replica_validation(bool available, std::string_view reason = {}) = 0;
     // Repairs accepted heads the local replica cannot reconstruct, from
     // peers; returns how many.
-    static constexpr Waits repair_heads_waits = Waits::state_device | Waits::network;
+    static constexpr Waits repair_heads_waits =
+        Waits::state_device | Waits::network | Waits::locks;
     virtual size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control) = 0;
     // One round toward re-rooting local history at a checkpoint, gated on
-    // its thresholds.
-    static constexpr Waits checkpoint_waits = Waits::state_device | Waits::network;
+    // its thresholds. Holds the mutation lock throughout, so commits wait for
+    // the round.
+    static constexpr Waits checkpoint_waits =
+        Waits::state_device | Waits::network | Waits::locks;
     virtual void attempt_history_checkpoint(size_t record_threshold = 256,
                                             uint64_t byte_threshold = 64ULL * 1024 * 1024) = 0;
 };

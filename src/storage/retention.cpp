@@ -752,46 +752,58 @@ size_t RetentionStore::prune_unclaimed(
     size_t operation_budget) {
     if (!operation_budget || !exists)
         return 0;
-    std::lock_guard lock(mutex_);
-    auto& state = state_for(type);
-    auto& cursor = prune_cursor_for(type);
-    if (state.empty()) {
-        cursor.reset();
-        return 0;
-    }
-
-    auto it = cursor ? state.upper_bound(*cursor) : state.begin();
-    if (it == state.end())
-        it = state.begin();
-    const auto start_id = it->first;
-    bool wrapped = false;
-    size_t examined = 0;
-    size_t removed = 0;
-    while (!state.empty() && examined < operation_budget) {
-        if (it == state.end()) {
-            if (wrapped)
-                break;
-            it = state.begin();
-            wrapped = true;
-            if (it == state.end())
-                break;
+    // Three steps, so `exists` (which may read a device) runs without mutex_:
+    // pick the unclaimed rows under the lock, ask the store without it, then
+    // erase under the lock only what is still unclaimed.
+    std::vector<ObjectId> unclaimed;
+    {
+        std::lock_guard lock(mutex_);
+        auto& state = state_for(type);
+        auto& cursor = prune_cursor_for(type);
+        if (state.empty()) {
+            cursor.reset();
+            return 0;
         }
-        if (wrapped && it->first == start_id)
-            break;
 
-        ++examined;
-        const auto id = it->first;
-        const bool erase = it->second.adds.empty() && !exists(id);
-        if (erase) {
-            it = state.erase(it);
-            ++removed;
-        } else {
+        auto it = cursor ? state.upper_bound(*cursor) : state.begin();
+        if (it == state.end())
+            it = state.begin();
+        const auto start_id = it->first;
+        bool wrapped = false;
+        size_t examined = 0;
+        while (examined < operation_budget) {
+            if (it == state.end()) {
+                if (wrapped)
+                    break;
+                it = state.begin();
+                wrapped = true;
+            }
+            if (wrapped && it->first == start_id)
+                break;
+            ++examined;
+            if (it->second.adds.empty())
+                unclaimed.push_back(it->first);
+            cursor = it->first;
             ++it;
         }
-        cursor = id;
+    }
+
+    std::erase_if(unclaimed, [&](const ObjectId& id) { return exists(id); });
+    if (unclaimed.empty())
+        return 0;
+
+    std::lock_guard lock(mutex_);
+    auto& state = state_for(type);
+    size_t removed = 0;
+    for (const auto& id : unclaimed) {
+        auto it = state.find(id);
+        if (it != state.end() && it->second.adds.empty()) {
+            state.erase(it);
+            ++removed;
+        }
     }
     if (state.empty())
-        cursor.reset();
+        prune_cursor_for(type).reset();
     return removed;
 }
 

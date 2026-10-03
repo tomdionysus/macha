@@ -926,6 +926,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
     }
     std::string temp;
     int fd = -1;
+    bool reserved = true;
     try {
         if (before_write)
             before_write(id);
@@ -949,6 +950,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         if (::close(fd) != 0) throw std::runtime_error(strerror(errno));
         fd = -1;
         if (::rename(temp.c_str(), p.c_str()) != 0) throw std::runtime_error(strerror(errno));
+        temp.clear();
         const auto installed_stamp = loose_stamp(p);
         if (!installed_stamp)
             throw std::runtime_error("cannot stat installed local object");
@@ -956,6 +958,7 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         if (reserved_write_bytes_ < need)
             throw std::logic_error("local store write reservation underflow");
         reserved_write_bytes_ -= need;
+        reserved = false;
         used_.fetch_add(need, std::memory_order_relaxed);
         remember_verified_loose_locked(id, *installed_stamp);
         presence_.installed(id);
@@ -980,9 +983,11 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
             std::filesystem::remove(temp, remove_error);
         if (!lock.owns_lock())
             lock.lock();
-        if (reserved_write_bytes_ < need)
-            throw std::logic_error("local store write reservation underflow during failure");
-        reserved_write_bytes_ -= need;
+        if (reserved) {
+            if (reserved_write_bytes_ < need)
+                throw std::logic_error("local store write reservation underflow during failure");
+            reserved_write_bytes_ -= need;
+        }
         throw;
     }
 }
@@ -1222,8 +1227,6 @@ bool LocalStore::has(const ObjectId& id) const noexcept {
         if (present) {
             std::lock_guard lock(m_);
             presence_.observed(id);
-        } else if (!error) {
-            (void)prune_empty_loose(id, p);
         }
         return present;
     } catch (...) {
@@ -1742,40 +1745,55 @@ std::optional<ObjectId> object_id_from_file_name(std::string_view name) {
 } // namespace
 
 void LocalStore::warm_presence_index(std::stop_token stop) {
-    const auto started = Clock::now();
-    std::error_code error;
-    std::vector<ObjectId> batch;
-    batch.reserve(4096);
-    uint64_t entries = 0;
-    const auto flush = [&] {
-        if (batch.empty()) return;
-        std::lock_guard lock(m_);
-        presence_.listed(batch);
-        entries += batch.size();
-        batch.clear();
-    };
-    // Directory names only: readdir supplies the file type, so nothing here
-    // stats an object. The scan (when it runs) does the same as it walks.
-    for (auto it = std::filesystem::recursive_directory_iterator(objects_, error);
-         !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
-        if (stop.stop_requested()) return;
-        if (it.depth() < 2) continue;
-        if (auto id = object_id_from_file_name(it->path().filename().string())) {
-            batch.push_back(*id);
-            if (batch.size() >= 4096) flush();
+    // Until a walk completes, has() asks the device on a miss; a failed walk
+    // is retried, backing off to five minutes, so that stays temporary.
+    auto backoff = std::chrono::seconds(1);
+    while (!stop.stop_requested()) {
+        const auto started = Clock::now();
+        std::error_code error;
+        std::vector<ObjectId> batch;
+        batch.reserve(4096);
+        uint64_t entries = 0;
+        const auto flush = [&] {
+            if (batch.empty()) return;
+            std::lock_guard lock(m_);
+            presence_.listed(batch);
+            entries += batch.size();
+            batch.clear();
+        };
+        // Directory names only: readdir supplies the file type, so nothing here
+        // stats an object. The scan (when it runs) does the same as it walks.
+        for (auto it = std::filesystem::recursive_directory_iterator(objects_, error);
+             !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+            if (stop.stop_requested()) return;
+            if (it.depth() < 2) continue;
+            if (auto id = object_id_from_file_name(it->path().filename().string())) {
+                batch.push_back(*id);
+                if (batch.size() >= 4096) flush();
+            }
         }
+        flush();
+        presence_index_entries_.store(entries, std::memory_order_relaxed);
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    Clock::now() - started).count();
+        if (!error) {
+            {
+                std::lock_guard lock(m_);
+                presence_.warmed();
+            }
+            Log::debug("storage presence index warmed path=" + root_.string() +
+                       " objects=" + std::to_string(entries) +
+                       " elapsed_ms=" + std::to_string(elapsed_ms));
+            return;
+        }
+        Log::warn("storage presence index walk failed path=" + root_.string() +
+                  " error=" + error.message() + " retry_s=" + std::to_string(backoff.count()));
+        std::mutex wait_mutex;
+        std::condition_variable_any wait_cv;
+        std::unique_lock wait_lock(wait_mutex);
+        wait_cv.wait_for(wait_lock, stop, backoff, [] { return false; });
+        backoff = std::min<std::chrono::seconds>(backoff * 2, std::chrono::minutes(5));
     }
-    flush();
-    presence_index_entries_.store(entries, std::memory_order_relaxed);
-    if (!error) {
-        std::lock_guard lock(m_);
-        presence_.warmed();
-    }
-    Log::debug("storage presence index warmed path=" + root_.string() +
-               " objects=" + std::to_string(entries) + " elapsed_ms=" +
-               std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  Clock::now() - started).count()) +
-               (error ? " error=" + error.message() : std::string{}));
 }
 
 void LocalStore::scan(std::stop_token stop) {
@@ -1842,7 +1860,7 @@ void LocalStore::scan(std::stop_token stop) {
         }
     }
     {
-        std::lock_guard lock(m_);
+        std::unique_lock lock(m_);
         // Writes admitted against the estimate during the walk may or may
         // not have been seen by it; keep the larger figure (over-counting is
         // the safe direction, and bounded by what was written meanwhile).
@@ -1853,8 +1871,28 @@ void LocalStore::scan(std::stop_token stop) {
         accounting_estimate_.store(false, std::memory_order_release);
         accounting_trusted_.store(true, std::memory_order_release);
         if (mode_ != LocalStoreMode::ephemeral) {
-            accounting_dirty_ = true;
-            checkpoint_accounting_locked();
+            // The clean checkpoint is written without m_, as
+            // ensure_accounting_dirty writes its marker: a writer meanwhile
+            // finds the store clean, waits for this write, then marks it dirty.
+            accounting_state_cv_.wait(lock, [this] { return !accounting_dirty_in_progress_; });
+            accounting_dirty_in_progress_ = true;
+            accounting_dirty_ = false;
+            const auto used = used_.load(std::memory_order_relaxed);
+            lock.unlock();
+            std::exception_ptr failure;
+            try {
+                ObjectId none{};
+                persist_accounting(used, accounting_none, none, 0, true);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            lock.lock();
+            if (failure)
+                accounting_dirty_ = true;
+            accounting_dirty_in_progress_ = false;
+            accounting_state_cv_.notify_all();
+            if (failure)
+                std::rethrow_exception(failure);
         }
     }
     scan_complete_.store(true, std::memory_order_release);
