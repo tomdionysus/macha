@@ -123,3 +123,30 @@ Suites on fi-1 before install: 703 + 17 + 21 (`7d9ef27`). Tarball md5
 - A session created on fi-1 (0.79.0) was honoured by gbni-1 (0.75.0) at
   once (HTTP 200); revoking it on fi-1 had gbni-1 refuse it within 6 s
   (401). Status normal on both nodes.
+
+## 0.79.0 on gbni-1 (2026-10-03)
+
+Same tarball as fi-1's 0.79.0 (installed library md5 identical); backup
+`/root/macha-0.75.0-installed.tgz`. Installed 08:25Z, healthy at once,
+writable at generation 65164; no warnings or errors on either node after.
+
+## 0.80.0 on both nodes (2026-10-03)
+
+T5.16-T5.18: the filesystem without the node, the replica built with its
+namespace applier, the contract audit and its fixes. Suites on fi-1 before
+install: 704 + 17 + 21 (`3cbe49c`). Tarball md5
+`f5228be744aea6dedd9b9789de802da2`; backups `/root/macha-0.79.0-installed.tgz`
+on both.
+
+- fi-1 09:44:09Z, gbni-1 09:52:39Z (eight minutes apart, no playback on
+  either): healthy and writable at generation 65164; every startup plane
+  ready, both nodes ready, plugins running with no restarts; no warnings
+  or errors on either beyond fi-1's standing edge-node note and the known
+  torrent alert overflow.
+- Presence warm-up: control stores in 61 ms (fi-1) and 191 ms (gbni-1);
+  fi-1's DATA store (99,694 objects) in 28.6 s.
+- A read through fi-1's FUSE of Men In Black 1: 16 MiB from 200 MiB in
+  18.4 s while the DATA warm-up was running (a DATA pressure onset at
+  09:44:27Z), the same range again at 299 MB/s, then EIO at 216 MiB.
+  gbni-1, still on 0.79.0, returned nothing at 216 MiB and 4 of 8 MiB at
+  100 MiB: the missing extents already recorded, not this release.
