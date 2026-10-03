@@ -183,6 +183,10 @@ class Service {
         wait_services_ready();
         return services_->files_api();
     }
+    CatalogueApi& catalogue_api() {
+        wait_services_ready();
+        return services_->catalogue_api();
+    }
     CatalogueHintQueue& catalogue_hints() {
         wait_services_ready();
         return services_->catalogue_hints();

@@ -68,11 +68,14 @@ class AvailabilityService {
 
     // Brings the roll-up and the survey up to `head` if something that could
     // change the answer has happened since the last. The roll-up is rebuilt
-    // when the namespace or this node's holdings changed, held to a
-    // `rollup_share` duty cycle. Peers are asked again when the roll-up was
-    // rebuilt, the membership changed, a peer's storage shrank, a peer's
-    // storage grew while something was unavailable or unknown, or a peer that
-    // could not answer is due another try. Returns
+    // when the namespace or this node's holdings changed, held to a `share`
+    // duty cycle and not begun while the store's presence index is still
+    // filling. Peers are asked again when the namespace changed or this node
+    // lost something, the membership changed, or a peer's storage shrank; at
+    // the duty cycle when a peer's storage grew while something was
+    // unavailable or unknown; and when a peer that could not answer answers
+    // a one-node probe. A roll-up after a gain alone asks nobody: what this
+    // node gained was already available. Returns
     // whether a survey ran. `pause` is called between tree nodes. Reads tree
     // nodes, fetching from peers those this node lacks, and asks peers about
     // theirs. Single owner: the maintenance pass.
@@ -97,9 +100,13 @@ class AvailabilityService {
         return current && current->survey.is_unavailable(id);
     }
 
-    // A roll-up walks the whole namespace, so the next waits this many times
-    // the last one's cost: a twentieth of the pass's time at most.
-    static constexpr int rollup_share = 20;
+    // A roll-up or a survey walks the namespace, so the next of each waits
+    // this many times the last one's cost: a twentieth of the pass's time.
+    static constexpr int share = 20;
+    // While the presence index fills, a roll-up would read the device once
+    // per extent: it waits, checking this often, for at most this long.
+    static constexpr std::chrono::seconds cold_retry{5};
+    static constexpr std::chrono::minutes cold_patience{30};
     static constexpr std::chrono::seconds retry_floor{1};
     static constexpr std::chrono::minutes retry_ceiling{5};
 
@@ -138,6 +145,9 @@ class AvailabilityService {
     uint64_t rolled_storage_events_{};
     Clock::time_point rolled_at_{};
     Clock::duration rolled_cost_{};
+    Clock::time_point surveyed_at_{};
+    Clock::duration surveyed_cost_{};
+    std::optional<Clock::time_point> cold_since_;
     // A peer that could not answer is asked again after this, doubling to
     // retry_ceiling; an answer clears it.
     Clock::duration retry_backoff_{};

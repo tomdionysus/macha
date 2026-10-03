@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "api/files_api.hpp"
 
+#include "api/item_availability.hpp"
+
 #include <cerrno>
 
 namespace macha {
@@ -48,16 +50,13 @@ void put_availability(Json::Object& out, const AvailabilitySnapshot* snapshot,
         out["extents_local"] = Json(nullptr);
         out["extents_unavailable"] = Json(nullptr);
         out["extents_unknown"] = Json(nullptr);
-        out["availability"] = "unknown";
     } else {
         out["extents"] = facts->extents;
         out["extents_local"] = facts->extents_local;
         out["extents_unavailable"] = facts->extents_unavailable;
         out["extents_unknown"] = facts->extents_unknown;
-        out["availability"] = facts->extents_unavailable ? "partial"
-                              : facts->extents_unknown   ? "unknown"
-                                                         : "complete";
     }
+    out["availability"] = availability_name(availability_of(facts));
     out["surveyed_generation"] = snapshot ? Json(snapshot->generation) : Json(nullptr);
     out["surveyed_unix_ms"] = snapshot ? Json(snapshot->surveyed_unix_ms) : Json(nullptr);
 }

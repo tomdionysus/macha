@@ -129,6 +129,7 @@ class StoragePool final : public ObjectStore {
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const override;
     uint64_t losses() const noexcept override;
+    bool indexed() const noexcept override;
     bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;

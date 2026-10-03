@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_support.hpp"
 
+#include "api/item_availability.hpp"
 #include "ledger/availability.hpp"
 #include "metadata/namespace_tree.hpp"
 
@@ -486,6 +487,132 @@ MACHA_FAST_TEST("availability", test_questions_and_answers_survive_the_wire) {
     CHECK(too_many);
 }
 
+MACHA_FAST_TEST("availability", test_a_files_code_follows_its_extent_counts) {
+    CHECK(availability_of(nullptr) == Availability::unknown);
+    PathAvailability facts;
+    CHECK(availability_of(&facts) == Availability::complete); // no extents: nothing needed
+    facts.extents = 4;
+    facts.extents_local = 4;
+    CHECK(availability_of(&facts) == Availability::complete);
+    facts.extents_local = 1; // the rest on a peer
+    CHECK(availability_of(&facts) == Availability::complete);
+    facts.extents_unknown = 1;
+    CHECK(availability_of(&facts) == Availability::unknown);
+    facts.extents_unavailable = 1; // definitely short, whatever is undecided
+    CHECK(availability_of(&facts) == Availability::partial);
+    facts.extents_unknown = 0;
+    facts.extents_unavailable = 4;
+    CHECK(availability_of(&facts) == Availability::unavailable);
+    CHECK(std::string(availability_name(Availability::unavailable)) == "unavailable");
+}
+
+MACHA_FAST_TEST("availability", test_items_take_their_best_file_and_sets_count_their_members) {
+    AvailabilitySnapshot survey;
+    const auto file = [&](const std::string& hash, uint64_t extents, uint64_t unavailable,
+                          uint64_t unknown = 0) {
+        PathAvailability facts;
+        facts.extents = extents;
+        facts.extents_unavailable = unavailable;
+        facts.extents_unknown = unknown;
+        facts.hash = hash;
+        survey.paths["/" + hash] = facts;
+        survey.by_hash.emplace(hash, "/" + hash);
+    };
+    file("macha:whole", 4, 0);
+    file("macha:holed", 4, 1);
+    file("macha:gone", 4, 4);
+    file("macha:undecided", 4, 0, 2);
+
+    CatalogueSnapshot catalogue;
+    const auto item = [&](const std::string& id, CatalogueKind kind,
+                          std::vector<std::string> media, std::optional<std::string> parent = {}) {
+        CatalogueItem value;
+        value.id = id;
+        value.kind = kind;
+        value.media_ids = std::move(media);
+        value.parent_id = std::move(parent);
+        catalogue.items[id] = value;
+    };
+    item("m-whole", CatalogueKind::movie, {"macha:whole"});
+    item("m-holed", CatalogueKind::movie, {"macha:holed"});
+    item("m-gone", CatalogueKind::movie, {"macha:gone"});
+    item("m-undecided", CatalogueKind::movie, {"macha:undecided"});
+    item("m-unsurveyed", CatalogueKind::movie, {"macha:never-seen"});
+    item("m-two-files", CatalogueKind::movie, {"macha:gone", "macha:whole"}); // any one plays
+    item("m-holed-or-gone", CatalogueKind::movie, {"macha:gone", "macha:holed"});
+    item("m-no-files", CatalogueKind::movie, {});
+
+    item("show", CatalogueKind::show, {});
+    item("s1", CatalogueKind::season, {}, "show");
+    item("s1e1", CatalogueKind::episode, {"macha:whole"}, "s1");
+    item("s1e2", CatalogueKind::episode, {"macha:gone"}, "s1");
+    item("s2", CatalogueKind::season, {}, "show");
+    item("s2e1", CatalogueKind::episode, {"macha:whole"}, "s2");
+    item("s3", CatalogueKind::season, {}, "show"); // nothing in it
+    item("lost-show", CatalogueKind::show, {});
+    item("lost-e1", CatalogueKind::episode, {"macha:gone"}, "lost-show");
+    item("new-show", CatalogueKind::show, {});
+    item("new-e1", CatalogueKind::episode, {"macha:whole"}, "new-show");
+    item("new-e2", CatalogueKind::episode, {"macha:undecided"}, "new-show");
+
+    const auto table = item_availability(catalogue, &survey);
+    REQUIRE(table.size() == catalogue.items.size());
+    const auto status = [&](const char* id) { return table.at(id).status; };
+    CHECK(status("m-whole") == Availability::complete);
+    CHECK(status("m-holed") == Availability::partial);
+    CHECK(status("m-gone") == Availability::unavailable);
+    CHECK(status("m-undecided") == Availability::unknown);
+    CHECK(status("m-unsurveyed") == Availability::unknown);
+    CHECK(status("m-two-files") == Availability::complete);
+    CHECK(status("m-holed-or-gone") == Availability::partial);
+    CHECK(status("m-no-files") == Availability::unknown);
+    CHECK(table.at("m-whole").members == 0);
+
+    // A season of one whole and one lost episode; the show adds a whole season.
+    CHECK((table.at("s1") == ItemAvailability{Availability::partial, 2, 1, 0, 1, 0}));
+    CHECK((table.at("s2") == ItemAvailability{Availability::complete, 1, 1, 0, 0, 0}));
+    CHECK((table.at("s3") == ItemAvailability{Availability::unknown, 0, 0, 0, 0, 0}));
+    CHECK((table.at("show") == ItemAvailability{Availability::partial, 3, 2, 0, 1, 0}));
+    CHECK((table.at("lost-show") == ItemAvailability{Availability::unavailable, 1, 0, 0, 1, 0}));
+    // Complete as far as is known, with one member undecided.
+    CHECK((table.at("new-show") == ItemAvailability{Availability::unknown, 2, 1, 0, 0, 1}));
+
+    // Nothing surveyed: every item is unknown, and sets still count members.
+    const auto blind = item_availability(catalogue, nullptr);
+    for (const auto& [id, entry] : blind)
+        CHECK(entry.status == Availability::unknown);
+    CHECK(blind.at("show").members == 3);
+
+    // A parent cycle ends instead of looping.
+    catalogue.items["show"].parent_id = "s1";
+    CHECK(item_availability(catalogue, &survey).size() == catalogue.items.size());
+}
+
+MACHA_FAST_TEST("availability", test_the_item_table_is_rebuilt_only_when_a_snapshot_changes) {
+    auto catalogue = std::make_shared<CatalogueSnapshot>();
+    CatalogueItem movie;
+    movie.id = "m";
+    movie.media_ids = {"macha:x"};
+    catalogue->items["m"] = movie;
+    auto survey = std::make_shared<AvailabilitySnapshot>();
+
+    ItemAvailabilityCache cache;
+    const auto first = cache.table(catalogue, survey);
+    CHECK(cache.table(catalogue, survey) == first);
+    CHECK(first->at("m").status == Availability::unknown);
+
+    auto surveyed = std::make_shared<AvailabilitySnapshot>();
+    PathAvailability facts;
+    facts.extents = 2;
+    facts.hash = "macha:x";
+    surveyed->paths["/x"] = facts;
+    surveyed->by_hash.emplace("macha:x", "/x");
+    const auto second = cache.table(catalogue, surveyed);
+    CHECK(second != first);
+    CHECK(second->at("m").status == Availability::complete);
+    CHECK(cache.table(catalogue, nullptr)->at("m").status == Availability::unknown);
+}
+
 // Two real nodes: the pass rolls up and surveys, a peer answers over RPC, and
 // the path table says what a reader would be told.
 MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
@@ -640,6 +767,74 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
                             {"/dir", "partial"}, {"/later.bin", "complete"}, {"/whole.bin", "complete"}}));
         CHECK(json(get("/api/v1/files/dir")).find("entries")->asArray().size() == 1);
         CHECK(json(get("/api/v1/files")).find("path")->asString() == "/");
+    }
+    {
+        // The same answer on catalogue items: a title with one holed file is
+        // partial; with a whole file as well it is complete; a set counts.
+        const auto media_id = json(get("/api/v1/files/dir/holed.bin")).find("media_id")->asString();
+        const auto whole_id = json(get("/api/v1/files/whole.bin")).find("media_id")->asString();
+        CatalogueItem show;
+        show.id = "test:show:availability";
+        show.kind = CatalogueKind::show;
+        show.title = "Availability";
+        first.catalogue().upsert(show);
+        CatalogueItem holed;
+        holed.id = "test:movie:holed";
+        holed.kind = CatalogueKind::movie;
+        holed.title = "Holed";
+        holed.media_ids = {media_id};
+        first.catalogue().upsert(holed);
+        CatalogueItem both = holed;
+        both.id = "test:movie:both";
+        both.title = "Both";
+        both.media_ids = {media_id, whole_id};
+        first.catalogue().upsert(both);
+
+        const auto item = [&](const std::string& id) {
+            HttpRequest request;
+            request.method = "GET";
+            request.path = "/api/v1/catalogue/items/" + id;
+            const auto response = first.catalogue_api().handle(request);
+            REQUIRE(response.status == 200);
+            return json(response);
+        };
+        // The survey is of the namespace, which these catalogue writes do
+        // not change, so the answers are already there.
+        CHECK(item("test:movie:holed").find("availability")->asString() == "partial");
+        CHECK(item("test:movie:holed").find("availability_members")->isNull());
+        CHECK(item("test:movie:both").find("availability")->asString() == "complete");
+        CHECK(item("test:show:availability").find("availability")->asString() == "unknown");
+
+        // A client that PUTs the whole item back echoes both fields: they
+        // are not part of the item, and are answered afresh.
+        {
+            auto echoed = item("test:movie:holed");
+            echoed.asObject()["availability"] = "complete";
+            echoed.asObject()["availability_members"] = Json::Object{{"total", 9}};
+            echoed.asObject()["title"] = "Holed again";
+            const auto body = echoed.dump();
+            HttpRequest put;
+            put.method = "PUT";
+            put.path = "/api/v1/catalogue/items/test:movie:holed";
+            put.body.assign(body.begin(), body.end());
+            const auto response = first.catalogue_api().handle(put);
+            REQUIRE(response.status == 200);
+            const auto saved = json(response);
+            CHECK(saved.find("title")->asString() == "Holed again");
+            CHECK(saved.find("availability")->asString() == "partial");
+            CHECK(saved.find("availability_members")->isNull());
+        }
+
+        HttpRequest list;
+        list.method = "GET";
+        list.path = "/api/v1/catalogue/items";
+        const auto listed = json(first.catalogue_api().handle(list));
+        size_t seen = 0;
+        for (const auto& entry : listed.find("items")->asArray()) {
+            CHECK(entry.find("availability") != nullptr);
+            ++seen;
+        }
+        CHECK(seen == 3);
     }
     CHECK(get("/api/v1/files/nowhere").status == 404);
     CHECK(get("/api/v1/files/dir", "macha:00").status == 400);

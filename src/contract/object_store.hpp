@@ -29,6 +29,13 @@ class ObjectStore {
     static constexpr Waits losses_waits = Waits::none;
     static constexpr ThreadSafety losses_safety = ThreadSafety::thread_safe;
     virtual uint64_t losses() const noexcept = 0;
+
+    // Whether has() now answers from the presence index alone: false while
+    // the index is still being filled after a start, when a miss costs a
+    // device read. A walk that asks has() of every object waits for this.
+    static constexpr Waits indexed_waits = Waits::none;
+    static constexpr ThreadSafety indexed_safety = ThreadSafety::thread_safe;
+    virtual bool indexed() const noexcept = 0;
 };
 
 } // namespace macha
