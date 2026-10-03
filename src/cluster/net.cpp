@@ -387,6 +387,8 @@ bool is_priority_data_message(MessageType type) {
     case MessageType::have_objects_reply:
     case MessageType::have_valid_objects:
     case MessageType::have_valid_objects_reply:
+    case MessageType::tree_holdings:
+    case MessageType::tree_holdings_reply:
     case MessageType::retain_objects:
     case MessageType::delete_object:
     case MessageType::get_metadata:
@@ -675,6 +677,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_control_objects";
     case MessageType::have_valid_objects:
         return "have_valid_objects";
+    case MessageType::tree_holdings:
+        return "tree_holdings";
     case MessageType::torrent_intent:
         return "torrent_intent";
     case MessageType::dial_request:
@@ -725,6 +729,8 @@ const char* message_type_name(MessageType type) noexcept {
         return "have_control_objects_reply";
     case MessageType::have_valid_objects_reply:
         return "have_valid_objects_reply";
+    case MessageType::tree_holdings_reply:
+        return "tree_holdings_reply";
     case MessageType::torrent_intent_reply:
         return "torrent_intent_reply";
     case MessageType::user_sync:
@@ -758,7 +764,7 @@ FrameType default_frame_type(MessageType type) noexcept {
     if (type == MessageType::get_control_object || type == MessageType::put_control_object ||
         type == MessageType::telemetry || type == MessageType::have_object ||
         type == MessageType::have_objects || type == MessageType::have_valid_objects ||
-        type == MessageType::retain_objects ||
+        type == MessageType::tree_holdings || type == MessageType::retain_objects ||
         type == MessageType::delete_object)
         return FrameType::speculative;
     return FrameType::control;
@@ -3210,7 +3216,9 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     std::map<uint64_t, FrameType> outbound_classes MACHA_GUARDED_BY(outbound_mutex);
     std::set<uint64_t> cancelled_outgoing MACHA_GUARDED_BY(outbound_mutex);
     std::atomic_uint64_t next_request{2}; // TCP acceptor owns even request IDs.
+    // Assigned by the accept thread, which stop() joins before it reads this.
     std::jthread reader;
+    // Assigned by the reader thread; the reaper reads it after joining that.
     std::jthread writer;
     RetainedMemoryLedger* retained_memory{};
 
@@ -3710,8 +3718,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             outbound_classes.clear();
             cancelled_outgoing.clear();
         }
-        if (writer.joinable())
-            writer.request_stop();
+        // The writer leaves on `done`; its handle is not read here.
         outbound_cv.notify_all();
     }
 };

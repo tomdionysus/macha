@@ -21,6 +21,14 @@ class ObjectStore {
     static constexpr Waits has_waits = Waits::data_device | Waits::locks;
     static constexpr ThreadSafety has_safety = ThreadSafety::thread_safe;
     virtual bool has(const ObjectId&) const = 0;
+
+    // Advances whenever an object this store held may no longer be held: a
+    // removal, an empty file pruned, a backend going away. Whatever was
+    // derived from has() before a change in it may be overtaken. An atomic
+    // read.
+    static constexpr Waits losses_waits = Waits::none;
+    static constexpr ThreadSafety losses_safety = ThreadSafety::thread_safe;
+    virtual uint64_t losses() const noexcept = 0;
 };
 
 } // namespace macha

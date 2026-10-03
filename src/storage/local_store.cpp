@@ -624,6 +624,7 @@ bool LocalStore::prune_empty_loose(const ObjectId& id, const std::filesystem::pa
         verified_loose_.erase(id);
         presence_.pruned(id);
     }
+    losses_.fetch_add(1, std::memory_order_release);
     Log::warn("storage pruned an empty object file id=" + to_string(id) + " path=" + p.string());
     return true;
 }
@@ -937,8 +938,14 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         reserved_write_bytes_ -= need;
         return false;
     }
-    if (!ephemeral)
-        ensure_accounting_dirty(lock);
+    if (!ephemeral) {
+        try {
+            ensure_accounting_dirty(lock);
+        } catch (...) {
+            reserved_write_bytes_ -= need;
+            throw;
+        }
+    }
     bool reserved = true;
     try {
         const auto p = path(id);
@@ -1023,7 +1030,14 @@ bool LocalStore::put_packed_locked(const ObjectId& id, std::span<const uint8_t> 
         reserved_write_bytes_ -= need;
         return false;
     }
-    if (!ephemeral) ensure_accounting_dirty(lock);
+    if (!ephemeral) {
+        try {
+            ensure_accounting_dirty(lock);
+        } catch (...) {
+            reserved_write_bytes_ -= need;
+            throw;
+        }
+    }
     PackEntry entry;
     uint64_t record_size = 0;
     try {
@@ -1270,6 +1284,7 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
         append_pack_record_locked(pack_remove, id, {}, unix_ms(), &tomb, &tomb_size, lock);
         pack_dead_bytes_ += found->second.record_size + tomb_size;
         packed_.erase(found);
+        losses_.fetch_add(1, std::memory_order_release);
         used_.fetch_add(tomb_size, std::memory_order_relaxed);
         provisional_generations_.erase(id);
         if (mode_ != LocalStoreMode::ephemeral && durability_domain_) {
@@ -1297,6 +1312,7 @@ bool LocalStore::remove_locked(const ObjectId& id, Lock& lock) {
             generation = durability_domain_->complete_mutation({}, p.parent_path());
     }
     if (error || !removed) return false;
+    losses_.fetch_add(1, std::memory_order_release);
     const auto before = used_.fetch_sub(size, std::memory_order_relaxed);
     if (size > before) {
         used_.fetch_add(size, std::memory_order_relaxed);

@@ -80,6 +80,8 @@ class StoragePool final : public ObjectStore {
     mutable std::atomic_int64_t diag_get_report_ns_{};
     mutable std::atomic_uint64_t full_list_scans_{};
     std::atomic_size_t online_backends_cached_{};
+    // Losses of backends that have gone, and one for each going.
+    mutable std::atomic_uint64_t retired_losses_{};
 
     void observe_get(size_t, uint64_t) const;
 
@@ -126,6 +128,7 @@ class StoragePool final : public ObjectStore {
     std::optional<DurabilityToken> reassert_durable(const ObjectId&);
     std::optional<Bytes> get(const ObjectId&) const;
     bool has(const ObjectId&) const override;
+    uint64_t losses() const noexcept override;
     bool valid(const ObjectId&) const;
     bool remove(const ObjectId&);
     std::vector<ObjectId> list() const;

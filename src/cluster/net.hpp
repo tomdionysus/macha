@@ -79,6 +79,13 @@ enum class MessageType : uint16_t {
     // copy reports absent. At most have_valid_objects_max ids. Reply:
     // have_valid_objects_reply; a peer that errors is probed per object.
     have_valid_objects = 47,
+    // The availability survey's question: for each namespace tree node id,
+    // how many extents lie beneath it, how many this node holds, and which
+    // of its children it holds whole. At most tree_holdings_max ids. Reply:
+    // tree_holdings_reply. A peer older than 0.82.0 drops a connection that
+    // carries it, so it is sent only to peers that advertise a version with
+    // it.
+    tree_holdings = 48,
     // A history hash's record as a self-contained full-body entry,
     // materialised by the server (get_metadata_history_entry returns the
     // stored frame, possibly a delta the caller cannot replay).
@@ -116,7 +123,8 @@ enum class MessageType : uint16_t {
     dial_back_probe_reply = 120,
     have_control_objects_reply = 121,
     torrent_intent_reply = 122,
-    have_valid_objects_reply = 123
+    have_valid_objects_reply = 123,
+    tree_holdings_reply = 124
 };
 
 // Each id in a have_valid_objects request is a full read on the peer, so a

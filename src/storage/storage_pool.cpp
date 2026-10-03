@@ -124,6 +124,8 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
         was_online = backend->online;
         log = backend->online || backend->last_error != reason;
         backend->online = false;
+        if (backend->store)
+            retired_losses_.fetch_add(backend->store->losses() + 1, std::memory_order_release);
         retired = std::move(backend->store);
         backend->durability_domain.reset();
         backend->instance_id = 0;
@@ -311,6 +313,9 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
                     (*existing)->cfg.reserve_free = cfg.reserve_free;
                     ++(*existing)->generation;
                     (*existing)->online = false;
+                    if ((*existing)->store)
+                        retired_losses_.fetch_add((*existing)->store->losses() + 1,
+                                                  std::memory_order_release);
                     retired.push_back(std::move((*existing)->store));
                 }
             }
@@ -321,6 +326,9 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
                 backend->configured = false;
                 backend->online = false;
                 ++backend->generation;
+                if (backend->store)
+                    retired_losses_.fetch_add(backend->store->losses() + 1,
+                                              std::memory_order_release);
                 retired.push_back(std::move(backend->store));
                 backend->last_error = "removed from configuration";
             }
@@ -660,6 +668,21 @@ bool StoragePool::valid(const ObjectId& id) const {
             return true;
     }
     return false;
+}
+
+uint64_t StoragePool::losses() const noexcept {
+    try {
+        uint64_t sum = retired_losses_.load(std::memory_order_acquire);
+        for (const auto& backend : snapshot()) {
+            Lock lock(backend->mutex);
+            if (backend->store)
+                sum += backend->store->losses();
+        }
+        return sum;
+    } catch (...) {
+        // Unanswerable is reported as a change.
+        return retired_losses_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
 }
 
 bool StoragePool::remove(const ObjectId& id) {

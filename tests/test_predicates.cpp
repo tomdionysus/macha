@@ -89,6 +89,7 @@ struct FakeLedger final : ObjectLedger {
     bool held(RetentionClass type, const ObjectId& id) const override {
         return type == RetentionClass::data && held_ids.contains(id);
     }
+    uint64_t held_losses(RetentionClass) const noexcept override { return 0; }
     InventoryHandle inventory() const override { return inventory_handle; }
     ReleaseHandle release() const override { return release_handle; }
     void publish(InventoryHandle) override {}

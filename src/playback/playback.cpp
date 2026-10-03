@@ -895,6 +895,8 @@ struct PlaybackManager::Impl {
     bool started{}; // the owner's, through start() and stop()
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles;
     MediaInformationService* media_information{};
+    // Set at construction, before any request.
+    PlaybackManager::MediaFacts extra_media_facts;
 
     static size_t probe_resident_weight(const MediaProbeResult& probe) {
         size_t bytes = sizeof(probe) + probe.format.capacity();
@@ -3608,6 +3610,8 @@ struct PlaybackManager::Impl {
                     {"bitrate", probe.bitrate},
                     {"streams", Json(std::move(streams))},
                     {"operations", Json(std::move(operations))}};
+                if (extra_media_facts)
+                    extra_media_facts(entry, lease.media_id);
                 reported.emplace_back(std::move(entry));
             } catch (const MediaError& e) {
                 last_error = e.what();
@@ -3822,10 +3826,13 @@ PlaybackManager::PlaybackManager(FileSystem& fs, TranscodeRateBook& transcode_ra
                                  CatalogueManager& catalogue, CatalogueApiConfig api,
                                  StreamingConfig streaming, std::shared_ptr<MediaEngine> engine,
                                  std::function<size_t(const std::vector<std::string>&)> request_profiles,
-                                 MediaInformationService* media_information)
+                                 MediaInformationService* media_information,
+                                 MediaFacts media_facts)
     : impl_(std::make_unique<Impl>(fs, transcode_rates, retained_memory, catalogue, std::move(api), std::move(streaming),
                                   std::move(engine), std::move(request_profiles),
-                                  media_information)) {}
+                                  media_information)) {
+    impl_->extra_media_facts = std::move(media_facts);
+}
 
 PlaybackManager::~PlaybackManager() { stop(); }
 

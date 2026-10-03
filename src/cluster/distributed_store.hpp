@@ -365,13 +365,16 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // cannot cover (credit_limited). should_yield is consulted between
     // operations, so a transfer in flight completes and is kept. With a
     // repair_position file the push pass resumes there after a restart
-    // (saved at most every 30 s and at each pass end).
+    // (saved at most every 30 s and at each pass end). An object `unavailable`
+    // names is one no reachable node holds: the pull pass moves past it
+    // without asking anyone, since nobody can supply it.
     uint64_t repair_once(uint64_t byte_budget = 0,
                          std::optional<std::span<const ObjectId>> live = std::nullopt);
     RepairResult repair_step(uint64_t byte_budget, size_t operation_budget,
                              std::optional<std::span<const ObjectId>> live = std::nullopt,
                              const std::function<bool()>& should_yield = {},
-                             uint64_t live_generation = 0);
+                             uint64_t live_generation = 0,
+                             const std::function<bool(const ObjectId&)>& unavailable = {});
     uint64_t scrub_once(uint64_t byte_budget = 0);
     RepairDiagnostics repair_diagnostics() const;
 

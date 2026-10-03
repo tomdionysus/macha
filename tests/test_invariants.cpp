@@ -2143,7 +2143,7 @@ MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesys
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
 
     const auto live_bytes = pattern(8192, 5);
     write_file(fs, "/live.bin", live_bytes);
@@ -2189,7 +2189,7 @@ MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
 
     const auto old_bytes = pattern(4096, 31);
     const auto new_bytes = pattern(4096, 32);
@@ -2232,7 +2232,7 @@ MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_g
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
     auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
 
     FsEntry dir;
     dir.type = EntryType::directory;
@@ -2529,7 +2529,7 @@ MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_ba
     fixture.start();
     REQUIRE(wait_until([&] { return fixture.node().local_store().online_backends() == 1; }));
 
-    CatalogueManager catalogue(fixture.node(), fixture.node().local_state(), fixture.node().metadata_server(), fixture.store(), fixture.metadata());
+    CatalogueManager catalogue(fixture.node(), fixture.node().local_state(), fixture.node().metadata_server(), fixture.store(), fixture.metadata(), fixture.node().ledger());
     DistributedStore::DurabilityBatch batch;
     const auto a = pattern(64 * 1024, 201);
     const auto b = pattern(64 * 1024, 202);
@@ -3577,7 +3577,7 @@ MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_ro
     auto& node = fixture.start();
     auto& store = fixture.store();
     auto& metadata = fixture.metadata();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata);
+    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
     catalogue.repair_once(); // establish a coherent empty cached catalogue
 
     const auto missing_root = object_id(pattern(32123, 11));
