@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "contract/thread_safety.hpp"
 #include "types.hpp"
 #include <filesystem>
 #include <mutex>
@@ -18,15 +20,16 @@ class Membership {
         Clock::time_point seen;
         std::optional<Clock::time_point> direct_seen;
     };
-    mutable std::mutex m_;
-    NodeInfo self_;
-    std::chrono::milliseconds dead_;
-    std::filesystem::path known_path_;
-    std::unordered_map<NodeId, R, NodeIdHash> nodes_;
-    std::unordered_map<std::string, IdentityAssociationReset> identity_resets_;
+    // Held while the known peers are persisted.
+    mutable IoMutex m_;
+    NodeInfo self_ MACHA_GUARDED_BY(m_);
+    const std::chrono::milliseconds dead_;
+    const std::filesystem::path known_path_;
+    std::unordered_map<NodeId, R, NodeIdHash> nodes_ MACHA_GUARDED_BY(m_);
+    std::unordered_map<std::string, IdentityAssociationReset> identity_resets_ MACHA_GUARDED_BY(m_);
 
-    void load_known();
-    void persist_known_locked() const;
+    void load_known() MACHA_REQUIRES(m_);
+    void persist_known_locked() const MACHA_REQUIRES(m_);
 
   public:
     Membership(NodeInfo, std::chrono::milliseconds, std::filesystem::path known_path = {});

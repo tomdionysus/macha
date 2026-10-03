@@ -21,7 +21,10 @@ template <typename T> T median(std::vector<T> values) {
 
 } // namespace
 
-TranscodeRateBook::TranscodeRateBook(std::filesystem::path path) : path_(std::move(path)) { load(); }
+TranscodeRateBook::TranscodeRateBook(std::filesystem::path path) : path_(std::move(path)) {
+    Lock lock(mutex_);
+    load();
+}
 
 uint32_t TranscodeRateBook::height_class(int height) noexcept {
     for (const uint32_t bound : {576U, 720U, 1080U, 1440U, 2160U})
@@ -32,7 +35,7 @@ uint32_t TranscodeRateBook::height_class(int height) noexcept {
 void TranscodeRateBook::record(const std::string& kind, const std::string& codec, uint32_t bit_depth,
                                uint32_t height_class, double rate, uint32_t concurrent) {
     if (!std::isfinite(rate) || rate <= 0.0 || codec.empty()) return;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& kept = observations_[Key{kind, codec, bit_depth, height_class}];
     const auto rate_milli = std::min(std::round(rate * 1000.0), 1e9);
     kept.push_back(Observation{static_cast<uint32_t>(rate_milli), concurrent});
@@ -41,7 +44,7 @@ void TranscodeRateBook::record(const std::string& kind, const std::string& codec
 }
 
 std::vector<TranscodeRate> TranscodeRateBook::summary() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<TranscodeRate> out;
     for (const auto& [key, kept] : observations_) {
         if (kept.empty()) continue;

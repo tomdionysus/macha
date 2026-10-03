@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "types.hpp"
 
 #include <array>
@@ -172,25 +174,27 @@ class TelemetryStore {
         Clock::time_point received{Clock::now()};
     };
 
-    mutable std::mutex mutex_;
-    std::map<NodeId, Record> records_;
-    std::map<NodeId, NodeTelemetry> persisted_;
-    std::map<std::string, IdentityAssociationReset, std::less<>> identity_resets_;
+    mutable Mutex mutex_;
+    std::map<NodeId, Record> records_ MACHA_GUARDED_BY(mutex_);
+    std::map<NodeId, NodeTelemetry> persisted_ MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, IdentityAssociationReset, std::less<>> identity_resets_ MACHA_GUARDED_BY(mutex_);
+    // Fixed at construction.
     NodeId self_{};
     NodeId boot_id_{};
     Clock::time_point started_{Clock::now()};
+    std::filesystem::path persisted_path_;
+    // The telemetry thread's own, written by refresh_local alone.
     Clock::time_point previous_cpu_wall_{Clock::now()};
     std::clock_t previous_cpu_{std::clock()};
     uint64_t sequence_{};
-    std::filesystem::path persisted_path_;
-    std::string node_name_;
-    std::optional<TrafficTotals> previous_traffic_;
-    Clock::time_point previous_traffic_at_{};
+    std::string node_name_ MACHA_GUARDED_BY(mutex_);
+    std::optional<TrafficTotals> previous_traffic_ MACHA_GUARDED_BY(mutex_);
+    Clock::time_point previous_traffic_at_ MACHA_GUARDED_BY(mutex_){};
 
   public:
     // Takes effect from the next sample.
     void set_node_name(std::string name) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         node_name_ = std::move(name);
     }
     TelemetryStore(NodeId self, std::filesystem::path persisted_path = {});

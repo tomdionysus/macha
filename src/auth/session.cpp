@@ -145,7 +145,7 @@ std::optional<AuthSession> SessionManager::validate(std::string_view token) cons
 }
 
 std::optional<AuthSession> SessionManager::find(const Hash256& token_hash) const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     auto found = by_token_hash_.find(token_hash);
     if (found == by_token_hash_.end())
         return std::nullopt;
@@ -174,7 +174,7 @@ std::optional<MintedSession> SessionManager::create(std::vector<std::string> rol
     session.version = 1;
 
     {
-        std::unique_lock lock(mutex_);
+        WriteLock lock(mutex_);
         if (by_token_hash_.size() >= max_sessions_)
             return std::nullopt;
         by_token_hash_[session.token_hash] = Record{session, Clock::now()};
@@ -183,7 +183,7 @@ std::optional<MintedSession> SessionManager::create(std::vector<std::string> rol
 }
 
 bool SessionManager::apply(AuthSession incoming) {
-    std::unique_lock lock(mutex_);
+    WriteLock lock(mutex_);
     auto found = by_token_hash_.find(incoming.token_hash);
     if (found != by_token_hash_.end()) {
         const auto& existing = found->second.session;
@@ -202,7 +202,7 @@ bool SessionManager::apply(AuthSession incoming) {
 }
 
 std::optional<AuthSession> SessionManager::revoke(const Hash256& token_hash) {
-    std::unique_lock lock(mutex_);
+    WriteLock lock(mutex_);
     auto found = by_token_hash_.find(token_hash);
     if (found == by_token_hash_.end())
         return std::nullopt;
@@ -214,7 +214,7 @@ std::optional<AuthSession> SessionManager::revoke(const Hash256& token_hash) {
 
 std::vector<AuthSession> SessionManager::recent(std::chrono::milliseconds max_age,
                                                 size_t max_records) const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     const auto now = Clock::now();
     std::vector<AuthSession> out;
     out.reserve(std::min(by_token_hash_.size(), max_records));
@@ -231,7 +231,7 @@ std::vector<AuthSession> SessionManager::recent(std::chrono::milliseconds max_ag
 }
 
 void SessionManager::prune_expired(uint64_t now_unix_ms) {
-    std::unique_lock lock(mutex_);
+    WriteLock lock(mutex_);
     std::erase_if(by_token_hash_, [&](const auto& item) {
         return item.second.session.expires_unix_ms <= now_unix_ms;
     });
@@ -242,7 +242,7 @@ void SessionManager::persist() {
         return;
     std::vector<AuthSession> values;
     {
-        std::shared_lock lock(mutex_);
+        ReadLock lock(mutex_);
         values.reserve(by_token_hash_.size());
         for (const auto& [_, record] : by_token_hash_)
             values.push_back(record.session);

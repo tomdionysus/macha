@@ -285,17 +285,17 @@ PublicConnectivity::PublicConnectivity(const Config& config, NodeId node_id, End
 }
 
 PublicConnectivity::~PublicConnectivity() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     remove_owned_mapping_locked();
 }
 
 PublicConnectivityStatus PublicConnectivity::status() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return status_;
 }
 
 PublicConnectivityStatus PublicConnectivity::refresh(bool should_probe, bool force_probe) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     refresh_locked();
     if (should_probe)
         probe_locked(force_probe);
@@ -303,7 +303,7 @@ PublicConnectivityStatus PublicConnectivity::refresh(bool should_probe, bool for
 }
 
 PublicConnectivityStatus PublicConnectivity::probe(bool force) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     probe_locked(force);
     return status_;
 }

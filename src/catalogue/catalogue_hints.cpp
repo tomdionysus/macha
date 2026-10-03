@@ -187,7 +187,7 @@ CatalogueHintQueue::CatalogueHintQueue(const std::filesystem::path& state_path)
 }
 
 void CatalogueHintQueue::load_state() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::ifstream in(state_file_, std::ios::binary);
     if (!in) return;
     std::ostringstream text;
@@ -242,7 +242,7 @@ void CatalogueHintQueue::persist_dirty_state_locked(bool force) {
 
 CatalogueHintQueue::~CatalogueHintQueue() {
     try {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         persist_dirty_state_locked(true);
     } catch (const std::exception& e) {
         Log::warn("catalogue hint state flush failed during shutdown: " +
@@ -255,7 +255,7 @@ std::vector<std::string> CatalogueHintQueue::submit_many(
     const auto now = now_ms();
     std::vector<std::string> ids;
     ids.reserve(submissions.size());
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     bool changed = false;
     for (auto& submission : submissions) {
         auto path = normalize_path(std::move(submission.path));
@@ -372,7 +372,7 @@ std::string CatalogueHintQueue::submit(std::string path, std::string source,
 
 std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
     const auto now = now_ms();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto best = hints_.end();
     uint64_t best_lane_served = UINT64_MAX;
     for (auto it = hints_.begin(); it != hints_.end(); ++it) {
@@ -406,7 +406,7 @@ std::optional<CatalogueHint> CatalogueHintQueue::claim_next() {
 
 std::optional<std::chrono::milliseconds> CatalogueHintQueue::next_ready_delay() const {
     const auto now = now_ms();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::optional<uint64_t> earliest;
     for (const auto& [_, hint] : hints_) {
         if (hint.state != CatalogueHintState::queued && hint.state != CatalogueHintState::deferred)
@@ -421,18 +421,18 @@ std::optional<std::chrono::milliseconds> CatalogueHintQueue::next_ready_delay() 
 }
 
 uint64_t CatalogueHintQueue::revision() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return revision_;
 }
 
 bool CatalogueHintQueue::wait_for_change(std::stop_token stop, uint64_t observed_revision,
                                          std::chrono::milliseconds timeout) {
-    std::unique_lock lock(mutex_);
+    Lock lock(mutex_);
     // Coalesced worker updates: the scanner waits here at least once a second
     // while active, so a dirty queue persists within two seconds; a crash
     // replays at most that window.
     persist_dirty_state_locked(false);
-    return change_cv_.wait_for(lock, stop, timeout, [&] {
+    return change_cv_.wait_for(lock.native(), stop, timeout, [&]() MACHA_REQUIRES(mutex_) {
         return revision_ != observed_revision;
     });
 }
@@ -441,7 +441,7 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
                                          std::string media_id,
                                          std::vector<std::string> catalogue_item_ids,
                                          std::string result) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
@@ -465,7 +465,7 @@ void CatalogueHintQueue::mark_catalogued(std::string_view id, std::string provid
 
 void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider,
                                        std::string media_id, std::string result) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
@@ -487,7 +487,7 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
 }
 
 void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_cursor) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
@@ -506,7 +506,7 @@ void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_curs
 
 void CatalogueHintQueue::defer(std::string_view id, std::string code, std::string error,
                                uint64_t retry_after_unix_ms) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
@@ -524,7 +524,7 @@ size_t CatalogueHintQueue::defer_matching(
     const std::function<bool(const CatalogueHint&)>& predicate,
     std::string code, std::string error, uint64_t retry_after_unix_ms) {
     const auto now = now_ms();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     size_t deferred = 0;
     for (auto& [_, hint] : hints_) {
         if (hint.state != CatalogueHintState::queued &&
@@ -552,7 +552,7 @@ size_t CatalogueHintQueue::defer_matching(
 bool CatalogueHintQueue::record_failure(std::string_view id, std::string code, std::string error,
                                         uint64_t retry_after_unix_ms,
                                         unsigned max_failures) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(),
                            [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return false;
@@ -580,7 +580,7 @@ bool CatalogueHintQueue::record_failure(std::string_view id, std::string code, s
 }
 
 void CatalogueHintQueue::fail(std::string_view id, std::string code, std::string error) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return;
     auto& hint = it->second;
@@ -598,7 +598,7 @@ void CatalogueHintQueue::fail(std::string_view id, std::string code, std::string
 }
 
 void CatalogueHintQueue::requeue_processing() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     bool changed = false;
     for (auto& [_, hint] : hints_) {
         if (hint.state != CatalogueHintState::processing) continue;
@@ -615,7 +615,7 @@ void CatalogueHintQueue::requeue_processing() {
 }
 
 std::vector<CatalogueHint> CatalogueHintQueue::list() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<CatalogueHint> out;
     out.reserve(hints_.size());
     for (const auto& [_, hint] : hints_) out.push_back(hint);
@@ -627,7 +627,7 @@ std::vector<CatalogueHint> CatalogueHintQueue::list() const {
 }
 
 std::optional<CatalogueHint> CatalogueHintQueue::get(std::string_view id) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return {};
     return it->second;
@@ -635,7 +635,7 @@ std::optional<CatalogueHint> CatalogueHintQueue::get(std::string_view id) const 
 
 CatalogueHintSummary CatalogueHintQueue::summary() const {
     CatalogueHintSummary out;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [_, hint] : hints_) {
         ++out.total;
         switch (hint.state) {
@@ -662,7 +662,7 @@ CatalogueHintSummary CatalogueHintQueue::summary() const {
 CatalogueHintSummary CatalogueHintQueue::summary(std::string_view source,
                                                  std::string_view source_ref) const {
     CatalogueHintSummary out;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [_, hint] : hints_) {
         if (!has_origin(hint, source, source_ref)) continue;
         ++out.total;
@@ -689,7 +689,7 @@ CatalogueHintSummary CatalogueHintQueue::summary(std::string_view source,
 }
 
 size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_view source_ref) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     size_t removed = 0;
     for (auto it = hints_.begin(); it != hints_.end();) {
         auto& origins = it->second.origins;
@@ -715,7 +715,7 @@ size_t CatalogueHintQueue::erase_origin(std::string_view source, std::string_vie
 }
 
 bool CatalogueHintQueue::erase(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(),
                            [&](const auto& pair) { return pair.second.id == id; });
     if (it == hints_.end()) return false;
@@ -729,7 +729,7 @@ bool CatalogueHintQueue::erase(std::string_view id) {
 size_t CatalogueHintQueue::erase_prefix(std::string_view path_value) {
     const auto path = normalize_path(std::string(path_value));
     const auto prefix = path == "/" ? std::string("/") : path + "/";
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     size_t removed = 0;
     for (auto it = hints_.begin(); it != hints_.end();) {
         if (it->first == path || it->first.starts_with(prefix)) {
@@ -754,7 +754,7 @@ size_t CatalogueHintQueue::rename_prefix(std::string_view source_value,
     if (source == destination) return 0;
     const auto prefix = source == "/" ? std::string("/") : source + "/";
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<std::pair<std::string, CatalogueHint>> moved;
     for (auto it = hints_.begin(); it != hints_.end();) {
         if (it->first != source && !it->first.starts_with(prefix)) {

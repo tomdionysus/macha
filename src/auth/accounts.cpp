@@ -80,7 +80,7 @@ void Accounts::stop() {
         return;
     gossip_.request_stop();
     {
-        std::lock_guard lock(events_.wait_mutex);
+        Lock lock(events_.wait_mutex);
     }
     events_.wait_cv.notify_all();
     gossip_.join();
@@ -158,8 +158,8 @@ void Accounts::gossip_loop(std::stop_token stop) {
         // The whole user table, tombstones included, so a node that missed a
         // deletion learns the tombstone rather than resurrecting the account.
         gossip_users_if_changed();
-        std::unique_lock lock(events_.wait_mutex);
-        events_.wait_cv.wait_for(lock, stop, interval, [&] {
+        Lock lock(events_.wait_mutex);
+        events_.wait_cv.wait_for(lock.native(), stop, interval, [&] {
             return events_.count(NodeEvent::topology) != topology;
         });
     }

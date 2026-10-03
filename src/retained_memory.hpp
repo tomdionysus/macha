@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -112,23 +114,23 @@ class RetainedMemoryLedger {
     uint64_t viewer_reserve_bytes_{};
     uint64_t loader_reserve_bytes_{};
     uint64_t reassembly_reserve_bytes_{};
-    mutable std::mutex mutex_;
+    mutable Mutex mutex_;
     std::condition_variable cv_;
-    std::map<uint64_t, Allocation> allocations_;
-    uint64_t next_id_{1};
-    uint64_t used_bytes_{};
-    uint64_t reclaimable_bytes_{};
-    uint64_t lower_durable_bytes_{};
-    uint64_t speculative_durable_bytes_{};
-    uint64_t peak_used_bytes_{};
+    std::map<uint64_t, Allocation> allocations_ MACHA_GUARDED_BY(mutex_);
+    uint64_t next_id_ MACHA_GUARDED_BY(mutex_){1};
+    uint64_t used_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t reclaimable_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t lower_durable_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t speculative_durable_bytes_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t peak_used_bytes_ MACHA_GUARDED_BY(mutex_){};
     std::array<uint64_t, static_cast<size_t>(MemoryOwner::count)> owner_bytes_{};
-    std::array<uint64_t, 4> admissions_{};
-    std::array<uint64_t, 4> waits_{};
-    std::array<uint64_t, 4> waiters_{};
-    uint64_t shed_requests_{};
-    uint64_t cancelled_waits_{};
-    uint64_t restored_bytes_{};
-    bool stopping_{};
+    std::array<uint64_t, 4> admissions_ MACHA_GUARDED_BY(mutex_){};
+    std::array<uint64_t, 4> waits_ MACHA_GUARDED_BY(mutex_){};
+    std::array<uint64_t, 4> waiters_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t shed_requests_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t cancelled_waits_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t restored_bytes_ MACHA_GUARDED_BY(mutex_){};
+    bool stopping_ MACHA_GUARDED_BY(mutex_){};
 
     static constexpr size_t index(MemoryClass value) {
         return static_cast<size_t>(value);
@@ -143,8 +145,8 @@ class RetainedMemoryLedger {
         return 3 - static_cast<int>(value);
     }
     uint64_t charge(uint64_t bytes) const noexcept { return std::max<uint64_t>(1, bytes); }
-    bool available_locked(MemoryClass, MemoryOwner, uint64_t, bool reclaimable) const;
-    std::vector<std::function<void()>> request_shedding_locked(MemoryClass);
+    bool available_locked(MemoryClass, MemoryOwner, uint64_t, bool reclaimable) const MACHA_REQUIRES(mutex_);
+    std::vector<std::function<void()>> request_shedding_locked(MemoryClass) MACHA_REQUIRES(mutex_);
     void release(uint64_t id);
 
   public:
@@ -256,7 +258,7 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
             : capacity_bytes_ - control_reserve_bytes_;
     if (bytes > absolute_class_capacity)
         return {};
-    std::unique_lock lock(mutex_);
+    Lock lock(mutex_);
     bool counted_wait = false;
     for (;;) {
         if (stopping_ || (cancelled && cancelled->load(std::memory_order_relaxed)) ||
@@ -289,9 +291,9 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
             continue;
         }
         if (deadline == Clock::time_point{})
-            cv_.wait(lock);
+            cv_.wait(lock.native());
         else
-            cv_.wait_until(lock, deadline);
+            cv_.wait_until(lock.native(), deadline);
     }
     if (counted_wait)
         --waiters_[index(memory_class)];
@@ -315,7 +317,7 @@ RetainedMemoryLedger::acquire(MemoryClass memory_class, MemoryOwner owner,
 inline RetainedMemoryLedger::Lease RetainedMemoryLedger::restore(
     MemoryClass memory_class, MemoryOwner owner, uint64_t bytes) {
     bytes = charge(bytes);
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto id = next_id_++;
     allocations_.emplace(id, Allocation{memory_class, owner, bytes, false, false, {}});
     used_bytes_ += bytes;
@@ -336,7 +338,7 @@ RetainedMemoryLedger::try_acquire(MemoryClass memory_class, MemoryOwner owner, u
     if (reclaimable && !shed)
         throw std::invalid_argument("reclaimable retained memory requires a shed callback");
     bytes = charge(bytes);
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (stopping_ || !available_locked(memory_class, owner, bytes, reclaimable))
         return {};
     const auto id = next_id_++;
@@ -357,7 +359,7 @@ RetainedMemoryLedger::try_acquire(MemoryClass memory_class, MemoryOwner owner, u
 }
 
 inline void RetainedMemoryLedger::release(uint64_t id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto found = allocations_.find(id);
     if (found == allocations_.end())
         return;
@@ -385,13 +387,13 @@ inline void RetainedMemoryLedger::Lease::reset() {
 }
 
 inline void RetainedMemoryLedger::stop() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     stopping_ = true;
     cv_.notify_all();
 }
 
 inline RetainedMemoryStats RetainedMemoryLedger::stats() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return {capacity_bytes_, control_reserve_bytes_, viewer_reserve_bytes_,
             loader_reserve_bytes_, reassembly_reserve_bytes_, used_bytes_, peak_used_bytes_,
             reclaimable_bytes_,

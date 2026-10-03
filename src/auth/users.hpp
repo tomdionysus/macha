@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "crypto.hpp"
 #include "types.hpp"
 
@@ -184,13 +186,14 @@ class UserStore {
     // An empty password makes a kdf-0 record, which verify() refuses before the KDF.
     std::optional<UserRecord> insert(std::string_view username, std::string_view password,
                                      const std::vector<std::string>& roles, const NodeId& by);
-    void persist_locked() const;
+    void persist_locked() const MACHA_REQUIRES_SHARED(mutex_);
 
-    mutable std::shared_mutex mutex_;
-    std::map<std::string, UserRecord> by_id_;
-    size_t max_users_;
-    std::filesystem::path persisted_path_;
-    std::array<uint8_t, 32> seal_key_{};
+    // Held shared while the table is persisted.
+    mutable IoSharedMutex mutex_;
+    std::map<std::string, UserRecord> by_id_ MACHA_GUARDED_BY(mutex_);
+    const size_t max_users_;
+    const std::filesystem::path persisted_path_;
+    const std::array<uint8_t, 32> seal_key_;
 };
 
 // A high-entropy password safe to retype: no vowels (spells nothing) and no

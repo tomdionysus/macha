@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -41,16 +43,16 @@ class DurabilityDomain {
     uint64_t id_{};
     std::vector<std::filesystem::path> representatives_;
     std::chrono::milliseconds batch_window_;
-    mutable std::mutex mutex_;
+    mutable Mutex mutex_;
     std::condition_variable_any cv_;
-    std::jthread worker_;
-    Generation mutation_generation_{};
-    Generation durable_generation_{};
-    Generation requested_generation_{};
-    bool immediate_requested_{};
-    std::optional<std::chrono::steady_clock::time_point> batch_deadline_;
-    std::exception_ptr failure_;
-    std::vector<PortableMutation> portable_mutations_;
+    std::jthread worker_ MACHA_GUARDED_BY(mutex_);
+    Generation mutation_generation_ MACHA_GUARDED_BY(mutex_){};
+    Generation durable_generation_ MACHA_GUARDED_BY(mutex_){};
+    Generation requested_generation_ MACHA_GUARDED_BY(mutex_){};
+    bool immediate_requested_ MACHA_GUARDED_BY(mutex_){};
+    std::optional<std::chrono::steady_clock::time_point> batch_deadline_ MACHA_GUARDED_BY(mutex_);
+    std::exception_ptr failure_ MACHA_GUARDED_BY(mutex_);
+    std::vector<PortableMutation> portable_mutations_ MACHA_GUARDED_BY(mutex_);
     std::atomic_uint64_t physical_barriers_{};
 
     void loop(std::stop_token);

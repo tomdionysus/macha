@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include <chrono>
 #include <compare>
 #include <condition_variable>
@@ -89,23 +91,24 @@ struct CatalogueHintSummary {
 
 class CatalogueHintQueue {
     std::filesystem::path state_file_;
-    mutable std::mutex mutex_;
+    // Held while the hint state is saved.
+    mutable IoMutex mutex_;
     std::condition_variable_any change_cv_;
-    uint64_t revision_{};
-    std::map<std::string, CatalogueHint, std::less<>> hints_; // canonical path -> hint
-    std::map<std::string, uint64_t, std::less<>> lane_served_;
-    uint64_t schedule_sequence_{};
-    bool state_dirty_{};
-    size_t dirty_updates_{};
-    std::chrono::steady_clock::time_point dirty_since_{};
+    uint64_t revision_ MACHA_GUARDED_BY(mutex_){};
+    std::map<std::string, CatalogueHint, std::less<>> hints_ MACHA_GUARDED_BY(mutex_); // canonical path -> hint
+    std::map<std::string, uint64_t, std::less<>> lane_served_ MACHA_GUARDED_BY(mutex_);
+    uint64_t schedule_sequence_ MACHA_GUARDED_BY(mutex_){};
+    bool state_dirty_ MACHA_GUARDED_BY(mutex_){};
+    size_t dirty_updates_ MACHA_GUARDED_BY(mutex_){};
+    std::chrono::steady_clock::time_point dirty_since_ MACHA_GUARDED_BY(mutex_){};
 
     void load_state();
-    void save_state_locked() const;
-    void mark_state_dirty_locked();
-    void persist_dirty_state_locked(bool force = false);
+    void save_state_locked() const MACHA_REQUIRES(mutex_);
+    void mark_state_dirty_locked() MACHA_REQUIRES(mutex_);
+    void persist_dirty_state_locked(bool force = false) MACHA_REQUIRES(mutex_);
     static bool terminal(CatalogueHintState) noexcept;
     static bool has_origin(const CatalogueHint&, std::string_view, std::string_view);
-    void changed_locked();
+    void changed_locked() MACHA_REQUIRES(mutex_);
 
   public:
     explicit CatalogueHintQueue(const std::filesystem::path& state_path);

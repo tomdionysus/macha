@@ -570,7 +570,7 @@ NodeTelemetry TelemetryStore::refresh_local(
     telemetry.playback_start_failed_retention_ms = playback.start_failed_retention_ms;
     telemetry.playback_transcode_rates = std::move(playback.transcode_rates);
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         telemetry.node_name = node_name_;
         if (traffic) {
             // Rates over the interval since the previous sample; the first
@@ -611,7 +611,7 @@ NodeTelemetry TelemetryStore::refresh_local(
 void TelemetryStore::observe(NodeTelemetry telemetry, bool direct) {
     if (telemetry.node_id == NodeId{} || !telemetry.sequence)
         return;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [_, reset] : identity_resets_) {
         if (!identity_reset_matches_endpoint(reset, telemetry.host, telemetry.port) ||
             !identity_reset_matches_node(reset, telemetry.node_id))
@@ -635,7 +635,7 @@ void TelemetryStore::observe(NodeTelemetry telemetry, bool direct) {
 void TelemetryStore::apply_identity_reset(const IdentityAssociationReset& reset) {
     if (reset.host.empty() || !reset.epoch)
         return;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto key = identity_reset_key(reset.host, reset.port);
     auto existing = identity_resets_.find(key);
     if (existing != identity_resets_.end() && existing->second.epoch >= reset.epoch)
@@ -649,7 +649,7 @@ void TelemetryStore::apply_identity_reset(const IdentityAssociationReset& reset)
 }
 
 std::optional<NodeTelemetry> TelemetryStore::local() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto found = records_.find(self_);
     if (found == records_.end())
         return {};
@@ -657,7 +657,7 @@ std::optional<NodeTelemetry> TelemetryStore::local() const {
 }
 
 std::vector<NodeTelemetry> TelemetryStore::all() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<NodeTelemetry> out;
     out.reserve(records_.size());
     for (const auto& [_, record] : records_)
@@ -667,7 +667,7 @@ std::vector<NodeTelemetry> TelemetryStore::all() const {
 
 std::vector<NodeTelemetry> TelemetryStore::recent(std::chrono::milliseconds max_age,
                                                      size_t max_records) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto now = Clock::now();
     std::vector<NodeTelemetry> out;
     out.reserve(std::min(records_.size(), max_records));
@@ -684,7 +684,7 @@ std::vector<NodeTelemetry> TelemetryStore::recent(std::chrono::milliseconds max_
 }
 
 std::vector<NodeTelemetry> TelemetryStore::persisted() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<NodeTelemetry> out;
     out.reserve(persisted_.size());
     for (const auto& [_, telemetry] : persisted_)
@@ -697,7 +697,7 @@ void TelemetryStore::persist() {
         return;
     std::map<NodeId, NodeTelemetry> merged;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         merged = persisted_;
         for (const auto& [node, record] : records_) {
             auto found = merged.find(node);
@@ -719,7 +719,7 @@ void TelemetryStore::persist() {
     const auto contents = std::string_view(reinterpret_cast<const char*>(encoded.data()), encoded.size());
     durable_replace_file(persisted_path_, contents);
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     // Mirror the bounded set just made durable, keeping the cache bounded.
     persisted_.clear();
     for (auto& telemetry : values) {
@@ -731,7 +731,7 @@ void TelemetryStore::persist() {
 }
 
 std::vector<TelemetryView> TelemetryStore::views(std::chrono::milliseconds fresh_for) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const auto now = Clock::now();
     std::vector<TelemetryView> out;
     out.reserve(records_.size());

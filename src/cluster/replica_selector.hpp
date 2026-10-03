@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "types.hpp"
 
 #include <chrono>
@@ -39,8 +41,8 @@ class ReplicaSelector {
         uint64_t selections{};
     };
 
-    mutable std::mutex mutex_;
-    std::map<NodeId, State> states_;
+    mutable Mutex mutex_;
+    std::map<NodeId, State> states_ MACHA_GUARDED_BY(mutex_);
 
     static double estimate_ms(const State&);
     static double score(const State&, ReplicaWorkClass);
