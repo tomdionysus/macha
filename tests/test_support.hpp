@@ -423,7 +423,7 @@ class TestNode {
                     if (publication_guard_)
                         publication_guard_(context);
                 });
-            filesystem_ = std::make_unique<FileSystem>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_,
+            filesystem_ = std::make_unique<FileSystem>(node_->config(), node_->node_id(), node_->membership(), node_->local_state(), node_->metadata_server(), *store_, *metadata_,
                                                        node_->resources.memory);
         }
         return *node_;
