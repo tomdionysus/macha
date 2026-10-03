@@ -2,10 +2,13 @@
 #include "test_support.hpp"
 
 #include "api/item_availability.hpp"
+#include "filesystem/filesystem.hpp"
 #include "ledger/availability.hpp"
 #include "metadata/namespace_tree.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -613,6 +616,98 @@ MACHA_FAST_TEST("availability", test_the_item_table_is_rebuilt_only_when_a_snaps
     CHECK(cache.table(catalogue, nullptr)->at("m").status == Availability::unknown);
 }
 
+MACHA_FAST_TEST("availability", test_a_file_the_survey_cannot_decide_takes_its_last_known_count) {
+    MetadataSnapshot head;
+    head.entries["/"].type = EntryType::directory;
+    head.entries["/undecided"] = file_of(100, 4);
+    head.entries["/short-now"] = file_of(200, 4);
+    head.entries["/never-decided"] = file_of(300, 4);
+    head.entries["/new"] = file_of(400, 4);
+    const auto hash = [&](const char* path) { return file_media_id(head.entries.at(path)); };
+
+    // The last survey, under other names: what a file is, is its content.
+    AvailabilitySnapshot last;
+    const auto known = [&](const std::string& path, const std::string& file_hash,
+                           uint64_t unavailable, uint64_t unknown) {
+        PathAvailability facts;
+        facts.extents = 4;
+        facts.extents_unavailable = unavailable;
+        facts.extents_unknown = unknown;
+        facts.hash = file_hash;
+        last.paths[path] = facts;
+        last.by_hash.emplace(file_hash, path);
+    };
+    known("/was-undecided", hash("/undecided"), 1, 0);
+    known("/was-short-now", hash("/short-now"), 1, 0);
+    known("/was-never-decided", hash("/never-decided"), 0, 2);
+
+    // Nothing held here; the one peer could not be asked, except that two
+    // extents of /short-now are now known to be held nowhere.
+    AvailabilitySnapshot next;
+    for (const auto& [_, entry] : head.entries)
+        for (const auto& extent : entry.extents)
+            next.survey.unknown.push_back(extent.id);
+    next.survey.unavailable = {head.entries.at("/short-now").extents.at(0).id,
+                               head.entries.at("/short-now").extents.at(1).id};
+    std::erase_if(next.survey.unknown,
+                  [&](const ObjectId& id) { return next.survey.is_unavailable(id); });
+    std::sort(next.survey.unknown.begin(), next.survey.unknown.end());
+    std::sort(next.survey.unavailable.begin(), next.survey.unavailable.end());
+
+    MemoryNamespaceNodeStore store;
+    const std::set<ObjectId> none;
+    fill_path_table(next, head, store, holds(none), &last);
+    const auto facts = [&](const char* path) { return next.paths.at(path); };
+    CHECK(facts("/undecided").extents_unavailable == 1);
+    CHECK(facts("/undecided").extents_unknown == 0);
+    CHECK(availability_of(&next.paths.at("/undecided")) == Availability::partial);
+    // A count found now is not lowered by an older one.
+    CHECK(facts("/short-now").extents_unavailable == 2);
+    CHECK(facts("/short-now").extents_unknown == 0);
+    // Undecided before as well: still unknown.
+    CHECK(facts("/never-decided").extents_unknown == 4);
+    CHECK(facts("/new").extents_unknown == 4);
+    CHECK(facts("/").extents_unavailable == 3);
+    CHECK(facts("/").extents_unknown == 8);
+
+    // What this node holds itself is never counted short.
+    const auto& undecided = head.entries.at("/undecided").extents;
+    const std::set<ObjectId> three{undecided.at(0).id, undecided.at(1).id, undecided.at(2).id};
+    AvailabilitySnapshot held_here;
+    held_here.survey = next.survey;
+    fill_path_table(held_here, head, store, holds(three), &last);
+    CHECK(held_here.paths.at("/undecided").extents_local == 3);
+    CHECK(held_here.paths.at("/undecided").extents_unavailable == 1);
+
+    // Kept on disk and read back, extent lists aside.
+    next.generation = 7;
+    next.surveyed_unix_ms = 1234;
+    const auto bytes = encode_availability_paths(next);
+    const auto back = decode_availability_paths(bytes);
+    CHECK(back.generation == 7);
+    CHECK(back.surveyed_unix_ms == 1234);
+    CHECK(back.paths == next.paths);
+    CHECK(back.by_hash == next.by_hash);
+    CHECK(back.survey.unknown.empty());
+    const auto refused = [](Bytes damaged) {
+        try {
+            (void)decode_availability_paths(damaged);
+        } catch (const DecodeError&) {
+            return true;
+        }
+        return false;
+    };
+    auto truncated = bytes;
+    truncated.pop_back();
+    CHECK(refused(truncated));
+    auto trailing = bytes;
+    trailing.push_back(0);
+    CHECK(refused(trailing));
+    AvailabilitySnapshot impossible;
+    impossible.paths["/x"] = PathAvailability{false, 1, 2, 2, 1, 0, "macha:x"};
+    CHECK(refused(encode_availability_paths(impossible)));
+}
+
 // Two real nodes: the pass rolls up and surveys, a peer answers over RPC, and
 // the path table says what a reader would be told.
 MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
@@ -712,6 +807,20 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
         const auto paths = snapshot->by_hash.equal_range(holed.hash);
         REQUIRE(paths.first != paths.second);
         CHECK(paths.first->second == "/dir/holed.bin");
+    }
+
+    // Each node keeps its last survey, to answer with until its next.
+    for (auto* service : {&first, &second}) {
+        const auto kept = service->node().config().state_path / "availability" / "last-survey.bin";
+        CHECK(wait_until(
+            [&] {
+                std::ifstream in(kept, std::ios::binary);
+                const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
+                return !bytes.empty() &&
+                       decode_availability_paths(bytes).paths ==
+                           service->availability().snapshot()->paths;
+            },
+            10s));
     }
 
     // What a client is told.

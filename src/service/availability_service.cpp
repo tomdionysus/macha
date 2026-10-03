@@ -5,6 +5,7 @@
 #include "cluster/distributed_store.hpp"
 #include "cluster/local_state.hpp"
 #include "codec.hpp"
+#include "durable_file.hpp"
 #include "filesystem/filesystem.hpp"
 #include "log.hpp"
 #include "metadata/namespace_control_store.hpp"
@@ -13,6 +14,8 @@
 #include "storage/local_store.hpp"
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <tuple>
 
@@ -90,7 +93,7 @@ std::string_view parent_of(std::string_view path) {
 
 void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot,
                      const NamespaceNodeStore& store, const HeldFn& held,
-                     const std::function<void()>& pause) {
+                     const AvailabilitySnapshot* last_known, const std::function<void()>& pause) {
     for_each_namespace_entry(snapshot, &store, [&](const std::string& path, const FsEntry& entry) {
         if (pause)
             pause();
@@ -112,6 +115,18 @@ void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot
             else if (out.survey.is_unknown(extent.id))
                 ++facts.extents_unknown;
         }
+        if (facts.extents_unknown && last_known)
+            if (const auto known = last_known->by_hash.find(facts.hash);
+                known != last_known->by_hash.end())
+                if (const auto was = last_known->paths.find(known->second);
+                    was != last_known->paths.end() && was->second.hash == facts.hash &&
+                    was->second.extents == facts.extents && !was->second.extents_unknown) {
+                    facts.extents_unavailable =
+                        std::max(facts.extents_unavailable,
+                                 std::min(was->second.extents_unavailable,
+                                          facts.extents - facts.extents_local));
+                    facts.extents_unknown = 0;
+                }
         out.by_hash.emplace(facts.hash, path);
         const auto file = facts;
         for (auto parent = parent_of(path); !parent.empty(); parent = parent_of(parent)) {
@@ -126,11 +141,83 @@ void fill_path_table(AvailabilitySnapshot& out, const MetadataSnapshot& snapshot
     });
 }
 
+namespace {
+
+constexpr uint32_t persisted_schema = 1;
+
+} // namespace
+
+Bytes encode_availability_paths(const AvailabilitySnapshot& snapshot) {
+    Writer out;
+    out.u32(persisted_schema);
+    out.u64(snapshot.generation);
+    out.u64(snapshot.surveyed_unix_ms);
+    out.u64(snapshot.paths.size());
+    for (const auto& [path, facts] : snapshot.paths) {
+        out.string(path);
+        out.u8(facts.directory ? 1 : 0);
+        out.u64(facts.size);
+        out.u64(facts.extents);
+        out.u64(facts.extents_local);
+        out.u64(facts.extents_unavailable);
+        out.u64(facts.extents_unknown);
+        out.string(facts.hash);
+    }
+    return out.take();
+}
+
+AvailabilitySnapshot decode_availability_paths(std::span<const uint8_t> bytes) {
+    Reader in(bytes);
+    if (in.u32() != persisted_schema)
+        throw DecodeError("unknown availability schema");
+    AvailabilitySnapshot snapshot;
+    snapshot.generation = in.u64();
+    snapshot.surveyed_unix_ms = in.u64();
+    const auto count = in.u64();
+    for (uint64_t i = 0; i < count; ++i) {
+        auto path = in.string();
+        PathAvailability facts;
+        const auto directory = in.u8();
+        if (directory > 1)
+            throw DecodeError("bad availability path kind");
+        facts.directory = directory == 1;
+        facts.size = in.u64();
+        facts.extents = in.u64();
+        facts.extents_local = in.u64();
+        facts.extents_unavailable = in.u64();
+        facts.extents_unknown = in.u64();
+        facts.hash = in.string();
+        if (facts.extents_local > facts.extents ||
+            facts.extents_unavailable > facts.extents - facts.extents_local ||
+            facts.extents_unknown >
+                facts.extents - facts.extents_local - facts.extents_unavailable)
+            throw DecodeError("availability counts exceed the extents");
+        if (!facts.directory)
+            snapshot.by_hash.emplace(facts.hash, path);
+        if (!snapshot.paths.emplace(std::move(path), std::move(facts)).second)
+            throw DecodeError("availability path repeated");
+    }
+    in.finish();
+    return snapshot;
+}
+
 AvailabilityService::AvailabilityService(NodeRuntime& node, LocalState& local,
                                          DistributedStore& store, const ObjectLedger& ledger,
-                                         const NodeEvents& events, MessageRoutes& routes)
+                                         const NodeEvents& events, MessageRoutes& routes,
+                                         std::filesystem::path persisted)
     : node_(node), local_(local), store_(store), ledger_(ledger), events_(events),
-      routes_(routes) {
+      routes_(routes), persisted_(std::move(persisted)) {
+    if (!persisted_.empty()) {
+        std::ifstream in(persisted_, std::ios::binary);
+        if (in) {
+            const Bytes bytes{std::istreambuf_iterator<char>(in), {}};
+            try {
+                snapshot_.publish(decode_availability_paths(bytes));
+            } catch (const DecodeError& error) {
+                Log::warn("availability: ignoring " + persisted_.string() + ": " + error.what());
+            }
+        }
+    }
     routes_.bind(MessageType::tree_holdings,
                  [this](const NodeInfo&, FrameType, const RpcMessage& request) {
                      return answer(request);
@@ -253,9 +340,9 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         grew = grew || peers[i].second > surveyed_peers_[i].second;
     }
     // What must be asked of the peers again, whatever it costs.
-    const bool must_ask = !previous || head_changed || lost ||
+    const bool must_ask = !surveyed_ || head_changed || lost ||
                           topology_events != surveyed_topology_events_ || !same_peers || shrank;
-    const bool missing = previous && (!previous->survey.unavailable.empty() ||
+    const bool missing = surveyed_ && (!previous->survey.unavailable.empty() ||
                                       !previous->survey.unknown.empty());
     // A peer holding more could hold something missing: worth asking, but a
     // peer that is importing grows all the time.
@@ -321,12 +408,14 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         std::erase_if(next.survey.unavailable, held);
         std::erase_if(next.survey.unknown, held);
     }
-    if (!rolled && previous && previous->survey.unavailable == next.survey.unavailable &&
+    bool table_changed = false;
+    if (!rolled && surveyed_ && previous->survey.unavailable == next.survey.unavailable &&
         previous->survey.unknown == next.survey.unknown) {
         next.paths = previous->paths;
         next.by_hash = previous->by_hash;
     } else {
-        fill_path_table(next, *holdings->snapshot, stored, held, pause);
+        fill_path_table(next, *holdings->snapshot, stored, held, previous.get(), pause);
+        table_changed = true;
     }
     if (ask)
         surveyed_cost_ = Clock::now() - started;
@@ -342,6 +431,16 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                " peers_failed=" + std::to_string(next.survey.peers_failed) +
                " rounds=" + std::to_string(next.survey.rounds) +
                " tree_nodes_asked=" + std::to_string(next.survey.nodes_asked));
+    if (table_changed && !persisted_.empty()) {
+        try {
+            const auto bytes = encode_availability_paths(next);
+            durable_replace_file(persisted_,
+                                 std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                                                  bytes.size()));
+        } catch (const std::exception& error) {
+            Log::warn(std::string("availability: cannot keep the survey: ") + error.what());
+        }
+    }
     if (!ask) {
         snapshot_.publish(std::move(next));
         return false;
@@ -355,6 +454,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         retry_at_.reset();
     }
     snapshot_.publish(std::move(next));
+    surveyed_ = true;
     surveyed_topology_events_ = topology_events;
     surveyed_peers_ = std::move(peers);
     return true;
