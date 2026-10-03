@@ -13,6 +13,7 @@
 // only through read_extent.
 
 #include "cluster/data_work.hpp"
+#include "contract/thread_safety.hpp"
 #include "types.hpp"
 
 #include <libtorrent/session_params.hpp>
@@ -22,7 +23,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -45,30 +45,31 @@ class TorrentPieceVerifications {
     using Progress = std::function<std::optional<TorrentPublicationProgress>(const std::string&)>;
 
     void piece_verified(const std::string& save_path, int piece) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (sink_) sink_(save_path, piece);
     }
     // Empty when no backend is publishing or none holds this torrent.
     std::optional<TorrentPublicationProgress> publication(const std::string& save_path) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!progress_) return std::nullopt;
         return progress_(save_path);
     }
     void attach(Sink sink, Progress progress) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         sink_ = std::move(sink);
         progress_ = std::move(progress);
     }
     void detach() {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         sink_ = nullptr;
         progress_ = nullptr;
     }
 
   private:
-    std::mutex mutex_;
-    Sink sink_;
-    Progress progress_;
+    // Held across the attached backend's sink and progress callbacks.
+    IoMutex mutex_;
+    Sink sink_ MACHA_GUARDED_BY(mutex_);
+    Progress progress_ MACHA_GUARDED_BY(mutex_);
 };
 
 struct TorrentDiskHooks {

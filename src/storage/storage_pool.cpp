@@ -54,19 +54,19 @@ bool parse_marker(const std::string& text, NodeId& node, NodeId& token) {
 } // namespace
 
 struct StoragePool::Backend {
-    // This mutex protects only the small in-memory state below. No filesystem
-    // operation is performed while it is held.
-    mutable std::mutex mutex;
-    StorageBackendConfig cfg;
-    NodeId token{};
-    bool token_known{};
-    bool online{};
-    bool configured{true};
-    uint64_t generation{1};
-    uint64_t instance_id{};
-    std::shared_ptr<DurabilityDomain> durability_domain;
-    std::shared_ptr<LocalStore> store;
-    std::string last_error;
+    // Guards the small in-memory state below. No filesystem operation is
+    // performed while it is held.
+    mutable Mutex mutex;
+    StorageBackendConfig cfg MACHA_GUARDED_BY(mutex);
+    NodeId token MACHA_GUARDED_BY(mutex){};
+    bool token_known MACHA_GUARDED_BY(mutex){};
+    bool online MACHA_GUARDED_BY(mutex){};
+    bool configured MACHA_GUARDED_BY(mutex){true};
+    uint64_t generation MACHA_GUARDED_BY(mutex){1};
+    uint64_t instance_id MACHA_GUARDED_BY(mutex){};
+    std::shared_ptr<DurabilityDomain> durability_domain MACHA_GUARDED_BY(mutex);
+    std::shared_ptr<LocalStore> store MACHA_GUARDED_BY(mutex);
+    std::string last_error MACHA_GUARDED_BY(mutex);
 };
 
 StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
@@ -81,7 +81,7 @@ StoragePool::StoragePool(std::filesystem::path state_path, NodeId node_id,
 }
 
 std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::snapshot() const {
-    DiagnosticLock lock(mutex_, "storage.pool");
+    TimedLock lock(mutex_, "storage.pool");
     return backends_;
 }
 
@@ -90,7 +90,7 @@ std::shared_ptr<DurabilityDomain> StoragePool::domain_for(const std::filesystem:
     if (::stat(path.c_str(), &st) != 0)
         throw std::runtime_error("cannot stat storage durability domain " + path.string());
     const auto device = static_cast<uint64_t>(st.st_dev);
-    std::lock_guard lock(domain_mutex_);
+    Lock lock(domain_mutex_);
     if (const auto found = domains_by_device_.find(device); found != domains_by_device_.end() &&
         !found->second->failed()) {
         found->second->add_representative(path);
@@ -116,7 +116,7 @@ void StoragePool::deactivate(const std::shared_ptr<Backend>& backend,
     bool log = false;
     bool was_online = false;
     {
-        std::lock_guard lock(backend->mutex);
+        Lock lock(backend->mutex);
         if ((expected_generation && backend->generation != expected_generation) ||
             (expected && backend->store != expected))
             return;
@@ -148,7 +148,7 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
     uint64_t generation = 0;
     std::shared_ptr<LocalStore> existing;
     {
-        std::lock_guard lock(backend->mutex);
+        Lock lock(backend->mutex);
         cfg = backend->cfg;
         known_token = backend->token;
         token_known = backend->token_known;
@@ -228,7 +228,7 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
         if (!store) {
             durability_domain = domain_for(cfg.path);
             {
-                std::lock_guard lock(domain_mutex_);
+                Lock lock(domain_mutex_);
                 instance_id = next_backend_instance_++;
             }
             LocalStoreOptions options;
@@ -240,14 +240,14 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
                                                  LocalStoreMode::authoritative,
                                                  durability_domain);
         } else {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             durability_domain = backend->durability_domain;
             instance_id = backend->instance_id;
         }
 
         bool installed = false;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->generation == generation && backend->configured &&
                 backend->cfg.path == cfg.path && backend->cfg.limit == cfg.limit &&
                 backend->cfg.reserve_free == cfg.reserve_free) {
@@ -284,23 +284,26 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
 void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) {
     std::vector<std::shared_ptr<LocalStore>> retired;
     {
-        DiagnosticLock lock(mutex_, "storage.pool");
+        TimedLock lock(mutex_, "storage.pool");
         std::set<std::filesystem::path> wanted;
         for (const auto& cfg : configs) {
             auto normalized = cfg.path.lexically_normal();
             if (!wanted.insert(normalized).second)
                 throw std::runtime_error("duplicate storage backend: " + normalized.string());
             auto existing = std::find_if(backends_.begin(), backends_.end(), [&](const auto& backend) {
-                std::lock_guard backend_lock(backend->mutex);
+                Lock backend_lock(backend->mutex);
                 return backend->cfg.path.lexically_normal() == normalized;
             });
             if (existing == backends_.end()) {
                 auto backend = std::make_shared<Backend>();
-                backend->cfg = cfg;
-                backend->configured = true;
+                {
+                    Lock backend_lock(backend->mutex);
+                    backend->cfg = cfg;
+                    backend->configured = true;
+                }
                 backends_.push_back(std::move(backend));
             } else {
-                std::lock_guard backend_lock((*existing)->mutex);
+                Lock backend_lock((*existing)->mutex);
                 (*existing)->configured = true;
                 if ((*existing)->cfg.limit != cfg.limit ||
                     (*existing)->cfg.reserve_free != cfg.reserve_free) {
@@ -313,7 +316,7 @@ void StoragePool::reconfigure(const std::vector<StorageBackendConfig>& configs) 
             }
         }
         for (auto& backend : backends_) {
-            std::lock_guard backend_lock(backend->mutex);
+            Lock backend_lock(backend->mutex);
             if (!wanted.contains(backend->cfg.path.lexically_normal())) {
                 backend->configured = false;
                 backend->online = false;
@@ -332,7 +335,7 @@ void StoragePool::refresh() {
     for (const auto& backend : snapshot()) {
         bool configured = false;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             configured = backend->configured;
         }
         if (configured && activate(backend))
@@ -349,7 +352,7 @@ std::vector<std::shared_ptr<StoragePool::Backend>> StoragePool::ranked(const Obj
         uint64_t capacity = 0;
         bool eligible = false;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             eligible = backend->configured && backend->token_known;
             token = backend->token;
             capacity = backend->cfg.limit;
@@ -381,7 +384,7 @@ bool StoragePool::put(const ObjectId& id, std::span<const uint8_t> data) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (!backend->online || !backend->store)
                 continue;
             store = backend->store;
@@ -416,7 +419,7 @@ std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
         uint64_t backend_instance = 0;
         uint64_t domain = 0;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (!backend->online || !backend->store || !backend->durability_domain ||
                 !backend->instance_id)
                 continue;
@@ -439,7 +442,7 @@ std::optional<StoragePool::DurabilityToken> StoragePool::put_deferred(
             // in progress, do not allow the new incarnation to satisfy the old
             // publication requirement merely because it shares a filesystem.
             {
-                std::lock_guard lock(backend->mutex);
+                Lock lock(backend->mutex);
                 if (!backend->online || backend->store != store ||
                     backend->instance_id != backend_instance ||
                     !backend->durability_domain || backend->durability_domain->id() != domain)
@@ -461,7 +464,7 @@ void StoragePool::durability_barrier(const DurabilityToken& token, DurabilityUrg
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (!backend->online || !backend->store || !backend->durability_domain ||
                 backend->instance_id != token.backend_instance ||
                 backend->durability_domain->id() != token.domain)
@@ -472,7 +475,7 @@ void StoragePool::durability_barrier(const DurabilityToken& token, DurabilityUrg
         try {
             store->durability_barrier(token.generation, urgency);
             {
-                std::lock_guard lock(backend->mutex);
+                Lock lock(backend->mutex);
                 if (!backend->online || backend->store != store ||
                     backend->instance_id != token.backend_instance ||
                     !backend->durability_domain || backend->durability_domain->id() != token.domain)
@@ -493,7 +496,7 @@ bool StoragePool::durability_covered(const DurabilityToken& token) const {
     if (!token.valid())
         return false;
     for (const auto& backend : snapshot()) {
-        std::lock_guard lock(backend->mutex);
+        Lock lock(backend->mutex);
         if (!backend->online || !backend->store || !backend->durability_domain ||
             backend->instance_id != token.backend_instance ||
             backend->durability_domain->id() != token.domain)
@@ -552,7 +555,7 @@ std::optional<Bytes> StoragePool::get(const ObjectId& id) const {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (!backend->online || !backend->store)
                 continue;
             store = backend->store;
@@ -596,7 +599,7 @@ bool StoragePool::has(const ObjectId& id) const {
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }
@@ -618,7 +621,7 @@ std::optional<StoragePool::DurabilityToken> StoragePool::reassert_durable(const 
         uint64_t backend_instance = 0;
         uint64_t domain = 0;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (!backend->online || !backend->store || !backend->durability_domain ||
                 !backend->instance_id)
                 continue;
@@ -647,7 +650,7 @@ bool StoragePool::valid(const ObjectId& id) const {
     for (const auto& backend : ranked(id)) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }
@@ -664,7 +667,7 @@ bool StoragePool::remove(const ObjectId& id) {
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }
@@ -684,7 +687,7 @@ std::vector<ObjectId> StoragePool::list() const {
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }
@@ -709,7 +712,7 @@ std::optional<StoragePool::CursorItem> StoragePool::next_physical(Cursor& cursor
     };
     std::vector<View> views;
     for (const auto& backend : snapshot()) {
-        std::lock_guard lock(backend->mutex);
+        Lock lock(backend->mutex);
         if (backend->online && backend->store)
             views.push_back({backend, backend->store, backend->cfg.path});
     }
@@ -761,7 +764,7 @@ bool StoragePool::older_than(const ObjectId& id, std::chrono::milliseconds age) 
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }
@@ -808,7 +811,7 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
         for (const auto& backend : snapshot()) {
             std::shared_ptr<LocalStore> store;
             {
-                std::lock_guard lock(backend->mutex);
+                Lock lock(backend->mutex);
                 if (backend->online)
                     store = backend->store;
             }
@@ -852,7 +855,7 @@ StoragePool::rebalance_step(uint64_t budget_bytes, size_t operation_budget,
 
             std::shared_ptr<LocalStore> preferred_store;
             {
-                std::lock_guard lock(preferred->mutex);
+                Lock lock(preferred->mutex);
                 if (preferred->online)
                     preferred_store = preferred->store;
             }
@@ -994,7 +997,7 @@ size_t StoragePool::compact_packs(std::stop_token stop) {
         std::shared_ptr<LocalStore> store;
         std::filesystem::path path;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (!backend->online || !backend->store)
                 continue;
             store = backend->store;
@@ -1019,7 +1022,7 @@ uint64_t StoragePool::used() const {
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }
@@ -1035,7 +1038,7 @@ uint64_t StoragePool::limit() const {
         uint64_t capacity = 0;
         bool include = false;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             include = backend->configured && backend->token_known;
             capacity = backend->cfg.limit;
         }
@@ -1057,7 +1060,7 @@ LocalStoreDiagnostics StoragePool::diagnostics() const {
     for (const auto& backend : snapshot()) {
         std::shared_ptr<LocalStore> store;
         {
-            std::lock_guard lock(backend->mutex);
+            Lock lock(backend->mutex);
             if (backend->online)
                 store = backend->store;
         }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
 #include "metadata/metadata_server.hpp"
 #include "cluster/distributed_store.hpp"
 #include "media/media_engine.hpp"
@@ -163,40 +164,48 @@ class CatalogueManager {
     MetadataServer& metadata_server_;
     DistributedStore& store_;
     MetadataView& metadata_;
-    mutable std::mutex mutex_;
-    mutable std::mutex refresh_mutex_;
-    mutable std::mutex mutation_mutex_;
-    std::shared_ptr<const CatalogueSnapshot> cached_;
-    std::optional<ObjectId> cached_root_;
-    uint64_t cached_metadata_generation_{};
-    Clock::time_point cache_until_{};
-    uint64_t last_sync_unix_ms_{};
+    // Held across control-store reads and removals in control_gc_step().
+    mutable IoMutex mutex_;
+    // Single-flight refresh; guards nothing. Held across metadata reads and
+    // control replica fetches.
+    mutable IoMutex refresh_mutex_;
+    // Serialises read-modify-commit; guards nothing. Held across metadata
+    // commits and DATA/CONTROL store writes.
+    mutable IoMutex mutation_mutex_;
+    std::shared_ptr<const CatalogueSnapshot> cached_ MACHA_GUARDED_BY(mutex_);
+    std::optional<ObjectId> cached_root_ MACHA_GUARDED_BY(mutex_);
+    uint64_t cached_metadata_generation_ MACHA_GUARDED_BY(mutex_){};
+    Clock::time_point cache_until_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t last_sync_unix_ms_ MACHA_GUARDED_BY(mutex_){};
     // A successor catalogue's CONTROL objects are staged before metadata
     // references them, so an unreferenced object is reclaimable only once a
     // later catalogue root has been seen than the epoch it was first seen
     // unreferenced in. The time point catches objects re-affirmed since the
     // current root.
-    Clock::time_point control_gc_root_epoch_{};
-    uint64_t control_gc_root_epoch_sequence_{};
-    bool control_gc_root_epoch_initialized_{};
-    std::map<ObjectId, uint64_t> control_gc_unreferenced_epoch_;
-    bool ready_{};
-    std::string error_code_; // converging, unavailable
-    std::string error_;
+    Clock::time_point control_gc_root_epoch_ MACHA_GUARDED_BY(mutex_){};
+    uint64_t control_gc_root_epoch_sequence_ MACHA_GUARDED_BY(mutex_){};
+    bool control_gc_root_epoch_initialized_ MACHA_GUARDED_BY(mutex_){};
+    std::map<ObjectId, uint64_t> control_gc_unreferenced_epoch_ MACHA_GUARDED_BY(mutex_);
+    bool ready_ MACHA_GUARDED_BY(mutex_){};
+    std::string error_code_ MACHA_GUARDED_BY(mutex_); // converging, unavailable
+    std::string error_ MACHA_GUARDED_BY(mutex_);
     struct MediaProfileFlight {
-        std::mutex mutex;
+        Mutex mutex;
         std::condition_variable cv;
-        bool complete{};
-        std::optional<MediaProbeResult> result;
-        std::exception_ptr error;
+        bool complete MACHA_GUARDED_BY(mutex){};
+        std::optional<MediaProbeResult> result MACHA_GUARDED_BY(mutex);
+        std::exception_ptr error MACHA_GUARDED_BY(mutex);
     };
-    mutable std::mutex media_profile_mutex_;
-    std::map<std::string, MediaProbeResult, std::less<>> resolved_media_profiles_;
-    std::map<std::string, std::shared_ptr<MediaProfileFlight>, std::less<>> media_profile_flights_;
+    mutable Mutex media_profile_mutex_;
+    std::map<std::string, MediaProbeResult, std::less<>> resolved_media_profiles_
+        MACHA_GUARDED_BY(media_profile_mutex_);
+    std::map<std::string, std::shared_ptr<MediaProfileFlight>, std::less<>> media_profile_flights_
+        MACHA_GUARDED_BY(media_profile_mutex_);
+    // Owned by the maintenance thread, the only caller of control_gc_step().
     LocalStore::Cursor control_gc_cursor_;
-    std::optional<ObjectId> control_converged_root_;
-    std::vector<NodeId> control_converged_nodes_;
-    Clock::time_point control_convergence_retry_{};
+    std::optional<ObjectId> control_converged_root_ MACHA_GUARDED_BY(mutex_);
+    std::vector<NodeId> control_converged_nodes_ MACHA_GUARDED_BY(mutex_);
+    Clock::time_point control_convergence_retry_ MACHA_GUARDED_BY(mutex_){};
 
     // Every DATA object the catalogue references: artwork and media indexes.
     static std::set<ObjectId> data_object_ids(const CatalogueSnapshot&);

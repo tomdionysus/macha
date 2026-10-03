@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "contract/thread_safety.hpp"
 #include "crypto.hpp"
 #include "torrent/torrent_request.hpp"
 #include <atomic>
@@ -7,7 +8,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 namespace macha {
 enum class EntryType : uint8_t { directory = 1, file = 2 };
@@ -421,58 +421,63 @@ class MetadataReplica {
     std::filesystem::path mutation_sequence_p_;
     std::filesystem::path recovery_p_;
     std::array<uint8_t, 32> key_;
-    mutable std::mutex m_;
-    // Serialises durable mutations whose file I/O runs without m_. Order:
-    // before m_.
-    mutable std::mutex durable_mutation_m_;
-    // Serialises cache-miss computation without blocking m_.
-    mutable std::mutex materialization_compute_m_;
-    MetadataRecord cur_;
-    MetadataRecord committed_;
+    // Held across journal appends, heads and checkpoint writes and their
+    // fsyncs, and history reads.
+    mutable IoMutex m_;
+    // Serialises durable mutations whose history append and fsync run without
+    // m_; held across them.
+    mutable IoMutex durable_mutation_m_ MACHA_ACQUIRED_BEFORE(m_);
+    // Serialises cache-miss computation without blocking m_; held across
+    // history reads.
+    mutable IoMutex materialization_compute_m_ MACHA_ACQUIRED_BEFORE(m_);
+    MetadataRecord cur_ MACHA_GUARDED_BY(m_);
+    MetadataRecord committed_ MACHA_GUARDED_BY(m_);
     // committed_.generation, readable without m_; set_committed_locked keeps
     // the two together.
     std::atomic_uint64_t committed_generation_{};
-    void set_committed_locked(MetadataRecord record) {
+    void set_committed_locked(MetadataRecord record) MACHA_REQUIRES(m_) {
         committed_ = std::move(record);
         committed_generation_.store(committed_.generation, std::memory_order_release);
     }
     // Payloads live in history.log; memory holds ancestry and frame offsets.
-    std::map<Hash256, HistoryIndexEntry> history_;
-    std::map<Hash256, MetadataAcceptance> accepted_heads_;
+    std::map<Hash256, HistoryIndexEntry> history_ MACHA_GUARDED_BY(m_);
+    std::map<Hash256, MetadataAcceptance> accepted_heads_ MACHA_GUARDED_BY(m_);
     // Per-hash retry cooldown for an accepted head that fails to reconstruct,
     // so callers that catch and retry cannot spin. Between attempts the head
     // is treated as absent and the replica serves its last good state.
-    mutable std::map<Hash256, Clock::time_point> unreconstructable_head_retry_at_;
+    mutable std::map<Hash256, Clock::time_point>
+        unreconstructable_head_retry_at_ MACHA_GUARDED_BY(m_);
     static constexpr std::chrono::seconds unreconstructable_retry_cooldown{30};
     // Arms the cooldown, logs one WARN per episode, and returns the diagnosis
     // for the caller's exception.
     std::string flag_unreconstructable_locked(const Hash256& hash, Clock::time_point now,
-                                              std::string_view context) const;
+                                              std::string_view context) const MACHA_REQUIRES(m_);
     // Walk the delta chain as materialized_locked() does and name the first
     // break: not indexed, parent absent, succession, cycle, unreadable frame,
     // or replay hash mismatch.
-    std::string diagnose_unreconstructable_locked(const Hash256& hash) const;
+    std::string diagnose_unreconstructable_locked(const Hash256& hash) const MACHA_REQUIRES(m_);
     // Test-only: report the matching hashes as unreconstructable.
-    mutable std::function<bool(const Hash256&)> force_unreconstructable_for_tests_;
+    mutable std::function<bool(const Hash256&)>
+        force_unreconstructable_for_tests_ MACHA_GUARDED_BY(m_);
     // Loaded only if valid against committed_; record_checkpoint_ack() may
     // later set an acked proposal. nullopt means no proof.
-    std::optional<HistoryCheckpointProof> checkpoint_proof_;
-    std::optional<MetadataHistoryEntry> pending_history_;
-    bool pending_recovered_{};
-    bool mutation_sequence_loaded_{};
-    uint64_t mutation_sequence_{};
-    size_t journal_records_{};
-    uint64_t journal_bytes_{};
-    size_t history_records_{};
-    uint64_t history_bytes_{};
-    bool recovery_required_{};
+    std::optional<HistoryCheckpointProof> checkpoint_proof_ MACHA_GUARDED_BY(m_);
+    std::optional<MetadataHistoryEntry> pending_history_ MACHA_GUARDED_BY(m_);
+    bool pending_recovered_ MACHA_GUARDED_BY(m_){};
+    bool mutation_sequence_loaded_ MACHA_GUARDED_BY(m_){};
+    uint64_t mutation_sequence_ MACHA_GUARDED_BY(m_){};
+    size_t journal_records_ MACHA_GUARDED_BY(m_){};
+    uint64_t journal_bytes_ MACHA_GUARDED_BY(m_){};
+    size_t history_records_ MACHA_GUARDED_BY(m_){};
+    uint64_t history_bytes_ MACHA_GUARDED_BY(m_){};
+    bool recovery_required_ MACHA_GUARDED_BY(m_){};
     // Edits a tree-backed namespace; fixed for the replica's lifetime.
     const NamespaceDeltaApplier namespace_applier_;
-    bool accept_pristine_genesis_authority_{true};
-    mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_;
-    mutable uint64_t materialized_history_clock_{};
-    mutable uint64_t materialized_history_bytes_{};
-    uint64_t materialized_history_limit_bytes_{};
+    const bool accept_pristine_genesis_authority_{true};
+    mutable std::map<Hash256, MaterializedHistoryEntry> materialized_history_ MACHA_GUARDED_BY(m_);
+    mutable uint64_t materialized_history_clock_ MACHA_GUARDED_BY(m_){};
+    mutable uint64_t materialized_history_bytes_ MACHA_GUARDED_BY(m_){};
+    const uint64_t materialized_history_limit_bytes_{};
     mutable std::atomic_uint64_t historical_requests_{};
     mutable std::atomic_uint64_t historical_reconstructions_{};
     mutable std::atomic_uint64_t historical_deltas_applied_{};
@@ -484,41 +489,48 @@ class MetadataReplica {
     std::atomic_uint64_t accepted_head_persistence_failures_{};
     void persist(const std::filesystem::path&, const MetadataRecord&);
     std::optional<MetadataRecord> load(const std::filesystem::path&) const;
-    void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {});
-    void load_journal();
+    // Construction calls the load_* functions and recover_from_seed() before the
+    // replica is shared; the analysis does not check constructors.
+    void append_journal(uint8_t, const MetadataRecord&, std::span<const uint8_t> = {})
+        MACHA_REQUIRES(m_);
+    void load_journal() MACHA_REQUIRES(m_);
     Bytes encode_history_frame(const MetadataHistoryEntry&) const;
     MetadataHistoryEntry read_history_entry(const HistoryIndexEntry&) const;
     static HistoryIndexEntry index_history_entry(const MetadataHistoryEntry&, uint64_t, uint64_t);
     void write_history_frame(std::span<const uint8_t>) const;
-    void append_history(const MetadataHistoryEntry&);
-    void load_history();
-    void load_heads();
-    void persist_heads_locked();
-    void load_checkpoint_proof();
-    void persist_checkpoint_proof_locked();
-    void ensure_history_root(const MetadataRecord&);
-    void migrate_legacy_head_locked();
-    bool prune_accepted_heads_locked();
-    bool accepted_head_is_ancestor_locked(const Hash256&, const Hash256&) const;
+    void append_history(const MetadataHistoryEntry&) MACHA_REQUIRES(m_);
+    void load_history() MACHA_REQUIRES(m_);
+    void load_heads() MACHA_REQUIRES(m_);
+    void persist_heads_locked() MACHA_REQUIRES(m_);
+    void load_checkpoint_proof() MACHA_REQUIRES(m_);
+    void persist_checkpoint_proof_locked() MACHA_REQUIRES(m_);
+    void ensure_history_root(const MetadataRecord&) MACHA_REQUIRES(m_);
+    void migrate_legacy_head_locked() MACHA_REQUIRES(m_);
+    bool prune_accepted_heads_locked() MACHA_REQUIRES(m_);
+    bool accepted_head_is_ancestor_locked(const Hash256&, const Hash256&) const MACHA_REQUIRES(m_);
     bool acceptance_matches_record_policy_locked(const MetadataAcceptance&,
-                                                 const MetadataMaterialization&) const;
-    bool legacy_write_api_allowed_locked() const;
-    void set_legacy_committed_head_locked(const MetadataRecord&);
-    void refresh_materialized_head_locked();
-    bool refresh_materialized_head_in_memory_locked();
-    MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {});
+                                                 const MetadataMaterialization&) const
+        MACHA_REQUIRES(m_);
+    bool legacy_write_api_allowed_locked() const MACHA_REQUIRES(m_);
+    void set_legacy_committed_head_locked(const MetadataRecord&) MACHA_REQUIRES(m_);
+    void refresh_materialized_head_locked() MACHA_REQUIRES(m_);
+    bool refresh_materialized_head_in_memory_locked() MACHA_REQUIRES(m_);
+    MetadataHistoryEntry history_for_current(std::span<const uint8_t> delta = {})
+        MACHA_REQUIRES(m_);
     std::shared_ptr<const MetadataMaterialization>
     cache_materialization_locked(const MetadataRecord&,
                                  std::shared_ptr<const MetadataSnapshot> = {},
-                                 uint64_t resident_bytes = 0) const;
-    std::shared_ptr<const MetadataMaterialization> materialized_locked(const Hash256&) const;
-    std::optional<MetadataRecord> historical_locked(const Hash256&) const;
-    bool history_is_ancestor_locked(const Hash256&, const Hash256&) const;
-    std::optional<Hash256> history_common_ancestor_locked(const Hash256&, const Hash256&) const;
-    void compact_if_needed();
-    void reset_checkpoint(const MetadataRecord&);
-    void reset_checkpoint_journal_locked();
-    void recover_from_seed(const MetadataRecord&, const std::string&);
+                                 uint64_t resident_bytes = 0) const MACHA_REQUIRES(m_);
+    std::shared_ptr<const MetadataMaterialization> materialized_locked(const Hash256&) const
+        MACHA_REQUIRES(m_);
+    std::optional<MetadataRecord> historical_locked(const Hash256&) const MACHA_REQUIRES(m_);
+    bool history_is_ancestor_locked(const Hash256&, const Hash256&) const MACHA_REQUIRES(m_);
+    std::optional<Hash256> history_common_ancestor_locked(const Hash256&, const Hash256&) const
+        MACHA_REQUIRES(m_);
+    void compact_if_needed() MACHA_REQUIRES(m_);
+    void reset_checkpoint(const MetadataRecord&) MACHA_REQUIRES(m_);
+    void reset_checkpoint_journal_locked() MACHA_REQUIRES(m_);
+    void recover_from_seed(const MetadataRecord&, const std::string&) MACHA_REQUIRES(m_);
 
   public:
     MetadataReplica(std::filesystem::path, std::array<uint8_t, 32>,
@@ -595,7 +607,7 @@ class MetadataReplica {
     // Promote the acked record for exactly (floor_hash, epoch); false if none.
     bool record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch);
     void set_force_unreconstructable_for_tests(std::function<bool(const Hash256&)> hook) {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         force_unreconstructable_for_tests_ = std::move(hook);
     }
 };

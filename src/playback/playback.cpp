@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "playback/playback.hpp"
+#include "contract/thread_safety.hpp"
 #include "diagnostics.hpp"
 
 #include "crypto.hpp"
@@ -701,8 +702,12 @@ Json output_json(const MediaProbeResult& probe, const PlaybackPlan& plan,
 
 struct PlaybackManager::Impl {
     struct LogicalViewerSession {
-        mutable std::mutex operation_mutex;
-        std::string client_key;
+        // Held across a whole create, update or teardown of the viewer's
+        // session: probing, VOD planning, pipeline start and stop. Guards no
+        // state; it keeps those operations serial.
+        mutable IoMutex operation_mutex;
+        std::string client_key; // set before the session is shared
+        // Guarded by Impl::mutex (not expressible to the analysis).
         bool video_transcode_entitled{};
         bool audio_transcode_entitled{};
     };
@@ -727,14 +732,16 @@ struct PlaybackManager::Impl {
         std::optional<HlsVodPlan> vod_plan;
         uint64_t generation{};
         std::filesystem::path generation_dir;
-        mutable std::mutex pipeline_mutex;
-        std::shared_ptr<MediaEngineSession> engine_session;
+        mutable Mutex pipeline_mutex;
+        std::shared_ptr<MediaEngineSession> engine_session MACHA_GUARDED_BY(pipeline_mutex);
         std::string stream_url;
         struct SubtitleCache {
-            std::mutex mutex;
-            std::map<std::pair<int, uint64_t>, std::string> segments;
-            std::deque<std::pair<int, uint64_t>> order;
-            size_t bytes{};
+            // Held across WebVTT extraction from the source (media reads that
+            // may fetch from peers) and a log line.
+            IoMutex mutex;
+            std::map<std::pair<int, uint64_t>, std::string> segments MACHA_GUARDED_BY(mutex);
+            std::deque<std::pair<int, uint64_t>> order MACHA_GUARDED_BY(mutex);
+            size_t bytes MACHA_GUARDED_BY(mutex){};
             static constexpr size_t max_entries = 256;
             static constexpr size_t max_bytes = 4ULL * 1024 * 1024;
         };
@@ -760,28 +767,37 @@ struct PlaybackManager::Impl {
         std::shared_ptr<PendingReplacement> pending;
     };
 
+    // Adds the cache's usage unless an extraction holds it, so status() never
+    // waits on one.
+    static void subtitle_cache_usage(Session::SubtitleCache& cache, size_t& segments,
+                                     size_t& bytes) {
+        if (!cache.mutex.try_lock()) return;
+        Lock lock(cache.mutex, std::adopt_lock);
+        segments += cache.segments.size();
+        bytes += cache.bytes;
+    }
+
     // An async start. The session map holds the admitted placeholder (counted
     // against every cap, owned, deletable) while a worker builds the real
     // session and swaps it in once its first fragment exists. GET and
     // long-polls read this, never the half-built session.
     struct StartState {
-        std::mutex mutex;
-        std::string stage{"planning"};
-        Clock::time_point started{Clock::now()};
-        Clock::time_point last_change{Clock::now()};
-        uint64_t seq{};
-        std::optional<uint64_t> source_bytes_read;
-        std::optional<int64_t> preroll_decoded_ms;
-        std::optional<int64_t> preroll_total_ms;
-        std::optional<int64_t> output_media_ms;
-        std::optional<int64_t> first_fragment_ms;
-        std::optional<Json> error;
-        std::vector<std::shared_ptr<HttpWaker>> waiters;
+        Mutex mutex;
+        std::string stage MACHA_GUARDED_BY(mutex){"planning"};
+        const Clock::time_point started{Clock::now()};
+        Clock::time_point last_change MACHA_GUARDED_BY(mutex){Clock::now()};
+        uint64_t seq MACHA_GUARDED_BY(mutex){};
+        std::optional<uint64_t> source_bytes_read MACHA_GUARDED_BY(mutex);
+        std::optional<int64_t> preroll_decoded_ms MACHA_GUARDED_BY(mutex);
+        std::optional<int64_t> preroll_total_ms MACHA_GUARDED_BY(mutex);
+        std::optional<int64_t> output_media_ms MACHA_GUARDED_BY(mutex);
+        std::optional<int64_t> first_fragment_ms MACHA_GUARDED_BY(mutex);
+        std::optional<Json> error MACHA_GUARDED_BY(mutex);
+        std::vector<std::shared_ptr<HttpWaker>> waiters MACHA_GUARDED_BY(mutex);
         std::atomic_bool cancelled{};
-        std::shared_ptr<Session> candidate;
-        bool finished() const { return stage == "ready" || stage == "failed"; }
-        // Precondition: mutex held.
-        std::vector<std::shared_ptr<HttpWaker>> changed_locked() {
+        std::shared_ptr<Session> candidate; // set before the start is shared
+        bool finished() const MACHA_REQUIRES(mutex) { return stage == "ready" || stage == "failed"; }
+        std::vector<std::shared_ptr<HttpWaker>> changed_locked() MACHA_REQUIRES(mutex) {
             ++seq;
             last_change = Clock::now();
             return std::exchange(waiters, {});
@@ -792,13 +808,15 @@ struct PlaybackManager::Impl {
     // (committed at the swap, rolled back by its worker otherwise), and when
     // its worker is done.
     struct PendingReplacement {
+        // These three are set before the replacement is shared.
         std::shared_ptr<StartState> start;
         std::shared_ptr<ResourceReservation> reservation;
         bool needs_plan{};
+        // Guarded by Impl::mutex (not expressible to the analysis).
         Clock::time_point failed_until{};
-        std::mutex done_mutex;
+        Mutex done_mutex;
         std::condition_variable done_cv;
-        bool done{};
+        bool done MACHA_GUARDED_BY(done_mutex){};
     };
     struct FailedStart {
         std::string account;
@@ -810,7 +828,8 @@ struct PlaybackManager::Impl {
     TranscodeRateBook& transcode_rates;
     RetainedMemoryLedger& retained_memory;
     CatalogueManager& catalogue;
-    StreamingConfig config;
+    // reconfigure() changes the live limits and timings under mutex.
+    StreamingConfig config MACHA_GUARDED_BY(mutex);
     // Node-global fairness and memory bound across all sessions.
     SegmentHoldArbiter segment_holds{config.max_session_holds, config.max_concurrent_holds};
     // Parked across a held segment request's deferral; the hold is released
@@ -822,54 +841,58 @@ struct PlaybackManager::Impl {
     std::shared_ptr<MediaEngine> engine;
     std::jthread cleanup_thread;
     std::jthread profile_publish_thread;
-    mutable std::mutex mutex;
+    // Held across log lines (probe cache hits, entitlement releases).
+    mutable IoMutex mutex;
     std::condition_variable_any cleanup_cv;
-    uint64_t cleanup_revision{};
-    std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions;
+    uint64_t cleanup_revision MACHA_GUARDED_BY(mutex){};
+    std::map<std::string, std::shared_ptr<Session>, std::less<>> sessions MACHA_GUARDED_BY(mutex);
     // Client keys are advisory local handles, never cluster ownership. Weak
     // values leave no state behind an expired or deleted logical session.
-    std::map<std::string, std::weak_ptr<LogicalViewerSession>, std::less<>> logical_sessions;
+    std::map<std::string, std::weak_ptr<LogicalViewerSession>, std::less<>> logical_sessions
+        MACHA_GUARDED_BY(mutex);
     // In-flight creations per account, so concurrent creates cannot race past
-    // the cap. Guarded by `mutex`, emptied as each create settles.
-    std::map<std::string, size_t, std::less<>> pending_by_account;
-    std::map<std::string, MediaProbeResult, std::less<>> probe_cache;
-    size_t probe_cache_bytes{};
+    // the cap. Emptied as each create settles.
+    std::map<std::string, size_t, std::less<>> pending_by_account MACHA_GUARDED_BY(mutex);
+    std::map<std::string, MediaProbeResult, std::less<>> probe_cache MACHA_GUARDED_BY(mutex);
+    size_t probe_cache_bytes MACHA_GUARDED_BY(mutex){};
     static constexpr size_t max_probe_cache_entries = 512;
     static constexpr size_t max_probe_cache_bytes = 8ULL * 1024 * 1024;
     struct ProbeFlight {
-        std::mutex mutex;
+        Mutex mutex;
         std::condition_variable cv;
-        bool complete{};
-        std::optional<MediaProbeResult> result;
-        std::exception_ptr error;
+        bool complete MACHA_GUARDED_BY(mutex){};
+        std::optional<MediaProbeResult> result MACHA_GUARDED_BY(mutex);
+        std::exception_ptr error MACHA_GUARDED_BY(mutex);
     };
-    std::map<std::string, std::shared_ptr<ProbeFlight>, std::less<>> probe_flights;
-    std::mutex profile_publish_mutex;
+    std::map<std::string, std::shared_ptr<ProbeFlight>, std::less<>> probe_flights
+        MACHA_GUARDED_BY(mutex);
+    Mutex profile_publish_mutex;
     std::condition_variable_any profile_publish_cv;
-    std::map<std::string, MediaProbeResult, std::less<>> pending_profile_publications;
-    size_t pending_profile_publication_bytes{};
+    std::map<std::string, MediaProbeResult, std::less<>> pending_profile_publications
+        MACHA_GUARDED_BY(profile_publish_mutex);
+    size_t pending_profile_publication_bytes MACHA_GUARDED_BY(profile_publish_mutex){};
     static constexpr size_t max_pending_profile_publications = 128;
     static constexpr size_t max_pending_profile_publication_bytes = 4ULL * 1024 * 1024;
-    std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache;
-    std::deque<std::string> vod_plan_cache_order;
+    std::map<std::string, HlsVodPlan, std::less<>> vod_plan_cache MACHA_GUARDED_BY(mutex);
+    std::deque<std::string> vod_plan_cache_order MACHA_GUARDED_BY(mutex);
     static constexpr size_t max_vod_plan_cache_entries = 64;
     // Admission precedes visibility in `sessions`, so slots are reserved
     // explicitly: concurrent POST/PATCH cannot all pass the same limit check.
-    size_t pending_sessions{};
-    size_t reserved_video_transcodes{};
-    size_t reserved_audio_transcodes{};
+    size_t pending_sessions MACHA_GUARDED_BY(mutex){};
+    size_t reserved_video_transcodes MACHA_GUARDED_BY(mutex){};
+    size_t reserved_audio_transcodes MACHA_GUARDED_BY(mutex){};
     // Transcode entitlements reserved per account and not yet committed.
-    std::map<std::string, size_t, std::less<>> reserved_account_transcodes;
+    std::map<std::string, size_t, std::less<>> reserved_account_transcodes MACHA_GUARDED_BY(mutex);
     // Transcoding pipelines running now: the concurrency a rate observation
     // was taken at.
     std::atomic<uint32_t> running_transcodes{};
-    uint64_t idle_pipelines_reclaimed{};
-    uint64_t unused_sessions_reclaimed{};
-    bool heap_reclaim_pending{};
-    uint64_t heap_reclaim_requests{};
-    uint64_t heap_reclaim_runs{};
-    uint64_t heap_reclaim_successes{};
-    bool started{};
+    uint64_t idle_pipelines_reclaimed MACHA_GUARDED_BY(mutex){};
+    uint64_t unused_sessions_reclaimed MACHA_GUARDED_BY(mutex){};
+    bool heap_reclaim_pending MACHA_GUARDED_BY(mutex){};
+    uint64_t heap_reclaim_requests MACHA_GUARDED_BY(mutex){};
+    uint64_t heap_reclaim_runs MACHA_GUARDED_BY(mutex){};
+    uint64_t heap_reclaim_successes MACHA_GUARDED_BY(mutex){};
+    bool started{}; // the owner's, through start() and stop()
     std::function<size_t(const std::vector<std::string>&)> request_media_profiles;
     MediaInformationService* media_information{};
 
@@ -882,9 +905,10 @@ struct PlaybackManager::Impl {
         return bytes;
     }
 
-    // Precondition: profile_publish_mutex held. A bounded retry cache, not
-    // durable state: a broken publisher must not make it grow without limit.
-    void queue_profile_publication(std::string media_id, MediaProbeResult probe) {
+    // A bounded retry cache, not durable state: a broken publisher must not
+    // make it grow without limit.
+    void queue_profile_publication(std::string media_id, MediaProbeResult probe)
+        MACHA_REQUIRES(profile_publish_mutex) {
         const auto weight = probe_resident_weight(probe) + media_id.size();
         if (weight > max_pending_profile_publication_bytes)
             return;
@@ -909,9 +933,9 @@ struct PlaybackManager::Impl {
         pending_profile_publication_bytes += weight;
     }
 
-    // Precondition: mutex held. Bounded by count and bytes, independent of
-    // catalogue size; safely repopulated.
-    void cache_probe(std::string key, MediaProbeResult probe) {
+    // Bounded by count and bytes, independent of catalogue size; safely
+    // repopulated.
+    void cache_probe(std::string key, MediaProbeResult probe) MACHA_REQUIRES(mutex) {
         const auto weight = probe_resident_weight(probe);
         if (weight > max_probe_cache_bytes)
             return;
@@ -932,18 +956,19 @@ struct PlaybackManager::Impl {
         probe_cache_bytes += weight;
     }
     struct IdempotentCreation {
-        std::mutex mutex;
+        Mutex mutex;
         std::condition_variable cv;
-        std::string fingerprint;
-        bool complete{};
-        std::string session_id;
-        std::exception_ptr error;
+        std::string fingerprint; // set before the creation is shared
+        bool complete MACHA_GUARDED_BY(mutex){};
+        std::string session_id MACHA_GUARDED_BY(mutex);
+        std::exception_ptr error MACHA_GUARDED_BY(mutex);
     };
-    std::map<std::string, std::shared_ptr<IdempotentCreation>, std::less<>> idempotent_creations;
-    // Failed async starts, readable until they expire. Guarded by `mutex`.
-    std::map<std::string, FailedStart, std::less<>> failed_starts;
-    // Start workers still running, so stop() can wait for them. Guarded by `mutex`.
-    size_t start_workers{};
+    std::map<std::string, std::shared_ptr<IdempotentCreation>, std::less<>> idempotent_creations
+        MACHA_GUARDED_BY(mutex);
+    // Failed async starts, readable until they expire.
+    std::map<std::string, FailedStart, std::less<>> failed_starts MACHA_GUARDED_BY(mutex);
+    // Start workers still running, so stop() can wait for them.
+    size_t start_workers MACHA_GUARDED_BY(mutex){};
     std::condition_variable_any start_workers_cv;
 
     Impl(FileSystem& filesystem, TranscodeRateBook& rates, RetainedMemoryLedger& memory,
@@ -956,6 +981,12 @@ struct PlaybackManager::Impl {
                 (config.enabled ? make_libav_media_engine(config) : nullptr)),
           request_media_profiles(std::move(request_profiles)), media_information(information) {
         (void)api;
+    }
+
+    // A copy of the configuration; reconfigure() may change it at any time.
+    StreamingConfig current_config() const MACHA_EXCLUDES(mutex) {
+        Lock lock(mutex);
+        return config;
     }
 
     // A broken generation, not merely an unready one. 503 deliberately shares
@@ -1031,8 +1062,8 @@ struct PlaybackManager::Impl {
     }
 
     // The live pending replacement, dropping one whose failure has been
-    // readable long enough. Precondition: mutex held.
-    std::shared_ptr<PendingReplacement> pending_locked(Session& session) {
+    // readable long enough.
+    std::shared_ptr<PendingReplacement> pending_locked(Session& session) MACHA_REQUIRES(mutex) {
         if (session.pending && session.pending->failed_until != Clock::time_point{} &&
             Clock::now() >= session.pending->failed_until)
             session.pending.reset();
@@ -1044,22 +1075,21 @@ struct PlaybackManager::Impl {
     void cancel_pending(Session& session) {
         std::shared_ptr<PendingReplacement> taken;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             taken = std::exchange(session.pending, {});
         }
         if (!taken) return;
         taken->start->cancelled.store(true);
         stop_pipeline(*taken->start->candidate);
-        std::unique_lock done(taken->done_mutex);
-        taken->done_cv.wait(done, [&] { return taken->done; });
+        Lock done(taken->done_mutex);
+        taken->done_cv.wait(done.native(), [&]() MACHA_REQUIRES(taken->done_mutex) { return taken->done; });
     }
 
     static void wake(const std::vector<std::shared_ptr<HttpWaker>>& waiters) {
         for (const auto& waiter : waiters) waiter->fire();
     }
 
-    // Precondition: start.mutex held.
-    static Json start_json_locked(const StartState& start) {
+    static Json start_json_locked(const StartState& start) MACHA_REQUIRES(start.mutex) {
         const auto now = Clock::now();
         Json::Object out{{"stage", start.stage},
                          {"progress_seq", start.seq},
@@ -1084,19 +1114,18 @@ struct PlaybackManager::Impl {
         auto payload = session_json(placeholder);
         payload["stream"]["url"] = Json(nullptr);
         payload["stream"]["close_url"] = public_stream_prefix(placeholder) + "/close";
-        std::lock_guard lock(start.mutex);
+        Lock lock(start.mutex);
         payload["start"] = start_json_locked(start);
         return payload;
     }
 
     static bool start_pending(const Session& session) {
         if (!session.start) return false;
-        std::lock_guard lock(session.start->mutex);
+        Lock lock(session.start->mutex);
         return !session.start->finished();
     }
 
-    // Precondition: mutex held.
-    void prune_failed_starts_locked() {
+    void prune_failed_starts_locked() MACHA_REQUIRES(mutex) {
         const auto now = Clock::now();
         std::erase_if(failed_starts, [&](const auto& entry) { return entry.second.expires <= now; });
     }
@@ -1143,7 +1172,8 @@ struct PlaybackManager::Impl {
 
     // Waits for the first fragment, publishing engine progress; fails only
     // when nothing has moved for startup_no_progress.
-    void wait_for_first_fragment_async(Session& session, StartState& start, std::string_view trace) {
+    void wait_for_first_fragment_async(Session& session, StartState& start, std::string_view trace)
+        MACHA_EXCLUDES(mutex) {
         auto active = active_engine(session);
         if (!active) throw std::runtime_error("media pipeline did not start");
         auto store = active->segments();
@@ -1152,10 +1182,11 @@ struct PlaybackManager::Impl {
         while (true) {
             if (start.cancelled.load()) throw std::runtime_error("start cancelled");
             const bool ready = store->wait_ready(std::chrono::milliseconds(250));
+            const auto no_progress = current_config().startup_no_progress;
             std::vector<std::shared_ptr<HttpWaker>> waiters;
             bool stalled = false;
             {
-                std::lock_guard lock(start.mutex);
+                Lock lock(start.mutex);
                 if (progress) {
                     const auto seq = progress->seq.load(std::memory_order_relaxed);
                     if (seq != seen) {
@@ -1173,7 +1204,7 @@ struct PlaybackManager::Impl {
                         waiters = start.changed_locked();
                     }
                 }
-                stalled = !ready && Clock::now() - start.last_change > config.startup_no_progress;
+                stalled = !ready && Clock::now() - start.last_change > no_progress;
             }
             wake(waiters);
             if (ready) return;
@@ -1187,7 +1218,7 @@ struct PlaybackManager::Impl {
             if (stalled)
                 throw stage_error(std::string(trace), "pipeline_start",
                                   std::runtime_error("no start progress for " +
-                                                     std::to_string(config.startup_no_progress.count()) + " ms"));
+                                                     std::to_string(no_progress.count()) + " ms"));
         }
     }
 
@@ -1203,7 +1234,7 @@ struct PlaybackManager::Impl {
             if (start->cancelled.load()) throw std::runtime_error("start cancelled");
             std::vector<std::shared_ptr<HttpWaker>> waiters;
             {
-                std::lock_guard lock(start->mutex);
+                Lock lock(start->mutex);
                 if (candidate->vod_plan && !candidate->vod_plan->segment_durations.empty())
                     start->first_fragment_ms =
                         std::llround(candidate->vod_plan->segment_durations.front() * 1000.0);
@@ -1215,7 +1246,7 @@ struct PlaybackManager::Impl {
             start_pipeline(*candidate, trace, false);
             wait_for_first_fragment_async(*candidate, *start, trace);
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = sessions.find(candidate->id);
                 if (start->cancelled.load() || it == sessions.end() || it->second != placeholder)
                     throw std::runtime_error("start cancelled");
@@ -1223,7 +1254,7 @@ struct PlaybackManager::Impl {
                 signal_cleanup_locked();
             }
             {
-                std::lock_guard lock(start->mutex);
+                Lock lock(start->mutex);
                 start->stage = "ready";
                 waiters = start->changed_locked();
             }
@@ -1240,7 +1271,7 @@ struct PlaybackManager::Impl {
             if (start->cancelled.load()) {
                 std::vector<std::shared_ptr<HttpWaker>> waiters;
                 {
-                    std::lock_guard lock(start->mutex);
+                    Lock lock(start->mutex);
                     waiters = std::exchange(start->waiters, {});
                 }
                 wake(waiters);
@@ -1248,14 +1279,14 @@ struct PlaybackManager::Impl {
                 std::vector<std::shared_ptr<HttpWaker>> waiters;
                 Json payload;
                 {
-                    std::lock_guard lock(start->mutex);
+                    Lock lock(start->mutex);
                     start->error = start_error_json(error, stalled);
                     start->stage = "failed";
                     waiters = start->changed_locked();
                 }
                 payload = pending_json(*placeholder, *start);
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     auto it = sessions.find(placeholder->id);
                     if (it != sessions.end() && it->second == placeholder) {
                         sessions.erase(it);
@@ -1276,7 +1307,7 @@ struct PlaybackManager::Impl {
                           " stage=" + stalled + " error=" + message);
             }
         }
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         --start_workers;
         start_workers_cv.notify_all();
     }
@@ -1294,7 +1325,7 @@ struct PlaybackManager::Impl {
             if (start->cancelled.load()) throw std::runtime_error("start cancelled");
             std::vector<std::shared_ptr<HttpWaker>> waiters;
             {
-                std::lock_guard lock(start->mutex);
+                Lock lock(start->mutex);
                 if (replacement->vod_plan && !replacement->vod_plan->segment_durations.empty())
                     start->first_fragment_ms =
                         std::llround(replacement->vod_plan->segment_durations.front() * 1000.0);
@@ -1307,7 +1338,7 @@ struct PlaybackManager::Impl {
             wait_for_first_fragment_async(*replacement, *start, trace);
             auto old_active = active_engine(*old);
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = sessions.find(old->id);
                 if (start->cancelled.load() || it == sessions.end() || it->second != old ||
                     old->pending != pending)
@@ -1326,7 +1357,7 @@ struct PlaybackManager::Impl {
             if (!old->generation_dir.empty() && old->generation_dir != replacement->generation_dir)
                 std::filesystem::remove_all(old->generation_dir, ec);
             {
-                std::lock_guard lock(start->mutex);
+                Lock lock(start->mutex);
                 start->stage = "ready";
                 waiters = start->changed_locked();
             }
@@ -1348,17 +1379,17 @@ struct PlaybackManager::Impl {
             }
             std::vector<std::shared_ptr<HttpWaker>> waiters;
             if (start->cancelled.load()) {
-                std::lock_guard lock(start->mutex);
+                Lock lock(start->mutex);
                 waiters = std::exchange(start->waiters, {});
             } else {
                 {
-                    std::lock_guard lock(start->mutex);
+                    Lock lock(start->mutex);
                     start->error = start_error_json(error, stalled);
                     start->stage = "failed";
                     waiters = start->changed_locked();
                 }
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     if (old->pending == pending)
                         pending->failed_until = Clock::now() + config.start_failed_retention;
                 }
@@ -1370,11 +1401,11 @@ struct PlaybackManager::Impl {
             wake(waiters);
         }
         {
-            std::lock_guard done(pending->done_mutex);
+            Lock done(pending->done_mutex);
             pending->done = true;
         }
         pending->done_cv.notify_all();
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         --start_workers;
         start_workers_cv.notify_all();
     }
@@ -1397,9 +1428,9 @@ struct PlaybackManager::Impl {
         return response;
     }
 
-    void erase_idempotency_for_session_locked(std::string_view session_id) {
+    void erase_idempotency_for_session_locked(std::string_view session_id) MACHA_REQUIRES(mutex) {
         for (auto it = idempotent_creations.begin(); it != idempotent_creations.end();) {
-            std::lock_guard creation_lock(it->second->mutex);
+            Lock creation_lock(it->second->mutex);
             if (it->second->complete && it->second->session_id == session_id)
                 it = idempotent_creations.erase(it);
             else
@@ -1421,7 +1452,7 @@ struct PlaybackManager::Impl {
     std::shared_ptr<LogicalViewerSession> logical_session_for(std::string client_key) {
         if (client_key.empty())
             return std::make_shared<LogicalViewerSession>();
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         auto& weak = logical_sessions[client_key];
         auto logical = weak.lock();
         if (!logical) {
@@ -1433,7 +1464,7 @@ struct PlaybackManager::Impl {
     }
 
     std::shared_ptr<Session> session_for_logical_locked(
-        const std::shared_ptr<LogicalViewerSession>& logical) const {
+        const std::shared_ptr<LogicalViewerSession>& logical) const MACHA_REQUIRES(mutex) {
         for (const auto& [_, session] : sessions)
             if (session->logical_session == logical) return session;
         return {};
@@ -1488,7 +1519,7 @@ struct PlaybackManager::Impl {
         auto key = probe_key(lease);
         const auto lookup_started = Clock::now();
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             if (auto it = probe_cache.find(key); it != probe_cache.end()) {
                 Log::debug("playback[" + std::string(trace) + "] probe cache-hit media=" + lease.media_id);
                 return it->second;
@@ -1501,7 +1532,7 @@ struct PlaybackManager::Impl {
                 Log::info("playback[" + std::string(trace) +
                           "] immutable profile hit media=" + lease.media_id +
                           " lookup_ms=" + std::to_string(lookup_elapsed));
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 cache_probe(key, *stored);
                 return *stored;
             }
@@ -1523,7 +1554,7 @@ struct PlaybackManager::Impl {
                           " fallback_ms=" + std::to_string(fallback_elapsed) +
                           " format=" + resolved.format + " streams=" +
                           std::to_string(resolved.streams.size()));
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 cache_probe(key, resolved);
                 return resolved;
             } catch (const std::exception& e) {
@@ -1564,7 +1595,7 @@ struct PlaybackManager::Impl {
                         return result;
                     });
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     cache_probe(key, resolved.probe);
                 }
                 const auto lookup_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1579,7 +1610,7 @@ struct PlaybackManager::Impl {
                                   "] immutable profile coalesced media=" + lease.media_id +
                                   " wait_ms=" + std::to_string(lookup_elapsed));
                     {
-                        std::lock_guard lock(profile_publish_mutex);
+                        Lock lock(profile_publish_mutex);
                         queue_profile_publication(lease.media_id, resolved.probe);
                     }
                     profile_publish_cv.notify_one();
@@ -1595,7 +1626,7 @@ struct PlaybackManager::Impl {
         std::shared_ptr<ProbeFlight> flight;
         bool owner = false;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             if (auto it = probe_cache.find(key); it != probe_cache.end()) return it->second;
             auto [it, inserted] = probe_flights.try_emplace(key, std::make_shared<ProbeFlight>());
             flight = it->second;
@@ -1603,9 +1634,9 @@ struct PlaybackManager::Impl {
         }
         if (!owner) {
             const auto wait_started = Clock::now();
-            std::unique_lock flight_lock(flight->mutex);
-            if (!flight->cv.wait_until(flight_lock, resolve_deadline,
-                                       [&] { return flight->complete; }))
+            Lock flight_lock(flight->mutex);
+            if (!flight->cv.wait_until(flight_lock.native(), resolve_deadline,
+                                       [&]() MACHA_REQUIRES(flight->mutex) { return flight->complete; }))
                 throw PlaybackStageError(std::string(trace), "probe",
                                          "timed out waiting for concurrent media inspection");
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1619,13 +1650,13 @@ struct PlaybackManager::Impl {
         auto complete_flight = [&](std::optional<MediaProbeResult> result,
                                    std::exception_ptr error = {}) {
             {
-                std::lock_guard flight_lock(flight->mutex);
+                Lock flight_lock(flight->mutex);
                 flight->result = std::move(result);
                 flight->error = error;
                 flight->complete = true;
             }
             flight->cv.notify_all();
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = probe_flights.find(key);
             if (it != probe_flights.end() && it->second == flight) probe_flights.erase(it);
         };
@@ -1657,7 +1688,7 @@ struct PlaybackManager::Impl {
                   " elapsed_ms=" + std::to_string(elapsed) + " format=" + probed.format +
                   " streams=" + std::to_string(probed.streams.size()));
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             cache_probe(key, probed);
         }
         complete_flight(probed);
@@ -1669,8 +1700,8 @@ struct PlaybackManager::Impl {
         while (!stop.stop_requested()) {
             std::pair<std::string, MediaProbeResult> pending;
             {
-                std::unique_lock lock(profile_publish_mutex);
-                profile_publish_cv.wait(lock, stop, [&] {
+                Lock lock(profile_publish_mutex);
+                profile_publish_cv.wait(lock.native(), stop, [&]() MACHA_REQUIRES(profile_publish_mutex) {
                     return !pending_profile_publications.empty();
                 });
                 if (stop.stop_requested()) break;
@@ -1687,11 +1718,11 @@ struct PlaybackManager::Impl {
             } catch (const std::exception& e) {
                 Log::warn("playback immutable profile asynchronous publication failed media=" +
                           pending.first + " error=" + e.what());
-                std::unique_lock lock(profile_publish_mutex);
+                Lock lock(profile_publish_mutex);
                 queue_profile_publication(pending.first, pending.second);
                 // A CAS conflict is transient: keep the completed probe and
                 // retry after a bounded backoff rather than re-probing.
-                profile_publish_cv.wait_for(lock, stop, std::chrono::milliseconds(250),
+                profile_publish_cv.wait_for(lock.native(), stop, std::chrono::milliseconds(250),
                                             [] { return false; });
             }
         }
@@ -1704,7 +1735,7 @@ struct PlaybackManager::Impl {
     void drain_profile_publications() {
         std::map<std::string, MediaProbeResult, std::less<>> pending;
         {
-            std::lock_guard lock(profile_publish_mutex);
+            Lock lock(profile_publish_mutex);
             pending.swap(pending_profile_publications);
             pending_profile_publication_bytes = 0;
         }
@@ -1720,7 +1751,7 @@ struct PlaybackManager::Impl {
         }
     }
 
-    size_t video_transcodes_locked(std::string_view excluding = {}) const {
+    size_t video_transcodes_locked(std::string_view excluding = {}) const MACHA_REQUIRES(mutex) {
         size_t count = 0;
         std::set<const LogicalViewerSession*> counted;
         for (const auto& [id, session] : sessions) {
@@ -1733,7 +1764,7 @@ struct PlaybackManager::Impl {
         return count;
     }
 
-    size_t audio_transcodes_locked(std::string_view excluding = {}) const {
+    size_t audio_transcodes_locked(std::string_view excluding = {}) const MACHA_REQUIRES(mutex) {
         size_t count = 0;
         std::set<const LogicalViewerSession*> counted;
         for (const auto& [id, session] : sessions) {
@@ -1746,21 +1777,21 @@ struct PlaybackManager::Impl {
         return count;
     }
 
-    size_t running_video_transcode_pipelines_locked() const {
+    size_t running_video_transcode_pipelines_locked() const MACHA_REQUIRES(mutex) {
         size_t count = 0;
         for (const auto& [_, session] : sessions) {
             if (session->plan.video != MediaTransform::transcode) continue;
-            std::lock_guard pipeline_lock(session->pipeline_mutex);
+            Lock pipeline_lock(session->pipeline_mutex);
             if (session->engine_session && session->engine_session->running()) ++count;
         }
         return count;
     }
 
-    size_t running_audio_transcode_pipelines_locked() const {
+    size_t running_audio_transcode_pipelines_locked() const MACHA_REQUIRES(mutex) {
         size_t count = 0;
         for (const auto& [_, session] : sessions) {
             if (session->plan.audio != MediaTransform::transcode) continue;
-            std::lock_guard pipeline_lock(session->pipeline_mutex);
+            Lock pipeline_lock(session->pipeline_mutex);
             if (session->engine_session && session->engine_session->running()) ++count;
         }
         return count;
@@ -1778,7 +1809,7 @@ struct PlaybackManager::Impl {
     // Logical viewers of `account` holding a transcode entitlement, plus the
     // account's entitlements reserved and not yet committed.
     size_t account_transcodes_locked(std::string_view account,
-                                     std::string_view excluding = {}) const {
+                                     std::string_view excluding = {}) const MACHA_REQUIRES(mutex) {
         size_t count = 0;
         std::set<const LogicalViewerSession*> counted;
         for (const auto& [id, session] : sessions) {
@@ -1796,7 +1827,7 @@ struct PlaybackManager::Impl {
     }
 
     void reserve_session_slot(std::string_view account) {
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         if (sessions.size() + pending_sessions >= config.max_sessions)
             throw ResourceLimitError("playback session limit reached");
         if (config.max_sessions_per_account) {
@@ -1809,14 +1840,14 @@ struct PlaybackManager::Impl {
     }
 
     void release_session_slot(std::string_view account) {
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         if (pending_sessions) --pending_sessions;
         release_pending_account_locked(account);
     }
 
     // Live sessions plus in-flight creations, so a burst of concurrent creates
     // cannot pass the cap.
-    size_t sessions_held_by_locked(std::string_view account) const {
+    size_t sessions_held_by_locked(std::string_view account) const MACHA_REQUIRES(mutex) {
         size_t held = 0;
         for (const auto& [_, session] : sessions)
             if (session->account == account) ++held;
@@ -1825,7 +1856,7 @@ struct PlaybackManager::Impl {
         return held;
     }
 
-    void release_pending_account_locked(std::string_view account) {
+    void release_pending_account_locked(std::string_view account) MACHA_REQUIRES(mutex) {
         auto pending = pending_by_account.find(account);
         if (pending == pending_by_account.end())
             return;
@@ -1836,7 +1867,7 @@ struct PlaybackManager::Impl {
     }
 
     ResourceReservation reserve_resources(Session& session, std::string_view excluding = {}) {
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         if (!session.logical_session)
             throw std::logic_error("playback session has no logical viewer session");
         const bool video = session.plan.video == MediaTransform::transcode &&
@@ -1869,7 +1900,7 @@ struct PlaybackManager::Impl {
     // True when no other session shares this logical viewer. Presence, not a
     // running engine, is checked: that avoids taking a sibling's
     // pipeline_mutex under `mutex`. An idle sibling keeps the entitlement.
-    bool sole_session_for_logical_locked(const Session& keep) const {
+    bool sole_session_for_logical_locked(const Session& keep) const MACHA_REQUIRES(mutex) {
         for (const auto& [id, other] : sessions) {
             if (other.get() == &keep) continue;
             if (other->logical_session == keep.logical_session) return false;
@@ -1877,7 +1908,7 @@ struct PlaybackManager::Impl {
         return true;
     }
 
-    bool holds_transcode_entitlement_locked(const Session& session) const {
+    bool holds_transcode_entitlement_locked(const Session& session) const MACHA_REQUIRES(mutex) {
         return session.logical_session &&
                (session.logical_session->video_transcode_entitled ||
                 session.logical_session->audio_transcode_entitled);
@@ -1887,7 +1918,7 @@ struct PlaybackManager::Impl {
     // abandoned session cannot hold a node's transcode slots for session_idle.
     // Longer than the pipeline idle: a paused viewer keeps the slot a while.
     // Per logical viewer only. Reacquired on resume, where it may be refused.
-    void release_transcode_entitlements_locked(Session& session) {
+    void release_transcode_entitlements_locked(Session& session) MACHA_REQUIRES(mutex) {
         if (!session.logical_session) return;
         const bool held = session.logical_session->video_transcode_entitled ||
                           session.logical_session->audio_transcode_entitled;
@@ -1900,7 +1931,7 @@ struct PlaybackManager::Impl {
 
     // A session PATCHed out of transcode releases the entitlement at once,
     // unless a sibling on the same logical viewer holds it.
-    void release_unused_transcode_entitlements_locked(Session& session) {
+    void release_unused_transcode_entitlements_locked(Session& session) MACHA_REQUIRES(mutex) {
         if (!session.logical_session || !sole_session_for_logical_locked(session)) return;
         auto& logical = *session.logical_session;
         const bool video = logical.video_transcode_entitled &&
@@ -1914,7 +1945,7 @@ struct PlaybackManager::Impl {
                       session.id + (video ? " video" : "") + (audio ? " audio" : ""));
     }
 
-    void commit_resources_locked(const ResourceReservation& reservation) {
+    void commit_resources_locked(const ResourceReservation& reservation) MACHA_REQUIRES(mutex) {
         if (reservation.video && reserved_video_transcodes) --reserved_video_transcodes;
         if (reservation.audio && reserved_audio_transcodes) --reserved_audio_transcodes;
         if (reservation.account_slot) {
@@ -1926,14 +1957,14 @@ struct PlaybackManager::Impl {
     }
 
     void rollback_resources(Session& session, const ResourceReservation& reservation) {
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         commit_resources_locked(reservation);
         if (reservation.video) session.logical_session->video_transcode_entitled = false;
         if (reservation.audio) session.logical_session->audio_transcode_entitled = false;
     }
 
     std::shared_ptr<MediaEngineSession> active_engine(const Session& session) const {
-        std::lock_guard lock(session.pipeline_mutex);
+        Lock lock(session.pipeline_mutex);
         return session.engine_session;
     }
 
@@ -1943,7 +1974,7 @@ struct PlaybackManager::Impl {
     }
 
     void request_heap_reclaim() {
-        std::lock_guard lock(mutex);
+        Lock lock(mutex);
         heap_reclaim_pending = true;
         ++heap_reclaim_requests;
         signal_cleanup_locked();
@@ -1974,7 +2005,7 @@ struct PlaybackManager::Impl {
     void stop_pipeline(Session& session) {
         std::shared_ptr<MediaEngineSession> active;
         {
-            std::lock_guard lock(session.pipeline_mutex);
+            Lock lock(session.pipeline_mutex);
             active.swap(session.engine_session);
         }
         if (active) {
@@ -1989,12 +2020,12 @@ struct PlaybackManager::Impl {
         }
     }
 
-    void wait_for_initial_fragment(Session& session, std::string_view trace) {
+    void wait_for_initial_fragment(Session& session, std::string_view trace) MACHA_EXCLUDES(mutex) {
         auto active = active_engine(session);
         if (!active) throw std::runtime_error("media pipeline did not start");
         auto store = active->segments();
         auto started_at = Clock::now();
-        const auto deadline = started_at + config.startup_timeout;
+        const auto deadline = started_at + current_config().startup_timeout;
         const auto* progress = active->start_progress();
         // Where a slow start's time went: source bytes, pre-roll, output media.
         const auto progress_text = [&] {
@@ -2045,7 +2076,7 @@ struct PlaybackManager::Impl {
         throw std::runtime_error("timed out waiting for first fragmented-MP4 segment");
     }
 
-    std::string vod_plan_key(const Session& session) const {
+    std::string vod_plan_key(const Session& session) const MACHA_EXCLUDES(mutex) {
         const auto& plan = session.plan;
         std::ostringstream key;
         key << session.source.media_id << '|'
@@ -2058,13 +2089,13 @@ struct PlaybackManager::Impl {
             << static_cast<int>(plan.container) << '|'
             // The seek position is not part of the key: a hit is re-seeked
             // (reseek_hls_vod) rather than re-indexing the container.
-            << config.segment_duration.count() << '|'
+            << current_config().segment_duration.count() << '|'
             << (session.preferences.mode != "remux" &&
                 false);
         return key.str();
     }
 
-    void prepare_transformed_vod(Session& session, std::string_view trace) {
+    void prepare_transformed_vod(Session& session, std::string_view trace) MACHA_EXCLUDES(mutex) {
         session.vod_plan.reset();
         if (session.plan.mode == PlaybackMode::direct) return;
 
@@ -2072,7 +2103,7 @@ struct PlaybackManager::Impl {
         {
             std::optional<HlsVodPlan> cached;
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 if (auto it = vod_plan_cache.find(cache_key); it != vod_plan_cache.end())
                     cached = it->second;
             }
@@ -2100,12 +2131,13 @@ struct PlaybackManager::Impl {
             }
         }
 
+        const auto settings = current_config();
         auto started = Clock::now();
         auto prepared = engine->prepare_hls_vod(session.source, session.plan,
-                                                session.probe.duration_seconds, config.segment_duration,
+                                                session.probe.duration_seconds, settings.segment_duration,
                                                 session.preferences.mode != "remux" &&
                                                     false,
-                                                config.probe_timeout);
+                                                settings.probe_timeout);
         session.plan = prepared.playback;
         Log::debug("playback[" + std::string(trace) + "] VOD plan ready mode=" +
                    playback_mode_name(session.plan.mode) +
@@ -2114,7 +2146,7 @@ struct PlaybackManager::Impl {
                    " elapsed_ms=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
                        Clock::now() - started).count()));
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             if (!vod_plan_cache.contains(cache_key)) {
                 while (vod_plan_cache_order.size() >= max_vod_plan_cache_entries) {
                     vod_plan_cache.erase(vod_plan_cache_order.front());
@@ -2127,11 +2159,13 @@ struct PlaybackManager::Impl {
         session.vod_plan = std::move(prepared);
     }
 
-    void start_pipeline(Session& session, std::string_view trace, bool wait_for_first_fragment = true) {
+    void start_pipeline(Session& session, std::string_view trace, bool wait_for_first_fragment = true)
+        MACHA_EXCLUDES(mutex) {
         stop_pipeline(session);
+        const auto settings = current_config();
         session.stream_touched = Clock::now();
         ++session.generation;
-        session.generation_dir = *config.temp_path / session.id / std::to_string(session.generation);
+        session.generation_dir = *settings.temp_path / session.id / std::to_string(session.generation);
         std::error_code ec;
         std::filesystem::remove_all(session.generation_dir, ec);
         session.subtitle_cache = std::make_shared<Session::SubtitleCache>();
@@ -2145,8 +2179,8 @@ struct PlaybackManager::Impl {
             Log::info("playback[" + std::string(trace) + "] pipeline start media=" + session.source.media_id +
                       " mode=" + playback_mode_name(session.plan.mode));
             if (!session.vod_plan) throw std::runtime_error("transformed session has no VOD plan");
-            auto launched = engine->start_hls(session.source, *session.vod_plan, config.segment_duration,
-                                              config.max_ahead_segments, config.segment_memory_bytes,
+            auto launched = engine->start_hls(session.source, *session.vod_plan, settings.segment_duration,
+                                              settings.max_ahead_segments, settings.segment_memory_bytes,
                                               session.generation_dir);
             auto segment_store = launched->segments();
             if (!segment_store || !segment_store->attach_memory_ledger(retained_memory)) {
@@ -2154,7 +2188,7 @@ struct PlaybackManager::Impl {
                 throw std::runtime_error("viewer fragment memory admission unavailable");
             }
             {
-                std::lock_guard lock(session.pipeline_mutex);
+                Lock lock(session.pipeline_mutex);
                 session.engine_session = std::shared_ptr<MediaEngineSession>(std::move(launched));
             }
             if (transcoding(session.plan)) ++running_transcodes;
@@ -2193,7 +2227,7 @@ struct PlaybackManager::Impl {
                                              std::string existing_id = {}, std::string existing_token = {}) {
         auto lease = create_source(media_id);
         const auto profile_started = Clock::now();
-        auto probe = probe_source(lease, trace, Clock::now() + config.probe_timeout);
+        auto probe = probe_source(lease, trace, Clock::now() + current_config().probe_timeout);
         const auto profile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - profile_started).count();
         auto plan = plan_for(probe, preferences);
@@ -2277,7 +2311,11 @@ struct PlaybackManager::Impl {
         session->vod_plan = old.vod_plan;
         session->generation = old.generation;
         session->generation_dir = old.generation_dir;
-        session->engine_session = active_engine(old);
+        {
+            auto active = active_engine(old);
+            Lock lock(session->pipeline_mutex);
+            session->engine_session = std::move(active);
+        }
         session->stream_url = old.stream_url;
         session->subtitle_cache = old.subtitle_cache;
         session->logical_session = old.logical_session;
@@ -2327,7 +2365,7 @@ struct PlaybackManager::Impl {
         return false;
     }
 
-    Json session_json(const Session& session) const {
+    Json session_json(const Session& session) const MACHA_EXCLUDES(mutex) {
         Json::Array streams;
         for (const auto& stream : session.probe.streams) streams.push_back(stream_json(stream));
         Json::Object selected{{"video_stream", session.plan.video_stream},
@@ -2404,9 +2442,10 @@ struct PlaybackManager::Impl {
         // production authorised: the producer parks at highest_requested +
         // max_ahead_segments, matching segment_hold_window. Reported in ms so
         // clients need not know the knobs. Null for direct play.
+        const auto settings = current_config();
         const auto look_ahead_ms =
-            static_cast<uint64_t>(config.max_ahead_segments) *
-            static_cast<uint64_t>(std::max<int64_t>(0, config.segment_duration.count()));
+            static_cast<uint64_t>(settings.max_ahead_segments) *
+            static_cast<uint64_t>(std::max<int64_t>(0, settings.segment_duration.count()));
         Json::Object stream{{"url", session.stream_url},
                             {"mime_type", mime_type},
                             {"look_ahead_ms", session.plan.mode == PlaybackMode::direct
@@ -2453,7 +2492,8 @@ struct PlaybackManager::Impl {
         return Json(std::move(out));
     }
 
-    std::vector<uint64_t> subtitle_segment_durations_ms(const Session& session) const {
+    std::vector<uint64_t> subtitle_segment_durations_ms(const Session& session) const
+        MACHA_EXCLUDES(mutex) {
         std::vector<uint64_t> durations;
         if (session.plan.mode != PlaybackMode::direct && session.vod_plan) {
             durations.reserve(session.vod_plan->segment_durations.size());
@@ -2463,7 +2503,8 @@ struct PlaybackManager::Impl {
         }
 
         const auto total_ms = static_cast<uint64_t>(std::max(0.0, session.probe.duration_seconds) * 1000.0);
-        const auto segment_ms = static_cast<uint64_t>(std::max<int64_t>(1, config.segment_duration.count()));
+        const auto segment_ms =
+            static_cast<uint64_t>(std::max<int64_t>(1, current_config().segment_duration.count()));
         if (total_ms == 0) return durations;
         for (uint64_t start = 0; start < total_ms; start += segment_ms)
             durations.push_back(std::min(segment_ms, total_ms - start));
@@ -2524,7 +2565,7 @@ struct PlaybackManager::Impl {
         rest.remove_prefix(slash1 + 1);
         std::shared_ptr<Session> session;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end() || !stream_token_matches(it->second->token, token))
                 return http_error(404, "not_found", "stream not found");
@@ -2533,7 +2574,7 @@ struct PlaybackManager::Impl {
         if (request.method != "GET" && request.method != "HEAD") return http_error(405, "method", "GET or HEAD required");
         if (rest == "direct") {
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = sessions.find(id);
                 if (it == sessions.end() || it->second != session)
                     return http_error(404, "not_found", "stream not found");
@@ -2562,7 +2603,7 @@ struct PlaybackManager::Impl {
         if (name.empty() || name == "." || name == ".." || name.find("..") != std::string::npos)
             return http_error(400, "bad_path", "invalid stream object");
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             // A removed session is 404. A replaced record (subtitle change,
             // fast-path seek, mode change) is supersession of the client's
@@ -2581,7 +2622,7 @@ struct PlaybackManager::Impl {
             signal_cleanup_locked();
         }
         [[maybe_unused]] auto stream_request = std::shared_ptr<void>(nullptr, [this, session](void*) {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             if (session->active_stream_requests) --session->active_stream_requests;
             signal_cleanup_locked();
         });
@@ -2614,10 +2655,11 @@ struct PlaybackManager::Impl {
 
             std::string data;
             {
-                std::lock_guard subtitle_lock(session->subtitle_cache->mutex);
+                auto& cache = *session->subtitle_cache;
+                Lock subtitle_lock(cache.mutex);
                 auto key = std::make_pair(stream_index, *index);
-                auto cached = session->subtitle_cache->segments.find(key);
-                if (cached != session->subtitle_cache->segments.end()) {
+                auto cached = cache.segments.find(key);
+                if (cached != cache.segments.end()) {
                     data = cached->second;
                 } else {
                     try {
@@ -2632,7 +2674,6 @@ struct PlaybackManager::Impl {
                             std::chrono::milliseconds(source_start_ms),
                             std::chrono::milliseconds(source_end_ms),
                             std::chrono::milliseconds(origin_ms));
-                        auto& cache = *session->subtitle_cache;
                         if (data.size() <= cache.max_bytes) {
                             while (!cache.order.empty() &&
                                    (cache.segments.size() >= cache.max_entries ||
@@ -2730,7 +2771,7 @@ struct PlaybackManager::Impl {
                             : std::shared_ptr<HeldRequest>{};
             if (!held) {
                 // Beyond the window nothing is working toward this fragment.
-                if (index && *index >= state.segment_count + config.segment_hold_window)
+                if (index && *index >= state.segment_count + current_config().segment_hold_window)
                     return segment_not_ready(session->id, *index, "beyond_hold_window");
                 auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
                 auto hold = segment_holds.try_acquire(session->id, &why);
@@ -2748,10 +2789,11 @@ struct PlaybackManager::Impl {
             // then the server is handed a deferral and re-runs the request when
             // the store fires or the deadline passes. The hold rides in the
             // deferral's state and is released with it.
+            const auto segment_timeout = current_config().segment_timeout;
             const auto deadline =
                 request.resumed ? request.resume_deadline
-                : config.segment_timeout.count() > 0
-                    ? Clock::now() + config.segment_timeout
+                : segment_timeout.count() > 0
+                    ? Clock::now() + segment_timeout
                     : Clock::time_point::max();
             auto waker = std::make_shared<HttpWaker>();
             auto awaited = store->object_or_subscribe(name, [waker] { waker->fire(); });
@@ -2791,7 +2833,8 @@ struct PlaybackManager::Impl {
     }
 
     HttpResponse create(const HttpRequest& request) {
-        if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
+        if (!current_config().enabled)
+            return http_error(503, "streaming_disabled", "streaming is disabled");
         // HttpServer has already refused unauthenticated requests (this route
         // is not exempt in capability_request); checked anyway.
         if (!request.session) return http_error(401, "unauthorized", "a valid session bearer token is required");
@@ -2847,7 +2890,7 @@ struct PlaybackManager::Impl {
             // into a 409.
             idempotency_scope = account + '\0' + idempotency_key;
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = idempotent_creations.find(idempotency_scope);
                 if (it != idempotent_creations.end() &&
                     it->second->fingerprint != fingerprint)
@@ -2863,11 +2906,15 @@ struct PlaybackManager::Impl {
                 }
             }
             if (!idempotent_owner) {
-                std::unique_lock lock(idempotent->mutex);
+                Lock lock(idempotent->mutex);
                 if (!idempotent->complete) {
-                    const auto deadline = Clock::now() + config.probe_timeout + config.startup_timeout;
-                    if (!idempotent->cv.wait_until(lock, deadline,
-                                                   [&] { return idempotent->complete; }))
+                    const auto settings = current_config();
+                    const auto deadline =
+                        Clock::now() + settings.probe_timeout + settings.startup_timeout;
+                    if (!idempotent->cv.wait_until(lock.native(), deadline,
+                                                   [&]() MACHA_REQUIRES(idempotent->mutex) {
+                                                       return idempotent->complete;
+                                                   }))
                         return http_error(503, "idempotency_in_progress",
                                           "matching session creation is still in progress");
                 }
@@ -2879,7 +2926,7 @@ struct PlaybackManager::Impl {
                                       "the prior playback session has expired");
                 std::shared_ptr<Session> existing;
                 {
-                    std::lock_guard sessions_lock(mutex);
+                    Lock sessions_lock(mutex);
                     auto active = sessions.find(existing_id);
                     if (active == sessions.end())
                         return http_error(409, "idempotency_expired",
@@ -2895,7 +2942,7 @@ struct PlaybackManager::Impl {
         // Each session is its own logical viewer, so viewers sharing a login
         // do not share a transcode entitlement.
         auto logical_session = std::make_shared<LogicalViewerSession>();
-        std::unique_lock logical_operation(logical_session->operation_mutex);
+        Lock logical_operation(logical_session->operation_mutex);
         reserve_session_slot(account);
         ResourceReservation resource_reservation;
         std::shared_ptr<Session> session;
@@ -2921,7 +2968,7 @@ struct PlaybackManager::Impl {
                 start->candidate->start = start;
                 session->start = start;
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     sessions[session->id] = session;
                     signal_cleanup_locked();
                     if (pending_sessions) --pending_sessions;
@@ -2933,7 +2980,7 @@ struct PlaybackManager::Impl {
                 try {
                     std::thread([this, session, start, trace] { run_start(session, start, trace); }).detach();
                 } catch (...) {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     sessions.erase(session->id);
                     --start_workers;
                     start_workers_cv.notify_all();
@@ -2944,7 +2991,7 @@ struct PlaybackManager::Impl {
                 resource_reservation = reserve_resources(*session);
                 start_pipeline(*session, trace);
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     sessions[session->id] = session;
                     signal_cleanup_locked();
                     if (pending_sessions) --pending_sessions;
@@ -2961,12 +3008,12 @@ struct PlaybackManager::Impl {
             release_session_slot(account);
             if (idempotent) {
                 {
-                    std::lock_guard lock(idempotent->mutex);
+                    Lock lock(idempotent->mutex);
                     idempotent->error = error;
                     idempotent->complete = true;
                 }
                 idempotent->cv.notify_all();
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = idempotent_creations.find(idempotency_scope);
                 if (it != idempotent_creations.end() && it->second == idempotent)
                     idempotent_creations.erase(it);
@@ -2975,7 +3022,7 @@ struct PlaybackManager::Impl {
         }
         if (idempotent) {
             {
-                std::lock_guard lock(idempotent->mutex);
+                Lock lock(idempotent->mutex);
                 idempotent->session_id = session->id;
                 idempotent->complete = true;
             }
@@ -3005,12 +3052,12 @@ struct PlaybackManager::Impl {
     Json account_state_json(std::string_view account) const {
         Json::Object out;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             out["sessions"] = static_cast<uint64_t>(sessions_held_by_locked(account));
             out["transcodes"] = static_cast<uint64_t>(account_transcodes_locked(account));
+            out["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
+            out["max_transcodes"] = static_cast<uint64_t>(config.max_transcodes_per_account);
         }
-        out["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
-        out["max_transcodes"] = static_cast<uint64_t>(config.max_transcodes_per_account);
         return Json(std::move(out));
     }
 
@@ -3020,25 +3067,29 @@ struct PlaybackManager::Impl {
         // Node-local by design: a session's resources live on this node, and
         // asking each node gives the client every session's provenance.
         const auto account = account_key(*request.session);
-        Json::Array out;
+        std::vector<std::shared_ptr<Session>> owned;
         size_t transcodes = 0;
+        size_t max_sessions = 0;
+        size_t max_transcodes = 0;
         {
-            std::lock_guard lock(mutex);
-            for (const auto& [_, session] : sessions) {
-                if (session->account != account) continue;
-                out.push_back(session_json(*session));
-            }
+            Lock lock(mutex);
+            for (const auto& [_, session] : sessions)
+                if (session->account == account) owned.push_back(session);
             transcodes = account_transcodes_locked(account);
+            max_sessions = config.max_sessions_per_account;
+            max_transcodes = config.max_transcodes_per_account;
         }
+        Json::Array out;
+        for (const auto& session : owned) out.push_back(session_json(*session));
         Json::Object body;
         const auto held = out.size();
         body["items"] = std::move(out);
         // The caps, so a client can plan against them rather than meet them.
         Json::Object account_info;
         account_info["sessions"] = static_cast<uint64_t>(held);
-        account_info["max_sessions"] = static_cast<uint64_t>(config.max_sessions_per_account);
+        account_info["max_sessions"] = static_cast<uint64_t>(max_sessions);
         account_info["transcodes"] = static_cast<uint64_t>(transcodes);
-        account_info["max_transcodes"] = static_cast<uint64_t>(config.max_transcodes_per_account);
+        account_info["max_transcodes"] = static_cast<uint64_t>(max_transcodes);
         body["account"] = std::move(account_info);
         return http_json(200, Json(std::move(body)).dump());
     }
@@ -3046,7 +3097,7 @@ struct PlaybackManager::Impl {
     HttpResponse get_session(std::string_view id, const HttpRequest& request) {
         std::shared_ptr<Session> session;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) {
                 // A failed async start stays readable for a while.
@@ -3065,7 +3116,7 @@ struct PlaybackManager::Impl {
         }
         std::shared_ptr<PendingReplacement> pending;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             pending = pending_locked(*session);
         }
         const auto watched = session->start && start_pending(*session) ? session->start
@@ -3085,13 +3136,13 @@ struct PlaybackManager::Impl {
             };
             const auto after = number("after");
             const auto wait_ms = std::min<uint64_t>(number("wait_ms").value_or(0),
-                                                    static_cast<uint64_t>(config.start_wait_max.count()));
+                                                    static_cast<uint64_t>(current_config().start_wait_max.count()));
             const auto deadline = request.resumed ? request.resume_deadline
                                                   : Clock::now() + std::chrono::milliseconds(wait_ms);
             std::shared_ptr<HttpWaker> waker;
             bool unfinished = false;
             {
-                std::lock_guard lock(watched->mutex);
+                Lock lock(watched->mutex);
                 unfinished = !watched->finished();
                 if (after && unfinished && watched->seq <= *after && Clock::now() < deadline) {
                     waker = std::make_shared<HttpWaker>();
@@ -3108,11 +3159,11 @@ struct PlaybackManager::Impl {
         }
         auto result = session_json(*session);
         if (session->start) {
-            std::lock_guard lock(session->start->mutex);
+            Lock lock(session->start->mutex);
             result["start"] = start_json_locked(*session->start);
         }
         if (pending) {
-            std::lock_guard lock(pending->start->mutex);
+            Lock lock(pending->start->mutex);
             result["pending"] = Json(Json::Object{{"start", start_json_locked(*pending->start)}});
         }
         if (auto active = active_engine(*session)) {
@@ -3128,7 +3179,7 @@ struct PlaybackManager::Impl {
     HttpResponse update_session(std::string_view id, const HttpRequest& request) {
         std::shared_ptr<Session> old;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             if (!caller_owns(*it->second, request))
@@ -3137,9 +3188,9 @@ struct PlaybackManager::Impl {
         }
         if (!old->logical_session)
             throw std::logic_error("playback session has no logical viewer session");
-        std::unique_lock logical_operation(old->logical_session->operation_mutex);
+        Lock logical_operation(old->logical_session->operation_mutex);
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end())
                 return http_error(404, "not_found", "playback session not found");
@@ -3187,7 +3238,7 @@ struct PlaybackManager::Impl {
         if (subtitle_only) {
             auto replacement = reuse_subtitle_session(*old, std::move(prefs), trace);
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = sessions.find(std::string(id));
                 if (it == sessions.end() || it->second != old)
                     throw std::runtime_error("playback session changed during subtitle update");
@@ -3230,7 +3281,7 @@ struct PlaybackManager::Impl {
             pending->start = std::make_shared<StartState>();
             pending->start->candidate = replacement;
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = sessions.find(std::string(id));
                 if (it == sessions.end() || it->second != old) {
                     rollback_resources(*replacement, *pending->reservation);
@@ -3243,7 +3294,7 @@ struct PlaybackManager::Impl {
                 std::thread([this, old, pending, trace] { run_replacement(old, pending, trace); }).detach();
             } catch (...) {
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     old->pending.reset();
                     --start_workers;
                     start_workers_cv.notify_all();
@@ -3254,7 +3305,7 @@ struct PlaybackManager::Impl {
             auto payload = session_json(*old);
             payload["status"] = std::string("playback_starting");
             {
-                std::lock_guard lock(pending->start->mutex);
+                Lock lock(pending->start->mutex);
                 payload["pending"] = Json(Json::Object{{"start", start_json_locked(*pending->start)}});
             }
             return http_json(202, payload.dump());
@@ -3273,7 +3324,7 @@ struct PlaybackManager::Impl {
             // request cannot take the apparently free slot mid-handover.
             stop_pipeline(*old);
             {
-                std::lock_guard lock(mutex);
+                Lock lock(mutex);
                 auto it = sessions.find(std::string(id));
                 if (it == sessions.end() || it->second != old)
                     throw std::runtime_error("playback session changed during update");
@@ -3300,7 +3351,7 @@ struct PlaybackManager::Impl {
     HttpResponse erase_pending(std::string_view id, const HttpRequest& request) {
         std::shared_ptr<Session> session;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end() || !caller_owns(*it->second, request))
                 return http_error(404, "not_found", "playback session not found");
@@ -3313,7 +3364,7 @@ struct PlaybackManager::Impl {
     HttpResponse erase_session(std::string_view id, const HttpRequest& request) {
         std::shared_ptr<Session> session;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return http_error(404, "not_found", "playback session not found");
             if (!caller_owns(*it->second, request))
@@ -3332,7 +3383,7 @@ struct PlaybackManager::Impl {
     HttpResponse close_by_capability(std::string_view id, std::string_view token) {
         std::shared_ptr<Session> session;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return {204, "application/json; charset=utf-8", {}, {}, {}};
             if (!stream_token_matches(it->second->token, std::string(token)))
@@ -3347,9 +3398,9 @@ struct PlaybackManager::Impl {
     // False when it was removed meanwhile.
     bool tear_down_session(std::string_view id, std::shared_ptr<Session> session) {
         std::shared_ptr<Session> removed;
-        std::unique_lock logical_operation(session->logical_session->operation_mutex);
+        Lock logical_operation(session->logical_session->operation_mutex);
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
             auto it = sessions.find(id);
             if (it == sessions.end()) return false;
             // Whatever holds the id now, possibly a recreate. `session` keeps
@@ -3370,7 +3421,7 @@ struct PlaybackManager::Impl {
         cancel_pending(*removed);
         stop_pipeline(*removed);
         std::error_code ec;
-        std::filesystem::remove_all(*config.temp_path / removed->id, ec);
+        std::filesystem::remove_all(*current_config().temp_path / removed->id, ec);
         return true;
     }
 
@@ -3392,8 +3443,10 @@ struct PlaybackManager::Impl {
         std::chrono::milliseconds session_unused_idle{};
         uint64_t unused_reclaimed = 0;
         std::vector<std::shared_ptr<Session>> active_sessions;
+        StreamingConfig settings;
         {
-            std::lock_guard lock(mutex);
+            Lock lock(mutex);
+            settings = config;
             session_count = sessions.size();
             video_transcodes = video_transcodes_locked();
             audio_transcodes = audio_transcodes_locked();
@@ -3417,11 +3470,8 @@ struct PlaybackManager::Impl {
         // extraction cannot stall every playback operation. try_lock: a session
         // mid-extraction contributes zero rather than blocking status().
         for (const auto& session : active_sessions) {
-            if (std::unique_lock subtitle_lock(session->subtitle_cache->mutex, std::try_to_lock);
-                subtitle_lock.owns_lock()) {
-                cached_subtitle_segments += session->subtitle_cache->segments.size();
-                cached_subtitle_bytes += session->subtitle_cache->bytes;
-            }
+            subtitle_cache_usage(*session->subtitle_cache, cached_subtitle_segments,
+                                 cached_subtitle_bytes);
             auto active = active_engine(*session);
             if (!active)
                 continue;
@@ -3433,27 +3483,27 @@ struct PlaybackManager::Impl {
             segment_store_planned_segments += segment_state.planned_segments;
         }
         Json::Object out{{"server_version", std::string(kServerVersion)},
-                         {"enabled", config.enabled},
+                         {"enabled", settings.enabled},
                          {"sessions", static_cast<uint64_t>(session_count)},
-                         {"max_sessions", static_cast<uint64_t>(config.max_sessions)},
+                         {"max_sessions", static_cast<uint64_t>(settings.max_sessions)},
                          {"max_sessions_per_account",
-                          static_cast<uint64_t>(config.max_sessions_per_account)},
+                          static_cast<uint64_t>(settings.max_sessions_per_account)},
                          {"max_transcodes_per_account",
-                          static_cast<uint64_t>(config.max_transcodes_per_account)},
-                         {"startup_no_progress_ms", static_cast<uint64_t>(config.startup_no_progress.count())},
-                         {"start_wait_max_ms", static_cast<uint64_t>(config.start_wait_max.count())},
+                          static_cast<uint64_t>(settings.max_transcodes_per_account)},
+                         {"startup_no_progress_ms", static_cast<uint64_t>(settings.startup_no_progress.count())},
+                         {"start_wait_max_ms", static_cast<uint64_t>(settings.start_wait_max.count())},
                          {"start_failed_retention_ms",
-                          static_cast<uint64_t>(config.start_failed_retention.count())},
+                          static_cast<uint64_t>(settings.start_failed_retention.count())},
                          {"video_transcodes", static_cast<uint64_t>(video_transcodes)},
-                         {"max_video_transcodes", static_cast<uint64_t>(config.max_video_transcodes)},
+                         {"max_video_transcodes", static_cast<uint64_t>(settings.max_video_transcodes)},
                          {"audio_transcodes", static_cast<uint64_t>(audio_transcodes)},
-                         {"max_audio_transcodes", static_cast<uint64_t>(config.max_audio_transcodes)},
+                         {"max_audio_transcodes", static_cast<uint64_t>(settings.max_audio_transcodes)},
                          {"running_video_transcode_pipelines",
                           static_cast<uint64_t>(running_video_transcode_pipelines)},
                          {"running_audio_transcode_pipelines",
                           static_cast<uint64_t>(running_audio_transcode_pipelines)},
                          {"video_decoder_threads",
-                          static_cast<uint64_t>(config.video_decoder_threads)},
+                          static_cast<uint64_t>(settings.video_decoder_threads)},
                          {"pipeline_idle_ms", static_cast<uint64_t>(pipeline_idle.count())},
                          {"idle_pipelines_reclaimed", reclaimed},
                          {"session_unused_idle_ms",
@@ -3493,7 +3543,8 @@ struct PlaybackManager::Impl {
     // and what can be done with it. No session, no pipeline, no capability
     // matching; the client reads these facts and then instructs.
     HttpResponse media_facts(const HttpRequest& request) {
-        if (!config.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
+        const auto settings = current_config();
+        if (!settings.enabled) return http_error(503, "streaming_disabled", "streaming is disabled");
         if (!request.session)
             return http_error(401, "unauthorized", "a valid session bearer token is required");
         const auto find_query = [&](std::string_view key) {
@@ -3524,7 +3575,7 @@ struct PlaybackManager::Impl {
                 auto lease = create_source(id);
                 // Each file gets the whole probe allowance, so a slow file
                 // cannot push the rest into `unavailable`.
-                auto probe = probe_source(lease, "facts", Clock::now() + config.probe_timeout);
+                auto probe = probe_source(lease, "facts", Clock::now() + settings.probe_timeout);
                 // Facts of media and muxers, not of any client: direct is
                 // always possible, copy_into is per stream, transcode needs the
                 // encoders.
@@ -3621,7 +3672,7 @@ struct PlaybackManager::Impl {
         return http_error(404, "not_found", "endpoint not found");
     }
 
-    void signal_cleanup_locked() {
+    void signal_cleanup_locked() MACHA_REQUIRES(mutex) {
         ++cleanup_revision;
         cleanup_cv.notify_all();
     }
@@ -3637,9 +3688,11 @@ struct PlaybackManager::Impl {
             std::chrono::milliseconds unused_idle_timeout{};
             std::chrono::milliseconds entitlement_idle{};
             bool reclaim_heap = false;
+            std::filesystem::path temp_path;
             {
-                std::unique_lock lock(mutex);
+                Lock lock(mutex);
                 const auto now = Clock::now();
+                temp_path = *config.temp_path;
                 idle_timeout = config.pipeline_idle;
                 unused_idle_timeout = config.session_unused_idle;
                 // Clamped to [pipeline_idle, session_idle]: reconfigure() can
@@ -3670,7 +3723,7 @@ struct PlaybackManager::Impl {
                         const auto pipeline_expires =
                             it->second->stream_touched + idle_timeout;
                         {
-                            std::lock_guard pipeline_lock(it->second->pipeline_mutex);
+                            Lock pipeline_lock(it->second->pipeline_mutex);
                             if (!it->second->active_stream_requests &&
                                 it->second->engine_session &&
                                 it->second->engine_session->running()) {
@@ -3705,7 +3758,7 @@ struct PlaybackManager::Impl {
                     for (const auto& [_, session] : sessions) {
                         if (!transformed(session->plan))
                             continue;
-                        std::lock_guard pipeline_lock(session->pipeline_mutex);
+                        Lock pipeline_lock(session->pipeline_mutex);
                         if (session->engine_session) {
                             transformed_pipeline_active = true;
                             break;
@@ -3719,11 +3772,13 @@ struct PlaybackManager::Impl {
 
                 if (expired.empty() && idle_pipelines.empty() && !reclaim_heap) {
                     const auto observed_revision = cleanup_revision;
-                    const auto changed = [&] { return cleanup_revision != observed_revision; };
+                    const auto changed = [&]() MACHA_REQUIRES(mutex) {
+                        return cleanup_revision != observed_revision;
+                    };
                     if (next_expiry)
-                        cleanup_cv.wait_until(lock, stop, *next_expiry, changed);
+                        cleanup_cv.wait_until(lock.native(), stop, *next_expiry, changed);
                     else
-                        cleanup_cv.wait(lock, stop, changed);
+                        cleanup_cv.wait(lock.native(), stop, changed);
                     continue;
                 }
             }
@@ -3734,7 +3789,7 @@ struct PlaybackManager::Impl {
                               std::to_string(unused_idle_timeout.count()));
                 stop_pipeline(*session);
                 std::error_code ec;
-                std::filesystem::remove_all(*config.temp_path / session->id, ec);
+                std::filesystem::remove_all(temp_path / session->id, ec);
             }
             for (auto& [session, pipeline] : idle_pipelines) {
                 pipeline->stop();
@@ -3750,7 +3805,7 @@ struct PlaybackManager::Impl {
             if (reclaim_heap) {
                 const bool released = release_free_process_heap_pages();
                 {
-                    std::lock_guard lock(mutex);
+                    Lock lock(mutex);
                     ++heap_reclaim_runs;
                     if (released)
                         ++heap_reclaim_successes;
@@ -3775,8 +3830,9 @@ PlaybackManager::PlaybackManager(FileSystem& fs, TranscodeRateBook& transcode_ra
 PlaybackManager::~PlaybackManager() { stop(); }
 
 void PlaybackManager::start() {
-    if (impl_->started || !impl_->config.enabled) return;
-    std::filesystem::create_directories(*impl_->config.temp_path);
+    const auto config = impl_->current_config();
+    if (impl_->started || !config.enabled) return;
+    std::filesystem::create_directories(*config.temp_path);
     if (!impl_->engine) throw std::runtime_error("streaming media engine is unavailable");
     auto status = impl_->engine->status();
     if (!status.available) throw std::runtime_error("streaming media engine is unavailable");
@@ -3803,7 +3859,7 @@ void PlaybackManager::stop() {
     }
     std::vector<std::shared_ptr<Impl::StartState>> starts;
     {
-        std::lock_guard lock(impl_->mutex);
+        Lock lock(impl_->mutex);
         for (auto& [_, session] : impl_->sessions) {
             if (session->start) starts.push_back(session->start);
             if (session->pending) starts.push_back(session->pending->start);
@@ -3814,12 +3870,14 @@ void PlaybackManager::stop() {
         if (start->candidate) impl_->stop_pipeline(*start->candidate);
     }
     {
-        std::unique_lock lock(impl_->mutex);
-        impl_->start_workers_cv.wait(lock, [&] { return impl_->start_workers == 0; });
+        Lock lock(impl_->mutex);
+        impl_->start_workers_cv.wait(lock.native(), [&]() MACHA_REQUIRES(impl_->mutex) {
+            return impl_->start_workers == 0;
+        });
     }
     std::vector<std::shared_ptr<Impl::Session>> sessions;
     {
-        std::lock_guard lock(impl_->mutex);
+        Lock lock(impl_->mutex);
         for (auto& [_, session] : impl_->sessions) sessions.push_back(session);
         impl_->sessions.clear();
         impl_->logical_sessions.clear();
@@ -3842,7 +3900,7 @@ void PlaybackManager::request_stop() {
 }
 
 void PlaybackManager::reconfigure(StreamingConfig config) {
-    std::lock_guard lock(impl_->mutex);
+    Lock lock(impl_->mutex);
     // Policy limits and timing apply at once; backend, probe, buffering and
     // temp-path changes need a restart.
     impl_->config.max_sessions = config.max_sessions;

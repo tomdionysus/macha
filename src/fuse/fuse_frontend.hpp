@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/thread_safety.hpp"
 #include "filesystem/filesystem.hpp"
 #include "filesystem/hydration.hpp"
 
@@ -73,16 +74,16 @@ class WeightedLoaderService {
     using TimePoint = Clock::time_point;
 
   private:
-    mutable std::mutex mutex_;
-    size_t viewer_weight_;
-    size_t loader_weight_;
-    std::chrono::milliseconds slice_;
-    std::optional<TimePoint> burst_started_;
-    TimePoint slice_deadline_{};
-    TimePoint not_before_{};
-    size_t active_loaders_{};
+    mutable Mutex mutex_;
+    const size_t viewer_weight_;
+    const size_t loader_weight_;
+    const std::chrono::milliseconds slice_;
+    std::optional<TimePoint> burst_started_ MACHA_GUARDED_BY(mutex_);
+    TimePoint slice_deadline_ MACHA_GUARDED_BY(mutex_){};
+    TimePoint not_before_ MACHA_GUARDED_BY(mutex_){};
+    size_t active_loaders_ MACHA_GUARDED_BY(mutex_){};
 
-    void reset_locked() {
+    void reset_locked() MACHA_REQUIRES(mutex_) {
         burst_started_.reset();
         slice_deadline_ = {};
         not_before_ = {};
@@ -95,7 +96,7 @@ class WeightedLoaderService {
         : viewer_weight_(viewer_weight), loader_weight_(loader_weight), slice_(slice) {}
 
     bool can_start(TimePoint now, bool viewer_active) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!viewer_active) {
             reset_locked();
             return true;
@@ -108,7 +109,7 @@ class WeightedLoaderService {
     }
 
     void started(TimePoint now, bool viewer_active, bool begin_service = true) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         ++active_loaders_;
         if (!viewer_active) {
             reset_locked();
@@ -125,7 +126,7 @@ class WeightedLoaderService {
     // A loader admitted before its writer is ready counts as active at once but
     // starts its service slice only here, when it can do useful work.
     void service_started(TimePoint now, bool viewer_active) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!viewer_active) {
             reset_locked();
             return;
@@ -139,7 +140,7 @@ class WeightedLoaderService {
     }
 
     bool should_yield(TimePoint now, bool viewer_active) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!viewer_active) {
             reset_locked();
             return false;
@@ -157,7 +158,7 @@ class WeightedLoaderService {
     }
 
     std::chrono::milliseconds finished(TimePoint now, bool viewer_active) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (active_loaders_)
             --active_loaders_;
         if (!viewer_active) {
@@ -182,7 +183,7 @@ class WeightedLoaderService {
     }
 
     std::chrono::milliseconds wait_for(TimePoint now, bool viewer_active) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!viewer_active) {
             reset_locked();
             return {};

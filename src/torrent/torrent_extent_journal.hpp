@@ -7,13 +7,13 @@
 // Trusted no further than the commit proves: the retention barrier refuses a
 // manifest naming objects the cluster lacks, and the ingest then copies.
 
+#include "contract/thread_safety.hpp"
 #include "metadata/metadata.hpp"
 #include "types.hpp"
 
 #include <cstdint>
 #include <filesystem>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,8 +53,11 @@ class TorrentExtentJournal {
 
   private:
     std::filesystem::path path_;
-    std::mutex mutex_;
-    int fd_{-1};
+    // Held across the journal file's write and fsync; guards no state, it
+    // keeps appended lines whole.
+    IoMutex mutex_;
+    int fd_{-1}; // opened at construction, fixed after
+
 };
 
 } // namespace macha

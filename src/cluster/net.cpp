@@ -775,14 +775,14 @@ SecureChannel::~SecureChannel() {
 }
 
 void SecureChannel::set_io_timeout(std::chrono::milliseconds timeout) {
-    std::lock_guard lock(close_mutex_);
+    Lock lock(close_mutex_);
     if (fd_ < 0)
         throw std::runtime_error("closed socket");
     socket_timeout(fd_, timeout);
 }
 
 void SecureChannel::close_fd() {
-    std::lock_guard lock(close_mutex_);
+    Lock lock(close_mutex_);
     if (fd_ >= 0) {
         ::shutdown(fd_, SHUT_RDWR);
         close(fd_);
@@ -792,7 +792,7 @@ void SecureChannel::close_fd() {
 }
 
 void SecureChannel::shutdown() {
-    std::lock_guard lock(close_mutex_);
+    Lock lock(close_mutex_);
     if (fd_ >= 0 && !shutdown_) {
         ::shutdown(fd_, SHUT_RDWR);
         shutdown_ = true;
@@ -1157,34 +1157,38 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     std::function<void(bool, std::chrono::milliseconds, bool)> result_observer_;
     RetainedMemoryLedger* retained_memory_{};
 
-    std::mutex admission_mutex_;
-    std::mutex pending_mutex_;
-    std::map<uint64_t, std::shared_ptr<Pending>> pending_;
-    std::mutex outbound_mutex_;
+    // Guards nothing: orders call() admission against retire().
+    Mutex admission_mutex_;
+    Mutex pending_mutex_;
+    std::map<uint64_t, std::shared_ptr<Pending>> pending_ MACHA_GUARDED_BY(pending_mutex_);
+    Mutex outbound_mutex_;
     std::condition_variable outbound_cv_;
-    std::deque<Outbound> outbound_;
-    size_t outbound_bytes_{}; // queued payload bytes; guarded by outbound_mutex_
-    std::map<uint64_t, FrameType> inbound_classes_; // guarded by outbound_mutex_
-    std::set<uint64_t> cancelled_inbound_;          // guarded by outbound_mutex_
+    std::deque<Outbound> outbound_ MACHA_GUARDED_BY(outbound_mutex_);
+    size_t outbound_bytes_ MACHA_GUARDED_BY(outbound_mutex_){}; // queued payload bytes
+    std::map<uint64_t, FrameType> inbound_classes_ MACHA_GUARDED_BY(outbound_mutex_);
+    std::set<uint64_t> cancelled_inbound_ MACHA_GUARDED_BY(outbound_mutex_);
     // Kept while the writer has an item dequeued for sending, so a promotion
     // or cancellation during send_fragment() still applies to it.
-    std::map<uint64_t, FrameType> outbound_classes_; // guarded by outbound_mutex_
-    std::set<uint64_t> cancelled_outgoing_;          // guarded by outbound_mutex_
-    std::atomic_uint64_t next_request_{1};           // TCP dialler owns odd request IDs.
+    std::map<uint64_t, FrameType> outbound_classes_ MACHA_GUARDED_BY(outbound_mutex_);
+    std::set<uint64_t> cancelled_outgoing_ MACHA_GUARDED_BY(outbound_mutex_);
+    std::atomic_uint64_t next_request_{1}; // TCP dialler owns odd request IDs.
     std::atomic_bool broken_{};
     std::atomic_bool retiring_{};
     std::atomic_bool peer_retired_{};
-    bool retire_notice_sent_{}; // guarded by outbound_mutex_
+    bool retire_notice_sent_ MACHA_GUARDED_BY(outbound_mutex_){};
     std::atomic_uint64_t inbound_active_{};
     std::atomic_uint64_t writes_active_{};
-    std::mutex start_mutex_;
+    // Guards nothing: holds the reader and writer back until start() has
+    // assigned both.
+    Mutex start_mutex_;
+    // Assigned once in start(), before either thread runs.
     std::jthread reader_;
     std::jthread writer_;
 
     void touch(uint64_t request_id) {
         std::shared_ptr<Pending> pending;
         {
-            DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+            TimedLock lock(pending_mutex_, "rpc.client.pending");
             auto found = pending_.find(request_id);
             if (found == pending_.end())
                 return;
@@ -1196,7 +1200,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     std::chrono::milliseconds idle_for(uint64_t request_id) {
         std::shared_ptr<Pending> pending;
         {
-            DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+            TimedLock lock(pending_mutex_, "rpc.client.pending");
             auto found = pending_.find(request_id);
             if (found == pending_.end())
                 return std::chrono::milliseconds(0);
@@ -1211,7 +1215,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     void fail_all(const std::string& text) {
         std::map<uint64_t, std::shared_ptr<Pending>> pending;
         {
-            DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+            TimedLock lock(pending_mutex_, "rpc.client.pending");
             pending.swap(pending_);
         }
         for (auto& [_, item] : pending) {
@@ -1225,7 +1229,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     }
 
     bool drained() {
-        std::scoped_lock lock(pending_mutex_, outbound_mutex_);
+        Lock pending_lock(pending_mutex_);
+        Lock outbound_lock(outbound_mutex_);
         return pending_.empty() && outbound_.empty() && inbound_active_.load() == 0 &&
                writes_active_.load() == 0;
     }
@@ -1235,7 +1240,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             close();
     }
 
-    void maybe_queue_retire_locked() {
+    void maybe_queue_retire_locked() MACHA_REQUIRES(outbound_mutex_) {
         if (!retiring_.load() || retire_notice_sent_ || !outbound_.empty() ||
             writes_active_.load() != 0)
             return;
@@ -1244,7 +1249,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}, {}});
     }
 
-    void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate) {
+    void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate)
+        MACHA_REQUIRES(outbound_mutex_) {
         for (auto item = outbound_.begin(); item != outbound_.end();) {
             if (!predicate(*item)) {
                 ++item;
@@ -1267,7 +1273,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 throw std::runtime_error("process retained-memory RPC admission saturated");
         }
         {
-            DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+            TimedLock lock(outbound_mutex_, "rpc.client.outbound");
             if (broken_.load())
                 throw std::runtime_error("peer channel is closed");
             if (reply) {
@@ -1300,7 +1306,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     }
 
     void register_inbound(uint64_t request_id, FrameType type) {
-        DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+        TimedLock lock(outbound_mutex_, "rpc.client.outbound");
         inbound_classes_[request_id] = type;
     }
 
@@ -1308,7 +1314,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         if (type != FrameType::foreground && type != FrameType::read_ahead)
             return;
         {
-            DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+            TimedLock lock(outbound_mutex_, "rpc.client.outbound");
             auto found = inbound_classes_.find(request_id);
             if (found != inbound_classes_.end())
                 found->second = more_urgent(type, found->second);
@@ -1321,7 +1327,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     }
 
     void cancel_inbound(uint64_t request_id) {
-        DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+        TimedLock lock(outbound_mutex_, "rpc.client.outbound");
         // Untrusted input: only a registered inbound request may create a
         // tombstone, bounding the set by real in-flight work.
         if (!inbound_classes_.contains(request_id))
@@ -1343,7 +1349,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             return;
 
         {
-            DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+            TimedLock lock(outbound_mutex_, "rpc.client.outbound");
             if (auto found = outbound_classes_.find(request_id); found != outbound_classes_.end())
                 found->second = more_urgent(type, found->second);
             for (auto& item : outbound_) {
@@ -1359,7 +1365,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
     void cancel_outgoing(uint64_t request_id) {
         {
-            DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+            TimedLock lock(outbound_mutex_, "rpc.client.outbound");
             const bool active = outbound_classes_.contains(request_id);
             bool removed_queued = false;
             erase_queued_locked([&](const Outbound& item) {
@@ -1404,7 +1410,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                              });
         } catch (...) {
             {
-                DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+                TimedLock lock(outbound_mutex_, "rpc.client.outbound");
                 inbound_classes_.erase(id);
             }
             --inbound_active_;
@@ -1421,17 +1427,17 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         inbound_handler_(peer_, std::move(frame), [](const RpcMessage&) {});
     }
 
-    std::deque<Outbound>::iterator best_outbound_locked() {
+    std::deque<Outbound>::iterator best_outbound_locked() MACHA_REQUIRES(outbound_mutex_) {
         return std::min_element(
             outbound_.begin(), outbound_.end(), [](const Outbound& a, const Outbound& b) {
                 return frame_type_priority(a.frame_type) < frame_type_priority(b.frame_type);
             });
     }
 
-    // Caller holds outbound_mutex_. Releases every waited-on queued frame
-    // with an error rather than leave a promise no thread will set (a stuck
-    // notify() under the metadata mutation mutex would block publication).
-    void abandon_outbound_locked(const char* reason) {
+    // Releases every waited-on queued frame with an error rather than leave a
+    // promise no thread will set (a stuck notify() under the metadata mutation
+    // mutex would block publication).
+    void abandon_outbound_locked(const char* reason) MACHA_REQUIRES(outbound_mutex_) {
         for (auto& item : outbound_) {
             if (!item.sent)
                 continue;
@@ -1452,9 +1458,9 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             while (true) {
                 Outbound item;
                 {
-                    std::unique_lock lock(outbound_mutex_);
+                    Lock lock(outbound_mutex_);
                     maybe_queue_retire_locked();
-                    outbound_cv_.wait(lock, [&] {
+                    outbound_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(outbound_mutex_) {
                         maybe_queue_retire_locked();
                         return stop.stop_requested() || broken_.load() || !outbound_.empty();
                     });
@@ -1500,7 +1506,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
                 if (!last) {
                     item.offset += amount;
-                    DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+                    TimedLock lock(outbound_mutex_, "rpc.client.outbound");
                     if (item.reply) {
                         if (cancelled_inbound_.contains(item.request_id)) {
                             cancelled_inbound_.erase(item.request_id);
@@ -1527,12 +1533,12 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                     outbound_cv_.notify_one();
                 } else {
                     if (item.reply) {
-                        DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+                        TimedLock lock(outbound_mutex_, "rpc.client.outbound");
                         inbound_classes_.erase(item.request_id);
                         cancelled_inbound_.erase(item.request_id);
                         maybe_queue_retire_locked();
                     } else if (item.request_id) {
-                        DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+                        TimedLock lock(outbound_mutex_, "rpc.client.outbound");
                         outbound_classes_.erase(item.request_id);
                         cancelled_outgoing_.erase(item.request_id);
                     }
@@ -1551,7 +1557,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             channel_.shutdown();
             fail_all(error.what());
             {
-                DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+                TimedLock lock(outbound_mutex_, "rpc.client.outbound");
                 abandon_outbound_locked(error.what());
             }
             outbound_cv_.notify_all();
@@ -1611,7 +1617,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
 
                 std::shared_ptr<Pending> pending;
                 {
-                    DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+                    TimedLock lock(pending_mutex_, "rpc.client.pending");
                     auto found = pending_.find(frame->request_id);
                     if (found == pending_.end())
                         continue;
@@ -1657,13 +1663,13 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     // make_shared, so shared_from_this() works and close() cannot race the
     // assignment of reader_ and writer_. Each thread waits until both are set.
     void start() {
-        std::lock_guard starting(start_mutex_);
+        Lock starting(start_mutex_);
         reader_ = std::jthread([this](std::stop_token stop) {
-            { std::lock_guard started(start_mutex_); }
+            { Lock started(start_mutex_); }
             run_supervised_once("net-peer-reader", [this, stop] { reader_loop(stop); });
         });
         writer_ = std::jthread([this](std::stop_token stop) {
-            { std::lock_guard started(start_mutex_); }
+            { Lock started(start_mutex_); }
             run_supervised_once("net-peer-writer", [this, stop] { writer_loop(stop); });
         });
     }
@@ -1704,7 +1710,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         pending->latency_sample = type == MessageType::ping;
         auto future = pending->promise.get_future();
         {
-            std::lock_guard admission(admission_mutex_);
+            Lock admission(admission_mutex_);
             if (broken_.load())
                 throw std::runtime_error("peer channel is closed");
             if (retiring_.load())
@@ -1713,7 +1719,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             if (!id)
                 throw std::runtime_error("RPC request id exhausted");
             {
-                DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+                TimedLock lock(pending_mutex_, "rpc.client.pending");
                 if (pending_.size() >= max_pending_requests)
                     throw std::runtime_error("peer pending reply limit reached");
                 pending_.emplace(id, pending);
@@ -1722,7 +1728,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
                 (void)queue_message(id, frame_type, {type, Bytes(payload.begin(), payload.end())},
                                     false);
             } catch (...) {
-                DiagnosticLock lock(pending_mutex_, "rpc.client.pending");
+                TimedLock lock(pending_mutex_, "rpc.client.pending");
                 pending_.erase(id);
                 throw;
             }
@@ -1733,7 +1739,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             if (auto self = weak.lock()) {
                 bool existed = false;
                 {
-                    DiagnosticLock lock(self->pending_mutex_, "rpc.client.pending");
+                    TimedLock lock(self->pending_mutex_, "rpc.client.pending");
                     existed = self->pending_.erase(id) != 0;
                 }
                 if (existed)
@@ -1744,7 +1750,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         auto abort = [weak, id] {
             if (auto self = weak.lock()) {
                 {
-                    DiagnosticLock lock(self->pending_mutex_, "rpc.client.pending");
+                    TimedLock lock(self->pending_mutex_, "rpc.client.pending");
                     self->pending_.erase(id);
                 }
                 self->close();
@@ -1785,13 +1791,30 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             if (!memory)
                 return false;
         }
-        std::unique_lock lock(outbound_mutex_, std::try_to_lock);
-        // A small notification may queue behind existing work; anything larger
-        // waits for an idle writer so it adds no delay ahead of operational
-        // RPC. Size decides, not class: telemetry rides SPECULATIVE and must
-        // survive a busy writer, and best_outbound_locked() still sends more
-        // urgent frames first.
-        if (!lock.owns_lock() || broken_.load())
+        if (!outbound_mutex_.try_lock())
+            return false;
+        bool queued = false;
+        try {
+            queued = try_queue_notify_locked(message, frame_type, memory);
+        } catch (...) {
+            outbound_mutex_.unlock();
+            throw;
+        }
+        outbound_mutex_.unlock();
+        if (queued)
+            outbound_cv_.notify_one();
+        return queued;
+    }
+
+    // A small notification may queue behind existing work; anything larger
+    // waits for an idle writer so it adds no delay ahead of operational RPC.
+    // Size decides, not class: telemetry rides SPECULATIVE and must survive a
+    // busy writer, and best_outbound_locked() still sends more urgent frames
+    // first.
+    bool try_queue_notify_locked(const RpcMessage& message, FrameType frame_type,
+                                 std::optional<RetainedMemoryLedger::Lease>& memory)
+        MACHA_REQUIRES(outbound_mutex_) {
+        if (broken_.load())
             return false;
         const bool small_notification = message.payload.size() <= max_notify_payload_bytes;
         if (!outbound_.empty() &&
@@ -1802,20 +1825,18 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         outbound_.push_back({0, frame_type, message, 0, false, {},
                              memory ? std::move(*memory) : RetainedMemoryLedger::Lease{}});
         outbound_bytes_ += message.payload.size();
-        lock.unlock();
-        outbound_cv_.notify_one();
         return true;
     }
 
     void retire() {
         {
-            std::lock_guard admission(admission_mutex_);
+            Lock admission(admission_mutex_);
             bool expected = false;
             if (!retiring_.compare_exchange_strong(expected, true))
                 return;
         }
         {
-            DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+            TimedLock lock(outbound_mutex_, "rpc.client.outbound");
             maybe_queue_retire_locked();
         }
         outbound_cv_.notify_all();
@@ -1828,7 +1849,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             fail_all("peer channel closed");
         }
         {
-            DiagnosticLock lock(outbound_mutex_, "rpc.client.outbound");
+            TimedLock lock(outbound_mutex_, "rpc.client.outbound");
             for (auto& item : outbound_) {
                 if (item.sent) {
                     try {
@@ -1899,39 +1920,39 @@ TransportLane RpcClient::lane_for(MessageType type, FrameType frame_type) noexce
 }
 
 void RpcClient::set_inbound_handler(InboundHandler handler) {
-    std::lock_guard lock(inbound_mutex_);
+    Lock lock(inbound_mutex_);
     inbound_handler_ = std::move(handler);
 }
 
 void RpcClient::dispatch_inbound(const NodeInfo& peer, RpcFrame frame, InboundReply reply) {
-    std::lock_guard lock(inbound_mutex_);
+    Lock lock(inbound_mutex_);
     if (!inbound_handler_)
         throw std::runtime_error("no inbound RPC handler installed");
     inbound_handler_(peer, std::move(frame), std::move(reply));
 }
 
 void RpcClient::set_inbound_transfer_control(InboundPromoter promoter, InboundCanceller canceller) {
-    std::lock_guard lock(inbound_mutex_);
+    Lock lock(inbound_mutex_);
     inbound_promoter_ = std::move(promoter);
     inbound_canceller_ = std::move(canceller);
 }
 
 void RpcClient::dispatch_inbound_promotion(const NodeInfo& peer, uint64_t request_id,
                                            FrameType type) {
-    std::lock_guard lock(inbound_mutex_);
+    Lock lock(inbound_mutex_);
     if (inbound_promoter_)
         inbound_promoter_(peer, request_id, type);
 }
 
 void RpcClient::dispatch_inbound_cancel(const NodeInfo& peer, uint64_t request_id) {
-    std::lock_guard lock(inbound_mutex_);
+    Lock lock(inbound_mutex_);
     if (inbound_canceller_)
         inbound_canceller_(peer, request_id);
 }
 
 void RpcClient::observe_result(const std::string& connection_key, bool success,
                                std::chrono::milliseconds elapsed, bool latency_sample) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& health = health_[connection_key];
     if (success) {
         health.failures = 0;
@@ -1954,7 +1975,7 @@ void RpcClient::observe_result(const std::string& connection_key, bool success,
 }
 
 std::map<NodeId, std::chrono::milliseconds> RpcClient::peer_latencies() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     static const std::string control_suffix =
         std::string(":") + transport_lane_name(TransportLane::control);
     std::map<NodeId, std::chrono::milliseconds> out;
@@ -1984,7 +2005,7 @@ std::optional<std::chrono::milliseconds> RpcClient::peer_latency(const NodeId& p
 void RpcClient::reap_retired() {
     std::vector<std::shared_ptr<PeerConnection>> reap;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (auto it = retired_connections_.begin(); it != retired_connections_.end();) {
             if (*it && (*it)->finished()) {
                 reap.push_back(std::move(*it));
@@ -2031,7 +2052,7 @@ void RpcClient::register_inbound(InboundRoute route) {
     const auto k = route_key(peer, lane);
     std::vector<std::function<void()>> retire;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (held_inbound_peers_for_tests_.contains(peer)) {
             held_inbound_routes_for_tests_.push_back(std::move(route));
             return;
@@ -2063,7 +2084,7 @@ void RpcClient::register_inbound(InboundRoute route) {
 
 void RpcClient::unregister_inbound(const NodeId& peer, TransportLane lane,
                                    const std::array<uint8_t, 32>& session_id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto found = inbound_routes_.find(route_key(peer, lane));
     if (found != inbound_routes_.end() && found->second.session_id == session_id)
         inbound_routes_.erase(found);
@@ -2078,7 +2099,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
     std::optional<NodeId> known;
     std::string flight_key;
     while (true) {
-        std::unique_lock lock(mutex_);
+        Lock lock(mutex_);
         if (expected) {
             known = *expected;
         } else if (auto p = endpoint_peers_.find(endpoint_key(endpoint));
@@ -2121,7 +2142,9 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         if (connection_dials_.insert(flight_key).second)
             break;
 
-        connection_cv_.wait(lock, [&] { return !connection_dials_.contains(flight_key); });
+        connection_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(mutex_) {
+            return !connection_dials_.contains(flight_key);
+        });
         // The leader may have installed an outbound route, accepted an inbound
         // one, or failed into backoff: re-evaluate rather than redial.
         known.reset();
@@ -2132,7 +2155,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         if (!flight_active)
             return;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             connection_dials_.erase(flight_key);
         }
         flight_active = false;
@@ -2174,7 +2197,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         std::shared_ptr<PeerConnection> winner;
         bool installed = false;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             note_peer_locked(fresh->peer());
             endpoints_[endpoint_key(endpoint)] = endpoint;
             endpoint_peers_[endpoint_key(endpoint)] = fresh->peer().id;
@@ -2225,7 +2248,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
         }
         std::function<void()> after_dial;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             after_dial = after_dial_for_tests_;
         }
         if (after_dial)
@@ -2246,7 +2269,7 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
     const auto lane = lane_for(type, frame_type);
 
     if (expected) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto stalled = stalled_peers_for_tests_.find(*expected);
         if (stalled != stalled_peers_for_tests_.end() &&
             (!stalled->second || *stalled->second == type))
@@ -2290,7 +2313,7 @@ std::optional<AsyncRpc> RpcClient::call_existing(const NodeId& peer, TransportLa
     std::shared_ptr<PeerConnection> outbound;
     std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         const auto k = route_key(peer, lane);
         auto out = connections_.find(k);
         if (out != connections_.end() && out->second && out->second->usable())
@@ -2331,7 +2354,7 @@ AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
                                std::span<const uint8_t> payload) {
     Endpoint endpoint{node.host, node.port};
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (reset_invalidates_node_reference(identity_resets_, node))
             throw std::runtime_error("RPC endpoint " + endpoint_key(endpoint) +
                                      " identity association for NodeId " + to_string(node.id) +
@@ -2349,7 +2372,7 @@ AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
                                std::span<const uint8_t> payload, FrameType frame_type) {
     Endpoint endpoint{node.host, node.port};
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (reset_invalidates_node_reference(identity_resets_, node))
             throw std::runtime_error("RPC endpoint " + endpoint_key(endpoint) +
                                      " identity association for NodeId " + to_string(node.id) +
@@ -2380,14 +2403,14 @@ AsyncRpc RpcClient::stalled_call_for_tests_locked() {
 }
 
 void RpcClient::stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     stalled_peers_for_tests_[peer] = message;
 }
 
 void RpcClient::release_peer_for_tests(const NodeId& peer) {
     std::vector<std::shared_ptr<std::promise<RpcReply>>> held;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         stalled_peers_for_tests_.erase(peer);
         held.swap(stalled_calls_for_tests_);
     }
@@ -2401,7 +2424,7 @@ void RpcClient::release_peer_for_tests(const NodeId& peer) {
 }
 
 size_t RpcClient::stalled_calls_for_tests() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return stalled_calls_for_tests_.size();
 }
 
@@ -2484,7 +2507,7 @@ void RpcClient::close_endpoint(const Endpoint& endpoint, const std::string& reas
     std::vector<std::function<void()>> inbound;
     std::optional<NodeId> peer;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto known = endpoint_peers_.find(endpoint_key(endpoint));
         if (known != endpoint_peers_.end())
             peer = known->second;
@@ -2549,17 +2572,19 @@ void RpcClient::note_peer_locked(const NodeInfo& peer) {
 }
 
 void RpcClient::note_peer(const NodeInfo& peer) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     note_peer_locked(peer);
 }
 
 bool RpcClient::has_route(const NodeId& peer, TransportLane lane) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return route_usable_locked(peer, lane);
 }
 
-void RpcClient::await_reverse_dial(std::unique_lock<std::mutex>& lock, const NodeId& peer,
-                                   TransportLane lane, const std::string& retry_key) {
+// Unchecked: it releases and retakes the caller's Lock through a reference,
+// which the analysis cannot follow.
+void RpcClient::await_reverse_dial(Lock& lock, const NodeId& peer, TransportLane lane,
+                                   const std::string& retry_key) MACHA_NO_THREAD_SAFETY_ANALYSIS {
     // Something to ask over: normally the CONTROL session the peer opened, but
     // an outbound one (tests, a misdeclared node) is honoured too.
     std::function<bool(const RpcMessage&, FrameType)> try_notify;
@@ -2604,9 +2629,9 @@ void RpcClient::await_reverse_dial(std::unique_lock<std::mutex>& lock, const Nod
             ++dial_requests_sent_;
             Log::debug("dial request sent peer=" + to_string(peer).substr(0, 12) +
                        " lane=" + transport_lane_name(lane));
-            const bool arrived = connection_cv_.wait_for(lock, connect_timeout_, [&] {
-                return route_usable_locked(peer, lane);
-            });
+            const bool arrived = connection_cv_.wait_for(
+                lock.native(), connect_timeout_,
+                [&]() MACHA_REQUIRES(mutex_) { return route_usable_locked(peer, lane); });
             if (arrived) {
                 Log::debug("dial request answered peer=" + to_string(peer).substr(0, 12) +
                            " lane=" + transport_lane_name(lane));
@@ -2632,7 +2657,7 @@ void RpcClient::request_lane(const NodeInfo& peer, TransportLane lane) {
     if (peer.id == NodeId{} || peer.host.empty() || !peer.port)
         return;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         note_peer_locked(peer);
         requested_lanes_[route_key(peer.id, lane)] = {peer, lane};
     }
@@ -2642,7 +2667,7 @@ void RpcClient::request_lane(const NodeInfo& peer, TransportLane lane) {
 }
 
 void RpcClient::set_maintained_peers(std::function<std::vector<NodeInfo>()> peers) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     maintained_peers_ = std::move(peers);
 }
 
@@ -2650,7 +2675,7 @@ void RpcClient::open_requested_lanes(std::stop_token stop) {
     std::vector<std::pair<NodeInfo, TransportLane>> wanted;
     std::function<std::vector<NodeInfo>()> maintained;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (auto& [_, item] : requested_lanes_)
             wanted.push_back(item);
         requested_lanes_.clear();
@@ -2701,20 +2726,22 @@ std::string RpcClient::probe_dial(const Endpoint& endpoint, const NodeId& expect
 }
 
 bool RpcClient::await_route(const NodeId& peer, TransportLane lane) {
-    std::unique_lock lock(mutex_);
-    return connection_cv_.wait_for(lock, connect_timeout_,
-                                   [&] { return route_usable_locked(peer, lane); });
+    Lock lock(mutex_);
+    return connection_cv_.wait_for(lock.native(), connect_timeout_,
+                                   [&]() MACHA_REQUIRES(mutex_) {
+                                       return route_usable_locked(peer, lane);
+                                   });
 }
 
 void RpcClient::hold_inbound_for_tests(const NodeId& peer) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     held_inbound_peers_for_tests_.insert(peer);
 }
 
 void RpcClient::release_inbound_for_tests(const NodeId& peer) {
     std::vector<InboundRoute> held;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         held_inbound_peers_for_tests_.erase(peer);
         for (auto it = held_inbound_routes_for_tests_.begin();
              it != held_inbound_routes_for_tests_.end();) {
@@ -2731,7 +2758,7 @@ void RpcClient::release_inbound_for_tests(const NodeId& peer) {
 }
 
 void RpcClient::set_after_dial_for_tests(std::function<void()> hook) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     after_dial_for_tests_ = std::move(hook);
 }
 
@@ -2739,7 +2766,7 @@ void RpcClient::close_lane_for_tests(const NodeId& peer, TransportLane lane) {
     std::shared_ptr<PeerConnection> outbound;
     std::function<void()> inbound;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         const auto k = route_key(peer, lane);
         if (auto out = connections_.find(k); out != connections_.end()) {
             outbound = std::move(out->second);
@@ -2780,8 +2807,8 @@ void RpcClient::health_loop(std::stop_token stop) {
     auto last_probe_round = Clock::time_point{};
     while (!stop.stop_requested()) {
         {
-            std::unique_lock wait_lock(health_wait_mutex_);
-            health_wait_cv_.wait_for(wait_lock, stop, heartbeat_, [&] {
+            Lock wait_lock(health_wait_mutex_);
+            health_wait_cv_.wait_for(wait_lock.native(), stop, heartbeat_, [&] {
                 return lane_wakeups_.load(std::memory_order_acquire) != lane_wakeups_seen;
             });
             lane_wakeups_seen = lane_wakeups_.load(std::memory_order_acquire);
@@ -2803,7 +2830,7 @@ void RpcClient::health_loop(std::stop_token stop) {
         std::map<NodeId, Endpoint> active_peers;
         std::map<NodeId, Endpoint> data_peers;
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             for (const auto& [base, endpoint] : endpoints_) {
                 auto known = endpoint_peers_.find(base);
                 if (known == endpoint_peers_.end())
@@ -2948,7 +2975,7 @@ void RpcClient::health_loop(std::stop_token stop) {
 
 RpcStats RpcClient::stats() const {
     RpcStats stats{connections_created_.load(), connections_reused_.load()};
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [_, connection] : connections_)
         if (connection && connection->usable())
             ++stats.canonical_connections;
@@ -2962,7 +2989,7 @@ void RpcClient::broadcast(const RpcMessage& message) {
     std::vector<std::shared_ptr<PeerConnection>> outbound;
     std::vector<std::function<void(const RpcMessage&)>> inbound;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (const auto& [_, connection] : connections_)
             if (connection && connection->usable() && connection->lane() == TransportLane::control)
                 outbound.push_back(connection);
@@ -2988,18 +3015,8 @@ void RpcClient::broadcast(const RpcMessage& message) {
 size_t RpcClient::broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
     std::vector<std::shared_ptr<PeerConnection>> outbound;
     std::vector<std::function<bool(const RpcMessage&, FrameType)>> inbound;
-    {
-        std::unique_lock lock(mutex_, std::try_to_lock);
-        if (!lock.owns_lock())
-            return 0;
-        for (const auto& [_, connection] : connections_)
-            if (connection && connection->usable() && connection->lane() == TransportLane::control)
-                outbound.push_back(connection);
-        for (const auto& [_, route] : inbound_routes_)
-            if (route.lane == TransportLane::control && route.usable && route.usable() &&
-                route.try_notify)
-                inbound.push_back(route.try_notify);
-    }
+    if (!try_control_routes(outbound, inbound))
+        return 0;
 
     size_t queued = 0;
     for (auto& connection : outbound)
@@ -3017,13 +3034,29 @@ size_t RpcClient::broadcast_best_effort(const RpcMessage& message, FrameType fra
     return queued;
 }
 
+bool RpcClient::try_control_routes(
+    std::vector<std::shared_ptr<PeerConnection>>& outbound,
+    std::vector<std::function<bool(const RpcMessage&, FrameType)>>& inbound) {
+    if (!mutex_.try_lock())
+        return false;
+    Lock lock(mutex_, std::adopt_lock);
+    for (const auto& [_, connection] : connections_)
+        if (connection && connection->usable() && connection->lane() == TransportLane::control)
+            outbound.push_back(connection);
+    for (const auto& [_, route] : inbound_routes_)
+        if (route.lane == TransportLane::control && route.usable && route.usable() &&
+            route.try_notify)
+            inbound.push_back(route.try_notify);
+    return true;
+}
+
 void RpcClient::invalidate_identity_association(const IdentityAssociationReset& reset) {
     if (reset.host.empty() || !reset.epoch)
         return;
     std::vector<std::shared_ptr<PeerConnection>> outbound;
     std::vector<std::function<void()>> inbound;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         const auto reset_key = identity_reset_key(reset.host, reset.port);
         auto existing = identity_resets_.find(reset_key);
         if (existing != identity_resets_.end() && existing->second.epoch >= reset.epoch)
@@ -3113,7 +3146,7 @@ void RpcClient::stop() {
     std::vector<std::shared_ptr<PeerConnection>> connections;
     std::vector<std::function<void()>> inbound;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (auto& [_, connection] : connections_)
             if (connection)
                 connections.push_back(std::move(connection));
@@ -3160,21 +3193,22 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     std::atomic_bool done{};
     std::atomic_bool retiring{};
     std::atomic_bool peer_retired{};
-    bool retire_notice_sent{}; // guarded by outbound_mutex
     std::atomic_uint64_t active_requests{};
     std::atomic_uint64_t writes_active{};
 
-    std::mutex admission_mutex;
-    std::mutex pending_mutex;
-    std::map<uint64_t, std::shared_ptr<Pending>> pending;
-    std::mutex outbound_mutex;
+    // Guards nothing: orders call() admission against retire().
+    Mutex admission_mutex;
+    Mutex pending_mutex;
+    std::map<uint64_t, std::shared_ptr<Pending>> pending MACHA_GUARDED_BY(pending_mutex);
+    Mutex outbound_mutex;
     std::condition_variable outbound_cv;
-    std::deque<Outbound> outbound;
-    size_t outbound_bytes{}; // queued payload bytes; guarded by outbound_mutex
-    std::map<uint64_t, FrameType> inbound_classes;
-    std::set<uint64_t> cancelled_inbound;
-    std::map<uint64_t, FrameType> outbound_classes;
-    std::set<uint64_t> cancelled_outgoing;
+    bool retire_notice_sent MACHA_GUARDED_BY(outbound_mutex){};
+    std::deque<Outbound> outbound MACHA_GUARDED_BY(outbound_mutex);
+    size_t outbound_bytes MACHA_GUARDED_BY(outbound_mutex){}; // queued payload bytes
+    std::map<uint64_t, FrameType> inbound_classes MACHA_GUARDED_BY(outbound_mutex);
+    std::set<uint64_t> cancelled_inbound MACHA_GUARDED_BY(outbound_mutex);
+    std::map<uint64_t, FrameType> outbound_classes MACHA_GUARDED_BY(outbound_mutex);
+    std::set<uint64_t> cancelled_outgoing MACHA_GUARDED_BY(outbound_mutex);
     std::atomic_uint64_t next_request{2}; // TCP acceptor owns even request IDs.
     std::jthread reader;
     std::jthread writer;
@@ -3183,7 +3217,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     void fail_pending(const std::string& text) {
         std::map<uint64_t, std::shared_ptr<Pending>> failed;
         {
-            DiagnosticLock lock(pending_mutex, "rpc.session.pending");
+            TimedLock lock(pending_mutex, "rpc.session.pending");
             failed.swap(pending);
         }
         for (auto& [_, item] : failed) {
@@ -3195,7 +3229,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     }
 
     bool drained() {
-        std::scoped_lock lock(pending_mutex, outbound_mutex);
+        Lock pending_lock(pending_mutex);
+        Lock outbound_lock(outbound_mutex);
         return pending.empty() && outbound.empty() && active_requests.load() == 0 &&
                writes_active.load() == 0;
     }
@@ -3210,7 +3245,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     }
 
 
-    void maybe_queue_retire_locked() {
+    void maybe_queue_retire_locked() MACHA_REQUIRES(outbound_mutex) {
         if (!retiring.load() || retire_notice_sent || !outbound.empty() ||
             writes_active.load() != 0)
             return;
@@ -3219,7 +3254,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             {0, FrameType::control, {MessageType::session_retire, {}}, 0, false, {}, {}});
     }
 
-    void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate) {
+    void erase_queued_locked(const std::function<bool(const Outbound&)>& predicate)
+        MACHA_REQUIRES(outbound_mutex) {
         for (auto item = outbound.begin(); item != outbound.end();) {
             if (!predicate(*item)) {
                 ++item;
@@ -3242,7 +3278,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 throw std::runtime_error("process retained-memory RPC admission saturated");
         }
         {
-            DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+            TimedLock lock(outbound_mutex, "rpc.session.outbound");
             if (!ready.load() || done.load())
                 throw std::runtime_error("accepted peer session is closed");
             if (reply) {
@@ -3275,7 +3311,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     }
 
     void register_inbound(uint64_t request_id, FrameType type) {
-        DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+        TimedLock lock(outbound_mutex, "rpc.session.outbound");
         inbound_classes[request_id] = type;
     }
 
@@ -3283,7 +3319,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         if (type != FrameType::foreground && type != FrameType::read_ahead)
             return;
         {
-            DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+            TimedLock lock(outbound_mutex, "rpc.session.outbound");
             auto found = inbound_classes.find(request_id);
             if (found != inbound_classes.end())
                 found->second = more_urgent(type, found->second);
@@ -3296,7 +3332,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
     }
 
     void cancel_inbound(uint64_t request_id) {
-        DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+        TimedLock lock(outbound_mutex, "rpc.session.outbound");
         // Untrusted input: tombstone only work this session owns, keeping the
         // set bounded.
         if (!inbound_classes.contains(request_id))
@@ -3317,7 +3353,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         else
             return;
         {
-            DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+            TimedLock lock(outbound_mutex, "rpc.session.outbound");
             if (auto found = outbound_classes.find(request_id); found != outbound_classes.end())
                 found->second = more_urgent(type, found->second);
             for (auto& item : outbound) {
@@ -3333,7 +3369,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
     void cancel_outgoing(uint64_t request_id) {
         {
-            DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+            TimedLock lock(outbound_mutex, "rpc.session.outbound");
             const bool active = outbound_classes.contains(request_id);
             bool removed_queued = false;
             erase_queued_locked([&](const Outbound& item) {
@@ -3353,7 +3389,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         }
     }
 
-    std::deque<Outbound>::iterator best_outbound_locked() {
+    std::deque<Outbound>::iterator best_outbound_locked() MACHA_REQUIRES(outbound_mutex) {
         return std::min_element(
             outbound.begin(), outbound.end(), [](const Outbound& a, const Outbound& b) {
                 return frame_type_priority(a.frame_type) < frame_type_priority(b.frame_type);
@@ -3366,9 +3402,9 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             while (true) {
                 Outbound item;
                 {
-                    std::unique_lock lock(outbound_mutex);
+                    Lock lock(outbound_mutex);
                     maybe_queue_retire_locked();
-                    outbound_cv.wait(lock, [&] {
+                    outbound_cv.wait(lock.native(), [&]() MACHA_REQUIRES(outbound_mutex) {
                         maybe_queue_retire_locked();
                         return stop.stop_requested() || done.load() || !outbound.empty();
                     });
@@ -3405,7 +3441,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                         [this, id = item.request_id](size_t) {
                             if (!id || (id & 1U))
                                 return;
-                            DiagnosticLock lock(pending_mutex, "rpc.session.pending");
+                            TimedLock lock(pending_mutex, "rpc.session.pending");
                             auto found = pending.find(id);
                             if (found != pending.end())
                                 found->second->last_progress_ns.store(steady_ns());
@@ -3418,7 +3454,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
 
                 if (!last) {
                     item.offset += amount;
-                    DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+                    TimedLock lock(outbound_mutex, "rpc.session.outbound");
                     if (item.reply) {
                         if (cancelled_inbound.contains(item.request_id)) {
                             cancelled_inbound.erase(item.request_id);
@@ -3445,12 +3481,12 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                     outbound_cv.notify_one();
                 } else {
                     if (item.reply) {
-                        DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+                        TimedLock lock(outbound_mutex, "rpc.session.outbound");
                         inbound_classes.erase(item.request_id);
                         cancelled_inbound.erase(item.request_id);
                         maybe_queue_retire_locked();
                     } else if (item.request_id) {
-                        DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+                        TimedLock lock(outbound_mutex, "rpc.session.outbound");
                         outbound_classes.erase(item.request_id);
                         cancelled_outgoing.erase(item.request_id);
                     }
@@ -3470,7 +3506,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             if (channel)
                 channel->shutdown();
             {
-                DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+                TimedLock lock(outbound_mutex, "rpc.session.outbound");
                 abandon_outbound_locked(error.what());
             }
             outbound_cv.notify_all();
@@ -3483,8 +3519,8 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         });
     }
 
-    // Caller holds outbound_mutex. See PeerConnection::abandon_outbound_locked.
-    void abandon_outbound_locked(const char* reason) {
+    // See PeerConnection::abandon_outbound_locked.
+    void abandon_outbound_locked(const char* reason) MACHA_REQUIRES(outbound_mutex) {
         for (auto& item : outbound) {
             if (!item.sent)
                 continue;
@@ -3521,10 +3557,27 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             if (!memory)
                 return false;
         }
-        std::unique_lock lock(outbound_mutex, std::try_to_lock);
-        // As for PeerConnection: a small notification may queue behind
-        // existing work; anything larger waits for an idle writer.
-        if (!lock.owns_lock() || !ready.load() || done.load())
+        if (!outbound_mutex.try_lock())
+            return false;
+        bool queued = false;
+        try {
+            queued = try_queue_notify_locked(message, frame_type, memory);
+        } catch (...) {
+            outbound_mutex.unlock();
+            throw;
+        }
+        outbound_mutex.unlock();
+        if (queued)
+            outbound_cv.notify_one();
+        return queued;
+    }
+
+    // As for PeerConnection: a small notification may queue behind existing
+    // work; anything larger waits for an idle writer.
+    bool try_queue_notify_locked(const RpcMessage& message, FrameType frame_type,
+                                 std::optional<RetainedMemoryLedger::Lease>& memory)
+        MACHA_REQUIRES(outbound_mutex) {
+        if (!ready.load() || done.load())
             return false;
         const bool small_notification = message.payload.size() <= max_notify_payload_bytes;
         if (!outbound.empty() &&
@@ -3535,20 +3588,18 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         outbound.push_back({0, frame_type, message, 0, false, {},
                             memory ? std::move(*memory) : RetainedMemoryLedger::Lease{}});
         outbound_bytes += message.payload.size();
-        lock.unlock();
-        outbound_cv.notify_one();
         return true;
     }
 
     void retire() {
         {
-            std::lock_guard admission(admission_mutex);
+            Lock admission(admission_mutex);
             bool expected = false;
             if (!retiring.compare_exchange_strong(expected, true))
                 return;
         }
         {
-            DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+            TimedLock lock(outbound_mutex, "rpc.session.outbound");
             maybe_queue_retire_locked();
         }
         outbound_cv.notify_all();
@@ -3568,14 +3619,14 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         auto item = std::make_shared<Pending>();
         auto future = item->promise.get_future();
         {
-            std::lock_guard admission(admission_mutex);
+            Lock admission(admission_mutex);
             if (!usable())
                 throw std::runtime_error("accepted peer session is unavailable");
             id = next_request.fetch_add(2);
             if (!id)
                 throw std::runtime_error("RPC request id exhausted");
             {
-                DiagnosticLock lock(pending_mutex, "rpc.session.pending");
+                TimedLock lock(pending_mutex, "rpc.session.pending");
                 if (pending.size() >= max_pending_requests)
                     throw std::runtime_error("peer pending reply limit reached");
                 pending.emplace(id, item);
@@ -3584,7 +3635,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 (void)queue_message(id, frame_type, {type, Bytes(payload.begin(), payload.end())},
                                     false);
             } catch (...) {
-                DiagnosticLock lock(pending_mutex, "rpc.session.pending");
+                TimedLock lock(pending_mutex, "rpc.session.pending");
                 pending.erase(id);
                 throw;
             }
@@ -3595,7 +3646,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             if (auto self = weak.lock()) {
                 bool existed = false;
                 {
-                    DiagnosticLock lock(self->pending_mutex, "rpc.session.pending");
+                    TimedLock lock(self->pending_mutex, "rpc.session.pending");
                     existed = self->pending.erase(id) != 0;
                 }
                 if (existed)
@@ -3606,7 +3657,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
         auto abort = [weak, id] {
             if (auto self = weak.lock()) {
                 {
-                    DiagnosticLock lock(self->pending_mutex, "rpc.session.pending");
+                    TimedLock lock(self->pending_mutex, "rpc.session.pending");
                     self->pending.erase(id);
                 }
                 self->close();
@@ -3622,7 +3673,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
                 return std::chrono::milliseconds(0);
             std::shared_ptr<Pending> item;
             {
-                DiagnosticLock lock(self->pending_mutex, "rpc.session.pending");
+                TimedLock lock(self->pending_mutex, "rpc.session.pending");
                 auto found = self->pending.find(id);
                 if (found != self->pending.end())
                     item = found->second;
@@ -3645,7 +3696,7 @@ struct RpcServer::Session : public std::enable_shared_from_this<RpcServer::Sessi
             channel->shutdown();
         fail_pending("accepted peer session closed");
         {
-            DiagnosticLock lock(outbound_mutex, "rpc.session.outbound");
+            TimedLock lock(outbound_mutex, "rpc.session.outbound");
             for (auto& item : outbound) {
                 if (item.sent) {
                     try {
@@ -3685,7 +3736,7 @@ RpcServer::~RpcServer() {
 }
 
 void RpcServer::set_local(NodeInfo local) {
-    std::lock_guard lock(local_mutex_);
+    Lock lock(local_mutex_);
     local_ = std::move(local);
 }
 
@@ -3837,7 +3888,7 @@ void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
                                RpcClient::InboundReply reply) {
     bool admitted = false;
     {
-        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+        TimedLock lock(request_mutex_, "rpc.server.queue");
         admitted = admit_locked({{}, peer, std::move(frame), reply, Clock::now(), {}});
     }
     if (!admitted) {
@@ -3850,7 +3901,7 @@ void RpcServer::enqueue_shared(const NodeInfo& peer, RpcFrame frame,
 void RpcServer::enqueue_notification(const NodeInfo& peer, RpcFrame frame) {
     bool admitted = false;
     {
-        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+        TimedLock lock(request_mutex_, "rpc.server.queue");
         admitted = admit_locked({{}, peer, std::move(frame), {}, Clock::now(), {}});
     }
     if (admitted)
@@ -3861,8 +3912,8 @@ void RpcServer::promote_queued(const NodeInfo& peer, uint64_t request_id, FrameT
     if (type != FrameType::foreground && type != FrameType::read_ahead)
         return;
 
-    DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-    auto promote_from = [&](std::deque<RequestJob>& requests) {
+    TimedLock lock(request_mutex_, "rpc.server.queue");
+    auto promote_from = [&](std::deque<RequestJob>& requests) MACHA_REQUIRES(request_mutex_) {
         auto found = std::find_if(requests.begin(), requests.end(), [&](const RequestJob& job) {
             return job.peer.id == peer.id && job.frame.request_id == request_id;
         });
@@ -3891,8 +3942,8 @@ void RpcServer::cancel_queued(const NodeInfo& peer, uint64_t request_id) {
     std::vector<RpcClient::InboundReply> replies;
     std::vector<std::shared_ptr<Session>> sessions;
     {
-        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
-        auto cancel_from = [&](std::deque<RequestJob>& requests) {
+        TimedLock lock(request_mutex_, "rpc.server.queue");
+        auto cancel_from = [&](std::deque<RequestJob>& requests) MACHA_REQUIRES(request_mutex_) {
             for (auto it = requests.begin(); it != requests.end();) {
                 if (it->peer.id != peer.id || it->frame.request_id != request_id) {
                     ++it;
@@ -3999,7 +4050,7 @@ void RpcServer::stop() {
 
     std::vector<std::shared_ptr<Session>> sessions;
     {
-        std::lock_guard lock(sessions_mutex_);
+        Lock lock(sessions_mutex_);
         sessions = sessions_;
     }
     for (auto& session : sessions) {
@@ -4018,7 +4069,7 @@ void RpcServer::stop() {
     // join. Shutdown owes those callers an error reply.
     std::vector<RpcClient::InboundReply> dropped;
     {
-        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+        TimedLock lock(request_mutex_, "rpc.server.queue");
         for (auto* requests :
              {&fast_control_requests_, &control_requests_, &foreground_requests_,
               &read_ahead_requests_, &loader_requests_, &speculative_requests_,
@@ -4103,7 +4154,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
             session->remote_host = numeric_host(address, size);
             NodeInfo local;
             {
-                std::lock_guard lock(local_mutex_);
+                Lock lock(local_mutex_);
                 local = local_;
             }
             session->channel =
@@ -4112,7 +4163,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
             channel_owns_client = true;
             session->channel->set_io_timeout(rpc_handshake_timeout);
             {
-                std::lock_guard lock(sessions_mutex_);
+                Lock lock(sessions_mutex_);
                 sessions_.push_back(session);
                 registered = true;
             }
@@ -4122,7 +4173,7 @@ void RpcServer::accept_loop(std::stop_token stop) {
         } catch (...) {
             pre_auth_sessions_.fetch_sub(1, std::memory_order_acq_rel);
             if (registered) {
-                std::lock_guard lock(sessions_mutex_);
+                Lock lock(sessions_mutex_);
                 std::erase_if(sessions_,
                               [&](const auto& candidate) { return candidate == session; });
             }
@@ -4159,7 +4210,7 @@ void RpcServer::session_loop(Session* session) {
         if (shared_client_) {
             std::shared_ptr<Session> shared;
             {
-                std::lock_guard sessions_lock(sessions_mutex_);
+                Lock sessions_lock(sessions_mutex_);
                 auto found = std::find_if(sessions_.begin(), sessions_.end(),
                                           [&](const auto& item) { return item.get() == session; });
                 if (found != sessions_.end())
@@ -4212,7 +4263,7 @@ void RpcServer::session_loop(Session* session) {
                 session->channel->receive_fragment([session](uint64_t request_id, size_t) {
                     if (!request_id || (request_id & 1U))
                         return;
-                    DiagnosticLock lock(session->pending_mutex, "rpc.session.pending");
+                    TimedLock lock(session->pending_mutex, "rpc.session.pending");
                     auto found = session->pending.find(request_id);
                     if (found != session->pending.end())
                         found->second->last_progress_ns.store(steady_ns());
@@ -4248,7 +4299,7 @@ void RpcServer::session_loop(Session* session) {
             if ((frame->request_id & 1U) == 0) {
                 std::shared_ptr<Session::Pending> pending;
                 {
-                    DiagnosticLock lock(session->pending_mutex, "rpc.session.pending");
+                    TimedLock lock(session->pending_mutex, "rpc.session.pending");
                     auto found = session->pending.find(frame->request_id);
                     if (found == session->pending.end())
                         continue;
@@ -4265,10 +4316,10 @@ void RpcServer::session_loop(Session* session) {
             session->register_inbound(frame->request_id, frame->frame_type);
             bool queued = false;
             {
-                DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+                TimedLock lock(request_mutex_, "rpc.server.queue");
                 std::shared_ptr<Session> shared;
                 {
-                    std::lock_guard sessions_lock(sessions_mutex_);
+                    Lock sessions_lock(sessions_mutex_);
                     auto found =
                         std::find_if(sessions_.begin(), sessions_.end(),
                                      [&](const auto& item) { return item.get() == session; });
@@ -4397,9 +4448,10 @@ void RpcServer::fast_control_worker_loop(std::stop_token stop) {
     while (true) {
         RequestJob job;
         {
-            std::unique_lock lock(request_mutex_);
-            request_cv_.wait(
-                lock, [&] { return stop.stop_requested() || !fast_control_requests_.empty(); });
+            Lock lock(request_mutex_);
+            request_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(request_mutex_) {
+                return stop.stop_requested() || !fast_control_requests_.empty();
+            });
             if (stop.stop_requested() && fast_control_requests_.empty())
                 return;
             job = std::move(fast_control_requests_.front());
@@ -4416,9 +4468,10 @@ void RpcServer::control_worker_loop(std::stop_token stop) {
     while (true) {
         RequestJob job;
         {
-            std::unique_lock lock(request_mutex_);
-            request_cv_.wait(lock,
-                             [&] { return stop.stop_requested() || !control_requests_.empty(); });
+            Lock lock(request_mutex_);
+            request_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(request_mutex_) {
+                return stop.stop_requested() || !control_requests_.empty();
+            });
             if (stop.stop_requested() && control_requests_.empty())
                 return;
             job = std::move(control_requests_.front());
@@ -4436,12 +4489,12 @@ void RpcServer::metadata_worker_loop(std::stop_token stop) {
         RequestJob job;
         NodeId peer;
         {
-            std::unique_lock lock(request_mutex_);
-            request_cv_.wait(lock, [&] {
+            Lock lock(request_mutex_);
+            request_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(request_mutex_) {
                 if (stop.stop_requested() && metadata_requests_.empty())
                     return true;
                 return std::any_of(metadata_requests_.begin(), metadata_requests_.end(),
-                                   [&](const RequestJob& candidate) {
+                                   [&](const RequestJob& candidate) MACHA_REQUIRES(request_mutex_) {
                                        return !metadata_active_peers_.contains(candidate.peer.id);
                                    });
             });
@@ -4449,7 +4502,7 @@ void RpcServer::metadata_worker_loop(std::stop_token stop) {
                 return;
             auto ready =
                 std::find_if(metadata_requests_.begin(), metadata_requests_.end(),
-                             [&](const RequestJob& candidate) {
+                             [&](const RequestJob& candidate) MACHA_REQUIRES(request_mutex_) {
                                  return !metadata_active_peers_.contains(candidate.peer.id);
                              });
             if (ready == metadata_requests_.end())
@@ -4463,7 +4516,7 @@ void RpcServer::metadata_worker_loop(std::stop_token stop) {
         }
         execute(std::move(job));
         {
-            std::lock_guard lock(request_mutex_);
+            Lock lock(request_mutex_);
             metadata_active_peers_.erase(peer);
             active_metadata_requests_.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -4475,7 +4528,7 @@ void RpcServer::metadata_worker_loop(std::stop_token stop) {
 RpcServerWorkStats RpcServer::work_stats() const {
     RpcServerWorkStats out;
     {
-        DiagnosticLock lock(request_mutex_, "rpc.server.queue");
+        TimedLock lock(request_mutex_, "rpc.server.queue");
         out.metadata_pending_jobs = metadata_requests_.size();
         out.metadata_pending_bytes = metadata_request_bytes_;
         out.fast_control_pending_bytes = fast_control_request_bytes_;
@@ -4513,8 +4566,8 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
         RequestJob job;
         bool nonforeground = false;
         {
-            std::unique_lock lock(request_mutex_);
-            request_cv_.wait(lock, [&] {
+            Lock lock(request_mutex_);
+            request_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(request_mutex_) {
                 if (stop.stop_requested())
                     return true;
                 if (!foreground_requests_.empty())
@@ -4549,7 +4602,7 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
         execute(std::move(job));
         if (nonforeground) {
             {
-                std::lock_guard lock(request_mutex_);
+                Lock lock(request_mutex_);
                 if (active_nonforeground_data_)
                     --active_nonforeground_data_;
             }
@@ -4562,7 +4615,7 @@ void RpcServer::data_worker_loop(std::stop_token stop) {
 void RpcServer::reap_sessions(bool all) {
     std::vector<std::shared_ptr<Session>> reap;
     {
-        std::lock_guard lock(sessions_mutex_);
+        Lock lock(sessions_mutex_);
         for (auto it = sessions_.begin(); it != sessions_.end();) {
             if (all || (*it)->done.load()) {
                 reap.push_back(*it);
@@ -4594,7 +4647,7 @@ void RpcServer::broadcast(const RpcMessage& message) {
     }
     std::vector<std::shared_ptr<Session>> sessions;
     {
-        std::lock_guard lock(sessions_mutex_);
+        Lock lock(sessions_mutex_);
         sessions = sessions_;
     }
     for (auto& session : sessions) {

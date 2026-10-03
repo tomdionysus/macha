@@ -503,7 +503,7 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
     });
 
     const auto expires = unix_ms() + 30ULL * 60 * 1000;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (auto it = acquisitions_.begin(); it != acquisitions_.end();) {
         if (it->second.expires_unix_ms <= unix_ms()) it = acquisitions_.erase(it);
         else ++it;
@@ -527,7 +527,7 @@ TorrentSearchResponse TorrentSearchManager::search(std::string_view query) {
 }
 
 std::optional<std::string> TorrentSearchManager::resolve(std::string_view acquisition_ref) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = acquisitions_.find(std::string(acquisition_ref));
     if (it == acquisitions_.end()) return {};
     if (it->second.expires_unix_ms <= unix_ms()) {

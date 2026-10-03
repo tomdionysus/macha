@@ -139,7 +139,7 @@ TorrentManager::TorrentManager(NodeRuntime& node, LocalState& local,
                                IngestManager& ingest, TorrentConfig config,
                                const std::filesystem::path& state_path)
     : node_(node), local_(local), data_resources_(data_resources), ingest_(ingest), config_(std::move(config)),
-      state_file_(state_path / "torrent" / "jobs.json"),
+      enabled_(config_.enabled), state_file_(state_path / "torrent" / "jobs.json"),
       resume_dir_(state_path / "torrent" / "resume") {
     if (!config_.enabled) return;
     // The only signal that a failed job's ingest runs again; a settled manager
@@ -286,7 +286,12 @@ Bytes TorrentManager::handle_job_action(std::span<const uint8_t> request_payload
 TorrentService::Placement TorrentManager::place(std::string_view magnet_or_uri, bool search_result) {
     Placement placement;
     placement.node_id = node_.node_id();
-    if (!config_.accept_new_jobs) {
+    bool accepting;
+    {
+        Lock lock(mutex_);
+        accepting = config_.accept_new_jobs;
+    }
+    if (!accepting) {
         placement.reason = "node_not_torrent_capable";
         placement.error = "this node is draining (torrent.accept_new_jobs is false)";
         return placement;
@@ -310,9 +315,11 @@ TorrentService::Placement TorrentManager::place(std::string_view magnet_or_uri, 
 
 TorrentService::Offer TorrentManager::offer() const {
     Offer out;
-    out.max_active = config_.max_active;
+    bool accept_new_jobs;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
+        out.max_active = config_.max_active;
+        accept_new_jobs = config_.accept_new_jobs;
         for (const auto& [_, job] : jobs_) {
             switch (job.state) {
             case TorrentJobState::queued:
@@ -329,7 +336,7 @@ TorrentService::Offer TorrentManager::offer() const {
         }
     }
     const auto staging = ingest_.staging().status();
-    if (!config_.accept_new_jobs)
+    if (!accept_new_jobs)
         out.not_accepting_reason = "draining";
     else if (out.max_active && out.active_jobs >= out.max_active)
         out.not_accepting_reason = "slots_full";
@@ -340,7 +347,7 @@ TorrentService::Offer TorrentManager::offer() const {
 }
 
 void TorrentManager::load_state() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::ifstream in(state_file_, std::ios::binary);
     if (!in) return;
     std::ostringstream text;
@@ -380,18 +387,18 @@ void TorrentManager::save_state_locked() const {
 }
 
 void TorrentManager::set_fault_sink(std::function<void(std::string)> sink) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     fault_sink_ = std::move(sink);
 }
 
 void TorrentManager::start() {
-    if (!config_.enabled || worker_.joinable()) return;
+    if (!enabled_ || worker_.joinable()) return;
     restore_jobs();
     worker_ = std::jthread([this](std::stop_token stop) {
         run_supervised_escalating("torrent", [this, stop] { loop(stop); }, [this](std::string reason) {
             std::function<void(std::string)> sink;
             {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 sink = fault_sink_;
             }
             if (sink) sink(std::move(reason));
@@ -426,7 +433,7 @@ void TorrentManager::write_resume_alert(const lt::torrent_handle& handle,
                                         const lt::add_torrent_params& params) {
     std::string id;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (!impl_) return;
         for (const auto& [job_id, candidate] : impl_->handles)
             if (candidate == handle) {
@@ -447,7 +454,7 @@ void TorrentManager::save_all_resume_data() {
     if (!impl_) return;
     size_t outstanding = 0;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (const auto& [_, handle] : impl_->handles) {
             if (!handle.is_valid()) continue;
             // Unconditional at stop, so no change is lost to only_if_modified.
@@ -476,7 +483,7 @@ void TorrentManager::save_all_resume_data() {
 }
 
 void TorrentManager::reconfigure(TorrentConfig config) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (config.enabled != config_.enabled) Log::warn("torrent.enabled changes require restart");
     config_.max_active = config.max_active;
     config_.max_download_rate = config.max_download_rate;
@@ -498,7 +505,7 @@ void TorrentManager::reconfigure(TorrentConfig config) {
 void TorrentManager::restore_jobs() {
     std::vector<TorrentJob> restore;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         for (const auto& [_, job] : jobs_) {
             if (job.state == TorrentJobState::completed || job.state == TorrentJobState::cancelled ||
                 job.state == TorrentJobState::failed || job.state == TorrentJobState::importing)
@@ -515,7 +522,7 @@ void TorrentManager::restore_jobs() {
         if (!job.info_hash.empty()) {
             const auto [holder, first] = restored_by_hash.try_emplace(job.info_hash, job.id);
             if (!first) {
-                std::lock_guard lock(mutex_);
+                Lock lock(mutex_);
                 auto& mutable_job = jobs_[job.id];
                 mutable_job.state = TorrentJobState::failed;
                 mutable_job.error_code = "duplicate_torrent";
@@ -540,17 +547,17 @@ void TorrentManager::restore_jobs() {
                 atp = lt::parse_magnet_uri(*sanitized);
             }
             atp.save_path = job.save_path.string();
-            harden_add_params(atp, config_);
             // Held from add for operator pauses: paused after add, libtorrent's
             // queue would start an auto-managed torrent. Not staging_full jobs:
             // held, a magnet never learns its size, so the staging check that
             // would release it never runs; it re-holds once the size is known.
             set_hold_at_add(atp, job.state == TorrentJobState::paused);
             atp.flags |= lt::torrent_flags::duplicate_is_error;
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
+            harden_add_params(atp, config_);
             impl_->handles[job.id] = impl_->session.add_torrent(std::move(atp));
         } catch (const std::exception& e) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             auto& mutable_job = jobs_[job.id];
             mutable_job.state = TorrentJobState::failed;
             mutable_job.error_code = "restore_failed";
@@ -594,7 +601,7 @@ void TorrentManager::parse_add_uri(std::string uri, bool allow_fetch, ParsedAdd&
 }
 
 TorrentService::Resolved TorrentManager::resolve(std::string_view uri, bool search_result) {
-    if (!config_.enabled) throw std::runtime_error("torrent support is disabled");
+    if (!enabled_) throw std::runtime_error("torrent support is disabled");
     ParsedAdd parsed;
     parse_add_uri(std::string(uri), search_result, parsed);
     Resolved out;
@@ -607,7 +614,7 @@ TorrentService::Resolved TorrentManager::resolve(std::string_view uri, bool sear
 
 std::string TorrentManager::adopt(std::string_view id, std::string_view magnet, bool held) {
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         if (jobs_.contains(id)) return std::string(id);
     }
     ParsedAdd parsed;
@@ -616,14 +623,14 @@ std::string TorrentManager::adopt(std::string_view id, std::string_view magnet, 
 }
 
 std::string TorrentManager::add_impl(std::string uri, bool allow_fetch) {
-    if (!config_.enabled) throw std::runtime_error("torrent support is disabled");
+    if (!enabled_) throw std::runtime_error("torrent support is disabled");
     ParsedAdd parsed;
     parse_add_uri(std::move(uri), allow_fetch, parsed);
     return add_parsed(to_string(random_node_id()), parsed, false);
 }
 
 std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool held) {
-    if (!config_.enabled) throw std::runtime_error("torrent support is disabled");
+    if (!enabled_) throw std::runtime_error("torrent support is disabled");
     TorrentJob job;
     job.id = std::move(id);
     job.created_unix_ms = job.updated_unix_ms = unix_ms();
@@ -634,7 +641,6 @@ std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool h
     // start an auto-managed torrent.
     set_hold_at_add(atp, held);
     atp.save_path = job.save_path.string();
-    harden_add_params(atp, config_);
     // Backstop to the check below: libtorrent would answer a second add with
     // the first one's handle, so a hash Macha missed (a v2-only magnet for a
     // hybrid torrent) would make two jobs share one torrent.
@@ -644,7 +650,8 @@ std::string TorrentManager::add_parsed(std::string id, ParsedAdd& parsed, bool h
 
     // Checked and added under one lock, so two concurrent adds of one torrent
     // cannot both pass the check.
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
+    harden_add_params(atp, config_);
     if (!info_hash.empty())
         if (auto holder = job_holding_locked(info_hash)) {
             Log::info("torrent add refused: job " + *holder + " already holds info_hash=" + info_hash);
@@ -701,7 +708,7 @@ std::string TorrentManager::add_search_result(std::string acquisition_uri) {
 }
 
 std::vector<TorrentJob> TorrentManager::jobs() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::vector<TorrentJob> out;
     for (const auto& [_, job] : jobs_) out.push_back(job);
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.created_unix_ms > b.created_unix_ms; });
@@ -709,14 +716,14 @@ std::vector<TorrentJob> TorrentManager::jobs() const {
 }
 
 std::optional<TorrentJob> TorrentManager::job(std::string_view id) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return {};
     return it->second;
 }
 
 bool TorrentManager::pause(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     if (it->second.state == TorrentJobState::completed || it->second.state == TorrentJobState::cancelled ||
@@ -737,7 +744,7 @@ bool TorrentManager::pause(std::string_view id) {
 }
 
 bool TorrentManager::resume(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     if (it->second.state != TorrentJobState::paused && it->second.state != TorrentJobState::blocked) return false;
@@ -755,7 +762,7 @@ bool TorrentManager::resume(std::string_view id) {
 }
 
 bool TorrentManager::retry(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     auto& job = it->second;
@@ -798,7 +805,7 @@ bool TorrentManager::retry(std::string_view id) {
 }
 
 bool TorrentManager::cancel(std::string_view id) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     if (it->second.state == TorrentJobState::completed || it->second.state == TorrentJobState::cancelled) return false;
@@ -824,7 +831,7 @@ bool TorrentManager::cancel(std::string_view id) {
 bool TorrentManager::clear(std::string_view id) {
     TorrentJob terminal_job;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = jobs_.find(std::string(id));
         if (it == jobs_.end()) return false;
         if (it->second.state != TorrentJobState::completed &&
@@ -852,7 +859,7 @@ bool TorrentManager::clear(std::string_view id) {
     }
     ingest_.staging().release(terminal_job.id);
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = jobs_.find(std::string(id));
     if (it == jobs_.end()) return false;
     if (it->second.state != terminal_job.state) return false;
@@ -958,7 +965,7 @@ void TorrentManager::drain_alerts() {
         // An alert can outlive its torrent: act only on a handle a job still
         // holds, under the lock that keeps it held.
         if (const auto* finished = lt::alert_cast<lt::piece_finished_alert>(alert)) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (const auto* job = job_of_locked(finished->handle))
                 verifications_->piece_verified(job->save_path.string(),
                                                static_cast<int>(finished->piece_index));
@@ -972,7 +979,7 @@ void TorrentManager::drain_alerts() {
         else if (const auto* finished = lt::alert_cast<lt::torrent_finished_alert>(alert))
             settled = &finished->handle;
         if (settled) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (auto* job = job_of_locked(*settled)) {
                 const auto id = job->id;
                 try {
@@ -1013,10 +1020,15 @@ void TorrentManager::drain_alerts() {
         if (const auto* map_failed = lt::alert_cast<lt::portmap_error_alert>(alert)) {
             if (!warned_portmap_failed_) {
                 warned_portmap_failed_ = true;
+                uint16_t listen_port;
+                {
+                    Lock lock(mutex_);
+                    listen_port = config_.listen_port;
+                }
                 Log::warn("torrent port mapping failed (" + map_failed->message() +
                           "): this node has no inbound port, so it can dial peers but "
                           "none can dial it -- expect low peer counts and no seeding. "
-                          "Forward " + std::to_string(config_.listen_port) +
+                          "Forward " + std::to_string(listen_port) +
                           " TCP+UDP by hand, or set torrent.upnp/torrent.natpmp false "
                           "to stop trying.");
             }
@@ -1118,7 +1130,10 @@ bool TorrentManager::publication_settled_locked(const std::string& id, const Tor
 
 TorrentDiskHooks TorrentManager::disk_hooks() const {
     TorrentDiskHooks hooks;
-    hooks.threads = config_.disk_threads;
+    {
+        Lock lock(mutex_);
+        hooks.threads = config_.disk_threads;
+    }
     hooks.admit = loader_admission(data_resources_);
     // Every verified extent is published durably at loader class into the
     // ingest's store and journalled; the ingest commits files by naming them.
@@ -1167,7 +1182,7 @@ void TorrentManager::loop(std::stop_token stop) {
         // each handle names a live torrent; a throw fails that job only.
         if (impl_ && Clock::now() - last_held_pieces_report_ >= held_pieces_report_interval) {
             last_held_pieces_report_ = Clock::now();
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             std::vector<std::pair<std::string, std::string>> faults;
             for (const auto& [id, handle] : impl_->handles) {
                 const auto job = jobs_.find(id);
@@ -1182,7 +1197,7 @@ void TorrentManager::loop(std::stop_token stop) {
         }
         if (impl_ && Clock::now() - last_resume_save_ >= resume_save_interval) {
             last_resume_save_ = Clock::now();
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             std::vector<std::pair<std::string, std::string>> faults;
             for (const auto& [id, handle] : impl_->handles) {
                 try {
@@ -1194,15 +1209,15 @@ void TorrentManager::loop(std::stop_token stop) {
             for (const auto& [id, what] : faults) isolate_fault_locked(id, what);
         }
         update_jobs();
-        std::unique_lock lock(mutex_);
+        Lock lock(mutex_);
         if (has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire)) {
             // Active jobs are sampled at a modest cadence; a settled manager
             // blocks until woken.
-            cv_.wait_for(lock, stop, std::chrono::milliseconds(500), [this] {
+            cv_.wait_for(lock.native(), stop, std::chrono::milliseconds(500), [this]() MACHA_REQUIRES(mutex_) {
                 return !has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
             });
         } else {
-            cv_.wait(lock, stop, [this] {
+            cv_.wait(lock.native(), stop, [this]() MACHA_REQUIRES(mutex_) {
                 return has_active_jobs_locked() || alerts_pending_.load(std::memory_order_acquire);
             });
         }
@@ -1210,7 +1225,7 @@ void TorrentManager::loop(std::stop_token stop) {
 }
 
 void TorrentManager::update_jobs() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     bool changed = false;
     bool progress_moved = false;
     std::vector<std::pair<std::string, std::string>> faults;
@@ -1220,7 +1235,7 @@ void TorrentManager::update_jobs() {
         // One job's fault is that job's, not the worker's.
         try {
             const auto before = job;
-            [&] {
+            [&]() MACHA_REQUIRES(mutex_) {
                 if (job.state == TorrentJobState::cancelled || job.state == TorrentJobState::completed)
                     return;
                 // A failed job whose ingest runs again follows it below.

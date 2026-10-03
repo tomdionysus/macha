@@ -2,6 +2,7 @@
 #pragma once
 
 #include "acquisition/cluster_jobs.hpp"
+#include "contract/thread_safety.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "torrent/torrent_request.hpp"
 
@@ -9,7 +10,6 @@
 #include <condition_variable>
 #include <filesystem>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <set>
 #include <stop_token>
@@ -91,7 +91,7 @@ class TorrentCoordinator {
     TorrentDesired effective_desired(const TorrentRequest&) const;
     void publish_intents();
     void load_intents();
-    void save_intents_locked() const;
+    void save_intents_locked() const MACHA_REQUIRES(mutex_);
     std::optional<std::pair<std::string, std::string>> resolve_remote(std::string_view uri, bool search_result,
                                                                       std::string& error);
     bool write_available() const;
@@ -106,17 +106,19 @@ class TorrentCoordinator {
     const std::chrono::milliseconds claim_lease_;
     std::filesystem::path intents_path_;
 
-    mutable std::mutex mutex_;
+    // Held across the intent journal's durable write and log lines.
+    mutable IoMutex mutex_;
     // Operator intent applied here while metadata could not be written.
-    std::map<std::string, Intent, std::less<>> intents_;
+    std::map<std::string, Intent, std::less<>> intents_ MACHA_GUARDED_BY(mutex_);
     // When each member was last seen absent from membership, for leases.
-    std::map<NodeId, uint64_t> absent_since_;
+    std::map<NodeId, uint64_t> absent_since_ MACHA_GUARDED_BY(mutex_);
     // When each request first became claimable here, for rank waits.
-    std::map<std::string, uint64_t, std::less<>> claimable_since_;
-    std::set<std::string, std::less<>> migrated_;
+    std::map<std::string, uint64_t, std::less<>> claimable_since_ MACHA_GUARDED_BY(mutex_);
+    std::set<std::string, std::less<>> migrated_ MACHA_GUARDED_BY(mutex_);
 
-
-    std::mutex pass_mutex_;
+    // Held across a whole pass: metadata commits and peer calls. Guards no
+    // state; it keeps passes serial.
+    IoMutex pass_mutex_;
     std::condition_variable_any wake_;
     std::jthread worker_;
 };

@@ -214,7 +214,7 @@ const Bytes& ReadHandle::extent(size_t i, Clock::time_point deadline,
 
 size_t ReadHandle::read(uint64_t off, std::span<uint8_t> out, Clock::time_point deadline,
                         std::atomic_bool* cancelled) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     if (off >= e_.size || out.empty())
         return 0;
     size_t want = std::min<uint64_t>(out.size(), e_.size - off), done = 0;
@@ -353,7 +353,7 @@ void WriteHandle::ensure_buffer_memory() {
 }
 WriteHandle::~WriteHandle() {
     try {
-        std::lock_guard lock(m_);
+        Lock lock(m_);
         (void)drain_staging_locked();
     } catch (...) {
         // Provisional puts must be joined before the handle releases what
@@ -461,7 +461,7 @@ std::chrono::milliseconds WriteHandle::flush() {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
     if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
         Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ +
+                   " path=" + current_path() +
                    " stage=extent-put offset=" + std::to_string(offset) +
                    " bytes=" + std::to_string(length) +
                    " object=" + to_string(id) +
@@ -523,7 +523,7 @@ std::chrono::milliseconds WriteHandle::drain_one_extent() {
     ++new_extent_puts_;
     if (result.elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
         Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ + " stage=extent-put offset=" +
+                   " path=" + current_path() + " stage=extent-put offset=" +
                    std::to_string(result.extent.offset) + " bytes=" +
                    std::to_string(result.extent.length) + " object=" +
                    to_string(result.extent.id) + " elapsed_ms=" +
@@ -546,7 +546,7 @@ std::chrono::milliseconds WriteHandle::drain_staging_locked() {
 }
 
 void WriteHandle::drain_staging() {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     (void)drain_staging_locked();
 }
 void WriteHandle::prepare_append_tail() {
@@ -579,7 +579,7 @@ void WriteHandle::prepare_append_tail() {
 
     if (Log::enabled(LogLevel::debug))
         Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ +
+                   " path=" + current_path() +
                    " stage=append-tail-fetch offset=" + std::to_string(tail.offset) +
                    " bytes=" + std::to_string(tail.length));
 }
@@ -683,7 +683,7 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
         materialize_extent_index_ = 0;
         if (Log::enabled(LogLevel::all))
             Log::trace("WRITE materialize-begin id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ +
+                   " path=" + current_path() +
                    " logical=" + std::to_string(logical_) +
                    " staged=" + std::to_string(staged_) +
                    " buffer=" + std::to_string(buffer_.size()) +
@@ -784,7 +784,7 @@ void WriteHandle::materialize() {
 }
 
 WritePreparation WriteHandle::prepare_write(uint64_t offset, uint64_t byte_budget) {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     if (!materializing_ && ((sequential_ && offset == logical_) || temp_ >= 0))
         return {true, 0};
     if (!materializing_ && temp_ < 0 && canonical_base()) {
@@ -795,7 +795,7 @@ WritePreparation WriteHandle::prepare_write(uint64_t offset, uint64_t byte_budge
 }
 size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
     const auto operation_started = Clock::now();
-    std::unique_lock g(m_);
+    Lock g(m_);
     const auto lock_wait =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (d.empty())
@@ -986,7 +986,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
         Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ +
+                   " path=" + current_path() +
                    " stage=write bytes=" + std::to_string(d.size()) +
                    " offset=" + std::to_string(off) +
                    " lock_wait_ms=" + std::to_string(lock_wait.count()) +
@@ -996,7 +996,7 @@ size_t WriteHandle::write(uint64_t off, std::span<const uint8_t> d) {
     return d.size();
 }
 void WriteHandle::truncate(uint64_t z) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     (void)drain_staging_locked();
     const bool diagnostics = Log::enabled(LogLevel::all);
     if (diagnostics) {
@@ -1196,7 +1196,7 @@ WritePreparation WriteHandle::rebuild_step(uint64_t byte_budget) {
             ++rebuild_put_extents_;
             if (elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug))
                 Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                           " path=" + path_ +
+                           " path=" + current_path() +
                            " stage=rebuild-extent-put index=" +
                            std::to_string(rebuild_index_) +
                            " offset=" + std::to_string(rebuild_offset_) +
@@ -1247,7 +1247,7 @@ void WriteHandle::rebuild() {
 }
 
 WritePreparation WriteHandle::prepare_commit(uint64_t byte_budget) {
-    std::lock_guard lock(m_);
+    Lock lock(m_);
     if (!dirty_)
         return {true, 0};
     if (materializing_) {
@@ -1265,13 +1265,13 @@ WritePreparation WriteHandle::prepare_commit(uint64_t byte_budget) {
 }
 void WriteHandle::commit() {
     const auto operation_started = Clock::now();
-    std::unique_lock g(m_);
+    Lock g(m_);
     const auto lock_wait =
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (!dirty_) {
         if (lock_wait >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
             Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                       " path=" + path_ +
+                       " path=" + current_path() +
                        " stage=commit-clean lock_wait_ms=" +
                        std::to_string(lock_wait.count()));
         }
@@ -1335,8 +1335,8 @@ void WriteHandle::commit() {
                          ? "object durability quorum unavailable before publication"
                          : "object durability lost on a peer and no local copy; "
                            "publication must be replayed");
-            Log::info("write stage id=" + std::to_string(diagnostic_id_) + " path=" + path_ +
-                      " re-put " + std::to_string(unsatisfiable.size()) +
+            Log::info("write stage id=" + std::to_string(diagnostic_id_) +
+                      " path=" + current_path() + " re-put " + std::to_string(unsatisfiable.size()) +
                       " extent(s) a peer no longer held");
             unsatisfiable.clear();
             if (!fs_.store().durability_barrier(durability_batch_, work_context_.frame_type(),
@@ -1348,7 +1348,7 @@ void WriteHandle::commit() {
             Clock::now() - durability_started);
         if (durability_elapsed >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug))
             Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                       " path=" + path_ + " stage=durability-barrier ms=" +
+                       " path=" + current_path() + " stage=durability-barrier ms=" +
                        std::to_string(durability_elapsed.count()));
     }
 
@@ -1401,7 +1401,7 @@ void WriteHandle::commit() {
         std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - operation_started);
     if (total >= std::chrono::milliseconds(500) && Log::enabled(LogLevel::debug)) {
         Log::debug("write stage id=" + std::to_string(diagnostic_id_) +
-                   " path=" + path_ +
+                   " path=" + current_path() +
                    " stage=commit logical_bytes=" + std::to_string(logical_) +
                    " extents=" + std::to_string(extents_.size()) +
                    " lock_wait_ms=" + std::to_string(lock_wait.count()) +
@@ -1417,13 +1417,18 @@ void WriteHandle::commit() {
 }
 
 WriteHandleDiagnostics WriteHandle::diagnostics() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     return {diagnostic_id_, logical_, staged_, buffer_.size(), sequential_, temp_ >= 0,
             fd_size(temp_), append_tail_fetches_, materialize_source_reads_, new_extent_puts_,
             rebuild_reused_extents_, rebuild_put_extents_, pending_extents_.size(),
             peak_pending_extents_, work_context_.frame_type(), work_context_.quantum_bytes(),
             materialize_source_bytes_, materialize_steps_, rebuild_source_bytes_,
             rebuild_steps_};
+}
+
+std::string WriteHandle::current_path() const {
+    Lock handles(fs_.open_writes_mutex_);
+    return path_;
 }
 
 void WriteHandle::cleanup() {
@@ -1452,9 +1457,11 @@ void FileSystem::extent_worker(std::stop_token stop) {
     while (true) {
         std::shared_ptr<ExtentTask> task;
         {
-            std::unique_lock lock(extent_tasks_mutex_);
-            extent_tasks_cv_.wait(lock, stop,
-                                  [&] { return !extent_tasks_.empty(); });
+            Lock lock(extent_tasks_mutex_);
+            extent_tasks_cv_.wait(lock.native(), stop,
+                                  [&]() MACHA_REQUIRES(extent_tasks_mutex_) {
+                                      return !extent_tasks_.empty();
+                                  });
             if (extent_tasks_.empty()) {
                 if (stop.stop_requested())
                     return;
@@ -1479,13 +1486,13 @@ std::future<WriteHandle::StagedExtentResult> FileSystem::submit_extent_task(
     auto task = std::make_shared<ExtentTask>(std::move(fn));
     auto result = task->get_future();
     {
-        std::unique_lock lock(extent_tasks_mutex_);
+        Lock lock(extent_tasks_mutex_);
         if (extent_workers_.empty()) {
             for (size_t i = 0; i < extent_worker_limit_; ++i)
                 extent_workers_.emplace_back(
                     [this](std::stop_token stop) { extent_worker(stop); });
         }
-        extent_tasks_cv_.wait(lock, [&] {
+        extent_tasks_cv_.wait(lock.native(), [&]() MACHA_REQUIRES(extent_tasks_mutex_) {
             return io_cancellation_requested() || extent_tasks_.size() < extent_task_limit_;
         });
         if (io_cancellation_requested())
@@ -1506,7 +1513,7 @@ ExtentExecutorDiagnostics FileSystem::extent_executor_diagnostics() const {
     uint64_t queued = 0;
     uint64_t workers = 0;
     {
-        std::lock_guard lock(extent_tasks_mutex_);
+        Lock lock(extent_tasks_mutex_);
         queued = extent_tasks_.size();
         workers = extent_workers_.size();
     }
@@ -1523,7 +1530,7 @@ MetadataSnapshot FileSystem::snap() {
 std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() {
     auto view = m_.converged();
     {
-        std::lock_guard lock(namespace_index_mutex_);
+        Lock lock(namespace_index_mutex_);
         if (namespace_index_ && namespace_index_->generation == view.generation &&
             namespace_index_->hash == view.hash)
             return namespace_index_;
@@ -1549,7 +1556,7 @@ std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() 
         built->children[parent_path(path)].push_back({base_name(path), path});
     });
 
-    std::lock_guard lock(namespace_index_mutex_);
+    Lock lock(namespace_index_mutex_);
     if (!namespace_index_ || namespace_index_->generation < built->generation ||
         (namespace_index_->generation == built->generation && namespace_index_->hash != built->hash))
         namespace_index_ = built;
@@ -1841,7 +1848,7 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
         result.applied = operations.size();
     }
 
-    std::lock_guard handles(open_writes_mutex_);
+    Lock handles(open_writes_mutex_);
     for (size_t op_index = 0; op_index < result.applied; ++op_index) {
         const auto& op = operations[op_index];
         if (op.kind != FilesystemNamespaceMutation::Kind::rename || op.from == op.to)
@@ -2019,7 +2026,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
     // generations: hits come from the indexing snapshot, and only a miss
     // consults current metadata, keeping namespace churn out of playback.
     {
-        std::lock_guard lock(media_index_mutex_);
+        Lock lock(media_index_mutex_);
         if (media_index_valid_ && media_index_snapshot_) {
             auto found = media_index_.find(std::string(id));
             if (found != media_index_.end()) {
@@ -2033,7 +2040,7 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
 
     auto install_and_lookup = [&](const MetadataSnapshotView& view)
         -> std::optional<std::pair<std::string, FsEntry>> {
-        std::lock_guard lock(media_index_mutex_);
+        Lock lock(media_index_mutex_);
 
         // Another lookup may have indexed this id meanwhile.
         if (media_index_valid_ && media_index_snapshot_) {
@@ -2125,7 +2132,7 @@ std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool t
         if (current.size)
             truncate_file(*existing, 0);
     }
-    std::lock_guard handles(open_writes_mutex_);
+    Lock handles(open_writes_mutex_);
     auto resolved = resolve_existing_path(p);
     if (!resolved)
         fail(ENOENT, "missing");
@@ -2149,7 +2156,7 @@ std::optional<uint64_t> FileSystem::active_write_size(const std::string& p) {
     const auto q = resolve_existing_path(p).value_or(normalize_path(p));
     std::vector<std::shared_ptr<WriteHandle>> matches;
     {
-        std::lock_guard handles(open_writes_mutex_);
+        Lock handles(open_writes_mutex_);
         for (auto i = open_writes_.begin(); i != open_writes_.end();) {
             auto handle = i->lock();
             if (!handle) {
@@ -2176,7 +2183,7 @@ std::vector<WriteHandleDiagnostics> FileSystem::active_write_diagnostics(const s
     const auto q = resolve_existing_path(p).value_or(normalize_path(p));
     std::vector<std::shared_ptr<WriteHandle>> matches;
     {
-        std::lock_guard handles(open_writes_mutex_);
+        Lock handles(open_writes_mutex_);
         for (auto i = open_writes_.begin(); i != open_writes_.end();) {
             auto handle = i->lock();
             if (!handle) {
@@ -2205,7 +2212,7 @@ void FileSystem::commit_write(WriteHandle& handle, const FsEntry& expected, uint
     // fixed-up path_.
     std::string path;
     {
-        std::lock_guard handles(open_writes_mutex_);
+        Lock handles(open_writes_mutex_);
         path = handle.path_;
     }
     commit_file(path, expected, z, xs, out, mtime_override,
@@ -2287,7 +2294,7 @@ MetadataSnapshotView FileSystem::local_snapshot_view() {
     if (!valid_metadata_record(record))
         throw std::runtime_error("local metadata replica unavailable");
 
-    std::lock_guard lock(local_snapshot_mutex_);
+    Lock lock(local_snapshot_mutex_);
     if (!local_snapshot_cache_ || local_snapshot_generation_ != record.generation ||
         local_snapshot_hash_ != record.hash) {
         local_snapshot_generation_ = record.generation;
@@ -2358,7 +2365,7 @@ std::optional<Hash256> FileSystem::available_namespace_signature(
 std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached() {
     const auto known_generation = metadata_server_.known_generation();
     {
-        std::lock_guard lock(maintenance_index_mutex_);
+        Lock lock(maintenance_index_mutex_);
         if (maintenance_index_ && maintenance_index_generation_ >= known_generation)
             return maintenance_index_;
     }
@@ -2424,7 +2431,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     built->entries = walked_entries;
     built->extents = extents;
 
-    std::lock_guard lock(maintenance_index_mutex_);
+    Lock lock(maintenance_index_mutex_);
     if (!maintenance_index_ || view.generation >= maintenance_index_generation_) {
         maintenance_index_generation_ = view.generation;
         maintenance_index_ = built;
