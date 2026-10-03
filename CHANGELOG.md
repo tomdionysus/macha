@@ -1,5 +1,28 @@
 # Current release
 
+## 0.81.0 — S: every lock checked by the compiler (experiment)
+
+The object ledger experiment's final sweep, begun. No wire format, protocol
+or on-disk format changes; either node can go back to 0.80.0 (or earlier)
+by reinstalling it.
+
+Every lock in the server is now a type the compiler checks: state a lock
+protects cannot be touched without it, and each lock held across disk or
+network I/O is marked as one. The check found these faults, now fixed:
+
+- **A write could wait for the wrong pack file to reach disk.** While one
+  write appended to a pack, another could start a new pack; a write, a
+  removal or a re-affirmation that had just appended then waited on the
+  new file rather than the one holding its record.
+- **A configuration reload could race the work it reconfigures**: playback
+  limits and timeouts, torrent admission, ingest source roots and copy
+  sizes, the staging limit and the scanner's providers were read while a
+  reload replaced them.
+- **Status could read the hydration worker while a reload stopped it.**
+- **A file being written logged its path while a rename changed it.**
+- A node learning of itself from a peer, and a failed startup's error
+  message, were each read outside the lock that guards them.
+
 ## 0.80.0 — T5: contracts say what they wait on (experiment)
 
 The object ledger experiment's T5, completed. No wire format, protocol or
