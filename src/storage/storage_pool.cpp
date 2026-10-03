@@ -240,7 +240,8 @@ bool StoragePool::activate(const std::shared_ptr<Backend>& backend) {
             options.pack_target_size = packing_.target_size;
             store = std::make_shared<LocalStore>(cfg.path, options, key_,
                                                  LocalStoreMode::authoritative,
-                                                 durability_domain);
+                                                 durability_domain,
+                                                 posix_local_store_files());
         } else {
             Lock lock(backend->mutex);
             durability_domain = backend->durability_domain;
