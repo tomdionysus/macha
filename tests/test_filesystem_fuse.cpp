@@ -1018,7 +1018,12 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
         },
         3s));
     const auto parked = s1.maintenance_wakeups();
+    const auto parked_wait = s1.maintenance_sleep_diagnostic();
     std::this_thread::sleep_for(1500ms);
+    if (s1.maintenance_wakeups() != parked)
+        std::cerr << "woke while parked: before " << parked_wait << ", after "
+                  << s1.maintenance_sleep_diagnostic() << ", stage " << s1.maintenance_stage()
+                  << "\n";
     CHECK(s1.maintenance_wakeups() == parked);
 
     // A peer/membership event must bypass the outstanding retry deadline and
