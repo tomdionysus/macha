@@ -3738,7 +3738,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     FileSystem fs2(n2.config(), n2.node_id(), n2.membership(), n2.local_state(), n2.metadata_server(), store2, metadata2, n2.resources.memory);
     FuseConfig fuse_config;
     fuse_config.commit_workers = 1;
-    auto frontend = std::make_shared<FuseFrontend>(fs2, n2.resources.memory, fuse_config);
+    auto frontend = make_fuse_frontend(fs2, n2.resources.memory, fuse_config);
     const auto available_before_fuse = metadata2.available_snapshot_view();
     REQUIRE(available_before_fuse.has_value());
     const auto namespace_revision_before = metadata2.available_namespace_revision();

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <type_traits>
@@ -67,7 +68,8 @@ class SpoolRetirementRateEstimator {
 
 // Duty-cycle gate for loader publication while viewers are active: a bounded
 // loader burst earns a cooldown proportional to viewer:loader weight (relative
-// active time, not a bandwidth cap). With no viewer the loader is always admitted.
+// active time, not a bandwidth cap). With no viewer the loader is always
+// admitted. Both weights are at least 1: the loader is paced, never stopped.
 class WeightedLoaderService {
   public:
     using Clock = std::chrono::steady_clock;
@@ -93,7 +95,10 @@ class WeightedLoaderService {
     explicit WeightedLoaderService(size_t viewer_weight = 95, size_t loader_weight = 5,
                                    std::chrono::milliseconds slice =
                                        std::chrono::milliseconds(25))
-        : viewer_weight_(viewer_weight), loader_weight_(loader_weight), slice_(slice) {}
+        : viewer_weight_(viewer_weight), loader_weight_(loader_weight), slice_(slice) {
+        if (!viewer_weight_ || !loader_weight_)
+            throw std::invalid_argument("weighted loader service weights must be at least 1");
+    }
 
     bool can_start(TimePoint now, bool viewer_active) {
         Lock lock(mutex_);
@@ -101,8 +106,6 @@ class WeightedLoaderService {
             reset_locked();
             return true;
         }
-        if (!loader_weight_)
-            return false;
         if (now < not_before_)
             return false;
         return !burst_started_ || now < slice_deadline_;
@@ -115,7 +118,7 @@ class WeightedLoaderService {
             reset_locked();
             return;
         }
-        if (!loader_weight_ || !begin_service)
+        if (!begin_service)
             return;
         if (!burst_started_) {
             burst_started_ = now;
@@ -131,8 +134,6 @@ class WeightedLoaderService {
             reset_locked();
             return;
         }
-        if (!loader_weight_)
-            return;
         if (!burst_started_) {
             burst_started_ = now;
             slice_deadline_ = now + slice_;
@@ -145,8 +146,6 @@ class WeightedLoaderService {
             reset_locked();
             return false;
         }
-        if (!loader_weight_)
-            return true;
         // A viewer arriving mid-quantum yields at the next chunk; the pipeline
         // drain counts as the first contended burst before the cooldown.
         if (!burst_started_) {
@@ -165,7 +164,7 @@ class WeightedLoaderService {
             reset_locked();
             return {};
         }
-        if (!loader_weight_ || active_loaders_ || !burst_started_)
+        if (active_loaders_ || !burst_started_)
             return {};
         auto active = std::chrono::duration_cast<std::chrono::milliseconds>(now - *burst_started_);
         active = std::max(active, std::chrono::milliseconds(1));
@@ -188,12 +187,79 @@ class WeightedLoaderService {
             reset_locked();
             return {};
         }
-        if (!loader_weight_)
-            return std::chrono::hours(24);
         if (now >= not_before_)
             return {};
         return std::chrono::duration_cast<std::chrono::milliseconds>(not_before_ - now);
     }
+};
+
+// When the FUSE frontend may run loader publication (law 2: the viewer
+// before the loader). The frontend asks before starting and between chunks of
+// loader work and reports each burst; it owns the admission it is given. All
+// operations are thread_safe and wait on nothing.
+class LoaderAdmission {
+  public:
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    virtual ~LoaderAdmission() = default;
+
+    static constexpr Waits can_start_waits = Waits::none;
+    static constexpr ThreadSafety can_start_safety = ThreadSafety::thread_safe;
+    virtual bool can_start(TimePoint now) = 0;
+
+    // A loader admitted with `begin_service` false counts as active at once
+    // but starts its service slice only at service_started().
+    static constexpr Waits started_waits = Waits::none;
+    static constexpr ThreadSafety started_safety = ThreadSafety::thread_safe;
+    virtual void started(TimePoint now, bool begin_service) = 0;
+
+    static constexpr Waits service_started_waits = Waits::none;
+    static constexpr ThreadSafety service_started_safety = ThreadSafety::thread_safe;
+    virtual void service_started(TimePoint now) = 0;
+
+    static constexpr Waits should_yield_waits = Waits::none;
+    static constexpr ThreadSafety should_yield_safety = ThreadSafety::thread_safe;
+    virtual bool should_yield(TimePoint now) = 0;
+
+    static constexpr Waits finished_waits = Waits::none;
+    static constexpr ThreadSafety finished_safety = ThreadSafety::thread_safe;
+    virtual void finished(TimePoint now) = 0;
+
+    // How long until can_start() may change with time alone: zero when it
+    // may already, nullopt when only a wake can change it.
+    static constexpr Waits retry_after_waits = Waits::none;
+    static constexpr ThreadSafety retry_after_safety = ThreadSafety::thread_safe;
+    virtual std::optional<std::chrono::milliseconds> retry_after(TimePoint now) = 0;
+
+    // Called whenever admission changes other than with time. Set once, by
+    // the owner, before any other call.
+    static constexpr Waits set_wake_callback_waits = Waits::none;
+    static constexpr ThreadSafety set_wake_callback_safety = ThreadSafety::single_owner;
+    virtual void set_wake_callback(std::function<void()>) = 0;
+};
+
+// Production admission: a viewer is active while the foreground clock, which
+// only HTTP playback advances, has moved within `publication_quiet`; loader
+// work then runs at its weighted share (WeightedLoaderService). Admission
+// changes only with time, so it never wakes.
+class ViewerWeightedAdmission final : public LoaderAdmission {
+    FileSystem& fs_;
+    const std::chrono::milliseconds quiet_;
+    WeightedLoaderService share_;
+
+    bool viewer_active() const;
+
+  public:
+    ViewerWeightedAdmission(FileSystem&, const FuseConfig&);
+
+    bool can_start(TimePoint now) override;
+    void started(TimePoint now, bool begin_service) override;
+    void service_started(TimePoint now) override;
+    bool should_yield(TimePoint now) override;
+    void finished(TimePoint now) override;
+    std::optional<std::chrono::milliseconds> retry_after(TimePoint now) override;
+    void set_wake_callback(std::function<void()>) override {}
 };
 
 enum class FuseOperationClass : uint8_t {
@@ -469,7 +535,8 @@ struct ParkedPublication {
 // FUSE traffic is loader traffic: mount reads use FrameType::loader and never
 // advance the foreground clock that gates loader publication (law 2). Only HTTP
 // playback drives that clock (FileSystem::note_foreground_activity()); the
-// publication scheduler reads it via fs.foreground_idle_for().
+// LoaderAdmission the frontend is given decides when loader publication runs,
+// and the PublicationTarget receives the published data.
 class FuseFrontend final : public HydrationHintProvider {
     struct State;
     std::unique_ptr<State> state_;
@@ -574,8 +641,10 @@ class FuseFrontend final : public HydrationHintProvider {
   public:
     // The stop token cancels the wait for the initial namespace, the one
     // unbounded wait in construction, so Service::stop() can join the
-    // lifecycle thread if the metadata replica never arrives.
-    FuseFrontend(FileSystem&, RetainedMemoryLedger&, FuseConfig, std::stop_token = {});
+    // lifecycle thread if the metadata replica never arrives. The publication
+    // target must outlive the frontend.
+    FuseFrontend(FileSystem&, RetainedMemoryLedger&, FuseConfig, std::unique_ptr<LoaderAdmission>,
+                 PublicationTarget&, std::stop_token = {});
     ~FuseFrontend() override;
     FuseFrontend(const FuseFrontend&) = delete;
     FuseFrontend& operator=(const FuseFrontend&) = delete;
@@ -631,9 +700,6 @@ class FuseFrontend final : public HydrationHintProvider {
     // durable in the local journal and recovery publishes it after restart.
     void interrupt_waits();
     void stop();
-    // Tests only: overrides the foreground clock's viewer-active decision;
-    // nullopt restores it.
-    void set_viewer_active_for_tests(std::optional<bool> active);
 };
 
 } // namespace macha

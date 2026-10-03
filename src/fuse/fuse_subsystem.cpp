@@ -43,8 +43,10 @@ FuseSubsystem::FuseSubsystem(const SubsystemContext& context,
 
     // Journal replay and the wait for the first namespace happen here, not in
     // start(), so a failure is a construction fault the supervisor retries.
-    frontend_ = std::make_shared<FuseFrontend>(filesystem_, *context.retained_memory, config_,
-                                               context.startup_stop);
+    frontend_ = std::make_shared<FuseFrontend>(
+        filesystem_, *context.retained_memory, config_,
+        std::make_unique<ViewerWeightedAdmission>(filesystem_, config_), filesystem_,
+        context.startup_stop);
 
     // Published before start(): Status and the manage endpoints use the
     // frontend without a kernel mount. The destructor withdraws it.

@@ -233,6 +233,45 @@ class MACHA_SCOPED_CAPABILITY PairLock {
 
 } // namespace
 
+ViewerWeightedAdmission::ViewerWeightedAdmission(FileSystem& filesystem, const FuseConfig& config)
+    : fs_(filesystem), quiet_(config.publication_quiet),
+      share_(config.viewer_weight, config.loader_weight) {}
+
+bool ViewerWeightedAdmission::viewer_active() const {
+    return quiet_.count() > 0 && fs_.foreground_idle_for() < quiet_;
+}
+
+bool ViewerWeightedAdmission::can_start(TimePoint now) {
+    return share_.can_start(now, viewer_active());
+}
+
+void ViewerWeightedAdmission::started(TimePoint now, bool begin_service) {
+    share_.started(now, viewer_active(), begin_service);
+}
+
+void ViewerWeightedAdmission::service_started(TimePoint now) {
+    share_.service_started(now, viewer_active());
+}
+
+bool ViewerWeightedAdmission::should_yield(TimePoint now) {
+    return share_.should_yield(now, viewer_active());
+}
+
+void ViewerWeightedAdmission::finished(TimePoint now) {
+    (void)share_.finished(now, viewer_active());
+}
+
+std::optional<std::chrono::milliseconds> ViewerWeightedAdmission::retry_after(TimePoint now) {
+    // The earlier of the viewer window closing and the loader's cooldown.
+    const auto idle = fs_.foreground_idle_for();
+    if (quiet_.count() <= 0 || idle >= quiet_)
+        return std::chrono::milliseconds(0);
+    auto retry = quiet_ - idle;
+    if (const auto cooldown = share_.wait_for(now, true); cooldown > std::chrono::milliseconds(0))
+        retry = std::min(retry, cooldown);
+    return retry;
+}
+
 class FuseReadSession {
   public:
     // Held across opening the read handle, which may fetch from peers.
@@ -329,7 +368,7 @@ struct FuseFrontend::State {
         // Spool bytes replayed since the last drained quantum; they earn
         // bootstrap admission credit only once drain_staging() succeeds.
         uint64_t unreported_spool_progress{};
-        std::shared_ptr<WriteHandle> writer;
+        std::shared_ptr<PublicationWriter> writer;
         ScopedFd replay_spool;
     };
 
@@ -601,7 +640,10 @@ struct FuseFrontend::State {
     FuseConfig config;
     // Cancels the initial-namespace wait in start(); see the constructor.
     const std::stop_token startup_stop;
-    WeightedLoaderService weighted_loader;
+    // Decides when loader publication runs; owned.
+    const std::unique_ptr<LoaderAdmission> admission;
+    // Receives published file data; outlives the frontend.
+    PublicationTarget& publication_target;
     const std::filesystem::path spool_dir;
     const std::filesystem::path journal_path;
     const std::filesystem::path journal_dir;
@@ -722,8 +764,6 @@ struct FuseFrontend::State {
     std::atomic_bool stopping{};
     // Set by interrupt_waits(): no wait on a publication may outlast it.
     std::atomic_bool waits_interrupted{};
-    // -1: the foreground clock decides; 0 or 1: a test has decided.
-    std::atomic_int viewer_active_override{-1};
     Mutex write_request_mutex;
     std::condition_variable_any write_request_cv;
     uint64_t pending_write_request_bytes MACHA_GUARDED_BY(write_request_mutex){};
@@ -794,7 +834,6 @@ struct FuseFrontend::State {
     std::atomic_uint64_t peak_operation_metadata_bytes{};
     std::atomic_uint64_t operation_metadata_waits{};
     std::atomic_uint64_t backend_failures{};
-    std::atomic_bool publication_failure_injected_for_tests{};
     // Monotonic counts of durable work (not queue depth), so tests can assert
     // batching and replay amplification without timing.
     std::atomic_uint64_t namespace_operations_admitted{};
@@ -825,10 +864,10 @@ struct FuseFrontend::State {
     std::atomic_uint64_t journal_durability_barriers{};
 
     State(FileSystem& filesystem, RetainedMemoryLedger& memory, FuseConfig policy,
+          std::unique_ptr<LoaderAdmission> loader_admission, PublicationTarget& target,
           std::stop_token startup_cancel = {})
         : fs(filesystem), retained_memory(memory), config(std::move(policy)), startup_stop(std::move(startup_cancel)),
-          weighted_loader(config.viewer_weight,
-                          config.suspend_loader_for_tests ? 0 : config.loader_weight),
+          admission(std::move(loader_admission)), publication_target(target),
           spool_dir(config.spool_path.value_or(fs.config().state_path / "fuse-spool")),
           journal_path(config.operation_journal_path.value_or(spool_dir / "operations.log")),
           journal_dir(journal_path.parent_path().empty() ? std::filesystem::path(".")
@@ -849,6 +888,15 @@ struct FuseFrontend::State {
                 fs.config().runtime.loader_memory_reserve_bytes / per_writer));
         }
         fuse_namespace_origin = derive_fuse_namespace_origin(fs.node_id());
+        if (!admission)
+            throw std::invalid_argument("FUSE frontend requires a loader admission");
+        // A data loop may be sleeping with no timed wake.
+        admission->set_wake_callback([this] {
+            {
+                Lock lock(data_queue_mutex);
+            }
+            data_cv.notify_all();
+        });
     }
 
     ~State() {
@@ -2177,7 +2225,7 @@ struct FuseFrontend::State {
                 Lock inode_lock(inode->mutex);
                 if (inode->backend_error)
                     throw FsError(*inode->backend_error, "FUSE inode publication error");
-                // Advanced only after WriteHandle::commit(): cluster-durable at
+                // Advanced only after PublicationWriter::commit(): cluster-durable at
                 // this watermark even if local confirmation lags.
                 if (inode->published_data_sequence >= target)
                     return;
@@ -3020,7 +3068,7 @@ struct FuseFrontend::State {
                         const bool atomic = identity_batch && remaining.size() > 1;
                         FilesystemNamespaceBatchResult result;
                         try {
-                            wait_for_weighted_loader_service();
+                            wait_for_loader_admission(stop);
                             try {
                                 if (atomic) {
                                     if (!batch_journaled) {
@@ -3032,10 +3080,10 @@ struct FuseFrontend::State {
                                     result = apply_namespace_backend(remaining);
                                 }
                             } catch (...) {
-                                finish_weighted_loader_service();
+                                finish_loader_admission();
                                 throw;
                             }
-                            finish_weighted_loader_service();
+                            finish_loader_admission();
                         } catch (const FsError& error) {
                             if (atomic && !retryable_backend_error(error)) {
                                 // An op was refused and nothing committed:
@@ -3233,43 +3281,36 @@ struct FuseFrontend::State {
         return snapshot;
     }
 
-    bool viewer_active() const {
-        if (const auto decided = viewer_active_override.load(std::memory_order_acquire); decided >= 0)
-            return decided == 1;
-        return config.publication_quiet.count() > 0 &&
-               fs.foreground_idle_for() < config.publication_quiet;
+    bool loader_should_yield() {
+        return admission->should_yield(Clock::now());
     }
 
-    bool weighted_loader_should_yield() {
-        return weighted_loader.should_yield(Clock::now(), viewer_active());
-    }
-
-    void wait_for_weighted_loader_service() {
+    void wait_for_loader_admission(std::stop_token stop) {
         for (;;) {
-            if (stopping.load(std::memory_order_relaxed))
+            if (stop.stop_requested() || stopping.load(std::memory_order_relaxed))
                 throw FsError(EINTR, "FUSE publication stopping");
-            const auto active = viewer_active();
             const auto now = Clock::now();
-            if (weighted_loader.can_start(now, active)) {
-                weighted_loader.started(now, active);
+            if (admission->can_start(now)) {
+                admission->started(now, true);
                 return;
             }
-            const auto idle = fs.foreground_idle_for();
-            auto wake_after = idle < config.publication_quiet
-                                  ? config.publication_quiet - idle
-                                  : std::chrono::milliseconds(1);
-            const auto cooldown = weighted_loader.wait_for(now, active);
-            if (cooldown > std::chrono::milliseconds(0))
-                wake_after = std::min(wake_after, cooldown);
+            const auto retry = admission->retry_after(now);
             Lock lock(data_queue_mutex);
-            data_cv.wait_for(lock.native(), wake_after, [&]() MACHA_REQUIRES(data_queue_mutex) {
-                return stopping.load(std::memory_order_relaxed);
-            });
+            const auto admitted_or_stopping = [&]() MACHA_REQUIRES(data_queue_mutex) {
+                return stopping.load(std::memory_order_relaxed) ||
+                       admission->can_start(Clock::now());
+            };
+            if (retry)
+                data_cv.wait_for(lock.native(), stop,
+                                 std::max(*retry, std::chrono::milliseconds(1)),
+                                 admitted_or_stopping);
+            else
+                data_cv.wait(lock.native(), stop, admitted_or_stopping);
         }
     }
 
-    void finish_weighted_loader_service() {
-        (void)weighted_loader.finished(Clock::now(), viewer_active());
+    void finish_loader_admission() {
+        admission->finished(Clock::now());
         data_cv.notify_all();
     }
 
@@ -3428,10 +3469,9 @@ struct FuseFrontend::State {
             // and group-synced once before metadata publication. Recovery
             // replay bypasses the cache so a backlog cannot evict the working set.
             try {
-                publication->writer = fs.open_write(
-                    *snapshot.published_path, false,
+                publication->writer = publication_target.open_publication(
+                    *snapshot.published_path,
                     config.write_through_cache && !publication->recovered,
-                    WriteDurability::publication_generation,
                     config.publication_pipeline_bytes,
                     DataWorkContext(FrameType::loader, config.publication_quantum_bytes, {},
                                     nullptr, &fs.write_progress(),
@@ -3446,7 +3486,7 @@ struct FuseFrontend::State {
 
         // Writer setup is not charged as loader service; otherwise it could
         // spend the slice and yield with no progress.
-        weighted_loader.service_started(Clock::now(), viewer_active());
+        admission->service_started(Clock::now());
 
         uint64_t served = 0;
         constexpr size_t chunk_size = spool_checksum_chunk_size;
@@ -3472,7 +3512,7 @@ struct FuseFrontend::State {
             while (publication->operation_index < snapshot.operations.size()) {
                 if (stopping.load())
                     throw FsError(EINTR, "FUSE publication stopping");
-                if (weighted_loader_should_yield()) {
+                if (loader_should_yield()) {
                     return yield_quantum();
                 }
                 const auto& op = snapshot.operations[publication->operation_index];
@@ -3491,7 +3531,7 @@ struct FuseFrontend::State {
                        served < config.publication_quantum_bytes) {
                     // Input is already durable, so yielding between chunks is
                     // safe.
-                    if (weighted_loader_should_yield()) {
+                    if (loader_should_yield()) {
                         return yield_quantum();
                     }
                     const auto write_offset = op.offset + publication->operation_offset;
@@ -3543,12 +3583,6 @@ struct FuseFrontend::State {
                     publication->operation_offset += chunk;
                     publication->unreported_spool_progress += chunk;
                     served += chunk;
-                    if (config.fail_publication_once_after_spool_bytes_for_tests &&
-                        publication->spool_bytes_read >=
-                            config.fail_publication_once_after_spool_bytes_for_tests &&
-                        !publication_failure_injected_for_tests.exchange(
-                            true, std::memory_order_acq_rel))
-                        throw FsError(EIO, "injected transient FUSE publication failure");
                 }
                 if (publication->operation_offset == op.length) {
                     ++publication->operation_index;
@@ -3559,7 +3593,7 @@ struct FuseFrontend::State {
                     return yield_quantum();
                 }
             }
-            if (weighted_loader_should_yield())
+            if (loader_should_yield())
                 return yield_quantum();
             // Commit preparation starts on a fresh grant so arbitrary write
             // lengths do not fragment the rebuilt manifest.
@@ -3628,7 +3662,7 @@ struct FuseFrontend::State {
     bool data_global_slot_available() MACHA_REQUIRES(data_queue_mutex) {
         // Viewers get the dominant share, not exclusion: loader bursts run
         // after a proportional cooldown and take all capacity when idle.
-        if (!weighted_loader.can_start(Clock::now(), viewer_active()))
+        if (!admission->can_start(Clock::now()))
             return false;
         return active_data.load(std::memory_order_relaxed) < config.commit_workers &&
                publication_inflight_bytes <=
@@ -3787,21 +3821,10 @@ struct FuseFrontend::State {
                     // writer cap every queued inode may be inadmissible while
                     // the writers that could free a slot are backed off.
                     auto wake_at = due;
-                    if (viewer_active()) {
-                        const auto now = Clock::now();
-                        const auto cooldown = weighted_loader.wait_for(now, true);
-                        const auto viewer_idle = fs.foreground_idle_for();
-                        const auto quiet_remaining =
-                            viewer_idle < config.publication_quiet
-                                ? config.publication_quiet - viewer_idle
-                                : std::chrono::milliseconds(0);
-                        auto wake_after = quiet_remaining;
-                        if (cooldown > std::chrono::milliseconds(0))
-                            wake_after = std::min(wake_after, cooldown);
-                        if (wake_after > std::chrono::milliseconds(0))
-                            wake_at = wake_at ? std::min(*wake_at, now + wake_after)
-                                              : now + wake_after;
-                    }
+                    const auto now = Clock::now();
+                    if (const auto retry = admission->retry_after(now);
+                        retry && *retry > std::chrono::milliseconds(0))
+                        wake_at = wake_at ? std::min(*wake_at, now + *retry) : now + *retry;
                     const auto changed = [&]() MACHA_REQUIRES(data_queue_mutex) {
                         return stopping.load() || data_queue.empty() ||
                                runnable_data_available_locked() ||
@@ -3857,7 +3880,7 @@ struct FuseFrontend::State {
                 if (reserved)
                     ++reserved_publications;
                 data_queue.erase(selected);
-                weighted_loader.started(Clock::now(), viewer_active(), false);
+                admission->started(Clock::now(), false);
                 publication_inflight_bytes += config.publication_quantum_bytes;
                 publication_inflight_bytes_diagnostic.store(publication_inflight_bytes,
                                                              std::memory_order_relaxed);
@@ -4061,7 +4084,7 @@ struct FuseFrontend::State {
                 (void)active_data.fetch_sub(1, std::memory_order_relaxed);
                 if (recovered)
                     --active_recovery_data;
-                (void)weighted_loader.finished(Clock::now(), viewer_active());
+                admission->finished(Clock::now());
             }
             data_cv.notify_all();
             admit_deferred();
@@ -5137,9 +5160,10 @@ struct FuseFrontend::State {
 };
 
 FuseFrontend::FuseFrontend(FileSystem& filesystem, RetainedMemoryLedger& retained_memory,
-                           FuseConfig config, std::stop_token stop)
+                           FuseConfig config, std::unique_ptr<LoaderAdmission> admission,
+                           PublicationTarget& target, std::stop_token stop)
     : state_(std::make_unique<State>(filesystem, retained_memory, std::move(config),
-                                     std::move(stop))) {
+                                     std::move(admission), target, std::move(stop))) {
     state_->start();
 }
 
@@ -6431,16 +6455,6 @@ FuseFrontendDiagnostics FuseFrontend::diagnostics() const noexcept {
         state_->recovery_dropped_operations.load(std::memory_order_relaxed),
         state_->publications_abandoned.load(std::memory_order_relaxed),
     };
-}
-
-void FuseFrontend::set_viewer_active_for_tests(std::optional<bool> active) {
-    state_->viewer_active_override.store(active ? (*active ? 1 : 0) : -1,
-                                         std::memory_order_release);
-    // A data loop may be sleeping with no timed wake; wake it now.
-    {
-        Lock lock(state_->data_queue_mutex);
-    }
-    state_->data_cv.notify_all();
 }
 
 bool FuseFrontend::wait_for_idle(std::chrono::milliseconds timeout) {
