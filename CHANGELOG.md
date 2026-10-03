@@ -1,5 +1,37 @@
 # Current release
 
+## 0.80.0 — T5: contracts say what they wait on (experiment)
+
+The object ledger experiment's T5, completed. No wire format, protocol or
+on-disk format changes; either node can go back to 0.79.0 (or earlier) by
+reinstalling it.
+
+**Metadata reads on the viewer path no longer wait behind a peer's commit.**
+Reading the current metadata snapshot (what FUSE and the HTTP API use)
+could wait for a commit's heads file to reach disk; it now waits on
+nothing.
+
+**Claim checks no longer wait on the DATA disk.** Pruning old claim
+records checked whether each object was still stored while holding the
+lock every claim read takes, so a peer's remove request, rebalancing and
+publication could wait on DATA I/O; the check now runs without the lock.
+
+**Object presence recovers from a failed startup walk.** If listing a
+store's objects at startup failed, presence checks went to the disk for as
+long as the node ran; the listing is now retried, backing off to five
+minutes. A presence check no longer deletes an empty object file; reads
+and the accounting scan still prune them.
+
+**A local write that fails after its file is in place** no longer removes
+that file's old name or releases its space reservation twice.
+
+Inside, unchanged in behaviour: the metadata replica is built with the
+function that applies namespace changes, so it can no longer be left
+holding one from a component that has stopped; the filesystem is given the
+node's configuration, id and membership rather than the node; every
+storage, claim, ledger, metadata and horizon contract declares what each
+operation waits on and who may call it.
+
 ## 0.79.0 — T5: accounts are their own part (experiment)
 
 The object ledger experiment's T5, continued. No wire format, protocol or
