@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
-#include <functional>
 #include "storage/presence_index.hpp"
 #include "contract/object_store.hpp"
 #include "contract/thread_safety.hpp"
@@ -15,8 +14,10 @@
 #include <set>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <thread>
+#include <utility>
 #include <vector>
 namespace macha {
 class StorageLock {
@@ -45,6 +46,55 @@ struct LocalStoreOptions {
     size_t pack_threshold{};
     size_t pack_target_size{};
 };
+
+// The device work behind LocalStore's object reads, object writes and pack
+// compaction, which the store does with its index mutex released. Handed to
+// the store at construction and owned by whoever constructed it, which keeps
+// it alive for the store's lifetime. PosixLocalStoreFiles is the device.
+// Every operation is thread safe and waits on the device holding its path.
+class LocalStoreFiles {
+  public:
+    virtual ~LocalStoreFiles() = default;
+    // Writes head then body to a new file, creating its directory, and
+    // renames it to `path`. A throw leaves nothing at `path`.
+    virtual void install(const std::filesystem::path&, std::span<const uint8_t> head,
+                         std::span<const uint8_t> body) MACHA_EXCLUDES(no_io) = 0;
+    // The whole file. Throws unless it is read in full.
+    virtual Bytes read(const std::filesystem::path&) MACHA_EXCLUDES(no_io) = 0;
+    // `size` bytes at `offset`, or none if the file is shorter. Throws if the
+    // file cannot be opened or closed.
+    virtual std::optional<Bytes> read_at(const std::filesystem::path&, uint64_t offset,
+                                         size_t size) MACHA_EXCLUDES(no_io) = 0;
+    // Appends head then body, creating the file. A throw may leave part of
+    // them appended.
+    virtual void append(const std::filesystem::path&, std::span<const uint8_t> head,
+                        std::span<const uint8_t> body) MACHA_EXCLUDES(no_io) = 0;
+    // Cuts the file to `size`; false if it cannot.
+    virtual bool truncate(const std::filesystem::path&, uint64_t size) MACHA_EXCLUDES(no_io) = 0;
+    // The regular files in `dir` with their sizes. Throws if it cannot list or
+    // size them.
+    virtual std::vector<std::pair<std::filesystem::path, uint64_t>>
+    list(const std::filesystem::path& dir) MACHA_EXCLUDES(no_io) = 0;
+};
+
+// The files on the local filesystem through POSIX calls. Stateless.
+class PosixLocalStoreFiles final : public LocalStoreFiles {
+  public:
+    void install(const std::filesystem::path&, std::span<const uint8_t> head,
+                 std::span<const uint8_t> body) override MACHA_EXCLUDES(no_io);
+    Bytes read(const std::filesystem::path&) override MACHA_EXCLUDES(no_io);
+    std::optional<Bytes> read_at(const std::filesystem::path&, uint64_t offset,
+                                 size_t size) override MACHA_EXCLUDES(no_io);
+    void append(const std::filesystem::path&, std::span<const uint8_t> head,
+                std::span<const uint8_t> body) override MACHA_EXCLUDES(no_io);
+    bool truncate(const std::filesystem::path&, uint64_t size) override MACHA_EXCLUDES(no_io);
+    std::vector<std::pair<std::filesystem::path, uint64_t>>
+    list(const std::filesystem::path& dir) override MACHA_EXCLUDES(no_io);
+};
+
+// The process's PosixLocalStoreFiles. It holds no state, so one instance
+// living for the whole process serves every store.
+LocalStoreFiles& posix_local_store_files() noexcept;
 
 struct LocalStoreDiagnostics {
     uint64_t loose_reaffirmation_fast_paths{};
@@ -102,6 +152,8 @@ class LocalStore final : public ObjectStore {
     const size_t pack_target_size_{};
     const std::array<uint8_t, 32> key_{};
     const LocalStoreMode mode_{LocalStoreMode::authoritative};
+    // Object and pack file I/O; called only with m_ released.
+    LocalStoreFiles& files_;
     std::atomic<uint64_t> used_{};
     mutable std::atomic<uint64_t> losses_{};
     // presence_ has listed the store; set once by the warm-up.
@@ -119,11 +171,6 @@ class LocalStore final : public ObjectStore {
     mutable std::map<ObjectId, std::weak_ptr<IoMutex>>
         object_mutexes_ MACHA_GUARDED_BY(object_mutex_map_mutex_);
     uint64_t reserved_write_bytes_ MACHA_GUARDED_BY(m_){};
-    std::function<void(const ObjectId&)> before_loose_write_for_tests_ MACHA_GUARDED_BY(m_);
-    std::function<void(const ObjectId&)> before_loose_read_for_tests_ MACHA_GUARDED_BY(m_);
-    std::function<void(const ObjectId&)> before_packed_read_for_tests_ MACHA_GUARDED_BY(m_);
-    std::function<void(const ObjectId&)> before_packed_write_for_tests_ MACHA_GUARDED_BY(m_);
-    std::function<void()> before_pack_compaction_for_tests_ MACHA_GUARDED_BY(m_);
     static constexpr size_t verified_loose_limit = 4096;
     mutable std::map<ObjectId, VerifiedLoose> verified_loose_ MACHA_GUARDED_BY(m_);
     // Loose objects present: published when a put installs the file, filled
@@ -231,12 +278,14 @@ class LocalStore final : public ObjectStore {
   public:
     LocalStore(std::filesystem::path, LocalStoreOptions, std::array<uint8_t, 32>,
                LocalStoreMode = LocalStoreMode::authoritative,
-               std::shared_ptr<DurabilityDomain> = {});
+               std::shared_ptr<DurabilityDomain> = {},
+               LocalStoreFiles& = posix_local_store_files());
     // Loose objects only, for the cache and tests; StoragePool passes
     // LocalStoreOptions.
     LocalStore(std::filesystem::path, uint64_t, std::array<uint8_t, 32>,
                LocalStoreMode = LocalStoreMode::authoritative,
-               std::shared_ptr<DurabilityDomain> = {});
+               std::shared_ptr<DurabilityDomain> = {},
+               LocalStoreFiles& = posix_local_store_files());
     ~LocalStore();
     bool put(const ObjectId&, std::span<const uint8_t>);
     std::optional<uint64_t> put_deferred(const ObjectId&, std::span<const uint8_t>);
@@ -275,26 +324,6 @@ class LocalStore final : public ObjectStore {
     void touch(const ObjectId&);
     bool is_packed(const ObjectId&) const;
     bool compact_packs(std::stop_token = {});
-    void set_before_loose_write_for_tests(std::function<void(const ObjectId&)> hook) {
-        Lock lock(m_);
-        before_loose_write_for_tests_ = std::move(hook);
-    }
-    void set_before_packed_read_for_tests(std::function<void(const ObjectId&)> hook) {
-        Lock lock(m_);
-        before_packed_read_for_tests_ = std::move(hook);
-    }
-    void set_before_loose_read_for_tests(std::function<void(const ObjectId&)> hook) {
-        Lock lock(m_);
-        before_loose_read_for_tests_ = std::move(hook);
-    }
-    void set_before_packed_write_for_tests(std::function<void(const ObjectId&)> hook) {
-        Lock lock(m_);
-        before_packed_write_for_tests_ = std::move(hook);
-    }
-    void set_before_pack_compaction_for_tests(std::function<void()> hook) {
-        Lock lock(m_);
-        before_pack_compaction_for_tests_ = std::move(hook);
-    }
 
     uint64_t used() const { return used_.load(std::memory_order_relaxed); }
     uint64_t limit() const { return limit_; }

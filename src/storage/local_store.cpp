@@ -237,37 +237,6 @@ void wa(int fd, std::span<const uint8_t> bytes) {
     }
 }
 
-Bytes rf(const std::filesystem::path& p) {
-    int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0)
-        throw std::runtime_error("cannot open object: " + std::string(strerror(errno)));
-    struct stat st{};
-    if (fstat(fd, &st) != 0 || st.st_size < 0) {
-        const auto error = std::string(strerror(errno));
-        close(fd);
-        throw std::runtime_error("cannot stat object: " + error);
-    }
-    Bytes out(static_cast<size_t>(st.st_size));
-    size_t done = 0;
-    while (done < out.size()) {
-        auto n = ::read(fd, out.data() + done, out.size() - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            const auto error = std::string(strerror(errno));
-            close(fd);
-            throw std::runtime_error("cannot read object: " + error);
-        }
-        if (n == 0) {
-            close(fd);
-            throw std::runtime_error("short object read");
-        }
-        done += static_cast<size_t>(n);
-    }
-    if (close(fd) != 0)
-        throw std::runtime_error("cannot close object: " + std::string(strerror(errno)));
-    return out;
-}
-
 void syncdir(const std::filesystem::path& p) {
     int fd = ::open(p.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd >= 0) {
@@ -304,6 +273,137 @@ std::filesystem::file_time_type file_time_from_unix_ms(uint64_t value) {
 
 } // namespace
 
+void PosixLocalStoreFiles::install(const std::filesystem::path& path,
+                                   std::span<const uint8_t> head,
+                                   std::span<const uint8_t> body) {
+    std::filesystem::create_directories(path.parent_path());
+    std::string temp =
+        path.string() + ".tmp." + std::to_string(getpid()) + "." + std::to_string(unix_ms());
+    int fd = -1;
+    try {
+        fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) throw std::runtime_error(strerror(errno));
+        wa(fd, head);
+        wa(fd, body);
+        const int close_rc = ::close(fd);
+        fd = -1;
+        if (close_rc != 0) throw std::runtime_error(strerror(errno));
+        if (::rename(temp.c_str(), path.c_str()) != 0)
+            throw std::runtime_error(strerror(errno));
+    } catch (...) {
+        if (fd >= 0) ::close(fd);
+        std::error_code remove_error;
+        std::filesystem::remove(temp, remove_error);
+        throw;
+    }
+}
+
+Bytes PosixLocalStoreFiles::read(const std::filesystem::path& path) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+        throw std::runtime_error("cannot open object: " + std::string(strerror(errno)));
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size < 0) {
+        const auto error = std::string(strerror(errno));
+        close(fd);
+        throw std::runtime_error("cannot stat object: " + error);
+    }
+    Bytes out(static_cast<size_t>(st.st_size));
+    size_t done = 0;
+    while (done < out.size()) {
+        auto n = ::read(fd, out.data() + done, out.size() - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const auto error = std::string(strerror(errno));
+            close(fd);
+            throw std::runtime_error("cannot read object: " + error);
+        }
+        if (n == 0) {
+            close(fd);
+            throw std::runtime_error("short object read");
+        }
+        done += static_cast<size_t>(n);
+    }
+    if (close(fd) != 0)
+        throw std::runtime_error("cannot close object: " + std::string(strerror(errno)));
+    return out;
+}
+
+std::optional<Bytes> PosixLocalStoreFiles::read_at(const std::filesystem::path& path,
+                                                   uint64_t offset, size_t size) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+        throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+    std::optional<Bytes> out(std::in_place, size);
+    size_t done = 0;
+    while (done < size) {
+        auto n = ::pread(fd, out->data() + done, size - done, static_cast<off_t>(offset + done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const auto error = std::string(strerror(errno));
+            ::close(fd);
+            throw std::runtime_error("cannot read pack: " + error);
+        }
+        if (n == 0) {
+            out.reset();
+            break;
+        }
+        done += static_cast<size_t>(n);
+    }
+    if (::close(fd) != 0)
+        throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+    return out;
+}
+
+void PosixLocalStoreFiles::append(const std::filesystem::path& path,
+                                  std::span<const uint8_t> head,
+                                  std::span<const uint8_t> body) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0)
+        throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
+    try {
+        wa(fd, head);
+        wa(fd, body);
+    } catch (...) {
+        ::close(fd);
+        throw;
+    }
+    if (::close(fd) != 0)
+        throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
+}
+
+bool PosixLocalStoreFiles::truncate(const std::filesystem::path& path, uint64_t size) {
+    int fd = ::open(path.c_str(), O_WRONLY);
+    if (fd < 0) return false;
+    const bool cut = ::ftruncate(fd, static_cast<off_t>(size)) == 0;
+    ::close(fd);
+    return cut;
+}
+
+std::vector<std::pair<std::filesystem::path, uint64_t>>
+PosixLocalStoreFiles::list(const std::filesystem::path& dir) {
+    std::vector<std::pair<std::filesystem::path, uint64_t>> files;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
+        if (error) break;
+        if (!entry.is_regular_file()) continue;
+        std::error_code size_error;
+        const auto size = entry.file_size(size_error);
+        if (size_error)
+            throw std::runtime_error("cannot size " + entry.path().string() + ": " +
+                                     size_error.message());
+        files.push_back({entry.path(), size});
+    }
+    if (error)
+        throw std::runtime_error("cannot list " + dir.string() + ": " + error.message());
+    return files;
+}
+
+LocalStoreFiles& posix_local_store_files() noexcept {
+    static PosixLocalStoreFiles files;
+    return files;
+}
+
 StorageLock::StorageLock(const std::filesystem::path& root) {
     std::filesystem::create_directories(root);
     auto path = root / ".macha.lock";
@@ -327,11 +427,12 @@ StorageLock::~StorageLock() {
 
 LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
                        std::array<uint8_t, 32> key, LocalStoreMode mode,
-                       std::shared_ptr<DurabilityDomain> durability_domain)
+                       std::shared_ptr<DurabilityDomain> durability_domain,
+                       LocalStoreFiles& files)
     : root_(std::move(root)), objects_(root_ / "objects"), packs_(root_ / "packs"),
       accounting_path_(root_ / ".macha.accounting"), limit_(options.limit),
       reserve_free_(options.reserve_free), pack_threshold_(options.pack_threshold),
-      pack_target_size_(options.pack_target_size), key_(key), mode_(mode),
+      pack_target_size_(options.pack_target_size), key_(key), mode_(mode), files_(files),
       durability_domain_(std::move(durability_domain)) {
     if (!limit_) throw std::runtime_error("local store limit must be non-zero");
     if ((pack_threshold_ == 0) != (pack_target_size_ == 0))
@@ -420,9 +521,10 @@ LocalStore::LocalStore(std::filesystem::path root, LocalStoreOptions options,
 
 LocalStore::LocalStore(std::filesystem::path root, uint64_t limit,
                        std::array<uint8_t, 32> key, LocalStoreMode mode,
-                       std::shared_ptr<DurabilityDomain> durability_domain)
+                       std::shared_ptr<DurabilityDomain> durability_domain,
+                       LocalStoreFiles& files)
     : LocalStore(std::move(root), LocalStoreOptions{limit, 0, 0, 0}, key, mode,
-                 std::move(durability_domain)) {}
+                 std::move(durability_domain), files) {}
 
 LocalStore::~LocalStore() {
     if (presence_thread_.joinable()) {
@@ -645,7 +747,6 @@ bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
     h.type = type;
     h.touched_ms = touched_ms;
     h.id = id;
-    const auto before_write = before_packed_write_for_tests_;
     Bytes header;
     uint64_t total = 0;
     std::filesystem::path target;
@@ -654,8 +755,6 @@ bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
         Unlocked unlocked(lock, m_);
         Bytes payload;
         try {
-            if (before_write)
-                before_write(id);
             if (type == pack_put) {
                 auto sealed = aes_gcm_seal(key_, data, id.bytes);
                 payload = std::move(sealed.ciphertext);
@@ -678,36 +777,20 @@ bool LocalStore::append_pack_record_locked(uint8_t type, const ObjectId& id,
         // The pack stream has its own single-writer lock; m_ stays free during
         // encryption and I/O so unrelated reads are not trapped behind an append.
         Lock pack_io_lock(pack_io_mutex_);
-        int fd = -1;
         try {
             select_active_pack_locked(total);
             target = active_pack_;
             start = active_pack_size_;
-            fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-            if (fd < 0)
-                throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
-            wa(fd, header);
-            if (!payload.empty()) wa(fd, payload);
-            if (::close(fd) != 0)
-                throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
-            fd = -1;
+            files_.append(target, header, payload);
             active_pack_size_ += total;
         } catch (...) {
-            if (fd >= 0) ::close(fd);
             // A failed append (ENOSPC, EIO, short write) must not poison the live
             // process with a torn record. Restore the previous durable boundary
             // when possible; if rollback itself fails, abandon this pack so later
             // writes never append behind the torn bytes. Restart recovery will
             // truncate it.
-            int rollback = target.empty() ? -1 : ::open(target.c_str(), O_WRONLY);
-            if (rollback >= 0) {
-                if (::ftruncate(rollback, static_cast<off_t>(start)) == 0)
-                    active_pack_size_ = start;
-                else {
-                    active_pack_.clear();
-                    active_pack_size_ = 0;
-                }
-                ::close(rollback);
+            if (!target.empty() && files_.truncate(target, start)) {
+                active_pack_size_ = start;
             } else {
                 active_pack_.clear();
                 active_pack_size_ = 0;
@@ -733,7 +816,6 @@ std::optional<Bytes> LocalStore::get_packed_locked(const ObjectId& id, Lock& loc
     auto found = packed_.find(id);
     if (found == packed_.end()) return {};
     const auto entry = found->second;
-    const auto before_read = before_packed_read_for_tests_;
     ++active_pack_readers_[entry.file];
 
     // A reader lease pins the indexed pack against compaction before any
@@ -750,29 +832,13 @@ std::optional<Bytes> LocalStore::get_packed_locked(const ObjectId& id, Lock& loc
     Bytes plain;
     try {
         Unlocked unlocked(lock, m_);
-        int fd = -1;
-        try {
-            if (before_read)
-                before_read(id);
-            fd = ::open(entry.file.c_str(), O_RDONLY);
-            if (fd < 0)
-                throw std::runtime_error("cannot open pack: " + std::string(strerror(errno)));
-            auto payload = pra_exact(fd, static_cast<size_t>(entry.payload_size),
-                                     entry.payload_offset);
-            const int close_rc = ::close(fd);
-            fd = -1;
-            if (!payload)
-                throw std::runtime_error("short packed object read");
-            if (close_rc != 0)
-                throw std::runtime_error("cannot close pack: " + std::string(strerror(errno)));
-            plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
-            if (plain.size() != entry.plain_size || object_id(plain) != id)
-                throw std::runtime_error("packed object integrity failure");
-        } catch (...) {
-            if (fd >= 0)
-                ::close(fd);
-            throw;
-        }
+        auto payload = files_.read_at(entry.file, entry.payload_offset,
+                                      static_cast<size_t>(entry.payload_size));
+        if (!payload)
+            throw std::runtime_error("short packed object read");
+        plain = aes_gcm_open(key_, entry.nonce, entry.tag, *payload, id.bytes);
+        if (plain.size() != entry.plain_size || object_id(plain) != id)
+            throw std::runtime_error("packed object integrity failure");
     } catch (...) {
         release_reader();
         throw;
@@ -928,7 +994,6 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
     if (!physical_space_available_locked(need)) return false;
     const bool ephemeral = mode_ == LocalStoreMode::ephemeral;
     reserved_write_bytes_ += need;
-    auto before_write = before_loose_write_for_tests_;
     bool space = false;
     {
         Unlocked unlocked(lock, m_);
@@ -952,42 +1017,18 @@ bool LocalStore::put_loose_locked(const ObjectId& id, std::span<const uint8_t> d
         std::optional<LooseStamp> installed_stamp;
         {
             Unlocked unlocked(lock, m_);
-            std::string temp;
-            int fd = -1;
-            try {
-                if (before_write)
-                    before_write(id);
-                auto sealed = aes_gcm_seal(key_, data, id.bytes);
-                Writer header;
-                header.raw(M);
-                header.u64(data.size());
-                header.fixed(sealed.nonce);
-                header.fixed(sealed.tag);
-                if (header.data().size() + sealed.ciphertext.size() != need)
-                    throw std::logic_error("local store loose object size mismatch");
-
-                std::filesystem::create_directories(p.parent_path());
-                temp = p.string() + ".tmp." + std::to_string(getpid()) + "." +
-                       std::to_string(unix_ms());
-                fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-                if (fd < 0) throw std::runtime_error(strerror(errno));
-                wa(fd, header.data());
-                wa(fd, sealed.ciphertext);
-                if (::close(fd) != 0) throw std::runtime_error(strerror(errno));
-                fd = -1;
-                if (::rename(temp.c_str(), p.c_str()) != 0)
-                    throw std::runtime_error(strerror(errno));
-                temp.clear();
-                installed_stamp = loose_stamp(p);
-                if (!installed_stamp)
-                    throw std::runtime_error("cannot stat installed local object");
-            } catch (...) {
-                if (fd >= 0) ::close(fd);
-                std::error_code remove_error;
-                if (!temp.empty())
-                    std::filesystem::remove(temp, remove_error);
-                throw;
-            }
+            auto sealed = aes_gcm_seal(key_, data, id.bytes);
+            Writer header;
+            header.raw(M);
+            header.u64(data.size());
+            header.fixed(sealed.nonce);
+            header.fixed(sealed.tag);
+            if (header.data().size() + sealed.ciphertext.size() != need)
+                throw std::logic_error("local store loose object size mismatch");
+            files_.install(p, header.data(), sealed.ciphertext);
+            installed_stamp = loose_stamp(p);
+            if (!installed_stamp)
+                throw std::runtime_error("cannot stat installed local object");
         }
         if (reserved_write_bytes_ < need)
             throw std::logic_error("local store write reservation underflow");
@@ -1129,7 +1170,7 @@ bool LocalStore::put_impl(const ObjectId& id, std::span<const uint8_t> data,
             } else {
                 loose_reaffirmation_full_validations_.fetch_add(1, std::memory_order_relaxed);
                 try {
-                    auto encoded = rf(loose_path);
+                    auto encoded = files_.read(loose_path);
                     Reader r(encoded);
                     auto magic = r.raw(M.size());
                     if (!std::equal(magic.begin(), magic.end(), M.begin()))
@@ -1206,11 +1247,9 @@ std::optional<Bytes> LocalStore::get(const ObjectId& id) const {
     if (packed_.contains(id))
         return get_packed_locked(id, lock);
     const auto p = path(id);
-    const auto before_read = before_loose_read_for_tests_;
     lock.unlock();
     if (!std::filesystem::exists(p)) return {};
-    if (before_read) before_read(id);
-    auto encoded = rf(p);
+    auto encoded = files_.read(p);
     if (encoded.empty() && prune_empty_loose(id, p)) return {};
     Reader r(encoded);
     auto magic = r.raw(M.size());
@@ -1537,7 +1576,6 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
         live += entry.record_size;
     }
     const auto packed_snapshot = packed_;
-    const auto before_compaction = before_pack_compaction_for_tests_;
 
     std::vector<PackUsage> packs;
     uint64_t total_dead = 0;
@@ -1545,20 +1583,10 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
     bool space_available = true;
     {
         Unlocked unlocked(lock, m_);
-        if (before_compaction)
-            before_compaction();
-
-        std::error_code enumerate_error;
-        for (const auto& entry : std::filesystem::directory_iterator(packs_, enumerate_error)) {
-            if (enumerate_error)
-                break;
-            if (!entry.is_regular_file() || !pack_sequence(entry.path().filename().string()))
+        for (const auto& [file, size] : files_.list(packs_)) {
+            if (!pack_sequence(file.filename().string()))
                 continue;
-            std::error_code size_error;
-            const auto size = entry.file_size(size_error);
-            if (size_error)
-                throw std::runtime_error("cannot size source pack: " + size_error.message());
-            const auto found = live_by_pack.find(entry.path());
+            const auto found = live_by_pack.find(file);
             const uint64_t live = found == live_by_pack.end() ? 0 : found->second;
             if (live > size)
                 throw std::runtime_error("pack live accounting exceeds physical pack size");
@@ -1566,11 +1594,8 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
             if (dead > std::numeric_limits<uint64_t>::max() - total_dead)
                 throw std::runtime_error("pack dead-size overflow");
             total_dead += dead;
-            packs.push_back({entry.path(), size, live, dead});
+            packs.push_back({file, size, live, dead});
         }
-        if (enumerate_error)
-            throw std::runtime_error("cannot enumerate source packs: " +
-                                     enumerate_error.message());
 
         // The cached counter is only an admission hint; recompute from the index
         // so an interrupted compaction cannot leave dead bytes hidden.
@@ -1626,16 +1651,10 @@ bool LocalStore::compact_packs_locked(Lock& lock) {
                 if (old_entry.payload_offset < pack_header_size)
                     throw std::runtime_error("invalid packed object offset during compaction");
                 const auto record_offset = old_entry.payload_offset - pack_header_size;
-                int source = ::open(victim->file.c_str(), O_RDONLY);
-                if (source < 0)
-                    throw std::runtime_error("cannot open source pack during compaction: " +
-                                             std::string(strerror(errno)));
-                auto bytes = pra_exact(source, old_entry.record_size, record_offset);
-                const auto saved = errno;
-                ::close(source);
+                auto bytes = files_.read_at(victim->file, record_offset,
+                                            static_cast<size_t>(old_entry.record_size));
                 if (!bytes)
-                    throw std::runtime_error("cannot read live pack record during compaction: " +
-                                             std::string(strerror(saved)));
+                    throw std::runtime_error("short live pack record during compaction");
                 wa(fd, *bytes);
 
                 auto next = old_entry;

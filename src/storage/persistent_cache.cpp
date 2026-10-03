@@ -69,7 +69,8 @@ void PersistentBlockCache::open_locked() {
     try {
         store_ = std::make_shared<LocalStore>(config_.path,
                                               std::numeric_limits<uint64_t>::max(), key_,
-                                              LocalStoreMode::ephemeral);
+                                              LocalStoreMode::ephemeral, nullptr,
+                                              posix_local_store_files());
         rebuild_lru_locked();
     } catch (const std::exception& error) {
         store_.reset();
