@@ -33,6 +33,8 @@ class ObjectLedger {
     // The class's object store's losses(): advances when something held may
     // no longer be.
     virtual uint64_t held_losses(RetentionClass) const noexcept = 0;
+    // The class's object store's indexed(): held() costs no device read.
+    virtual bool held_indexed(RetentionClass) const noexcept = 0;
 
     // The published horizons, null until first published. A held handle's
     // snapshot never changes. A pointer copy.

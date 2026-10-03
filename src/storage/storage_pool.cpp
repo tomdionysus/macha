@@ -685,6 +685,19 @@ uint64_t StoragePool::losses() const noexcept {
     }
 }
 
+bool StoragePool::indexed() const noexcept {
+    try {
+        for (const auto& backend : snapshot()) {
+            Lock lock(backend->mutex);
+            if (backend->store && !backend->store->indexed())
+                return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool StoragePool::remove(const ObjectId& id) {
     bool removed = false;
     for (const auto& backend : snapshot()) {

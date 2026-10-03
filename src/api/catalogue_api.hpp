@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "api/item_availability.hpp"
+
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "http/http.hpp"
@@ -25,7 +27,14 @@ class CatalogueApi {
     // A media id's keyframe byte index, stored or built now; empty when this
     // node cannot find the file.
     std::function<std::optional<Bytes>(const std::string&)> keyframe_index_;
+    // The last availability survey, or null; absent in fixtures without one.
+    std::function<std::shared_ptr<const AvailabilitySnapshot>()> availability_;
+    ItemAvailabilityCache item_availability_;
+    // The per-item table for this catalogue snapshot and the last survey.
+    std::shared_ptr<const ItemAvailabilityTable>
+    item_availability(const std::shared_ptr<const CatalogueSnapshot>&);
   public:
+    using AvailabilitySource = std::function<std::shared_ptr<const AvailabilitySnapshot>()>;
     CatalogueApi(
         CatalogueManager& catalogue, CatalogueHintQueue& hints,
         std::function<void(const std::vector<std::string>&)> request_media_rescan = {},
@@ -33,13 +42,14 @@ class CatalogueApi {
         std::function<std::optional<MediaProbeResult>(const std::string&)> resolve_media_profile = {},
         std::chrono::milliseconds artwork_capability_ttl = std::chrono::hours(24 * 30),
         std::function<std::optional<uint64_t>(const std::string&)> media_size = {},
-        std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {})
+        std::function<std::optional<Bytes>(const std::string&)> keyframe_index = {},
+        AvailabilitySource availability = {})
         : catalogue_(catalogue), hints_(hints),
           request_media_rescan_(std::move(request_media_rescan)),
           request_media_profiles_(std::move(request_media_profiles)),
           resolve_media_profile_(std::move(resolve_media_profile)),
           artwork_capability_ttl_(artwork_capability_ttl), media_size_(std::move(media_size)),
-          keyframe_index_(std::move(keyframe_index)) {}
+          keyframe_index_(std::move(keyframe_index)), availability_(std::move(availability)) {}
     HttpResponse handle(const HttpRequest&);
     // Recognises a self-authorising capability URL (an artwork GET with a valid,
     // unexpired signature) so HttpServer exempts it from the bearer-token check.

@@ -1,5 +1,37 @@
 # Current release
 
+## 0.83.0 — every catalogue item says how much of it can be played (experiment)
+
+No wire format, protocol or on-disk format changes; either node can go
+back to 0.82.0 by reinstalling it.
+
+**`availability` on every catalogue item.** Wherever an item is returned
+(`GET /api/v1/catalogue/items`, `/items/{id}`, `/search`, and the replies
+to `PUT` and `PATCH`) it carries `availability`: `complete`, `partial`,
+`unavailable` or `unknown`. An item with files takes the best of its
+files, since any one can be played. A show, season, artist or album is
+judged over the items beneath it that have files, and carries
+`availability_members` (`total`, `complete`, `partial`, `unavailable`,
+`unknown`) so a client can say "7 of 10" without another request; it is
+`null` on an item that is not a set. One lookup per item, from the last
+survey; a response never waits. See [Files and availability](docs/files.md).
+
+**`unavailable` joins the codes everywhere.** The files resource and
+`GET /api/v1/playback/media` now answer `unavailable` when no extent of a
+file is held by a reachable node; in 0.82.0 that read `partial`.
+
+**The survey no longer repeats itself.** On the live library 0.82.0
+re-surveyed about every thirty seconds, because one node's storage grows
+all the time while something is unavailable. A growing peer is now asked
+again at no more than a twentieth of the pass's time; a peer that could
+not answer is tried with one tree node before a whole descent; and a
+roll-up after this node merely gained something asks nobody.
+
+**The first survey after a restart waits for the presence index.** A
+roll-up that began while the index was still filling read the disk once
+per extent and took four minutes on a large store; it now starts when the
+index is ready and takes seconds.
+
 ## 0.82.0 — what the cluster holds, by Merkle descent (experiment)
 
 The object ledger experiment's first consumer. One new cluster message
