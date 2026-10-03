@@ -266,6 +266,7 @@ struct BareNodeResources {
     NodeIdentity identity;
     RecoveryProgress progress;
     MessageRoutes routes;
+    NetworkLinks links;
     LocalState::StageHook stage_hook;
     BareNodeResources(const Config& config, ClusterKeys keys, LocalState::StageHook hook)
         : resources(config), identity(config.state_path, std::move(keys)),
@@ -283,7 +284,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         : BareNodeResources(config, keys, hook),
           NodeRuntime(std::move(config), identity, progress, resources.memory,
                       resources.transcode_rates, routes,
-                      resources.events, std::move(hook)) {}
+                      resources.events, links, std::move(hook)) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;

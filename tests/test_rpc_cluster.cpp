@@ -154,12 +154,13 @@ MACHA_TEST("rpc_cluster", test_best_effort_telemetry_notifications_reach_both_ro
         return RpcMessage{MessageType::ok, {}};
     };
 
+    NetworkLinks links;
     RpcClient local_client(
-        keys, [local_info] { return local_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        5s, 30s, 4096);
+        links, keys, [local_info] { return local_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 5s, 30s, 4096);
     RpcClient remote_client(
-        keys, [remote_info] { return remote_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        5s, 30s, 4096);
+        links, keys, [remote_info] { return remote_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 5s, 30s, 4096);
     RpcServer local_server(
         "127.0.0.1", local_port, keys, local_info,
         [&](const NodeInfo&, FrameType, const RpcMessage& request) {
@@ -266,9 +267,10 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        5s, 30s, 4096);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 5s, 30s, 4096);
     Endpoint endpoint{"127.0.0.1", port};
 
     // Not a multiple of max_frame_size: the final frame is short, not padded.
@@ -1076,8 +1078,9 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
 
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
         500ms);
     Endpoint endpoint{"127.0.0.1", port};
 
@@ -1145,8 +1148,9 @@ MACHA_TEST("rpc_cluster", test_rpc_concurrent_cold_data_calls_share_one_dial) {
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
         500ms);
 
     constexpr size_t callers = 24;
@@ -1209,8 +1213,9 @@ MACHA_TEST("rpc_cluster", test_rpc_full_extent_reply_uses_owned_transport_handof
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
         500ms);
 
     auto reply = client.call(server_info, MessageType::get_object, Bytes{0x01},
@@ -1235,13 +1240,14 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
 
     struct TestNode {
         NodeInfo info;
+        NetworkLinks links;
         RpcClient client;
         RpcServer server;
 
         TestNode(ClusterKeys keys, NodeInfo node, RpcServer::Handler handler)
             : info(std::move(node)), client(
-                                         keys, [this] { return info; }, [](const NodeInfo&) {},
-                                         [](uint64_t) {}, 500ms, 10s, 30s),
+                                         links, keys, [this] { return info; },
+                                         [](const NodeInfo&) {}, [](uint64_t) {}, 500ms, 10s, 30s),
               server("127.0.0.1", info.port, keys, info, std::move(handler),
                      [](const NodeInfo&) {}) {
             server.attach_client(client);
@@ -1570,9 +1576,10 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
 
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        20ms, 80ms);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 20ms, 80ms);
     Endpoint endpoint{"127.0.0.1", port};
 
     // 20 ms is not a deadline: both 120 ms RPCs complete, outliving the 80 ms
@@ -1621,8 +1628,10 @@ MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_comp
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
-    RpcClient client(keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
-                     [](uint64_t) {}, 500ms);
+    NetworkLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms);
 
     Bytes payload(64 * 1024, 0x5a);
     auto request = client.call_async(Endpoint{"127.0.0.1", port}, MessageType::put_object,
@@ -1675,9 +1684,10 @@ MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
 
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     // With every data worker busy, health and membership stay prompt on the control stream.
@@ -1748,9 +1758,10 @@ MACHA_TEST("rpc_cluster", test_have_objects_flood_does_not_delay_unrelated_contr
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
 
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     // Every data worker busy with have_objects, as a large retain_data() batch makes it.
@@ -1814,9 +1825,10 @@ MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) 
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
 
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     // With both control handlers busy, health and membership use the fast-control executor.
@@ -1877,9 +1889,10 @@ MACHA_TEST("rpc_cluster", test_rpc_call_fails_after_no_progress_deadline) {
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     // Stuck: the handler never answers; the deadline turns that into a
@@ -1963,9 +1976,10 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     // One metadata mutation executes while two wait in its bounded queue,
@@ -2115,12 +2129,13 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
             .metadata_workers = 2, .metadata_pending_jobs = 8, .metadata_pending_bytes = 64});
     server.start();
 
+    NetworkLinks links;
     RpcClient client_a(
-        keys, [first_client] { return first_client; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
+        links, keys, [first_client] { return first_client; }, [](const NodeInfo&) {},
+        [](uint64_t) {}, 500ms, 100ms, 2s);
     RpcClient client_b(
-        keys, [second_client] { return second_client; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
+        links, keys, [second_client] { return second_client; }, [](const NodeInfo&) {},
+        [](uint64_t) {}, 500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     auto first = client_a.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
@@ -2175,9 +2190,10 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect
     server.start();
 
     NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     auto running = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
@@ -2229,9 +2245,10 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_shutdown_finishes_owner_and
     server.start();
 
     NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     auto running = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
@@ -2357,9 +2374,10 @@ MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) 
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
+    NetworkLinks links;
     RpcClient client(
-        keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 500ms,
-        100ms, 2s);
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
 
     // Loader work leaves DATA execution capacity for a later playback read.
@@ -2514,8 +2532,10 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     client_info.host = "127.0.0.1";
     client_info.port = free_port();
     client_info.failure_domain = "client-site";
-    RpcClient client(fixture.keys(), [client_info] { return client_info; },
-                     [](const NodeInfo&) {}, [](uint64_t) {}, 500ms, 100ms, 2s);
+    NetworkLinks links;
+    RpcClient client(
+        links, fixture.keys(), [client_info] { return client_info; }, [](const NodeInfo&) {},
+        [](uint64_t) {}, 500ms, 100ms, 2s);
     // The node pings this client back over the same connection as a peer;
     // without an inbound handler that ping would close it and fail pending calls.
     RpcServer client_server(
@@ -5122,6 +5142,198 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
     n1.stop();
 }
 
+// RpcLinks over the real network, with the faults these tests inject: a peer
+// that never answers, sessions that have not reached this node yet, a call
+// whose route is retired before it is placed, and a lane that dies underneath.
+class FaultyLinks final : public RpcLinks {
+    struct Stall {
+        std::optional<MessageType> message;
+        std::optional<TransportLane> lane;
+    };
+    struct Dialled {
+        size_t count{};
+        // Duplicates of the dialled sockets: sever() reaches the socket even
+        // after the transport has closed its own descriptor, never a reused one.
+        std::vector<int> sockets;
+    };
+
+    NetworkLinks network_;
+    mutable Mutex mutex_;
+    std::map<NodeId, Stall> stalled_ MACHA_GUARDED_BY(mutex_);
+    std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_ MACHA_GUARDED_BY(mutex_);
+    std::set<NodeId> held_ MACHA_GUARDED_BY(mutex_);
+    std::vector<std::pair<NodeId, std::function<void()>>> held_installs_ MACHA_GUARDED_BY(mutex_);
+    std::set<NodeId> retire_before_send_ MACHA_GUARDED_BY(mutex_);
+    size_t retirement_waits_ MACHA_GUARDED_BY(mutex_){};
+    bool sent_after_retirement_ MACHA_GUARDED_BY(mutex_){};
+    std::map<std::pair<std::string, TransportLane>, Dialled> dialled_ MACHA_GUARDED_BY(mutex_);
+
+    AsyncRpc stalled_call_locked() MACHA_REQUIRES(mutex_) {
+        auto promise = std::make_shared<std::promise<RpcReply>>();
+        auto future = promise->get_future();
+        stalled_calls_.push_back(promise);
+        const auto started = Clock::now();
+        std::weak_ptr<std::promise<RpcReply>> weak = promise;
+        auto fail = [weak] {
+            if (auto held = weak.lock()) {
+                try {
+                    held->set_exception(std::make_exception_ptr(
+                        std::runtime_error("RPC cancelled: peer is stalled by FaultyLinks")));
+                } catch (const std::future_error&) {
+                    // Already released or cancelled.
+                }
+            }
+        };
+        return AsyncRpc(std::move(future), fail, fail, {}, [started] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        });
+    }
+
+  public:
+    ~FaultyLinks() override {
+        Lock lock(mutex_);
+        for (auto& [_, dialled] : dialled_)
+            for (int socket : dialled.sockets)
+                ::close(socket);
+    }
+
+    int connect(const Endpoint& endpoint, TransportLane lane,
+                std::chrono::milliseconds timeout) override {
+        const int fd = network_.connect(endpoint, lane, timeout);
+        const int kept = ::dup(fd);
+        Lock lock(mutex_);
+        auto& dialled = dialled_[{endpoint_identity_key(endpoint), lane}];
+        ++dialled.count;
+        if (kept >= 0)
+            dialled.sockets.push_back(kept);
+        return fd;
+    }
+
+    std::optional<AsyncRpc> send(const NodeId& peer, TransportLane lane, MessageType type,
+                                 std::span<const uint8_t> payload, FrameType frame_type,
+                                 RpcRoute& route) override {
+        bool retire_first = false;
+        {
+            Lock lock(mutex_);
+            if (auto found = stalled_.find(peer);
+                found != stalled_.end() &&
+                (!found->second.message || *found->second.message == type) &&
+                (!found->second.lane || *found->second.lane == lane))
+                return stalled_call_locked();
+            retire_first = held_.contains(peer) && retire_before_send_.contains(peer);
+            if (retire_first)
+                ++retirement_waits_;
+        }
+        if (retire_first) {
+            const bool retired = wait_until([&] { return !route.usable(); }, 5s, 1ms);
+            Lock lock(mutex_);
+            sent_after_retirement_ = sent_after_retirement_ || retired;
+        }
+        return network_.send(peer, lane, type, payload, frame_type, route);
+    }
+
+    void admit(const NodeInfo& peer, TransportLane lane, std::function<void()> install) override {
+        {
+            Lock lock(mutex_);
+            if (held_.contains(peer.id)) {
+                held_installs_.emplace_back(peer.id, std::move(install));
+                return;
+            }
+        }
+        network_.admit(peer, lane, std::move(install));
+    }
+
+    // Calls to `peer` (every one, or only `message`, or only on `lane`) are
+    // held unanswered, with idle_for() advancing as for a dead link.
+    void stall(const NodeId& peer, std::optional<MessageType> message = {},
+               std::optional<TransportLane> lane = {}) {
+        Lock lock(mutex_);
+        stalled_[peer] = {message, lane};
+    }
+    // Ends the stall on `peer` and fails every held call with a transport
+    // error, as a timed-out link would.
+    void release(const NodeId& peer) {
+        std::vector<std::shared_ptr<std::promise<RpcReply>>> held;
+        {
+            Lock lock(mutex_);
+            stalled_.erase(peer);
+            held.swap(stalled_calls_);
+        }
+        for (auto& promise : held) {
+            try {
+                promise->set_exception(std::make_exception_ptr(
+                    std::runtime_error("RPC failed: FaultyLinks released the stalled peer")));
+            } catch (const std::future_error&) {
+            }
+        }
+    }
+    // Calls held since the last release().
+    size_t stalled_calls() const {
+        Lock lock(mutex_);
+        return stalled_calls_.size();
+    }
+
+    // Sessions `peer` opens authenticate and serve requests but are not
+    // installed as routes until release_sessions(), as if they had not
+    // reached this node yet.
+    void hold_sessions(const NodeId& peer) {
+        Lock lock(mutex_);
+        held_.insert(peer);
+    }
+    void release_sessions(const NodeId& peer) {
+        std::vector<std::function<void()>> installs;
+        {
+            Lock lock(mutex_);
+            held_.erase(peer);
+            for (auto it = held_installs_.begin(); it != held_installs_.end();) {
+                if (it->first == peer) {
+                    installs.push_back(std::move(it->second));
+                    it = held_installs_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& install : installs)
+            install();
+    }
+    // While `peer`'s sessions are held, a send to it first waits (bounded)
+    // for its route to be retired: a call that loses its dial before it is
+    // placed on it.
+    void retire_before_send(const NodeId& peer) {
+        Lock lock(mutex_);
+        retire_before_send_.insert(peer);
+    }
+    // Sends that have waited for retirement, and whether one saw it.
+    size_t retirement_waits() const {
+        Lock lock(mutex_);
+        return retirement_waits_;
+    }
+    bool sent_after_retirement() const {
+        Lock lock(mutex_);
+        return sent_after_retirement_;
+    }
+
+    size_t dials(const Endpoint& endpoint, TransportLane lane) const {
+        Lock lock(mutex_);
+        auto found = dialled_.find({endpoint_identity_key(endpoint), lane});
+        return found == dialled_.end() ? 0 : found->second.count;
+    }
+    // Shuts down every socket dialled to `endpoint` for `lane`, both
+    // directions, as a NAT mapping expiring under it would end it.
+    void sever(const Endpoint& endpoint, TransportLane lane) {
+        Lock lock(mutex_);
+        auto found = dialled_.find({endpoint_identity_key(endpoint), lane});
+        if (found == dialled_.end())
+            return;
+        for (int socket : found->second.sockets) {
+            ::shutdown(socket, SHUT_RDWR);
+            ::close(socket);
+        }
+        found->second.sockets.clear();
+    }
+};
+
 // Needs the libmacha-torrent plugin, built only when libtorrent is found.
 #ifdef MACHA_TEST_PLUGIN_DIR
 MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not_block_local_writes) {
@@ -5139,7 +5351,10 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
 
-    Service s1(c1, keys);
+    auto links = std::make_shared<FaultyLinks>();
+    ServiceInstruments instruments;
+    instruments.links = links;
+    Service s1(c1, keys, {}, {}, {}, instruments);
     Service s2(c2, keys);
     s1.start();
     s2.start();
@@ -5152,7 +5367,7 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
         retry_while_not_ready([&] { s1.filesystem().mkdir("/warm", 0755, getuid(), getgid()); }));
 
     const auto peer = s2.node().node_id();
-    s1.node().stall_peer_for_tests(peer, MessageType::has_metadata_history_entry);
+    links->stall(peer, MessageType::has_metadata_history_entry);
     std::atomic_bool repair_done{false};
     std::jthread repair([&] {
         try {
@@ -5163,7 +5378,7 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
         repair_done = true;
     });
     // Repair is now inside the fan-out, holding the probe to the silent peer.
-    REQUIRE(wait_until([&] { return s1.node().stalled_calls_for_tests() >= 1; }, 15s));
+    REQUIRE(wait_until([&] { return links->stalled_calls() >= 1; }, 15s));
     CHECK(!repair_done.load());
 
     const auto started = std::chrono::steady_clock::now();
@@ -5173,7 +5388,7 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     CHECK(elapsed < 3s);
     CHECK(!repair_done.load());
 
-    s1.node().release_peer_for_tests(peer);
+    links->release(peer);
     REQUIRE(wait_until([&] { return repair_done.load(); }, 60s));
     repair.join();
 
@@ -5201,7 +5416,10 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
 
-    Service s1(c1, keys);
+    auto links = std::make_shared<FaultyLinks>();
+    ServiceInstruments instruments;
+    instruments.links = links;
+    Service s1(c1, keys, {}, {}, {}, instruments);
     Service s2(c2, keys);
     s1.start();
     s2.start();
@@ -5223,13 +5441,13 @@ MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_pee
     // Node 2 now answers nothing, so a listing that surveyed it would block.
     // Stalled-call counts are no evidence: background work calls node 2 constantly.
     const auto peer = s2.node().node_id();
-    s1.node().stall_peer_for_tests(peer);
+    links->stall(peer);
     const auto started = std::chrono::steady_clock::now();
     (void)s1.torrent_coordinator().requests();
     (void)s1.torrent_coordinator().request("does-not-exist");
     const auto elapsed = std::chrono::steady_clock::now() - started;
     CHECK(elapsed < 1s);
-    s1.node().release_peer_for_tests(peer);
+    links->release(peer);
 
     s2.stop();
     s1.stop();
@@ -5252,7 +5470,10 @@ MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_p
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     c1.write_stall = c2.write_stall = 200ms;
 
-    Service s1(c1, keys);
+    auto links = std::make_shared<FaultyLinks>();
+    ServiceInstruments instruments;
+    instruments.links = links;
+    Service s1(c1, keys, {}, {}, {}, instruments);
     Service s2(c2, keys);
     s1.start();
     s2.start();
@@ -5277,7 +5498,7 @@ MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_p
             DataWorkContext(FrameType::loader, c1.extent_size, {}, nullptr, &progress, 500ms));
     };
 
-    s1.node().stall_peer_for_tests(peer, MessageType::put_object_deferred);
+    links->stall(peer, MessageType::put_object_deferred);
     std::string error;
     const auto started = std::chrono::steady_clock::now();
     {
@@ -5289,7 +5510,7 @@ MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_p
             error = e.what();
         }
         // The destructor relaunches a failed put; let the peer answer it.
-        s1.node().release_peer_for_tests(peer);
+        links->release(peer);
     }
     const auto elapsed = std::chrono::steady_clock::now() - started;
     CHECK(!error.empty());
@@ -5918,8 +6139,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_
 
 MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_liveness_budget) {
     // A hung health ping is retried within the liveness budget, not held for
-    // all of dead_after. The stall fixture holds every ping unanswered and
-    // stalled_calls_for_tests() counts the attempts.
+    // all of dead_after. FaultyLinks holds every CONTROL-lane ping unanswered
+    // and counts the attempts.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -5931,7 +6152,10 @@ MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_livenes
     // A 3 s liveness budget gives 1 s attempts: three per window.
     c1.dead_after = c2.dead_after = 3s;
 
-    Service s1(c1, keys);
+    auto links = std::make_shared<FaultyLinks>();
+    ServiceInstruments instruments;
+    instruments.links = links;
+    Service s1(c1, keys, {}, {}, {}, instruments);
     Service s2(c2, keys);
     s1.start();
     s2.start();
@@ -5941,12 +6165,11 @@ MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_livenes
     }));
 
     const auto peer = s2.node().node_id();
-    s1.node().stall_peer_for_tests(peer, MessageType::ping);
+    links->stall(peer, MessageType::ping, TransportLane::control);
     const auto started = std::chrono::steady_clock::now();
-    const bool retried =
-        wait_until([&] { return s1.node().stalled_calls_for_tests() >= 3; }, 3s);
+    const bool retried = wait_until([&] { return links->stalled_calls() >= 3; }, 3s);
     const auto elapsed = std::chrono::steady_clock::now() - started;
-    s1.node().release_peer_for_tests(peer);
+    links->release(peer);
 
     CHECK(retried);
     CHECK(elapsed < c1.dead_after);
@@ -5963,10 +6186,11 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
         RpcClient client;
         RpcServer server;
 
-        FlagNode(ClusterKeys keys, NodeInfo node, std::chrono::milliseconds connect_timeout)
+        FlagNode(RpcLinks& links, ClusterKeys keys, NodeInfo node,
+                 std::chrono::milliseconds connect_timeout)
             : info(std::move(node)),
               client(
-                  keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+                  links, keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {},
                   connect_timeout, 100ms, 30s),
               server(
                   "127.0.0.1", info.port, keys, info,
@@ -6012,11 +6236,14 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
         return node;
     };
 
+    NetworkLinks network;
+    FaultyLinks site_links;
+
     // A peer that knows the node cannot be dialled does not try, and says
     // so at once rather than after a connect timeout.
     {
-        FlagNode hub(keys, capable_info(), 2s);
-        FlagNode site(keys, incapable_info(), 300ms);
+        FlagNode hub(network, keys, capable_info(), 2s);
+        FlagNode site(network, keys, incapable_info(), 300ms);
         hub.client.note_peer(site.info);
         const auto started = Clock::now();
         bool refused = false;
@@ -6031,8 +6258,8 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
         CHECK(hub.client.stats().connections_created == 0);
     }
 
-    FlagNode hub(keys, capable_info(), 2s);
-    FlagNode site(keys, incapable_info(), 300ms);
+    FlagNode hub(network, keys, capable_info(), 2s);
+    FlagNode site(site_links, keys, incapable_info(), 300ms);
 
     // Control flows both ways over the one session the site opened.
     CHECK(site.client.call(hub.info, MessageType::members, Bytes{1}, 1s).message.payload ==
@@ -6056,9 +6283,15 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
     // A DATA lane that dies underneath (a NAT mapping expiring) is redialled
     // by the site on its own initiative, without being asked.
     site.client.set_maintained_peers([&] { return std::vector<NodeInfo>{hub.info}; });
-    site.client.close_lane_for_tests(hub.info.id, TransportLane::data);
-    REQUIRE(wait_until([&] { return site.client.has_route(hub.info.id, TransportLane::data); },
-                       5s));
+    const Endpoint hub_endpoint{hub.info.host, hub.info.port};
+    const auto data_dials = site_links.dials(hub_endpoint, TransportLane::data);
+    site_links.sever(hub_endpoint, TransportLane::data);
+    REQUIRE(wait_until(
+        [&] {
+            return site_links.dials(hub_endpoint, TransportLane::data) > data_dials &&
+                   site.client.has_route(hub.info.id, TransportLane::data);
+        },
+        5s));
     CHECK(hub.client.dial_requests_sent() == 1);
     CHECK(hub.client.stats().connections_created == 0);
     CHECK(hub.client.call(site.info, MessageType::get_object, Bytes{4}, FrameType::foreground, 5s)
@@ -6083,11 +6316,11 @@ MACHA_TEST("rpc_cluster", test_a_call_whose_dial_is_retired_by_a_simultaneous_co
         NodeInfo info;
         RpcClient client;
         RpcServer server;
-        Node(ClusterKeys keys, NodeInfo node)
+        Node(RpcLinks& links, ClusterKeys keys, NodeInfo node)
             : info(std::move(node)),
               client(
-                  keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {}, 2s,
-                  100ms, 30s),
+                  links, keys, [this] { return info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+                  2s, 100ms, 30s),
               server(
                   "127.0.0.1", info.port, keys, info,
                   [](const NodeInfo&, FrameType, const RpcMessage& request) {
@@ -6115,27 +6348,34 @@ MACHA_TEST("rpc_cluster", test_a_call_whose_dial_is_retired_by_a_simultaneous_co
     auto a = info();
     auto b = info();
     if (b.id < a.id) std::swap(a, b);
-    Node low(keys, a);
-    Node high(keys, b);
+    NetworkLinks network;
+    FaultyLinks high_links;
+    Node low(network, keys, a);
+    Node high(high_links, keys, b);
 
-    // The low node's session reaches the high node but is not yet registered.
-    high.client.hold_inbound_for_tests(low.info.id);
+    // The low node's session reaches the high node but is not yet installed.
+    high_links.hold_sessions(low.info.id);
     REQUIRE(low.client.call(high.info, MessageType::members, Bytes{1}, 2s).message.payload ==
             Bytes{1});
     REQUIRE(!high.client.has_route(low.info.id, TransportLane::control));
 
-    // The low node retires the high node's dial; the call waits for that.
-    std::atomic_bool retired{false};
-    high.client.set_after_dial_for_tests([&] {
-        retired.store(wait_until(
-            [&] { return !high.client.has_route(low.info.id, TransportLane::control); }, 5s));
-    });
+    // The low node retires the high node's dial before the call is placed on
+    // it; the call waits for that. A dial retired before it was even
+    // installed reaches no send, and leaves no route.
+    high_links.retire_before_send(low.info.id);
     auto call = std::async(std::launch::async, [&] {
         return high.client.call(low.info, MessageType::members, Bytes{2}, 5s);
     });
-    REQUIRE(wait_until([&] { return retired.load(); }, 5s));
-    // The low node's session now registers, as it would a moment later.
-    high.client.release_inbound_for_tests(low.info.id);
+    REQUIRE(wait_until(
+        [&] {
+            return high_links.sent_after_retirement() ||
+                   (high_links.retirement_waits() == 0 &&
+                    high.client.stats().connections_created == 1 &&
+                    !high.client.has_route(low.info.id, TransportLane::control));
+        },
+        5s));
+    // The low node's session now installs, as it would a moment later.
+    high_links.release_sessions(low.info.id);
     CHECK(call.get().message.payload == Bytes{2});
 }
 

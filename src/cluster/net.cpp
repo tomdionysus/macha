@@ -1133,7 +1133,8 @@ std::chrono::milliseconds AsyncRpc::idle_for() const {
     return idle_();
 }
 
-class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient::PeerConnection> {
+class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient::PeerConnection>,
+                                   public RpcRoute {
     struct Pending {
         std::promise<RpcReply> promise;
         Clock::time_point started{Clock::now()};
@@ -1688,7 +1689,7 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
             reader_.join();
     }
 
-    bool usable() const {
+    bool usable() const override {
         return !broken_.load() && !retiring_.load();
     }
     bool finished() const {
@@ -1708,7 +1709,8 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
         return channel_.session_id();
     }
 
-    AsyncRpc call(MessageType type, std::span<const uint8_t> payload, FrameType frame_type) {
+    AsyncRpc call(MessageType type, std::span<const uint8_t> payload,
+                  FrameType frame_type) override {
         validate_frame_semantics(type, frame_type);
 
         uint64_t id = 0;
@@ -1877,14 +1879,54 @@ class RpcClient::PeerConnection : public std::enable_shared_from_this<RpcClient:
     }
 };
 
-RpcClient::RpcClient(ClusterKeys keys, std::function<NodeInfo()> local,
+namespace {
+
+// A session the peer opened, as RpcServer registered it.
+class AcceptedRoute final : public RpcRoute {
+    std::function<bool()> usable_;
+    std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> call_;
+
+  public:
+    AcceptedRoute(std::function<bool()> usable,
+                  std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> call)
+        : usable_(std::move(usable)), call_(std::move(call)) {}
+    bool usable() const override {
+        return usable_ && usable_();
+    }
+    AsyncRpc call(MessageType type, std::span<const uint8_t> payload,
+                  FrameType frame_type) override {
+        return call_(type, payload, frame_type);
+    }
+};
+
+} // namespace
+
+int NetworkLinks::connect(const Endpoint& endpoint, TransportLane,
+                          std::chrono::milliseconds timeout) {
+    return connect_socket(endpoint, timeout);
+}
+
+std::optional<AsyncRpc> NetworkLinks::send(const NodeId&, TransportLane, MessageType type,
+                                           std::span<const uint8_t> payload, FrameType frame_type,
+                                           RpcRoute& route) {
+    if (!route.usable())
+        return std::nullopt;
+    return route.call(type, payload, frame_type);
+}
+
+void NetworkLinks::admit(const NodeInfo&, TransportLane, std::function<void()> install) {
+    install();
+}
+
+RpcClient::RpcClient(RpcLinks& links, ClusterKeys keys, std::function<NodeInfo()> local,
                      std::function<void(const NodeInfo&)> peer_observer,
                      std::function<void(uint64_t)> metadata_observer,
                      std::chrono::milliseconds connect_timeout, std::chrono::milliseconds heartbeat,
                      std::chrono::milliseconds dead_after, size_t max_frame_size,
                      RetainedMemoryLedger* retained_memory)
-    : keys_(keys), local_(std::move(local)), peer_observer_(std::move(peer_observer)),
-      metadata_observer_(std::move(metadata_observer)), connect_timeout_(connect_timeout),
+    : links_(links), keys_(keys), local_(std::move(local)),
+      peer_observer_(std::move(peer_observer)), metadata_observer_(std::move(metadata_observer)),
+      connect_timeout_(connect_timeout),
       heartbeat_(heartbeat), dead_after_(dead_after), max_frame_size_(max_frame_size),
       retained_memory_(retained_memory) {
     validate_frame_limit(max_frame_size_);
@@ -2052,6 +2094,13 @@ void RpcClient::reconcile_locked(const NodeId& peer, TransportLane lane,
 }
 
 void RpcClient::register_inbound(InboundRoute route) {
+    const auto peer = route.peer;
+    const auto lane = route.lane;
+    links_.admit(peer, lane,
+                 [this, route = std::move(route)]() mutable { install_inbound(std::move(route)); });
+}
+
+void RpcClient::install_inbound(InboundRoute route) {
     reap_retired();
     const auto peer = route.peer.id;
     const auto lane = route.lane;
@@ -2059,10 +2108,6 @@ void RpcClient::register_inbound(InboundRoute route) {
     std::vector<std::function<void()>> retire;
     {
         Lock lock(mutex_);
-        if (held_inbound_peers_for_tests_.contains(peer)) {
-            held_inbound_routes_for_tests_.push_back(std::move(route));
-            return;
-        }
         note_peer_locked(route.peer);
         if (!route.peer.host.empty() && route.peer.port) {
             Endpoint advertised{route.peer.host, route.peer.port};
@@ -2169,7 +2214,7 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
     };
 
     try {
-        int fd = connect_socket(endpoint, connect_timeout_);
+        int fd = links_.connect(endpoint, lane, connect_timeout_);
         auto fresh = std::make_shared<PeerConnection>(
             fd, keys_, local_(), max_frame_size_, lane, peer_observer_, metadata_observer_,
             [this](const NodeInfo& peer, RpcFrame frame, InboundReply reply) {
@@ -2252,13 +2297,6 @@ std::shared_ptr<RpcClient::PeerConnection> RpcClient::connection(const Endpoint&
                       " lane=" + std::string(transport_lane_name(lane)) +
                       " endpoint=" + endpoint_key(endpoint));
         }
-        std::function<void()> after_dial;
-        {
-            Lock lock(mutex_);
-            after_dial = after_dial_for_tests_;
-        }
-        if (after_dial)
-            after_dial();
         finish_flight();
         return winner;
     } catch (...) {
@@ -2274,14 +2312,6 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
     validate_frame_semantics(type, frame_type);
     const auto lane = lane_for(type, frame_type);
 
-    if (expected) {
-        Lock lock(mutex_);
-        auto stalled = stalled_peers_for_tests_.find(*expected);
-        if (stalled != stalled_peers_for_tests_.end() &&
-            (!stalled->second || *stalled->second == type))
-            return stalled_call_for_tests_locked();
-    }
-
     std::string route_error;
     if (expected)
         if (auto existing =
@@ -2292,9 +2322,11 @@ AsyncRpc RpcClient::call_async_known(const Endpoint& endpoint, const NodeId* exp
     auto outbound = connection(endpoint, expected, &actual, lane);
     // Keep why the canonical route refused the call (e.g. the shared
     // pending-reply budget), so it is not reported as a dead link.
-    if (outbound && outbound->usable()) {
+    if (outbound) {
         try {
-            return outbound->call(type, payload, frame_type);
+            if (auto sent =
+                    links_.send(outbound->peer().id, lane, type, payload, frame_type, *outbound))
+                return std::move(*sent);
         } catch (const std::exception& error) {
             route_error = error.what();
         }
@@ -2317,7 +2349,7 @@ std::optional<AsyncRpc> RpcClient::call_existing(const NodeId& peer, TransportLa
                                                  std::span<const uint8_t> payload,
                                                  FrameType frame_type, std::string* why) {
     std::shared_ptr<PeerConnection> outbound;
-    std::function<AsyncRpc(MessageType, std::span<const uint8_t>, FrameType)> inbound;
+    std::optional<AcceptedRoute> inbound;
     {
         Lock lock(mutex_);
         const auto k = route_key(peer, lane);
@@ -2327,27 +2359,28 @@ std::optional<AsyncRpc> RpcClient::call_existing(const NodeId& peer, TransportLa
         if (!outbound) {
             auto in = inbound_routes_.find(k);
             if (in != inbound_routes_.end() && in->second.usable && in->second.usable())
-                inbound = in->second.call;
+                inbound.emplace(in->second.usable, in->second.call);
         }
     }
-    if (outbound) {
+    auto send = [&](RpcRoute& route) -> std::optional<AsyncRpc> {
         ++connections_reused_;
         try {
-            return outbound->call(type, payload, frame_type);
+            if (auto sent = links_.send(peer, lane, type, payload, frame_type, route))
+                return sent;
+            if (why)
+                *why = "route closed before the call was placed";
         } catch (const std::exception& error) {
             if (why)
                 *why = error.what();
         }
-    }
-    if (inbound) {
-        ++connections_reused_;
-        try {
-            return inbound(type, payload, frame_type);
-        } catch (const std::exception& error) {
-            if (why)
-                *why = error.what();
-        }
-    }
+        return std::nullopt;
+    };
+    if (outbound)
+        if (auto sent = send(*outbound))
+            return sent;
+    if (inbound)
+        if (auto sent = send(*inbound))
+            return sent;
     return std::nullopt;
 }
 
@@ -2385,53 +2418,6 @@ AsyncRpc RpcClient::call_async(const NodeInfo& node, MessageType type,
                                      " was reset; re-resolve the node before retrying");
     }
     return call_async_known(endpoint, &node.id, type, payload, frame_type);
-}
-
-AsyncRpc RpcClient::stalled_call_for_tests_locked() {
-    auto promise = std::make_shared<std::promise<RpcReply>>();
-    auto future = promise->get_future();
-    stalled_calls_for_tests_.push_back(promise);
-    const auto started = Clock::now();
-    std::weak_ptr<std::promise<RpcReply>> weak = promise;
-    auto fail = [weak] {
-        if (auto held = weak.lock()) {
-            try {
-                held->set_exception(std::make_exception_ptr(
-                    std::runtime_error("RPC cancelled: peer is stalled by a test fixture")));
-            } catch (const std::future_error&) {
-                // Already released or cancelled: settled.
-            }
-        }
-    };
-    return AsyncRpc(std::move(future), fail, fail, {}, [started] {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
-    });
-}
-
-void RpcClient::stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message) {
-    Lock lock(mutex_);
-    stalled_peers_for_tests_[peer] = message;
-}
-
-void RpcClient::release_peer_for_tests(const NodeId& peer) {
-    std::vector<std::shared_ptr<std::promise<RpcReply>>> held;
-    {
-        Lock lock(mutex_);
-        stalled_peers_for_tests_.erase(peer);
-        held.swap(stalled_calls_for_tests_);
-    }
-    for (auto& promise : held) {
-        try {
-            promise->set_exception(std::make_exception_ptr(
-                std::runtime_error("RPC failed: stalled peer fixture released")));
-        } catch (const std::future_error&) {
-        }
-    }
-}
-
-size_t RpcClient::stalled_calls_for_tests() const {
-    Lock lock(mutex_);
-    return stalled_calls_for_tests_.size();
 }
 
 RpcReply RpcClient::call(const Endpoint& endpoint, MessageType type,
@@ -2717,7 +2703,7 @@ void RpcClient::open_requested_lanes(std::stop_token stop) {
 
 std::string RpcClient::probe_dial(const Endpoint& endpoint, const NodeId& expected) {
     try {
-        int fd = connect_socket(endpoint, connect_timeout_);
+        int fd = links_.connect(endpoint, TransportLane::probe, connect_timeout_);
         SecureChannel channel(fd, keys_, local_(), max_frame_size_);
         channel.set_io_timeout(rpc_handshake_timeout);
         const auto peer = channel.client_handshake(TransportLane::probe);
@@ -2737,56 +2723,6 @@ bool RpcClient::await_route(const NodeId& peer, TransportLane lane) {
                                    [&]() MACHA_REQUIRES(mutex_) {
                                        return route_usable_locked(peer, lane);
                                    });
-}
-
-void RpcClient::hold_inbound_for_tests(const NodeId& peer) {
-    Lock lock(mutex_);
-    held_inbound_peers_for_tests_.insert(peer);
-}
-
-void RpcClient::release_inbound_for_tests(const NodeId& peer) {
-    std::vector<InboundRoute> held;
-    {
-        Lock lock(mutex_);
-        held_inbound_peers_for_tests_.erase(peer);
-        for (auto it = held_inbound_routes_for_tests_.begin();
-             it != held_inbound_routes_for_tests_.end();) {
-            if (it->peer.id == peer) {
-                held.push_back(std::move(*it));
-                it = held_inbound_routes_for_tests_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (auto& route : held)
-        register_inbound(std::move(route));
-}
-
-void RpcClient::set_after_dial_for_tests(std::function<void()> hook) {
-    Lock lock(mutex_);
-    after_dial_for_tests_ = std::move(hook);
-}
-
-void RpcClient::close_lane_for_tests(const NodeId& peer, TransportLane lane) {
-    std::shared_ptr<PeerConnection> outbound;
-    std::function<void()> inbound;
-    {
-        Lock lock(mutex_);
-        const auto k = route_key(peer, lane);
-        if (auto out = connections_.find(k); out != connections_.end()) {
-            outbound = std::move(out->second);
-            connections_.erase(out);
-        }
-        if (auto in = inbound_routes_.find(k); in != inbound_routes_.end()) {
-            inbound = in->second.close;
-            inbound_routes_.erase(in);
-        }
-    }
-    if (inbound)
-        inbound();
-    if (outbound)
-        outbound->close();
 }
 
 void RpcClient::health_loop(std::stop_token stop) {

@@ -102,7 +102,6 @@ class NodeRuntime {
     // Guards no state: the connectivity worker's wait lock.
     Mutex connectivity_wait_mutex_;
     std::condition_variable_any connectivity_wait_cv_;
-    std::atomic_uint64_t connectivity_wake_{};
     // One dial-back probe in flight per requesting peer, and one per 10 s: a
     // peer cannot use the probe to make this node hammer an address.
     Mutex dial_back_mutex_;
@@ -161,7 +160,8 @@ class NodeRuntime {
   public:
     // The caller holds state_path's StorageLock for this node's life.
     NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, RetainedMemoryLedger&,
-                TranscodeRateBook&, MessageRoutes&, NodeEvents&, StartupStageHook startup_stage_hook = {});
+                TranscodeRateBook&, MessageRoutes&, NodeEvents&, RpcLinks&,
+                StartupStageHook startup_stage_hook = {});
     ~NodeRuntime();
     void start();
     void request_stop();
@@ -221,12 +221,6 @@ class NodeRuntime {
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
-    // Test-only pass-throughs to RpcClient's silent-peer fixture.
-    void stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message = {}) {
-        client_.stall_peer_for_tests(peer, message);
-    }
-    void release_peer_for_tests(const NodeId& peer) { client_.release_peer_for_tests(peer); }
-    size_t stalled_calls_for_tests() const { return client_.stalled_calls_for_tests(); }
     // Tells peers this node's accepted metadata changed: advances the
     // announcement epoch, advertises the generation and broadcasts a notice.
     void announce_metadata_generation(uint64_t);
@@ -259,11 +253,6 @@ class NodeRuntime {
     }
     bool hosts_extents() const {
         return inbound_resolution().hosts_extents;
-    }
-    // Test-only: run a dial-back probe round now.
-    void probe_inbound_now_for_tests() {
-        connectivity_wake_.fetch_add(1, std::memory_order_acq_rel);
-        connectivity_wait_cv_.notify_all();
     }
     RpcStats rpc_stats() const {
         return client_.stats();

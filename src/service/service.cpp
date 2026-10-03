@@ -29,12 +29,14 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
                  StartupStallHandler startup_stall_handler, ServiceInstruments instruments)
     : clock_(instruments.clock ? std::move(instruments.clock)
                                : std::make_shared<SystemMaintenanceClock>()),
+      links_(instruments.links ? std::move(instruments.links)
+                               : std::make_shared<NetworkLinks>()),
       maintenance_trace_(std::move(instruments.trace)),
       lifecycle_(std::move(instruments.lifecycle)),
       resources_(config, [clock = clock_] { return clock->now(); }),
       identity_(config.state_path, keys), recovery_stage_hook_(startup_stage_hook),
       node_(std::move(config), identity_, progress_, resources_.memory,
-            resources_.transcode_rates, routes_, resources_.events,
+            resources_.transcode_rates, routes_, resources_.events, *links_,
             std::move(startup_stage_hook)),
       accounts_(node_.config(), identity_, node_, resources_.events, routes_),
       cluster_status_(node_, accounts_, resources_.activity, resources_.data, resources_.memory),

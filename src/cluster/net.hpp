@@ -3,6 +3,7 @@
 
 #include "cluster/frame_type.hpp"
 #include "contract/thread_safety.hpp"
+#include "contract/work.hpp"
 #include "crypto.hpp"
 #include "types.hpp"
 
@@ -350,6 +351,56 @@ class AsyncRpc {
     std::chrono::milliseconds idle_for() const;
 };
 
+// An established, authenticated lane to one peer, as a call is placed on it:
+// a session this node dialled or one the peer opened.
+class RpcRoute {
+  public:
+    virtual ~RpcRoute() = default;
+    virtual bool usable() const = 0;
+    // Queues the call; throws when the route refuses it (closed, retiring, or
+    // a queue or pending-reply limit reached).
+    virtual AsyncRpc call(MessageType, std::span<const uint8_t>, FrameType) = 0;
+};
+
+// Where RpcClient meets its peers: the socket a lane is dialled on, the route
+// a call is placed on, and a session a peer opened becoming a route. RpcClient
+// owns the routing between them. NetworkLinks is the production implementation.
+class RpcLinks {
+  public:
+    virtual ~RpcLinks() = default;
+
+    // A connected TCP socket to `endpoint` for `lane`, owned by the caller.
+    // Throws when no connection is made within `timeout`.
+    static constexpr Waits connect_waits = Waits::network;
+    static constexpr ThreadSafety connect_safety = ThreadSafety::thread_safe;
+    virtual int connect(const Endpoint&, TransportLane, std::chrono::milliseconds timeout) = 0;
+
+    // Places one call to `peer` on `route`, which carries `lane`. Empty when
+    // the route no longer takes calls; throws when it refuses this one.
+    // Queues only: never waits for the peer.
+    static constexpr Waits send_waits = Waits::none;
+    static constexpr ThreadSafety send_safety = ThreadSafety::thread_safe;
+    virtual std::optional<AsyncRpc> send(const NodeId& peer, TransportLane lane, MessageType,
+                                         std::span<const uint8_t>, FrameType,
+                                         RpcRoute& route) = 0;
+
+    // A session `peer` opened on `lane` has authenticated; `install` makes it
+    // a route, under the transport's route lock.
+    static constexpr Waits admit_waits = Waits::locks;
+    static constexpr ThreadSafety admit_safety = ThreadSafety::thread_safe;
+    virtual void admit(const NodeInfo& peer, TransportLane lane, std::function<void()> install) = 0;
+};
+
+// Dials over TCP, places each call on the route it is given, and installs
+// every session as soon as it authenticates. Stateless.
+class NetworkLinks final : public RpcLinks {
+  public:
+    int connect(const Endpoint&, TransportLane, std::chrono::milliseconds timeout) override;
+    std::optional<AsyncRpc> send(const NodeId& peer, TransportLane lane, MessageType,
+                                 std::span<const uint8_t>, FrameType, RpcRoute& route) override;
+    void admit(const NodeInfo& peer, TransportLane lane, std::function<void()> install) override;
+};
+
 class RpcClient {
     class PeerConnection;
     friend class RpcServer;
@@ -381,6 +432,8 @@ class RpcClient {
         std::optional<double> control_latency_ms;
     };
 
+    // Fixed at construction.
+    RpcLinks& links_;
     ClusterKeys keys_;
     std::function<NodeInfo()> local_;
     std::function<void(const NodeInfo&)> peer_observer_;
@@ -402,18 +455,6 @@ class RpcClient {
     std::vector<std::shared_ptr<PeerConnection>> retired_connections_ MACHA_GUARDED_BY(mutex_);
     std::map<std::string, InboundRoute> inbound_routes_ MACHA_GUARDED_BY(mutex_);
     std::map<std::string, NodeId> endpoint_peers_ MACHA_GUARDED_BY(mutex_);
-    // Test fixture for an unresponsive peer: calls to a listed peer (all
-    // messages, or one type) return an AsyncRpc that never resolves until
-    // released, with idle_for() advancing as for a dead link.
-    std::map<NodeId, std::optional<MessageType>> stalled_peers_for_tests_ MACHA_GUARDED_BY(mutex_);
-    std::vector<std::shared_ptr<std::promise<RpcReply>>> stalled_calls_for_tests_
-        MACHA_GUARDED_BY(mutex_);
-    AsyncRpc stalled_call_for_tests_locked() MACHA_REQUIRES(mutex_);
-    // Test-only: inbound routes from these peers are parked, not registered,
-    // until release_inbound_for_tests(); and a hook run after every dial.
-    std::set<NodeId> held_inbound_peers_for_tests_ MACHA_GUARDED_BY(mutex_);
-    std::vector<InboundRoute> held_inbound_routes_for_tests_ MACHA_GUARDED_BY(mutex_);
-    std::function<void()> after_dial_for_tests_ MACHA_GUARDED_BY(mutex_);
     // Waits, up to the connect timeout, for any usable route to `peer`.
     bool await_route(const NodeId& peer, TransportLane lane);
     std::map<std::string, PeerHealth> health_ MACHA_GUARDED_BY(mutex_);
@@ -478,7 +519,9 @@ class RpcClient {
     void dispatch_inbound(const NodeInfo&, RpcFrame, InboundReply);
     void dispatch_inbound_promotion(const NodeInfo&, uint64_t, FrameType);
     void dispatch_inbound_cancel(const NodeInfo&, uint64_t);
+    // Hands an accepted session to links_.admit(), which installs it.
     void register_inbound(InboundRoute);
+    void install_inbound(InboundRoute);
     void unregister_inbound(const NodeId&, TransportLane,
                             const std::array<uint8_t, 32>& session_id);
     void reconcile_locked(const NodeId&, TransportLane, std::vector<std::function<void()>>& retire)
@@ -490,19 +533,15 @@ class RpcClient {
     void reap_retired();
 
   public:
-    RpcClient(ClusterKeys, std::function<NodeInfo()>, std::function<void(const NodeInfo&)>,
-              std::function<void(uint64_t)>, std::chrono::milliseconds connect_timeout,
+    // `links` outlives the client.
+    RpcClient(RpcLinks& links, ClusterKeys, std::function<NodeInfo()>,
+              std::function<void(const NodeInfo&)>, std::function<void(uint64_t)>,
+              std::chrono::milliseconds connect_timeout,
               std::chrono::milliseconds heartbeat = std::chrono::seconds(5),
               std::chrono::milliseconds dead_after = std::chrono::seconds(30),
               size_t max_frame_size = 256 * 1024,
               RetainedMemoryLedger* retained_memory = nullptr);
     ~RpcClient();
-    // Test-only. Hold every outbound call to `peer` (or only `message`)
-    // unresolved until release_peer_for_tests(); releasing fails the held
-    // calls with a transport error, as a timed-out link would. Idempotent.
-    void stall_peer_for_tests(const NodeId& peer, std::optional<MessageType> message = {});
-    void release_peer_for_tests(const NodeId& peer);
-    size_t stalled_calls_for_tests() const;
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
@@ -542,15 +581,6 @@ class RpcClient {
     // must authenticate as `expected`, then closed; never a route. The
     // evidence for `inbound_capable: auto`. Returns the error text, empty on success.
     std::string probe_dial(const Endpoint& endpoint, const NodeId& expected);
-    // Tear down one lane to a peer (both directions) without touching the
-    // other. Tests use it to stand in for a NAT mapping silently expiring.
-    void close_lane_for_tests(const NodeId& peer, TransportLane lane);
-    // Test-only. Park inbound routes from `peer` instead of registering them,
-    // as if its sessions had not reached this node yet; release registers
-    // them. The hook runs after each dial installs, before the call uses it.
-    void hold_inbound_for_tests(const NodeId& peer);
-    void release_inbound_for_tests(const NodeId& peer);
-    void set_after_dial_for_tests(std::function<void()> hook);
     uint64_t dial_requests_sent() const {
         return dial_requests_sent_.load(std::memory_order_relaxed);
     }
