@@ -57,7 +57,7 @@ FuseSubsystem::~FuseSubsystem() {
 }
 
 void FuseSubsystem::attach_fault_sink(FaultSink sink) {
-    std::lock_guard lock(fault_mutex_);
+    Lock lock(fault_mutex_);
     fault_sink_ = std::move(sink);
 }
 
@@ -98,7 +98,7 @@ void FuseSubsystem::run_mount(std::stop_token stop) {
 void FuseSubsystem::report_fault(std::string reason) {
     FaultSink sink;
     {
-        std::lock_guard lock(fault_mutex_);
+        Lock lock(fault_mutex_);
         sink = fault_sink_;
     }
     Log::error("FUSE mount fault at " + mount_path_.string() + ": " + reason);

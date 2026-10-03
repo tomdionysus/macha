@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "cluster/activity_clocks.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/message_routes.hpp"
@@ -64,7 +66,8 @@ class StorageServer {
     const uint64_t cache_max_blocks_;
     const std::chrono::milliseconds refresh_interval_;
     std::vector<MessageType> bound_;
-    std::mutex refresh_mutex_;
+    // Guards nothing; the refresher waits on it.
+    Mutex refresh_mutex_;
     std::condition_variable_any refresh_cv_;
     std::jthread refresher_;
 };

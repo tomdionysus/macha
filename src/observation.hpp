@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "types.hpp"
 
 #include <array>
@@ -129,10 +131,12 @@ class Observations {
   private:
     const size_t max_series_;
     const size_t max_events_;
-    mutable std::mutex mutex_;
-    std::map<std::string, std::unique_ptr<LatencyHistogram>, std::less<>> histograms_;
-    std::map<std::string, std::unique_ptr<std::atomic<uint64_t>>, std::less<>> counters_;
-    std::deque<ObservationEvent> events_;
+    mutable Mutex mutex_;
+    std::map<std::string, std::unique_ptr<LatencyHistogram>, std::less<>> histograms_
+        MACHA_GUARDED_BY(mutex_);
+    std::map<std::string, std::unique_ptr<std::atomic<uint64_t>>, std::less<>> counters_
+        MACHA_GUARDED_BY(mutex_);
+    std::deque<ObservationEvent> events_ MACHA_GUARDED_BY(mutex_);
     LatencyHistogram overflow_histogram_;
     // Where increments to a counter past the bound go; never reported.
     std::atomic<uint64_t> overflow_counter_{};
@@ -185,8 +189,9 @@ std::string render_observation_event(const ObservationEvent&);
 class ObservationLog {
     std::filesystem::path path_;
     uint64_t max_bytes_;
-    std::mutex mutex_;
-    bool failing_{};
+    // Held across the append and the rotation.
+    IoMutex mutex_;
+    bool failing_ MACHA_GUARDED_BY(mutex_){};
 
   public:
     ObservationLog(std::filesystem::path path, uint64_t max_bytes);
@@ -223,10 +228,12 @@ class ObservationRecorder {
     std::string version_;
     std::chrono::milliseconds interval_;
     GaugeSampler sampler_;
-    ObservationSnapshot previous_;
-    uint64_t previous_unix_ms_{};
-    std::mutex tick_mutex_;
-    std::mutex wait_mutex_;
+    // Held across a window's write to the log.
+    IoMutex tick_mutex_;
+    ObservationSnapshot previous_ MACHA_GUARDED_BY(tick_mutex_);
+    uint64_t previous_unix_ms_ MACHA_GUARDED_BY(tick_mutex_){};
+    // Guards nothing; orders stop() against the thread's wait.
+    Mutex wait_mutex_;
     std::condition_variable_any wait_cv_;
     std::jthread thread_;
 };

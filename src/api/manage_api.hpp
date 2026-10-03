@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "catalogue/catalogue.hpp"
 #include "catalogue/catalogue_hints.hpp"
 #include "filesystem/filesystem.hpp"
@@ -25,10 +27,13 @@ class ManageApi {
     CatalogueManager& catalogue_;
     CatalogueHintQueue& hints_;
     CatalogueScanner& scanner_;
-    std::mutex mutation_mutex_;
-    std::mutex identity_audit_mutex_;
+    // Guards nothing; serialises management writes, held across their
+    // metadata commits.
+    IoMutex mutation_mutex_;
+    Mutex identity_audit_mutex_;
     std::condition_variable_any identity_audit_cv_;
-    std::map<std::string, IdentityAssociationReset, std::less<>> identity_audit_pending_;
+    std::map<std::string, IdentityAssociationReset, std::less<>> identity_audit_pending_
+        MACHA_GUARDED_BY(identity_audit_mutex_);
     std::jthread identity_audit_worker_;
 
     void queue_identity_reset_audit(IdentityAssociationReset);

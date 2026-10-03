@@ -19,8 +19,8 @@ std::atomic<WaitGuard::Mode> guard_mode{WaitGuard::Mode::record};
 std::atomic<uint64_t> guard_violations{};
 
 // Operations already reported: a hot path reached from control logs once.
-std::mutex reported_mutex;
-std::set<std::string, std::less<>> reported;
+Mutex reported_mutex;
+std::set<std::string, std::less<>> reported MACHA_GUARDED_BY(reported_mutex);
 
 } // namespace
 
@@ -47,7 +47,7 @@ bool WaitGuard::enter(const WorkContext& context, Waits declared, std::string_vi
         throw std::logic_error(message);
     bool first = false;
     {
-        std::lock_guard lock(reported_mutex);
+        Lock lock(reported_mutex);
         first = reported.emplace(std::string(context.origin()) + " -> " + std::string(operation))
                     .second;
     }

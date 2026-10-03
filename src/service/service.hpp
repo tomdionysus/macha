@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "contract/thread_safety.hpp"
 #include "metadata/metadata_server.hpp"
 #include "api/acquisition_api.hpp"
 #include "catalogue/catalogue.hpp"
@@ -105,9 +107,9 @@ class Service {
     std::atomic_bool services_ready_{};
     std::atomic_bool stopped_{};
     std::atomic_bool startup_failed_{};
-    mutable std::mutex startup_mutex_;
+    mutable Mutex startup_mutex_;
     std::condition_variable startup_cv_;
-    std::string startup_error_;
+    std::string startup_error_ MACHA_GUARDED_BY(startup_mutex_);
     StartupStallHandler startup_stall_handler_;
 
     // Observation probes: written to a local file under the state path, never to

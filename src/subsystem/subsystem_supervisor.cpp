@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <deque>
 #include <dlfcn.h>
+#include "contract/thread_safety.hpp"
 #include <mutex>
 #include <system_error>
 #include <thread>
@@ -31,16 +32,16 @@ struct SubsystemSupervisor::Entry {
     const SubsystemPluginEntry* plugin{};
     SubsystemFactory factory;
 
-    mutable std::mutex mutex;
+    mutable Mutex mutex;
     std::condition_variable_any cv;
     // Not yet tried until the first attempt decides.
-    SubsystemState state{SubsystemState::starting};
-    size_t restart_count{};
-    std::string last_fault;
-    std::unique_ptr<Subsystem> instance;
+    SubsystemState state MACHA_GUARDED_BY(mutex){SubsystemState::starting};
+    size_t restart_count MACHA_GUARDED_BY(mutex){};
+    std::string last_fault MACHA_GUARDED_BY(mutex);
+    std::unique_ptr<Subsystem> instance MACHA_GUARDED_BY(mutex);
     // Set by the instance's fault sink; run_entry tears down and retries.
-    bool fault_requested{};
-    std::string pending_fault;
+    bool fault_requested MACHA_GUARDED_BY(mutex){};
+    std::string pending_fault MACHA_GUARDED_BY(mutex);
 
     std::jthread lifecycle;
 
@@ -75,8 +76,11 @@ void SubsystemSupervisor::start(SubsystemContext context) {
     discover_plugins();
 
     for (auto& entry : entries_) {
-        if (entry->state == SubsystemState::disabled)
-            continue; // failed to load
+        {
+            Lock lock(entry->mutex);
+            if (entry->state == SubsystemState::disabled)
+                continue; // failed to load
+        }
         Entry* raw = entry.get();
         raw->lifecycle = std::jthread([this, raw](std::stop_token stop) {
             run_supervised_loop(raw->name, stop, [this, raw, stop] { run_entry(*raw, stop); });
@@ -107,7 +111,10 @@ void SubsystemSupervisor::discover_plugins() {
         if (!entry->handle) {
             Log::error("subsystem plugin '" + entry->name +
                       "' failed to load: " + std::string(::dlerror()));
-            entry->state = SubsystemState::disabled;
+            {
+                Lock lock(entry->mutex);
+                entry->state = SubsystemState::disabled;
+            }
             entries_.push_back(std::move(entry));
             continue;
         }
@@ -131,7 +138,10 @@ void SubsystemSupervisor::discover_plugins() {
         entry->plugin = entry_function();
         if (!entry->plugin) {
             Log::error("subsystem plugin '" + entry->name + "' entry function returned null");
-            entry->state = SubsystemState::disabled;
+            {
+                Lock lock(entry->mutex);
+                entry->state = SubsystemState::disabled;
+            }
             entries_.push_back(std::move(entry));
             continue;
         }
@@ -141,7 +151,10 @@ void SubsystemSupervisor::discover_plugins() {
                       std::string(entry->plugin->build_identity) +
                       " core=" + std::string(kBuildIdentity) +
                       "; refusing to load (partial deploy?)");
-            entry->state = SubsystemState::disabled;
+            {
+                Lock lock(entry->mutex);
+                entry->state = SubsystemState::disabled;
+            }
             entries_.push_back(std::move(entry));
             continue;
         }
@@ -158,7 +171,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
 
     while (!stop.stop_requested()) {
         {
-            std::lock_guard lock(entry.mutex);
+            Lock lock(entry.mutex);
             // Status tells a first start from a rebuild.
             entry.state = entry.restart_count ? SubsystemState::restarting
                                               : SubsystemState::starting;
@@ -178,7 +191,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             if (instance) {
                 // Before start(): threads started inside start() can report.
                 instance->attach_fault_sink([&entry](std::string reason) {
-                    std::lock_guard lock(entry.mutex);
+                    Lock lock(entry.mutex);
                     if (entry.fault_requested)
                         return; // first reason wins
                     entry.fault_requested = true;
@@ -203,7 +216,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             Log::info("subsystem plugin '" + entry.name +
                       "' loaded but its capability is not enabled on this node path=" +
                       entry.origin());
-            std::lock_guard lock(entry.mutex);
+            Lock lock(entry.mutex);
             entry.state = SubsystemState::unavailable;
             return;
         }
@@ -212,7 +225,7 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
             Log::info("subsystem plugin '" + entry.name + "' loaded and running path=" +
                       entry.origin());
             {
-                std::lock_guard lock(entry.mutex);
+                Lock lock(entry.mutex);
                 entry.state = SubsystemState::running;
                 entry.instance = std::move(instance);
             }
@@ -220,8 +233,9 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
 
             // Park until stopping or a reported fault. The kept failure window
             // drives a flapping subsystem into `disabled`.
-            std::unique_lock lock(entry.mutex);
-            entry.cv.wait(lock, stop, [&entry] { return entry.fault_requested; });
+            Lock lock(entry.mutex);
+            entry.cv.wait(lock.native(), stop,
+                          [&entry]() MACHA_REQUIRES(entry.mutex) { return entry.fault_requested; });
             const bool post_start_fault = entry.fault_requested;
             if (post_start_fault)
                 fault = std::move(entry.pending_fault);
@@ -254,14 +268,14 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         }
 
         {
-            std::lock_guard lock(entry.mutex);
+            Lock lock(entry.mutex);
             entry.last_fault = fault;
             ++entry.restart_count;
         }
 
         const auto delay = retry.failed(policy_);
         if (!delay) {
-            std::lock_guard lock(entry.mutex);
+            Lock lock(entry.mutex);
             entry.state = SubsystemState::disabled;
             Log::error("subsystem '" + entry.name + "' disabled after " +
                       std::to_string(retry.failures_in_window()) +
@@ -270,11 +284,11 @@ void SubsystemSupervisor::run_entry(Entry& entry, std::stop_token stop) {
         }
 
         {
-            std::lock_guard lock(entry.mutex);
+            Lock lock(entry.mutex);
             entry.state = SubsystemState::faulted;
         }
-        std::unique_lock lock(entry.mutex);
-        entry.cv.wait_for(lock, stop, *delay, [] { return false; });
+        Lock lock(entry.mutex);
+        entry.cv.wait_for(lock.native(), stop, *delay, [] { return false; });
     }
 }
 
@@ -296,7 +310,7 @@ std::vector<SubsystemStatus> SubsystemSupervisor::statuses() const {
     std::vector<SubsystemStatus> result;
     result.reserve(entries_.size());
     for (const auto& entry : entries_) {
-        std::lock_guard lock(entry->mutex);
+        Lock lock(entry->mutex);
         result.push_back(SubsystemStatus{entry->name, entry->state, entry->restart_count,
                                          entry->last_fault});
     }
