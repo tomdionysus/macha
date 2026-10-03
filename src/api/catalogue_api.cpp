@@ -143,8 +143,25 @@ std::string artwork_json(const std::vector<CatalogueArtwork>& artwork,
     return out;
 }
 
+// `availability`: complete, partial, unavailable or unknown; for a set,
+// `availability_members` counts the items beneath it that have files.
+std::string availability_json(const CatalogueItem& item, const ItemAvailabilityTable& table) {
+    ItemAvailability entry;
+    if (const auto found = table.find(item.id); found != table.end())
+        entry = found->second;
+    std::string out = ",\"availability\":" + json_escape(availability_name(entry.status));
+    out += ",\"availability_members\":";
+    if (!entry.members)
+        return out + "null";
+    return out + "{\"total\":" + std::to_string(entry.members) +
+           ",\"complete\":" + std::to_string(entry.complete) +
+           ",\"partial\":" + std::to_string(entry.partial) +
+           ",\"unavailable\":" + std::to_string(entry.unavailable) +
+           ",\"unknown\":" + std::to_string(entry.unknown) + "}";
+}
+
 std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapshot,
-                      const ArtworkUrlContext& urls) {
+                      const ArtworkUrlContext& urls, const ItemAvailabilityTable& availability) {
     std::string out = "{";
     out += "\"id\":" + json_escape(item.id);
     out += ",\"kind\":" + json_escape(catalogue_kind_name(item.kind));
@@ -176,17 +193,18 @@ std::string item_json(const CatalogueItem& item, const CatalogueSnapshot& snapsh
     }
     out += "],\"artwork\":" + artwork_json(item.artwork, urls);
     out += ",\"effective_artwork\":" + artwork_json(effective_catalogue_artwork(snapshot, item), urls);
+    out += availability_json(item, availability);
     out += ",\"revision\":" + std::to_string(item.revision);
     out += ",\"updated_ns\":" + std::to_string(item.updated_ns) + "}";
     return out;
 }
 
 std::string items_json(const std::vector<CatalogueItem>& items, const CatalogueSnapshot& snapshot,
-                       const ArtworkUrlContext& urls) {
+                       const ArtworkUrlContext& urls, const ItemAvailabilityTable& availability) {
     std::string out = "{\"items\":[";
     for (size_t i = 0; i < items.size(); ++i) {
         if (i) out += ',';
-        out += item_json(items[i], snapshot, urls);
+        out += item_json(items[i], snapshot, urls, availability);
     }
     out += "]}";
     return out;
@@ -398,6 +416,11 @@ std::string url_decode(std::string_view value) {
 
 } // namespace
 
+std::shared_ptr<const ItemAvailabilityTable>
+CatalogueApi::item_availability(const std::shared_ptr<const CatalogueSnapshot>& snapshot) {
+    return item_availability_.table(snapshot, availability_ ? availability_() : nullptr);
+}
+
 HttpResponse CatalogueApi::handle(const HttpRequest& request) {
     try {
         if (request.method == "GET" && request.path == "/api/v1/catalogue/status") {
@@ -464,7 +487,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/items"));
             return json(200, items_json(catalogue_.list(kind, parent), *snapshot,
-                                        {catalogue_.cluster_keys(), artwork_capability_ttl_}));
+                                        {catalogue_.cluster_keys(), artwork_capability_ttl_},
+                                        *item_availability(snapshot)));
         }
 
         if (request.method == "GET" && request.path == "/api/v1/catalogue/search") {
@@ -499,7 +523,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
             auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "GET /api/v1/catalogue/search"));
             return json(200, items_json(catalogue_.search(q->second, limit, keep), *snapshot,
-                                        {catalogue_.cluster_keys(), artwork_capability_ttl_}));
+                                        {catalogue_.cluster_keys(), artwork_capability_ttl_},
+                                        *item_availability(snapshot)));
         }
 
         constexpr std::string_view media_prefix = "/api/v1/catalogue/media/";
@@ -626,7 +651,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "/api/v1/catalogue/items/{id}"));
                 auto response = json(200, item_json(*item, *snapshot,
-                                                    {catalogue_.cluster_keys(), artwork_capability_ttl_}));
+                                                    {catalogue_.cluster_keys(), artwork_capability_ttl_},
+                                                    *item_availability(snapshot)));
                 response.headers["ETag"] = "\"rev-" + std::to_string(item->revision) + "\"";
                 return response;
             }
@@ -653,7 +679,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 auto snapshot = catalogue_.snapshot_view(
                 WorkContext(FrameType::control, {}, nullptr, "/api/v1/catalogue/items/{id}"));
                 auto response = json(existing ? 200 : 201, item_json(saved, *snapshot,
-                                                    {catalogue_.cluster_keys(), artwork_capability_ttl_}));
+                                                    {catalogue_.cluster_keys(), artwork_capability_ttl_},
+                                                    *item_availability(snapshot)));
                 response.headers["ETag"] = "\"rev-" + std::to_string(saved.revision) + "\"";
                 return response;
             }

@@ -1819,6 +1819,7 @@ void LocalStore::warm_presence_index(std::stop_token stop) {
                 Lock lock(m_);
                 presence_.warmed();
             }
+            presence_warm_.store(true, std::memory_order_release);
             Log::debug("storage presence index warmed path=" + root_.string() +
                        " objects=" + std::to_string(entries) +
                        " elapsed_ms=" + std::to_string(elapsed_ms));

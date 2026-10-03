@@ -194,6 +194,8 @@ The `error` text is for people; act on the codes.
 
 Reads need `media_viewer`; every mutation needs `manager`.
 
+Every item returned carries `availability` (`complete`, `partial`, `unavailable` or `unknown`) and, for a set, `availability_members`: how much of it the reachable cluster holds, as described in [Files and availability](files.md#catalogue-items). They are not part of the item: a `PUT` or `PATCH` body that names them is ignored there.
+
 - `GET /api/v1/catalogue/status` — `ready`, `metadata_generation`, `known_metadata_generation`, `root`, `items`, `artwork_objects`, `local_artwork_objects`, `last_sync_unix_ms`, and `error_code` (`converging`, `unavailable`) beside `error`.
 - `GET /api/v1/catalogue/items?type=...&parent=...` and `GET /api/v1/catalogue/search?q=...&limit=...` (limit up to 1000, default 50) — `{"items": [...]}`. Search also takes `kind`, which may repeat (`kind=movie&kind=show`; `movie`, `show`, `season`, `episode`, `artist`, `album`, `track`), and `parent`, which keeps only that item's children; both filter before `limit`, and an unknown kind is `400 bad_kind`.
 - `GET|PUT|PATCH|DELETE /api/v1/catalogue/items/{id}` — the item carries its revision as `ETag: "rev-N"`; `PUT`, `PATCH` and `DELETE` honour `If-Match` with that value and answer a stale one with `409 conflict`.

@@ -27,6 +27,7 @@ ObjectId id_of(size_t i) {
 
 struct FakeStore final : ObjectStore {
     uint64_t losses() const noexcept override { return 0; }
+    bool indexed() const noexcept override { return true; }
     std::set<ObjectId> objects;
     mutable size_t asked{};
     bool has(const ObjectId& id) const override {
@@ -238,6 +239,7 @@ struct FakeLedger final : ObjectLedger {
         return held_ids.contains(id);
     }
     uint64_t held_losses(RetentionClass) const noexcept override { return 0; }
+    bool held_indexed(RetentionClass) const noexcept override { return true; }
     // The claim walk reads no horizon.
     InventoryHandle inventory() const override { return {}; }
     ReleaseHandle release() const override { return {}; }

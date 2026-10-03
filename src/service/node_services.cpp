@@ -80,7 +80,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
           [this](const std::string& media_id) -> std::optional<Bytes> {
               return media_information_.keyframe_index(media_id,
                                                        Clock::now() + std::chrono::seconds(30));
-          }),
+          },
+          [this] { return availability_.snapshot(); }),
       manage_api_(node_, metadata_, filesystem_, catalogue_, catalogue_hints_, scanner_),
       streaming_(
           filesystem_, resources_.transcode_rates, resources_.memory, catalogue_,

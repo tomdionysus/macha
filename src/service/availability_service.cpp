@@ -177,14 +177,27 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         return ledger_.held(RetentionClass::data, id);
     };
 
+    const auto refresh_started = Clock::now();
     auto holdings = holdings_.handle();
     bool rolled = false;
     const auto losses = ledger_.held_losses(RetentionClass::data);
     const bool lost = holdings && losses != holdings->losses;
-    const bool changed =
-        rolled_head_ != head_key || storage_events != rolled_storage_events_ || lost;
-    const auto rollup_due = rolled_at_ + rolled_cost_ * rollup_share;
+    const bool head_changed = rolled_head_ != head_key;
+    const bool changed = head_changed || storage_events != rolled_storage_events_ || lost;
+    const auto rollup_due = rolled_at_ + rolled_cost_ * share;
     due_ = retry_at_;
+    if (!holdings || changed) {
+        if (ledger_.held_indexed(RetentionClass::data)) {
+            cold_since_.reset();
+        } else {
+            if (!cold_since_)
+                cold_since_ = now;
+            if (now - *cold_since_ < cold_patience) {
+                due_ = now + cold_retry;
+                return false;
+            }
+        }
+    }
     if (!holdings || (changed && now >= rollup_due)) {
         const auto started = Clock::now();
         Holdings next;
@@ -205,7 +218,6 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         rolled_storage_events_ = storage_events;
         rolled_at_ = now;
         rolled = true;
-        rolled_cost_ = Clock::now() - started;
         observations().record("availability.rollup_us", elapsed_us(started));
     }
     if (changed && !rolled) {
@@ -230,24 +242,35 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     std::sort(peers.begin(), peers.end());
     const auto previous = snapshot_.handle();
     const bool retry = retry_at_ && now >= *retry_at_;
-    if (!rolled && !retry && previous && topology_events == surveyed_topology_events_) {
-        const bool same_peers =
-            peers.size() == surveyed_peers_.size() &&
-            std::equal(peers.begin(), peers.end(), surveyed_peers_.begin(),
-                       [](const auto& a, const auto& b) { return a.first == b.first; });
-        bool shrank = false;
-        bool grew = false;
-        for (size_t i = 0; same_peers && i < peers.size(); ++i) {
-            shrank = shrank || peers[i].second < surveyed_peers_[i].second;
-            grew = grew || peers[i].second > surveyed_peers_[i].second;
-        }
-        const bool missing =
-            !previous->survey.unavailable.empty() || !previous->survey.unknown.empty();
-        if (same_peers && !shrank && !(grew && missing)) {
-            // The next comparison is against what the peers advertise now.
-            surveyed_peers_ = std::move(peers);
-            return false;
-        }
+    const bool same_peers =
+        peers.size() == surveyed_peers_.size() &&
+        std::equal(peers.begin(), peers.end(), surveyed_peers_.begin(),
+                   [](const auto& a, const auto& b) { return a.first == b.first; });
+    bool shrank = false;
+    bool grew = false;
+    for (size_t i = 0; same_peers && i < peers.size(); ++i) {
+        shrank = shrank || peers[i].second < surveyed_peers_[i].second;
+        grew = grew || peers[i].second > surveyed_peers_[i].second;
+    }
+    // What must be asked of the peers again, whatever it costs.
+    const bool must_ask = !previous || head_changed || lost ||
+                          topology_events != surveyed_topology_events_ || !same_peers || shrank;
+    const bool missing = previous && (!previous->survey.unavailable.empty() ||
+                                      !previous->survey.unknown.empty());
+    // A peer holding more could hold something missing: worth asking, but a
+    // peer that is importing grows all the time.
+    const auto ask_due = surveyed_at_ + surveyed_cost_ * share;
+    bool ask = must_ask || retry;
+    if (!ask && grew && missing) {
+        if (now >= ask_due)
+            ask = true;
+        else
+            due_ = due_ ? std::min(*due_, ask_due) : ask_due;
+    }
+    if (!ask && !rolled) {
+        if (!(grew && missing))
+            surveyed_peers_ = std::move(peers); // compare next against these
+        return false;
     }
 
     const auto telemetry = node_.telemetry().all();
@@ -263,11 +286,41 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     for (auto& remote : remotes)
         asking.push_back(&remote);
 
+    // A peer that could not answer is tried with one tree node before the
+    // whole descent is repeated for it.
+    if (retry && !must_ask && !rolled) {
+        const ObjectId root = rollup->root();
+        bool answered = false;
+        for (auto* peer : asking) {
+            try {
+                (void)peer->ask(std::span<const ObjectId>(&root, 1));
+                answered = true;
+            } catch (const std::exception&) {
+            }
+        }
+        if (!answered) {
+            retry_backoff_ =
+                std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
+            retry_at_ = now + retry_backoff_;
+            due_ = due_ ? std::min(*due_, *retry_at_) : *retry_at_;
+            return false;
+        }
+    }
+
     const auto started = Clock::now();
     AvailabilitySnapshot next;
     next.generation = holdings->generation;
     next.surveyed_unix_ms = now_unix_ms;
-    next.survey = survey_availability(*rollup, nodes, held, asking);
+    if (ask) {
+        next.survey = survey_availability(*rollup, nodes, held, asking);
+        surveyed_at_ = now;
+    } else {
+        // Rolled up after a gain alone: what was missing is still missing,
+        // less what this node now holds.
+        next.survey = previous->survey;
+        std::erase_if(next.survey.unavailable, held);
+        std::erase_if(next.survey.unknown, held);
+    }
     if (!rolled && previous && previous->survey.unavailable == next.survey.unavailable &&
         previous->survey.unknown == next.survey.unknown) {
         next.paths = previous->paths;
@@ -275,6 +328,10 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     } else {
         fill_path_table(next, *holdings->snapshot, stored, held, pause);
     }
+    if (ask)
+        surveyed_cost_ = Clock::now() - started;
+    if (rolled)
+        rolled_cost_ = Clock::now() - refresh_started;
     observations().record("availability.survey_us", elapsed_us(started));
     Log::debug("availability surveyed generation=" + std::to_string(next.generation) +
                " extents=" + std::to_string(rollup->total().extents) +
@@ -285,6 +342,10 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
                " peers_failed=" + std::to_string(next.survey.peers_failed) +
                " rounds=" + std::to_string(next.survey.rounds) +
                " tree_nodes_asked=" + std::to_string(next.survey.nodes_asked));
+    if (!ask) {
+        snapshot_.publish(std::move(next));
+        return false;
+    }
     if (next.survey.peers_failed) {
         retry_backoff_ = std::clamp<Clock::duration>(retry_backoff_ * 2, retry_floor, retry_ceiling);
         retry_at_ = now + retry_backoff_;

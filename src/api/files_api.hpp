@@ -12,7 +12,7 @@ namespace macha {
 
 // The availability facts of one path, or of nothing surveyed (`facts` null):
 // extents, extents_local, extents_unavailable, extents_unknown, availability
-// (complete, partial, unknown), surveyed_generation, surveyed_unix_ms. What
+// (complete, partial, unavailable, unknown), surveyed_generation, surveyed_unix_ms. What
 // the files resource and the media responses both carry.
 void put_availability(Json::Object& out, const AvailabilitySnapshot* snapshot,
                       const PathAvailability* facts);
