@@ -2230,13 +2230,15 @@ std::optional<MetadataConflictPreservingRepairPlan> plan_conflict_preserving_met
 MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32> k,
                                  std::optional<MetadataRecord> recovery_seed,
                                  bool accept_pristine_genesis_authority,
-                                 uint64_t materialization_cache_limit_bytes)
+                                 uint64_t materialization_cache_limit_bytes,
+                                 NamespaceDeltaApplier namespace_applier)
     : p_(r / "metadata" / "current.meta"), committed_p_(r / "metadata" / "committed.meta"),
       checkpoint_p_(r / "metadata" / "checkpoint.meta"), journal_p_(r / "metadata" / "journal.log"),
       history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
       checkpoint_proof_p_(r / "metadata" / "checkpoint-proof.meta"),
       mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
       recovery_p_(r / "metadata" / "recovery.required"), key_(k),
+      namespace_applier_(std::move(namespace_applier)),
       accept_pristine_genesis_authority_(accept_pristine_genesis_authority),
       materialized_history_limit_bytes_(materialization_cache_limit_bytes) {
     std::filesystem::create_directories(checkpoint_p_.parent_path());

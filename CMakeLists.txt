@@ -306,6 +306,7 @@ set(MACHA_CORE_SOURCES
     src/cluster/node_resources.cpp
     src/cluster/node_identity.cpp
     src/cluster/storage_server.cpp
+    src/cluster/control_objects.cpp
     src/cluster/local_state.cpp
     src/cluster/local_services.cpp
     src/cluster/public_connectivity.cpp

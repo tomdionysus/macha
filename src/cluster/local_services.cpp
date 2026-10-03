@@ -11,7 +11,7 @@ LocalServices::LocalServices(const Config& cfg, const NodeIdentity& identity,
                              RecoveryProgress& progress, const LocalState::StageHook& hook,
                              std::stop_token stop, NodeRuntime& node, NodeResources& resources,
                              MessageRoutes& routes)
-    : resources_(resources), state_(cfg, identity, progress, hook, stop),
+    : resources_(resources), state_(cfg, identity, node, progress, hook, stop),
       metadata_(node, state_.replica(), state_.cache(), routes, cfg.metadata_min_write_replicas,
                 cfg.heartbeat),
       storage_(node, identity,

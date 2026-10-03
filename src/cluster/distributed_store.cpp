@@ -2172,54 +2172,8 @@ bool DistributedStore::ensure_local(const ObjectId& id, bool foreground) {
 }
 
 bool DistributedStore::ensure_control_local(const ObjectId& id) {
-    // No DATA credit: the control store is not on the DATA device, and DATA
-    // pressure must not fail a commit's control-object check.
-    if (local_.control().valid(id))
-        return true;
-
-    Writer writer;
-    writer.fixed(id.bytes);
-    const auto payload = writer.take();
-
-    // Control objects are metadata-replica data, not DHT replicas: ask every
-    // active peer over CONTROL at speculative priority, so the search cannot
-    // block health/quorum traffic or need a DATA session.
-    size_t asked = 0;
-    std::string last_failure = "no active peer";
-    for (const auto& target : n_.membership().active()) {
-        if (target.id == n_.node_id())
-            continue;
-        ++asked;
-        try {
-            auto started = Clock::now();
-            auto reply = n_.call(target, MessageType::get_control_object, payload,
-                                 FrameType::speculative);
-            if (reply.message.type != MessageType::control_object_reply) {
-                last_failure = target.host + ": " + message_type_name(reply.message.type);
-                continue;
-            }
-
-            Reader reader(reply.message.payload);
-            ObjectId returned{reader.fixed<32>()};
-            auto data = reader.bytes(128 * 1024 * 1024);
-            reader.finish();
-            if (returned != id || object_id(data) != id) {
-                Log::debug("control object read " + target.host + ": integrity failure");
-                last_failure = target.host + ": integrity failure";
-                continue;
-            }
-            note_network(data.size(), Clock::now() - started);
-            if (local_.control().put(id, data))
-                return true;
-            last_failure = "local control store put failed";
-        } catch (const std::exception& e) {
-            Log::debug("control object read " + target.host + ": " + e.what());
-            last_failure = target.host + ": " + e.what();
-        }
-    }
-    Log::warn("control object unavailable id=" + hex(id.bytes) + " peers_asked=" + std::to_string(asked) +
-              " last_failure=" + last_failure);
-    return false;
+    return local_.control_fetch().pull(
+        id, [this](uint64_t bytes, Clock::duration elapsed) { note_network(bytes, elapsed); });
 }
 
 void DistributedStore::erase_all(const ObjectId& id) {

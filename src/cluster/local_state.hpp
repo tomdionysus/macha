@@ -17,8 +17,10 @@
 
 namespace macha {
 
+class ControlObjectFetch;
 class LocalStore;
 class MetadataReplica;
+class NodeRuntime;
 class PersistentBlockCache;
 class RetentionStore;
 class StoragePool;
@@ -99,8 +101,8 @@ struct RecoveryCancelled : std::runtime_error {
 class LocalState {
   public:
     using StageHook = std::function<void(std::string_view)>;
-    LocalState(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
-               std::stop_token);
+    LocalState(const Config&, const NodeIdentity&, NodeRuntime&, RecoveryProgress&,
+               const StageHook&, std::stop_token);
     ~LocalState();
     LocalState(const LocalState&) = delete;
     LocalState& operator=(const LocalState&) = delete;
@@ -109,6 +111,7 @@ class LocalState {
     const StoragePool& data() const noexcept { return *data_; }
     LocalStore& control() noexcept { return *control_; }
     const LocalStore& control() const noexcept { return *control_; }
+    ControlObjectFetch& control_fetch() noexcept { return *control_fetch_; }
     PersistentBlockCache& cache() noexcept { return *cache_; }
     RetentionStore& retention() noexcept { return *retention_; }
     const RetentionStore& retention() const noexcept { return *retention_; }
@@ -121,12 +124,13 @@ class LocalState {
   private:
     void recover_data(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
                       std::stop_token);
-    void recover_state(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
-                       std::stop_token);
+    void recover_state(const Config&, const NodeIdentity&, NodeRuntime&, RecoveryProgress&,
+                       const StageHook&, std::stop_token);
 
     // The replica is declared after the cache it reads, so destroyed first.
     std::unique_ptr<StoragePool> data_;
     std::unique_ptr<LocalStore> control_;
+    std::unique_ptr<ControlObjectFetch> control_fetch_;
     std::unique_ptr<PersistentBlockCache> cache_;
     std::unique_ptr<RetentionStore> retention_;
     std::unique_ptr<MetadataReplica> replica_;
