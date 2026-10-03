@@ -629,10 +629,10 @@ void WriteHandle::begin_sparse_overlay() {
     (void)drain_staging_locked();
     if (fs_.io_cancellation_requested())
         fail(EINTR, "write cancelled");
-    auto directory = fs_.node().config().state_path / "tmp";
+    auto directory = fs_.config_.state_path / "tmp";
     std::filesystem::create_directories(directory);
     auto pattern =
-        (directory / ("write." + to_string(fs_.node().node_id()) + ".XXXXXX")).string();
+        (directory / ("write." + to_string(fs_.node_id_) + ".XXXXXX")).string();
     std::vector<char> name(pattern.begin(), pattern.end());
     name.push_back('\0');
     temp_ = mkstemp(name.data());
@@ -669,9 +669,9 @@ WritePreparation WriteHandle::materialize_step(uint64_t byte_budget) {
         }
         if (fs_.io_cancellation_requested())
             fail(EINTR, "write cancelled");
-        auto d = fs_.node().config().state_path / "tmp";
+        auto d = fs_.config_.state_path / "tmp";
         std::filesystem::create_directories(d);
-        auto pattern = (d / ("write." + to_string(fs_.node().node_id()) + ".XXXXXX")).string();
+        auto pattern = (d / ("write." + to_string(fs_.node_id_) + ".XXXXXX")).string();
         std::vector<char> name(pattern.begin(), pattern.end());
         name.push_back('\0');
         temp_ = mkstemp(name.data());
@@ -1436,11 +1436,14 @@ void WriteHandle::cleanup() {
         std::filesystem::remove(temp_path_, e);
     }
 }
-FileSystem::FileSystem(NodeRuntime& n, LocalState& local, MetadataServer& metadata_server,
+FileSystem::FileSystem(const Config& config, NodeId node_id, const Membership& membership,
+                       LocalState& local, MetadataServer& metadata_server,
                        DistributedStore& s, MetadataView& m,
                        RetainedMemoryLedger& retained_memory, PlaybackTracker* playback)
-    : n_(n), local_(local), metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s), m_(m), playback_(playback) {
-    extent_worker_limit_ = std::max<size_t>(1, n_.config().fuse.commit_workers);
+    : config_(config), node_id_(node_id), membership_(membership), local_(local),
+      metadata_server_(metadata_server), retained_memory_(retained_memory), s_(s), m_(m),
+      playback_(playback) {
+    extent_worker_limit_ = std::max<size_t>(1, config_.fuse.commit_workers);
     extent_task_limit_ = extent_worker_limit_ * 2;
     extent_workers_.reserve(extent_worker_limit_);
 }
@@ -2306,7 +2309,7 @@ std::optional<MetadataSnapshotView> FileSystem::available_snapshot_view() const 
 }
 
 std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
-    auto ns = n_.membership().active();
+    auto ns = membership_.active();
     // Edge nodes hold no extents and must not enter the water-level
     // calculation: their presence would skew replica and failure-domain maths.
     std::erase_if(ns, [](const NodeInfo& node) { return !node_hosts_extents(node); });
@@ -2319,7 +2322,7 @@ std::pair<uint64_t, uint64_t> FileSystem::logical_capacity() const {
     };
     if (ns.empty())
         return local_fallback();
-    const size_t r = std::max<size_t>(1, std::min(n_.config().replication, ns.size()));
+    const size_t r = std::max<size_t>(1, std::min(config_.replication, ns.size()));
     const uint64_t total = placement_logical_capacity(ns, r);
     if (!total)
         return local_fallback();

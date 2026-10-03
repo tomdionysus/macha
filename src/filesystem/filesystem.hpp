@@ -2,6 +2,7 @@
 #pragma once
 #include "metadata/metadata_server.hpp"
 #include "cluster/data_work.hpp"
+#include "cluster/membership.hpp"
 #include "cluster/distributed_store.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "metadata/namespace_control_store.hpp"
@@ -258,7 +259,9 @@ class PlaybackTracker;
 class FileSystem {
     friend class WriteHandle;
 
-    NodeRuntime& n_;
+    const Config& config_;
+    NodeId node_id_;
+    const Membership& membership_;
     LocalState& local_;
     MetadataServer& metadata_server_;
     RetainedMemoryLedger& retained_memory_;
@@ -337,8 +340,8 @@ class FileSystem {
         const FilesystemNamespaceMutation&);
 
   public:
-    FileSystem(NodeRuntime&, LocalState&, MetadataServer&, DistributedStore&, MetadataView&,
-               RetainedMemoryLedger&,
+    FileSystem(const Config&, NodeId, const Membership&, LocalState&, MetadataServer&,
+               DistributedStore&, MetadataView&, RetainedMemoryLedger&,
                PlaybackTracker* = nullptr);
     FsEntry getattr(const std::string&);
     std::vector<std::pair<std::string, FsEntry>> readdir(const std::string&);
@@ -423,11 +426,14 @@ class FileSystem {
     }
     ExtentExecutorDiagnostics extent_executor_diagnostics() const;
     std::atomic_bool* io_cancellation_flag() { return &io_cancelled_; }
-    NodeRuntime& node() {
-        return n_;
+    const Config& config() const {
+        return config_;
+    }
+    NodeId node_id() const {
+        return node_id_;
     }
     size_t extent_size() const {
-        return n_.config().extent_size;
+        return config_.extent_size;
     }
     // Process-wide: memory one writer releases can admit another, so any
     // writer's progress re-arms every no-progress window.
