@@ -35,7 +35,7 @@ class SubsystemRegistry;
 
 // The core references a subsystem may use: `node` and `ingest` for Torrent,
 // `filesystem` and `hydration` for FUSE; `registry` is where a plugin publishes
-// its capability. Extend only for a real need. All non-owning; Service owns
+// its capability. Extend only for a real need. All non-owning; the root owns
 // them and stops the supervisor before destroying any.
 struct SubsystemContext {
     const Config* config{};

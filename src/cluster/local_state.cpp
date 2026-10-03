@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "cluster/local_state.hpp"
+#include "cluster/control_objects.hpp"
 
 #include "log.hpp"
 #include "metadata/metadata.hpp"
+#include "metadata/namespace_control_store.hpp"
 #include "startup_progress.hpp"
 #include "storage/local_store.hpp"
 #include "storage/persistent_cache.hpp"
@@ -25,8 +27,8 @@ void stage(const LocalState::StageHook& hook, std::string_view name, std::stop_t
 
 } // namespace
 
-LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, RecoveryProgress& progress,
-                       const StageHook& hook, std::stop_token stop) {
+LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, NodeRuntime& node,
+                       RecoveryProgress& progress, const StageHook& hook, std::stop_token stop) {
     // The DATA pool and the control-side chain are independent; recover them
     // side by side, as a large pool can take a while.
     std::exception_ptr data_failure;
@@ -41,7 +43,7 @@ LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, Recovery
     });
     std::exception_ptr state_failure;
     try {
-        recover_state(cfg, identity, progress, hook, stop);
+        recover_state(cfg, identity, node, progress, hook, stop);
     } catch (...) {
         state_failure = std::current_exception();
     }
@@ -99,8 +101,8 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
 }
 
 void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
-                               RecoveryProgress& progress, const StageHook& hook,
-                               std::stop_token stop) {
+                               NodeRuntime& node, RecoveryProgress& progress,
+                               const StageHook& hook, std::stop_token stop) {
     try {
         stage(hook, "control-storage", stop);
         control_ = std::make_unique<LocalStore>(
@@ -108,6 +110,7 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
             LocalStoreOptions{cfg.metadata_store.limit, 0, cfg.metadata_store.packing.threshold,
                               cfg.metadata_store.packing.target_size},
             identity.keys.storage);
+        control_fetch_ = std::make_unique<ControlObjectFetch>(node, *control_);
         note_startup_progress();
         progress.mark(RecoveryProgress::control_storage);
 
@@ -122,9 +125,16 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
         progress.mark(RecoveryProgress::retention);
 
         stage(hook, "metadata", stop);
-        replica_ = std::make_unique<MetadataReplica>(cfg.state_path, identity.keys.storage,
-                                                     cache_->metadata(), cfg.bootstrap.empty(),
-                                                     cfg.metadata_materialization_cache_bytes);
+        // Replay writes nodes locally and replicates nothing: the commit reached
+        // the floor when made, and rebuilding a local head must not depend on
+        // peers.
+        replica_ = std::make_unique<MetadataReplica>(
+            cfg.state_path, identity.keys.storage, cache_->metadata(), cfg.bootstrap.empty(),
+            cfg.metadata_materialization_cache_bytes,
+            [this](const ObjectId& root, const MetadataDelta& delta) {
+                auto nodes = ControlNamespaceNodeStore::for_replay(*control_, *control_fetch_);
+                return apply_delta_to_namespace_tree(root, nodes, delta);
+            });
         cache_->remember_metadata(replica_->committed());
         note_startup_progress();
         progress.mark(RecoveryProgress::metadata);

@@ -486,6 +486,27 @@ Stage 0:
   layering (part B puts the object store below metadata, which removes the
   reason for `set_namespace_store`) or becomes a declared port: a contract
   one component provides and another consumes, wired by the root.
+- **What wiring remains after T5, and why** (2026-10-03). Every setter
+  listed above is gone; the replica is built with its namespace applier,
+  which reads through `ControlObjectFetch`, owned by `LocalState`. Wiring
+  still made after construction:
+  - *Subscriptions*: `IngestManager::set_resume_listener` (torrent),
+    `PlaybackTracker::set_change_callback` (hydration), a hint provider's
+    `set_wake_callback` (hydration). The producer is built first; the
+    consumer subscribes in its constructor and unsubscribes in its
+    destructor.
+  - *The supervisor's contract*: `attach_fault_sink` and
+    `TorrentManager::set_fault_sink`, installed between create and start.
+  - *A device the arbiter predates*: `DataResourceArbiter::observe_device`,
+    set and cleared by `LocalServices`, since the root's resources exist
+    before the DATA store recovers.
+  - *The transport wiring its own parts*: `set_inbound_handler`,
+    `set_inbound_transfer_control`, `set_maintained_peers`,
+    `attach_client`, inside `NodeRuntime`.
+  - *Process-wide registration*: the media engine and FUSE mount driver
+    factories, the music metadata provider, the logger.
+  - *Values*: `TelemetryStore::set_node_name` (on reload),
+    `HttpServer::set_control_prefixes` (before start).
 - **A component's `stop()` includes the request** (T2d): it asks for the
   stop itself if nobody has, then joins. Service's shutdown asks every
   component to stop well before it stops each one, and its recorded order

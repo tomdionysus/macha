@@ -58,17 +58,7 @@ MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
                                  DistributedStore* namespace_store,
                                  PublicationRetention publication_retention)
     : node_(node), local_(local), metadata_server_(metadata_server), namespace_store_(namespace_store),
-      publication_retention_(std::move(publication_retention)) {
-    if (!namespace_store_)
-        return;
-    // Replay writes nodes locally and replicates nothing: the commit reached
-    // the floor when made, and rebuilding a local head must not depend on peers.
-    local_.replica().set_namespace_delta_applier(
-        [this](const ObjectId& root, const MetadataDelta& delta) {
-            auto nodes = ControlNamespaceNodeStore::for_replay(local_.control(), *namespace_store_);
-            return apply_delta_to_namespace_tree(root, nodes, delta);
-        });
-}
+      publication_retention_(std::move(publication_retention)) {}
 
 const char* metadata_availability_name(MetadataAvailability availability) noexcept {
     switch (availability) {

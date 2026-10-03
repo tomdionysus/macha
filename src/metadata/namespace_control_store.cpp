@@ -8,9 +8,11 @@
 
 namespace macha {
 
-ControlNamespaceNodeStore::ControlNamespaceNodeStore(LocalStore& control, DistributedStore& store,
-                                                     size_t required, Mode mode)
-    : control_(control), store_(store), required_(required), mode_(mode) {}
+ControlNamespaceNodeStore::ControlNamespaceNodeStore(LocalStore& control,
+                                                     ControlObjectSource& source,
+                                                     DistributedStore* replicas, size_t required,
+                                                     Mode mode)
+    : control_(control), source_(source), replicas_(replicas), required_(required), mode_(mode) {}
 
 ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
     if (mode_ == Mode::read)
@@ -31,7 +33,7 @@ ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
         return id;
     // MetadataNotReady: a peer dropping out mid-commit is transient, and
     // callers (an ingest) block and retry on that type rather than failing.
-    if (store_.replicate_control(id, node) < required_)
+    if (replicas_->replicate_control(id, node) < required_)
         throw MetadataNotReady("namespace node could not reach the metadata durability floor: " +
                                to_string(id));
     written_.push_back(id);
@@ -41,7 +43,7 @@ ObjectId ControlNamespaceNodeStore::put(std::span<const uint8_t> node) {
 std::optional<Bytes> ControlNamespaceNodeStore::get(const ObjectId& id) const {
     if (auto local = control_.get(id))
         return local;
-    if (!store_.ensure_control_local(id))
+    if (!source_.ensure_control_local(id))
         return {};
     return control_.get(id);
 }

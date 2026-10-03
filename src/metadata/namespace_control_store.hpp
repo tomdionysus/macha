@@ -20,20 +20,20 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
     // committed only once every node it addresses has durably reached it.
     // A reader (floor zero) refuses `put`; zero never means "no floor".
     static ControlNamespaceNodeStore for_reading(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, 0, Mode::read);
+        return ControlNamespaceNodeStore(control, store, nullptr, 0, Mode::read);
     }
     static ControlNamespaceNodeStore for_commit(LocalStore& control, DistributedStore& store,
                                                 size_t required) {
         if (!required)
             throw std::invalid_argument("namespace commit requires a metadata write floor");
-        return ControlNamespaceNodeStore(control, store, required, Mode::commit);
+        return ControlNamespaceNodeStore(control, store, &store, required, Mode::commit);
     }
     // Replay writes locally and replicates nothing: a materialised history
     // entry already reached the floor when committed, and replicating would
     // stop a node with peers down from rebuilding its own head. Content
     // addressing makes a locally rebuilt node identical to the committed one.
-    static ControlNamespaceNodeStore for_replay(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, 0, Mode::replay);
+    static ControlNamespaceNodeStore for_replay(LocalStore& control, ControlObjectSource& source) {
+        return ControlNamespaceNodeStore(control, source, nullptr, 0, Mode::replay);
     }
 
     // Writes the node and returns its content address. Throws
@@ -54,11 +54,13 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
 
   private:
     enum class Mode : uint8_t { read, commit, replay };
-    ControlNamespaceNodeStore(LocalStore& control, DistributedStore& store, size_t required,
-                              Mode mode);
+    ControlNamespaceNodeStore(LocalStore& control, ControlObjectSource& source,
+                              DistributedStore* replicas, size_t required, Mode mode);
 
     LocalStore& control_;
-    DistributedStore& store_;
+    ControlObjectSource& source_;
+    // Set only in commit mode, the one that replicates.
+    DistributedStore* replicas_;
     size_t required_;
     Mode mode_;
     std::vector<ObjectId> written_;
