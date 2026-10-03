@@ -223,3 +223,25 @@ Read against the kill criteria:
 - node-f's playback errors (seek 503 after about 15 s, `media input read
   failed`) are the missing extents, as at T0 (161 of 580 seeks then, a
   similar share now).
+
+## 0.82.0 on both nodes: the first survey of the library (2026-10-03)
+
+Suites on node-f before install: 717 + 17 + 21 (`6c94ece`). Tarball md5
+`1745b250358a6706d2c2ccb67b267e77`; backups
+`/root/macha-0.81.0-installed.tgz` on both. node-f 19:08:34Z, node-c
+19:15:54Z; healthy, no warnings. No load was run (operator).
+
+- While node-c was still on 0.81.0, and then until it had rolled up after
+  its restart (its presence index took 322 s to warm), node-f could not ask
+  it: 761,222 extents `unknown`, none `unavailable`, as designed.
+- Once both had rolled up, both surveys agree, at generation 66917:
+  **918,306 extent references; node-c holds 699,644, node-f 105,142;
+  209,313 extents are held by no reachable node.** Each survey asked the
+  peer about 2,845 tree nodes in 7 rounds; no extent id crossed the wire.
+- `GET /api/v1/files/` on node-c: 3,572 GiB referenced, 210,794
+  references unavailable (about 823 GiB, 23%): `/TV` 141,736 of 570,991,
+  `/Movies` 64,741 of 325,937, `/Music` 4,317 of 21,378. The request took
+  3.5 s, which is the filesystem's read of `/`, to be looked at.
+- This is the figure the 15-day repair walk was approaching by one
+  warning a minute, and matches the 0.9 TB repair was short when node-e
+  left (CHANGELOG 0.59.0).
