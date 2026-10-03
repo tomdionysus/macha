@@ -533,7 +533,7 @@ void ManageApi::stop() {
 void ManageApi::queue_identity_reset_audit(IdentityAssociationReset reset) {
     const auto key = identity_reset_key(reset.host, reset.port);
     {
-        std::lock_guard lock(identity_audit_mutex_);
+        Lock lock(identity_audit_mutex_);
         auto found = identity_audit_pending_.find(key);
         if (found == identity_audit_pending_.end() || found->second.epoch < reset.epoch)
             identity_audit_pending_[key] = std::move(reset);
@@ -545,8 +545,10 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         IdentityAssociationReset reset;
         {
-            std::unique_lock lock(identity_audit_mutex_);
-            identity_audit_cv_.wait(lock, stop, [&] { return !identity_audit_pending_.empty(); });
+            Lock lock(identity_audit_mutex_);
+            identity_audit_cv_.wait(lock.native(), stop, [&]() MACHA_REQUIRES(identity_audit_mutex_) {
+                return !identity_audit_pending_.empty();
+            });
             if (stop.stop_requested())
                 break;
             auto found = identity_audit_pending_.begin();
@@ -587,8 +589,8 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
 HttpResponse ManageApi::handle(const HttpRequest& request) {
     // Management writes are serialised; with media-id verification below, two
     // stale UI sessions cannot both resolve or delete the same exception.
-    std::unique_lock mutation_lock(mutation_mutex_, std::defer_lock);
-    if (request.method != "GET") mutation_lock.lock();
+    std::optional<Lock> mutation_lock;
+    if (request.method != "GET") mutation_lock.emplace(mutation_mutex_);
     try {
         if (request.method == "GET" && request.path == "/api/v1/manage") {
             Json::Object resources;

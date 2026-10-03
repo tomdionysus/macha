@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "supervised.hpp"
+#include "contract/thread_safety.hpp"
 #include "log.hpp"
 #include "types.hpp"
 
@@ -17,10 +18,10 @@ constexpr auto restart_initial = std::chrono::seconds(1);
 constexpr auto restart_ceiling = std::chrono::seconds(60);
 
 struct Registry {
-    std::mutex mutex;
-    std::map<std::string, SupervisedThreadStatus, std::less<>> threads;
+    Mutex mutex;
+    std::map<std::string, SupervisedThreadStatus, std::less<>> threads MACHA_GUARDED_BY(mutex);
 
-    SupervisedThreadStatus& entry_locked(std::string_view name) {
+    SupervisedThreadStatus& entry_locked(std::string_view name) MACHA_REQUIRES(mutex) {
         auto it = threads.find(name);
         if (it == threads.end()) {
             it = threads.emplace(std::string(name), SupervisedThreadStatus{}).first;
@@ -40,7 +41,7 @@ Registry& registry() {
 void entered(std::string_view name) noexcept {
     try {
         auto& r = registry();
-        std::lock_guard lock(r.mutex);
+        Lock lock(r.mutex);
         ++r.entry_locked(name).running;
     } catch (...) {
     }
@@ -49,7 +50,7 @@ void entered(std::string_view name) noexcept {
 void left(std::string_view name) noexcept {
     try {
         auto& r = registry();
-        std::lock_guard lock(r.mutex);
+        Lock lock(r.mutex);
         auto& entry = r.entry_locked(name);
         if (entry.running) --entry.running;
     } catch (...) {
@@ -59,7 +60,7 @@ void left(std::string_view name) noexcept {
 void set_restarting(std::string_view name, bool waiting) noexcept {
     try {
         auto& r = registry();
-        std::lock_guard lock(r.mutex);
+        Lock lock(r.mutex);
         auto& entry = r.entry_locked(name);
         if (waiting)
             ++entry.restarting;
@@ -78,7 +79,7 @@ void record(std::string_view name, const Fault& fault, std::string_view outcome)
     try {
         {
             auto& r = registry();
-            std::lock_guard lock(r.mutex);
+            Lock lock(r.mutex);
             auto& entry = r.entry_locked(name);
             ++entry.faults;
             entry.last_fault_code = fault.code;
@@ -142,10 +143,10 @@ void run_supervised_loop(std::string_view name, std::stop_token stop,
         record(name, *fault, "restarting in " + std::to_string(delay.count()) + " ms");
         set_restarting(name, true);
         try {
-            std::mutex mutex;
+            Mutex mutex;
             std::condition_variable_any wake;
-            std::unique_lock lock(mutex);
-            wake.wait_for(lock, stop, delay, [] { return false; });
+            Lock lock(mutex);
+            wake.wait_for(lock.native(), stop, delay, [] { return false; });
         } catch (...) {
         }
         set_restarting(name, false);
@@ -170,7 +171,7 @@ void run_supervised_escalating(std::string_view name, const std::function<void()
 
 std::vector<SupervisedThreadStatus> supervised_thread_statuses() {
     auto& r = registry();
-    std::lock_guard lock(r.mutex);
+    Lock lock(r.mutex);
     std::vector<SupervisedThreadStatus> out;
     out.reserve(r.threads.size());
     for (const auto& [_, status] : r.threads) out.push_back(status);

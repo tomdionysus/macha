@@ -60,8 +60,8 @@ void StorageServer::refresh() {
 void StorageServer::refresh_loop(std::stop_token stop) {
     while (!stop.stop_requested()) {
         {
-            std::unique_lock lock(refresh_mutex_);
-            refresh_cv_.wait_for(lock, stop, refresh_interval_, [] { return false; });
+            Lock lock(refresh_mutex_);
+            refresh_cv_.wait_for(lock.native(), stop, refresh_interval_, [] { return false; });
         }
         if (stop.stop_requested())
             return;

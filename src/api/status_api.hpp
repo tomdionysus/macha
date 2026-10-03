@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "auth/accounts.hpp"
 #include "service/convergence_demand.hpp"
 #include "cluster/distributed_store.hpp"
@@ -43,7 +45,8 @@ class ClusterStatusService {
     const DataResourceArbiter& data_resources_;
     const RetainedMemoryLedger& retained_memory_;
     std::jthread persistence_;
-    std::mutex wait_mutex_;
+    // Guards nothing; the observation thread waits on it.
+    Mutex wait_mutex_;
     std::condition_variable_any wait_cv_;
 
     void persistence_loop(std::stop_token);

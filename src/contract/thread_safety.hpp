@@ -8,6 +8,19 @@
 // Clang's thread-safety analysis (object ledger spec, A1 and A2): checked by
 // Clang with -Wthread-safety as errors, ignored by GCC. Every lock is one of
 // the types below, so every lock is checked.
+//
+// How a class uses them:
+// - A mutex any holder keeps across device or network I/O (or across a call
+//   that may do it, such as a callback or logging) is an IoMutex; otherwise a
+//   Mutex. A comment above it says what I/O it is held across.
+// - State a mutex protects is MACHA_GUARDED_BY it; a function called with it
+//   held is MACHA_REQUIRES it (the *_locked convention).
+// - State fixed at construction is const, or left unguarded with a comment;
+//   state one thread owns says which thread.
+// - A condition variable waits on Lock::native(); its predicate lambda is
+//   written [&]() MACHA_REQUIRES(mutex_) { ... }, as is any lambda that
+//   touches guarded state under the lock.
+// - A mutex that guards nothing (a wait or ordering lock) says so.
 #if defined(__clang__)
 #define MACHA_THREAD_ANNOTATION(x) __attribute__((x))
 #else

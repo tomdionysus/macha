@@ -197,7 +197,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
 
     if (!services_ready_.load(std::memory_order_acquire)) {
         if (startup_failed_.load(std::memory_order_acquire)) {
-            std::lock_guard lock(startup_mutex_);
+            Lock lock(startup_mutex_);
             return http_error(503, "startup_failed",
                               startup_error_.empty() ? "server startup failed" : startup_error_);
         }
@@ -439,9 +439,9 @@ void Service::wait_services_ready() {
     auto last_progress_at = started;
     auto last_progress = startup_progress();
     bool signalled = false;
-    std::unique_lock lock(startup_mutex_);
+    Lock lock(startup_mutex_);
     for (;;) {
-        signalled = startup_cv_.wait_for(lock, std::chrono::seconds(1), [this] {
+        signalled = startup_cv_.wait_for(lock.native(), std::chrono::seconds(1), [this] {
             return services_ready_.load(std::memory_order_acquire) ||
                    startup_failed_.load(std::memory_order_acquire);
         });
@@ -461,9 +461,10 @@ void Service::wait_services_ready() {
     }
     if (services_ready_.load(std::memory_order_acquire))
         return;
+    const auto error = startup_error_;
     lock.unlock();
     if (signalled)
-        throw std::runtime_error(startup_error_.empty() ? "server startup failed" : startup_error_);
+        throw std::runtime_error(error.empty() ? "server startup failed" : error);
 
     // Startup neither completed nor threw within the bound: a suspected stall (a
     // lock or lost wakeup below here). The startup thread may never be joinable,
@@ -526,7 +527,7 @@ void Service::initialise_services(std::stop_token stop) {
             {unix_ms(), "services_ready", {{"elapsed_ms", elapsed_us(constructed_) / 1000}}, {}});
     } catch (const std::exception& error) {
         {
-            std::lock_guard lock(startup_mutex_);
+            Lock lock(startup_mutex_);
             startup_error_ = error.what();
         }
         startup_failed_.store(true, std::memory_order_release);
