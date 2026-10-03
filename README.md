@@ -2,7 +2,7 @@
 
 # Macha
 
-*v0.81.0*
+*v0.82.0*
 
 *Macha — Old Irish /ˈmˠaxə/ — approximately “MAKH-uh”*
 
@@ -148,6 +148,7 @@ configuration, keys, state, cache, spool, mounts and media data.
 | [Catalogue](docs/catalogue.md) | [Streaming](docs/streaming.md) |
 | [Operations](docs/operations.md) | [Management API](docs/management.md) |
 | [High availability](docs/HA.md) | [Ownership and GC](docs/ownership.md) |
+| [Files and availability](docs/files.md) | |
 | [Architecture](ARCHITECTURE.md) | [Security](SECURITY.md) |
 | [Release notes](CHANGELOG.md) | [Roadmap](ROADMAP.md) |
 | [Validation](VALIDATION.md) | [Contributing](CONTRIBUTING.md) |

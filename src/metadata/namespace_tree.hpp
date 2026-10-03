@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace macha {
 
@@ -160,6 +161,20 @@ bool namespace_contains(const MetadataSnapshot& snapshot, const NamespaceNodeSto
 // this; comparing the (empty) entry maps of tree-backed snapshots would never
 // report a change.
 bool namespace_differs(const MetadataSnapshot& a, const MetadataSnapshot& b);
+
+// One direct child of a tree node: another tree node (a branch, a leaf or an
+// extent node) or a DATA extent.
+struct NamespaceTreeChild {
+    bool extent{};
+    ObjectId id{};
+    auto operator<=>(const NamespaceTreeChild&) const = default;
+};
+
+// A node's direct children in the order the node lists them. A leaf's are
+// each entry's inline extents or its extent sequence's root; holes are not
+// children. A function of the node's bytes alone, so every holder of the node
+// numbers its children alike. Throws DecodeError on anything else.
+std::vector<NamespaceTreeChild> namespace_tree_children(std::span<const uint8_t> node);
 
 // A change set: an entry to upsert, or nullopt to delete the path.
 using NamespaceChanges = std::map<std::string, std::optional<FsEntry>>;

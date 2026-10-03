@@ -868,7 +868,7 @@ class StorageClusterNode {
         store_ = std::make_unique<DistributedStore>(*node_, node_->local_state(), node_->resources.activity,
                                                     node_->resources.data, node_->resources.memory, node_->resources.events);
         metadata_ = std::make_unique<MetadataManager>(*node_, node_->local_state(), node_->metadata_server());
-        catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_);
+        catalogue_ = std::make_unique<CatalogueManager>(*node_, node_->local_state(), node_->metadata_server(), *store_, *metadata_, node_->ledger());
     }
     // A process restart in miniature: a fresh NodeRuntime over the same
     // on-disk state gets a fresh durability epoch and fresh backend instance
@@ -1108,6 +1108,85 @@ MACHA_TEST("storage_v18", test_min_write_floor_publishes_then_repair_converges_t
     }, 5s));
     REQUIRE(second.local_state().data().get(id).has_value());
     CHECK(*second.local_state().data().get(id) == data);
+}
+
+MACHA_TEST("storage_v18", test_nodes_replicating_to_each_other_do_not_hold_their_slots_across_the_peer) {
+    // Each node has one background DATA slot and replicates its own objects
+    // to the other. A sender that kept its slot while the peer admitted the
+    // object would leave both nodes waiting on each other's slot.
+    TestCluster cluster;
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    auto a_config = storage_node_config(cluster, "cross-a", a_port, 64ULL * 1024 * 1024, 2, 1);
+    auto b_config = storage_node_config(cluster, "cross-b", b_port, 64ULL * 1024 * 1024, 2, 1,
+                                        {{"127.0.0.1", a_port}});
+    a_config.maintenance.background_concurrency = 1;
+    b_config.maintenance.background_concurrency = 1;
+    StorageClusterNode a(std::move(a_config), cluster.keys());
+    StorageClusterNode b(std::move(b_config), cluster.keys());
+    a.start();
+    b.start();
+    REQUIRE(wait_until([&] {
+        return a.node().membership().active().size() == 2 &&
+               b.node().membership().active().size() == 2;
+    }, 5s));
+
+    constexpr size_t threads_per_node = 4;
+    constexpr size_t objects_per_thread = 8;
+    std::atomic_size_t done{};
+    std::atomic_size_t on_both{};
+    std::vector<std::jthread> writers;
+    for (auto* node : {&a, &b})
+        for (size_t t = 0; t < threads_per_node; ++t)
+            writers.emplace_back([&, node, t] {
+                for (size_t i = 0; i < objects_per_thread; ++i) {
+                    const auto seed = static_cast<uint8_t>((node == &a ? 0 : 100) + t * 10 + i);
+                    const auto data = pattern(64 * 1024, seed);
+                    if (node->store().replicate_all(object_id(data), data) == 2)
+                        on_both.fetch_add(1);
+                    done.fetch_add(1);
+                }
+            });
+    const size_t total = 2 * threads_per_node * objects_per_thread;
+    REQUIRE(wait_until([&] { return done.load() == total; }, 20s));
+    CHECK(on_both.load() == total);
+}
+
+MACHA_TEST("storage_v18", test_repair_passes_an_object_marked_unavailable_and_pulls_it_once_unmarked) {
+    // Repair does no work that cannot complete: an object the survey marks
+    // unavailable is passed without a fetch, and fetched once the mark goes.
+    TestCluster cluster;
+    const auto port = free_port();
+    auto config = storage_node_config(cluster, "skipper", port, 8ULL * 1024 * 1024, 2, 1);
+    StorageClusterNode node(std::move(config), cluster.keys());
+    node.start();
+
+    const auto missing = object_id(pattern(64 * 1024, 11));
+    const std::vector<ObjectId> live{missing};
+    bool marked = true;
+    size_t asked = 0;
+    const auto unavailable = [&](const ObjectId& id) {
+        ++asked;
+        CHECK(id == missing);
+        return marked;
+    };
+    const auto step = [&] {
+        return node.store().repair_step(4ULL * 1024 * 1024, 16, live, {}, 0, unavailable);
+    };
+
+    // A whole pass over the marked object examines it and attempts nothing.
+    const auto passed = step();
+    CHECK(asked == 1);
+    CHECK(passed.pull_examined == 1);
+    CHECK(passed.bytes_transferred == 0);
+    CHECK(node.store().repair_diagnostics().pull_unsourceable == 0);
+
+    // Unmarked, the same pass tries to source it (and here finds no peer).
+    marked = false;
+    REQUIRE(wait_until([&] {
+        (void)step();
+        return node.store().repair_diagnostics().pull_unsourceable > 0;
+    }, 5s));
 }
 
 MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
@@ -1504,7 +1583,7 @@ MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_rep
     // A fresh catalogue manager has no in-memory snapshot to hide the missing
     // physical control objects. Repair must fetch the manifest/shards from the
     // other metadata replica and leave them durable locally again.
-    CatalogueManager fresh(a.node(), a.node().local_state(), a.node().metadata_server(), a.store(), a.metadata());
+    CatalogueManager fresh(a.node(), a.node().local_state(), a.node().metadata_server(), a.store(), a.metadata(), a.node().ledger());
     fresh.repair_once();
     REQUIRE(fresh.get(item.id).has_value());
     for (const auto& id : referenced)

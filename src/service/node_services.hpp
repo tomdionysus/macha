@@ -16,6 +16,8 @@
 #include "filesystem/hydration.hpp"
 #include "ledger/node_horizon_builder.hpp"
 #include "ledger/retention_ledger.hpp"
+#include "api/files_api.hpp"
+#include "service/availability_service.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "playback/playback.hpp"
 #include "service/maintenance.hpp"
@@ -96,6 +98,8 @@ class NodeServices {
     DistributedStore& store() { return store_; }
     MetadataManager& metadata() { return metadata_; }
     CatalogueManager& catalogue() { return catalogue_; }
+    AvailabilityService& availability() { return availability_; }
+    FilesApi& files_api() { return files_api_; }
     FileSystem& filesystem() { return filesystem_; }
     CatalogueHintQueue& catalogue_hints() { return catalogue_hints_; }
     MediaInformationService& media_information() { return media_information_; }
@@ -131,6 +135,8 @@ class NodeServices {
     PlaybackTracker playback_;
     DistributedStore store_;
     MetadataManager metadata_;
+    RetentionLedger ledger_;
+    AvailabilityService availability_;
     CatalogueManager catalogue_;
     FileSystem filesystem_;
     CatalogueHintQueue catalogue_hints_;
@@ -147,8 +153,8 @@ class NodeServices {
     ManageApi manage_api_;
     PlaybackManager streaming_;
     SubsystemSupervisor subsystems_;
-    RetentionLedger ledger_;
     NodeHorizonBuilder horizon_builder_;
+    FilesApi files_api_;
     Maintenance maintenance_;
 };
 

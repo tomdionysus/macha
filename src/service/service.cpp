@@ -364,6 +364,8 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     }
     if (request.path.starts_with("/api/v1/manage"))
         return services_->manage_api().handle(request);
+    if (request.path == "/api/v1/files" || request.path.starts_with("/api/v1/files/"))
+        return services_->files_api().handle(request);
     return services_->catalogue_api().handle(request);
 }
 

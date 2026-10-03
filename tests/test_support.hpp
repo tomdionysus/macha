@@ -6,6 +6,7 @@
 #include "crypto.hpp"
 #include "cluster/distributed_store.hpp"
 #include "filesystem/filesystem.hpp"
+#include "ledger/retention_ledger.hpp"
 #include "fuse/fuse_frontend.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "service/service.hpp"
@@ -336,6 +337,15 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     LocalStore& control_store() { return local("control storage").state().control(); }
     PersistentBlockCache& block_cache() { return local("persistent cache").state().cache(); }
     ClaimStore& claims() { return local("retention state").state().retention(); }
+    // The ledger over this node's stores, built on first use.
+    ObjectLedger& ledger() {
+        auto& state = local("the ledger's stores").state();
+        std::lock_guard lock(ledger_mutex_);
+        if (!ledger_)
+            ledger_ = std::make_unique<RetentionLedger>(state.retention(), state.data(),
+                                                        state.control());
+        return *ledger_;
+    }
     MetadataReplica& metadata_replica() { return local("metadata replica").state().replica(); }
     uint64_t known_metadata_generation() {
         return progress.complete() ? local_->metadata().known_generation()
@@ -355,6 +365,8 @@ class BareNode : public BareNodeResources, public NodeRuntime {
     // Declared in this order so the recovery thread goes before what it built.
     std::unique_ptr<LocalServices> local_;
     std::jthread recovery_;
+    std::mutex ledger_mutex_;
+    std::unique_ptr<RetentionLedger> ledger_;
 };
 
 class TestNode {

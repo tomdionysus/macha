@@ -615,7 +615,7 @@ maintenance:
   garbage_grace_ms: 86400000
 ```
 
-`background_concurrency` is the node's background effort ceiling: how many loader or speculative DATA operations (publication and repair, one extent each) may hold an admission lease at once. `0` means half the hardware threads, minimum 1. Viewer work is never counted, so playback and read-ahead are unaffected; what it bounds is how much CPU (hashing, encryption) and I/O the node spends on its own import and repair traffic at once. The status API reports the ceiling and its use as `data_resources.background_limit` / `background_active` / `peak_background_active`.
+`background_concurrency` is the node's background effort ceiling: how many loader or speculative DATA operations (publication and repair, one extent each) may hold an admission lease at once. `0` means half the hardware threads, minimum 1. It counts work on this node's own disk: sending an extent to a peer or fetching one from it holds no slot here, and the peer admits it against its own ceiling. Viewer work is never counted, so playback and read-ahead are unaffected; what it bounds is how much CPU (hashing, encryption) and I/O the node spends on its own import and repair traffic at once. The status API reports the ceiling and its use as `data_resources.background_limit` / `background_active` / `peak_background_active`.
 
 
 Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted MachaDFS activity take priority.

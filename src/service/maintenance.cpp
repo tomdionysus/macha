@@ -93,6 +93,7 @@ Maintenance::Maintenance(MaintenanceDependencies dependencies)
       metadata_server_(dependencies.metadata_server), store_(dependencies.store), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
       builder_(dependencies.builder), ledger_(dependencies.ledger),
+      availability_(dependencies.availability),
       media_information_(dependencies.media_information), events_(dependencies.events),
       port_(dependencies.port),
       clock_(std::move(dependencies.clock)),
@@ -496,6 +497,17 @@ void Maintenance::run(std::stop_token stop) {
             // durably-known node has been directly reached by this process and
             // metadata repair has validated/converged that complete replica set.
 
+            // What the reachable nodes hold between them: surveyed when
+            // the namespace, holdings, membership or a peer's storage has
+            // changed, and a no-op otherwise.
+            enter_stage("availability");
+            try {
+                if (const auto head = metadata_.current())
+                    (void)availability_.refresh(*head, clock_->now(), unix_ms());
+            } catch (const std::exception& error) {
+                Log::debug("availability survey deferred: " + std::string(error.what()));
+            }
+
             // Reachability GC, repair and explicit tombstone accounting share
             // one immutable namespace inventory. Rebuild it only when one of
             // those consumers can make progress or metadata has advanced.
@@ -632,7 +644,10 @@ void Maintenance::run(std::stop_token stop) {
                             // never stopped.
                             return repair_share.should_yield(clock_->now(), higher_class_active());
                         },
-                        inventory ? inventory->generation() : 0);
+                        inventory ? inventory->generation() : 0,
+                        // No work that cannot complete: the survey asks again
+                        // when membership or storage could change the answer.
+                        [this](const ObjectId& id) { return availability_.unavailable(id); });
                     {
                         // Split by whether a higher class was active as the
                         // step ended: repair idle against repair on its share.
@@ -1162,6 +1177,9 @@ void Maintenance::run(std::stop_token stop) {
                 deadline = std::min(deadline, now_after_work + policy.interval);
         }
         credit_deadline(local_credit, local_quiescent_until);
+        // A deferred roll-up, or a peer to ask again.
+        if (const auto due = availability_.due())
+            deadline = std::min(deadline, std::max(*due, now_after_work));
 
         // A maintenance action can itself commit metadata (retiring a matured garbage
         // marker, say); that event must not be lost for arriving before the wait.

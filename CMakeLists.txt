@@ -7,7 +7,7 @@ if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
 endif()
 
-project(macha VERSION 0.81.0 LANGUAGES CXX)
+project(macha VERSION 0.82.0 LANGUAGES CXX)
 
 # README.md states the version under its header as *vX.Y.Z*. Refuse to
 # configure when it disagrees with the project version, so a release cannot
@@ -286,6 +286,7 @@ set(MACHA_CORE_SOURCES
     src/contract/horizon.cpp
     src/contract/gates.cpp
     src/ledger/node_horizon_builder.cpp
+    src/ledger/availability.cpp
     src/ledger/predicate_query.cpp
     src/observation.cpp
     src/durable_file.cpp
@@ -328,6 +329,7 @@ set(MACHA_CORE_SOURCES
     src/http/http_compression.cpp
     src/api/status_api.cpp
     src/api/catalogue_api.cpp
+    src/api/files_api.cpp
     src/api/manage_api.cpp
     src/api/session_api.cpp
     src/api/users_api.cpp
@@ -361,6 +363,7 @@ set(MACHA_CORE_SOURCES
     src/torrent/torrent_request.cpp
     src/service/maintenance_clock.cpp
     src/service/claim_walk.cpp
+    src/service/availability_service.cpp
     src/service/maintenance.cpp
     src/service/service.cpp
     src/service/node_services.cpp
@@ -603,6 +606,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_contract.cpp
         tests/test_ledger_gates.cpp
         tests/test_horizon_builder.cpp
+        tests/test_availability.cpp
         tests/test_predicates.cpp
         tests/test_catalogue_maintenance.cpp
         tests/test_namespace_entries.cpp

@@ -250,7 +250,6 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     struct PendingPut {
         NodeInfo owner;
         std::optional<AsyncRpc> rpc;
-        std::optional<DataResourceArbiter::Lease> resource;
         Clock::time_point started{};
         bool done{};
         bool spilled{};
@@ -314,14 +313,18 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         return ok;
     };
 
+    // A DATA lease covers work on this node's device. A put to a peer takes
+    // none here: the peer admits it against its own device, and a sender
+    // holding a slot while it waited would leave two nodes that replicate to
+    // each other waiting on each other's slots.
     auto launch = [&](const NodeInfo& owner) {
-        auto resource = data_resources_.acquire(
-            DataWorkContext(frame_type, data.size(), {}, cancelled), data.size());
-        if (!resource) {
-            ++replacement_needed;
-            return;
-        }
         if (owner.id == n_.node_id()) {
+            auto resource = data_resources_.acquire(
+                DataWorkContext(frame_type, data.size(), {}, cancelled), data.size());
+            if (!resource) {
+                ++replacement_needed;
+                return;
+            }
             const auto started = Clock::now();
             if (!local_.data().has(id))
                 events_.notify(NodeEvent::storage);
@@ -347,7 +350,6 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
             PendingPut item;
             item.owner = owner;
             item.started = Clock::now();
-            item.resource.emplace(std::move(*resource));
             const auto type = batch ? MessageType::put_object_deferred : MessageType::put_object;
             item.rpc.emplace(n_.call_async(owner, type, payload, frame_type));
             pending.push_back(std::move(item));
@@ -1351,15 +1353,16 @@ void DistributedStore::prompt_replication_loop(std::stop_token stop) {
 bool DistributedStore::put_on(const NodeInfo& target, const ObjectId& id,
                               std::span<const uint8_t> data, bool foreground) {
     const auto frame_type = foreground ? FrameType::foreground : FrameType::speculative;
-    auto resource = data_resources_.acquire(
-        DataWorkContext(frame_type, data.size()), data.size());
-    if (!resource)
-        return false;
     if (target.id == n_.node_id()) {
+        auto resource = data_resources_.acquire(
+            DataWorkContext(frame_type, data.size()), data.size());
+        if (!resource)
+            return false;
         if (!local_.data().has(id))
             events_.notify(NodeEvent::storage);
         return local_.data().put(id, data);
     }
+    // No local lease across the peer's admission (see replicate()).
     Writer writer;
     writer.fixed(id.bytes);
     writer.bytes(data);
@@ -1379,12 +1382,14 @@ DistributedStore::get_from(const NodeInfo& target, const ObjectId& id, FrameType
                            Clock::time_point deadline, std::atomic_bool* cancelled,
                            const std::function<bool()>& abort) {
     try {
-        auto resource = data_resources_.acquire(
-            DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
-            n_.config().extent_size);
-        if (!resource)
-            return {};
         if (target.id == n_.node_id()) {
+            // A lease for this node's device; a fetch from a peer takes none
+            // here, since the peer admits the read against its own.
+            auto resource = data_resources_.acquire(
+                DataWorkContext(frame_type, n_.config().extent_size, deadline, cancelled),
+                n_.config().extent_size);
+            if (!resource)
+                return {};
             auto memory = retained_memory_.acquire(
                 object_memory_class(frame_type), MemoryOwner::object_payload,
                 n_.config().extent_size, deadline, cancelled);
@@ -2290,7 +2295,8 @@ DistributedStore::RepairResult
 DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                               std::optional<std::span<const ObjectId>> live,
                               const std::function<bool()>& should_yield,
-                              uint64_t live_generation) {
+                              uint64_t live_generation,
+                              const std::function<bool(const ObjectId&)>& unavailable) {
     RepairResult result;
     result.complete = false;
     auto& transferred = result.bytes_transferred;
@@ -2669,6 +2675,18 @@ DistributedStore::repair_step(uint64_t byte_budget, size_t operation_budget,
                     break;
                 (void)local_.data().put(id, *cached);
                 trace_repair("pull " + to_string(id) + " from-cache");
+                repair_pull_after_ = id;
+                ++it;
+                ++scanned_total;
+                ++result.pull_examined;
+                continue;
+            }
+
+            if (unavailable && unavailable(id)) {
+                static auto& skipped =
+                    observations().counter("maintenance.repair.pull_unavailable");
+                skipped.fetch_add(1, std::memory_order_relaxed);
+                trace_repair("pull " + to_string(id) + " unavailable");
                 repair_pull_after_ = id;
                 ++it;
                 ++scanned_total;
