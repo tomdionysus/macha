@@ -2115,6 +2115,14 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const st
     return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
                                         normalize_path(logical_path), frame_type);
 }
+std::shared_ptr<PublicationWriter> FileSystem::open_publication(const std::string& path,
+                                                               bool cache_puts,
+                                                               uint64_t pipeline_bytes,
+                                                               DataWorkContext work_context) {
+    return open_write(path, false, cache_puts, WriteDurability::publication_generation,
+                      pipeline_bytes, std::move(work_context));
+}
+
 std::shared_ptr<WriteHandle> FileSystem::open_write(const std::string& p, bool trunc,
                                                     bool cache_puts, WriteDurability durability,
                                                     uint64_t publication_pipeline_bytes,

@@ -5915,58 +5915,68 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
     auto c1 = config_for(cluster.path() / "repair-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "repair-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     Service s1(c1, keys);
-    Service s2(c2, keys);
+    auto s2 = std::make_unique<Service>(c2, keys);
     s1.start();
-    s2.start();
+    s2->start();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
+               s2->node().membership().active().size() >= 2;
     }));
     REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/a", 0755, getuid(), getgid()); }));
     REQUIRE(wait_until([&] {
         try {
-            return s2.filesystem().getattr("/a").type == EntryType::directory;
+            return s2->filesystem().getattr("/a").type == EntryType::directory;
         } catch (...) {
             return false;
         }
     }));
 
-    auto& replica = s2.local_state().replica();
-    auto certificates = replica.accepted_head_certificates();
+    auto certificates = s2->local_state().replica().accepted_head_certificates();
     REQUIRE(certificates.size() == 1);
     const auto head = certificates.front().hash;
     CHECK(s1.local_state().replica().history_contains(head));
 
-    // The replica on s2 cannot reconstruct the head, so excludes and flags it.
-    replica.set_force_unreconstructable_for_tests(
-        [head](const Hash256& hash) { return hash == head; });
-    (void)replica.accepted_heads();
+    // s2 loses its metadata checkpoint, journal and history while stopped; its
+    // acceptance certificate survives. It comes back holding a head it cannot
+    // replay, which it keeps, flags and excludes from reads.
+    s2->stop();
+    s2.reset();
+    const auto metadata = c2.state_path / "metadata";
+    for (const auto* name : {"checkpoint.meta", "journal.log", "history.log"})
+        std::filesystem::remove(metadata / name);
+    {
+        MetadataReplica damaged(c2.state_path, keys.storage, {}, false);
+        REQUIRE(damaged.unreconstructable_heads() == std::vector<Hash256>{head});
+    }
+    s2 = std::make_unique<Service>(c2, keys);
+    s2->start();
     REQUIRE(wait_until([&] {
-        return replica.unreconstructable_heads() == std::vector<Hash256>{head};
+        return s1.node().membership().active().size() >= 2 &&
+               s2->node().membership().active().size() >= 2;
     }));
-    // Lift the fault; the flag's 30 s cooldown means only repair can clear it here.
-    replica.set_force_unreconstructable_for_tests({});
 
+    // The flag's 30 s cooldown means only repair can clear it here.
+    auto& replica = s2->local_state().replica();
     REQUIRE(wait_until([&] {
-        (void)s2.metadata_manager().repair_unreconstructable_heads();
+        (void)s2->metadata_manager().repair_unreconstructable_heads();
         return replica.unreconstructable_heads().empty();
     }));
     CHECK(replica.accepted_heads().size() == 1);
     CHECK(replica.accepted_heads().front().hash == head);
-    CHECK(s2.filesystem().getattr("/a").type == EntryType::directory);
+    CHECK(s2->filesystem().getattr("/a").type == EntryType::directory);
 
     // The wire call itself, independently of the driver.
     Writer request;
     request.fixed(head.bytes);
-    auto reply = s2.node().call(s1.node().membership().self(),
-                                MessageType::get_metadata_history_record, request.take(),
-                                FrameType::control);
+    auto reply = s2->node().call(s1.node().membership().self(),
+                                 MessageType::get_metadata_history_record, request.take(),
+                                 FrameType::control);
     REQUIRE(reply.message.type == MessageType::metadata_history_entry_reply);
     auto served = decode_metadata_history_entry(reply.message.payload);
     CHECK(served.hash == head);
     CHECK(served.body == MetadataHistoryEntry::Body::full);
 
-    s2.stop();
+    s2->stop();
     s1.stop();
 }
 

@@ -456,9 +456,6 @@ class MetadataReplica {
     // break: not indexed, parent absent, succession, cycle, unreadable frame,
     // or replay hash mismatch.
     std::string diagnose_unreconstructable_locked(const Hash256& hash) const MACHA_REQUIRES(m_);
-    // Test-only: report the matching hashes as unreconstructable.
-    mutable std::function<bool(const Hash256&)>
-        force_unreconstructable_for_tests_ MACHA_GUARDED_BY(m_);
     // Loaded only if valid against committed_; record_checkpoint_ack() may
     // later set an acked proposal. nullopt means no proof.
     std::optional<HistoryCheckpointProof> checkpoint_proof_ MACHA_GUARDED_BY(m_);
@@ -606,10 +603,6 @@ class MetadataReplica {
     bool record_checkpoint_ack(HistoryCheckpointProof proposal);
     // Promote the acked record for exactly (floor_hash, epoch); false if none.
     bool record_checkpoint_commit(const Hash256& floor_hash, const Hash256& epoch);
-    void set_force_unreconstructable_for_tests(std::function<bool(const Hash256&)> hook) {
-        Lock lock(m_);
-        force_unreconstructable_for_tests_ = std::move(hook);
-    }
 };
 std::string normalize_path(const std::string&);
 std::string parent_path(const std::string&);

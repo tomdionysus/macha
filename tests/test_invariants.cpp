@@ -2074,7 +2074,8 @@ MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace
     write_file(fs, "/replace.bin", old_bytes);
     write_file(fs, "/unlink.bin", old_bytes);
 
-    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse);
+    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse,
+                          std::make_unique<ViewerWeightedAdmission>(fs, config.fuse), fs);
     const auto replaced_handle = frontend.open("/replace.bin", true, false, false, false);
     const auto unlinked_handle = frontend.open("/unlink.bin", true, false, false, false);
 
@@ -2108,7 +2109,8 @@ MACHA_TEST("invariants", test_dirty_open_inode_never_writes_remote_replacement) 
     write_file(fs, "/victim.bin", original);
     write_file(fs, "/incoming.bin", replacement);
 
-    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse);
+    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse,
+                          std::make_unique<ViewerWeightedAdmission>(fs, config.fuse), fs);
     const auto old = frontend.open("/victim.bin", true, true, false, false);
     REQUIRE(frontend.write(old.inode, 0, dirty) == dirty.size());
 

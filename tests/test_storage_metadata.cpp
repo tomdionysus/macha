@@ -10,6 +10,22 @@ using namespace macha::test_support;
 
 namespace {
 
+// Flips the last byte of the history frame ending at `frame_end`: the frame
+// stays indexed but no longer authenticates, so it cannot be replayed until it
+// is flipped back.
+void flip_history_frame(const std::filesystem::path& history, uint64_t frame_end) {
+    std::fstream file(history, std::ios::binary | std::ios::in | std::ios::out);
+    char byte{};
+    file.seekg(static_cast<std::streamoff>(frame_end - 1));
+    file.read(&byte, 1);
+    byte = static_cast<char>(byte ^ 0x5a);
+    file.seekp(static_cast<std::streamoff>(frame_end - 1));
+    file.write(&byte, 1);
+    file.flush();
+    if (!file)
+        throw std::runtime_error("cannot flip history frame byte in " + history.string());
+}
+
 std::optional<uint64_t> process_rss_kib() {
 #if defined(__linux__)
     std::ifstream status("/proc/self/status");
@@ -919,11 +935,13 @@ MACHA_FAST_TEST("storage_metadata",
 
     // Source: a healthy replica holding both heads (the merge as a delta).
     MetadataReplica source(source_path, keys.storage, {}, true, 1);
+    const auto source_history = source_path / "metadata" / "history.log";
     REQUIRE(source.store_commit(older));
     REQUIRE(source.accept_commit({older.generation, older.hash, 2, {a, b}}));
     REQUIRE(source.store_commit(newer));
     REQUIRE(source.accept_commit({newer.generation, newer.hash, 2, {a, b}}));
     REQUIRE(source.store_commit(merge, encoded_delta));
+    const auto merge_frame_end = std::filesystem::file_size(source_history);
     REQUIRE(source.accept_commit({merge.generation, merge.hash, 2, {a, b}}));
     REQUIRE(source.store_commit(divergent));
     REQUIRE(source.accept_commit({divergent.generation, divergent.hash, 2, {a, b}}));
@@ -977,12 +995,10 @@ MACHA_FAST_TEST("storage_metadata",
     // Re-anchoring over an *indexed* but unreplayable frame supersedes it in
     // place, and a restart prefers the full frame over the older delta.
     {
-        // Reconstruction fails for the enumeration that flags the head and for the
-        // repair's pre-check, then the re-anchored frame reads.
-        size_t forced = 0;
-        source.set_force_unreconstructable_for_tests([&](const Hash256& hash) {
-            return hash == merge.hash && ++forced <= 2;
-        });
+        // The merge's delta frame stops authenticating, so the enumeration that
+        // flags the head and the repair's pre-check both fail to replay it; the
+        // cache holds only the committed head, so nothing masks the frame.
+        flip_history_frame(source_history, merge_frame_end);
         REQUIRE(source.accepted_heads().size() == 1);
         REQUIRE(source.unreconstructable_heads() == std::vector<Hash256>{merge.hash});
         MetadataHistoryEntry full;
@@ -996,7 +1012,8 @@ MACHA_FAST_TEST("storage_metadata",
         const auto before = source.diagnostics().history_records;
         REQUIRE(source.reanchor_history(full));
         CHECK(source.diagnostics().history_records == before + 1);
-        source.set_force_unreconstructable_for_tests({});
+        // The superseded delta frame is whole again for the restart below.
+        flip_history_frame(source_history, merge_frame_end);
         auto entry = source.history_entry(merge.hash);
         REQUIRE(entry.has_value());
         CHECK(entry->body == MetadataHistoryEntry::Body::full);
@@ -1192,25 +1209,30 @@ MACHA_FAST_TEST("storage_metadata",
         record.hash = metadata_hash(record.generation, record.previous, record.payload);
         return record;
     };
-    // Three siblings forked from genesis: each accept_commit() below is a real
-    // conflicting-branch acceptance.
+    // Siblings forked from genesis: each accept_commit() below is a real
+    // conflicting-branch acceptance. head_z's higher generation makes it the
+    // committed head, so head_a is an accepted head the cache does not pin.
     const auto head_a = make_child(genesis, "/a");
     const auto head_b = make_child(genesis, "/b");
     const auto head_c = make_child(genesis, "/c");
+    auto head_z = make_child(genesis, "/z");
+    head_z.generation = 5;
+    head_z.hash = metadata_hash(head_z.generation, head_z.previous, head_z.payload);
 
-    MetadataReplica replica(path, keys.storage);
+    // Only the committed head is cached, so reconstructing head_a reads its
+    // history frame.
+    MetadataReplica replica(path, keys.storage, {}, true, 1);
+    const auto history = path / "metadata" / "history.log";
     REQUIRE(replica.store_commit(head_a));
+    const auto head_a_frame_end = std::filesystem::file_size(history);
     REQUIRE(replica.accept_commit(MetadataAcceptance{head_a.generation, head_a.hash, 0, {}}));
-    REQUIRE(replica.accepted_heads().size() == 1);
+    REQUIRE(replica.store_commit(head_z));
+    REQUIRE(replica.accept_commit(MetadataAcceptance{head_z.generation, head_z.hash, 0, {}}));
+    REQUIRE(replica.committed().hash == head_z.hash);
+    REQUIRE(replica.accepted_heads().size() == 2);
 
-    // Force head_a to report as unreconstructable from here on.
-    size_t reconstruct_attempts = 0;
-    replica.set_force_unreconstructable_for_tests([&](const Hash256& hash) {
-        if (hash != head_a.hash)
-            return false;
-        ++reconstruct_attempts;
-        return true;
-    });
+    // head_a's frame stops authenticating.
+    flip_history_frame(history, head_a_frame_end);
 
     REQUIRE(replica.store_commit(head_b));
     bool threw = false;
@@ -1221,7 +1243,11 @@ MACHA_FAST_TEST("storage_metadata",
         CHECK(std::string(error.what()).find("cannot be reconstructed") != std::string::npos);
     }
     CHECK(threw); // The first occurrence still surfaces.
-    CHECK(reconstruct_attempts == 1);
+    REQUIRE(replica.unreconstructable_heads() == std::vector<Hash256>{head_a.hash});
+
+    // The frame is whole again: from here a reconstruction of head_a would
+    // succeed, so only the cooldown keeps it excluded.
+    flip_history_frame(history, head_a_frame_end);
 
     // A second fork accepted shortly after neither re-attempts reconstructing
     // head_a nor re-throws.
@@ -1233,7 +1259,6 @@ MACHA_FAST_TEST("storage_metadata",
         threw_again = true;
     }
     CHECK(!threw_again);
-    CHECK(reconstruct_attempts == 1); // Not retried again within the cooldown.
 
     // accepted_heads(), the hottest path, also stays quiet under repeated calls
     // and returns the reconstructable heads.
@@ -1246,11 +1271,12 @@ MACHA_FAST_TEST("storage_metadata",
             heads_threw = true;
         }
         CHECK(!heads_threw);
-        REQUIRE(heads.size() == 2);
+        REQUIRE(heads.size() == 3);
         for (const auto& head : heads)
             CHECK(head.hash != head_a.hash);
     }
-    CHECK(reconstruct_attempts == 1);
+    // Not retried within the cooldown.
+    CHECK(replica.unreconstructable_heads() == std::vector<Hash256>{head_a.hash});
 }
 
 MACHA_FAST_TEST("storage_metadata", test_history_transfer_follows_only_materialization_dependencies) {

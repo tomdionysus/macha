@@ -3417,8 +3417,6 @@ std::shared_ptr<const MetadataMaterialization> MetadataReplica::cache_materializ
 
 std::shared_ptr<const MetadataMaterialization>
 MetadataReplica::materialized_locked(const Hash256& target) const {
-    if (force_unreconstructable_for_tests_ && force_unreconstructable_for_tests_(target))
-        return {};
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
     auto found = history_.find(target);
     if (found == history_.end())
@@ -4191,15 +4189,6 @@ std::optional<MetadataRecord> MetadataReplica::historical(const Hash256& hash) c
 
 std::shared_ptr<const MetadataMaterialization>
 MetadataReplica::materialized(const Hash256& hash) const {
-    {
-        std::function<bool(const Hash256&)> forced;
-        {
-            Lock lock(m_);
-            forced = force_unreconstructable_for_tests_;
-        }
-        if (forced && forced(hash))
-            return {};
-    }
     historical_requests_.fetch_add(1, std::memory_order_relaxed);
     Lock computation(materialization_compute_m_);
 

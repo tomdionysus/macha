@@ -132,7 +132,75 @@ enum class WriteDurability : uint8_t {
     publication_generation,
 };
 
-class WriteHandle {
+// One file generation being published from durable local input: its extents
+// are staged provisionally, drained, and committed to the namespace. Every
+// operation is thread_safe; a publication drives one writer from one worker
+// at a time.
+class PublicationWriter {
+  public:
+    virtual ~PublicationWriter() = default;
+
+    // Stage the existing generation a write at `offset` overlaps, within
+    // `byte_budget` (zero: to completion); !ready asks the caller to yield.
+    static constexpr Waits prepare_write_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety prepare_write_safety = ThreadSafety::thread_safe;
+    virtual WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget) = 0;
+
+    static constexpr Waits prepare_commit_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety prepare_commit_safety = ThreadSafety::thread_safe;
+    virtual WritePreparation prepare_commit(uint64_t byte_budget) = 0;
+
+    static constexpr Waits write_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety write_safety = ThreadSafety::thread_safe;
+    virtual size_t write(uint64_t offset, std::span<const uint8_t>) = 0;
+
+    static constexpr Waits truncate_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety truncate_safety = ThreadSafety::thread_safe;
+    virtual void truncate(uint64_t size) = 0;
+
+    // Waits for every staged extent put; a failure here is retryable and
+    // leaves the writer usable.
+    static constexpr Waits drain_staging_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety drain_staging_safety = ThreadSafety::thread_safe;
+    virtual void drain_staging() = 0;
+
+    // The mtime the next commit publishes.
+    static constexpr Waits set_committed_mtime_waits = Waits::locks;
+    static constexpr ThreadSafety set_committed_mtime_safety = ThreadSafety::thread_safe;
+    virtual void set_committed_mtime(int64_t mtime_ns) = 0;
+
+    static constexpr Waits commit_waits = Waits::data_device | Waits::network | Waits::locks;
+    static constexpr ThreadSafety commit_safety = ThreadSafety::thread_safe;
+    virtual void commit() = 0;
+
+    // The entry the last commit published.
+    static constexpr Waits committed_entry_waits = Waits::locks;
+    static constexpr ThreadSafety committed_entry_safety = ThreadSafety::thread_safe;
+    virtual FsEntry committed_entry() const = 0;
+
+    static constexpr Waits diagnostics_waits = Waits::locks;
+    static constexpr ThreadSafety diagnostics_safety = ThreadSafety::thread_safe;
+    virtual WriteHandleDiagnostics diagnostics() const = 0;
+};
+
+// Where the FUSE frontend publishes spooled file data. FileSystem is the
+// production target.
+class PublicationTarget {
+  public:
+    virtual ~PublicationTarget() = default;
+
+    // Opens a writer for one generation of the file at `path`; ENOENT when
+    // the path is absent. `pipeline_bytes` bounds provisional extent data in
+    // flight.
+    static constexpr Waits open_publication_waits = Waits::network | Waits::locks;
+    static constexpr ThreadSafety open_publication_safety = ThreadSafety::thread_safe;
+    virtual std::shared_ptr<PublicationWriter> open_publication(const std::string& path,
+                                                                bool cache_puts,
+                                                                uint64_t pipeline_bytes,
+                                                                DataWorkContext) = 0;
+};
+
+class WriteHandle final : public PublicationWriter {
     friend class FileSystem;
 class PlaybackTracker;
 
@@ -240,25 +308,25 @@ class PlaybackTracker;
                 WriteDurability = WriteDurability::immediate,
                 uint64_t publication_pipeline_bytes = 0,
                 DataWorkContext work_context = DataWorkContext{});
-    ~WriteHandle();
+    ~WriteHandle() override;
     // Prepares any existing generation needed for a write at `offset`. Zero
     // budget runs to completion; non-zero is a hard DATA byte quantum and may
     // return !ready so the caller can yield.
-    WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget = 0);
-    WritePreparation prepare_commit(uint64_t byte_budget = 0);
-    size_t write(uint64_t, std::span<const uint8_t>);
-    void truncate(uint64_t);
-    void commit();
+    WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget = 0) override;
+    WritePreparation prepare_commit(uint64_t byte_budget = 0) override;
+    size_t write(uint64_t, std::span<const uint8_t>) override;
+    void truncate(uint64_t) override;
+    void commit() override;
     // The mtime the next commit publishes. The FUSE frontend sets the inode's
     // visible mtime so a utimens after the writes (rsync's order) is not
     // overwritten by the asynchronous publication's own timestamp.
-    void set_committed_mtime(int64_t mtime_ns) {
+    void set_committed_mtime(int64_t mtime_ns) override {
         Lock lock(m_);
         committed_mtime_ = mtime_ns;
     }
-    void drain_staging();
-    WriteHandleDiagnostics diagnostics() const;
-    FsEntry committed_entry() const { Lock lock(m_); return base_; }
+    void drain_staging() override;
+    WriteHandleDiagnostics diagnostics() const override;
+    FsEntry committed_entry() const override { Lock lock(m_); return base_; }
     uint64_t diagnostic_id() const noexcept {
         return diagnostic_id_;
     }
@@ -267,7 +335,7 @@ class PlaybackTracker;
         return logical_;
     }
 };
-class FileSystem {
+class FileSystem final : public PublicationTarget {
     friend class WriteHandle;
 
     const Config& config_;
@@ -392,6 +460,10 @@ class FileSystem {
                                             WriteDurability = WriteDurability::immediate,
                                             uint64_t publication_pipeline_bytes = 0,
                                             DataWorkContext work_context = DataWorkContext{});
+    // open_write() for a publication generation, never truncating.
+    std::shared_ptr<PublicationWriter> open_publication(const std::string& path, bool cache_puts,
+                                                        uint64_t pipeline_bytes,
+                                                        DataWorkContext work_context) override;
     std::optional<uint64_t> active_write_size(const std::string&);
     std::vector<WriteHandleDiagnostics> active_write_diagnostics(const std::string&);
     // `stale_basis_is_replayable`: a mismatched basis is ESTALE, not EAGAIN. A
