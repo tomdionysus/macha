@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "config.hpp"
 #include "subsystem/subsystem.hpp"
 
@@ -87,8 +89,8 @@ class FuseSubsystem final : public Subsystem {
     std::unique_ptr<FuseMountDriver> driver_;
     std::shared_ptr<FuseFrontend> frontend_;
 
-    std::mutex fault_mutex_;
-    FaultSink fault_sink_;
+    Mutex fault_mutex_;
+    FaultSink fault_sink_ MACHA_GUARDED_BY(fault_mutex_);
     std::atomic_bool stopping_{};
 
     std::jthread mount_;

@@ -125,7 +125,7 @@ Observations::Observations(size_t max_series, size_t max_events)
     : max_series_(max_series), max_events_(max_events) {}
 
 LatencyHistogram& Observations::histogram(std::string_view name) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (auto found = histograms_.find(name); found != histograms_.end())
         return *found->second;
     if (histograms_.size() >= max_series_) {
@@ -137,7 +137,7 @@ LatencyHistogram& Observations::histogram(std::string_view name) {
 }
 
 std::atomic<uint64_t>& Observations::counter(std::string_view name) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (auto found = counters_.find(name); found != counters_.end())
         return *found->second;
     if (counters_.size() >= max_series_) {
@@ -149,7 +149,7 @@ std::atomic<uint64_t>& Observations::counter(std::string_view name) {
 }
 
 void Observations::event(ObservationEvent event) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (events_.size() >= max_events_) {
         events_.pop_front();
         events_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -159,7 +159,7 @@ void Observations::event(ObservationEvent event) {
 
 ObservationSnapshot Observations::snapshot() const {
     ObservationSnapshot snapshot;
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     for (const auto& [name, histogram] : histograms_)
         snapshot.histograms.emplace(name, histogram->snapshot());
     for (const auto& [name, counter] : counters_)
@@ -173,7 +173,7 @@ ObservationSnapshot Observations::snapshot() const {
 }
 
 std::deque<ObservationEvent> Observations::drain_events() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return std::exchange(events_, {});
 }
 
@@ -272,7 +272,7 @@ ObservationLog::ObservationLog(std::filesystem::path path, uint64_t max_bytes)
     : path_(std::move(path)), max_bytes_(max_bytes) {}
 
 void ObservationLog::append(const std::string& line) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::error_code ec;
     std::filesystem::create_directories(path_.parent_path(), ec);
     const auto size = std::filesystem::file_size(path_, ec);
@@ -304,13 +304,16 @@ ObservationRecorder::~ObservationRecorder() {
 }
 
 void ObservationRecorder::start() {
-    previous_unix_ms_ = unix_ms();
+    {
+        Lock lock(tick_mutex_);
+        previous_unix_ms_ = unix_ms();
+    }
     thread_ = std::jthread([this](std::stop_token stop) {
         run_supervised_loop("observation", stop, [this, stop] {
             while (true) {
                 {
-                    std::unique_lock lock(wait_mutex_);
-                    wait_cv_.wait_for(lock, stop, interval_, [] { return false; });
+                    Lock lock(wait_mutex_);
+                    wait_cv_.wait_for(lock.native(), stop, interval_, [] { return false; });
                     if (stop.stop_requested())
                         return;
                 }
@@ -330,7 +333,7 @@ void ObservationRecorder::stop() {
 }
 
 void ObservationRecorder::tick(uint64_t now_unix_ms) {
-    std::lock_guard lock(tick_mutex_);
+    Lock lock(tick_mutex_);
     auto current = observations_.snapshot();
     std::map<std::string, uint64_t> gauges;
     if (sampler_) {

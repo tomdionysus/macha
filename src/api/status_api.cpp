@@ -513,8 +513,8 @@ void ClusterStatusService::persistence_loop(std::stop_token stop) {
     // per node. A failed checkpoint is retried; no telemetry backlog is replayed.
     auto delay = std::chrono::seconds(10);
     while (!stop.stop_requested()) {
-        std::unique_lock lock(wait_mutex_);
-        wait_cv_.wait_for(lock, stop, delay, [] { return false; });
+        Lock lock(wait_mutex_);
+        wait_cv_.wait_for(lock.native(), stop, delay, [] { return false; });
         lock.unlock();
         if (stop.stop_requested())
             break;

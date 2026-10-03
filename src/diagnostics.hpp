@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
 #include "types.hpp"
 
 #include <chrono>
@@ -35,6 +36,7 @@ class ThreadCpuReporter {
     void tick(uint64_t iterations = 1);
 };
 
+// DiagnosticLock over a std::mutex not yet converted to the annotated types.
 // Use only around important shared locks. It reports waits/holds above the
 // threshold at ALL and otherwise behaves like an ordinary unique_lock.
 class DiagnosticLock {
@@ -51,6 +53,24 @@ class DiagnosticLock {
     ~DiagnosticLock() noexcept;
     DiagnosticLock(const DiagnosticLock&) = delete;
     DiagnosticLock& operator=(const DiagnosticLock&) = delete;
+};
+
+// DiagnosticLock over an annotated mutex, checked like Lock.
+class MACHA_SCOPED_CAPABILITY TimedLock {
+    DiagnosticLock lock_;
+
+  public:
+    TimedLock(Mutex& mutex, std::string_view name,
+              std::chrono::milliseconds threshold = std::chrono::milliseconds(10))
+        MACHA_ACQUIRE(mutex)
+        : lock_(mutex.native(), name, threshold) {}
+    TimedLock(IoMutex& mutex, std::string_view name,
+              std::chrono::milliseconds threshold = std::chrono::milliseconds(10))
+        MACHA_ACQUIRE(mutex) MACHA_EXCLUDES(no_io)
+        : lock_(mutex.native(), name, threshold) {}
+    ~TimedLock() MACHA_RELEASE() {}
+    TimedLock(const TimedLock&) = delete;
+    TimedLock& operator=(const TimedLock&) = delete;
 };
 
 int64_t elapsed_ms(Clock::time_point started) noexcept;
