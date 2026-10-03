@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "interposed_local_store_files.hpp"
 #include "test_backend_support.hpp"
 #include <limits>
 
@@ -242,7 +243,9 @@ MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_load
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 0;
     options.pack_target_size = 0;
-    LocalStore store(t.path() / "store", options, keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
+                     {}, files);
 
     const auto viewer = pattern(512 * 1024, 0x41);
     const auto viewer_id = object_id(viewer);
@@ -255,8 +258,9 @@ MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_load
     std::promise<void> release_loader;
     auto release_loader_future = release_loader.get_future().share();
     std::atomic_uint64_t loader_hook_calls{};
-    store.set_before_loose_write_for_tests([&](const ObjectId& id) {
-        if (id != loader_id)
+    const auto loader_path = store.object_path(loader_id);
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path& path) {
+        if (op != InterposedLocalStoreFiles::Op::install || path != loader_path)
             return;
         if (loader_hook_calls.fetch_add(1, std::memory_order_relaxed) == 0)
             loader_entered.set_value();
@@ -268,8 +272,8 @@ MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_load
     });
     REQUIRE(loader_entered_future.wait_for(2s) == std::future_status::ready);
 
-    // The loader is held after admission but before crypto and disk I/O; an
-    // unrelated viewer read needs only the short index lock and completes.
+    // The loader is held after admission, at its disk write; an unrelated
+    // viewer read needs only the short index lock and completes.
     auto viewer_read = std::async(std::launch::async, [&] { return store.get(viewer_id); });
     REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
     REQUIRE(viewer_read.get().has_value());
@@ -301,7 +305,9 @@ MACHA_TEST("storage_v18", test_unrelated_object_read_bypasses_blocked_packed_rea
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 256 * 1024;
     options.pack_target_size = 4 * 1024 * 1024;
-    LocalStore store(t.path() / "store", options, keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
+                     {}, files);
 
     const auto blocked = pattern(128 * 1024, 0x37);
     const auto blocked_id = object_id(blocked);
@@ -317,8 +323,8 @@ MACHA_TEST("storage_v18", test_unrelated_object_read_bypasses_blocked_packed_rea
     std::promise<void> release_read;
     auto release_read_future = release_read.get_future().share();
     std::atomic_bool first{true};
-    store.set_before_packed_read_for_tests([&](const ObjectId& id) {
-        if (id == blocked_id && first.exchange(false)) {
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op == InterposedLocalStoreFiles::Op::read_at && first.exchange(false)) {
             read_entered.set_value();
             release_read_future.wait();
         }
@@ -328,8 +334,8 @@ MACHA_TEST("storage_v18", test_unrelated_object_read_bypasses_blocked_packed_rea
                                   [&] { return store.get(blocked_id); });
     REQUIRE(read_entered_future.wait_for(2s) == std::future_status::ready);
 
-    // The packed inode is pinned with its read and decrypt stalled; an
-    // unrelated viewer read must still take the index lock and complete.
+    // The packed inode is pinned with its read stalled; an unrelated viewer
+    // read must still take the index lock and complete.
     auto viewer_read = std::async(std::launch::async,
                                   [&] { return store.get(viewer_id); });
     REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
@@ -357,7 +363,9 @@ MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_wri
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 256 * 1024;
     options.pack_target_size = 4 * 1024 * 1024;
-    LocalStore store(t.path() / "store", options, keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
+                     {}, files);
 
     const auto viewer = pattern(512 * 1024, 0x22);
     const auto viewer_id = object_id(viewer);
@@ -369,9 +377,11 @@ MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_wri
     auto write_entered_future = write_entered.get_future();
     std::promise<void> release_write;
     auto release_write_future = release_write.get_future().share();
+    // Only the loader's records are appended once the viewer is stored.
     std::atomic_uint64_t hook_calls{};
-    store.set_before_packed_write_for_tests([&](const ObjectId& id) {
-        if (id == loader_id && hook_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op == InterposedLocalStoreFiles::Op::append &&
+            hook_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
             write_entered.set_value();
             release_write_future.wait();
         }
@@ -381,7 +391,7 @@ MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_wri
                                    [&] { return store.put(loader_id, loader); });
     REQUIRE(write_entered_future.wait_for(2s) == std::future_status::ready);
 
-    // The packed append is stalled before crypto and I/O; its reservation and
+    // The packed append is stalled at its disk write; its reservation and
     // per-object ownership must not hold the index mutex a viewer read needs.
     auto viewer_read = std::async(std::launch::async,
                                   [&] { return store.get(viewer_id); });
@@ -413,7 +423,9 @@ MACHA_TEST("storage_v18", test_viewer_reads_bypass_blocked_pack_compaction) {
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 256 * 1024;
     options.pack_target_size = 4 * 1024 * 1024;
-    LocalStore store(t.path() / "store", options, keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
+                     {}, files);
 
     const auto dead = pattern(128 * 1024, 0x19);
     const auto dead_id = object_id(dead);
@@ -430,9 +442,11 @@ MACHA_TEST("storage_v18", test_viewer_reads_bypass_blocked_pack_compaction) {
     auto compaction_entered_future = compaction_entered.get_future();
     std::promise<void> release_compaction;
     auto release_compaction_future = release_compaction.get_future().share();
-    store.set_before_pack_compaction_for_tests([&] {
-        compaction_entered.set_value();
-        release_compaction_future.wait();
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op == InterposedLocalStoreFiles::Op::list) {
+            compaction_entered.set_value();
+            release_compaction_future.wait();
+        }
     });
 
     auto compaction =
@@ -465,7 +479,9 @@ MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 256 * 1024;
     options.pack_target_size = 4 * 1024 * 1024;
-    LocalStore store(t.path() / "store", options, keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
+                     {}, files);
 
     const auto live = pattern(128 * 1024, 0x51);
     const auto live_id = object_id(live);
@@ -480,8 +496,8 @@ MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
     std::promise<void> release_reader;
     auto release_reader_future = release_reader.get_future().share();
     std::atomic_bool first{true};
-    store.set_before_packed_read_for_tests([&](const ObjectId& id) {
-        if (id == live_id && first.exchange(false)) {
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op == InterposedLocalStoreFiles::Op::read_at && first.exchange(false)) {
             reader_leased.set_value();
             release_reader_future.wait();
         }
@@ -540,8 +556,10 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
     options.limit = 64ULL * 1024 * 1024;
     options.pack_threshold = 256 * 1024;
     options.pack_target_size = 1024 * 1024;
+    InterposedLocalStoreFiles files;
     std::optional<LocalStore> store_holder;
-    store_holder.emplace(t.path() / "store", options, keys.storage);
+    store_holder.emplace(t.path() / "store", options, keys.storage,
+                         LocalStoreMode::authoritative, nullptr, files);
     auto& store = *store_holder;
 
     // Loose and packed objects take different presence-check paths.
@@ -556,17 +574,21 @@ MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
 
     std::atomic_bool loose_read{false};
     std::atomic_bool packed_read{false};
-    store.set_before_loose_read_for_tests([&](const ObjectId&) { loose_read = true; });
-    store.set_before_packed_read_for_tests([&](const ObjectId&) { packed_read = true; });
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op == InterposedLocalStoreFiles::Op::read)
+            loose_read = true;
+        if (op == InterposedLocalStoreFiles::Op::read_at)
+            packed_read = true;
+    });
 
-    // has() must not read or decrypt; the read hooks prove it, not just the
-    // returned boolean.
+    // has() must not read or decrypt; the recorded device reads prove it, not
+    // just the returned boolean.
     CHECK(store.has(loose_id));
     CHECK(store.has(packed_id));
     CHECK(!loose_read.load());
     CHECK(!packed_read.load());
 
-    // A real read does fire the hooks.
+    // A real read does reach the device.
     CHECK(store.get(loose_id).has_value());
     CHECK(store.get(packed_id).has_value());
     CHECK(loose_read.load());

@@ -4,6 +4,7 @@
 // reference model; for the store and pool, has() never reports an object a put
 // is still writing, never waits for that put, never consults the device after
 // warm-up, and is exact across a restart and a backend going offline and back.
+#include "interposed_local_store_files.hpp"
 #include "storage/local_store.hpp"
 #include "storage/presence_index.hpp"
 #include "storage/storage_pool.hpp"
@@ -169,7 +170,9 @@ struct Keys {
 
 MACHA_TEST("presence", test_has_answers_a_put_in_progress_without_waiting_for_it) {
     Keys k;
-    LocalStore store(k.dir.path() / "store", 64ULL << 20, k.keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(k.dir.path() / "store", 64ULL << 20, k.keys.storage,
+                     LocalStoreMode::authoritative, {}, files);
     REQUIRE(wait_until([&] { return store.presence_authoritative(); }, 5s));
     const auto bytes = numbered(1);
     const auto id = object_id(bytes);
@@ -178,7 +181,9 @@ MACHA_TEST("presence", test_has_answers_a_put_in_progress_without_waiting_for_it
     std::condition_variable cv;
     bool writing = false;
     bool release = false;
-    store.set_before_loose_write_for_tests([&](const ObjectId&) {
+    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op != InterposedLocalStoreFiles::Op::install)
+            return;
         std::unique_lock lock(mutex);
         writing = true;
         cv.notify_all();
@@ -205,12 +210,16 @@ MACHA_TEST("presence", test_has_answers_a_put_in_progress_without_waiting_for_it
 
 MACHA_TEST("presence", test_a_put_that_fails_midway_is_never_present) {
     Keys k;
-    LocalStore store(k.dir.path() / "store", 64ULL << 20, k.keys.storage);
+    InterposedLocalStoreFiles files;
+    LocalStore store(k.dir.path() / "store", 64ULL << 20, k.keys.storage,
+                     LocalStoreMode::authoritative, {}, files);
     REQUIRE(wait_until([&] { return store.presence_authoritative(); }, 5s));
     const auto bytes = numbered(1);
     const auto id = object_id(bytes);
-    store.set_before_loose_write_for_tests(
-        [](const ObjectId&) { throw std::runtime_error("device failed mid-write"); });
+    files.before([](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+        if (op == InterposedLocalStoreFiles::Op::install)
+            throw std::runtime_error("device failed mid-write");
+    });
     bool threw = false;
     try {
         (void)store.put(id, bytes);
@@ -220,7 +229,7 @@ MACHA_TEST("presence", test_a_put_that_fails_midway_is_never_present) {
     CHECK(threw);
     CHECK(!store.has(id));
     // And the store is still usable: the next put of it succeeds.
-    store.set_before_loose_write_for_tests({});
+    files.before({});
     REQUIRE(store.put(id, bytes));
     CHECK(store.has(id));
 }

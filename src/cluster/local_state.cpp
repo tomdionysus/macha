@@ -109,7 +109,8 @@ void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
             cfg.metadata_store.path,
             LocalStoreOptions{cfg.metadata_store.limit, 0, cfg.metadata_store.packing.threshold,
                               cfg.metadata_store.packing.target_size},
-            identity.keys.storage);
+            identity.keys.storage, LocalStoreMode::authoritative, nullptr,
+            posix_local_store_files());
         control_fetch_ = std::make_unique<ControlObjectFetch>(node, *control_);
         note_startup_progress();
         progress.mark(RecoveryProgress::control_storage);
