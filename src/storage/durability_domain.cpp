@@ -78,7 +78,7 @@ void DurabilityDomain::add_representative(std::filesystem::path path) {
     if (path.empty())
         return;
     path = path.lexically_normal();
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (std::find(representatives_.begin(), representatives_.end(), path) ==
         representatives_.end())
         representatives_.push_back(std::move(path));
@@ -86,7 +86,7 @@ void DurabilityDomain::add_representative(std::filesystem::path path) {
 
 DurabilityDomain::Generation DurabilityDomain::complete_mutation(
     std::filesystem::path file, std::filesystem::path directory) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (failure_)
         std::rethrow_exception(failure_);
     const auto generation = ++mutation_generation_;
@@ -102,7 +102,7 @@ DurabilityDomain::Generation DurabilityDomain::complete_mutation(
 void DurabilityDomain::await_durable(Generation generation, DurabilityUrgency urgency) {
     if (!generation)
         return;
-    std::unique_lock lock(mutex_);
+    Lock lock(mutex_);
     if (generation > mutation_generation_)
         throw std::runtime_error("durability generation was never admitted");
     if (failure_)
@@ -119,7 +119,7 @@ void DurabilityDomain::await_durable(Generation generation, DurabilityUrgency ur
     }
     cv_.notify_all();
 
-    cv_.wait(lock, [&] {
+    cv_.wait(lock.native(), [&]() MACHA_REQUIRES(mutex_) {
         return durable_generation_ >= generation || failure_ != nullptr;
     });
     if (failure_)
@@ -129,24 +129,24 @@ void DurabilityDomain::await_durable(Generation generation, DurabilityUrgency ur
 void DurabilityDomain::flush() {
     Generation generation;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         generation = mutation_generation_;
     }
     await_durable(generation, DurabilityUrgency::immediate);
 }
 
 DurabilityDomain::Generation DurabilityDomain::current_generation() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return mutation_generation_;
 }
 
 DurabilityDomain::Generation DurabilityDomain::durable_generation() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return durable_generation_;
 }
 
 bool DurabilityDomain::failed() const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return failure_ != nullptr;
 }
 
@@ -156,7 +156,7 @@ void DurabilityDomain::perform_barrier(Generation cut, std::vector<PortableMutat
     (void)portable;
     std::vector<std::filesystem::path> representatives;
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         representatives = representatives_;
     }
     int last_error = ENOENT;
@@ -208,8 +208,8 @@ void DurabilityDomain::loop(std::stop_token stop) {
         Generation cut = 0;
         std::vector<PortableMutation> portable;
         {
-            std::unique_lock lock(mutex_);
-            cv_.wait(lock, [&] {
+            Lock lock(mutex_);
+            cv_.wait(lock.native(), [&]() MACHA_REQUIRES(mutex_) {
                 return stop.stop_requested() || failure_ ||
                        requested_generation_ > durable_generation_;
             });
@@ -222,7 +222,7 @@ void DurabilityDomain::loop(std::stop_token stop) {
                 if (!batch_deadline_)
                     batch_deadline_ = std::chrono::steady_clock::now() + batch_window_;
                 const auto deadline = *batch_deadline_;
-                cv_.wait_until(lock, deadline, [&] {
+                cv_.wait_until(lock.native(), deadline, [&]() MACHA_REQUIRES(mutex_) {
                     return stop.stop_requested() || failure_ || immediate_requested_;
                 });
                 if (failure_)
@@ -253,21 +253,22 @@ void DurabilityDomain::loop(std::stop_token stop) {
         try {
             perform_barrier(cut, std::move(portable));
         } catch (...) {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             failure_ = std::current_exception();
             cv_.notify_all();
             return;
         }
 
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             durable_generation_ = std::max(durable_generation_, cut);
 #if !defined(__linux__)
+            const auto durable = durable_generation_;
             portable_mutations_.erase(
                 portable_mutations_.begin(),
                 std::find_if(portable_mutations_.begin(), portable_mutations_.end(),
                              [&](const PortableMutation& mutation) {
-                                 return mutation.generation > durable_generation_;
+                                 return mutation.generation > durable;
                              }));
 #endif
             if (requested_generation_ <= durable_generation_)

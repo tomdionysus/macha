@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "cluster/node_identity.hpp"
 #include "config.hpp"
 
@@ -46,7 +48,7 @@ class RecoveryProgress {
     // Keeps the first failure.
     void fail(std::string error) {
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             if (!failed_.exchange(true, std::memory_order_acq_rel))
                 error_ = std::move(error);
         }
@@ -54,7 +56,7 @@ class RecoveryProgress {
     }
     void mark_complete(uint64_t now_unix_ms) {
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             ready_unix_ms_.store(now_unix_ms, std::memory_order_release);
             complete_.store(true, std::memory_order_release);
         }
@@ -66,13 +68,13 @@ class RecoveryProgress {
     }
     // Waits until complete, failed, or `timeout`; true when complete.
     bool wait_complete(std::chrono::milliseconds timeout) const {
-        std::unique_lock lock(mutex_);
-        cv_.wait_for(lock, timeout, [this] { return complete() || failed(); });
+        Lock lock(mutex_);
+        cv_.wait_for(lock.native(), timeout, [this]() MACHA_REQUIRES(mutex_) { return complete() || failed(); });
         return complete();
     }
     bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
     std::string error() const {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         return error_;
     }
 
@@ -81,9 +83,9 @@ class RecoveryProgress {
     std::atomic_bool failed_{};
     std::atomic_bool complete_{};
     std::atomic_uint64_t ready_unix_ms_{};
-    mutable std::mutex mutex_;
+    mutable Mutex mutex_;
     mutable std::condition_variable cv_;
-    std::string error_;
+    std::string error_ MACHA_GUARDED_BY(mutex_);
 };
 
 // Recovery was stopped between stages; nothing failed.

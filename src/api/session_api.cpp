@@ -51,7 +51,7 @@ PasswordCredentialValidator::PasswordCredentialValidator(const UserStore& users,
     : users_(users), config_(std::move(config)) {}
 
 bool PasswordCredentialValidator::begin_check(const std::string& username) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (auto found = failures_.find(username);
         found != failures_.end() && Clock::now() < found->second.until)
         return false;
@@ -62,7 +62,7 @@ bool PasswordCredentialValidator::begin_check(const std::string& username) const
 }
 
 void PasswordCredentialValidator::end_check(const std::string& username, bool success) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     if (in_flight_)
         --in_flight_;
     if (success) {

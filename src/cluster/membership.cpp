@@ -21,6 +21,7 @@ constexpr uint64_t max_known_bytes = 16ULL * 1024 * 1024;
 
 Membership::Membership(NodeInfo s, std::chrono::milliseconds d, std::filesystem::path known_path)
     : self_(std::move(s)), dead_(d), known_path_(std::move(known_path)) {
+    Lock lock(m_);
     load_known();
 }
 
@@ -81,7 +82,7 @@ void Membership::load_known() {
                                           std::move(reset)).second)
                 throw DecodeError("duplicate identity association reset");
         }
-        std::erase_if(nodes_, [&](const auto& item) {
+        std::erase_if(nodes_, [&](const auto& item) MACHA_REQUIRES(m_) {
             const auto& node = item.second.info;
             return std::any_of(identity_resets_.begin(), identity_resets_.end(),
                                [&](const auto& reset_item) {
@@ -146,24 +147,24 @@ void Membership::persist_known_locked() const {
 }
 
 NodeInfo Membership::self() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     auto s = self_;
     s.seen_unix_ms = unix_ms();
     return s;
 }
 void Membership::usage(uint64_t u) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     self_.used = u;
     self_.seen_unix_ms = unix_ms();
 }
 void Membership::storage(uint64_t used, uint64_t capacity) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     self_.used = used;
     self_.capacity = capacity;
     self_.seen_unix_ms = unix_ms();
 }
 void Membership::endpoint(std::string host, uint16_t port) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     if (host.empty() || !port)
         throw std::runtime_error("membership endpoint must be complete");
     self_.host = std::move(host);
@@ -171,12 +172,12 @@ void Membership::endpoint(std::string host, uint16_t port) {
     self_.seen_unix_ms = unix_ms();
 }
 void Membership::metadata_generation(uint64_t generation) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     self_.metadata_generation = std::max(self_.metadata_generation, generation);
     self_.seen_unix_ms = unix_ms();
 }
 bool Membership::set_flags(bool inbound_capable, bool hosts_extents) {
-    std::lock_guard g(m_);
+    Lock g(m_);
     const auto flags = node_flags_for(inbound_capable, hosts_extents);
     if (self_.flags == flags)
         return false;
@@ -185,23 +186,25 @@ bool Membership::set_flags(bool inbound_capable, bool hosts_extents) {
     return true;
 }
 bool Membership::inbound_capable(const NodeId& id) const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     if (id == self_.id)
         return node_inbound_capable(self_);
     const auto found = nodes_.find(id);
     return found == nodes_.end() || node_inbound_capable(found->second.info);
 }
 bool Membership::hosts_extents(const NodeId& id) const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     if (id == self_.id)
         return node_hosts_extents(self_);
     const auto found = nodes_.find(id);
     return found == nodes_.end() || node_hosts_extents(found->second.info);
 }
 void Membership::observe(NodeInfo n, bool direct) {
-    if (n.id == self_.id || n.host.empty() || !n.port)
+    if (n.host.empty() || !n.port)
         return;
-    std::lock_guard g(m_);
+    Lock g(m_);
+    if (n.id == self_.id)
+        return;
     for (const auto& [_, reset] : identity_resets_) {
         if (!identity_reset_matches_endpoint(reset, n.host, n.port) ||
             !identity_reset_matches_node(reset, n.id))
@@ -244,7 +247,7 @@ void Membership::observe(NodeInfo n, bool direct) {
 bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
     if (reset.host.empty() || !reset.epoch)
         return false;
-    std::lock_guard g(m_);
+    Lock g(m_);
     const auto key = identity_reset_key(reset.host, reset.port);
     auto found = identity_resets_.find(key);
     if (found != identity_resets_.end() && found->second.epoch >= reset.epoch)
@@ -262,7 +265,7 @@ bool Membership::apply_identity_reset(const IdentityAssociationReset& reset) {
 }
 
 std::vector<IdentityAssociationReset> Membership::identity_resets() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     std::vector<IdentityAssociationReset> out;
     out.reserve(identity_resets_.size());
     for (const auto& [_, reset] : identity_resets_)
@@ -270,7 +273,7 @@ std::vector<IdentityAssociationReset> Membership::identity_resets() const {
     return out;
 }
 MembershipSnapshot Membership::snapshot() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     const auto now = Clock::now();
     const auto seen = unix_ms();
     MembershipSnapshot out;
@@ -289,7 +292,7 @@ MembershipSnapshot Membership::snapshot() const {
 }
 
 std::vector<NodeInfo> Membership::all() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     std::vector<NodeInfo> out{self_};
     out[0].seen_unix_ms = unix_ms();
     out.reserve(nodes_.size() + 1);
@@ -299,7 +302,7 @@ std::vector<NodeInfo> Membership::all() const {
 }
 
 std::vector<NodeInfo> Membership::active() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     const auto now = Clock::now();
     std::vector<NodeInfo> out{self_};
     out[0].seen_unix_ms = unix_ms();
@@ -311,7 +314,7 @@ std::vector<NodeInfo> Membership::active() const {
 }
 
 bool Membership::all_known_reachable() const {
-    std::lock_guard g(m_);
+    Lock g(m_);
     const auto now = Clock::now();
     const bool self_capable = node_inbound_capable(self_);
     return std::all_of(nodes_.begin(), nodes_.end(), [&](const auto& item) {

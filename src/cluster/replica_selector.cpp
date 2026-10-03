@@ -51,7 +51,7 @@ std::vector<NodeInfo> ReplicaSelector::order(const std::vector<NodeInfo>& candid
     std::vector<Ranked> ranked;
     ranked.reserve(candidates.size());
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     const size_t rotation = stripe % candidates.size();
     for (size_t i = 0; i < candidates.size(); ++i) {
         auto it = states_.find(candidates[i].id);
@@ -75,7 +75,7 @@ std::vector<NodeInfo> ReplicaSelector::order(const std::vector<NodeInfo>& candid
 }
 
 void ReplicaSelector::started(const NodeInfo& node, ReplicaWorkClass work) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& state = states_[node.id];
     ++state.selections;
     if (work == ReplicaWorkClass::foreground)
@@ -85,7 +85,7 @@ void ReplicaSelector::started(const NodeInfo& node, ReplicaWorkClass work) {
 }
 
 void ReplicaSelector::promoted(const NodeInfo& node) {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& state = states_[node.id];
     if (!state.speculative_in_flight)
         return;
@@ -99,7 +99,7 @@ void ReplicaSelector::finished(const NodeInfo& node, ReplicaWorkClass work, size
     const double ms = std::max(0.001,
         std::chrono::duration<double, std::milli>(elapsed).count());
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto& state = states_[node.id];
     if (work == ReplicaWorkClass::foreground) {
         if (state.foreground_in_flight)
@@ -121,7 +121,7 @@ void ReplicaSelector::finished(const NodeInfo& node, ReplicaWorkClass work, size
 }
 
 ReplicaTransferStats ReplicaSelector::stats(const NodeId& id) const {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     auto it = states_.find(id);
     if (it == states_.end())
         return {};

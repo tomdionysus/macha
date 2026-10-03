@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -53,7 +55,8 @@ class Logger {
 
 class ConsoleLogger final : public Logger {
     LogLevel level_;
-    mutable std::mutex mutex_;
+    // Held across the write to stderr.
+    mutable IoMutex mutex_;
 
   public:
     explicit ConsoleLogger(LogLevel level = LogLevel::info) : level_(level) {}
@@ -66,8 +69,8 @@ class ConsoleLogger final : public Logger {
 // once configuration has been parsed; the default is ConsoleLogger(INFO) so
 // startup/configuration failures are still visible.
 class Log {
-    static std::mutex mutex_;
-    static std::shared_ptr<Logger> logger_;
+    static Mutex mutex_;
+    static std::shared_ptr<Logger> logger_ MACHA_GUARDED_BY(mutex_);
     static std::atomic<unsigned int> enabled_mask_;
     static std::shared_ptr<Logger> logger();
 

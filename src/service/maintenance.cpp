@@ -116,7 +116,7 @@ void Maintenance::request_stop() noexcept {
         return;
     thread_.request_stop();
     {
-        std::lock_guard lock(events_.wait_mutex);
+        Lock lock(events_.wait_mutex);
     }
     events_.wait_cv.notify_all();
 }
@@ -1210,8 +1210,8 @@ void Maintenance::wait_for_events(std::stop_token stop, Clock::time_point deadli
     // replica, which must not happen under the lock notify() takes.
     while (!stop.stop_requested() && clock_->now() < deadline) {
         {
-            std::unique_lock wait_lock(events_.wait_mutex);
-            clock_->wait_until(events_.wait_cv, wait_lock, stop, deadline,
+            Lock wait_lock(events_.wait_mutex);
+            clock_->wait_until(events_.wait_cv, wait_lock.native(), stop, deadline,
                                [this] { return events_.total() != absorbed_total_; });
         }
         if (events_.total() != absorbed_total_ && absorb_events())

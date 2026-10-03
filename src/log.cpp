@@ -62,12 +62,12 @@ void ConsoleLogger::log(LogLevel level, const std::string& message) {
     // subtracts timestamps between journals.
     gmtime_r(&time, &tm);
 
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     std::cerr << std::put_time(&tm, "%F %TZ") << ' ' << log_level_name(level) << ' ' << message
               << '\n';
 }
 
-std::mutex Log::mutex_;
+Mutex Log::mutex_;
 std::shared_ptr<Logger> Log::logger_ = std::make_shared<ConsoleLogger>(LogLevel::info);
 std::atomic<unsigned int> Log::enabled_mask_{
     (1U << static_cast<unsigned int>(LogLevel::info)) |
@@ -75,7 +75,7 @@ std::atomic<unsigned int> Log::enabled_mask_{
     (1U << static_cast<unsigned int>(LogLevel::error))};
 
 std::shared_ptr<Logger> Log::logger() {
-    std::lock_guard lock(mutex_);
+    Lock lock(mutex_);
     return logger_;
 }
 
@@ -91,7 +91,7 @@ void Log::set_logger(std::shared_ptr<Logger> logger) {
     }
 
     {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         logger_ = std::move(logger);
     }
     enabled_mask_.store(mask, std::memory_order_release);

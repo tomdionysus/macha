@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include "contract/thread_safety.hpp"
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -23,7 +24,7 @@ template <class T> class Published {
     // The current snapshot, or null before the first publish. Thread-safe;
     // waits only on the pointer copy (a publish holds the lock for one swap).
     Handle handle() const {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         return current_;
     }
 
@@ -35,15 +36,15 @@ template <class T> class Published {
         if (!next)
             throw std::invalid_argument("Published::publish: a snapshot is required");
         {
-            std::lock_guard lock(mutex_);
+            Lock lock(mutex_);
             current_.swap(next);
         }
     }
     void publish(T value) { publish(std::make_shared<const T>(std::move(value))); }
 
   private:
-    mutable std::mutex mutex_;
-    Handle current_;
+    mutable Mutex mutex_;
+    Handle current_ MACHA_GUARDED_BY(mutex_);
 };
 
 } // namespace macha

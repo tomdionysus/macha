@@ -253,7 +253,7 @@ UserCredentialCheck UserStore::verify(std::string_view username,
     // `anonymous` is never reachable by password, whatever its record holds,
     // so no stored credential bypasses allow_anonymous.
     if (normalized != anonymous_username) {
-        std::shared_lock lock(mutex_);
+        ReadLock lock(mutex_);
         for (const auto& [_, record] : by_id_)
             if (!record.tombstone && record.username == normalized) {
                 user = record;
@@ -287,7 +287,7 @@ UserCredentialCheck UserStore::verify(std::string_view username,
 }
 
 std::optional<UserRecord> UserStore::find(std::string_view user_id) const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     auto found = by_id_.find(std::string(user_id));
     if (found == by_id_.end() || found->second.tombstone)
         return std::nullopt;
@@ -296,7 +296,7 @@ std::optional<UserRecord> UserStore::find(std::string_view user_id) const {
 
 std::optional<UserRecord> UserStore::find_by_username(std::string_view username) const {
     const auto normalized = normalize_username(username);
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     for (const auto& [_, record] : by_id_)
         if (!record.tombstone && record.username == normalized)
             return record;
@@ -304,7 +304,7 @@ std::optional<UserRecord> UserStore::find_by_username(std::string_view username)
 }
 
 std::vector<UserRecord> UserStore::list() const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     std::vector<UserRecord> out;
     for (const auto& [_, record] : by_id_)
         if (!record.tombstone)
@@ -315,7 +315,7 @@ std::vector<UserRecord> UserStore::list() const {
 }
 
 std::vector<UserRecord> UserStore::all() const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     std::vector<UserRecord> out;
     out.reserve(by_id_.size());
     for (const auto& [_, record] : by_id_)
@@ -324,7 +324,7 @@ std::vector<UserRecord> UserStore::all() const {
 }
 
 bool UserStore::sole_user_manager(std::string_view user_id) const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     auto found = by_id_.find(std::string(user_id));
     if (found == by_id_.end() || found->second.tombstone ||
         !user_has_role(found->second, role_manage_users))
@@ -336,21 +336,21 @@ bool UserStore::sole_user_manager(std::string_view user_id) const {
 }
 
 size_t UserStore::size() const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     return static_cast<size_t>(
         std::count_if(by_id_.begin(), by_id_.end(),
                       [](const auto& item) { return !item.second.tombstone; }));
 }
 
 size_t UserStore::tombstones() const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     return static_cast<size_t>(
         std::count_if(by_id_.begin(), by_id_.end(),
                       [](const auto& item) { return item.second.tombstone; }));
 }
 
 Hash256 UserStore::table_hash() const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     std::vector<UserRecord> ordered;
     ordered.reserve(by_id_.size());
     for (const auto& [_, record] : by_id_)
@@ -403,7 +403,7 @@ std::optional<UserRecord> UserStore::insert(std::string_view username, std::stri
     user.updated_by = by;
 
     {
-        std::unique_lock lock(mutex_);
+        WriteLock lock(mutex_);
         for (const auto& [_, record] : by_id_)
             if (!record.tombstone && record.username == normalized)
                 return std::nullopt;
@@ -418,7 +418,7 @@ std::optional<UserRecord> UserStore::insert(std::string_view username, std::stri
 std::optional<UserRecord> UserStore::mutate(std::string_view user_id,
                                             const std::function<bool(UserRecord&)>& change,
                                             const NodeId& by) {
-    std::unique_lock lock(mutex_);
+    WriteLock lock(mutex_);
     auto found = by_id_.find(std::string(user_id));
     if (found == by_id_.end() || found->second.tombstone)
         return std::nullopt;
@@ -535,7 +535,7 @@ std::optional<UserRecord> UserStore::reset_root_password(std::string_view new_pa
 }
 
 bool UserStore::apply(UserRecord incoming) {
-    std::unique_lock lock(mutex_);
+    WriteLock lock(mutex_);
     auto found = by_id_.find(incoming.id);
     if (found != by_id_.end()) {
         if (!incoming_wins(found->second, incoming))
@@ -698,7 +698,7 @@ std::optional<InitialAccounts> create_initial_accounts(UserStore& users, const C
 }
 
 void UserStore::persist() const {
-    std::shared_lock lock(mutex_);
+    ReadLock lock(mutex_);
     persist_locked();
 }
 

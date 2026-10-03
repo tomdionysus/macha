@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include "auth/accounts.hpp"
 #include "cluster/cluster.hpp"
 #include "http/http.hpp"
@@ -50,8 +52,8 @@ class PasswordCredentialValidator final : public CredentialValidator {
 
     // Local brakes on an unauthenticated endpoint running an expensive KDF. They
     // protect this node's CPU and are deliberately not cluster state.
-    mutable std::mutex mutex_;
-    mutable size_t in_flight_{};
+    mutable Mutex mutex_;
+    mutable size_t in_flight_ MACHA_GUARDED_BY(mutex_){};
     struct Failures {
         size_t count{};
         Clock::time_point until{};

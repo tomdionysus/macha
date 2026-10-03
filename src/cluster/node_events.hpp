@@ -5,7 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <mutex>
+#include "contract/thread_safety.hpp"
 
 namespace macha {
 
@@ -32,7 +32,7 @@ class NodeEvents {
     void notify(NodeEvent kind) {
         counts_[index(kind)].fetch_add(1, std::memory_order_release);
         {
-            std::lock_guard lock(wait_mutex);
+            Lock lock(wait_mutex);
         }
         wait_cv.notify_all();
     }
@@ -47,7 +47,8 @@ class NodeEvents {
         return sum;
     }
 
-    std::mutex wait_mutex;
+    // Guards nothing; held only to order a notify against a waiter's check.
+    Mutex wait_mutex;
     std::condition_variable_any wait_cv;
 
   private:

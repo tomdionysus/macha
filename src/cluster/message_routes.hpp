@@ -4,10 +4,10 @@
 #include "cluster/frame_type.hpp"
 #include "cluster/net.hpp"
 #include "codec.hpp"
+#include "contract/thread_safety.hpp"
 
 #include <array>
 #include <functional>
-#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 
@@ -32,19 +32,19 @@ class MessageRoutes {
         std::function<RpcMessage(const NodeInfo& peer, FrameType, const RpcMessage& request)>;
 
     void bind(MessageType type, Handler handler) {
-        std::unique_lock lock(mutex_);
+        WriteLock lock(mutex_);
         handlers_[index(type)] = std::move(handler);
     }
     // Waits for calls in flight on any route.
     void unbind(MessageType type) {
-        std::unique_lock lock(mutex_);
+        WriteLock lock(mutex_);
         handlers_[index(type)] = {};
     }
     RpcMessage dispatch(const NodeInfo& peer, FrameType frame_type,
                         const RpcMessage& request) const {
         if (static_cast<size_t>(request.type) >= route_count)
             return error_reply("unsupported request");
-        std::shared_lock lock(mutex_);
+        ReadLock lock(mutex_);
         const auto& handler = handlers_[index(request.type)];
         if (!handler)
             return error_reply(std::string(message_type_name(request.type)) +
@@ -66,8 +66,9 @@ class MessageRoutes {
         return value;
     }
 
-    mutable std::shared_mutex mutex_;
-    std::array<Handler, route_count> handlers_;
+    // Held shared across each handler call, which may do any I/O.
+    mutable IoSharedMutex mutex_;
+    std::array<Handler, route_count> handlers_ MACHA_GUARDED_BY(mutex_);
 };
 
 } // namespace macha

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/thread_safety.hpp"
+
 #include <cstddef>
 #include <map>
 #include <mutex>
@@ -57,7 +59,7 @@ class SegmentHoldArbiter {
         : max_session_(max_session_holds), max_total_(max_concurrent_holds) {}
 
     void reconfigure(size_t max_session_holds, size_t max_concurrent_holds) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         max_session_ = max_session_holds;
         max_total_ = max_concurrent_holds;
     }
@@ -65,7 +67,7 @@ class SegmentHoldArbiter {
     // Never waits: a request the node cannot afford to hold is refused now,
     // not queued behind the ones already held.
     std::optional<Hold> try_acquire(std::string_view session, Refusal* why = nullptr) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         std::string key(session);
         auto it = per_session_.find(key);
         const size_t held = it == per_session_.end() ? 0 : it->second;
@@ -85,30 +87,30 @@ class SegmentHoldArbiter {
     }
 
     size_t outstanding() const {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         return total_;
     }
 
     size_t outstanding(std::string_view session) const {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = per_session_.find(std::string(session));
         return it == per_session_.end() ? 0 : it->second;
     }
 
   private:
     void release(const std::string& session) {
-        std::lock_guard lock(mutex_);
+        Lock lock(mutex_);
         auto it = per_session_.find(session);
         if (it != per_session_.end() && it->second > 0 && --it->second == 0)
             per_session_.erase(it);
         if (total_ > 0) --total_;
     }
 
-    mutable std::mutex mutex_;
-    size_t max_session_{};
-    size_t max_total_{};
-    size_t total_{};
-    std::map<std::string, size_t, std::less<>> per_session_;
+    mutable Mutex mutex_;
+    size_t max_session_ MACHA_GUARDED_BY(mutex_){};
+    size_t max_total_ MACHA_GUARDED_BY(mutex_){};
+    size_t total_ MACHA_GUARDED_BY(mutex_){};
+    std::map<std::string, size_t, std::less<>> per_session_ MACHA_GUARDED_BY(mutex_);
 };
 
 } // namespace macha
