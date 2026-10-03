@@ -144,10 +144,6 @@ struct FuseConfig {
     // when either is idle.
     size_t viewer_weight{95};
     size_t loader_weight{5};
-    // Test fixtures only; never parsed from YAML or CLI.
-    bool suspend_loader_for_tests{};
-    // Injects one retryable publication error after this many spool bytes; 0 = off.
-    uint64_t fail_publication_once_after_spool_bytes_for_tests{};
     // A worker yields after this much spool input so other inodes get service;
     // the in-flight budget bounds concurrently admitted quanta.
     uint64_t publication_quantum_bytes{32ULL * 1024 * 1024};

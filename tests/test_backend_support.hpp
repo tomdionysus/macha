@@ -597,4 +597,60 @@ inline RawHttpResponse raw_http_exchange(int fd, std::string_view request) {
     return raw_http_read_response(fd);
 }
 
+// Loader admission a test holds: while held no loader publication starts and
+// running loader work yields at its next chunk; released, loader work is
+// always admitted, as with no viewer. Starts released.
+class HeldLoaderAdmission final : public LoaderAdmission {
+    std::atomic_bool held_{};
+    Mutex wake_mutex_;
+    std::function<void()> wake_ MACHA_GUARDED_BY(wake_mutex_);
+
+    void set(bool held) {
+        held_.store(held, std::memory_order_release);
+        std::function<void()> wake;
+        {
+            Lock lock(wake_mutex_);
+            wake = wake_;
+        }
+        if (wake)
+            wake();
+    }
+
+  public:
+    void hold() { set(true); }
+    void release() { set(false); }
+
+    bool can_start(TimePoint) override { return !held_.load(std::memory_order_acquire); }
+    void started(TimePoint, bool) override {}
+    void service_started(TimePoint) override {}
+    bool should_yield(TimePoint) override { return held_.load(std::memory_order_acquire); }
+    void finished(TimePoint) override {}
+    std::optional<std::chrono::milliseconds> retry_after(TimePoint) override {
+        if (held_.load(std::memory_order_acquire))
+            return std::nullopt;
+        return std::chrono::milliseconds(0);
+    }
+    void set_wake_callback(std::function<void()> wake) override {
+        Lock lock(wake_mutex_);
+        wake_ = std::move(wake);
+    }
+};
+
+// A frontend admitting loader publication as production does, publishing
+// into `fs`.
+inline std::shared_ptr<FuseFrontend> make_fuse_frontend(FileSystem& fs,
+                                                        RetainedMemoryLedger& memory,
+                                                        const FuseConfig& config) {
+    return std::make_shared<FuseFrontend>(
+        fs, memory, config, std::make_unique<ViewerWeightedAdmission>(fs, config), fs);
+}
+
+// A frontend whose loader publication `admission` decides.
+inline std::shared_ptr<FuseFrontend> make_fuse_frontend(FileSystem& fs,
+                                                        RetainedMemoryLedger& memory,
+                                                        const FuseConfig& config,
+                                                        std::unique_ptr<LoaderAdmission> admission) {
+    return std::make_shared<FuseFrontend>(fs, memory, config, std::move(admission), fs);
+}
+
 } // namespace macha::test_support
