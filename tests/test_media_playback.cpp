@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "stepped_time.hpp"
 #include "test_backend_support.hpp"
 #include "media/media_containers.hpp"
 #include "playback/segment_holds.hpp"
@@ -10,11 +11,146 @@ using namespace macha::test_support;
 
 namespace {
 
+const SessionIdentity anonymous{.id = "", .roles = {"anonymous"}};
+
+Json body_of(const HttpResponse& response) {
+    return Json::parse(std::string(response.body.begin(), response.body.end()));
+}
+
+std::string session_id_of(const HttpResponse& response) {
+    return body_of(response).find("session_id")->asString();
+}
+
 // The body's `idempotency` field on a keyed create, or empty when absent.
 std::string idempotency_of(const HttpResponse& response) {
-    auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
+    const auto body = body_of(response);
     const auto* field = body.find("idempotency");
     return field ? field->asString() : std::string{};
+}
+
+// Playback serves payloads as range-capable streams, so reading one means draining it.
+std::string response_text(const HttpResponse& response) {
+    if (!response.stream) return std::string(response.body.begin(), response.body.end());
+    Bytes bytes(static_cast<size_t>(response.stream->size()));
+    size_t filled = 0;
+    while (filled < bytes.size()) {
+        const auto n = response.stream->read(filled, std::span(bytes).subspan(filled));
+        if (n == 0) break;
+        filled += n;
+    }
+    bytes.resize(filled);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+HttpRequest playback_request(std::string method, std::string path, const Json::Object& body = {},
+                             const SessionIdentity& who = anonymous) {
+    HttpRequest request;
+    request.method = std::move(method);
+    request.path = std::move(path);
+    request.session = who;
+    if (!body.empty()) {
+        const auto text = Json(body).dump();
+        request.body.assign(text.begin(), text.end());
+    }
+    return request;
+}
+
+std::string segment_name(int index, const char* suffix = ".m4s") {
+    std::ostringstream name;
+    name << "segment-" << std::setfill('0') << std::setw(6) << index << suffix;
+    return name.str();
+}
+
+// One node's filesystem and catalogue: what PlaybackManager,
+// MediaInformationService and CatalogueApi are built on. Each test gives
+// every file distinct bytes, so managers sharing the node never share a
+// media id or its cached profile.
+class PlaybackNode {
+    TestNode node_{"playback"};
+    std::unique_ptr<CatalogueManager> catalogue_;
+    std::unique_ptr<CatalogueHintQueue> hints_;
+    unsigned managers_{};
+
+  public:
+    PlaybackNode() {
+        node_.start();
+        auto& bare = node_.node();
+        catalogue_ = std::make_unique<CatalogueManager>(bare, bare.local_state(), bare.metadata_server(),
+                                                        node_.store(), node_.metadata(), bare.ledger());
+        hints_ = std::make_unique<CatalogueHintQueue>(node_.path() / "catalogue-hints");
+        filesystem().mkdir("/media", 0755, getuid(), getgid());
+    }
+
+    FileSystem& filesystem() { return node_.filesystem(); }
+    CatalogueManager& catalogue() { return *catalogue_; }
+    CatalogueHintQueue& hints() { return *hints_; }
+    const std::filesystem::path& path() const { return node_.path(); }
+
+    // Writes `bytes` at `path`, replacing what is there, and returns its media id.
+    std::string write(const std::string& path, const Bytes& bytes) {
+        try {
+            (void)filesystem().getattr(path);
+        } catch (const FsError&) {
+            filesystem().create_file(path, 0644, getuid(), getgid());
+        }
+        auto writer = filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        return file_media_id(filesystem().getattr(path));
+    }
+
+    // Streaming enabled, with a spool directory no other manager uses.
+    StreamingConfig streaming() {
+        StreamingConfig config;
+        config.enabled = true;
+        config.temp_path = path() / ("playback-" + std::to_string(++managers_));
+        return config;
+    }
+
+    std::unique_ptr<PlaybackManager> playback(
+        StreamingConfig streaming, std::shared_ptr<MediaEngine> engine,
+        std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
+        MediaInformationService* information = nullptr, CatalogueApiConfig api = {},
+        const TimeSource& time = steady_time_source()) {
+        auto manager = std::make_unique<PlaybackManager>(
+            filesystem(), node_.resources().transcode_rates, node_.resources().memory, catalogue(), api,
+            std::move(streaming), std::move(engine), std::move(request_media_profiles), information,
+            PlaybackManager::MediaFacts{}, time);
+        manager->start();
+        return manager;
+    }
+
+    std::unique_ptr<MediaInformationService> information(
+        std::shared_ptr<MediaEngine> engine,
+        MediaInformationService::ProfilePublisher publisher = {}) {
+        return std::make_unique<MediaInformationService>(filesystem(), catalogue(), std::move(engine),
+                                                         path() / ("media-info-" + std::to_string(++managers_)),
+                                                         std::move(publisher));
+    }
+};
+
+// Creates a session for `media_id` with `preferences`, plus any other body
+// fields in `extra`.
+HttpResponse create_session(PlaybackManager& playback, const std::string& media_id,
+                            Json::Object preferences, Json::Object extra = {},
+                            const SessionIdentity& who = anonymous,
+                            std::map<std::string, std::string, std::less<>> query = {}) {
+    extra["media_id"] = media_id;
+    extra["preferences"] = Json(std::move(preferences));
+    auto request = playback_request("POST", "/api/v1/playback/sessions", extra, who);
+    request.query = std::move(query);
+    return playback.handle(request);
+}
+
+HttpResponse session_call(PlaybackManager& playback, const std::string& method, const std::string& id,
+                          const Json::Object& body = {}, const SessionIdentity& who = anonymous) {
+    return playback.handle(playback_request(method, "/api/v1/playback/sessions/" + id, body, who));
+}
+
+Json playback_status(PlaybackManager& playback) {
+    const auto response = playback.handle(playback_request("GET", "/api/v1/playback/status"));
+    REQUIRE(response.status == 200);
+    return body_of(response);
 }
 
 // FakeMediaEngine with its store reachable, so a test can watch what a refused
@@ -46,20 +182,7 @@ class ObservableHlsMediaEngine final : public FakeMediaEngine {
     }
 };
 
-// Playback serves payloads as range-capable streams, so reading one means draining it.
-std::string response_text(const HttpResponse& response) {
-    if (!response.stream) return std::string(response.body.begin(), response.body.end());
-    Bytes bytes(static_cast<size_t>(response.stream->size()));
-    size_t filled = 0;
-    while (filled < bytes.size()) {
-        const auto n = response.stream->read(filled, std::span(bytes).subspan(filled));
-        if (n == 0) break;
-        filled += n;
-    }
-    bytes.resize(filled);
-    return std::string(bytes.begin(), bytes.end());
-}
-
+// A probe that blocks on a gate (and may then fail), counting how many ran.
 class CoalescingProbeMediaEngine final : public MediaEngine {
     TestGate& gate_;
     bool fail_{};
@@ -108,8 +231,6 @@ class CoalescingProbeMediaEngine final : public MediaEngine {
 // can hold a session's subtitle_cache mutex while exercising other operations.
 class GatedSubtitleMediaEngine final : public MediaEngine {
     TestGate& gate_;
-    mutable std::mutex mutex_;
-    std::vector<PlaybackPlan> started_plans_;
   public:
     explicit GatedSubtitleMediaEngine(TestGate& gate) : gate_(gate) {}
     MediaEngineStatus status() const override {
@@ -143,10 +264,6 @@ class GatedSubtitleMediaEngine final : public MediaEngine {
                                                   std::chrono::milliseconds segment_duration,
                                                   size_t max_ahead_segments, uint64_t memory_limit,
                                                   const std::filesystem::path& spill_directory) override {
-        {
-            std::lock_guard lock(mutex_);
-            started_plans_.push_back(vod_plan.playback);
-        }
         auto store = std::make_shared<MediaSegmentStore>(max_ahead_segments, memory_limit,
                                                          spill_directory, segment_duration,
                                                          vod_plan.segment_durations);
@@ -161,6 +278,8 @@ class GatedSubtitleMediaEngine final : public MediaEngine {
     }
 };
 
+// Records the order media is probed in; the first probe may wait for its
+// cancellation instead of completing.
 class PriorityMediaInformationEngine final : public MediaEngine {
     bool cancel_first_{};
     mutable std::mutex mutex_;
@@ -224,536 +343,6 @@ class PriorityMediaInformationEngine final : public MediaEngine {
     }
 };
 
-MACHA_TEST("media_playback", test_media_segment_store_backpressure_and_spill) {
-    TempDir t;
-    RetainedMemoryLedger retained(8 * 1024, 1024, 4 * 1024, 1024);
-    auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms,
-                                                     std::vector<double>{4.0, 4.0, 4.0, 4.0});
-    REQUIRE(store->attach_memory_ledger(retained));
-    CHECK(retained.stats().owner_bytes[static_cast<size_t>(MemoryOwner::playback_segment)] ==
-          2 * 1024);
-    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    // The playlist is the plan: every planned entry, closed, from the first
-    // fetch, before any fragment exists. Admission on fragment requests is what
-    // stops a client queueing against the encoder.
-    const auto planned_playlist = store->playlist();
-    CHECK(!planned_playlist.empty());
-    CHECK(planned_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(planned_playlist.find("segment-000003.m4s") != std::string::npos);
-    CHECK(planned_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
-
-    REQUIRE(store->publish_segment(Bytes(1024, 0x10), 4.0));
-    REQUIRE(store->publish_segment(Bytes(1024, 0x11), 4.0));
-    REQUIRE(store->publish_segment(Bytes(1024, 0x12), 4.0));
-
-    std::atomic_bool fourth_published{};
-    std::jthread producer([&] {
-        fourth_published.store(store->publish_segment(Bytes(1024, 0x13), 4.0));
-    });
-    std::this_thread::sleep_for(50ms);
-    CHECK(!fourth_published.load());
-
-    std::optional<Bytes> waited_segment;
-    std::jthread consumer([&] {
-        store->note_requested(3);
-        waited_segment = store->wait_object("segment-000003.m4s", 1s);
-    });
-    consumer.join();
-    producer.join();
-    CHECK(fourth_published.load());
-    REQUIRE(waited_segment.has_value());
-    CHECK(waited_segment->size() == 1024);
-    CHECK((*waited_segment)[0] == 0x13);
-
-    store->finish();
-    REQUIRE(store->wait_ready(10ms));
-    auto state = store->snapshot();
-    CHECK(state.init_ready);
-    CHECK(state.finished);
-    CHECK(state.segment_count == 4);
-    CHECK(state.highest_requested == 3);
-    CHECK(state.resident_bytes <= 2 * 1024 + 1024 + 4);
-    CHECK(state.spill_bytes >= 1024);
-    CHECK(state.descriptor_bytes >= state.segment_count);
-    CHECK(state.planned_segments == 4);
-
-    // Production changes none of it: a VOD list may not be revised once a
-    // player has built a seek map from it.
-    auto playlist = store->playlist();
-    CHECK(playlist == planned_playlist);
-    CHECK(playlist.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
-    CHECK(playlist.find("segment-000000.m4s") != std::string::npos);
-    CHECK(playlist.find("segment-000003.m4s") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
-
-    auto init = store->object("init.mp4");
-    REQUIRE(init.has_value());
-    CHECK(std::string(init->begin(), init->end()) == "init");
-    for (int i = 0; i < 4; ++i) {
-        std::ostringstream name;
-        name << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s";
-        auto segment = store->object(name.str());
-        REQUIRE(segment.has_value());
-        CHECK(segment->size() == 1024);
-        CHECK((*segment)[0] == static_cast<uint8_t>(0x10 + i));
-    }
-    store.reset();
-    CHECK(retained.stats().used_bytes == 0);
-}
-
-MACHA_TEST("media_playback", test_media_segment_store_supersede_wakes_stale_waiter_reversibly) {
-    // A request blocked in wait_object() on an unproduced segment of a
-    // superseded generation wakes promptly; marking superseded is reversible,
-    // so a failed replacement leaves the active store's long-poll intact.
-    TempDir t;
-    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms,
-                                                      std::vector<double>{4.0, 4.0, 4.0, 4.0, 4.0});
-    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    REQUIRE(store->publish_segment(Bytes(16, 0x10), 4.0));
-
-    std::atomic_bool first_wait_returned{};
-    std::optional<Bytes> first_wait_result;
-    std::jthread first_waiter([&] {
-        store->note_requested(4);
-        first_wait_result = store->wait_object("segment-000004.m4s", {});
-        first_wait_returned.store(true);
-    });
-    std::this_thread::sleep_for(50ms);
-    CHECK(!first_wait_returned.load());
-
-    store->mark_superseded(true);
-    for (int i = 0; i < 100 && !first_wait_returned.load(); ++i) std::this_thread::sleep_for(10ms);
-    first_waiter.join();
-    CHECK(first_wait_returned.load());
-    CHECK(!first_wait_result.has_value());
-    auto superseded_state = store->snapshot();
-    CHECK(superseded_state.error.empty());
-    CHECK(!superseded_state.finished);
-
-    // A failed replacement clears superseded, restoring normal long-poll blocking.
-    store->mark_superseded(false);
-    std::atomic_bool second_wait_returned{};
-    std::jthread second_waiter([&] {
-        second_wait_returned.store(store->wait_object("segment-000004.m4s", {}).has_value());
-    });
-    std::this_thread::sleep_for(50ms);
-    CHECK(!second_wait_returned.load());
-
-    REQUIRE(store->publish_segment(Bytes(16, 0x11), 4.0));
-    REQUIRE(store->publish_segment(Bytes(16, 0x12), 4.0));
-    REQUIRE(store->publish_segment(Bytes(16, 0x13), 4.0));
-    REQUIRE(store->publish_segment(Bytes(16, 0x14), 4.0));
-    second_waiter.join();
-    CHECK(second_wait_returned.load());
-}
-
-MACHA_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_refuses_beyond_them) {
-    // A hold is an explicitly admitted resource, so the limits are testable
-    // without any thread blocking.
-    SegmentHoldArbiter arbiter(2, 3);
-    auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
-
-    // One in flight plus one prefetch, per session.
-    auto first = arbiter.try_acquire("session-a", &why);
-    auto second = arbiter.try_acquire("session-a", &why);
-    REQUIRE(first.has_value());
-    REQUIRE(second.has_value());
-    CHECK(arbiter.outstanding("session-a") == 2);
-
-    // A third from the same session is refused for the session limit, not the node's.
-    auto third = arbiter.try_acquire("session-a", &why);
-    CHECK(!third.has_value());
-    CHECK(why == SegmentHoldArbiter::Refusal::session_limit);
-
-    // Another session is unaffected by the first one's limit.
-    auto other = arbiter.try_acquire("session-b", &why);
-    REQUIRE(other.has_value());
-    CHECK(arbiter.outstanding() == 3);
-
-    // The global budget binds across sessions: session-b is under its own limit
-    // and still refused.
-    auto beyond = arbiter.try_acquire("session-b", &why);
-    CHECK(!beyond.has_value());
-    CHECK(why == SegmentHoldArbiter::Refusal::budget_exhausted);
-
-    // Releasing returns capacity to the node, not just to the session.
-    first->reset();
-    CHECK(arbiter.outstanding() == 2);
-    CHECK(arbiter.outstanding("session-a") == 1);
-    auto after_release = arbiter.try_acquire("session-b", &why);
-    CHECK(after_release.has_value());
-
-    // Release is idempotent, and a moved-from hold releases nothing twice.
-    first->reset();
-    CHECK(arbiter.outstanding() == 3);
-    {
-        auto moved = std::move(*second);
-        second.reset();
-        CHECK(arbiter.outstanding() == 3);
-    }
-    // Scope exit released the moved-to hold exactly once.
-    CHECK(arbiter.outstanding() == 2);
-    CHECK(arbiter.outstanding("session-a") == 0);
-}
-
-MACHA_TEST("media_playback", test_a_refused_segment_request_answers_at_once_and_never_advances_the_producer) {
-    // A request outside the window is answered at once rather than held, as a
-    // retryable 503 rather than a 404, and does not move the producer's
-    // authorised window forward.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/film.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(64 * 1024);
-    auto writer = service.filesystem().open_write("/media/film.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/film.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    // Short, so a request that reaches the deadline still finishes quickly.
-    streaming.segment_timeout = 400ms;
-    streaming.segment_hold_window = 8;
-    auto engine = std::make_unique<ObservableHlsMediaEngine>();
-    auto* engine_ptr = engine.get();
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(engine));
-    playback.start();
-
-    Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-    auto created = playback.handle(create);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
-    const auto url = created_json.find("stream")->find("url")->asString();
-    const auto base = url.substr(0, url.rfind('/'));
-
-    // A held request answers with a deferral and is re-run when the store
-    // publishes or the deadline passes; http_resolve drives that on this
-    // thread, as HttpServer does.
-    auto get = [&](const std::string& object) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = base + "/" + object;
-        return http_resolve([&](const HttpRequest& r) { return playback.handle(r); },
-                            std::move(request));
-    };
-
-    auto store = engine_ptr->store();
-    REQUIRE(store != nullptr);
-    REQUIRE(store->snapshot().segment_count == 1);
-    REQUIRE(store->snapshot().planned_segments == 15);
-
-    // Produced already: served with no admission at all.
-    auto produced = get("segment-000000.m4s");
-    CHECK(produced.status == 200);
-
-    // Beyond the window: the frontier is one fragment and the window eight, so
-    // nothing is working toward index 9.
-    const auto refused_at = Clock::now();
-    auto refused = get("segment-000009.m4s");
-    const auto refused_elapsed = Clock::now() - refused_at;
-    CHECK(refused.status == 500);
-    const auto refused_body = std::string(refused.body.begin(), refused.body.end());
-    CHECK(refused_body.find("segment_not_ready") != std::string::npos);
-    CHECK(refused_body.find("beyond_hold_window") != std::string::npos);
-    CHECK(refused.headers["Retry-After"] == "1");
-    CHECK(refused.headers["Cache-Control"] == "no-store");
-    // Immediately: not held anywhere near the segment timeout.
-    CHECK(refused_elapsed < 200ms);
-
-    // The producer is not told: noting a declined index would authorise
-    // production toward a fragment the node refused to serve.
-    CHECK(store->snapshot().highest_requested == 0);
-
-    // Past the end of the plan is a genuine miss: 404, not "come back later".
-    auto missing = get("segment-000099.m4s");
-    CHECK(missing.status == 404);
-    CHECK(store->snapshot().highest_requested == 0);
-
-    // Inside the window: held, and served when the fragment arrives.
-    std::jthread producer([&] {
-        std::this_thread::sleep_for(60ms);
-        // Fragment 0 is four bytes, so eleven bytes identifies fragment 1.
-        store->publish_segment(Bytes(11, 0x31), 4.0);
-    });
-    auto held = get("segment-000001.m4s");
-    producer.join();
-    CHECK(held.status == 200);
-    // The length identifies which fragment came back.
-    CHECK(held.content_length() == 11);
-    // Only an admitted request may move the frontier.
-    CHECK(store->snapshot().highest_requested == 1);
-
-    // A held request that reaches its deadline answers retryably, not as missing.
-    const auto timed_out_at = Clock::now();
-    auto timed_out = get("segment-000002.m4s");
-    const auto timed_out_elapsed = Clock::now() - timed_out_at;
-    CHECK(timed_out.status == 500);
-    CHECK(std::string(timed_out.body.begin(), timed_out.body.end()).find("segment_not_ready") !=
-          std::string::npos);
-    CHECK(timed_out_elapsed >= 300ms);
-}
-
-MACHA_TEST("media_playback", test_media_playlist_is_complete_and_closed_before_anything_is_published) {
-    // The playlist is the plan, which exists before any media: served complete
-    // and closed on the first fetch, and unchanged afterwards.
-    TempDir t;
-    const std::vector<double> plan{2.0, 4.0, 4.0, 3.5};
-    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms, plan);
-
-    // Nothing published at all -- no init fragment, no media.
-    auto state = store->snapshot();
-    REQUIRE(state.segment_count == 0);
-    REQUIRE(!state.init_ready);
-
-    const auto first = store->playlist();
-    REQUIRE(!first.empty());
-    CHECK(first.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(first.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
-    CHECK(first.find("#EXT-X-ENDLIST") != std::string::npos);
-    CHECK(first.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
-
-    // Every planned entry is advertised, produced or not.
-    for (int i = 0; i < 4; ++i) {
-        std::ostringstream name;
-        name << "segment-" << std::setfill('0') << std::setw(6) << i << ".m4s";
-        CHECK(first.find(name.str()) != std::string::npos);
-    }
-    CHECK(first.find("segment-000004.m4s") == std::string::npos);
-
-    // EXTINF is the planned length; TARGETDURATION is the longest planned entry,
-    // rounded up.
-    CHECK(first.find("#EXTINF:2.000,") != std::string::npos);
-    CHECK(first.find("#EXTINF:3.500,") != std::string::npos);
-    CHECK(first.find("#EXT-X-TARGETDURATION:4\n") != std::string::npos);
-
-    // Byte-identical on every later fetch: a VOD playlist is immutable.
-    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    CHECK(store->playlist() == first);
-    REQUIRE(store->publish_segment(Bytes(64, 0x10), 2.0));
-    CHECK(store->playlist() == first);
-
-    // Even when a fragment is longer than planned: the promised length stands.
-    REQUIRE(store->publish_segment(Bytes(64, 0x11), 6.0));
-    CHECK(store->playlist() == first);
-
-    REQUIRE(store->publish_segment(Bytes(64, 0x12), 4.0));
-    REQUIRE(store->publish_segment(Bytes(64, 0x13), 3.5));
-    store->finish();
-    CHECK(store->snapshot().error.empty());
-    CHECK(store->playlist() == first);
-
-    // A broken generation withholds the playlist rather than serve a promise
-    // it cannot keep.
-    auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
-                                                      4000ms, plan);
-    REQUIRE(!broken->playlist().empty());
-    broken->fail("generation broke");
-    CHECK(broken->playlist().empty());
-}
-
-MACHA_TEST("media_playback", test_media_segment_store_holds_an_init_request_until_it_is_published) {
-    // One hold path for anything a client can request: init.mp4 may be asked
-    // for before the muxer has written it, and is held rather than a 404.
-    TempDir t;
-    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms,
-                                                     std::vector<double>{4.0, 4.0});
-
-    // The immediate lookup misses.
-    CHECK(!store->object("init.mp4").has_value());
-
-    std::atomic_bool init_returned{};
-    std::optional<Bytes> waited_init;
-    std::jthread waiter([&] {
-        waited_init = store->wait_object("init.mp4", {});
-        init_returned.store(true);
-    });
-    std::this_thread::sleep_for(50ms);
-    CHECK(!init_returned.load());
-
-    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
-    waiter.join();
-    CHECK(init_returned.load());
-    REQUIRE(waited_init.has_value());
-    CHECK(std::string(waited_init->begin(), waited_init->end()) == "init");
-
-    // A generation that ends without an init fragment releases the waiter.
-    auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
-                                                      4000ms, std::vector<double>{4.0});
-    std::jthread breaker([&] { broken->fail("generation broke"); });
-    CHECK(!broken->wait_object("init.mp4", {}).has_value());
-    breaker.join();
-
-    // MPEG-TS has no init fragment, so that request must not hold; timed,
-    // because a wrong answer would only end at the timeout.
-    auto ts = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-ts", 4000ms,
-                                                  std::vector<double>{4.0}, MediaContainer::mpegts);
-    const auto before = std::chrono::steady_clock::now();
-    CHECK(!ts->wait_object("init.mp4", 5s).has_value());
-    CHECK(std::chrono::steady_clock::now() - before < 1s);
-
-    // An unknown object is still an immediate miss, held by nothing.
-    const auto unknown_before = std::chrono::steady_clock::now();
-    CHECK(!store->wait_object("nonsense.bin", 5s).has_value());
-    CHECK(std::chrono::steady_clock::now() - unknown_before < 1s);
-}
-
-MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = 0;
-    config.workers = 2;
-    config.max_connections = 8;
-    config.stream_chunk_bytes = 16 * 1024;
-    std::atomic_bool entered{};
-    TestGate slow_body_gate;
-    HttpServer server(config, [&](const HttpRequest& request) {
-        if (request.path == "/slow") {
-            HttpResponse response;
-            response.content_type = "application/octet-stream";
-            response.stream = std::make_shared<BlockingHttpBody>(entered, slow_body_gate, 128 * 1024);
-            return response;
-        }
-        if (request.path == "/fast")
-            return HttpResponse{200, "text/plain", {}, Bytes{'o', 'k'}};
-        return http_error(404, "not_found", "not found");
-    });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
-
-    std::string slow_response;
-    std::jthread slow([&] { slow_response = raw_http_get(server.bound_port(), "/slow"); });
-    REQUIRE(wait_until([&] { return entered.load(); }, 1s));
-    auto started = Clock::now();
-    auto fast = raw_http_get(server.bound_port(), "/fast");
-    auto elapsed = Clock::now() - started;
-    CHECK(fast.find("200 OK") != std::string::npos);
-    CHECK(fast.ends_with("ok"));
-    CHECK(elapsed < 300ms);
-    slow_body_gate.open();
-    slow.join();
-    CHECK(slow_response.find("200 OK") != std::string::npos);
-    CHECK(slow_response.size() >= 128 * 1024);
-    server.stop();
-}
-
-MACHA_FAST_TEST("media_playback", test_media_vod_index_planning_rejects_partial_indexes) {
-    CHECK(media_vod::requires_seek_index_materialisation("matroska,webm"));
-    CHECK(media_vod::requires_seek_index_materialisation("webm"));
-    CHECK(!media_vod::requires_seek_index_materialisation("mov,mp4,m4a,3gp,3g2,mj2"));
-
-    std::vector<double> complete;
-    for (double seconds = 0.0; seconds < 120.0; seconds += 2.0) complete.push_back(seconds);
-    auto full = media_vod::indexed_plan(complete, 120.0, 0, 4.0);
-    REQUIRE(full.has_value());
-    CHECK(std::abs(full->actual_seek_seconds) < 0.0005);
-    CHECK(full->segment_durations.size() == 30);
-    for (const auto duration : full->segment_durations) CHECK(duration <= 4.001);
-
-    // avformat_find_stream_info() can leave a Matroska index holding only the
-    // keyframes seen while probing; that is not a complete index.
-    const std::vector<double> partial{0.0, 2.0};
-    CHECK(!media_vod::indexed_plan(partial, 120.0, 0, 4.0).has_value());
-
-    // A partially populated index must also be rejected when it contains
-    // enough early entries to produce several apparently sensible fragments.
-    const std::vector<double> partial_with_several_starts{0.0, 4.0, 8.0, 12.0, 16.0};
-    CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0, 4.0).has_value());
-
-    // Sparse but complete GOPs can still be remuxed; a fragment is as long as its GOP.
-    std::vector<double> sparse_complete;
-    for (double seconds = 0.0; seconds < 60.0; seconds += 10.0)
-        sparse_complete.push_back(seconds);
-    CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0, 4.0).has_value());
-
-    // Scene-cut encodes leave keyframe gaps well past 3x the target; a 40 s
-    // fragment is a long fragment, not an unusable index.
-    std::vector<double> scene_cut{0.0, 4.0, 44.0, 48.0, 52.0, 90.0, 94.0, 118.0};
-    auto scene_cut_plan = media_vod::indexed_plan(scene_cut, 120.0, 0, 4.0);
-    REQUIRE(scene_cut_plan.has_value());
-    CHECK(std::abs(scene_cut_plan->longest_segment_seconds - 40.0) < 0.0005);
-    // A gap a viewer would wait minutes to seek across is unusable.
-    const std::vector<double> huge_gap{0.0, 4.0, 110.0, 114.0, 118.0};
-    CHECK(!media_vod::indexed_plan(huge_gap, 120.0, 0, 4.0).has_value());
-
-    // One fragment is legitimate for genuinely short media.
-    const std::vector<double> short_index{0.0};
-    auto short_plan = media_vod::indexed_plan(short_index, 6.0, 0, 4.0);
-    REQUIRE(short_plan.has_value());
-    CHECK(short_plan->segment_durations.size() == 1);
-    CHECK(std::abs(short_plan->segment_durations.front() - 6.0) < 0.0005);
-
-    // A seek starts at the last keyframe at or before the request, never after,
-    // and reports the remainder as an offset.
-    auto seeked = media_vod::indexed_plan(complete, 120.0, 61'000, 4.0);
-    REQUIRE(seeked.has_value());
-    CHECK(std::abs(seeked->actual_seek_seconds - 60.0) < 0.0005);
-    CHECK(seeked->seek_ms == 60'000);
-    CHECK(seeked->seek_offset_ms == 1'000);
-    CHECK(seeked->seek_requested_ms == 61'000);
-    CHECK(seeked->seek_ms + seeked->seek_offset_ms == seeked->seek_requested_ms);
-
-    // A request on a keyframe has offset zero, so clients can make aligned seeks.
-    auto aligned = media_vod::indexed_plan(complete, 120.0, 62'000, 4.0);
-    REQUIRE(aligned.has_value());
-    CHECK(aligned->seek_ms == 62'000);
-    CHECK(aligned->seek_offset_ms == 0);
-
-    // A keyframe a fraction of a millisecond after the request is not a
-    // candidate: it rounds UP to 61'001 ms (rounding down would land
-    // avformat_seek_file's backward search one keyframe early).
-    const std::vector<double> fractional{0.0, 30.0, 61.0004, 90.0};
-    auto fractional_plan = media_vod::indexed_plan(fractional, 120.0, 61'000, 4.0);
-    REQUIRE(fractional_plan.has_value());
-    CHECK(fractional_plan->seek_ms == 30'000);
-    CHECK(fractional_plan->seek_offset_ms == 31'000);
-
-    // Out of range clamps to [0, duration - 1 ms]; the invariant holds against
-    // the clamped request, so the clamp is visible.
-    CHECK(media_vod::clamp_seek_ms(500'000, 120.0) == 119'999);
-    CHECK(media_vod::clamp_seek_ms(-5, 120.0) == 0);
-
-    // No indexed keyframe at or before the request: baseline zero, the offset
-    // carries the whole request, and the mode is kept (a stream's first sample
-    // is always a sync sample).
-    const std::vector<double> late_index{40.0, 44.0, 48.0};
-    auto unnamed_start = media_vod::indexed_plan(late_index, 60.0, 20'000, 4.0);
-    REQUIRE(unnamed_start.has_value());
-    CHECK(unnamed_start->seek_ms == 0);
-    CHECK(unnamed_start->seek_offset_ms == 20'000);
-    CHECK(unnamed_start->seek_requested_ms == 20'000);
-
-    // The Cues behind a plan; the gaps bound the true GOP from above.
-    const auto density = media_vod::index_density(complete, 120.0);
-    CHECK(density.entries == 60);
-    CHECK(std::abs(density.longest_gap_seconds - 2.0) < 0.0005);
-    CHECK(std::abs(density.median_gap_seconds - 2.0) < 0.0005);
-}
-
-namespace {
 // HEVC Main 10, PQ transfer (Dolby Vision profile 8), E-AC3 audio, in Matroska.
 class HdrFakeMediaEngine final : public FakeMediaEngine {
   public:
@@ -784,1730 +373,6 @@ class HdrFakeMediaEngine final : public FakeMediaEngine {
     }
 };
 
-} // namespace
-
-MACHA_TEST("media_playback", test_direct_play_serves_a_matroska_source) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/episode.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(128 * 1024 + 17);
-    auto writer = service.filesystem().open_write("/media/episode.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/episode.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<HdrFakeMediaEngine>());
-    playback.start();
-
-    Json::Object root{{"media_id", media_id},
-                      {"preferences", Json(Json::Object{{"mode", "direct"}})}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/api/v1/playback/sessions";
-    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    request.body.assign(text.begin(), text.end());
-    auto response = playback.handle(request);
-    REQUIRE(response.status == 201);
-    auto session = Json::parse(std::string(response.body.begin(), response.body.end()));
-    // Matroska is served direct over byte ranges, with the facts alongside.
-    CHECK(session.find("mode")->asString() == "direct");
-    CHECK(session.find("stream")->find("url")->asString().ends_with("/direct"));
-    CHECK(session.find("stream")->find("mime_type")->asString() == "video/x-matroska");
-    CHECK(session.find("source")->find("format")->asString() == "matroska,webm");
-}
-
-MACHA_TEST("media_playback", test_a_deeply_prefetching_client_cannot_occupy_the_node) {
-    // The playlist is complete up front; a client that asks for more than its
-    // share of fragment holds is refused promptly rather than held.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/series.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(64 * 1024);
-    auto writer = service.filesystem().open_write("/media/series.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/series.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    streaming.max_session_holds = 2;
-    streaming.max_concurrent_holds = 8;
-    streaming.segment_hold_window = 8;
-    // The two admitted holds outlast the rest of the case, then time out.
-    streaming.segment_timeout = 1500ms;
-    auto engine = std::make_unique<ObservableHlsMediaEngine>();
-    auto* engine_ptr = engine.get();
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(engine));
-    playback.start();
-
-    Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-    auto created = playback.handle(create);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
-    const auto url = created_json.find("stream")->find("url")->asString();
-    const auto base = url.substr(0, url.rfind('/'));
-
-    auto get = [&](const std::string& object) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = base + "/" + object;
-        return http_resolve([&](const HttpRequest& r) { return playback.handle(r); },
-                            std::move(request));
-    };
-
-    // The playlist is complete and closed before a second fragment exists.
-    auto playlist_response = get("media.m3u8");
-    REQUIRE(playlist_response.status == 200);
-    const auto playlist = response_text(playlist_response);
-    CHECK(playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(playlist.find("#EXT-X-ENDLIST") != std::string::npos);
-    CHECK(playlist.find("segment-000014.m4s") != std::string::npos);
-    // Two requests for unproduced fragments: both admitted and held, the
-    // session's whole share (one in flight, one prefetch).
-    HttpResponse first_hold;
-    HttpResponse second_hold;
-    std::jthread first([&] { first_hold = get("segment-000001.m4s"); });
-    std::jthread second([&] { second_hold = get("segment-000002.m4s"); });
-    std::this_thread::sleep_for(150ms);
-
-    // The third is refused immediately, naming the limit it met.
-    const auto refused_at = Clock::now();
-    auto refused = get("segment-000003.m4s");
-    const auto refused_elapsed = Clock::now() - refused_at;
-    CHECK(refused.status == 500);
-    const auto refused_body = std::string(refused.body.begin(), refused.body.end());
-    CHECK(refused_body.find("segment_not_ready") != std::string::npos);
-    CHECK(refused_body.find("session_hold_limit") != std::string::npos);
-    CHECK(refused.headers["Retry-After"] == "1");
-    CHECK(refused_elapsed < 200ms);
-
-    // Control traffic stays prompt while both holds are outstanding (law 1).
-    HttpRequest status_request;
-    status_request.method = "GET";
-    status_request.path = "/api/v1/playback/status";
-    const auto status_at = Clock::now();
-    auto status_response = playback.handle(status_request);
-    const auto status_elapsed = Clock::now() - status_at;
-    CHECK(status_response.status == 200);
-    CHECK(status_elapsed < 300ms);
-
-    // Both holds reach their deadline and answer retryably, not as missing.
-    first.join();
-    second.join();
-    CHECK(first_hold.status == 500);
-    CHECK(second_hold.status == 500);
-    CHECK(std::string(first_hold.body.begin(), first_hold.body.end()).find("segment_not_ready") !=
-          std::string::npos);
-
-    // Their release returned the session's share, so the client is admitted again.
-    auto store = engine_ptr->store();
-    REQUIRE(store != nullptr);
-    std::jthread producer([&] {
-        std::this_thread::sleep_for(60ms);
-        store->publish_segment(Bytes(11, 0x31), 4.0);
-    });
-    auto served = get("segment-000001.m4s");
-    producer.join();
-    CHECK(served.status == 200);
-    CHECK(served.content_length() == 11);
-}
-
-MACHA_TEST("media_playback", test_segment_store_mpegts_mode_has_no_init_and_ts_names) {
-    TempDir t;
-    auto store = std::make_shared<MediaSegmentStore>(4, 64 * 1024, t.path() / "spill", 4000ms,
-                                                     std::vector<double>{2.0, 4.0, 4.0},
-                                                     MediaContainer::mpegts);
-    CHECK(store->container() == MediaContainer::mpegts);
-    // Complete and closed before anything is published; only names and version differ.
-    const auto planned_playlist = store->playlist();
-    CHECK(!planned_playlist.empty());
-    CHECK(planned_playlist.find("#EXT-X-VERSION:3") != std::string::npos);
-    CHECK(planned_playlist.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
-    CHECK(planned_playlist.find("segment-000002.ts") != std::string::npos);
-    CHECK(planned_playlist.find("#EXT-X-ENDLIST") != std::string::npos);
-    // MPEG-TS has no init segment: the first fragment makes it ready, and an
-    // init request is a genuine miss, not held.
-    CHECK(!store->wait_object("init.mp4", 100ms).has_value());
-    REQUIRE(store->publish_segment(Bytes(188 * 3, 0x47), 2.0));
-    REQUIRE(store->wait_ready(10ms));
-    auto playlist = store->playlist();
-    CHECK(playlist == planned_playlist);
-    CHECK(playlist.find("#EXT-X-MAP") == std::string::npos);
-    CHECK(playlist.find("segment-000000.ts") != std::string::npos);
-    CHECK(playlist.find(".m4s") == std::string::npos);
-    REQUIRE(store->object("segment-000000.ts").has_value());
-    CHECK(store->object("segment-000000.ts")->size() == 188 * 3);
-    CHECK(!store->object("segment-000000.m4s").has_value() == false); // both spellings map to index 0
-    REQUIRE(store->publish_segment(Bytes(188, 0x47), 4.0));
-    REQUIRE(store->publish_segment(Bytes(188, 0x47), 4.0));
-    store->finish();
-    CHECK(store->playlist() == planned_playlist);
-}
-
-MACHA_FAST_TEST("media_playback", test_hls_codec_strings_describe_the_fragments) {
-    MediaStreamInfo hevc10;
-    hevc10.codec = "hevc";
-    hevc10.profile = "Main 10";
-    hevc10.bit_depth = 10;
-    hevc10.level = 153;
-    hevc10.width = 1920;
-    hevc10.height = 802;
-    MediaStreamInfo eac3;
-    eac3.codec = "eac3";
-    MediaStreamInfo h264_high;
-    h264_high.codec = "h264";
-    h264_high.profile = "High";
-    h264_high.level = 41;
-
-    CHECK(hls_codec_string("hevc", &hevc10, false) == "hvc1.2.4.L153.B0");
-    CHECK(hls_codec_string("h264", &h264_high, false) == "avc1.640029");
-    CHECK(hls_codec_string("eac3", &eac3, false) == "ec-3");
-    CHECK(hls_codec_string("ac3", nullptr, false) == "ac-3");
-    CHECK(hls_codec_string("aac", nullptr, false) == "mp4a.40.2");
-    // The libx264/AAC transcode output is described, not the source.
-    CHECK(hls_codec_string("h264", &hevc10, true) == "avc1.640029");
-    CHECK(hls_codec_string("aac", &eac3, true) == "mp4a.40.2");
-
-    PlaybackPlan remux;
-    remux.video = MediaTransform::copy;
-    remux.audio = MediaTransform::copy;
-    remux.video_codec = "hevc";
-    remux.audio_codec = "eac3";
-    const auto remux_inf = hls_variant_stream_inf(remux, &hevc10, &eac3, 10'887'601);
-    CHECK(remux_inf == "#EXT-X-STREAM-INF:BANDWIDTH=10887601,CODECS=\"hvc1.2.4.L153.B0,ec-3\",RESOLUTION=1920x802");
-
-    PlaybackPlan transcode;
-    transcode.video = MediaTransform::transcode;
-    transcode.audio = MediaTransform::transcode;
-    transcode.video_codec = "h264";
-    transcode.audio_codec = "aac";
-    transcode.target_height = 720;
-    const auto transcode_inf = hls_variant_stream_inf(transcode, &hevc10, &eac3, 10'887'601);
-    CHECK(transcode_inf == "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.640029,mp4a.40.2\",RESOLUTION=1724x720");
-}
-
-MACHA_TEST("media_playback", test_reseek_hls_vod_reuses_prepared_random_access_state) {
-    HlsVodPlan remux;
-    remux.playback.mode = PlaybackMode::remux;
-    remux.playback.video = MediaTransform::copy;
-    remux.source_duration_seconds = 120.0;
-    remux.seek_segment_seconds = 4.0;
-    remux.reusable_seek = true;
-    for (double seconds = 0.0; seconds < 120.0; seconds += 2.0)
-        remux.video_random_access_points.push_back(seconds);
-
-    // A PATCH seek and a create seek agree: baseline at the keyframe at or before
-    // the request, the remainder published as an offset.
-    auto remux_seek = reseek_hls_vod(remux, 61s);
-    REQUIRE(remux_seek.has_value());
-    CHECK(remux_seek->playback.seek == 60s);
-    CHECK(remux_seek->playback.seek_offset == 1s);
-    CHECK(remux_seek->playback.seek_requested == 61s);
-    CHECK(remux_seek->playback.seek + remux_seek->playback.seek_offset ==
-          remux_seek->playback.seek_requested);
-    REQUIRE(!remux_seek->segment_durations.empty());
-    CHECK(remux_seek->segment_durations.front() <= 4.001);
-
-    HlsVodPlan transcode;
-    transcode.playback.mode = PlaybackMode::transcode;
-    transcode.playback.video = MediaTransform::transcode;
-    transcode.source_duration_seconds = 120.0;
-    transcode.seek_segment_seconds = 4.0;
-    transcode.reusable_seek = true;
-
-    auto transcode_seek = reseek_hls_vod(transcode, 61s);
-    REQUIRE(transcode_seek.has_value());
-    CHECK(transcode_seek->playback.seek == 61s);
-    CHECK(transcode_seek->playback.seek_offset == 0s);
-    CHECK(transcode_seek->playback.seek_requested == 61s);
-    REQUIRE(transcode_seek->segment_durations.size() >= 2);
-    // A seek's first fragment is the 2 s start-up fragment; the rest keep the target.
-    CHECK(std::abs(transcode_seek->segment_durations.front() - 2.0) < 0.0005);
-    CHECK(std::abs(transcode_seek->segment_durations[1] - 4.0) < 0.0005);
-
-    // A transcode with a known keyframe index does not snap: the encoder starts
-    // exactly where it was told. The keyframe at 62.5274 s, not a whole number
-    // of milliseconds, must not attract the seek.
-    HlsVodPlan transcode_with_keyframes;
-    transcode_with_keyframes.playback.mode = PlaybackMode::transcode;
-    transcode_with_keyframes.playback.video = MediaTransform::transcode;
-    transcode_with_keyframes.source_duration_seconds = 7200.0;
-    transcode_with_keyframes.seek_segment_seconds = 4.0;
-    transcode_with_keyframes.reusable_seek = true;
-    transcode_with_keyframes.video_random_access_points = {0.0, 30.0, 60.0, 62.5274, 6000.0};
-
-    auto unsnapped_seek = reseek_hls_vod(transcode_with_keyframes, 61s);
-    REQUIRE(unsnapped_seek.has_value());
-    CHECK(unsnapped_seek->playback.seek == 61s);
-    CHECK(unsnapped_seek->playback.seek_offset == 0s);
-    REQUIRE(!unsnapped_seek->segment_durations.empty());
-    CHECK(std::abs(unsnapped_seek->segment_durations.front() - 2.0) < 0.0005);
-
-    // Seeking past the last known keyframe is not a special case.
-    auto past_last_keyframe = reseek_hls_vod(transcode_with_keyframes, 6500s);
-    REQUIRE(past_last_keyframe.has_value());
-    CHECK(past_last_keyframe->playback.seek == 6500s);
-
-    // A decline names the precondition that failed.
-    HlsVodPlan unavailable;
-    std::string reason;
-    CHECK(!reseek_hls_vod(unavailable, 10s, &reason).has_value());
-    CHECK(reason == "plan-not-reusable");
-}
-
-MACHA_FAST_TEST("media_playback", test_media_timestamp_repair) {
-    MediaTimestampRepairState state;
-
-    MediaPacketTimestamps first{-69952, -69952, 40};
-    normalize_media_timestamps(state, first);
-    CHECK(first.pts == -69952);
-    CHECK(first.dts == -69952);
-    CHECK(state.repair_count() == 0);
-
-    // Two packets with equal DTS after a seek/rescale: the second advances, and
-    // the same correction applies to later source timestamps.
-    MediaPacketTimestamps equal{-69912, -69952, 40};
-    normalize_media_timestamps(state, equal);
-    CHECK(equal.dts == -69951);
-    CHECK(equal.pts == -69911);
-    CHECK(state.nonmonotonic_dts == 1);
-    CHECK(state.timeline_shift == 1);
-
-    MediaPacketTimestamps following{-69872, -69912, 40};
-    normalize_media_timestamps(state, following);
-    CHECK(following.dts == -69911);
-    CHECK(following.pts == -69871);
-    CHECK(state.nonmonotonic_dts == 1);
-
-    MediaTimestampRepairState missing;
-    MediaPacketTimestamps none{kNoMediaTimestamp, kNoMediaTimestamp, 0};
-    normalize_media_timestamps(missing, none);
-    CHECK(none.dts == 0);
-    CHECK(none.pts == 0);
-    CHECK(none.duration == 1);
-    CHECK(missing.missing_dts == 1);
-    CHECK(missing.missing_pts == 1);
-
-    MediaPacketTimestamps missing_dts{100, kNoMediaTimestamp, 40};
-    normalize_media_timestamps(missing, missing_dts);
-    CHECK(missing_dts.dts == 1);
-    CHECK(missing_dts.pts == 100);
-    CHECK(missing.missing_dts == 2);
-
-    MediaTimestampRepairState bad_pts;
-    MediaPacketTimestamps pts_before{4, 5, 1};
-    normalize_media_timestamps(bad_pts, pts_before);
-    CHECK(pts_before.pts == 4);
-    CHECK(pts_before.dts == 5);
-    CHECK(bad_pts.pts_before_dts == 1);
-    CHECK(bad_pts.repair_count() == 0);
-
-    int64_t encoder_pts = kNoMediaTimestamp;
-    CHECK(normalize_encoder_pts(encoder_pts, kNoMediaTimestamp) == kNoMediaTimestamp);
-    CHECK(encoder_pts == kNoMediaTimestamp);
-    CHECK(normalize_encoder_pts(encoder_pts, 100) == 100);
-    CHECK(normalize_encoder_pts(encoder_pts, 100) == 101);
-    CHECK(normalize_encoder_pts(encoder_pts, 99) == 102);
-    CHECK(normalize_encoder_pts(encoder_pts, 140) == 140);
-}
-
-MACHA_TEST("media_playback", test_playback_probe_failure_is_stage_specific) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/test.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/test.mp4", true);
-    auto bytes = pattern(64 * 1024);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.probe_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<FailingProbeMediaEngine>());
-    playback.start();
-
-    Json::Object root{{"media_id", media_id}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/api/v1/playback/sessions";
-    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    request.body.assign(text.begin(), text.end());
-    auto response = playback.handle(request);
-    REQUIRE(response.status == 503);
-    auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
-    // One envelope for every error: error.code is the snake_case discriminator,
-    // error.message is for a human, and every other detail hangs off `error`.
-    const auto* error = body.find("error");
-    REQUIRE(error != nullptr);
-    CHECK(error->find("code")->asString() == "playback_probe_failed");
-    REQUIRE(error->find("message") != nullptr);
-    CHECK(!error->find("message")->asString().empty());
-    CHECK(error->find("stage")->asString() == "probe");
-    REQUIRE(error->find("trace") != nullptr);
-    CHECK(!error->find("trace")->asString().empty());
-    // A probe failure is one title's problem; the node is fit for every other.
-    REQUIRE(error->find("node_healthy") != nullptr);
-    CHECK(error->find("node_healthy")->asBool());
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_immutable_media_profile_survives_cold_playback_manager) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/profile.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/profile.mp4", true);
-    auto bytes = pattern(128 * 1024 + 37);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto first_media_id = file_media_id(service.filesystem().getattr("/media/profile.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-
-    auto request_for = [](const std::string& media_id) {
-        Json::Object preferences{{"mode", "direct"}};
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.query["idempotency_key"] = media_id;
-        request.body.assign(text.begin(), text.end());
-        return request;
-    };
-
-    Json first_body;
-    std::string first_session_id;
-    {
-        auto engine = std::make_unique<FakeMediaEngine>();
-        auto* observed = engine.get();
-        PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                                 std::move(engine));
-        playback.start();
-        auto created = playback.handle(request_for(first_media_id));
-        REQUIRE(created.status == 201);
-        CHECK(observed->probes() == 1);
-        first_body = Json::parse(std::string(created.body.begin(), created.body.end()));
-        first_session_id = first_body.find("session_id")->asString();
-        CHECK(idempotency_of(created) == "created");
-        playback.stop();
-    }
-    REQUIRE(service.catalogue().media_profile(first_media_id).has_value());
-    {
-        auto media_size = [&](const std::string& media_id) -> std::optional<uint64_t> {
-            auto found = service.filesystem().find_media(media_id);
-            if (!found) return std::nullopt;
-            return found->second.size;
-        };
-        CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints(), {}, {}, {},
-                                   std::chrono::hours(24 * 30), media_size);
-        HttpRequest profile_request;
-        profile_request.method = "GET";
-        profile_request.path = "/api/v1/catalogue/media/" + first_media_id + "/profile";
-        auto response = catalogue_api.handle(profile_request);
-        REQUIRE(response.status == 200);
-        CHECK(response.headers.at("Cache-Control").find("immutable") != std::string::npos);
-        auto profile = Json::parse(std::string(response.body.begin(), response.body.end()));
-        CHECK(profile.find("media_id")->asString() == first_media_id);
-        CHECK(profile.find("size")->asUInt64() ==
-              service.filesystem().find_media(first_media_id)->second.size);
-
-        // A size this node cannot find is null, and the answer is not cached.
-        CatalogueApi sizeless_api(service.catalogue(), service.catalogue_hints());
-        auto sizeless = sizeless_api.handle(profile_request);
-        REQUIRE(sizeless.status == 200);
-        CHECK(sizeless.headers.at("Cache-Control") == "private, no-cache");
-        CHECK(Json::parse(std::string(sizeless.body.begin(), sizeless.body.end()))
-                  .find("size")->isNull());
-        CHECK(profile.find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
-        CHECK(profile.find("duration_ms")->asUInt64() == 60'000);
-        REQUIRE(profile.find("streams")->asArray().size() == 4);
-    }
-
-    // A distinct manager, with an empty process-local cache, answers the same
-    // without probing the media source.
-    {
-        auto engine = std::make_unique<FakeMediaEngine>();
-        auto* observed = engine.get();
-        PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                                 std::move(engine));
-        playback.start();
-        auto created = playback.handle(request_for(first_media_id));
-        REQUIRE(created.status == 201);
-        CHECK(observed->probes() == 0);
-        auto cached_body = Json::parse(std::string(created.body.begin(), created.body.end()));
-        CHECK(cached_body.find("session_id")->asString() == first_session_id);
-        CHECK(cached_body.find("generation")->dump() ==
-              first_body.find("generation")->dump());
-        for (const auto* field : {"mode", "media_id", "duration_ms", "preferences",
-                                  "selection", "source", "output", "options"}) {
-            REQUIRE(first_body.find(field) != nullptr);
-            REQUIRE(cached_body.find(field) != nullptr);
-            CHECK(first_body.find(field)->dump() == cached_body.find(field)->dump());
-        }
-        playback.stop();
-    }
-
-    // Replacing the file changes its extent-manifest identity, so the old profile
-    // cannot hit the new object.
-    auto replacement = pattern(128 * 1024 + 41);
-    for (auto& byte : replacement) byte ^= 0x5a;
-    auto replacement_writer = service.filesystem().open_write("/media/profile.mp4", true);
-    REQUIRE(replacement_writer->write(0, replacement) == replacement.size());
-    replacement_writer->commit();
-    const auto second_media_id = file_media_id(service.filesystem().getattr("/media/profile.mp4"));
-    REQUIRE(second_media_id != first_media_id);
-    {
-        auto engine = std::make_unique<FakeMediaEngine>();
-        auto* observed = engine.get();
-        PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                                 std::move(engine));
-        playback.start();
-        auto created = playback.handle(request_for(second_media_id));
-        REQUIRE(created.status == 201);
-        CHECK(observed->probes() == 1);
-        playback.stop();
-    }
-
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_concurrent_immutable_profile_misses_coalesce) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/coalesce.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/coalesce.mp4", true);
-    auto bytes = pattern(64 * 1024 + 19);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/coalesce.mp4"));
-
-    TestGate gate;
-    auto engine = std::make_unique<CoalescingProbeMediaEngine>(gate);
-    auto* observed = engine.get();
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.probe_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(engine));
-    playback.start();
-
-    Json::Object preferences{{"mode", "direct"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/api/v1/playback/sessions";
-    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    request.query["idempotency_key"] = "coalesced-create-1";
-    request.body.assign(text.begin(), text.end());
-    HttpResponse first, second;
-    std::jthread a([&] { first = playback.handle(request); });
-    REQUIRE(gate.wait_for_entries(1));
-    std::jthread b([&] { second = playback.handle(request); });
-    std::this_thread::sleep_for(50ms);
-    CHECK(gate.entered() == 1);
-    CHECK(observed->probes() == 1);
-    gate.open();
-    a.join();
-    b.join();
-    CHECK(first.status == 201);
-    CHECK(second.status == 201);
-    CHECK(observed->probes() == 1);
-    auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
-    auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
-    CHECK(first_json.find("session_id")->dump() == second_json.find("session_id")->dump());
-    CHECK(first_json.find("generation")->dump() == second_json.find("generation")->dump());
-    CHECK(idempotency_of(first) == "created");
-    CHECK(idempotency_of(second) == "replayed");
-
-    auto replay = playback.handle(request);
-    REQUIRE(replay.status == 201);
-    CHECK(idempotency_of(replay) == "replayed");
-    auto replay_json = Json::parse(std::string(replay.body.begin(), replay.body.end()));
-    CHECK(replay_json.find("session_id")->dump() == first_json.find("session_id")->dump());
-    CHECK(observed->probes() == 1);
-
-    Json::Object changed_preferences{{"mode", "direct"}};
-    Json::Object changed_root{{"media_id", media_id},
-                              {"seek_ms", 1000},
-                              {"preferences", Json(std::move(changed_preferences))}};
-    auto changed_text = Json(std::move(changed_root)).dump();
-    auto conflicting = request;
-    conflicting.body.assign(changed_text.begin(), changed_text.end());
-    auto conflict = playback.handle(conflicting);
-    REQUIRE(conflict.status == 409);
-    const std::string conflict_body(conflict.body.begin(), conflict.body.end());
-    CHECK(conflict_body.find("idempotency_conflict") != std::string::npos);
-
-    HttpRequest remove;
-    remove.method = "DELETE";
-    remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
-    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove).status == 204);
-    auto reused_after_delete = playback.handle(conflicting);
-    REQUIRE(reused_after_delete.status == 201);
-    CHECK(idempotency_of(reused_after_delete) == "created");
-    CHECK(observed->probes() == 1);
-    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_failed_idempotent_creation_releases_joiners_and_reservations) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/failing.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/failing.mp4", true);
-    auto bytes = pattern(64 * 1024 + 7);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/failing.mp4"));
-
-    TestGate gate;
-    auto engine = std::make_unique<CoalescingProbeMediaEngine>(gate, true);
-    auto* observed = engine.get();
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback-failure";
-    streaming.probe_timeout = 2s;
-    streaming.max_sessions = 1;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(engine));
-    playback.start();
-
-    Json::Object preferences{{"mode", "direct"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/api/v1/playback/sessions";
-    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    request.query["idempotency_key"] = "failing-create-1";
-    request.body.assign(text.begin(), text.end());
-
-    HttpResponse first, second;
-    std::jthread a([&] { first = playback.handle(request); });
-    REQUIRE(gate.wait_for_entries(1));
-    std::jthread b([&] { second = playback.handle(request); });
-    std::this_thread::sleep_for(30ms);
-    CHECK(observed->probes() == 1);
-    gate.open();
-    a.join();
-    b.join();
-    CHECK(first.status == 503);
-    CHECK(second.status == 503);
-    CHECK(observed->probes() == 1);
-
-    // With max_sessions=1, reaching a second probe proves the failed association
-    // and its pending-session reservation were both released.
-    auto retry = playback.handle(request);
-    CHECK(retry.status == 503);
-    CHECK(observed->probes() == 2);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_profile_endpoint_pending_does_not_gate_session_negotiation) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/pending.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/pending.mp4", true);
-    auto bytes = pattern(32 * 1024 + 3);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/pending.mp4"));
-
-    auto engine = std::make_shared<FakeMediaEngine>();
-    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
-                                        c.state_path);
-    std::atomic_uint queue_requests{};
-    auto queue = [&](const std::vector<std::string>& media_ids) {
-        ++queue_requests;
-        return information.request(media_ids, MediaInformationPriority::requested,
-                                   "media-information-api");
-    };
-
-    CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints(), {}, queue);
-    HttpRequest profile_request;
-    profile_request.method = "GET";
-    profile_request.path = "/api/v1/catalogue/media/" + media_id + "/profile";
-    auto profile_pending = catalogue_api.handle(profile_request);
-    REQUIRE(profile_pending.status == 202);
-    CHECK(profile_pending.headers.at("Retry-After") == "1");
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback-pending";
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             engine, queue, &information);
-    playback.start();
-    Json::Object preferences{{"mode", "direct"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.query["idempotency_key"] = "pending-profile-create";
-    create.body.assign(text.begin(), text.end());
-    auto admitted = playback.handle(create);
-    REQUIRE(admitted.status == 201);
-    CHECK(idempotency_of(admitted) == "created");
-    CHECK(engine->probes() == 1);
-    CHECK(queue_requests.load() == 1);
-
-    // Session negotiation produced the profile through the same shared flight,
-    // but publication remains asynchronous and outside admission.
-    CHECK(!service.catalogue().media_profile(media_id).has_value());
-    information.start();
-    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    playback.stop();
-    information.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_unavailable_profile_queue_uses_media_engine_fallback) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/fallback.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/fallback.mp4", true);
-    auto bytes = pattern(32 * 1024 + 5);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/fallback.mp4"));
-
-    std::atomic_uint queue_attempts{};
-    auto unavailable = [&](const std::vector<std::string>&) {
-        ++queue_attempts;
-        return size_t{0};
-    };
-    auto engine = std::make_shared<FakeMediaEngine>();
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback-fallback";
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             engine, unavailable);
-    playback.start();
-
-    Json::Object preferences{{"mode", "direct"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.query["idempotency_key"] = "unavailable-profile-fallback";
-    create.body.assign(text.begin(), text.end());
-
-    auto admitted = playback.handle(create);
-    REQUIRE(admitted.status == 201);
-    CHECK(idempotency_of(admitted) == "created");
-    CHECK(queue_attempts.load() == 0);
-    CHECK(engine->probes() == 1);
-    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_failed_profile_job_retry_falls_back_and_replays_once) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/retry.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/retry.mp4", true);
-    auto bytes = pattern(32 * 1024 + 7);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/retry.mp4"));
-
-    std::atomic_uint requests{};
-    auto pending_then_failed = [&](const std::vector<std::string>&) {
-        return ++requests == 1 ? size_t{1} : size_t{0};
-    };
-    CatalogueApi catalogue_api(service.catalogue(), service.catalogue_hints(), {},
-                               pending_then_failed);
-    HttpRequest profile_request;
-    profile_request.method = "GET";
-    profile_request.path = "/api/v1/catalogue/media/" + media_id + "/profile";
-    auto pending = catalogue_api.handle(profile_request);
-    REQUIRE(pending.status == 202);
-    auto engine = std::make_shared<FakeMediaEngine>();
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback-retry";
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             engine, pending_then_failed);
-    playback.start();
-
-    Json::Object preferences{{"mode", "direct"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.query["idempotency_key"] = "failed-profile-retry";
-    create.body.assign(text.begin(), text.end());
-
-    auto admitted = playback.handle(create);
-    REQUIRE(admitted.status == 201);
-    CHECK(idempotency_of(admitted) == "created");
-    CHECK(engine->probes() == 1);
-    CHECK(requests.load() == 1);
-    auto admitted_body = Json::parse(std::string(admitted.body.begin(), admitted.body.end()));
-
-    auto replayed = playback.handle(create);
-    REQUIRE(replayed.status == 201);
-    CHECK(idempotency_of(replayed) == "replayed");
-    CHECK(engine->probes() == 1);
-    auto replayed_body = Json::parse(std::string(replayed.body.begin(), replayed.body.end()));
-    CHECK(replayed_body.find("session_id")->dump() == admitted_body.find("session_id")->dump());
-    CHECK(replayed_body.find("generation")->dump() == admitted_body.find("generation")->dump());
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_media_information_hints_reorder_by_priority) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-
-    auto create_media = [&](std::string path, size_t size) {
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        auto writer = service.filesystem().open_write(path, true);
-        auto bytes = pattern(size);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-        return file_media_id(service.filesystem().getattr(path));
-    };
-    const auto low_a = create_media("/media/low-a.mp4", 32769);
-    const auto low_b = create_media("/media/low-b.mp4", 32771);
-    const auto requested = create_media("/media/requested.mp4", 32773);
-
-    auto engine = std::make_shared<PriorityMediaInformationEngine>();
-    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
-                                        t.path() / "media-info");
-    REQUIRE(information.request_path("/media/low-a.mp4",
-                                     MediaInformationPriority::background));
-    REQUIRE(information.request_path("/media/low-b.mp4",
-                                     MediaInformationPriority::background));
-    REQUIRE(information.request_path("/media/requested.mp4",
-                                     MediaInformationPriority::requested,
-                                     "media-information-request"));
-    information.start();
-
-    REQUIRE(wait_until([&] { return engine->completions() == 3; }, 5s));
-    auto order = engine->order();
-    REQUIRE(order.size() == 3);
-    CHECK(order.front() == requested);
-    REQUIRE(wait_until([&] {
-        return service.catalogue().media_profile(low_a).has_value() &&
-               service.catalogue().media_profile(low_b).has_value() &&
-               service.catalogue().media_profile(requested).has_value();
-    }, 5s));
-
-    information.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_media_information_foreground_requests_share_one_scan) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const std::string path = "/media/single-flight.mp4";
-    service.filesystem().create_file(path, 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write(path, true);
-    auto bytes = pattern(65539);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto entry = service.filesystem().getattr(path);
-    auto media_id = file_media_id(entry);
-
-    TestGate gate;
-    auto engine = std::make_shared<CoalescingProbeMediaEngine>(gate);
-    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
-                                        t.path() / "media-info");
-    information.start();
-    std::optional<MediaProbeResult> first, second;
-    std::jthread a([&] {
-        first = information.resolve_playback(media_id, path, entry, Clock::now() + 2s);
-    });
-    REQUIRE(gate.wait_for_entries(1));
-    std::jthread b([&] {
-        second = information.resolve_playback(media_id, path, entry, Clock::now() + 2s);
-    });
-    std::this_thread::sleep_for(30ms);
-    CHECK(engine->probes() == 1);
-    gate.open();
-    a.join();
-    b.join();
-    REQUIRE(first.has_value());
-    REQUIRE(second.has_value());
-    CHECK(*first == *second);
-    CHECK(engine->probes() == 1);
-    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    information.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_media_information_playback_takes_over_speculative_scan) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const std::string path = "/media/takeover.mp4";
-    service.filesystem().create_file(path, 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write(path, true);
-    auto bytes = pattern(65541);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto entry = service.filesystem().getattr(path);
-    auto media_id = file_media_id(entry);
-
-    auto engine = std::make_shared<PriorityMediaInformationEngine>(true);
-    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
-                                        t.path() / "media-info");
-    REQUIRE(information.request_path(path));
-    information.start();
-    REQUIRE(wait_until([&] { return engine->starts() == 1; }, 1s));
-
-    auto resolved = information.resolve_playback(media_id, path, entry, Clock::now() + 2s);
-    CHECK(!resolved.streams.empty());
-    CHECK(engine->starts() == 2);
-    CHECK(engine->cancellations() == 1);
-    CHECK(engine->completions() == 1);
-    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    information.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_media_information_profile_pruning_tracks_last_live_copy) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    auto bytes = pattern(65543);
-    for (const auto* path : {"/media/copy-a.mp4", "/media/copy-b.mp4"}) {
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        auto writer = service.filesystem().open_write(path, true);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-    }
-    auto first = service.filesystem().getattr("/media/copy-a.mp4");
-    auto second = service.filesystem().getattr("/media/copy-b.mp4");
-    const auto media_id = file_media_id(first);
-    REQUIRE(file_media_id(second) == media_id);
-
-    auto engine = std::make_shared<PriorityMediaInformationEngine>();
-    MediaInformationService information(service.filesystem(), service.catalogue(), engine,
-                                        t.path() / "media-info");
-    REQUIRE(information.request_path("/media/copy-a.mp4"));
-    information.start();
-    REQUIRE(wait_until([&] { return service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    service.filesystem().unlink("/media/copy-a.mp4");
-    information.request_prune();
-    std::this_thread::sleep_for(100ms);
-    CHECK(service.catalogue().media_profile(media_id).has_value());
-
-    service.filesystem().unlink("/media/copy-b.mp4");
-    information.request_prune();
-    REQUIRE(wait_until([&] { return !service.catalogue().media_profile(media_id).has_value(); }, 2s));
-
-    information.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_media_information_retries_profile_publication_without_rescanning) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const std::string path = "/media/retry-publication.mp4";
-    service.filesystem().create_file(path, 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write(path, true);
-    auto bytes = pattern(65547);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr(path));
-
-    auto engine = std::make_shared<PriorityMediaInformationEngine>();
-    std::atomic_uint publication_attempts{};
-    MediaInformationService information(
-        service.filesystem(), service.catalogue(), engine, t.path() / "media-info",
-        [&](std::string id, MediaProbeResult profile) {
-            if (++publication_attempts == 1)
-                throw std::runtime_error("synthetic catalogue conflict");
-            service.catalogue().put_media_profile(id, std::move(profile));
-        });
-    REQUIRE(information.request_path(path));
-    information.start();
-
-    REQUIRE(wait_until([&] {
-        return service.catalogue().media_profile(media_id).has_value();
-    }, 3s));
-    CHECK(publication_attempts.load() == 2);
-    CHECK(engine->starts() == 1);
-    CHECK(engine->completions() == 1);
-
-    information.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_abandoned_transcode_pipeline_is_reclaimed_before_session) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/abandoned.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/abandoned.mp4", true);
-    auto bytes = pattern(65549);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr("/media/abandoned.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.max_video_transcodes = 1;
-    streaming.video_decoder_threads = 3;
-    // Renewals come 20 ms apart; the lease must outlast a loaded host's sleep
-    // overrun between two of them.
-    streaming.pipeline_idle = 500ms;
-    streaming.session_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<FakeMediaEngine>());
-    playback.start();
-
-    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-    auto first = playback.handle(create);
-    REQUIRE(first.status == 201);
-    auto first_json = Json::parse(std::string(first.body.begin(), first.body.end()));
-    auto stale_stream = first_json.find("stream")->find("url")->asString();
-    const auto current_stream = stale_stream;
-    auto generation = stale_stream.find("/1/master.m3u8");
-    REQUIRE(generation != std::string::npos);
-    stale_stream.replace(generation, std::string("/1/master.m3u8").size(),
-                         "/0/master.m3u8");
-
-    auto playback_status = [&] {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/playback/status";
-        auto response = playback.handle(request);
-        REQUIRE(response.status == 200);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-    auto active = playback_status();
-    CHECK(active.find("sessions")->asUInt64() == 1);
-    CHECK(active.find("video_transcodes")->asUInt64() == 1);
-    CHECK(active.find("video_decoder_threads")->asUInt64() == 3);
-
-    // Valid current-generation traffic renews the physical pipeline lease.
-    for (int i = 0; i < 4; ++i) {
-        HttpRequest current;
-        current.method = "GET";
-        current.path = current_stream;
-        CHECK(playback.handle(current).status == 200);
-        std::this_thread::sleep_for(20ms);
-    }
-    CHECK(playback_status().find("video_transcodes")->asUInt64() == 1);
-
-    // Requests for an obsolete generation are answered gone and do not renew
-    // the abandoned encoder's lease.
-    for (int i = 0; i < 4; ++i) {
-        HttpRequest stale;
-        stale.method = "GET";
-        stale.path = stale_stream;
-        CHECK(playback.handle(stale).status == 410);
-        std::this_thread::sleep_for(20ms);
-    }
-
-    REQUIRE(wait_until([&] {
-        auto status = playback_status();
-        // The entitlement is on its own clock, transcode_entitlement_idle, left
-        // at its default here; the keep-alive case below tests it.
-        return status.find("sessions")->asUInt64() == 1 &&
-               status.find("video_transcodes")->asUInt64() == 1 &&
-               status.find("running_video_transcode_pipelines")->asUInt64() == 0 &&
-               !status.find("heap_reclaim_pending")->asBool() &&
-               status.find("heap_reclaim_requests")->asUInt64() >= 1 &&
-               status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
-               status.find("heap_reclaim_runs")->asUInt64() >= 1;
-    }, 5s));
-
-    // Reclaiming the pipeline does not surrender the entitlement, so a resume
-    // or seek after an idle pipeline is not refused.
-    auto second = playback.handle(create);
-    REQUIRE(second.status == 429);
-    auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
-    auto second_error = second_json.find("error");
-    REQUIRE(second_error != nullptr);
-    CHECK(second_error->find("code")->asString() == "resource_limit");
-    // Node-scoped on create: no session exists yet, so another node may serve it.
-    CHECK(second_error->find("scope")->asString() == "node");
-    CHECK(second_error->find("node_healthy")->asBool());
-    CHECK(second_error->find("alternative_may_succeed")->asBool());
-
-    HttpRequest remove;
-    remove.method = "DELETE";
-    remove.path = "/api/v1/playback/sessions/" +
-                  first_json.find("session_id")->asString();
-    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    REQUIRE(playback.handle(remove).status == 204);
-    second = playback.handle(create);
-    REQUIRE(second.status == 201);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_a_stream_fetch_holds_the_transcode_slot_and_a_session_poll_does_not) {
-    // A paused viewer keeps its transcode entitlement by fetching a stream object
-    // (a playlist is enough) within transcode_entitlement_idle. Polling the
-    // session keeps the session alive but not the entitlement.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/keepalive.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/keepalive.mp4", true);
-    auto bytes = pattern(65549);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr("/media/keepalive.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.max_video_transcodes = 1;
-    // A fetch every 100ms keeps the pipeline (and so the playlist it serves) alive.
-    streaming.pipeline_idle = 250ms;
-    // Clamped into [pipeline_idle, session_idle].
-    streaming.transcode_entitlement_idle = 600ms;
-    streaming.session_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<FakeMediaEngine>());
-    playback.start();
-
-    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-    auto created = playback.handle(create);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
-    const auto session_id = created_json.find("session_id")->asString();
-    const auto stream_url = created_json.find("stream")->find("url")->asString();
-
-    auto entitlements = [&] {
-        HttpRequest status;
-        status.method = "GET";
-        status.path = "/api/v1/playback/status";
-        auto response = playback.handle(status);
-        REQUIRE(response.status == 200);
-        auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
-        return json.find("video_transcodes")->asUInt64();
-    };
-    REQUIRE(entitlements() == 1);
-
-    // Polling well inside the window is not stream activity: the slot is released.
-    HttpRequest poll;
-    poll.method = "GET";
-    poll.path = "/api/v1/playback/sessions/" + session_id;
-    poll.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    REQUIRE(wait_until([&] {
-        CHECK(playback.handle(poll).status == 200);
-        return entitlements() == 0;
-    }, 3s));
-
-    // The session itself survived the release: the viewer keeps its place.
-    CHECK(playback.handle(poll).status == 200);
-
-    // A fresh session kept warm by playlist fetches holds its entitlement.
-    auto second = playback.handle(create);
-    REQUIRE(second.status == 201);
-    auto second_json = Json::parse(std::string(second.body.begin(), second.body.end()));
-    const auto second_stream = second_json.find("stream")->find("url")->asString();
-    REQUIRE(entitlements() == 1);
-
-    HttpRequest fetch;
-    fetch.method = "GET";
-    fetch.path = second_stream;
-    const auto until = Clock::now() + 1500ms;
-    while (Clock::now() < until) {
-        CHECK(playback.handle(fetch).status == 200);
-        std::this_thread::sleep_for(100ms);
-    }
-    // 1500ms against a 600ms window: without the fetches this entitlement
-    // would have been released twice over.
-    CHECK(entitlements() == 1);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_a_superseded_generation_is_gone_and_a_future_one_never_existed) {
-    // A URL generation below the current one was replaced (permanent, not to be
-    // retried); one above it is an ordinary not-found.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/superseded.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/superseded.mp4", true);
-    auto bytes = pattern(65549);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr("/media/superseded.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.session_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<FakeMediaEngine>());
-    playback.start();
-
-    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-    auto created = playback.handle(create);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
-    const auto session_id = created_json.find("session_id")->asString();
-    const auto first_url = created_json.find("stream")->find("url")->asString();
-    const auto first_generation = created_json.find("generation")->asUInt64();
-
-    // A seek ends the current generation and begins a new one.
-    Json::Object patch_root{{"seek_ms", 5'000}};
-    auto patch_text = Json(std::move(patch_root)).dump();
-    HttpRequest patch;
-    patch.method = "PATCH";
-    patch.path = "/api/v1/playback/sessions/" + session_id;
-    patch.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    patch.body.assign(patch_text.begin(), patch_text.end());
-    auto patched = playback.handle(patch);
-    REQUIRE(patched.status == 200);
-    auto patched_json = Json::parse(std::string(patched.body.begin(), patched.body.end()));
-    const auto second_generation = patched_json.find("generation")->asUInt64();
-    REQUIRE(second_generation > first_generation);
-
-    HttpRequest stale;
-    stale.method = "GET";
-    stale.path = first_url;
-    auto stale_response = playback.handle(stale);
-    REQUIRE(stale_response.status == 410);
-    auto stale_json = Json::parse(std::string(stale_response.body.begin(), stale_response.body.end()));
-    auto stale_error = stale_json.find("error");
-    REQUIRE(stale_error != nullptr);
-    CHECK(stale_error->find("code")->asString() == "generation_superseded");
-    // Scope `request`: no other node has this session, so do not walk the
-    // cluster. A different request against this node may succeed.
-    CHECK(stale_error->find("scope")->asString() == "request");
-    CHECK(stale_error->find("node_healthy")->asBool());
-    CHECK(stale_error->find("alternative_may_succeed")->asBool());
-
-    // Above the current generation: an ordinary not-found.
-    auto future_url = patched_json.find("stream")->find("url")->asString();
-    const auto marker = "/" + std::to_string(second_generation) + "/";
-    const auto at = future_url.find(marker);
-    REQUIRE(at != std::string::npos);
-    future_url.replace(at, marker.size(), "/" + std::to_string(second_generation + 99) + "/");
-    HttpRequest future;
-    future.method = "GET";
-    future.path = future_url;
-    auto future_response = playback.handle(future);
-    REQUIRE(future_response.status == 404);
-    auto future_json = Json::parse(std::string(future_response.body.begin(), future_response.body.end()));
-    CHECK(future_json.find("error")->find("code")->asString() == "not_found");
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_a_session_never_streamed_from_does_not_hold_a_transcode_slot) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/never-watched.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/never-watched.mp4", true);
-    auto bytes = pattern(65549);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr("/media/never-watched.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.max_video_transcodes = 1;
-    // The clock under test; session_idle stays long, so only this one can fire.
-    streaming.session_unused_idle = 150ms;
-    streaming.session_idle = 5min;
-    streaming.pipeline_idle = 5min;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<FakeMediaEngine>());
-    playback.start();
-
-    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-
-    auto playback_status = [&] {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/playback/status";
-        auto response = playback.handle(request);
-        REQUIRE(response.status == 200);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-
-    // A session created and never used again (app killed, DELETE never sent).
-    auto abandoned = playback.handle(create);
-    REQUIRE(abandoned.status == 201);
-    auto abandoned_json = Json::parse(std::string(abandoned.body.begin(), abandoned.body.end()));
-    CHECK(playback_status().find("video_transcodes")->asUInt64() == 1);
-
-    REQUIRE(wait_until([&] {
-        auto status = playback_status();
-        return status.find("sessions")->asUInt64() == 0 &&
-               status.find("video_transcodes")->asUInt64() == 0 &&
-               status.find("unused_sessions_reclaimed")->asUInt64() == 1;
-    }, 5s));
-    CHECK(playback_status().find("session_unused_idle_ms")->asUInt64() == 150);
-
-    // The slot is genuinely released, not merely reported free.
-    auto admitted = playback.handle(create);
-    REQUIRE(admitted.status == 201);
-    auto admitted_json = Json::parse(std::string(admitted.body.begin(), admitted.body.end()));
-    CHECK(admitted_json.find("session_id")->asString() !=
-          abandoned_json.find("session_id")->asString());
-
-    // One stream fetch moves a session onto the long clock, so a paused player
-    // is never evicted by this one.
-    HttpRequest stream;
-    stream.method = "GET";
-    stream.path = admitted_json.find("stream")->find("url")->asString();
-    REQUIRE(playback.handle(stream).status == 200);
-    std::this_thread::sleep_for(400ms);
-    auto still_here = playback_status();
-    CHECK(still_here.find("sessions")->asUInt64() == 1);
-    CHECK(still_here.find("video_transcodes")->asUInt64() == 1);
-    CHECK(still_here.find("unused_sessions_reclaimed")->asUInt64() == 1);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_status_does_not_block_on_a_contended_subtitle_cache) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/subtitled.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/subtitled.mp4", true);
-    auto bytes = pattern(65549);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr("/media/subtitled.mp4"));
-
-    TestGate gate;
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<GatedSubtitleMediaEngine>(gate));
-    playback.start();
-
-    Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}, {"subtitle_stream", 2}};
-    Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(text.begin(), text.end());
-    auto created = playback.handle(create);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
-    const auto subtitle_url = created_json.find("stream")->find("subtitle_url")->asString();
-    const auto subtitle_base = subtitle_url.substr(0, subtitle_url.rfind('/'));
-
-    // Hold this session's subtitle_cache mutex for the whole test by blocking
-    // inside extract_webvtt_segment, as a slow extraction would.
-    HttpResponse segment_response;
-    std::jthread segment_request([&] {
-        HttpRequest segment;
-        segment.method = "GET";
-        segment.path = subtitle_base + "/segment-0.vtt";
-        segment_response = playback.handle(segment);
-    });
-    REQUIRE(gate.wait_for_entries(1));
-
-    HttpRequest status_request;
-    status_request.method = "GET";
-    status_request.path = "/api/v1/playback/status";
-    const auto status_started = Clock::now();
-    auto status_response = playback.handle(status_request);
-    const auto status_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - status_started);
-    REQUIRE(status_response.status == 200);
-    // status() does not block on the held mutex: the per-session read is
-    // try_lock, so a busy session contributes nothing to the snapshot.
-    CHECK(status_elapsed < 500ms);
-    auto status_json = Json::parse(std::string(status_response.body.begin(), status_response.body.end()));
-    CHECK(status_json.find("sessions")->asUInt64() == 1);
-    CHECK(status_json.find("subtitle_cache_entries")->asUInt64() == 0);
-
-    // Nor is an unrelated session-mutating call stuck behind the global mutex.
-    HttpRequest second_create;
-    second_create.method = "POST";
-    second_create.path = "/api/v1/playback/sessions";
-    second_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    second_create.body.assign(text.begin(), text.end());
-    const auto second_started = Clock::now();
-    auto second_created = playback.handle(second_create);
-    const auto second_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - second_started);
-    REQUIRE(second_created.status == 201);
-    CHECK(second_elapsed < 500ms);
-
-    gate.open();
-    segment_request.join();
-    REQUIRE(segment_response.status == 200);
-    CHECK(segment_response.content_type.starts_with("text/vtt"));
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_attached_picture_audio_direct_play) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/cover.mp3", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/cover.mp3", true);
-    auto bytes = pattern(4096);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/cover.mp3"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<AttachedPictureAudioEngine>());
-    playback.start();
-
-    Json::Array containers{Json("mp3")};
-    Json::Array video_codecs{Json("h264")};
-    Json::Array audio_codecs{Json("mp3"), Json("aac")};
-    Json::Object capabilities{{"containers", Json(std::move(containers))},
-                              {"video_codecs", Json(std::move(video_codecs))},
-                              {"audio_codecs", Json(std::move(audio_codecs))},
-                              {"hls_fmp4", true}};
-    Json::Object root{{"media_id", media_id}, {"capabilities", Json(std::move(capabilities))},
-                      {"preferences", Json(Json::Object{{"mode", "direct"}})}};
-    auto text = Json(std::move(root)).dump();
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/api/v1/playback/sessions";
-    request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    request.body.assign(text.begin(), text.end());
-    auto response = playback.handle(request);
-    REQUIRE(response.status == 201);
-    auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
-    CHECK(body.find("mode")->asString() == "direct");
-    auto selection = body.find("selection");
-    REQUIRE(selection && selection->isObject());
-    CHECK(selection->find("video_stream")->asInt64() == -1);
-    CHECK(selection->find("audio_stream")->asInt64() == 1);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_FAST_TEST("media_playback", test_older_video_profiles_are_stale_and_regenerate) {
-    CatalogueSnapshot::MediaProfile profile;
-    profile.probe.format = "matroska,webm";
-    profile.probe.duration_seconds = 6660.0;
-    MediaStreamInfo video;
-    video.index = 0;
-    video.type = MediaStreamType::video;
-    video.codec = "hevc";
-    video.profile = "Main 10";
-    MediaStreamInfo audio;
-    audio.index = 1;
-    audio.type = MediaStreamType::audio;
-    audio.codec = "eac3";
-    profile.probe.streams = {video, audio};
-
-    // Fresh profiles carry the depth/transfer signalling negotiation needs.
-    CHECK(profile.schema_version == catalogue_media_profile_schema);
-    CHECK(valid_catalogue_media_profile("macha:abc", profile));
-    // A profile from an older schema lacks it, so it is regenerated.
-    for (uint32_t older = 1; older < catalogue_media_profile_schema; ++older) {
-        profile.schema_version = older;
-        CHECK(!valid_catalogue_media_profile("macha:abc", profile));
-    }
-    profile.schema_version = 1;
-    // Unless it has no video stream.
-    profile.probe.streams = {audio};
-    CHECK(valid_catalogue_media_profile("macha:abc", profile));
-}
-
-namespace {
 // English and French audio beside the fake engine's one video and two English
 // subtitles, so every choice is a real one.
 class TwoAudioFakeMediaEngine final : public FakeMediaEngine {
@@ -2519,559 +384,41 @@ class TwoAudioFakeMediaEngine final : public FakeMediaEngine {
         return result;
     }
 };
-} // namespace
 
-MACHA_TEST("media_playback", test_the_server_plays_what_it_is_told_and_chooses_nothing) {
-    // Playback is by media_id; a stream, language or container left open when
-    // there are several is refused with the candidates, and a language the
-    // media lacks is never answered with another track.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/two.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(128 * 1024 + 17);
-    auto writer = service.filesystem().open_write("/media/two.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/two.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<TwoAudioFakeMediaEngine>());
-    playback.start();
-
-    const auto create = [&](Json::Object root, int expect) {
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        auto response = playback.handle(request);
-        REQUIRE(response.status == expect);
-        auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
-        if (const auto* id = parsed.find("session_id")) {
-            HttpRequest remove;
-            remove.method = "DELETE";
-            remove.path = "/api/v1/playback/sessions/" + id->asString();
-            remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-            playback.handle(remove);
+// A remux engine with a keyframe every 10 s, so an off-keyframe seek lands
+// before the request (FakeMediaEngine's empty index makes every offset zero).
+class KeyframedRemuxMediaEngine final : public FakeMediaEngine {
+  public:
+    HlsVodPlan prepare_hls_vod(const MediaSource& source, const PlaybackPlan& plan,
+                               double duration_seconds,
+                               std::chrono::milliseconds segment_duration,
+                               bool allow_video_transcode_fallback,
+                               std::chrono::milliseconds timeout = {}) override {
+        auto vod = FakeMediaEngine::prepare_hls_vod(source, plan, duration_seconds,
+                                                    segment_duration,
+                                                    allow_video_transcode_fallback, timeout);
+        for (double seconds = 0.0; seconds < duration_seconds; seconds += 10.0)
+            vod.video_random_access_points.push_back(seconds);
+        const auto requested_ms =
+            media_vod::clamp_seek_ms(plan.seek.count(), duration_seconds);
+        // Only a stream copy is bound to a sync sample; a transcode starts on the frame asked for.
+        if (plan.video != MediaTransform::copy) {
+            vod.playback.seek = std::chrono::milliseconds(requested_ms);
+            vod.playback.seek_offset = {};
+            vod.playback.seek_requested = std::chrono::milliseconds(requested_ms);
+            return vod;
         }
-        return parsed;
-    };
-    const auto instruct = [&](Json::Object preferences, int expect = 201) {
-        return create(Json::Object{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}}, expect);
-    };
-    const auto refusal = [](const Json& body, std::string code, std::string choice) {
-        CHECK(body.find("status")->asString() == code);
-        CHECK(body.find("error")->find("code")->asString() == code);
-        CHECK(body.find("error")->find("choice")->asString() == choice);
-        return body.find("error")->find("choices")->asArray();
-    };
+        auto indexed = media_vod::indexed_plan(vod.video_random_access_points, duration_seconds,
+                                               requested_ms, vod.seek_segment_seconds);
+        REQUIRE(indexed.has_value());
+        vod.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
+        vod.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
+        vod.playback.seek_requested = std::chrono::milliseconds(indexed->seek_requested_ms);
+        vod.segment_durations = std::move(indexed->segment_durations);
+        return vod;
+    }
+};
 
-    // A title is not playable as such: only a file is, named by media_id.
-    auto by_item = create(Json::Object{{"item_id", "tmdb:movie:603"}, {"media_id", media_id},
-                                       {"preferences", Json(Json::Object{{"mode", "direct"}})}},
-                          400);
-    CHECK(by_item.find("error")->find("code")->asString() == "item_id_not_accepted");
-    auto nothing = create(Json::Object{{"preferences", Json(Json::Object{{"mode", "direct"}})}}, 400);
-    CHECK(nothing.find("error")->find("code")->asString() == "media_id_required");
-
-    // Two audio tracks and no instruction: refused with both, not the default.
-    auto open = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}}, 400),
-                        "choice_required", "audio_stream");
-    REQUIRE(open.size() == 2);
-    CHECK(open[0].asInt64() == 1);
-    CHECK(open[1].asInt64() == 4);
-    // Named by index or by a language only one track has: performed.
-    auto french = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 4}});
-    CHECK(french.find("output")->find("audio")->find("source_stream")->asInt64() == 4);
-    auto english = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_language", "eng"}});
-    CHECK(english.find("output")->find("audio")->find("source_stream")->asInt64() == 1);
-    // A language the media lacks is refused, never answered with another.
-    auto german = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"},
-                                                {"audio_language", "deu"}},
-                                   400),
-                          "choice_not_available", "audio_stream");
-    CHECK(german.size() == 2);
-    auto bogus = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 9}}, 400),
-                         "choice_not_available", "audio_stream");
-    CHECK(bogus.size() == 2);
-    // Two English subtitles: a language that matches both picks neither.
-    auto subtitles = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 1},
-                                                   {"subtitle_language", "eng"}},
-                                      400),
-                             "choice_required", "subtitle_stream");
-    CHECK(subtitles.size() == 2);
-    // Direct serves the file untouched and the player picks tracks: nothing is refused.
-    auto direct = instruct(Json::Object{{"mode", "direct"}});
-    CHECK(direct.find("mode")->asString() == "direct");
-    CHECK(direct.find("output")->find("audio") == nullptr);
-    // The session still reports every mode the media supports.
-    const auto& modes = direct.find("options")->find("modes")->asArray();
-    CHECK(modes.size() == 3);
-
-    // Copy support is a fact about each stream, not about whichever came first.
-    HttpRequest facts;
-    facts.method = "GET";
-    facts.path = "/api/v1/playback/media";
-    facts.query["media_id"] = media_id;
-    facts.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    auto response = playback.handle(facts);
-    REQUIRE(response.status == 200);
-    auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
-    const auto& media = parsed.find("media")->asArray().front();
-    CHECK(media.find("operations")->find("copy_into_fmp4") == nullptr);
-    size_t audio_with_facts = 0;
-    for (const auto& stream : media.find("streams")->asArray())
-        if (stream.find("type")->asString() == "audio" && stream.find("copy_into")) ++audio_with_facts;
-    CHECK(audio_with_facts == 2);
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_instructions_are_performed_not_negotiated) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/dv.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(128 * 1024 + 17);
-    auto writer = service.filesystem().open_write("/media/dv.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/dv.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<HdrFakeMediaEngine>());
-    playback.start();
-
-    const auto instruct = [&](Json::Object preferences, int expect = 201) {
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        auto response = playback.handle(request);
-        REQUIRE(response.status == expect);
-        auto parsed = Json::parse(std::string(response.body.begin(), response.body.end()));
-        // Release the slot so the permutation walk does not hit the session limit.
-        if (const auto* id = parsed.find("session_id")) {
-            HttpRequest remove;
-            remove.method = "DELETE";
-            remove.path = "/api/v1/playback/sessions/" + id->asString();
-            remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-            playback.handle(remove);
-        }
-        return parsed;
-    };
-
-    // A transcode instruction re-encodes both streams and says what it served.
-    auto transcoded = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}});
-    CHECK(transcoded.find("mode")->asString() == "transcode");
-    CHECK(transcoded.find("output")->find("video")->find("codec")->asString() == "h264");
-    CHECK(transcoded.find("output")->find("video")->find("color_transfer")->asString() == "bt709");
-    CHECK(transcoded.find("output")->find("audio")->find("codec")->asString() == "aac");
-    // The source facts are reported whatever was asked for.
-    auto source_streams = transcoded.find("source")->find("streams")->asArray();
-    REQUIRE(!source_streams.empty());
-    CHECK(source_streams.front().find("color_transfer")->asString() == "smpte2084");
-    CHECK(source_streams.front().find("bit_depth")->asInt64() == 10);
-
-    // Remux copies both, 10-bit PQ HEVC and E-AC-3 included.
-    auto remuxed = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
-    CHECK(remuxed.find("mode")->asString() == "remux");
-    CHECK(remuxed.find("output")->find("video")->find("codec")->asString() == "hevc");
-    CHECK(remuxed.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
-    CHECK(remuxed.find("output")->find("audio")->find("codec")->asString() == "eac3");
-
-    // Copy the video, re-encode the audio: a transcode, as the request says.
-    auto mixed = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
-    CHECK(mixed.find("mode")->asString() == "transcode");
-    CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
-    CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
-    // A codec change is not a downmix: the 5.1 source stays 5.1 through AAC.
-    CHECK(mixed.find("output")->find("audio")->find("channels")->asUInt64() == 6);
-    CHECK(transcoded.find("output")->find("audio")->find("channels")->asUInt64() == 6);
-
-    // The other mixture: re-encode the video, copy the audio.
-    auto video_only = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
-    CHECK(video_only.find("output")->find("video")->find("transform")->asString() == "transcode");
-    CHECK(video_only.find("output")->find("audio")->find("transform")->asString() == "copy");
-
-    // The segment container is instructed too, and the session reports the one served.
-    auto ts = instruct(Json::Object{{"mode", "transcode"}, {"container", "mpegts"}});
-    CHECK(ts.find("output")->find("format")->asString() == "mpegts");
-    CHECK(ts.find("output")->find("container")->asString() == "mpegts");
-    auto ts_copy = instruct(Json::Object{{"mode", "remux"}, {"container", "mpegts"}});
-    CHECK(ts_copy.find("output")->find("container")->asString() == "mpegts");
-    CHECK(ts_copy.find("output")->find("video")->find("transform")->asString() == "copy");
-    CHECK(ts_copy.find("output")->find("audio")->find("transform")->asString() == "copy");
-    // No default container: an HLS instruction without one is refused with both listed.
-    auto fmp4 = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
-    CHECK(fmp4.find("output")->find("container")->asString() == "fmp4");
-    auto unnamed = instruct(Json::Object{{"mode", "remux"}}, 400);
-    CHECK(unnamed.find("error")->find("code")->asString() == "choice_required");
-    CHECK(unnamed.find("error")->find("choice")->asString() == "container");
-    CHECK(unnamed.find("error")->find("choices")->asArray().size() == 2);
-    auto direct_container = instruct(Json::Object{{"mode", "direct"}});
-    CHECK(direct_container.find("output")->find("container")->asString() == "matroska");
-
-    // A mode is required, and a copy cannot also be a quality change.
-    instruct(Json::Object{{"max_height", 720}}, 400);
-    instruct(Json::Object{{"mode", "auto"}}, 400);
-    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"max_height", 720}}, 400);
-
-    // direct and remux copy every stream; transcode re-encodes at least one. A
-    // mode naming something it is not doing is refused, not reinterpreted.
-    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio", "transcode"}}, 400);
-    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "transcode"}}, 400);
-    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"max_height", 720}}, 400);
-    instruct(Json::Object{{"mode", "direct"}, {"audio", "transcode"}}, 400);
-    instruct(Json::Object{{"mode", "direct"}, {"video", "transcode"}}, 400);
-    instruct(Json::Object{{"mode", "direct"}, {"max_height", 720}}, 400);
-    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}}, 400);
-
-    // The legal permutations are accepted.
-    instruct(Json::Object{{"mode", "direct"}, {"video", "copy"}, {"audio", "copy"}});
-    instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}});
-    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "transcode"}});
-    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "transcode"}});
-    instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "copy"}});
-}
-
-MACHA_TEST("media_playback", test_direct_is_the_source_file_and_refuses_a_quality_change) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/test.mp4", 0644, getuid(), getgid());
-    auto bytes = pattern(128 * 1024 + 17);
-    auto writer = service.filesystem().open_write("/media/test.mp4", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    auto fake_engine = std::make_unique<FakeMediaEngine>();
-    auto* fake_engine_ptr = fake_engine.get();
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(fake_engine));
-    playback.start();
-
-    // A quality instruction is a re-encode, so it is refused with direct, not ignored.
-    Json::Object illegal_prefs{{"mode", "direct"},
-                               {"max_height", 1},
-                               {"max_bitrate", static_cast<uint64_t>(1)}};
-    Json::Object illegal_root{{"media_id", media_id},
-                              {"preferences", Json(std::move(illegal_prefs))}};
-    auto illegal_text = Json(std::move(illegal_root)).dump();
-    HttpRequest illegal_create;
-    illegal_create.method = "POST";
-    illegal_create.path = "/api/v1/playback/sessions";
-    illegal_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    illegal_create.body.assign(illegal_text.begin(), illegal_text.end());
-    CHECK(playback.handle(illegal_create).status == 400);
-
-    Json::Object direct_prefs{{"mode", "direct"}};
-    Json::Object direct_root{{"media_id", media_id},
-                             {"preferences", Json(std::move(direct_prefs))}};
-    auto direct_text = Json(std::move(direct_root)).dump();
-    HttpRequest direct_create;
-    direct_create.method = "POST";
-    direct_create.path = "/api/v1/playback/sessions";
-    direct_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    direct_create.body.assign(direct_text.begin(), direct_text.end());
-    auto direct_created = playback.handle(direct_create);
-    REQUIRE(direct_created.status == 201);
-    auto direct_json = Json::parse(std::string(direct_created.body.begin(), direct_created.body.end()));
-    CHECK(direct_json.find("mode")->asString() == "direct");
-    CHECK(direct_json.find("stream")->find("url")->asString().ends_with("/direct"));
-    auto direct_modes = direct_json.find("options")->find("modes")->asArray();
-    CHECK(std::any_of(direct_modes.begin(), direct_modes.end(), [](const Json& mode) {
-        return mode.asString() == "direct";
-    }));
-    CHECK(fake_engine_ptr->vod_prepares() == 0);
-    CHECK(fake_engine_ptr->started_plans().empty());
-
-    HttpRequest direct_range;
-    direct_range.method = "GET";
-    direct_range.path = direct_json.find("stream")->find("url")->asString();
-    direct_range.headers["range"] = "bytes=123-1122";
-    auto direct_range_response = playback.handle(direct_range);
-    REQUIRE(direct_range_response.status == 206);
-    REQUIRE(direct_range_response.stream != nullptr);
-    CHECK(direct_range_response.content_length() == 1000);
-    Bytes direct_bytes(1000);
-    REQUIRE(direct_range_response.stream->read(0, direct_bytes) == direct_bytes.size());
-    CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 123));
-
-    HttpRequest remove_direct;
-    remove_direct.method = "DELETE";
-    remove_direct.path = "/api/v1/playback/sessions/" + direct_json.find("session_id")->asString();
-    remove_direct.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove_direct).status == 204);
-
-    // A remux session advertises direct unconditionally and honours an
-    // explicit switch back to it.
-    Json::Object remux_root{{"media_id", media_id},
-                            {"preferences", Json(Json::Object{{"mode", "remux"}, {"container", "fmp4"}})}};
-    auto remux_text = Json(std::move(remux_root)).dump();
-    HttpRequest remux_create;
-    remux_create.method = "POST";
-    remux_create.path = "/api/v1/playback/sessions";
-    remux_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    remux_create.body.assign(remux_text.begin(), remux_text.end());
-    auto remux_created = playback.handle(remux_create);
-    REQUIRE(remux_created.status == 201);
-    auto remux_json = Json::parse(std::string(remux_created.body.begin(), remux_created.body.end()));
-    CHECK(remux_json.find("mode")->asString() == "remux");
-    auto remux_modes = remux_json.find("options")->find("modes")->asArray();
-    CHECK(std::any_of(remux_modes.begin(), remux_modes.end(), [](const Json& mode) {
-        return mode.asString() == "direct";
-    }));
-
-    Json::Object switch_preferences{{"mode", "direct"}};
-    Json::Object switch_root{{"preferences", Json(std::move(switch_preferences))}};
-    auto switch_text = Json(std::move(switch_root)).dump();
-    HttpRequest switch_direct;
-    switch_direct.method = "PATCH";
-    switch_direct.path = "/api/v1/playback/sessions/" + remux_json.find("session_id")->asString();
-    switch_direct.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    switch_direct.body.assign(switch_text.begin(), switch_text.end());
-    auto switched = playback.handle(switch_direct);
-    REQUIRE(switched.status == 200);
-    auto switched_json = Json::parse(std::string(switched.body.begin(), switched.body.end()));
-    CHECK(switched_json.find("mode")->asString() == "direct");
-    CHECK(switched_json.find("preferences")->find("mode")->asString() == "direct");
-    CHECK(switched_json.find("stream")->find("url")->asString().ends_with("/direct"));
-
-    HttpRequest remove_switched;
-    remove_switched.method = "DELETE";
-    remove_switched.path = "/api/v1/playback/sessions/" + switched_json.find("session_id")->asString();
-    remove_switched.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove_switched).status == 204);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_naming_a_mode_restates_the_whole_transform) {
-    // `mode` is shorthand for the whole transform, so an update naming it is not
-    // judged against per-stream instructions from the mode it replaces.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/dv.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(128 * 1024 + 17);
-    auto writer = service.filesystem().open_write("/media/dv.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/dv.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    streaming.max_video_transcodes = 4;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<HdrFakeMediaEngine>());
-    playback.start();
-
-    const auto create = [&](Json::Object preferences) {
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        auto response = playback.handle(request);
-        REQUIRE(response.status == 201);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-    const auto update = [&](const std::string& id, Json::Object preferences, int expect = 200) {
-        Json::Object root{{"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "PATCH";
-        request.path = "/api/v1/playback/sessions/" + id;
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        auto response = playback.handle(request);
-        REQUIRE(response.status == expect);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-    const auto discard = [&](const std::string& id) {
-        HttpRequest remove;
-        remove.method = "DELETE";
-        remove.path = "/api/v1/playback/sessions/" + id;
-        remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        playback.handle(remove);
-    };
-
-    // Transcode with the video copied.
-    auto mixed = create(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
-    CHECK(mixed.find("mode")->asString() == "transcode");
-    CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
-    CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
-    auto id = mixed.find("session_id")->asString();
-
-    // Obeyed: the per-stream instruction belonged to the replaced mode.
-    auto direct = update(id, Json::Object{{"mode", "direct"}});
-    CHECK(direct.find("mode")->asString() == "direct");
-    CHECK(direct.find("preferences")->find("video")->isNull());
-    CHECK(direct.find("preferences")->find("audio")->isNull());
-    id = direct.find("session_id")->asString();
-
-    auto remuxed = update(id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
-    CHECK(remuxed.find("mode")->asString() == "remux");
-    CHECK(remuxed.find("output")->find("video")->find("transform")->asString() == "copy");
-    CHECK(remuxed.find("output")->find("audio")->find("transform")->asString() == "copy");
-    id = remuxed.find("session_id")->asString();
-
-    // An update that names both sets both.
-    auto restated = update(id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
-    CHECK(restated.find("mode")->asString() == "transcode");
-    CHECK(restated.find("output")->find("video")->find("transform")->asString() == "transcode");
-    CHECK(restated.find("output")->find("audio")->find("transform")->asString() == "copy");
-    discard(restated.find("session_id")->asString());
-
-    // A quality instruction also belongs to its mode, so it does not outlive a transcode.
-    auto capped = create(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}});
-    CHECK(capped.find("preferences")->find("max_height")->asInt64() == 720);
-    auto uncapped = update(capped.find("session_id")->asString(), Json::Object{{"mode", "direct"}});
-    CHECK(uncapped.find("mode")->asString() == "direct");
-    CHECK(uncapped.find("preferences")->find("max_height")->isNull());
-    discard(uncapped.find("session_id")->asString());
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_TEST("media_playback", test_concurrent_transcode_admission_is_reserved) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/test.mkv", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/test.mkv", true);
-    auto bytes = pattern(64 * 1024);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.max_sessions = 4;
-    streaming.max_video_transcodes = 1;
-    streaming.max_audio_transcodes = 1;
-    streaming.startup_timeout = 2s;
-    auto engine = std::make_unique<BlockingMediaEngine>();
-    auto* blocking = engine.get();
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(engine));
-    playback.start();
-
-    auto request_for = [&](const std::string& id) {
-        Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-        Json::Object root{{"media_id", id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        return request;
-    };
-
-    HttpResponse first_response;
-    std::jthread first([&] { first_response = playback.handle(request_for(media_id)); });
-    REQUIRE(wait_until([&] { return blocking->starts() == 1; }, 1s));
-
-    auto second_response = playback.handle(request_for(media_id));
-    CHECK(second_response.status == 429);
-    CHECK(blocking->starts() == 1);
-
-    blocking->release();
-    first.join();
-    REQUIRE(first_response.status == 201);
-    auto first_json = Json::parse(std::string(first_response.body.begin(), first_response.body.end()));
-    HttpRequest remove;
-    remove.method = "DELETE";
-    remove.path = "/api/v1/playback/sessions/" + first_json.find("session_id")->asString();
-    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove).status == 204);
-
-    playback.stop();
-    service.stop();
-}
-
-namespace {
 // A pipeline whose first fragment and start progress the test controls, for
 // `start=async`; shared by engine and test so neither holds a dangling session.
 struct ProgressingState {
@@ -3165,1023 +512,453 @@ class ProgressingMediaEngine final : public MediaEngine {
     }
 };
 
-struct AsyncStartFixture {
-    TempDir t;
-    std::unique_ptr<Service> service;
-    std::unique_ptr<PlaybackManager> playback;
-    ProgressingMediaEngine* engine{};
-    std::string media_id;
-
-    explicit AsyncStartFixture(std::chrono::milliseconds no_progress = 1000ms) {
-        auto keyfile = t.path() / "key";
-        write_key(keyfile);
-        auto keys = load_cluster_keys(keyfile);
-        auto c = config_for(t.path() / "node", keyfile, free_port());
-        c.replication = 1;
-        c.metadata_min_write_replicas = 1;
-        c.catalogue.api.enabled = false;
-        service = std::make_unique<Service>(c, keys);
-        service->start();
-        service->filesystem().mkdir("/media", 0755, getuid(), getgid());
-        service->filesystem().create_file("/media/async.mkv", 0644, getuid(), getgid());
-        auto writer = service->filesystem().open_write("/media/async.mkv", true);
-        auto bytes = pattern(64 * 1024);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-        media_id = file_media_id(service->filesystem().getattr("/media/async.mkv"));
-
-        CatalogueApiConfig api;
-        StreamingConfig streaming;
-        streaming.enabled = true;
-        streaming.temp_path = t.path() / "playback";
-        streaming.max_sessions = 4;
-        streaming.max_video_transcodes = 1;
-        streaming.max_audio_transcodes = 1;
-        streaming.startup_timeout = 1s;
-        streaming.startup_no_progress = no_progress;
-        streaming.start_wait_max = 5s;
-        streaming.start_failed_retention = 1s;
-        auto owned = std::make_unique<ProgressingMediaEngine>();
-        engine = owned.get();
-        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->resources().transcode_rates,
-                                                     service->resources().memory, service->catalogue(), api,
-                                                     streaming, std::move(owned));
-        playback->start();
-    }
-    ~AsyncStartFixture() {
-        playback->stop();
-        service->stop();
-    }
-    static Json body(const HttpResponse& response) {
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    }
-    HttpResponse create(const std::string& mode, bool async, const std::string& key = {}) {
-        Json::Object preferences{{"mode", mode}};
-        if (mode != "direct") preferences["container"] = std::string("fmp4");
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        if (async) request.query["start"] = "async";
-        if (!key.empty()) request.query["idempotency_key"] = key;
-        request.session = SessionIdentity{.id = "viewer", .roles = {"media_viewer"}};
-        request.body.assign(text.begin(), text.end());
-        return playback->handle(request);
-    }
-    HttpResponse call(const std::string& method, const std::string& id,
-                      std::map<std::string, std::string, std::less<>> query = {}, std::string text = {}) {
-        HttpRequest request;
-        request.method = method;
-        request.path = "/api/v1/playback/sessions/" + id;
-        for (auto& [name, value] : query) request.query[name] = value;
-        request.session = SessionIdentity{.id = "viewer", .roles = {"media_viewer"}};
-        request.body.assign(text.begin(), text.end());
-        return playback->handle(request);
-    }
-    std::string stage(const std::string& id) {
-        auto response = call("GET", id);
-        if (response.status != 200) return "status-" + std::to_string(response.status);
-        return body(response).find("start")->find("stage")->asString();
-    }
-};
 } // namespace
 
-MACHA_TEST("media_playback", test_an_async_start_reports_progress_and_outlives_the_elapsed_budget) {
-    AsyncStartFixture f;
-    auto created = f.create("transcode", true);
-    REQUIRE(created.status == 202);
-    auto json = AsyncStartFixture::body(created);
-    CHECK(json.find("status")->asString() == "playback_starting");
-    const auto id = json.find("session_id")->asString();
-    CHECK(json.find("stream")->find("url")->isNull());
-    CHECK(json.find("stream")->find("close_url")->asString().ends_with("/close"));
-    CHECK(json.find("mode")->asString() == "transcode");
-    REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
-
-    // Still going past startup_timeout (1 s), because it keeps progressing.
-    for (int ms = 250; ms <= 2500; ms += 250) {
-        f.engine->advance(ms / 2);
-        std::this_thread::sleep_for(250ms);
-    }
-    CHECK(f.stage(id) == "encoding");
-    auto polled = AsyncStartFixture::body(f.call("GET", id));
-    const auto start = polled.find("start");
-    REQUIRE(start != nullptr);
-    REQUIRE(start->find("output_media_ms") != nullptr);
-    CHECK(start->find("output_media_ms")->asInt64() == 1250);
-    REQUIRE(start->find("first_fragment_ms") != nullptr);
-    CHECK(start->find("first_fragment_ms")->asInt64() == 2000);
-    REQUIRE(start->find("source_bytes_read") != nullptr);
-    CHECK(start->find("source_bytes_read")->asUInt64() > 0);
-    CHECK(start->find("preroll_total_ms") == nullptr);
-
-    // A long-poll on the current sequence parks; a PATCH is refused while pending.
-    const auto seq = std::to_string(start->find("progress_seq")->asUInt64());
-    auto parked = f.call("GET", id, {{"after", seq}, {"wait_ms", "60000"}});
-    CHECK(parked.defer.has_value());
-    auto patch = f.call("PATCH", id, {}, R"({"seek_ms":1000})");
-    CHECK(patch.status == 409);
-    CHECK(AsyncStartFixture::body(patch).find("error")->find("code")->asString() == "playback_starting");
-
-    f.engine->release();
-    REQUIRE(wait_until([&] { return f.stage(id) == "ready"; }, 2s));
-    auto ready = AsyncStartFixture::body(f.call("GET", id));
-    CHECK(ready.find("stream")->find("url")->asString().ends_with("/master.m3u8"));
-    CHECK(f.call("DELETE", id).status == 204);
-}
-
-MACHA_TEST("media_playback", test_a_stalled_async_start_fails_and_frees_its_slot_at_once) {
-    AsyncStartFixture f(600ms);
-    auto created = f.create("transcode", true);
-    REQUIRE(created.status == 202);
-    const auto id = AsyncStartFixture::body(created).find("session_id")->asString();
-    REQUIRE(wait_until([&] { return f.stage(id) == "failed"; }, 3s));
-    auto failed = AsyncStartFixture::body(f.call("GET", id));
-    const auto* error = failed.find("start")->find("error");
-    REQUIRE(error != nullptr);
-    CHECK(error->find("code")->asString() == "playback_pipeline_start_failed");
-    CHECK(error->find("start_stage")->asString() == "encoding");
-    // The only transcode slot is free again at once.
-    auto next = f.create("transcode", true);
-    CHECK(next.status == 202);
-    const auto next_id = AsyncStartFixture::body(next).find("session_id")->asString();
-    CHECK(f.call("DELETE", next_id).status == 204);
-    // The failure is gone after its retention.
-    REQUIRE(wait_until([&] { return f.call("GET", id).status == 404; }, 3s));
-}
-
-MACHA_TEST("media_playback", test_deleting_a_pending_async_start_stops_it_and_frees_the_slot) {
-    AsyncStartFixture f;
-    auto created = f.create("transcode", true);
-    REQUIRE(created.status == 202);
-    const auto id = AsyncStartFixture::body(created).find("session_id")->asString();
-    REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
-    CHECK(f.call("DELETE", id).status == 204);
-    REQUIRE(wait_until([&] { return !f.engine->last()->running.load(); }, 2s));
-    auto next = f.create("transcode", true);
-    CHECK(next.status == 202);
-    CHECK(f.call("DELETE", AsyncStartFixture::body(next).find("session_id")->asString()).status == 204);
-}
-
-namespace {
-// A ready async session on the fixture: created, released, swapped in.
-std::string ready_session(AsyncStartFixture& f) {
-    auto created = f.create("transcode", true);
-    REQUIRE(created.status == 202);
-    const auto id = AsyncStartFixture::body(created).find("session_id")->asString();
-    REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
-    f.engine->release();
-    REQUIRE(wait_until([&] { return f.stage(id) == "ready"; }, 2s));
-    return id;
-}
-std::string pending_stage(AsyncStartFixture& f, const std::string& id) {
-    auto json = AsyncStartFixture::body(f.call("GET", id));
-    const auto* pending = json.find("pending");
-    return pending ? pending->find("start")->find("stage")->asString() : std::string("none");
-}
-} // namespace
-
-MACHA_TEST("media_playback", test_an_async_update_keeps_the_playing_generation_until_its_replacement_is_ready) {
-    AsyncStartFixture f;
-    const auto id = ready_session(f);
-    const auto first = f.engine->last();
-    auto patched = f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":30000})");
-    REQUIRE(patched.status == 202);
-    auto json = AsyncStartFixture::body(patched);
-    CHECK(json.find("status")->asString() == "playback_starting");
-    CHECK(json.find("generation")->asUInt64() == 1);
-    CHECK(json.find("stream")->find("url")->asString().ends_with("/1/master.m3u8"));
-    REQUIRE(json.find("pending") != nullptr);
-    REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
-    // The playing generation is not superseded while the replacement starts.
-    CHECK(first->running.load());
-    f.engine->advance(500);
-    REQUIRE(wait_until([&] { return pending_stage(f, id) == "encoding"; }, 2s));
-    f.engine->release();
-    REQUIRE(wait_until([&] { return pending_stage(f, id) == "none"; }, 2s));
-    auto swapped = AsyncStartFixture::body(f.call("GET", id));
-    CHECK(swapped.find("generation")->asUInt64() == 2);
-    CHECK(swapped.find("seek_ms")->asUInt64() == 30000);
-    CHECK(!first->running.load());
-    CHECK(f.call("DELETE", id).status == 204);
-}
-
-MACHA_TEST("media_playback", test_abandoning_a_pending_update_leaves_the_playing_generation_and_frees_the_slot) {
-    AsyncStartFixture f;
-    const auto id = ready_session(f);
-    const auto first = f.engine->last();
-    REQUIRE(f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":20000})").status == 202);
-    REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
-    const auto second = f.engine->last();
-    CHECK(f.call("DELETE", id + "/pending").status == 204);
-    CHECK(!second->running.load());
-    CHECK(first->running.load());
-    auto json = AsyncStartFixture::body(f.call("GET", id));
-    CHECK(json.find("pending") == nullptr);
-    CHECK(json.find("generation")->asUInt64() == 1);
-    // The replacement's reservation is released: another update is admitted.
-    CHECK(f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":40000})").status == 202);
-    // Deleting the session takes its pending replacement with it.
-    REQUIRE(wait_until([&] { return f.engine->starts() == 3; }, 2s));
-    const auto third = f.engine->last();
-    CHECK(f.call("DELETE", id).status == 204);
-    CHECK(!third->running.load());
-    CHECK(!first->running.load());
-}
-
-MACHA_TEST("media_playback", test_a_stalled_update_fails_under_pending_and_the_generation_plays_on) {
-    AsyncStartFixture f(600ms);
-    const auto id = ready_session(f);
-    const auto first = f.engine->last();
-    REQUIRE(f.call("PATCH", id, {{"start", "async"}}, R"({"seek_ms":20000})").status == 202);
-    REQUIRE(wait_until([&] { return pending_stage(f, id) == "failed"; }, 3s));
-    auto json = AsyncStartFixture::body(f.call("GET", id));
-    CHECK(json.find("pending")->find("start")->find("error")->find("code")->asString() ==
-          "playback_pipeline_start_failed");
-    CHECK(json.find("generation")->asUInt64() == 1);
-    CHECK(first->running.load());
-    CHECK(f.call("DELETE", id).status == 204);
-}
-
-MACHA_TEST("media_playback", test_async_direct_play_and_replays_answer_without_a_second_start) {
-    AsyncStartFixture f;
-    // Direct play has no pipeline: it answers as a blocking create would.
-    auto direct = f.create("direct", true);
-    REQUIRE(direct.status == 201);
-    CHECK(AsyncStartFixture::body(direct).find("start") == nullptr);
-    CHECK(f.call("DELETE", AsyncStartFixture::body(direct).find("session_id")->asString()).status == 204);
-
-    // A retried keyed create while pending answers the same pending session.
-    auto first = f.create("transcode", true, "retry-1");
-    REQUIRE(first.status == 202);
-    auto again = f.create("transcode", true, "retry-1");
-    REQUIRE(again.status == 202);
-    CHECK(AsyncStartFixture::body(again).find("idempotency")->asString() == "replayed");
-    CHECK(AsyncStartFixture::body(again).find("session_id")->asString() ==
-          AsyncStartFixture::body(first).find("session_id")->asString());
-    CHECK(f.engine->starts() <= 1);
-    CHECK(f.call("DELETE", AsyncStartFixture::body(first).find("session_id")->asString()).status == 204);
-}
-
-namespace {
-// One node, one tiny file and a PlaybackManager admitting a single video transcode.
-struct SingleSlotPlayback {
+MACHA_FAST_TEST("media_playback", test_segment_store_serves_its_plan_as_a_closed_playlist) {
+    // The playlist is the plan, which exists before any media: complete and
+    // closed on the first fetch, byte-identical afterwards, named for its
+    // container, and withheld once the generation breaks.
     TempDir t;
-    std::unique_ptr<Service> service;
-    std::unique_ptr<PlaybackManager> playback;
-    std::string media_id;
+    const std::vector<double> plan{2.0, 4.0, 4.0, 3.5};
+    auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill", 4000ms, plan);
+    const auto state = store->snapshot();
+    REQUIRE(state.segment_count == 0);
+    REQUIRE(!state.init_ready);
+    CHECK(state.planned_segments == 4);
 
-    SingleSlotPlayback() {
-        auto keyfile = t.path() / "key";
-        write_key(keyfile);
-        auto keys = load_cluster_keys(keyfile);
-        auto c = config_for(t.path() / "node", keyfile, free_port());
-        c.replication = 1;
-        c.metadata_min_write_replicas = 1;
-        c.catalogue.api.enabled = false;
-        service = std::make_unique<Service>(c, keys);
-        service->start();
-        service->filesystem().mkdir("/media", 0755, getuid(), getgid());
-        service->filesystem().create_file("/media/slot.mp4", 0644, getuid(), getgid());
-        auto writer = service->filesystem().open_write("/media/slot.mp4", true);
-        auto bytes = pattern(64 * 1024);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-        media_id = file_media_id(service->filesystem().getattr("/media/slot.mp4"));
+    const auto first = store->playlist();
+    REQUIRE(!first.empty());
+    CHECK(first.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(first.find("#EXT-X-PLAYLIST-TYPE:EVENT") == std::string::npos);
+    CHECK(first.find("#EXT-X-ENDLIST") != std::string::npos);
+    CHECK(first.find("#EXT-X-MAP:URI=\"init.mp4\"") != std::string::npos);
+    // Every planned entry is advertised, produced or not.
+    for (int i = 0; i < 4; ++i) CHECK(first.find(segment_name(i)) != std::string::npos);
+    CHECK(first.find(segment_name(4)) == std::string::npos);
+    // EXTINF is the planned length; TARGETDURATION is the longest planned entry,
+    // rounded up.
+    CHECK(first.find("#EXTINF:2.000,") != std::string::npos);
+    CHECK(first.find("#EXTINF:3.500,") != std::string::npos);
+    CHECK(first.find("#EXT-X-TARGETDURATION:4\n") != std::string::npos);
 
-        CatalogueApiConfig api;
-        StreamingConfig streaming;
-        streaming.enabled = true;
-        streaming.temp_path = t.path() / "playback";
-        streaming.max_sessions = 4;
-        streaming.max_video_transcodes = 1;
-        streaming.max_audio_transcodes = 1;
-        streaming.startup_timeout = 2s;
-        playback = std::make_unique<PlaybackManager>(service->filesystem(), service->resources().transcode_rates,
-                                                     service->resources().memory, service->catalogue(),
-                                                     api, streaming,
-                                                     std::make_unique<FakeMediaEngine>());
-        playback->start();
+    // Immutable through production, even when a fragment is longer than planned.
+    REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+    CHECK(store->playlist() == first);
+    REQUIRE(store->publish_segment(Bytes(64, 0x10), 2.0));
+    CHECK(store->playlist() == first);
+    REQUIRE(store->publish_segment(Bytes(64, 0x11), 6.0));
+    CHECK(store->playlist() == first);
+    REQUIRE(store->publish_segment(Bytes(64, 0x12), 4.0));
+    REQUIRE(store->publish_segment(Bytes(64, 0x13), 3.5));
+    store->finish();
+    CHECK(store->snapshot().error.empty());
+    CHECK(store->playlist() == first);
+    auto init = store->object("init.mp4");
+    REQUIRE(init.has_value());
+    CHECK(std::string(init->begin(), init->end()) == "init");
+    for (int i = 0; i < 4; ++i) {
+        auto segment = store->object(segment_name(i));
+        REQUIRE(segment.has_value());
+        CHECK((*segment)[0] == static_cast<uint8_t>(0x10 + i));
     }
 
-    HttpResponse create(const std::string& mode, const std::string& viewer,
-                        const std::string& attempt) {
-        Json::Object preferences{{"mode", mode}, {"container", "fmp4"}};
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = viewer, .roles = {"anonymous"}};
-        request.query["idempotency_key"] = attempt;
-        request.body.assign(text.begin(), text.end());
-        return playback->handle(request);
-    }
+    // A broken generation withholds the playlist rather than serve a promise
+    // it cannot keep.
+    auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-broken",
+                                                      4000ms, plan);
+    REQUIRE(!broken->playlist().empty());
+    broken->fail("generation broke");
+    CHECK(broken->playlist().empty());
 
-    Json status() {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/playback/status";
-        auto response = playback->handle(request);
-        REQUIRE(response.status == 200);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    }
-
-    static Json body(const HttpResponse& response) {
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    }
-};
-} // namespace
-
-MACHA_TEST("media_playback", test_a_patch_out_of_transcode_releases_the_slot) {
-    SingleSlotPlayback fixture;
-    auto first = fixture.create("transcode", "viewer-1", "a1");
-    REQUIRE(first.status == 201);
-    const auto id = SingleSlotPlayback::body(first).find("session_id")->asString();
-    CHECK(fixture.status().find("video_transcodes")->asUInt64() == 1);
-    CHECK(fixture.create("transcode", "viewer-2", "b1").status == 429);
-
-    HttpRequest patch;
-    patch.method = "PATCH";
-    patch.path = "/api/v1/playback/sessions/" + id;
-    patch.session = SessionIdentity{.id = "viewer-1", .roles = {"anonymous"}};
-    const std::string text = R"({"preferences":{"mode":"direct"}})";
-    patch.body.assign(text.begin(), text.end());
-    auto patched = fixture.playback->handle(patch);
-    REQUIRE(patched.status == 200);
-
-    CHECK(fixture.status().find("video_transcodes")->asUInt64() == 0);
-    CHECK(fixture.create("transcode", "viewer-2", "b2").status == 201);
+    // MPEG-TS: the same closed plan with version 3 and .ts names, no init
+    // fragment (the first fragment makes it ready), and an init request that
+    // is a genuine miss rather than held.
+    auto ts = std::make_shared<MediaSegmentStore>(4, 64 * 1024, t.path() / "spill-ts", 4000ms,
+                                                  std::vector<double>{2.0, 4.0, 4.0},
+                                                  MediaContainer::mpegts);
+    CHECK(ts->container() == MediaContainer::mpegts);
+    const auto planned_ts = ts->playlist();
+    CHECK(planned_ts.find("#EXT-X-VERSION:3") != std::string::npos);
+    CHECK(planned_ts.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+    CHECK(planned_ts.find(segment_name(2, ".ts")) != std::string::npos);
+    CHECK(planned_ts.find("#EXT-X-ENDLIST") != std::string::npos);
+    CHECK(planned_ts.find("#EXT-X-MAP") == std::string::npos);
+    CHECK(planned_ts.find(".m4s") == std::string::npos);
+    const auto ts_init_asked = std::chrono::steady_clock::now();
+    CHECK(!ts->wait_object("init.mp4", 5s).has_value());
+    CHECK(std::chrono::steady_clock::now() - ts_init_asked < 1s);
+    REQUIRE(ts->publish_segment(Bytes(188 * 3, 0x47), 2.0));
+    REQUIRE(ts->wait_ready(10ms));
+    CHECK(ts->playlist() == planned_ts);
+    REQUIRE(ts->object(segment_name(0, ".ts")).has_value());
+    CHECK(ts->object(segment_name(0, ".ts"))->size() == 188 * 3);
+    // Both spellings map to index 0.
+    CHECK(ts->object(segment_name(0)).has_value());
+    REQUIRE(ts->publish_segment(Bytes(188, 0x47), 4.0));
+    REQUIRE(ts->publish_segment(Bytes(188, 0x47), 4.0));
+    ts->finish();
+    CHECK(ts->playlist() == planned_ts);
 }
 
-MACHA_TEST("media_playback", test_the_signed_stream_url_closes_its_session_without_a_bearer) {
-    // A page unloading cannot finish a preflighted DELETE, so the session is
-    // closed through its signed stream URL with no Authorization header (a
-    // CORS simple request).
-    SingleSlotPlayback fixture;
-    auto created = fixture.create("transcode", "viewer-1", "a1");
-    REQUIRE(created.status == 201);
-    const auto body = SingleSlotPlayback::body(created);
-    const auto id = body.find("session_id")->asString();
-    const auto url = body.find("stream")->find("url")->asString();
-    const std::string prefix = "/api/v1/playback/sessions/" + id + "/stream/";
-    REQUIRE(url.starts_with(prefix));
-    const auto token = url.substr(prefix.size(), url.find('/', prefix.size()) - prefix.size());
-    REQUIRE(!token.empty());
-
-    auto close = [&](const std::string& method, const std::string& with_token) {
-        HttpRequest request;
-        request.method = method;
-        request.path = prefix + with_token + "/close";
-        // No bearer: the token in the path is the whole authorisation.
-        CHECK(fixture.playback->capability_request(request));
-        return fixture.playback->handle(request);
-    };
-
-    CHECK(close("GET", token).status == 405);
-    std::string wrong = token;
-    wrong.back() = wrong.back() == '0' ? '1' : '0';
-    CHECK(close("POST", wrong).status == 404);
-    CHECK(fixture.status().find("sessions")->asUInt64() == 1);
-
-    CHECK(close("POST", token).status == 204);
-    CHECK(fixture.status().find("sessions")->asUInt64() == 0);
-    CHECK(fixture.status().find("video_transcodes")->asUInt64() == 0);
-    CHECK(fixture.create("transcode", "viewer-2", "b1").status == 201);
-
-    // Idempotent: the session is already gone, which is what was asked for.
-    CHECK(close("POST", token).status == 204);
-}
-
-MACHA_TEST("media_playback", test_each_create_is_its_own_session_and_its_own_entitlement) {
-    // Each create is a new member of the collection: distinct ids and an
-    // entitlement per session. A client that re-POSTs a transcode without
-    // releasing its previous session needs a second slot and is refused.
+MACHA_TEST("media_playback", test_segment_store_holds_requests_until_published_superseded_or_ended) {
     TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/logical.mp4", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/media/logical.mp4", true);
-    auto bytes = pattern(64 * 1024);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id =
-        file_media_id(service.filesystem().getattr("/media/logical.mp4"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.max_sessions = 4;
-    streaming.max_video_transcodes = 1;
-    streaming.max_audio_transcodes = 1;
-    streaming.startup_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<FakeMediaEngine>());
-    playback.start();
-
-    auto create = [&](std::string mode, std::string viewer, std::string attempt) {
-        Json::Object preferences{{"mode", std::move(mode)}, {"container", "fmp4"}};
-        Json::Object root{{"media_id", media_id},
-                          {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = viewer, .roles = {"anonymous"}};
-        request.query["idempotency_key"] = std::move(attempt);
-        request.body.assign(text.begin(), text.end());
-        return playback.handle(request);
-    };
-    auto status = [&] {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/playback/status";
-        auto response = playback.handle(request);
-        REQUIRE(response.status == 200);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-    auto session_id_of = [](const HttpResponse& response) {
-        auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
-        return body.find("session_id")->asString();
-    };
-
-    auto first = create("transcode", "ui-player-1", "attempt-1");
-    REQUIRE(first.status == 201);
-    const auto first_id = session_id_of(first);
-    CHECK(status().find("video_transcodes")->asUInt64() == 1);
-    CHECK(status().find("sessions")->asUInt64() == 1);
-
-    // A second create on the same bearer is a second session, not a replacement.
-    auto second = create("direct", "ui-player-1", "attempt-2");
-    REQUIRE(second.status == 201);
-    const auto second_id = session_id_of(second);
-    CHECK(second_id != first_id);
-    CHECK(status().find("sessions")->asUInt64() == 2);
-    // Direct needs no encoder; the first session keeps its slot.
-    CHECK(status().find("video_transcodes")->asUInt64() == 1);
-
-    // Both are addressable, independently, by their own ids.
-    for (const auto& id : {first_id, second_id}) {
-        HttpRequest get;
-        get.method = "GET";
-        get.path = "/api/v1/playback/sessions/" + id;
-        get.session = SessionIdentity{.id = "ui-player-1", .roles = {"anonymous"}};
-        CHECK(playback.handle(get).status == 200);
-    }
-
-    // The single transcode slot is still a node-wide bound: another viewer
-    // cannot take it while it is held.
-    CHECK(create("transcode", "ui-player-2", "other-attempt").status == 429);
-
-    // Nor can the account that already holds it.
-    CHECK(create("transcode", "ui-player-1", "attempt-3").status == 429);
-
-    // Releasing the session that holds the slot frees it for anyone.
-    HttpRequest remove;
-    remove.method = "DELETE";
-    remove.path = "/api/v1/playback/sessions/" + first_id;
-    remove.session = SessionIdentity{.id = "ui-player-1", .roles = {"anonymous"}};
-    REQUIRE(playback.handle(remove).status == 204);
-    CHECK(status().find("video_transcodes")->asUInt64() == 0);
-    CHECK(create("transcode", "ui-player-2", "other-attempt-2").status == 201);
-
-    playback.stop();
-    service.stop();
-}
-
-MACHA_HEAVY_TEST("media_playback", test_playback_sessions_and_streaming_http_bodies) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto port = free_port();
-    auto c = config_for(t.path() / "node", keyfile, port);
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/test.mp4", 0644, getuid(), getgid());
-    auto bytes = pattern(512 * 1024 + 37);
-    auto writer = service.filesystem().open_write("/media/test.mp4", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/test.mp4"));
-
-    CatalogueApiConfig api;
-    api.stream_chunk_bytes = 64 * 1024;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.max_sessions = 4;
-    streaming.max_video_transcodes = 1;
-    streaming.max_audio_transcodes = 1;
-    streaming.startup_timeout = 2s;
-    auto fake_engine = std::make_unique<FakeMediaEngine>();
-    auto* fake_engine_ptr = fake_engine.get();
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::move(fake_engine));
-    playback.start();
-
-    HttpRequest playback_status_request;
-    playback_status_request.method = "GET";
-    playback_status_request.path = "/api/v1/playback/status";
-    auto playback_status_response = playback.handle(playback_status_request);
-    REQUIRE(playback_status_response.status == 200);
-    auto playback_status_json = Json::parse(std::string(playback_status_response.body.begin(),
-                                                        playback_status_response.body.end()));
-    REQUIRE(playback_status_json.find("server_version") != nullptr);
-    CHECK(playback_status_json.find("server_version")->asString() == kServerVersion);
-    REQUIRE(playback_status_json.find("probe_cache_entries") != nullptr);
-    REQUIRE(playback_status_json.find("probe_cache_bytes") != nullptr);
-    CHECK(playback_status_json.find("probe_cache_entries")->asUInt64() <=
-          playback_status_json.find("probe_cache_limit_entries")->asUInt64());
-    CHECK(playback_status_json.find("probe_cache_bytes")->asUInt64() <=
-          playback_status_json.find("probe_cache_limit_bytes")->asUInt64());
-    REQUIRE(playback_status_json.find("subtitle_cache_entries") != nullptr);
-    REQUIRE(playback_status_json.find("subtitle_cache_bytes") != nullptr);
-    REQUIRE(playback_status_json.find("segment_store_resident_bytes") != nullptr);
-    REQUIRE(playback_status_json.find("segment_store_spill_bytes") != nullptr);
-    REQUIRE(playback_status_json.find("segment_store_descriptor_bytes") != nullptr);
-    REQUIRE(playback_status_json.find("segment_store_segments") != nullptr);
-    REQUIRE(playback_status_json.find("segment_store_planned_segments") != nullptr);
-    REQUIRE(playback_status_json.find("heap_reclaim_pending") != nullptr);
-    REQUIRE(playback_status_json.find("heap_reclaim_requests") != nullptr);
-    REQUIRE(playback_status_json.find("heap_reclaim_runs") != nullptr);
-    REQUIRE(playback_status_json.find("heap_reclaim_successes") != nullptr);
-
-    // A transformed stream can begin at its resume point in the initial POST.
-    Json::Object initial_seek_preferences{{"mode", "remux"}, {"container", "fmp4"}};
-    Json::Object initial_seek_root{{"media_id", media_id},
-                                   {"seek_ms", 23000},
-                                   {"preferences", Json(std::move(initial_seek_preferences))}};
-    auto initial_seek_text = Json(std::move(initial_seek_root)).dump();
-    HttpRequest initial_seek;
-    initial_seek.method = "POST";
-    initial_seek.path = "/api/v1/playback/sessions";
-    initial_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    initial_seek.body.assign(initial_seek_text.begin(), initial_seek_text.end());
-    auto initial_seek_response = playback.handle(initial_seek);
-    REQUIRE(initial_seek_response.status == 201);
-    auto initial_seek_json = Json::parse(std::string(initial_seek_response.body.begin(),
-                                                     initial_seek_response.body.end()));
-    CHECK(initial_seek_json.find("mode")->asString() == "remux");
-    CHECK(initial_seek_json.find("seek_ms")->asInt64() == 23000);
-    auto plans = fake_engine_ptr->started_plans();
-    REQUIRE(plans.size() == 1);
-    CHECK(plans.back().seek == 23s);
-
-    // A transformed seek-only PATCH reuses the prepared VOD plan without re-probing.
-    const auto probes_before_seek = fake_engine_ptr->probes();
-    const auto prepares_before_seek = fake_engine_ptr->vod_prepares();
-    Json::Object fast_seek_root{{"seek_ms", 35000}};
-    auto fast_seek_text = Json(std::move(fast_seek_root)).dump();
-    HttpRequest fast_seek;
-    fast_seek.method = "PATCH";
-    fast_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
-    fast_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    fast_seek.body.assign(fast_seek_text.begin(), fast_seek_text.end());
-    auto fast_seek_response = playback.handle(fast_seek);
-    REQUIRE(fast_seek_response.status == 200);
-    auto fast_seek_json = Json::parse(std::string(fast_seek_response.body.begin(),
-                                                  fast_seek_response.body.end()));
-    CHECK(fast_seek_json.find("seek_ms")->asInt64() == 35000);
-    CHECK(fake_engine_ptr->probes() == probes_before_seek);
-    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_seek);
-    plans = fake_engine_ptr->started_plans();
-    REQUIRE(plans.size() == 2);
-    CHECK(plans.back().seek == 35s);
-
-    // A PATCH restating unchanged preferences is still seek-only and keeps the
-    // random-access plan.
-    Json::Object redundant_seek_preferences{{"mode", "remux"}, {"container", "fmp4"}};
-    Json::Object redundant_seek_root{{"seek_ms", 47000},
-                                     {"preferences", Json(std::move(redundant_seek_preferences))}};
-    auto redundant_seek_text = Json(std::move(redundant_seek_root)).dump();
-    HttpRequest redundant_seek;
-    redundant_seek.method = "PATCH";
-    redundant_seek.path = fast_seek.path;
-    redundant_seek.session = fast_seek.session;
-    redundant_seek.body.assign(redundant_seek_text.begin(), redundant_seek_text.end());
-    auto redundant_seek_response = playback.handle(redundant_seek);
-    REQUIRE(redundant_seek_response.status == 200);
-    auto redundant_seek_json = Json::parse(std::string(redundant_seek_response.body.begin(),
-                                                       redundant_seek_response.body.end()));
-    CHECK(redundant_seek_json.find("seek_ms")->asInt64() == 47000);
-    CHECK(fake_engine_ptr->probes() == probes_before_seek);
-    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_seek);
-    plans = fake_engine_ptr->started_plans();
-    REQUIRE(plans.size() == 3);
-    CHECK(plans.back().seek == 47s);
-
-    HttpRequest remove_initial_seek;
-    remove_initial_seek.method = "DELETE";
-    remove_initial_seek.path = "/api/v1/playback/sessions/" + initial_seek_json.find("session_id")->asString();
-    remove_initial_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove_initial_seek).status == 204);
-
-    // Reopening the same media with the same transformed plan reuses the probe
-    // and the prepared plan; only the pipeline generation is fresh.
-    const auto probes_before_reopen = fake_engine_ptr->probes();
-    const auto prepares_before_reopen = fake_engine_ptr->vod_prepares();
-    auto reopened_seek = playback.handle(initial_seek);
-    REQUIRE(reopened_seek.status == 201);
-    CHECK(fake_engine_ptr->probes() == probes_before_reopen);
-    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_reopen);
-    auto reopened_seek_json = Json::parse(std::string(reopened_seek.body.begin(),
-                                                      reopened_seek.body.end()));
-    HttpRequest remove_reopened_seek;
-    remove_reopened_seek.method = "DELETE";
-    remove_reopened_seek.path = "/api/v1/playback/sessions/" +
-                                reopened_seek_json.find("session_id")->asString();
-    remove_reopened_seek.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove_reopened_seek).status == 204);
-
-    Json::Object create_root{{"media_id", media_id},
-                             {"preferences", Json(Json::Object{{"mode", "direct"}})}};
-    auto create_text = Json(std::move(create_root)).dump();
-    HttpRequest create;
-    create.method = "POST";
-    create.path = "/api/v1/playback/sessions";
-    create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    create.body.assign(create_text.begin(), create_text.end());
-    auto created = playback.handle(create);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(std::string(created.body.begin(), created.body.end()));
-    CHECK(created_json.find("mode")->asString() == "direct");
-    REQUIRE(created_json.find("stream") != nullptr);
-    CHECK(created_json.find("stream")->find("subtitle_url")->isNull());
-    REQUIRE(created_json.find("source") != nullptr);
-    CHECK(created_json.find("source")->find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
-    CHECK(created_json.find("source")->find("bitrate")->asUInt64() == 4'000'000);
-    REQUIRE(created_json.find("source")->find("streams")->isArray());
-    CHECK(created_json.find("source")->find("streams")->asArray().size() == 4);
-    CHECK(created_json.find("source")->find("streams")->asArray()[0].find("bitrate")->asUInt64() == 3'700'000);
-    CHECK(created_json.find("source")->find("streams")->asArray()[1].find("bitrate")->asUInt64() == 192'000);
-    REQUIRE(created_json.find("output") != nullptr);
-    CHECK(created_json.find("output")->find("video")->find("transform")->asString() == "copy");
-    CHECK(created_json.find("output")->find("video")->find("bitrate")->asUInt64() == 3'700'000);
-    CHECK(created_json.find("output")->find("audio")->find("transform")->asString() == "copy");
-    CHECK(created_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 192'000);
-    REQUIRE(created_json.find("preferences") != nullptr);
-    CHECK(created_json.find("preferences")->find("mode")->asString() == "direct");
-    REQUIRE(created_json.find("options") != nullptr);
-    auto options = created_json.find("options");
-    REQUIRE(options->find("audio_streams") != nullptr);
-    REQUIRE(options->find("audio_streams")->isArray());
-    REQUIRE(!options->find("audio_streams")->asArray().empty());
-    CHECK(options->find("audio_streams")->asArray().front().isObject());
-    REQUIRE(options->find("subtitle_streams") != nullptr);
-    REQUIRE(options->find("subtitle_streams")->isArray());
-    REQUIRE(options->find("subtitle_streams")->asArray().size() == 1);
-    CHECK(options->find("subtitle_streams")->asArray().front().find("index")->asInt64() == 2);
-    REQUIRE(options->find("quality_heights") != nullptr);
-    CHECK(!options->find("quality_heights")->asArray().empty());
-    auto session_id = created_json.find("session_id")->asString();
-    auto direct_url = created_json.find("stream")->find("url")->asString();
-
-    HttpRequest direct;
-    direct.method = "GET";
-    direct.path = direct_url;
-    direct.headers["range"] = "bytes=100-1099";
-    auto direct_response = playback.handle(direct);
-    REQUIRE(direct_response.status == 206);
-    REQUIRE(direct_response.stream != nullptr);
-    CHECK(direct_response.content_length() == 1000);
-    Bytes direct_bytes(1000);
-    REQUIRE(direct_response.stream->read(0, direct_bytes) == direct_bytes.size());
-    CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 100));
-
-    // A subtitle-only PATCH does not rebuild or seek the A/V generation; the
-    // subtitle gets a stream-specific URL so caches cannot serve the old track.
-    const auto probes_before_subtitle = fake_engine_ptr->probes();
-    const auto prepares_before_subtitle = fake_engine_ptr->vod_prepares();
-    Json::Object subtitle_only_preferences{{"subtitle_stream", 2}};
-    Json::Object subtitle_only_root{{"preferences", Json(std::move(subtitle_only_preferences))}};
-    auto subtitle_only_text = Json(std::move(subtitle_only_root)).dump();
-    HttpRequest subtitle_only;
-    subtitle_only.method = "PATCH";
-    subtitle_only.path = "/api/v1/playback/sessions/" + session_id;
-    subtitle_only.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    subtitle_only.body.assign(subtitle_only_text.begin(), subtitle_only_text.end());
-    auto subtitle_only_response = playback.handle(subtitle_only);
-    REQUIRE(subtitle_only_response.status == 200);
-    auto subtitle_only_json = Json::parse(std::string(subtitle_only_response.body.begin(),
-                                                      subtitle_only_response.body.end()));
-    CHECK(subtitle_only_json.find("stream")->find("url")->asString() == direct_url);
-    CHECK(subtitle_only_json.find("selection")->find("subtitle_stream")->asInt64() == 2);
-    CHECK(subtitle_only_json.find("stream")->find("subtitle_url")->asString().find("/1/subtitle-2/manifest.json") != std::string::npos);
-    CHECK(fake_engine_ptr->probes() == probes_before_subtitle);
-    CHECK(fake_engine_ptr->vod_prepares() == prepares_before_subtitle);
-
-    const auto subtitle_segments_before_manifest = fake_engine_ptr->subtitle_segments();
-    HttpRequest selected_subtitle_manifest;
-    selected_subtitle_manifest.method = "GET";
-    selected_subtitle_manifest.path = subtitle_only_json.find("stream")->find("subtitle_url")->asString();
-    auto selected_subtitle_manifest_response = playback.handle(selected_subtitle_manifest);
-    REQUIRE(selected_subtitle_manifest_response.status == 200);
-    CHECK(selected_subtitle_manifest_response.content_type.starts_with("application/json"));
-    CHECK(fake_engine_ptr->subtitle_segments() == subtitle_segments_before_manifest);
-    REQUIRE(selected_subtitle_manifest_response.stream != nullptr);
-    Bytes selected_subtitle_manifest_bytes(static_cast<size_t>(selected_subtitle_manifest_response.content_length()));
-    REQUIRE(selected_subtitle_manifest_response.stream->read(0, selected_subtitle_manifest_bytes) ==
-            selected_subtitle_manifest_bytes.size());
-    auto selected_subtitle_manifest_json = Json::parse(std::string(
-        selected_subtitle_manifest_bytes.begin(), selected_subtitle_manifest_bytes.end()));
-    CHECK(selected_subtitle_manifest_json.find("format")->asString() == "macha-webvtt-segments");
-    REQUIRE(selected_subtitle_manifest_json.find("segment_durations_ms")->asArray().size() == 15);
-
-    auto selected_subtitle_base = selected_subtitle_manifest.path.substr(0, selected_subtitle_manifest.path.rfind('/'));
-    HttpRequest selected_subtitle_segment;
-    selected_subtitle_segment.method = "GET";
-    selected_subtitle_segment.path = selected_subtitle_base + "/segment-0.vtt";
-    auto selected_subtitle_segment_response = playback.handle(selected_subtitle_segment);
-    REQUIRE(selected_subtitle_segment_response.status == 200);
-    CHECK(selected_subtitle_segment_response.content_type.starts_with("text/vtt"));
-    CHECK(fake_engine_ptr->subtitle_segments() == subtitle_segments_before_manifest + 1);
-    auto selected_subtitle_segment_again = playback.handle(selected_subtitle_segment);
-    REQUIRE(selected_subtitle_segment_again.status == 200);
-    CHECK(fake_engine_ptr->subtitle_segments() == subtitle_segments_before_manifest + 1);
-
-    Json::Object subtitle_off_preferences{{"subtitle_stream", Json(nullptr)},
-                                          {"subtitle_language", ""}};
-    Json::Object subtitle_off_root{{"preferences", Json(std::move(subtitle_off_preferences))}};
-    auto subtitle_off_text = Json(std::move(subtitle_off_root)).dump();
-    HttpRequest subtitle_off;
-    subtitle_off.method = "PATCH";
-    subtitle_off.path = "/api/v1/playback/sessions/" + session_id;
-    subtitle_off.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    subtitle_off.body.assign(subtitle_off_text.begin(), subtitle_off_text.end());
-    auto subtitle_off_response = playback.handle(subtitle_off);
-    REQUIRE(subtitle_off_response.status == 200);
-    auto subtitle_off_json = Json::parse(std::string(subtitle_off_response.body.begin(),
-                                                     subtitle_off_response.body.end()));
-    CHECK(subtitle_off_json.find("stream")->find("url")->asString() == direct_url);
-    CHECK(subtitle_off_json.find("selection")->find("subtitle_stream")->asInt64() == -1);
-    CHECK(subtitle_off_json.find("stream")->find("subtitle_url")->isNull());
-
-    Json::Object bitmap_subtitle_preferences{{"subtitle_stream", 3}};
-    Json::Object bitmap_subtitle_root{{"preferences", Json(std::move(bitmap_subtitle_preferences))}};
-    auto bitmap_subtitle_text = Json(std::move(bitmap_subtitle_root)).dump();
-    HttpRequest bitmap_subtitle;
-    bitmap_subtitle.method = "PATCH";
-    bitmap_subtitle.path = "/api/v1/playback/sessions/" + session_id;
-    bitmap_subtitle.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    bitmap_subtitle.body.assign(bitmap_subtitle_text.begin(), bitmap_subtitle_text.end());
-    CHECK(playback.handle(bitmap_subtitle).status == 400);
-
-    Json::Object bad_track_preferences{{"audio_stream", 99}};
-    Json::Object bad_track_root{{"preferences", Json(std::move(bad_track_preferences))}};
-    auto bad_track_text = Json(std::move(bad_track_root)).dump();
-    HttpRequest bad_track;
-    bad_track.method = "PATCH";
-    bad_track.path = "/api/v1/playback/sessions/" + session_id;
-    bad_track.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    bad_track.body.assign(bad_track_text.begin(), bad_track_text.end());
-    CHECK(playback.handle(bad_track).status == 400);
-
-    // Requesting 720p rebuilds the session at 720p. Remux cannot honour quality;
-    // Direct stays exposed as the byte-stream override.
-    Json::Object quality_preferences{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}};
-    Json::Object quality_root{{"preferences", Json(std::move(quality_preferences))}};
-    auto quality_text = Json(std::move(quality_root)).dump();
-    HttpRequest quality;
-    quality.method = "PATCH";
-    quality.path = "/api/v1/playback/sessions/" + session_id;
-    quality.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    quality.body.assign(quality_text.begin(), quality_text.end());
-    auto quality_response = playback.handle(quality);
-    REQUIRE(quality_response.status == 200);
-    auto quality_json = Json::parse(std::string(quality_response.body.begin(), quality_response.body.end()));
-    CHECK(quality_json.find("mode")->asString() == "transcode");
-    CHECK(quality_json.find("preferences")->find("mode")->asString() == "transcode");
-    CHECK(quality_json.find("preferences")->find("max_height")->asInt64() == 720);
-    CHECK(quality_json.find("output")->find("video")->find("codec")->asString() == "h264");
-    CHECK(quality_json.find("output")->find("video")->find("height")->asInt64() == 720);
-    auto quality_modes = quality_json.find("options")->find("modes")->asArray();
-    CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
-        return mode.asString() == "direct";
-    }));
-    CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
-        return mode.asString() == "remux";
-    }));
-    CHECK(std::any_of(quality_modes.begin(), quality_modes.end(), [](const Json& mode) {
-        return mode.asString() == "transcode";
-    }));
-
-    Json::Object restore_preferences{{"mode", "direct"}, {"max_height", Json(nullptr)},
-                                     {"max_bitrate", Json(nullptr)}};
-    Json::Object restore_root{{"preferences", Json(std::move(restore_preferences))}};
-    auto restore_text = Json(std::move(restore_root)).dump();
-    HttpRequest restore;
-    restore.method = "PATCH";
-    restore.path = "/api/v1/playback/sessions/" + session_id;
-    restore.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    restore.body.assign(restore_text.begin(), restore_text.end());
-    auto restore_response = playback.handle(restore);
-    REQUIRE(restore_response.status == 200);
-    auto restore_json = Json::parse(std::string(restore_response.body.begin(), restore_response.body.end()));
-    CHECK(restore_json.find("mode")->asString() == "direct");
-    CHECK(restore_json.find("preferences")->find("max_height")->isNull());
-
-    Json::Object unsupported_caps{{"containers", Json::Array{}},
-                                  {"video_codecs", Json::Array{Json("vp9")}},
-                                  {"audio_codecs", Json::Array{Json("opus")}},
-                                  {"hls_fmp4", true}};
-    Json::Object unsupported_prefs{{"mode", "transcode"}, {"container", "fmp4"}};
-    Json::Object unsupported_root{{"media_id", media_id},
-                                  {"capabilities", Json(std::move(unsupported_caps))},
-                                  {"preferences", Json(std::move(unsupported_prefs))}};
-    auto unsupported_text = Json(std::move(unsupported_root)).dump();
-    HttpRequest unsupported;
-    unsupported.method = "POST";
-    unsupported.path = "/api/v1/playback/sessions";
-    unsupported.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    unsupported.body.assign(unsupported_text.begin(), unsupported_text.end());
-    // Capabilities are advisory: the instruction is performed, not refused. The
-    // session above released its slot on leaving transcode, so this is admitted.
-    auto unsupported_response = playback.handle(unsupported);
-    REQUIRE(unsupported_response.status == 201);
+    // Back-pressure: the producer may run max_ahead fragments past the highest
+    // request and then parks; older fragments spill so residency stays bounded,
+    // and the store's memory is leased from the ledger.
     {
-        // Give the slot back so the session above can PATCH into transcode.
-        auto body = Json::parse(std::string(unsupported_response.body.begin(),
-                                            unsupported_response.body.end()));
-        HttpRequest erase;
-        erase.method = "DELETE";
-        erase.path = "/api/v1/playback/sessions/" + body.find("session_id")->asString();
-        erase.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        REQUIRE(playback.handle(erase).status == 204);
+        RetainedMemoryLedger retained(8 * 1024, 1024, 4 * 1024, 1024);
+        auto store = std::make_shared<MediaSegmentStore>(2, 2 * 1024, t.path() / "spill", 4000ms,
+                                                         std::vector<double>{4.0, 4.0, 4.0, 4.0});
+        REQUIRE(store->attach_memory_ledger(retained));
+        CHECK(retained.stats().owner_bytes[static_cast<size_t>(MemoryOwner::playback_segment)] ==
+              2 * 1024);
+        REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        REQUIRE(store->publish_segment(Bytes(1024, 0x10), 4.0));
+        REQUIRE(store->publish_segment(Bytes(1024, 0x11), 4.0));
+        REQUIRE(store->publish_segment(Bytes(1024, 0x12), 4.0));
+        CHECK(store->snapshot().producer_parked);
+
+        std::atomic_bool fourth_published{};
+        std::jthread producer([&] {
+            fourth_published.store(store->publish_segment(Bytes(1024, 0x13), 4.0));
+        });
+        std::this_thread::sleep_for(50ms);
+        CHECK(!fourth_published.load());
+        store->note_requested(3);
+        auto waited = store->wait_object(segment_name(3), 1s);
+        producer.join();
+        CHECK(fourth_published.load());
+        REQUIRE(waited.has_value());
+        CHECK(waited->size() == 1024);
+        CHECK((*waited)[0] == 0x13);
+
+        store->finish();
+        REQUIRE(store->wait_ready(10ms));
+        const auto state = store->snapshot();
+        CHECK(state.init_ready);
+        CHECK(state.finished);
+        CHECK(state.segment_count == 4);
+        CHECK(state.highest_requested == 3);
+        CHECK(state.resident_bytes <= 2 * 1024 + 1024 + 4);
+        CHECK(state.spill_bytes >= 1024);
+        CHECK(state.descriptor_bytes >= state.segment_count);
+        CHECK(!state.producer_parked);
+        for (int i = 0; i < 4; ++i) {
+            auto segment = store->object(segment_name(i));
+            REQUIRE(segment.has_value());
+            CHECK(segment->size() == 1024);
+            CHECK((*segment)[0] == static_cast<uint8_t>(0x10 + i));
+        }
+        store.reset();
+        CHECK(retained.stats().used_bytes == 0);
     }
 
-    Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}, {"subtitle_stream", 2}};
-    Json::Object patch_root{{"preferences", Json(std::move(preferences))}, {"seek_ms", 12000}};
-    auto patch_text = Json(std::move(patch_root)).dump();
-    HttpRequest patch;
-    patch.method = "PATCH";
-    patch.path = "/api/v1/playback/sessions/" + session_id;
-    patch.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    patch.body.assign(patch_text.begin(), patch_text.end());
-    auto patched = playback.handle(patch);
-    REQUIRE(patched.status == 200);
-    auto patched_json = Json::parse(std::string(patched.body.begin(), patched.body.end()));
-    CHECK(patched_json.find("mode")->asString() == "transcode");
-    CHECK(patched_json.find("preferences")->find("mode")->asString() == "transcode");
-    CHECK(patched_json.find("output")->find("video")->find("transform")->asString() == "transcode");
-    CHECK(patched_json.find("output")->find("video")->find("codec")->asString() == "h264");
-    CHECK(patched_json.find("output")->find("audio")->find("transform")->asString() == "transcode");
-    // A codec change is not a downmix: the source's (stereo) layout survives AAC.
-    CHECK(patched_json.find("output")->find("audio")->find("channels")->asUInt64() == 2);
-    CHECK(patched_json.find("output")->find("audio")->find("bitrate")->asUInt64() == 2 * 64000);
-    auto hls_url = patched_json.find("stream")->find("url")->asString();
-    auto subtitle_url = patched_json.find("stream")->find("subtitle_url")->asString();
+    // Superseding wakes a request held on an unproduced fragment, and is
+    // reversible: a failed replacement leaves the active store's long-poll
+    // intact.
+    {
+        auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-superseded", 4000ms,
+                                                         std::vector<double>{4.0, 4.0, 4.0, 4.0, 4.0});
+        REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        REQUIRE(store->publish_segment(Bytes(16, 0x10), 4.0));
+        std::atomic_bool returned{};
+        std::optional<Bytes> result;
+        std::jthread waiter([&] {
+            store->note_requested(4);
+            result = store->wait_object(segment_name(4), {});
+            returned.store(true);
+        });
+        std::this_thread::sleep_for(50ms);
+        CHECK(!returned.load());
+        store->mark_superseded(true);
+        waiter.join();
+        CHECK(!result.has_value());
+        CHECK(store->snapshot().error.empty());
+        CHECK(!store->snapshot().finished);
 
-    HttpRequest playlist;
-    playlist.method = "GET";
-    playlist.path = hls_url;
-    auto playlist_response = playback.handle(playlist);
-    REQUIRE(playlist_response.status == 200);
-    REQUIRE(playlist_response.stream != nullptr);
-    Bytes playlist_bytes(static_cast<size_t>(playlist_response.content_length()));
-    REQUIRE(playlist_response.stream->read(0, playlist_bytes) == playlist_bytes.size());
-    CHECK(std::string(playlist_bytes.begin(), playlist_bytes.end()).find("#EXTM3U") != std::string::npos);
+        store->mark_superseded(false);
+        std::atomic_bool second_returned{};
+        std::jthread second([&] {
+            second_returned.store(store->wait_object(segment_name(4), {}).has_value());
+        });
+        std::this_thread::sleep_for(50ms);
+        CHECK(!second_returned.load());
+        for (uint8_t fill = 0x11; fill <= 0x14; ++fill)
+            REQUIRE(store->publish_segment(Bytes(16, fill), 4.0));
+        second.join();
+        CHECK(second_returned.load());
+    }
 
-    HttpRequest subtitle_manifest_request;
-    subtitle_manifest_request.method = "GET";
-    subtitle_manifest_request.path = subtitle_url;
-    auto subtitle_manifest_response = playback.handle(subtitle_manifest_request);
-    REQUIRE(subtitle_manifest_response.status == 200);
-    CHECK(subtitle_manifest_response.content_type.starts_with("application/json"));
-    REQUIRE(subtitle_manifest_response.stream != nullptr);
-    Bytes subtitle_manifest_bytes(static_cast<size_t>(subtitle_manifest_response.content_length()));
-    REQUIRE(subtitle_manifest_response.stream->read(0, subtitle_manifest_bytes) == subtitle_manifest_bytes.size());
-    auto subtitle_manifest_json = Json::parse(std::string(subtitle_manifest_bytes.begin(),
-                                                          subtitle_manifest_bytes.end()));
-    REQUIRE(!subtitle_manifest_json.find("segment_durations_ms")->asArray().empty());
-    auto subtitle_base = subtitle_url.substr(0, subtitle_url.rfind('/'));
-    HttpRequest subtitle_segment;
-    subtitle_segment.method = "GET";
-    subtitle_segment.path = subtitle_base + "/segment-0.vtt";
-    auto subtitle_segment_response = playback.handle(subtitle_segment);
-    REQUIRE(subtitle_segment_response.status == 200);
-    CHECK(subtitle_segment_response.content_type.starts_with("text/vtt"));
+    // init.mp4 may be asked for before the muxer has written it: held like a
+    // fragment, released by its publication or by the generation ending.
+    {
+        auto store = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-init", 4000ms,
+                                                         std::vector<double>{4.0, 4.0});
+        CHECK(!store->object("init.mp4").has_value());
+        std::atomic_bool returned{};
+        std::optional<Bytes> init;
+        std::jthread waiter([&] {
+            init = store->wait_object("init.mp4", {});
+            returned.store(true);
+        });
+        std::this_thread::sleep_for(50ms);
+        CHECK(!returned.load());
+        REQUIRE(store->publish_init(Bytes{'i', 'n', 'i', 't'}));
+        waiter.join();
+        REQUIRE(init.has_value());
+        CHECK(std::string(init->begin(), init->end()) == "init");
 
-    // The in-place subtitle path also preserves a live transformed generation.
-    const auto plans_before_transformed_subtitle_off = fake_engine_ptr->started_plans().size();
-    Json::Object transformed_subtitle_off_preferences{{"subtitle_stream", Json(nullptr)},
-                                                      {"subtitle_language", ""}};
-    Json::Object transformed_subtitle_off_root{{"preferences", Json(std::move(transformed_subtitle_off_preferences))}};
-    auto transformed_subtitle_off_text = Json(std::move(transformed_subtitle_off_root)).dump();
-    HttpRequest transformed_subtitle_off;
-    transformed_subtitle_off.method = "PATCH";
-    transformed_subtitle_off.path = "/api/v1/playback/sessions/" + session_id;
-    transformed_subtitle_off.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    transformed_subtitle_off.body.assign(transformed_subtitle_off_text.begin(), transformed_subtitle_off_text.end());
-    auto transformed_subtitle_off_response = playback.handle(transformed_subtitle_off);
-    REQUIRE(transformed_subtitle_off_response.status == 200);
-    auto transformed_subtitle_off_json = Json::parse(std::string(transformed_subtitle_off_response.body.begin(),
-                                                                 transformed_subtitle_off_response.body.end()));
-    CHECK(transformed_subtitle_off_json.find("stream")->find("url")->asString() == hls_url);
-    CHECK(transformed_subtitle_off_json.find("stream")->find("subtitle_url")->isNull());
-    CHECK(fake_engine_ptr->started_plans().size() == plans_before_transformed_subtitle_off);
+        auto broken = std::make_shared<MediaSegmentStore>(8, 8 * 1024, t.path() / "spill-init-broken",
+                                                          4000ms, std::vector<double>{4.0});
+        std::jthread breaker([&] { broken->fail("generation broke"); });
+        CHECK(!broken->wait_object("init.mp4", {}).has_value());
+        breaker.join();
 
-    Json::Object second_preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-    Json::Object second_root{{"media_id", media_id}, {"preferences", Json(std::move(second_preferences))}};
-    auto second_text = Json(std::move(second_root)).dump();
-    HttpRequest second;
-    second.method = "POST";
-    second.path = "/api/v1/playback/sessions";
-    second.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    second.body.assign(second_text.begin(), second_text.end());
-    auto limited = playback.handle(second);
-    CHECK(limited.status == 429);
-
-    HttpRequest remove;
-    remove.method = "DELETE";
-    remove.path = "/api/v1/playback/sessions/" + session_id;
-    remove.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove).status == 204);
-
-    // A playback lease is a snapshot: replacing the file does not change the
-    // bytes of a running direct stream.
-    Json::Object path_root{{"media_id", "path:/media/test.mp4"},
-                           {"preferences", Json(Json::Object{{"mode", "direct"}})}};
-    auto path_text = Json(std::move(path_root)).dump();
-    HttpRequest path_create;
-    path_create.method = "POST";
-    path_create.path = "/api/v1/playback/sessions";
-    path_create.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    path_create.body.assign(path_text.begin(), path_text.end());
-    auto path_created = playback.handle(path_create);
-    REQUIRE(path_created.status == 201);
-    auto path_json = Json::parse(std::string(path_created.body.begin(), path_created.body.end()));
-    auto path_session_id = path_json.find("session_id")->asString();
-    auto path_stream_url = path_json.find("stream")->find("url")->asString();
-
-    auto replacement_bytes = bytes;
-    for (auto& byte : replacement_bytes) byte ^= 0x5a;
-    auto replacement_writer = service.filesystem().open_write("/media/test.mp4", true);
-    REQUIRE(replacement_writer->write(0, replacement_bytes) == replacement_bytes.size());
-    replacement_writer->commit();
-
-    HttpRequest pinned;
-    pinned.method = "GET";
-    pinned.path = path_stream_url;
-    pinned.headers["range"] = "bytes=0-255";
-    auto pinned_response = playback.handle(pinned);
-    REQUIRE(pinned_response.status == 206);
-    Bytes pinned_bytes(256);
-    REQUIRE(pinned_response.stream->read(0, pinned_bytes) == pinned_bytes.size());
-    CHECK(std::equal(pinned_bytes.begin(), pinned_bytes.end(), bytes.begin()));
-
-    HttpRequest remove_path;
-    remove_path.method = "DELETE";
-    remove_path.path = "/api/v1/playback/sessions/" + path_session_id;
-    remove_path.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    CHECK(playback.handle(remove_path).status == 204);
-
-    // Session creation wakes the otherwise indefinitely blocked cleanup worker.
-    streaming.session_idle = 50ms;
-    playback.reconfigure(streaming);
-    auto expiring = playback.handle(create);
-    REQUIRE(expiring.status == 201);
-    REQUIRE(wait_until([&] {
-        HttpRequest status_request;
-        status_request.method = "GET";
-        status_request.path = "/api/v1/playback/status";
-        auto response = playback.handle(status_request);
-        if (response.status != 200) return false;
-        auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
-        return body.find("sessions") && body.find("sessions")->asUInt64() == 0;
-    }, 1s));
-
-    playback.stop();
-    service.stop();
+        // An unknown object is an immediate miss, held by nothing.
+        const auto asked = std::chrono::steady_clock::now();
+        CHECK(!store->wait_object("nonsense.bin", 5s).has_value());
+        CHECK(std::chrono::steady_clock::now() - asked < 1s);
+    }
 }
 
-MACHA_FAST_TEST("media_playback", test_subtitle_text_normalisation) {
-    CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello") == "Hello");
-    CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello, world") == "Hello, world");
-    CHECK(plain_ass_subtitle_text("Dialogue: 0,0,Default,,0,0,0,,{\\i1}Hello{\\i0}\\Nworld") ==
-          "Hello\nworld");
+MACHA_FAST_TEST("media_playback", test_production_rate_excludes_time_parked_on_demand) {
+    // producing_ms counts encode time only, so the rate is what the node could
+    // sustain: time parked at the look-ahead limit is excluded.
+    TempDir t;
+    SteppedTime time;
+    MediaSegmentStore store(2, 64ULL * 1024 * 1024, t.path() / "spill", 4000ms, {}, MediaContainer::fmp4, time);
+    REQUIRE(store.publish_init(Bytes{'i', 'n', 'i', 't'}));
+
+    // Three fragments of 20 ms encode work each are inside the look-ahead.
+    for (int i = 0; i < 3; ++i) {
+        time.advance(20ms);
+        REQUIRE(store.publish_segment(Bytes{'s', 'e', 'g'}, 4.0));
+    }
+    // Nothing has been requested, so the fourth parks: index 3 is past
+    // highest_requested (0) + max_ahead (2).
+    CHECK(store.snapshot().producer_parked);
+    time.advance(20ms);
+    const auto reads = time.reads();
+    std::thread producer([&] { store.publish_segment(Bytes{'s', 'e', 'g'}, 4.0); });
+    // The producer has taken its entry time and is at the gate.
+    REQUIRE(wait_until([&] { return time.reads() == reads + 1; }, 5s));
+    time.advance(2000ms);
+    store.note_requested(3);
+    producer.join();
+
+    const auto state = store.snapshot();
+    CHECK(state.segment_count == 4);
+    CHECK(state.produced_media_ms == 16'000);
+    // Four 20 ms fragments; the two seconds parked are not in it.
+    CHECK(state.producing_ms == 80);
+    CHECK(state.produced_age_ms == 0);
+    CHECK(!state.producer_parked);
 }
 
-// Every file the catalogue admits is one playback can name.
-MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catalogue_admits) {
+MACHA_FAST_TEST("media_playback", test_segment_hold_arbiter_admits_within_limits_and_refuses_beyond_them) {
+    // A hold is an explicitly admitted resource, so the limits are testable
+    // without any thread blocking.
+    SegmentHoldArbiter arbiter(2, 3);
+    auto why = SegmentHoldArbiter::Refusal::budget_exhausted;
+
+    // One in flight plus one prefetch, per session.
+    auto first = arbiter.try_acquire("session-a", &why);
+    auto second = arbiter.try_acquire("session-a", &why);
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(arbiter.outstanding("session-a") == 2);
+
+    // A third from the same session is refused for the session limit, not the node's.
+    auto third = arbiter.try_acquire("session-a", &why);
+    CHECK(!third.has_value());
+    CHECK(why == SegmentHoldArbiter::Refusal::session_limit);
+
+    // Another session is unaffected by the first one's limit.
+    auto other = arbiter.try_acquire("session-b", &why);
+    REQUIRE(other.has_value());
+    CHECK(arbiter.outstanding() == 3);
+
+    // The global budget binds across sessions: session-b is under its own limit
+    // and still refused.
+    auto beyond = arbiter.try_acquire("session-b", &why);
+    CHECK(!beyond.has_value());
+    CHECK(why == SegmentHoldArbiter::Refusal::budget_exhausted);
+
+    // Releasing returns capacity to the node, not just to the session.
+    first->reset();
+    CHECK(arbiter.outstanding() == 2);
+    CHECK(arbiter.outstanding("session-a") == 1);
+    auto after_release = arbiter.try_acquire("session-b", &why);
+    CHECK(after_release.has_value());
+
+    // Release is idempotent, and a moved-from hold releases nothing twice.
+    first->reset();
+    CHECK(arbiter.outstanding() == 3);
+    {
+        auto moved = std::move(*second);
+        second.reset();
+        CHECK(arbiter.outstanding() == 3);
+    }
+    // Scope exit released the moved-to hold exactly once.
+    CHECK(arbiter.outstanding() == 2);
+    CHECK(arbiter.outstanding("session-a") == 0);
+}
+
+MACHA_FAST_TEST("media_playback", test_vod_plans_follow_the_keyframe_index) {
+    CHECK(media_vod::requires_seek_index_materialisation("matroska,webm"));
+    CHECK(media_vod::requires_seek_index_materialisation("webm"));
+    CHECK(!media_vod::requires_seek_index_materialisation("mov,mp4,m4a,3gp,3g2,mj2"));
+
+    std::vector<double> complete;
+    for (double seconds = 0.0; seconds < 120.0; seconds += 2.0) complete.push_back(seconds);
+    auto full = media_vod::indexed_plan(complete, 120.0, 0, 4.0);
+    REQUIRE(full.has_value());
+    CHECK(std::abs(full->actual_seek_seconds) < 0.0005);
+    CHECK(full->segment_durations.size() == 30);
+    for (const auto duration : full->segment_durations) CHECK(duration <= 4.001);
+
+    // avformat_find_stream_info() can leave a Matroska index holding only the
+    // keyframes seen while probing; that is not a complete index.
+    const std::vector<double> partial{0.0, 2.0};
+    CHECK(!media_vod::indexed_plan(partial, 120.0, 0, 4.0).has_value());
+
+    // A partially populated index must also be rejected when it contains
+    // enough early entries to produce several apparently sensible fragments.
+    const std::vector<double> partial_with_several_starts{0.0, 4.0, 8.0, 12.0, 16.0};
+    CHECK(!media_vod::indexed_plan(partial_with_several_starts, 120.0, 0, 4.0).has_value());
+
+    // Sparse but complete GOPs can still be remuxed; a fragment is as long as its GOP.
+    std::vector<double> sparse_complete;
+    for (double seconds = 0.0; seconds < 60.0; seconds += 10.0)
+        sparse_complete.push_back(seconds);
+    CHECK(media_vod::indexed_plan(sparse_complete, 60.0, 0, 4.0).has_value());
+
+    // Scene-cut encodes leave keyframe gaps well past 3x the target; a 40 s
+    // fragment is a long fragment, not an unusable index.
+    std::vector<double> scene_cut{0.0, 4.0, 44.0, 48.0, 52.0, 90.0, 94.0, 118.0};
+    auto scene_cut_plan = media_vod::indexed_plan(scene_cut, 120.0, 0, 4.0);
+    REQUIRE(scene_cut_plan.has_value());
+    CHECK(std::abs(scene_cut_plan->longest_segment_seconds - 40.0) < 0.0005);
+    // A gap a viewer would wait minutes to seek across is unusable.
+    const std::vector<double> huge_gap{0.0, 4.0, 110.0, 114.0, 118.0};
+    CHECK(!media_vod::indexed_plan(huge_gap, 120.0, 0, 4.0).has_value());
+
+    // One fragment is legitimate for genuinely short media.
+    const std::vector<double> short_index{0.0};
+    auto short_plan = media_vod::indexed_plan(short_index, 6.0, 0, 4.0);
+    REQUIRE(short_plan.has_value());
+    CHECK(short_plan->segment_durations.size() == 1);
+    CHECK(std::abs(short_plan->segment_durations.front() - 6.0) < 0.0005);
+
+    // A seek starts at the last keyframe at or before the request, never after,
+    // and reports the remainder as an offset.
+    auto seeked = media_vod::indexed_plan(complete, 120.0, 61'000, 4.0);
+    REQUIRE(seeked.has_value());
+    CHECK(std::abs(seeked->actual_seek_seconds - 60.0) < 0.0005);
+    CHECK(seeked->seek_ms == 60'000);
+    CHECK(seeked->seek_offset_ms == 1'000);
+    CHECK(seeked->seek_requested_ms == 61'000);
+    CHECK(seeked->seek_ms + seeked->seek_offset_ms == seeked->seek_requested_ms);
+
+    // A request on a keyframe has offset zero, so clients can make aligned seeks.
+    auto aligned = media_vod::indexed_plan(complete, 120.0, 62'000, 4.0);
+    REQUIRE(aligned.has_value());
+    CHECK(aligned->seek_ms == 62'000);
+    CHECK(aligned->seek_offset_ms == 0);
+
+    // A keyframe a fraction of a millisecond after the request is not a
+    // candidate: it rounds UP to 61'001 ms (rounding down would land
+    // avformat_seek_file's backward search one keyframe early).
+    const std::vector<double> fractional{0.0, 30.0, 61.0004, 90.0};
+    auto fractional_plan = media_vod::indexed_plan(fractional, 120.0, 61'000, 4.0);
+    REQUIRE(fractional_plan.has_value());
+    CHECK(fractional_plan->seek_ms == 30'000);
+    CHECK(fractional_plan->seek_offset_ms == 31'000);
+
+    // Out of range clamps to [0, duration - 1 ms]; the invariant holds against
+    // the clamped request, so the clamp is visible.
+    CHECK(media_vod::clamp_seek_ms(500'000, 120.0) == 119'999);
+    CHECK(media_vod::clamp_seek_ms(-5, 120.0) == 0);
+
+    // No indexed keyframe at or before the request: baseline zero, the offset
+    // carries the whole request, and the mode is kept (a stream's first sample
+    // is always a sync sample).
+    const std::vector<double> late_index{40.0, 44.0, 48.0};
+    auto unnamed_start = media_vod::indexed_plan(late_index, 60.0, 20'000, 4.0);
+    REQUIRE(unnamed_start.has_value());
+    CHECK(unnamed_start->seek_ms == 0);
+    CHECK(unnamed_start->seek_offset_ms == 20'000);
+    CHECK(unnamed_start->seek_requested_ms == 20'000);
+
+    // The Cues behind a plan; the gaps bound the true GOP from above.
+    const auto density = media_vod::index_density(complete, 120.0);
+    CHECK(density.entries == 60);
+    CHECK(std::abs(density.longest_gap_seconds - 2.0) < 0.0005);
+    CHECK(std::abs(density.median_gap_seconds - 2.0) < 0.0005);
+
+    // A prepared plan re-seeks without the engine. A PATCH seek and a create
+    // seek agree: baseline at the keyframe at or before the request, the
+    // remainder published as an offset.
+    HlsVodPlan remux;
+    remux.playback.mode = PlaybackMode::remux;
+    remux.playback.video = MediaTransform::copy;
+    remux.source_duration_seconds = 120.0;
+    remux.seek_segment_seconds = 4.0;
+    remux.reusable_seek = true;
+    for (double seconds = 0.0; seconds < 120.0; seconds += 2.0)
+        remux.video_random_access_points.push_back(seconds);
+    auto remux_seek = reseek_hls_vod(remux, 61s);
+    REQUIRE(remux_seek.has_value());
+    CHECK(remux_seek->playback.seek == 60s);
+    CHECK(remux_seek->playback.seek_offset == 1s);
+    CHECK(remux_seek->playback.seek_requested == 61s);
+    CHECK(remux_seek->playback.seek + remux_seek->playback.seek_offset ==
+          remux_seek->playback.seek_requested);
+    REQUIRE(!remux_seek->segment_durations.empty());
+    CHECK(remux_seek->segment_durations.front() <= 4.001);
+
+    HlsVodPlan transcode;
+    transcode.playback.mode = PlaybackMode::transcode;
+    transcode.playback.video = MediaTransform::transcode;
+    transcode.source_duration_seconds = 120.0;
+    transcode.seek_segment_seconds = 4.0;
+    transcode.reusable_seek = true;
+    auto transcode_seek = reseek_hls_vod(transcode, 61s);
+    REQUIRE(transcode_seek.has_value());
+    CHECK(transcode_seek->playback.seek == 61s);
+    CHECK(transcode_seek->playback.seek_offset == 0s);
+    CHECK(transcode_seek->playback.seek_requested == 61s);
+    REQUIRE(transcode_seek->segment_durations.size() >= 2);
+    // A seek's first fragment is the 2 s start-up fragment; the rest keep the target.
+    CHECK(std::abs(transcode_seek->segment_durations.front() - 2.0) < 0.0005);
+    CHECK(std::abs(transcode_seek->segment_durations[1] - 4.0) < 0.0005);
+
+    // A transcode with a known keyframe index does not snap: the encoder starts
+    // exactly where it was told. The keyframe at 62.5274 s, not a whole number
+    // of milliseconds, must not attract the seek.
+    HlsVodPlan transcode_with_keyframes = transcode;
+    transcode_with_keyframes.source_duration_seconds = 7200.0;
+    transcode_with_keyframes.video_random_access_points = {0.0, 30.0, 60.0, 62.5274, 6000.0};
+    auto unsnapped_seek = reseek_hls_vod(transcode_with_keyframes, 61s);
+    REQUIRE(unsnapped_seek.has_value());
+    CHECK(unsnapped_seek->playback.seek == 61s);
+    CHECK(unsnapped_seek->playback.seek_offset == 0s);
+    REQUIRE(!unsnapped_seek->segment_durations.empty());
+    CHECK(std::abs(unsnapped_seek->segment_durations.front() - 2.0) < 0.0005);
+    // Seeking past the last known keyframe is not a special case.
+    auto past_last_keyframe = reseek_hls_vod(transcode_with_keyframes, 6500s);
+    REQUIRE(past_last_keyframe.has_value());
+    CHECK(past_last_keyframe->playback.seek == 6500s);
+
+    // A decline names the precondition that failed.
+    HlsVodPlan unavailable;
+    std::string reason;
+    CHECK(!reseek_hls_vod(unavailable, 10s, &reason).has_value());
+    CHECK(reason == "plan-not-reusable");
+}
+
+MACHA_FAST_TEST("media_playback", test_media_vocabulary_names_containers_codecs_and_subtitles) {
+    // Every file the catalogue admits is one playback can name.
     for (std::string_view ext : {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".mpg",
                                  ".mpeg", ".ts", ".m2ts", ".webm"}) {
         CHECK(video_extension(ext));
@@ -4249,524 +1026,1979 @@ MACHA_FAST_TEST("media_playback", test_container_vocabulary_names_what_the_catal
     CHECK(webvtt_subtitle_codec_supported("subrip"));
     CHECK(webvtt_subtitle_codec_supported("mov_text"));
     CHECK(!webvtt_subtitle_codec_supported("dvd_subtitle"));
+    CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello") == "Hello");
+    CHECK(plain_ass_subtitle_text("0,0,Default,,0,0,0,,Hello, world") == "Hello, world");
+    CHECK(plain_ass_subtitle_text("Dialogue: 0,0,Default,,0,0,0,,{\\i1}Hello{\\i0}\\Nworld") ==
+          "Hello\nworld");
+
+    // HLS CODECS describe the fragments: the source's for a copy, the
+    // libx264/AAC output for a transcode.
+    MediaStreamInfo hevc10;
+    hevc10.codec = "hevc";
+    hevc10.profile = "Main 10";
+    hevc10.bit_depth = 10;
+    hevc10.level = 153;
+    hevc10.width = 1920;
+    hevc10.height = 802;
+    MediaStreamInfo eac3;
+    eac3.codec = "eac3";
+    MediaStreamInfo h264_high;
+    h264_high.codec = "h264";
+    h264_high.profile = "High";
+    h264_high.level = 41;
+    CHECK(hls_codec_string("hevc", &hevc10, false) == "hvc1.2.4.L153.B0");
+    CHECK(hls_codec_string("h264", &h264_high, false) == "avc1.640029");
+    CHECK(hls_codec_string("eac3", &eac3, false) == "ec-3");
+    CHECK(hls_codec_string("ac3", nullptr, false) == "ac-3");
+    CHECK(hls_codec_string("aac", nullptr, false) == "mp4a.40.2");
+    CHECK(hls_codec_string("h264", &hevc10, true) == "avc1.640029");
+    CHECK(hls_codec_string("aac", &eac3, true) == "mp4a.40.2");
+
+    PlaybackPlan remux;
+    remux.video = MediaTransform::copy;
+    remux.audio = MediaTransform::copy;
+    remux.video_codec = "hevc";
+    remux.audio_codec = "eac3";
+    CHECK(hls_variant_stream_inf(remux, &hevc10, &eac3, 10'887'601) ==
+          "#EXT-X-STREAM-INF:BANDWIDTH=10887601,CODECS=\"hvc1.2.4.L153.B0,ec-3\",RESOLUTION=1920x802");
+    PlaybackPlan transcode;
+    transcode.video = MediaTransform::transcode;
+    transcode.audio = MediaTransform::transcode;
+    transcode.video_codec = "h264";
+    transcode.audio_codec = "aac";
+    transcode.target_height = 720;
+    CHECK(hls_variant_stream_inf(transcode, &hevc10, &eac3, 10'887'601) ==
+          "#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"avc1.640029,mp4a.40.2\",RESOLUTION=1724x720");
 }
 
+MACHA_FAST_TEST("media_playback", test_media_timestamp_repair) {
+    MediaTimestampRepairState state;
 
-namespace {
-// A node, one playable file, and a playback manager with caller-chosen limits.
-struct PlaybackFixture {
-    TempDir t;
-    std::filesystem::path keyfile{t.path() / "key"};
-    std::optional<Service> service;
-    std::optional<PlaybackManager> playback;
-    std::string media_id;
+    MediaPacketTimestamps first{-69952, -69952, 40};
+    normalize_media_timestamps(state, first);
+    CHECK(first.pts == -69952);
+    CHECK(first.dts == -69952);
+    CHECK(state.repair_count() == 0);
 
-    explicit PlaybackFixture(size_t per_account, size_t node_wide = 16) {
-        write_key(keyfile);
-        auto keys = load_cluster_keys(keyfile);
-        auto c = config_for(t.path() / "node", keyfile, free_port());
-        c.replication = 1;
-        c.metadata_min_write_replicas = 1;
-        c.catalogue.api.enabled = false;
-        service.emplace(c, keys);
-        service->start();
-        service->filesystem().mkdir("/media", 0755, getuid(), getgid());
-        service->filesystem().create_file("/media/a.mp4", 0644, getuid(), getgid());
-        auto writer = service->filesystem().open_write("/media/a.mp4", true);
-        auto bytes = pattern(64 * 1024);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-        media_id = file_media_id(service->filesystem().getattr("/media/a.mp4"));
+    // Two packets with equal DTS after a seek/rescale: the second advances, and
+    // the same correction applies to later source timestamps.
+    MediaPacketTimestamps equal{-69912, -69952, 40};
+    normalize_media_timestamps(state, equal);
+    CHECK(equal.dts == -69951);
+    CHECK(equal.pts == -69911);
+    CHECK(state.nonmonotonic_dts == 1);
+    CHECK(state.timeline_shift == 1);
 
-        CatalogueApiConfig api;
-        StreamingConfig streaming;
-        streaming.enabled = true;
-        streaming.temp_path = t.path() / "playback";
-        streaming.startup_timeout = 2s;
-        streaming.max_sessions = node_wide;
-        streaming.max_sessions_per_account = per_account;
-        streaming.max_video_transcodes = 4;
-        streaming.max_audio_transcodes = 4;
-        playback.emplace(service->filesystem(), service->resources().transcode_rates,
-                         service->resources().memory, service->catalogue(), api, streaming,
-                         std::make_unique<FakeMediaEngine>());
-        playback->start();
-    }
-    ~PlaybackFixture() {
-        if (playback) playback->stop();
-        if (service) service->stop();
-    }
+    MediaPacketTimestamps following{-69872, -69912, 40};
+    normalize_media_timestamps(state, following);
+    CHECK(following.dts == -69911);
+    CHECK(following.pts == -69871);
+    CHECK(state.nonmonotonic_dts == 1);
 
-    static SessionIdentity viewer(std::string_view user) {
-        return SessionIdentity{.id = std::string(user) + "-auth",
-                               .roles = {"media_viewer"},
-                               .user_id = std::string(user)};
-    }
+    MediaTimestampRepairState missing;
+    MediaPacketTimestamps none{kNoMediaTimestamp, kNoMediaTimestamp, 0};
+    normalize_media_timestamps(missing, none);
+    CHECK(none.dts == 0);
+    CHECK(none.pts == 0);
+    CHECK(none.duration == 1);
+    CHECK(missing.missing_dts == 1);
+    CHECK(missing.missing_pts == 1);
 
-    HttpResponse create_transcode(const SessionIdentity& who) {
-        Json::Object preferences{{"mode", "transcode"}, {"container", "fmp4"}};
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = who;
-        request.body.assign(text.begin(), text.end());
-        return playback->handle(request);
-    }
+    MediaPacketTimestamps missing_dts{100, kNoMediaTimestamp, 40};
+    normalize_media_timestamps(missing, missing_dts);
+    CHECK(missing_dts.dts == 1);
+    CHECK(missing_dts.pts == 100);
+    CHECK(missing.missing_dts == 2);
 
-    HttpResponse create(const SessionIdentity& who, std::string_view key = {}) {
-        Json::Object preferences{{"mode", "remux"}, {"container", "fmp4"}};
-        Json::Object root{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = who;
-        if (!key.empty()) request.query["idempotency_key"] = std::string(key);
-        request.body.assign(text.begin(), text.end());
-        return playback->handle(request);
-    }
+    MediaTimestampRepairState bad_pts;
+    MediaPacketTimestamps pts_before{4, 5, 1};
+    normalize_media_timestamps(bad_pts, pts_before);
+    CHECK(pts_before.pts == 4);
+    CHECK(pts_before.dts == 5);
+    CHECK(bad_pts.pts_before_dts == 1);
+    CHECK(bad_pts.repair_count() == 0);
 
-    HttpResponse control(std::string_view method, std::string_view id,
-                         const SessionIdentity& who, std::string body = {}) {
-        HttpRequest request;
-        request.method = std::string(method);
-        request.path = "/api/v1/playback/sessions/" + std::string(id);
-        request.session = who;
-        request.body.assign(body.begin(), body.end());
-        return playback->handle(request);
-    }
-
-    HttpResponse list(const SessionIdentity& who) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/playback/sessions";
-        request.session = who;
-        return playback->handle(request);
-    }
-
-    static Json body_of(const HttpResponse& response) {
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    }
-    static std::string id_of(const HttpResponse& response) {
-        return body_of(response).find("session_id")->asString();
-    }
-};
-} // namespace
-
-MACHA_TEST("media_playback", test_the_collection_lists_only_the_callers_own_sessions) {
-    // The node-local listing lets a client find its own sessions again, and
-    // never shows one account another's.
-    PlaybackFixture fixture(8);
-    const auto alice = PlaybackFixture::viewer("alice");
-    const auto bob = PlaybackFixture::viewer("bob");
-
-    auto first = fixture.create(alice);
-    REQUIRE(first.status == 201);
-    auto second = fixture.create(alice);
-    REQUIRE(second.status == 201);
-    auto theirs = fixture.create(bob);
-    REQUIRE(theirs.status == 201);
-
-    auto listed = fixture.list(alice);
-    REQUIRE(listed.status == 200);
-    auto body = PlaybackFixture::body_of(listed);
-    auto items = body.find("items");
-    REQUIRE(items->isArray());
-    const auto& entries = items->asArray();
-    CHECK(entries.size() == 2);
-    std::set<std::string> ids;
-    for (const auto& entry : entries)
-        ids.insert(entry.find("session_id")->asString());
-    CHECK(ids.count(PlaybackFixture::id_of(first)) == 1);
-    CHECK(ids.count(PlaybackFixture::id_of(second)) == 1);
-    CHECK(ids.count(PlaybackFixture::id_of(theirs)) == 0);
-
-    // The cap is stated, not left to be discovered by refusal.
-    auto account = body.find("account");
-    CHECK(account->find("sessions")->asUInt64() == 2);
-    CHECK(account->find("max_sessions")->asUInt64() == 8);
-
-    CHECK(PlaybackFixture::body_of(fixture.list(bob)).find("items")->asArray().size() == 1);
+    int64_t encoder_pts = kNoMediaTimestamp;
+    CHECK(normalize_encoder_pts(encoder_pts, kNoMediaTimestamp) == kNoMediaTimestamp);
+    CHECK(encoder_pts == kNoMediaTimestamp);
+    CHECK(normalize_encoder_pts(encoder_pts, 100) == 100);
+    CHECK(normalize_encoder_pts(encoder_pts, 100) == 101);
+    CHECK(normalize_encoder_pts(encoder_pts, 99) == 102);
+    CHECK(normalize_encoder_pts(encoder_pts, 140) == 140);
 }
 
-MACHA_TEST("media_playback", test_one_account_cannot_touch_anothers_session) {
-    // The control routes check the owner, answering 404 rather than 403 so one
-    // account cannot learn whether another's id exists.
-    PlaybackFixture fixture(8);
-    const auto alice = PlaybackFixture::viewer("alice");
-    const auto bob = PlaybackFixture::viewer("bob");
+MACHA_FAST_TEST("media_playback", test_older_video_profiles_are_stale_and_regenerate) {
+    CatalogueSnapshot::MediaProfile profile;
+    profile.probe.format = "matroska,webm";
+    profile.probe.duration_seconds = 6660.0;
+    MediaStreamInfo video;
+    video.index = 0;
+    video.type = MediaStreamType::video;
+    video.codec = "hevc";
+    video.profile = "Main 10";
+    MediaStreamInfo audio;
+    audio.index = 1;
+    audio.type = MediaStreamType::audio;
+    audio.codec = "eac3";
+    profile.probe.streams = {video, audio};
 
-    auto mine = fixture.create(alice);
-    REQUIRE(mine.status == 201);
-    const auto id = PlaybackFixture::id_of(mine);
-
-    CHECK(fixture.control("GET", id, bob).status == 404);
-    CHECK(fixture.control("PATCH", id, bob, R"({"seek_ms":1000})").status == 404);
-    CHECK(fixture.control("DELETE", id, bob).status == 404);
-
-    // The owner is unaffected.
-    CHECK(fixture.control("GET", id, alice).status == 200);
-    CHECK(fixture.control("DELETE", id, alice).status == 204);
+    // Fresh profiles carry the depth/transfer signalling negotiation needs.
+    CHECK(profile.schema_version == catalogue_media_profile_schema);
+    CHECK(valid_catalogue_media_profile("macha:abc", profile));
+    // A profile from an older schema lacks it, so it is regenerated.
+    for (uint32_t older = 1; older < catalogue_media_profile_schema; ++older) {
+        profile.schema_version = older;
+        CHECK(!valid_catalogue_media_profile("macha:abc", profile));
+    }
+    profile.schema_version = 1;
+    // Unless it has no video stream.
+    profile.probe.streams = {audio};
+    CHECK(valid_catalogue_media_profile("macha:abc", profile));
 }
 
-MACHA_TEST("media_playback", test_ownership_survives_a_session_replacement) {
-    // A session replaced by a subtitle change, fast-path seek or mode change
-    // keeps its `account`: still reachable by its owner and counted against the cap.
-    PlaybackFixture fixture(8);
-    const auto alice = PlaybackFixture::viewer("alice");
-
-    auto created = fixture.create(alice);
-    REQUIRE(created.status == 201);
-    auto id = PlaybackFixture::id_of(created);
-
-    auto switched = fixture.control("PATCH", id, alice,
-                                    R"({"preferences":{"mode":"transcode","container":"fmp4"}})");
-    REQUIRE(switched.status == 200);
-    id = PlaybackFixture::body_of(switched).find("session_id")->asString();
-
-    // Still the caller's: reachable, listed, and counted exactly once.
-    CHECK(fixture.control("GET", id, alice).status == 200);
-    auto body = PlaybackFixture::body_of(fixture.list(alice));
-    CHECK(body.find("items")->asArray().size() == 1);
-    CHECK(body.find("account")->find("sessions")->asUInt64() == 1);
-    CHECK(fixture.control("GET", id, PlaybackFixture::viewer("bob")).status == 404);
-}
-
-MACHA_TEST("media_playback", test_the_account_cap_refuses_with_its_own_code_and_states_the_limit) {
-    // The account cap is distinguishable from a node limit: it is the same on
-    // every node, so a client must not walk the cluster for it.
-    PlaybackFixture fixture(2, 16);
-    const auto alice = PlaybackFixture::viewer("alice");
-    const auto bob = PlaybackFixture::viewer("bob");
-
-    REQUIRE(fixture.create(alice).status == 201);
-    REQUIRE(fixture.create(alice).status == 201);
-
-    auto refused = fixture.create(alice);
-    REQUIRE(refused.status == 429);
-    // Bound to a named Json: find() returns a pointer into the document.
-    const auto refusal = PlaybackFixture::body_of(refused);
-    auto error = refusal.find("error");
-    CHECK(error->find("code")->asString() == "account_session_limit");
-    // Do not walk: every node would answer the same.
-    CHECK(error->find("scope")->asString() == "request");
-    CHECK(error->find("node_healthy")->asBool() == true);
-    // Stated, so a client can plan.
-    CHECK(error->find("sessions")->asUInt64() == 2);
-    CHECK(error->find("max_sessions")->asUInt64() == 2);
-
-    // Another account is entirely unaffected: the bound is per account.
-    CHECK(fixture.create(bob).status == 201);
-
-    // Releasing one frees one.
-    auto listed = PlaybackFixture::body_of(fixture.list(alice));
-    const auto id = listed.find("items")->asArray().front().find("session_id")->asString();
-    REQUIRE(fixture.control("DELETE", id, alice).status == 204);
-    CHECK(fixture.create(alice).status == 201);
-}
-
-MACHA_TEST("media_playback", test_one_account_cannot_take_every_transcode_on_a_node) {
-    // Entitlements are per session, so a per-account bound stops one account
-    // taking every transcode slot. The node allows four; one account two.
-    PlaybackFixture fixture(32, 16);
-    const auto alice = PlaybackFixture::viewer("alice");
-    const auto bob = PlaybackFixture::viewer("bob");
-
-    const auto first = fixture.create_transcode(alice);
-    REQUIRE(first.status == 201);
-    REQUIRE(fixture.create_transcode(alice).status == 201);
-
-    auto refused = fixture.create_transcode(alice);
-    REQUIRE(refused.status == 429);
-    const auto refusal = PlaybackFixture::body_of(refused);
-    const auto* error = refusal.find("error");
-    CHECK(error->find("code")->asString() == "account_transcode_limit");
-    // Not worth walking; the same request without a transcode may succeed here.
-    CHECK(error->find("scope")->asString() == "request");
-    CHECK(error->find("node_healthy")->asBool() == true);
-    CHECK(error->find("alternative_may_succeed")->asBool() == true);
-    CHECK(error->find("transcodes")->asUInt64() == 2);
-    CHECK(error->find("max_transcodes")->asUInt64() == 2);
-
-    // The account can still remux, and another account can still transcode.
-    CHECK(fixture.create(alice).status == 201);
-    CHECK(fixture.create_transcode(bob).status == 201);
-
-    // Stated beside the session count.
-    const auto listed = PlaybackFixture::body_of(fixture.list(alice));
-    CHECK(listed.find("account")->find("transcodes")->asUInt64() == 2);
-    CHECK(listed.find("account")->find("max_transcodes")->asUInt64() == 2);
-
-    // Releasing one transcoding session frees one.
-    const auto first_id = PlaybackFixture::body_of(first).find("session_id")->asString();
-    REQUIRE(fixture.control("DELETE", first_id, alice).status == 204);
-    CHECK(fixture.create_transcode(alice).status == 201);
-}
-
-MACHA_TEST("media_playback", test_an_idempotency_key_is_scoped_to_its_account) {
-    // Idempotency keys are client-chosen and often predictable ("retry-1"), so
-    // they are scoped per account: one account cannot turn another's retry into a 409.
-    PlaybackFixture fixture(8);
-    const auto alice = PlaybackFixture::viewer("alice");
-    const auto bob = PlaybackFixture::viewer("bob");
-
-    auto squatted = fixture.create(bob, "retry-1");
-    REQUIRE(squatted.status == 201);
-
-    auto mine = fixture.create(alice, "retry-1");
-    CHECK(mine.status == 201);
-    CHECK(PlaybackFixture::id_of(mine) != PlaybackFixture::id_of(squatted));
-
-    // Within one account the same request replays rather than creating a second session.
-    auto replayed = fixture.create(alice, "retry-1");
-    REQUIRE(replayed.status == 201);
-    CHECK(PlaybackFixture::id_of(replayed) == PlaybackFixture::id_of(mine));
-}
-
-MACHA_TEST("media_playback", test_the_session_reports_the_look_ahead_the_node_actually_has) {
-    // A session reports how far past its last requested fragment media is
-    // produced, from this node's max_ahead_segments and segment duration.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/film.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(64 * 1024);
-    auto writer = service.filesystem().open_write("/media/film.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/film.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    // Not the defaults, so the assertion cannot pass by coincidence.
-    streaming.max_ahead_segments = 3;
-    streaming.segment_duration = 2000ms;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<ObservableHlsMediaEngine>());
-    playback.start();
-
-    auto create_session = [&](const char* mode) {
-        Json::Object root{{"media_id", media_id},
-                          {"preferences", Json(Json::Object{{"mode", mode}, {"container", "fmp4"}})}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        auto response = playback.handle(request);
-        REQUIRE(response.status == 201);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-
-    auto transformed = create_session("remux");
-    REQUIRE(transformed.find("stream") != nullptr);
-    const auto* look_ahead = transformed.find("stream")->find("look_ahead_ms");
-    REQUIRE(look_ahead != nullptr);
-    CHECK(look_ahead->asInt64() == 6000);
-
-    // Direct play has no pipeline and so no frontier: null, not zero ("no look-ahead").
-    auto direct = create_session("direct");
-    REQUIRE(direct.find("stream") != nullptr);
-    REQUIRE(direct.find("stream")->find("look_ahead_ms") != nullptr);
-    CHECK(direct.find("stream")->find("look_ahead_ms")->isNull());
-
-    // Production figures sit beside look_ahead_ms, and are absent for direct play.
-    const auto* production = transformed.find("stream")->find("production");
-    REQUIRE(production != nullptr);
-    REQUIRE(production->find("produced_ms") != nullptr);
-    REQUIRE(production->find("producing_ms") != nullptr);
-    REQUIRE(production->find("produced_age_ms") != nullptr);
-    REQUIRE(production->find("producer_parked") != nullptr);
-    CHECK(direct.find("stream")->find("production") == nullptr);
-}
-
-MACHA_TEST("media_playback", test_production_rate_excludes_time_parked_on_demand) {
-    // producing_ms counts encode time only, so the rate is what the node could
-    // sustain: time parked at the look-ahead limit is excluded.
-    TempDir t;
-    MediaSegmentStore store(2, 64ULL * 1024 * 1024, t.path() / "spill", 4000ms);
-    REQUIRE(store.publish_init(Bytes{'i', 'n', 'i', 't'}));
-
-    constexpr auto park = 2000ms;
-    std::thread producer([&] {
-        for (int i = 0; i < 4; ++i) {
-            // Stands in for encode work, so the measured total is non-zero.
-            std::this_thread::sleep_for(20ms);
-            store.publish_segment(Bytes{'s', 'e', 'g'}, 4.0);
+// Integrated: the concurrency is HttpServer's worker pool over real sockets.
+MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
+    CatalogueApiConfig config;
+    config.enabled = true;
+    config.listen = "127.0.0.1";
+    config.port = 0;
+    config.workers = 2;
+    config.max_connections = 8;
+    config.stream_chunk_bytes = 16 * 1024;
+    std::atomic_bool entered{};
+    TestGate slow_body_gate;
+    HttpServer server(config, [&](const HttpRequest& request) {
+        if (request.path == "/slow") {
+            HttpResponse response;
+            response.content_type = "application/octet-stream";
+            response.stream = std::make_shared<BlockingHttpBody>(entered, slow_body_gate, 128 * 1024);
+            return response;
         }
+        if (request.path == "/fast")
+            return HttpResponse{200, "text/plain", {}, Bytes{'o', 'k'}};
+        return http_error(404, "not_found", "not found");
     });
+    server.start();
+    REQUIRE(wait_until([&] { return server.bound_port() != 0; }, 1s));
 
-    // Nothing has been requested, so the producer publishes 0, 1 and 2 and
-    // then blocks: index 3 is past highest_requested (0) + max_ahead (2).
-    std::this_thread::sleep_for(park);
-    auto parked = store.snapshot();
-    CHECK(parked.producer_parked);
-    store.note_requested(3);
-    producer.join();
+    std::string slow_response;
+    std::jthread slow([&] { slow_response = raw_http_get(server.bound_port(), "/slow"); });
+    REQUIRE(slow_body_gate.wait_for_entries(1));
+    auto started = Clock::now();
+    auto fast = raw_http_get(server.bound_port(), "/fast");
+    auto elapsed = Clock::now() - started;
+    CHECK(fast.find("200 OK") != std::string::npos);
+    CHECK(fast.ends_with("ok"));
+    CHECK(elapsed < 300ms);
+    slow_body_gate.open();
+    slow.join();
+    CHECK(slow_response.find("200 OK") != std::string::npos);
+    CHECK(slow_response.size() >= 128 * 1024);
+    server.stop();
+}
 
-    const auto state = store.snapshot();
-    CHECK(state.segment_count == 4);
-    CHECK(state.produced_media_ms == 16'000);
-    // Four 20 ms fragments. The upper bound is loose for slow nodes but far
-    // below the parked interval, so exceeding it means the park was counted.
-    CHECK(state.producing_ms >= 40);
-    CHECK(state.producing_ms < 1'000);
-    CHECK(state.produced_age_ms < 1'000);
-    CHECK(!state.producer_parked);
+MACHA_TEST("media_playback", test_playback_performs_the_instruction_it_is_given) {
+    // Negotiation is the client's: playback is by media_id, performs exactly
+    // the mode and per-stream transforms it is told, refuses what it cannot
+    // perform or would have to choose, and reports what it served. One manager
+    // per engine, all on one node.
+    PlaybackNode node;
+
+    // A title is not playable as such: only a file is. Stream, language and
+    // container left open where there are several are refused with the
+    // candidates; a language the media lacks is never answered with another.
+    {
+        const auto media_id = node.write("/media/two.mkv", pattern(128 * 1024 + 17, 1));
+        auto streaming = node.streaming();
+        streaming.startup_timeout = 2s;
+        streaming.max_video_transcodes = 4;
+        auto playback = node.playback(streaming, std::make_shared<TwoAudioFakeMediaEngine>());
+        const auto create = [&](Json::Object root, int expect) {
+            auto response = playback->handle(playback_request("POST", "/api/v1/playback/sessions", root));
+            REQUIRE(response.status == expect);
+            auto parsed = body_of(response);
+            if (const auto* id = parsed.find("session_id"))
+                playback->handle(playback_request("DELETE", "/api/v1/playback/sessions/" + id->asString()));
+            return parsed;
+        };
+        const auto instruct = [&](Json::Object preferences, int expect = 201) {
+            return create(Json::Object{{"media_id", media_id}, {"preferences", Json(std::move(preferences))}}, expect);
+        };
+        const auto refusal = [](const Json& body, std::string code, std::string choice) {
+            CHECK(body.find("status")->asString() == code);
+            CHECK(body.find("error")->find("code")->asString() == code);
+            CHECK(body.find("error")->find("choice")->asString() == choice);
+            return body.find("error")->find("choices")->asArray();
+        };
+
+        auto by_item = create(Json::Object{{"item_id", "tmdb:movie:603"}, {"media_id", media_id},
+                                           {"preferences", Json(Json::Object{{"mode", "direct"}})}},
+                              400);
+        CHECK(by_item.find("error")->find("code")->asString() == "item_id_not_accepted");
+        auto nothing = create(Json::Object{{"preferences", Json(Json::Object{{"mode", "direct"}})}}, 400);
+        CHECK(nothing.find("error")->find("code")->asString() == "media_id_required");
+
+        auto open = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}}, 400),
+                            "choice_required", "audio_stream");
+        REQUIRE(open.size() == 2);
+        CHECK(open[0].asInt64() == 1);
+        CHECK(open[1].asInt64() == 4);
+        auto french = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 4}});
+        CHECK(french.find("output")->find("audio")->find("source_stream")->asInt64() == 4);
+        auto english = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_language", "eng"}});
+        CHECK(english.find("output")->find("audio")->find("source_stream")->asInt64() == 1);
+        auto german = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"},
+                                                    {"audio_language", "deu"}},
+                                       400),
+                              "choice_not_available", "audio_stream");
+        CHECK(german.size() == 2);
+        auto bogus = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 9}}, 400),
+                             "choice_not_available", "audio_stream");
+        CHECK(bogus.size() == 2);
+        // Two English subtitles: a language that matches both picks neither.
+        auto subtitles = refusal(instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio_stream", 1},
+                                                       {"subtitle_language", "eng"}},
+                                          400),
+                                 "choice_required", "subtitle_stream");
+        CHECK(subtitles.size() == 2);
+        // Direct serves the file untouched and the player picks tracks: nothing is refused.
+        auto direct = instruct(Json::Object{{"mode", "direct"}});
+        CHECK(direct.find("mode")->asString() == "direct");
+        CHECK(direct.find("output")->find("audio") == nullptr);
+        // The session still reports every mode the media supports.
+        CHECK(direct.find("options")->find("modes")->asArray().size() == 3);
+
+        // Copy support is a fact about each stream, not about whichever came first.
+        auto facts = playback_request("GET", "/api/v1/playback/media");
+        facts.query["media_id"] = media_id;
+        auto response = playback->handle(facts);
+        REQUIRE(response.status == 200);
+        const auto parsed = body_of(response);
+        const auto& media = parsed.find("media")->asArray().front();
+        CHECK(media.find("operations")->find("copy_into_fmp4") == nullptr);
+        size_t audio_with_facts = 0;
+        for (const auto& stream : media.find("streams")->asArray())
+            if (stream.find("type")->asString() == "audio" && stream.find("copy_into")) ++audio_with_facts;
+        CHECK(audio_with_facts == 2);
+    }
+
+    // HDR Matroska: direct is served over byte ranges as Matroska; transcode,
+    // remux and the per-stream mixtures are performed as named; a mode
+    // naming a transform it is not doing is refused, never reinterpreted; and
+    // an update naming a mode restates the whole transform.
+    {
+        const auto media_id = node.write("/media/dv.mkv", pattern(128 * 1024 + 17, 2));
+        auto streaming = node.streaming();
+        streaming.startup_timeout = 2s;
+        streaming.max_video_transcodes = 4;
+        auto playback = node.playback(streaming, std::make_shared<HdrFakeMediaEngine>());
+        const auto instruct = [&](Json::Object preferences, int expect = 201) {
+            auto response = create_session(*playback, media_id, std::move(preferences));
+            REQUIRE(response.status == expect);
+            auto parsed = body_of(response);
+            // Release the slot so the permutation walk does not hit the session limit.
+            if (const auto* id = parsed.find("session_id"))
+                session_call(*playback, "DELETE", id->asString());
+            return parsed;
+        };
+
+        auto direct_session = instruct(Json::Object{{"mode", "direct"}});
+        CHECK(direct_session.find("mode")->asString() == "direct");
+        CHECK(direct_session.find("stream")->find("url")->asString().ends_with("/direct"));
+        CHECK(direct_session.find("stream")->find("mime_type")->asString() == "video/x-matroska");
+        CHECK(direct_session.find("source")->find("format")->asString() == "matroska,webm");
+        CHECK(direct_session.find("output")->find("container")->asString() == "matroska");
+
+        auto transcoded = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}});
+        CHECK(transcoded.find("mode")->asString() == "transcode");
+        CHECK(transcoded.find("output")->find("video")->find("codec")->asString() == "h264");
+        CHECK(transcoded.find("output")->find("video")->find("color_transfer")->asString() == "bt709");
+        CHECK(transcoded.find("output")->find("audio")->find("codec")->asString() == "aac");
+        // The source facts are reported whatever was asked for.
+        auto source_streams = transcoded.find("source")->find("streams")->asArray();
+        REQUIRE(!source_streams.empty());
+        CHECK(source_streams.front().find("color_transfer")->asString() == "smpte2084");
+        CHECK(source_streams.front().find("bit_depth")->asInt64() == 10);
+
+        // Remux copies both, 10-bit PQ HEVC and E-AC-3 included.
+        auto remuxed = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
+        CHECK(remuxed.find("mode")->asString() == "remux");
+        CHECK(remuxed.find("output")->find("video")->find("codec")->asString() == "hevc");
+        CHECK(remuxed.find("output")->find("video")->find("color_transfer")->asString() == "smpte2084");
+        CHECK(remuxed.find("output")->find("audio")->find("codec")->asString() == "eac3");
+
+        // Copy the video, re-encode the audio: a transcode, as the request says.
+        auto mixed = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
+        CHECK(mixed.find("mode")->asString() == "transcode");
+        CHECK(mixed.find("output")->find("video")->find("transform")->asString() == "copy");
+        CHECK(mixed.find("output")->find("audio")->find("transform")->asString() == "transcode");
+        // A codec change is not a downmix: the 5.1 source stays 5.1 through AAC.
+        CHECK(mixed.find("output")->find("audio")->find("channels")->asUInt64() == 6);
+        CHECK(transcoded.find("output")->find("audio")->find("channels")->asUInt64() == 6);
+        auto video_only = instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
+        CHECK(video_only.find("output")->find("video")->find("transform")->asString() == "transcode");
+        CHECK(video_only.find("output")->find("audio")->find("transform")->asString() == "copy");
+
+        // The segment container is instructed too, and the session reports the one served.
+        auto ts = instruct(Json::Object{{"mode", "transcode"}, {"container", "mpegts"}});
+        CHECK(ts.find("output")->find("format")->asString() == "mpegts");
+        CHECK(ts.find("output")->find("container")->asString() == "mpegts");
+        auto ts_copy = instruct(Json::Object{{"mode", "remux"}, {"container", "mpegts"}});
+        CHECK(ts_copy.find("output")->find("container")->asString() == "mpegts");
+        CHECK(ts_copy.find("output")->find("video")->find("transform")->asString() == "copy");
+        CHECK(ts_copy.find("output")->find("audio")->find("transform")->asString() == "copy");
+        auto fmp4 = instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
+        CHECK(fmp4.find("output")->find("container")->asString() == "fmp4");
+        // No default container: an HLS instruction without one is refused with both listed.
+        auto unnamed = instruct(Json::Object{{"mode", "remux"}}, 400);
+        CHECK(unnamed.find("error")->find("code")->asString() == "choice_required");
+        CHECK(unnamed.find("error")->find("choice")->asString() == "container");
+        CHECK(unnamed.find("error")->find("choices")->asArray().size() == 2);
+
+        // A mode is required, and a copy cannot also be a quality change.
+        instruct(Json::Object{{"max_height", 720}}, 400);
+        instruct(Json::Object{{"mode", "auto"}}, 400);
+        instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"max_height", 720}}, 400);
+        // direct and remux copy every stream; transcode re-encodes at least one.
+        instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"audio", "transcode"}}, 400);
+        instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "transcode"}}, 400);
+        instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"max_height", 720}}, 400);
+        instruct(Json::Object{{"mode", "direct"}, {"audio", "transcode"}}, 400);
+        instruct(Json::Object{{"mode", "direct"}, {"video", "transcode"}}, 400);
+        instruct(Json::Object{{"mode", "direct"}, {"max_height", 720}}, 400);
+        instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}}, 400);
+        // The legal permutations are accepted.
+        instruct(Json::Object{{"mode", "direct"}, {"video", "copy"}, {"audio", "copy"}});
+        instruct(Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "copy"}});
+        instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "transcode"}});
+        instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}, {"audio", "transcode"}});
+        instruct(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "transcode"}, {"audio", "copy"}});
+
+        // `mode` is shorthand for the whole transform, so an update naming it is
+        // not judged against per-stream instructions from the mode it replaces.
+        const auto update = [&](const std::string& id, Json::Object preferences, int expect = 200) {
+            auto response = session_call(*playback, "PATCH", id,
+                                         Json::Object{{"preferences", Json(std::move(preferences))}});
+            REQUIRE(response.status == expect);
+            return body_of(response);
+        };
+        auto created = create_session(*playback, media_id,
+                                      Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"video", "copy"}});
+        REQUIRE(created.status == 201);
+        auto id = session_id_of(created);
+        auto to_direct = update(id, Json::Object{{"mode", "direct"}});
+        CHECK(to_direct.find("mode")->asString() == "direct");
+        CHECK(to_direct.find("preferences")->find("video")->isNull());
+        CHECK(to_direct.find("preferences")->find("audio")->isNull());
+        id = to_direct.find("session_id")->asString();
+        auto to_remux = update(id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
+        CHECK(to_remux.find("mode")->asString() == "remux");
+        CHECK(to_remux.find("output")->find("video")->find("transform")->asString() == "copy");
+        CHECK(to_remux.find("output")->find("audio")->find("transform")->asString() == "copy");
+        id = to_remux.find("session_id")->asString();
+        // An update that names both sets both.
+        auto restated = update(id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"audio", "copy"}});
+        CHECK(restated.find("mode")->asString() == "transcode");
+        CHECK(restated.find("output")->find("video")->find("transform")->asString() == "transcode");
+        CHECK(restated.find("output")->find("audio")->find("transform")->asString() == "copy");
+        session_call(*playback, "DELETE", restated.find("session_id")->asString());
+        // A quality instruction also belongs to its mode, so it does not outlive a transcode.
+        auto capped = create_session(*playback, media_id,
+                                     Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}});
+        REQUIRE(capped.status == 201);
+        CHECK(body_of(capped).find("preferences")->find("max_height")->asInt64() == 720);
+        auto uncapped = update(session_id_of(capped), Json::Object{{"mode", "direct"}});
+        CHECK(uncapped.find("mode")->asString() == "direct");
+        CHECK(uncapped.find("preferences")->find("max_height")->isNull());
+        session_call(*playback, "DELETE", uncapped.find("session_id")->asString());
+    }
+
+    // A cover picture is not a video stream: an MP3 with one direct-plays its audio.
+    {
+        const auto media_id = node.write("/media/cover.mp3", pattern(4096, 3));
+        auto playback = node.playback(node.streaming(), std::make_shared<AttachedPictureAudioEngine>());
+        Json::Object capabilities{{"containers", Json(Json::Array{Json("mp3")})},
+                                  {"video_codecs", Json(Json::Array{Json("h264")})},
+                                  {"audio_codecs", Json(Json::Array{Json("mp3"), Json("aac")})},
+                                  {"hls_fmp4", true}};
+        auto response = create_session(*playback, media_id, Json::Object{{"mode", "direct"}},
+                                       Json::Object{{"capabilities", Json(std::move(capabilities))}});
+        REQUIRE(response.status == 201);
+        const auto body = body_of(response);
+        CHECK(body.find("mode")->asString() == "direct");
+        const auto* selection = body.find("selection");
+        REQUIRE(selection && selection->isObject());
+        CHECK(selection->find("video_stream")->asInt64() == -1);
+        CHECK(selection->find("audio_stream")->asInt64() == 1);
+    }
+
+    // A seek never starts after the position asked for: seek_ms +
+    // seek_offset_ms equals the request exactly, with a non-negative offset.
+    {
+        const auto media_id = node.write("/media/keyframed.mkv", pattern(64 * 1024, 4));
+        auto streaming = node.streaming();
+        streaming.startup_timeout = 2s;
+        auto playback = node.playback(streaming, std::make_shared<KeyframedRemuxMediaEngine>());
+        const auto honoured = [](const Json& payload) {
+            REQUIRE(payload.find("seek_ms") != nullptr);
+            REQUIRE(payload.find("seek_offset_ms") != nullptr);
+            REQUIRE(payload.find("seek_requested_ms") != nullptr);
+            const auto seek = payload.find("seek_ms")->asInt64();
+            const auto offset = payload.find("seek_offset_ms")->asInt64();
+            const auto requested = payload.find("seek_requested_ms")->asInt64();
+            CHECK(seek + offset == requested);
+            CHECK(offset >= 0);
+            return requested;
+        };
+        const auto create = [&](const char* mode, int64_t seek_ms) {
+            auto response = create_session(*playback, media_id, Json::Object{{"mode", mode}, {"container", "fmp4"}},
+                                           Json::Object{{"seek_ms", seek_ms}});
+            REQUIRE(response.status == 201);
+            return body_of(response);
+        };
+        // Remux: baseline at the last keyframe at or before 23 s, remainder published.
+        auto remux = create("remux", 23'000);
+        CHECK(remux.find("mode")->asString() == "remux");
+        CHECK(honoured(remux) == 23'000);
+        CHECK(remux.find("seek_ms")->asInt64() == 20'000);
+        CHECK(remux.find("seek_offset_ms")->asInt64() == 3'000);
+        // A seek-only PATCH follows the same rule as a create seek, and the
+        // mode is never substituted.
+        auto patched = session_call(*playback, "PATCH", remux.find("session_id")->asString(),
+                                    Json::Object{{"seek_ms", 35'000}});
+        REQUIRE(patched.status == 200);
+        const auto patched_body = body_of(patched);
+        CHECK(honoured(patched_body) == 35'000);
+        CHECK(patched_body.find("seek_ms")->asInt64() == 30'000);
+        CHECK(patched_body.find("seek_offset_ms")->asInt64() == 5'000);
+        CHECK(patched_body.find("mode")->asString() == "remux");
+        auto aligned = create("remux", 30'000);
+        CHECK(honoured(aligned) == 30'000);
+        CHECK(aligned.find("seek_offset_ms")->asInt64() == 0);
+        // Transcode is frame-accurate: the offset is always zero.
+        auto transcode = create("transcode", 23'000);
+        CHECK(transcode.find("mode")->asString() == "transcode");
+        CHECK(honoured(transcode) == 23'000);
+        CHECK(transcode.find("seek_ms")->asInt64() == 23'000);
+        CHECK(transcode.find("seek_offset_ms")->asInt64() == 0);
+        // Direct has no generation; the client byte-ranges the source.
+        auto direct = create("direct", 23'000);
+        CHECK(direct.find("mode")->asString() == "direct");
+        CHECK(honoured(direct) == 23'000);
+        CHECK(direct.find("seek_offset_ms")->asInt64() == 0);
+    }
+
+    // A session reports how far past its last requested fragment media is
+    // produced, from this node's max_ahead_segments and segment duration; direct
+    // play has no frontier.
+    {
+        const auto media_id = node.write("/media/look-ahead.mkv", pattern(64 * 1024, 5));
+        auto streaming = node.streaming();
+        streaming.startup_timeout = 2s;
+        // Not the defaults, so the assertion cannot pass by coincidence.
+        streaming.max_ahead_segments = 3;
+        streaming.segment_duration = 2000ms;
+        auto playback = node.playback(streaming, std::make_shared<ObservableHlsMediaEngine>());
+        auto transformed = create_session(*playback, media_id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
+        REQUIRE(transformed.status == 201);
+        const auto transformed_body = body_of(transformed);
+        const auto* look_ahead = transformed_body.find("stream")->find("look_ahead_ms");
+        REQUIRE(look_ahead != nullptr);
+        CHECK(look_ahead->asInt64() == 6000);
+        auto direct = create_session(*playback, media_id, Json::Object{{"mode", "direct"}, {"container", "fmp4"}});
+        REQUIRE(direct.status == 201);
+        const auto direct_body = body_of(direct);
+        REQUIRE(direct_body.find("stream")->find("look_ahead_ms") != nullptr);
+        CHECK(direct_body.find("stream")->find("look_ahead_ms")->isNull());
+        // Production figures sit beside look_ahead_ms, and are absent for direct play.
+        const auto* production = transformed_body.find("stream")->find("production");
+        REQUIRE(production != nullptr);
+        REQUIRE(production->find("produced_ms") != nullptr);
+        REQUIRE(production->find("producing_ms") != nullptr);
+        REQUIRE(production->find("produced_age_ms") != nullptr);
+        REQUIRE(production->find("producer_parked") != nullptr);
+        CHECK(direct_body.find("stream")->find("production") == nullptr);
+    }
+
+    // A URL generation below the current one was replaced (gone, not to be
+    // retried, scoped to the request); one above it is an ordinary not-found.
+    {
+        const auto media_id = node.write("/media/superseded.mp4", pattern(65549, 6));
+        auto streaming = node.streaming();
+        streaming.session_idle = 5min;
+        auto playback = node.playback(streaming, std::make_shared<FakeMediaEngine>());
+        auto created = create_session(*playback, media_id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}});
+        REQUIRE(created.status == 201);
+        const auto created_body = body_of(created);
+        const auto first_url = created_body.find("stream")->find("url")->asString();
+        const auto first_generation = created_body.find("generation")->asUInt64();
+        auto patched = session_call(*playback, "PATCH", created_body.find("session_id")->asString(),
+                                    Json::Object{{"seek_ms", 5'000}});
+        REQUIRE(patched.status == 200);
+        const auto patched_body = body_of(patched);
+        const auto second_generation = patched_body.find("generation")->asUInt64();
+        REQUIRE(second_generation > first_generation);
+
+        auto stale = playback->handle(playback_request("GET", first_url));
+        REQUIRE(stale.status == 410);
+        const auto stale_body = body_of(stale);
+        const auto* stale_error = stale_body.find("error");
+        REQUIRE(stale_error != nullptr);
+        CHECK(stale_error->find("code")->asString() == "generation_superseded");
+        CHECK(stale_error->find("scope")->asString() == "request");
+        CHECK(stale_error->find("node_healthy")->asBool());
+        CHECK(stale_error->find("alternative_may_succeed")->asBool());
+
+        auto future_url = patched_body.find("stream")->find("url")->asString();
+        const auto marker = "/" + std::to_string(second_generation) + "/";
+        const auto at = future_url.find(marker);
+        REQUIRE(at != std::string::npos);
+        future_url.replace(at, marker.size(), "/" + std::to_string(second_generation + 99) + "/");
+        auto future = playback->handle(playback_request("GET", future_url));
+        REQUIRE(future.status == 404);
+        CHECK(body_of(future).find("error")->find("code")->asString() == "not_found");
+    }
+
+    // A session's own life: its report, direct byte ranges over a snapshot of
+    // the file, seek-only and subtitle-only updates that reuse the prepared plan,
+    // quality and mode changes, and capabilities that are advisory.
+    {
+        const auto bytes = pattern(512 * 1024 + 37, 7);
+        const auto media_id = node.write("/media/test.mp4", bytes);
+        CatalogueApiConfig api;
+        api.stream_chunk_bytes = 64 * 1024;
+        auto streaming = node.streaming();
+        streaming.max_sessions = 4;
+        streaming.max_video_transcodes = 1;
+        streaming.max_audio_transcodes = 1;
+        streaming.startup_timeout = 2s;
+        auto engine = std::make_shared<FakeMediaEngine>();
+        auto playback = node.playback(streaming, engine, {}, nullptr, api);
+
+        const auto status = playback_status(*playback);
+        REQUIRE(status.find("server_version") != nullptr);
+        CHECK(status.find("server_version")->asString() == kServerVersion);
+        CHECK(status.find("probe_cache_entries")->asUInt64() <=
+              status.find("probe_cache_limit_entries")->asUInt64());
+        CHECK(status.find("probe_cache_bytes")->asUInt64() <=
+              status.find("probe_cache_limit_bytes")->asUInt64());
+        for (const auto* field : {"subtitle_cache_entries", "subtitle_cache_bytes",
+                                  "segment_store_resident_bytes", "segment_store_spill_bytes",
+                                  "segment_store_descriptor_bytes", "segment_store_segments",
+                                  "segment_store_planned_segments", "heap_reclaim_pending",
+                                  "heap_reclaim_requests", "heap_reclaim_runs", "heap_reclaim_successes"})
+            CHECK(status.find(field) != nullptr);
+
+        // A transformed stream can begin at its resume point in the initial POST.
+        auto initial_seek = create_session(*playback, media_id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}},
+                                           Json::Object{{"seek_ms", 23000}});
+        REQUIRE(initial_seek.status == 201);
+        const auto initial_seek_body = body_of(initial_seek);
+        CHECK(initial_seek_body.find("mode")->asString() == "remux");
+        CHECK(initial_seek_body.find("seek_ms")->asInt64() == 23000);
+        auto plans = engine->started_plans();
+        REQUIRE(plans.size() == 1);
+        CHECK(plans.back().seek == 23s);
+        const auto seek_id = initial_seek_body.find("session_id")->asString();
+
+        // A seek-only PATCH, even one restating unchanged preferences, reuses the
+        // prepared VOD plan without re-probing.
+        const auto probes_before_seek = engine->probes();
+        const auto prepares_before_seek = engine->vod_prepares();
+        auto fast_seek = session_call(*playback, "PATCH", seek_id, Json::Object{{"seek_ms", 35000}});
+        REQUIRE(fast_seek.status == 200);
+        CHECK(body_of(fast_seek).find("seek_ms")->asInt64() == 35000);
+        auto redundant_seek = session_call(
+            *playback, "PATCH", seek_id,
+            Json::Object{{"seek_ms", 47000},
+                         {"preferences", Json(Json::Object{{"mode", "remux"}, {"container", "fmp4"}})}});
+        REQUIRE(redundant_seek.status == 200);
+        CHECK(body_of(redundant_seek).find("seek_ms")->asInt64() == 47000);
+        CHECK(engine->probes() == probes_before_seek);
+        CHECK(engine->vod_prepares() == prepares_before_seek);
+        plans = engine->started_plans();
+        REQUIRE(plans.size() == 3);
+        CHECK(plans[1].seek == 35s);
+        CHECK(plans[2].seek == 47s);
+        CHECK(session_call(*playback, "DELETE", seek_id).status == 204);
+
+        // Reopening the same media with the same transformed plan reuses the
+        // probe and the prepared plan; only the pipeline generation is fresh.
+        const auto probes_before_reopen = engine->probes();
+        const auto prepares_before_reopen = engine->vod_prepares();
+        auto reopened = create_session(*playback, media_id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}},
+                                       Json::Object{{"seek_ms", 23000}});
+        REQUIRE(reopened.status == 201);
+        CHECK(engine->probes() == probes_before_reopen);
+        CHECK(engine->vod_prepares() == prepares_before_reopen);
+        CHECK(session_call(*playback, "DELETE", session_id_of(reopened)).status == 204);
+
+        // Direct: the source, described, its streams offered, served by range,
+        // with no HLS plan prepared or started.
+        const auto plans_before_direct = engine->started_plans().size();
+        auto created = create_session(*playback, media_id, Json::Object{{"mode", "direct"}});
+        REQUIRE(created.status == 201);
+        const auto created_body = body_of(created);
+        CHECK(created_body.find("mode")->asString() == "direct");
+        CHECK(created_body.find("stream")->find("subtitle_url")->isNull());
+        CHECK(created_body.find("source")->find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
+        CHECK(created_body.find("source")->find("bitrate")->asUInt64() == 4'000'000);
+        const auto& source_streams = created_body.find("source")->find("streams")->asArray();
+        REQUIRE(source_streams.size() == 4);
+        CHECK(source_streams[0].find("bitrate")->asUInt64() == 3'700'000);
+        CHECK(source_streams[1].find("bitrate")->asUInt64() == 192'000);
+        CHECK(created_body.find("output")->find("video")->find("transform")->asString() == "copy");
+        CHECK(created_body.find("output")->find("video")->find("bitrate")->asUInt64() == 3'700'000);
+        CHECK(created_body.find("output")->find("audio")->find("transform")->asString() == "copy");
+        CHECK(created_body.find("output")->find("audio")->find("bitrate")->asUInt64() == 192'000);
+        CHECK(created_body.find("preferences")->find("mode")->asString() == "direct");
+        const auto* options = created_body.find("options");
+        REQUIRE(options != nullptr);
+        REQUIRE(!options->find("audio_streams")->asArray().empty());
+        CHECK(options->find("audio_streams")->asArray().front().isObject());
+        REQUIRE(options->find("subtitle_streams")->asArray().size() == 1);
+        CHECK(options->find("subtitle_streams")->asArray().front().find("index")->asInt64() == 2);
+        CHECK(!options->find("quality_heights")->asArray().empty());
+        CHECK(std::any_of(options->find("modes")->asArray().begin(), options->find("modes")->asArray().end(),
+                          [](const Json& mode) { return mode.asString() == "direct"; }));
+        CHECK(engine->vod_prepares() == prepares_before_reopen);
+        CHECK(engine->started_plans().size() == plans_before_direct);
+        const auto session_id = created_body.find("session_id")->asString();
+        const auto direct_url = created_body.find("stream")->find("url")->asString();
+        CHECK(direct_url.ends_with("/direct"));
+        auto direct = playback_request("GET", direct_url);
+        direct.headers["range"] = "bytes=100-1099";
+        auto direct_response = playback->handle(direct);
+        REQUIRE(direct_response.status == 206);
+        REQUIRE(direct_response.stream != nullptr);
+        CHECK(direct_response.content_length() == 1000);
+        Bytes direct_bytes(1000);
+        REQUIRE(direct_response.stream->read(0, direct_bytes) == direct_bytes.size());
+        CHECK(std::equal(direct_bytes.begin(), direct_bytes.end(), bytes.begin() + 100));
+
+        // A quality instruction is a re-encode, so it is refused with direct, not ignored.
+        CHECK(create_session(*playback, media_id,
+                             Json::Object{{"mode", "direct"}, {"max_height", 1},
+                                          {"max_bitrate", static_cast<uint64_t>(1)}})
+                  .status == 400);
+
+        // A subtitle-only PATCH does not rebuild or seek the A/V generation; the
+        // subtitle gets a stream-specific URL so caches cannot serve the old track.
+        const auto probes_before_subtitle = engine->probes();
+        const auto prepares_before_subtitle = engine->vod_prepares();
+        auto subtitle_only = session_call(*playback, "PATCH", session_id,
+                                          Json::Object{{"preferences", Json(Json::Object{{"subtitle_stream", 2}})}});
+        REQUIRE(subtitle_only.status == 200);
+        const auto subtitle_only_body = body_of(subtitle_only);
+        CHECK(subtitle_only_body.find("stream")->find("url")->asString() == direct_url);
+        CHECK(subtitle_only_body.find("selection")->find("subtitle_stream")->asInt64() == 2);
+        const auto selected_subtitle_url = subtitle_only_body.find("stream")->find("subtitle_url")->asString();
+        CHECK(selected_subtitle_url.find("/1/subtitle-2/manifest.json") != std::string::npos);
+        CHECK(engine->probes() == probes_before_subtitle);
+        CHECK(engine->vod_prepares() == prepares_before_subtitle);
+
+        // The manifest describes segments without extracting any; a segment is
+        // extracted once and then cached.
+        const auto subtitle_segments_before = engine->subtitle_segments();
+        auto manifest = playback->handle(playback_request("GET", selected_subtitle_url));
+        REQUIRE(manifest.status == 200);
+        CHECK(manifest.content_type.starts_with("application/json"));
+        CHECK(engine->subtitle_segments() == subtitle_segments_before);
+        const auto manifest_body = Json::parse(response_text(manifest));
+        CHECK(manifest_body.find("format")->asString() == "macha-webvtt-segments");
+        REQUIRE(manifest_body.find("segment_durations_ms")->asArray().size() == 15);
+        const auto subtitle_segment_path =
+            selected_subtitle_url.substr(0, selected_subtitle_url.rfind('/')) + "/segment-0.vtt";
+        auto segment = playback->handle(playback_request("GET", subtitle_segment_path));
+        REQUIRE(segment.status == 200);
+        CHECK(segment.content_type.starts_with("text/vtt"));
+        CHECK(engine->subtitle_segments() == subtitle_segments_before + 1);
+        REQUIRE(playback->handle(playback_request("GET", subtitle_segment_path)).status == 200);
+        CHECK(engine->subtitle_segments() == subtitle_segments_before + 1);
+
+        // Subtitles off; a bitmap subtitle or a missing track is refused.
+        const Json::Object subtitles_off{{"subtitle_stream", Json(nullptr)}, {"subtitle_language", ""}};
+        auto subtitle_off = session_call(*playback, "PATCH", session_id,
+                                         Json::Object{{"preferences", Json(subtitles_off)}});
+        REQUIRE(subtitle_off.status == 200);
+        const auto subtitle_off_body = body_of(subtitle_off);
+        CHECK(subtitle_off_body.find("stream")->find("url")->asString() == direct_url);
+        CHECK(subtitle_off_body.find("selection")->find("subtitle_stream")->asInt64() == -1);
+        CHECK(subtitle_off_body.find("stream")->find("subtitle_url")->isNull());
+        CHECK(session_call(*playback, "PATCH", session_id,
+                           Json::Object{{"preferences", Json(Json::Object{{"subtitle_stream", 3}})}})
+                  .status == 400);
+        CHECK(session_call(*playback, "PATCH", session_id,
+                           Json::Object{{"preferences", Json(Json::Object{{"audio_stream", 99}})}})
+                  .status == 400);
+
+        // Requesting 720p rebuilds the session at 720p, every mode still offered.
+        auto quality = session_call(
+            *playback, "PATCH", session_id,
+            Json::Object{{"preferences",
+                          Json(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"max_height", 720}})}});
+        REQUIRE(quality.status == 200);
+        const auto quality_body = body_of(quality);
+        CHECK(quality_body.find("mode")->asString() == "transcode");
+        CHECK(quality_body.find("preferences")->find("mode")->asString() == "transcode");
+        CHECK(quality_body.find("preferences")->find("max_height")->asInt64() == 720);
+        CHECK(quality_body.find("output")->find("video")->find("codec")->asString() == "h264");
+        CHECK(quality_body.find("output")->find("video")->find("height")->asInt64() == 720);
+        for (const auto* mode : {"direct", "remux", "transcode"}) {
+            const auto& modes = quality_body.find("options")->find("modes")->asArray();
+            CHECK(std::any_of(modes.begin(), modes.end(), [&](const Json& m) { return m.asString() == mode; }));
+        }
+        auto restore = session_call(
+            *playback, "PATCH", session_id,
+            Json::Object{{"preferences", Json(Json::Object{{"mode", "direct"}, {"max_height", Json(nullptr)},
+                                                           {"max_bitrate", Json(nullptr)}})}});
+        REQUIRE(restore.status == 200);
+        CHECK(body_of(restore).find("mode")->asString() == "direct");
+        CHECK(body_of(restore).find("preferences")->find("max_height")->isNull());
+
+        // Capabilities are advisory: the instruction is performed, not refused.
+        // The session above released its slot on leaving transcode, so this is admitted.
+        Json::Object unsupported_caps{{"containers", Json::Array{}},
+                                      {"video_codecs", Json::Array{Json("vp9")}},
+                                      {"audio_codecs", Json::Array{Json("opus")}},
+                                      {"hls_fmp4", true}};
+        auto unsupported = create_session(*playback, media_id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}},
+                                          Json::Object{{"capabilities", Json(std::move(unsupported_caps))}});
+        REQUIRE(unsupported.status == 201);
+        REQUIRE(session_call(*playback, "DELETE", session_id_of(unsupported)).status == 204);
+
+        // Into transcode with a seek and a subtitle: AAC keeps the stereo layout.
+        auto patched = session_call(
+            *playback, "PATCH", session_id,
+            Json::Object{{"preferences",
+                          Json(Json::Object{{"mode", "transcode"}, {"container", "fmp4"}, {"subtitle_stream", 2}})},
+                         {"seek_ms", 12000}});
+        REQUIRE(patched.status == 200);
+        const auto patched_body = body_of(patched);
+        CHECK(patched_body.find("mode")->asString() == "transcode");
+        CHECK(patched_body.find("output")->find("video")->find("transform")->asString() == "transcode");
+        CHECK(patched_body.find("output")->find("video")->find("codec")->asString() == "h264");
+        CHECK(patched_body.find("output")->find("audio")->find("transform")->asString() == "transcode");
+        CHECK(patched_body.find("output")->find("audio")->find("channels")->asUInt64() == 2);
+        CHECK(patched_body.find("output")->find("audio")->find("bitrate")->asUInt64() == 2 * 64000);
+        const auto hls_url = patched_body.find("stream")->find("url")->asString();
+        const auto subtitle_url = patched_body.find("stream")->find("subtitle_url")->asString();
+        CHECK(response_text(playback->handle(playback_request("GET", hls_url))).find("#EXTM3U") !=
+              std::string::npos);
+        auto transcoded_manifest = playback->handle(playback_request("GET", subtitle_url));
+        REQUIRE(transcoded_manifest.status == 200);
+        REQUIRE(!Json::parse(response_text(transcoded_manifest)).find("segment_durations_ms")->asArray().empty());
+        auto transcoded_segment = playback->handle(
+            playback_request("GET", subtitle_url.substr(0, subtitle_url.rfind('/')) + "/segment-0.vtt"));
+        REQUIRE(transcoded_segment.status == 200);
+        CHECK(transcoded_segment.content_type.starts_with("text/vtt"));
+
+        // The in-place subtitle path also preserves a live transformed generation.
+        const auto plans_before_subtitle_off = engine->started_plans().size();
+        auto transformed_off = session_call(*playback, "PATCH", session_id,
+                                            Json::Object{{"preferences", Json(subtitles_off)}});
+        REQUIRE(transformed_off.status == 200);
+        CHECK(body_of(transformed_off).find("stream")->find("url")->asString() == hls_url);
+        CHECK(body_of(transformed_off).find("stream")->find("subtitle_url")->isNull());
+        CHECK(engine->started_plans().size() == plans_before_subtitle_off);
+
+        // The one transcode slot is held.
+        CHECK(create_session(*playback, media_id, Json::Object{{"mode", "transcode"}, {"container", "fmp4"}})
+                  .status == 429);
+        CHECK(session_call(*playback, "DELETE", session_id).status == 204);
+
+        // A playback lease is a snapshot: replacing the file does not change the
+        // bytes of a running direct stream named by path.
+        auto by_path = create_session(*playback, "path:/media/test.mp4", Json::Object{{"mode", "direct"}});
+        REQUIRE(by_path.status == 201);
+        auto replacement = bytes;
+        for (auto& byte : replacement) byte ^= 0x5a;
+        (void)node.write("/media/test.mp4", replacement);
+        auto pinned = playback_request("GET", body_of(by_path).find("stream")->find("url")->asString());
+        pinned.headers["range"] = "bytes=0-255";
+        auto pinned_response = playback->handle(pinned);
+        REQUIRE(pinned_response.status == 206);
+        Bytes pinned_bytes(256);
+        REQUIRE(pinned_response.stream->read(0, pinned_bytes) == pinned_bytes.size());
+        CHECK(std::equal(pinned_bytes.begin(), pinned_bytes.end(), bytes.begin()));
+        CHECK(session_call(*playback, "DELETE", session_id_of(by_path)).status == 204);
+
+        // A remux session advertises direct and honours an explicit switch back to it.
+        auto remux = create_session(*playback, media_id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
+        REQUIRE(remux.status == 201);
+        const auto remux_body = body_of(remux);
+        const auto& remux_modes = remux_body.find("options")->find("modes")->asArray();
+        CHECK(std::any_of(remux_modes.begin(), remux_modes.end(),
+                          [](const Json& mode) { return mode.asString() == "direct"; }));
+        auto switched = session_call(*playback, "PATCH", session_id_of(remux),
+                                     Json::Object{{"preferences", Json(Json::Object{{"mode", "direct"}})}});
+        REQUIRE(switched.status == 200);
+        CHECK(body_of(switched).find("mode")->asString() == "direct");
+        CHECK(body_of(switched).find("preferences")->find("mode")->asString() == "direct");
+        CHECK(body_of(switched).find("stream")->find("url")->asString().ends_with("/direct"));
+        CHECK(session_call(*playback, "DELETE", body_of(switched).find("session_id")->asString()).status == 204);
+    }
+}
+
+MACHA_TEST("media_playback", test_playback_admission_bounds_slots_sessions_and_accounts) {
+    // Each create is its own session and its own entitlement; transcode slots
+    // are reserved at admission, bound per node and per account, released by
+    // leaving transcode or closing; and one account never sees, touches or
+    // collides with another's sessions.
+    PlaybackNode node;
+    const auto transcode = Json::Object{{"mode", "transcode"}, {"container", "fmp4"}};
+    const auto remux = Json::Object{{"mode", "remux"}, {"container", "fmp4"}};
+
+    // A second transcode is refused while the first is still starting: the
+    // slot is reserved before the pipeline exists.
+    {
+        const auto media_id = node.write("/media/reserved.mkv", pattern(64 * 1024, 11));
+        auto streaming = node.streaming();
+        streaming.max_sessions = 4;
+        streaming.max_video_transcodes = 1;
+        streaming.max_audio_transcodes = 1;
+        streaming.startup_timeout = 2s;
+        auto engine = std::make_shared<BlockingMediaEngine>();
+        auto playback = node.playback(streaming, engine);
+        HttpResponse first;
+        std::jthread starting([&] { first = create_session(*playback, media_id, transcode); });
+        REQUIRE(wait_until([&] { return engine->starts() == 1; }, 2s));
+        CHECK(create_session(*playback, media_id, transcode).status == 429);
+        CHECK(engine->starts() == 1);
+        engine->release();
+        starting.join();
+        REQUIRE(first.status == 201);
+        CHECK(session_call(*playback, "DELETE", session_id_of(first)).status == 204);
+    }
+
+    // One node-wide transcode slot: a second create on the same bearer is a
+    // second session, not a replacement; direct needs no encoder; a PATCH out
+    // of transcode or a close through the signed stream URL releases the slot.
+    {
+        const auto media_id = node.write("/media/slot.mp4", pattern(64 * 1024, 12));
+        auto streaming = node.streaming();
+        streaming.max_sessions = 4;
+        streaming.max_video_transcodes = 1;
+        streaming.max_audio_transcodes = 1;
+        streaming.startup_timeout = 2s;
+        auto playback = node.playback(streaming, std::make_shared<FakeMediaEngine>());
+        const auto create = [&](const Json::Object& preferences, const std::string& viewer,
+                                const std::string& attempt) {
+            return create_session(*playback, media_id, preferences, {},
+                                  SessionIdentity{.id = viewer, .roles = {"anonymous"}},
+                                  {{"idempotency_key", attempt}});
+        };
+        const auto as = [](const std::string& viewer) { return SessionIdentity{.id = viewer, .roles = {"anonymous"}}; };
+
+        auto first = create(transcode, "ui-player-1", "attempt-1");
+        REQUIRE(first.status == 201);
+        const auto first_id = session_id_of(first);
+        CHECK(playback_status(*playback).find("video_transcodes")->asUInt64() == 1);
+        CHECK(playback_status(*playback).find("sessions")->asUInt64() == 1);
+        auto second = create(Json::Object{{"mode", "direct"}, {"container", "fmp4"}}, "ui-player-1", "attempt-2");
+        REQUIRE(second.status == 201);
+        const auto second_id = session_id_of(second);
+        CHECK(second_id != first_id);
+        CHECK(playback_status(*playback).find("sessions")->asUInt64() == 2);
+        CHECK(playback_status(*playback).find("video_transcodes")->asUInt64() == 1);
+        for (const auto& id : {first_id, second_id})
+            CHECK(session_call(*playback, "GET", id, {}, as("ui-player-1")).status == 200);
+        // Bound node-wide: neither another viewer nor the holder gets a second slot.
+        CHECK(create(transcode, "ui-player-2", "other-attempt").status == 429);
+        CHECK(create(transcode, "ui-player-1", "attempt-3").status == 429);
+        REQUIRE(session_call(*playback, "DELETE", second_id, {}, as("ui-player-1")).status == 204);
+
+        // Leaving transcode by PATCH frees the slot.
+        auto patched = session_call(*playback, "PATCH", first_id,
+                                    Json::Object{{"preferences", Json(Json::Object{{"mode", "direct"}})}},
+                                    as("ui-player-1"));
+        REQUIRE(patched.status == 200);
+        CHECK(playback_status(*playback).find("video_transcodes")->asUInt64() == 0);
+        auto other = create(transcode, "ui-player-2", "other-attempt-2");
+        REQUIRE(other.status == 201);
+        REQUIRE(session_call(*playback, "DELETE", body_of(patched).find("session_id")->asString(), {},
+                             as("ui-player-1")).status == 204);
+
+        // A page unloading cannot finish a preflighted DELETE, so the session is
+        // closed through its signed stream URL with no bearer (a CORS simple request).
+        const auto other_body = body_of(other);
+        const auto id = other_body.find("session_id")->asString();
+        const auto url = other_body.find("stream")->find("url")->asString();
+        const std::string prefix = "/api/v1/playback/sessions/" + id + "/stream/";
+        REQUIRE(url.starts_with(prefix));
+        const auto token = url.substr(prefix.size(), url.find('/', prefix.size()) - prefix.size());
+        REQUIRE(!token.empty());
+        const auto close = [&](const std::string& method, const std::string& with_token) {
+            HttpRequest request;
+            request.method = method;
+            request.path = prefix + with_token + "/close";
+            CHECK(playback->capability_request(request));
+            return playback->handle(request);
+        };
+        CHECK(close("GET", token).status == 405);
+        std::string wrong = token;
+        wrong.back() = wrong.back() == '0' ? '1' : '0';
+        CHECK(close("POST", wrong).status == 404);
+        CHECK(playback_status(*playback).find("sessions")->asUInt64() == 1);
+        CHECK(close("POST", token).status == 204);
+        CHECK(playback_status(*playback).find("sessions")->asUInt64() == 0);
+        CHECK(playback_status(*playback).find("video_transcodes")->asUInt64() == 0);
+        CHECK(create(transcode, "ui-player-3", "after-close").status == 201);
+        // Idempotent: the session is already gone, which is what was asked for.
+        CHECK(close("POST", token).status == 204);
+    }
+
+    // Accounts: a listing of one's own sessions with the cap stated, owner
+    // checks answering 404, ownership kept across a replacement, a session cap
+    // and a transcode cap with their own codes, and idempotency keys scoped to
+    // their account.
+    {
+        const auto media_id = node.write("/media/accounts.mp4", pattern(64 * 1024, 13));
+        const auto viewer = [](std::string_view user) {
+            return SessionIdentity{.id = std::string(user) + "-auth", .roles = {"media_viewer"},
+                                   .user_id = std::string(user)};
+        };
+        const auto alice = viewer("alice");
+        const auto bob = viewer("bob");
+        const auto manager = [&](size_t per_account) {
+            auto streaming = node.streaming();
+            streaming.startup_timeout = 2s;
+            streaming.max_sessions = 16;
+            streaming.max_sessions_per_account = per_account;
+            streaming.max_video_transcodes = 4;
+            streaming.max_audio_transcodes = 4;
+            return node.playback(streaming, std::make_shared<FakeMediaEngine>());
+        };
+        const auto list = [](PlaybackManager& playback, const SessionIdentity& who) {
+            auto response = playback.handle(playback_request("GET", "/api/v1/playback/sessions", {}, who));
+            REQUIRE(response.status == 200);
+            return body_of(response);
+        };
+
+        {
+            auto playback = manager(8);
+            auto first = create_session(*playback, media_id, remux, {}, alice);
+            REQUIRE(first.status == 201);
+            auto second = create_session(*playback, media_id, remux, {}, alice);
+            REQUIRE(second.status == 201);
+            auto theirs = create_session(*playback, media_id, remux, {}, bob);
+            REQUIRE(theirs.status == 201);
+            const auto listed = list(*playback, alice);
+            std::set<std::string> ids;
+            for (const auto& entry : listed.find("items")->asArray())
+                ids.insert(entry.find("session_id")->asString());
+            CHECK((ids == std::set<std::string>{session_id_of(first), session_id_of(second)}));
+            CHECK(listed.find("account")->find("sessions")->asUInt64() == 2);
+            CHECK(listed.find("account")->find("max_sessions")->asUInt64() == 8);
+            CHECK(list(*playback, bob).find("items")->asArray().size() == 1);
+
+            // Another account gets 404, not 403, so it cannot learn the id exists.
+            const auto id = session_id_of(first);
+            CHECK(session_call(*playback, "GET", id, {}, bob).status == 404);
+            CHECK(session_call(*playback, "PATCH", id, Json::Object{{"seek_ms", 1000}}, bob).status == 404);
+            CHECK(session_call(*playback, "DELETE", id, {}, bob).status == 404);
+            CHECK(session_call(*playback, "GET", id, {}, alice).status == 200);
+            CHECK(session_call(*playback, "DELETE", id, {}, alice).status == 204);
+
+            // A replaced session keeps its account: reachable, listed and counted once.
+            auto switched = session_call(*playback, "PATCH", session_id_of(second),
+                                         Json::Object{{"preferences", Json(transcode)}}, alice);
+            REQUIRE(switched.status == 200);
+            const auto replaced = body_of(switched).find("session_id")->asString();
+            CHECK(session_call(*playback, "GET", replaced, {}, alice).status == 200);
+            const auto after = list(*playback, alice);
+            CHECK(after.find("items")->asArray().size() == 1);
+            CHECK(after.find("account")->find("sessions")->asUInt64() == 1);
+            CHECK(session_call(*playback, "GET", replaced, {}, bob).status == 404);
+
+            // Keys are client-chosen and predictable, so one account cannot turn
+            // another's retry into a 409; within one account it replays.
+            auto squatted = create_session(*playback, media_id, remux, {}, bob, {{"idempotency_key", "retry-1"}});
+            REQUIRE(squatted.status == 201);
+            auto mine = create_session(*playback, media_id, remux, {}, alice, {{"idempotency_key", "retry-1"}});
+            REQUIRE(mine.status == 201);
+            CHECK(session_id_of(mine) != session_id_of(squatted));
+            auto replayed = create_session(*playback, media_id, remux, {}, alice, {{"idempotency_key", "retry-1"}});
+            REQUIRE(replayed.status == 201);
+            CHECK(session_id_of(replayed) == session_id_of(mine));
+        }
+        {
+            // The account session cap is the same on every node: scope request.
+            auto playback = manager(2);
+            REQUIRE(create_session(*playback, media_id, remux, {}, alice).status == 201);
+            REQUIRE(create_session(*playback, media_id, remux, {}, alice).status == 201);
+            auto refused = create_session(*playback, media_id, remux, {}, alice);
+            REQUIRE(refused.status == 429);
+            const auto refusal = body_of(refused);
+            const auto* error = refusal.find("error");
+            CHECK(error->find("code")->asString() == "account_session_limit");
+            CHECK(error->find("scope")->asString() == "request");
+            CHECK(error->find("node_healthy")->asBool() == true);
+            CHECK(error->find("sessions")->asUInt64() == 2);
+            CHECK(error->find("max_sessions")->asUInt64() == 2);
+            CHECK(create_session(*playback, media_id, remux, {}, bob).status == 201);
+            const auto listed = list(*playback, alice);
+            const auto id = listed.find("items")->asArray().front().find("session_id")->asString();
+            REQUIRE(session_call(*playback, "DELETE", id, {}, alice).status == 204);
+            CHECK(create_session(*playback, media_id, remux, {}, alice).status == 201);
+        }
+        {
+            // Entitlements are per session, so a per-account bound stops one
+            // account taking every transcode slot: the node allows four, one account two.
+            auto playback = manager(32);
+            const auto first = create_session(*playback, media_id, transcode, {}, alice);
+            REQUIRE(first.status == 201);
+            REQUIRE(create_session(*playback, media_id, transcode, {}, alice).status == 201);
+            auto refused = create_session(*playback, media_id, transcode, {}, alice);
+            REQUIRE(refused.status == 429);
+            const auto refusal = body_of(refused);
+            const auto* error = refusal.find("error");
+            CHECK(error->find("code")->asString() == "account_transcode_limit");
+            CHECK(error->find("scope")->asString() == "request");
+            CHECK(error->find("node_healthy")->asBool() == true);
+            CHECK(error->find("alternative_may_succeed")->asBool() == true);
+            CHECK(error->find("transcodes")->asUInt64() == 2);
+            CHECK(error->find("max_transcodes")->asUInt64() == 2);
+            CHECK(create_session(*playback, media_id, remux, {}, alice).status == 201);
+            CHECK(create_session(*playback, media_id, transcode, {}, bob).status == 201);
+            const auto listed = list(*playback, alice);
+            CHECK(listed.find("account")->find("transcodes")->asUInt64() == 2);
+            CHECK(listed.find("account")->find("max_transcodes")->asUInt64() == 2);
+            REQUIRE(session_call(*playback, "DELETE", session_id_of(first), {}, alice).status == 204);
+            CHECK(create_session(*playback, media_id, transcode, {}, alice).status == 201);
+        }
+    }
+}
+
+MACHA_TEST("media_playback", test_playback_probes_once_and_replays_idempotent_creates) {
+    // The probe is stage-specific and node-healthy when it fails; a profile is
+    // immutable per media identity and survives a cold manager; concurrent
+    // misses and keyed retries share one probe and one session; a failed
+    // creation releases its joiners and reservation; and the profile queue
+    // never gates admission.
+    PlaybackNode node;
+    const auto direct = Json::Object{{"mode", "direct"}};
+    const auto keyed = [](std::string key) {
+        return std::map<std::string, std::string, std::less<>>{{"idempotency_key", std::move(key)}};
+    };
+
+    // One error envelope: error.code is the discriminator, error.message for a
+    // human, every other detail beside them.
+    {
+        const auto media_id = node.write("/media/probe-fails.mp4", pattern(64 * 1024, 21));
+        auto streaming = node.streaming();
+        streaming.probe_timeout = 2s;
+        auto playback = node.playback(streaming, std::make_shared<FailingProbeMediaEngine>());
+        auto request = playback_request("POST", "/api/v1/playback/sessions", Json::Object{{"media_id", media_id}});
+        auto response = playback->handle(request);
+        REQUIRE(response.status == 503);
+        const auto body = body_of(response);
+        const auto* error = body.find("error");
+        REQUIRE(error != nullptr);
+        CHECK(error->find("code")->asString() == "playback_probe_failed");
+        CHECK(!error->find("message")->asString().empty());
+        CHECK(error->find("stage")->asString() == "probe");
+        CHECK(!error->find("trace")->asString().empty());
+        // A probe failure is one title's problem; the node is fit for every other.
+        CHECK(error->find("node_healthy")->asBool());
+    }
+
+    // A distinct manager with an empty process-local cache answers from the
+    // catalogue's immutable profile without probing; replacing the file changes
+    // its identity, so the old profile cannot hit it.
+    {
+        const auto first_media_id = node.write("/media/profile.mp4", pattern(128 * 1024 + 37, 22));
+        Json first_body;
+        {
+            auto engine = std::make_shared<FakeMediaEngine>();
+            auto playback = node.playback(node.streaming(), engine);
+            auto created = create_session(*playback, first_media_id, direct, {}, anonymous, keyed(first_media_id));
+            REQUIRE(created.status == 201);
+            CHECK(engine->probes() == 1);
+            CHECK(idempotency_of(created) == "created");
+            first_body = body_of(created);
+        }
+        REQUIRE(node.catalogue().media_profile(first_media_id).has_value());
+
+        // The profile endpoint serves it immutably with the size this node finds;
+        // a size it cannot find is null and the answer is not cached.
+        auto media_size = [&](const std::string& media_id) -> std::optional<uint64_t> {
+            auto found = node.filesystem().find_media(media_id);
+            if (!found) return std::nullopt;
+            return found->second.size;
+        };
+        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, {}, {}, std::chrono::hours(24 * 30),
+                                   media_size);
+        auto profile_request = playback_request("GET", "/api/v1/catalogue/media/" + first_media_id + "/profile");
+        auto response = catalogue_api.handle(profile_request);
+        REQUIRE(response.status == 200);
+        CHECK(response.headers.at("Cache-Control").find("immutable") != std::string::npos);
+        const auto profile = body_of(response);
+        CHECK(profile.find("media_id")->asString() == first_media_id);
+        CHECK(profile.find("size")->asUInt64() == node.filesystem().find_media(first_media_id)->second.size);
+        CHECK(profile.find("format")->asString() == "mov,mp4,m4a,3gp,3g2,mj2");
+        CHECK(profile.find("duration_ms")->asUInt64() == 60'000);
+        REQUIRE(profile.find("streams")->asArray().size() == 4);
+        CatalogueApi sizeless_api(node.catalogue(), node.hints());
+        auto sizeless = sizeless_api.handle(profile_request);
+        REQUIRE(sizeless.status == 200);
+        CHECK(sizeless.headers.at("Cache-Control") == "private, no-cache");
+        CHECK(body_of(sizeless).find("size")->isNull());
+
+        {
+            auto engine = std::make_shared<FakeMediaEngine>();
+            auto playback = node.playback(node.streaming(), engine);
+            auto created = create_session(*playback, first_media_id, direct, {}, anonymous, keyed(first_media_id));
+            REQUIRE(created.status == 201);
+            CHECK(engine->probes() == 0);
+            const auto cached_body = body_of(created);
+            CHECK(cached_body.find("session_id")->asString() == first_body.find("session_id")->asString());
+            CHECK(cached_body.find("generation")->dump() == first_body.find("generation")->dump());
+            for (const auto* field : {"mode", "media_id", "duration_ms", "preferences",
+                                      "selection", "source", "output", "options"}) {
+                REQUIRE(first_body.find(field) != nullptr);
+                REQUIRE(cached_body.find(field) != nullptr);
+                CHECK(first_body.find(field)->dump() == cached_body.find(field)->dump());
+            }
+        }
+        auto replacement = pattern(128 * 1024 + 41, 22);
+        for (auto& byte : replacement) byte ^= 0x5a;
+        const auto second_media_id = node.write("/media/profile.mp4", replacement);
+        REQUIRE(second_media_id != first_media_id);
+        auto engine = std::make_shared<FakeMediaEngine>();
+        auto playback = node.playback(node.streaming(), engine);
+        REQUIRE(create_session(*playback, second_media_id, direct, {}, anonymous, keyed(second_media_id)).status == 201);
+        CHECK(engine->probes() == 1);
+    }
+
+    // Two concurrent keyed creates share one probe and one session; a replay
+    // answers it; the same key with a different body is a conflict until the
+    // session is deleted.
+    {
+        const auto media_id = node.write("/media/coalesce.mp4", pattern(64 * 1024 + 19, 23));
+        TestGate gate;
+        auto engine = std::make_shared<CoalescingProbeMediaEngine>(gate);
+        auto streaming = node.streaming();
+        streaming.probe_timeout = 2s;
+        auto playback = node.playback(streaming, engine);
+        HttpResponse first, second;
+        std::jthread a([&] { first = create_session(*playback, media_id, direct, {}, anonymous, keyed("coalesced-create-1")); });
+        REQUIRE(gate.wait_for_entries(1));
+        std::jthread b([&] { second = create_session(*playback, media_id, direct, {}, anonymous, keyed("coalesced-create-1")); });
+        std::this_thread::sleep_for(50ms);
+        CHECK(gate.entered() == 1);
+        gate.open();
+        a.join();
+        b.join();
+        CHECK(first.status == 201);
+        CHECK(second.status == 201);
+        CHECK(engine->probes() == 1);
+        CHECK(body_of(first).find("session_id")->dump() == body_of(second).find("session_id")->dump());
+        CHECK(body_of(first).find("generation")->dump() == body_of(second).find("generation")->dump());
+        CHECK(idempotency_of(first) == "created");
+        CHECK(idempotency_of(second) == "replayed");
+
+        auto replay = create_session(*playback, media_id, direct, {}, anonymous, keyed("coalesced-create-1"));
+        REQUIRE(replay.status == 201);
+        CHECK(idempotency_of(replay) == "replayed");
+        CHECK(session_id_of(replay) == session_id_of(first));
+        CHECK(engine->probes() == 1);
+
+        auto conflict = create_session(*playback, media_id, direct, Json::Object{{"seek_ms", 1000}}, anonymous,
+                                       keyed("coalesced-create-1"));
+        REQUIRE(conflict.status == 409);
+        CHECK(std::string(conflict.body.begin(), conflict.body.end()).find("idempotency_conflict") !=
+              std::string::npos);
+        CHECK(session_call(*playback, "DELETE", session_id_of(first)).status == 204);
+        auto reused = create_session(*playback, media_id, direct, Json::Object{{"seek_ms", 1000}}, anonymous,
+                                     keyed("coalesced-create-1"));
+        REQUIRE(reused.status == 201);
+        CHECK(idempotency_of(reused) == "created");
+        CHECK(engine->probes() == 1);
+        // Publication of the probed profile is asynchronous.
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 2s));
+    }
+
+    // A failed keyed creation releases its joiners and its reservation: with
+    // max_sessions 1, reaching a second probe proves both were released.
+    {
+        const auto media_id = node.write("/media/failing.mp4", pattern(64 * 1024 + 7, 24));
+        TestGate gate;
+        auto engine = std::make_shared<CoalescingProbeMediaEngine>(gate, true);
+        auto streaming = node.streaming();
+        streaming.probe_timeout = 2s;
+        streaming.max_sessions = 1;
+        auto playback = node.playback(streaming, engine);
+        HttpResponse first, second;
+        std::jthread a([&] { first = create_session(*playback, media_id, direct, {}, anonymous, keyed("failing-create-1")); });
+        REQUIRE(gate.wait_for_entries(1));
+        std::jthread b([&] { second = create_session(*playback, media_id, direct, {}, anonymous, keyed("failing-create-1")); });
+        std::this_thread::sleep_for(30ms);
+        gate.open();
+        a.join();
+        b.join();
+        CHECK(first.status == 503);
+        CHECK(second.status == 503);
+        CHECK(engine->probes() == 1);
+        CHECK(create_session(*playback, media_id, direct, {}, anonymous, keyed("failing-create-1")).status == 503);
+        CHECK(engine->probes() == 2);
+    }
+
+    // The profile endpoint's pending answer (202) does not gate negotiation:
+    // the create produces the profile through the same shared flight, and
+    // publication stays asynchronous and outside admission.
+    {
+        const auto media_id = node.write("/media/pending.mp4", pattern(32 * 1024 + 3, 25));
+        auto engine = std::make_shared<FakeMediaEngine>();
+        auto information = node.information(engine);
+        std::atomic_uint queue_requests{};
+        auto queue = [&](const std::vector<std::string>& media_ids) {
+            ++queue_requests;
+            return information->request(media_ids, MediaInformationPriority::requested, "media-information-api");
+        };
+        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, queue);
+        auto pending = catalogue_api.handle(playback_request("GET", "/api/v1/catalogue/media/" + media_id + "/profile"));
+        REQUIRE(pending.status == 202);
+        CHECK(pending.headers.at("Retry-After") == "1");
+        auto playback = node.playback(node.streaming(), engine, queue, information.get());
+        auto admitted = create_session(*playback, media_id, direct, {}, anonymous, keyed("pending-profile-create"));
+        REQUIRE(admitted.status == 201);
+        CHECK(idempotency_of(admitted) == "created");
+        CHECK(engine->probes() == 1);
+        CHECK(queue_requests.load() == 1);
+        CHECK(!node.catalogue().media_profile(media_id).has_value());
+        information->start();
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 2s));
+        playback->stop();
+        information->stop();
+    }
+
+    // A profile queue that cannot take the job lets playback use its bounded
+    // media-engine fallback, without asking it.
+    {
+        const auto media_id = node.write("/media/fallback.mp4", pattern(32 * 1024 + 5, 26));
+        std::atomic_uint queue_attempts{};
+        auto unavailable = [&](const std::vector<std::string>&) {
+            ++queue_attempts;
+            return size_t{0};
+        };
+        auto engine = std::make_shared<FakeMediaEngine>();
+        auto playback = node.playback(node.streaming(), engine, unavailable);
+        auto admitted = create_session(*playback, media_id, direct, {}, anonymous, keyed("unavailable-profile-fallback"));
+        REQUIRE(admitted.status == 201);
+        CHECK(idempotency_of(admitted) == "created");
+        CHECK(queue_attempts.load() == 0);
+        CHECK(engine->probes() == 1);
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 2s));
+    }
+
+    // A profile job that went pending then failed: the create falls back to the
+    // engine once and a retry replays rather than probing again.
+    {
+        const auto media_id = node.write("/media/retry.mp4", pattern(32 * 1024 + 7, 27));
+        std::atomic_uint requests{};
+        auto pending_then_failed = [&](const std::vector<std::string>&) {
+            return ++requests == 1 ? size_t{1} : size_t{0};
+        };
+        CatalogueApi catalogue_api(node.catalogue(), node.hints(), {}, pending_then_failed);
+        REQUIRE(catalogue_api.handle(playback_request("GET", "/api/v1/catalogue/media/" + media_id + "/profile"))
+                    .status == 202);
+        auto engine = std::make_shared<FakeMediaEngine>();
+        auto playback = node.playback(node.streaming(), engine, pending_then_failed);
+        auto admitted = create_session(*playback, media_id, direct, {}, anonymous, keyed("failed-profile-retry"));
+        REQUIRE(admitted.status == 201);
+        CHECK(idempotency_of(admitted) == "created");
+        CHECK(engine->probes() == 1);
+        CHECK(requests.load() == 1);
+        auto replayed = create_session(*playback, media_id, direct, {}, anonymous, keyed("failed-profile-retry"));
+        REQUIRE(replayed.status == 201);
+        CHECK(idempotency_of(replayed) == "replayed");
+        CHECK(engine->probes() == 1);
+        CHECK(body_of(replayed).find("session_id")->dump() == body_of(admitted).find("session_id")->dump());
+        CHECK(body_of(replayed).find("generation")->dump() == body_of(admitted).find("generation")->dump());
+    }
+}
+
+MACHA_TEST("media_playback", test_media_information_schedules_scans_and_publishes_profiles) {
+    // MediaInformationService runs requested work before background work,
+    // shares one scan between foreground requests, lets playback take over a
+    // speculative scan, prunes a profile only with the last live copy, and
+    // retries publication without rescanning.
+    PlaybackNode node;
+
+    {
+        const auto low_a = node.write("/media/low-a.mp4", pattern(32769, 31));
+        const auto low_b = node.write("/media/low-b.mp4", pattern(32771, 31));
+        const auto requested = node.write("/media/requested.mp4", pattern(32773, 31));
+        auto engine = std::make_shared<PriorityMediaInformationEngine>();
+        auto information = node.information(engine);
+        REQUIRE(information->request_path("/media/low-a.mp4", MediaInformationPriority::background));
+        REQUIRE(information->request_path("/media/low-b.mp4", MediaInformationPriority::background));
+        REQUIRE(information->request_path("/media/requested.mp4", MediaInformationPriority::requested,
+                                          "media-information-request"));
+        information->start();
+        REQUIRE(wait_until([&] {
+            return node.catalogue().media_profile(low_a).has_value() &&
+                   node.catalogue().media_profile(low_b).has_value() &&
+                   node.catalogue().media_profile(requested).has_value();
+        }, 5s));
+        const auto order = engine->order();
+        REQUIRE(order.size() == 3);
+        CHECK(order.front() == requested);
+        information->stop();
+    }
+
+    {
+        const std::string path = "/media/single-flight.mp4";
+        const auto media_id = node.write(path, pattern(65539, 32));
+        const auto entry = node.filesystem().getattr(path);
+        TestGate gate;
+        auto engine = std::make_shared<CoalescingProbeMediaEngine>(gate);
+        auto information = node.information(engine);
+        information->start();
+        std::optional<MediaProbeResult> first, second;
+        std::jthread a([&] { first = information->resolve_playback(media_id, path, entry, Clock::now() + 2s); });
+        REQUIRE(gate.wait_for_entries(1));
+        std::jthread b([&] { second = information->resolve_playback(media_id, path, entry, Clock::now() + 2s); });
+        std::this_thread::sleep_for(30ms);
+        CHECK(engine->probes() == 1);
+        gate.open();
+        a.join();
+        b.join();
+        REQUIRE(first.has_value());
+        REQUIRE(second.has_value());
+        CHECK(*first == *second);
+        CHECK(engine->probes() == 1);
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 2s));
+        information->stop();
+    }
+
+    {
+        const std::string path = "/media/takeover.mp4";
+        const auto media_id = node.write(path, pattern(65541, 33));
+        const auto entry = node.filesystem().getattr(path);
+        auto engine = std::make_shared<PriorityMediaInformationEngine>(true);
+        auto information = node.information(engine);
+        REQUIRE(information->request_path(path));
+        information->start();
+        REQUIRE(wait_until([&] { return engine->starts() == 1; }, 2s));
+        auto resolved = information->resolve_playback(media_id, path, entry, Clock::now() + 2s);
+        CHECK(!resolved.streams.empty());
+        CHECK(engine->starts() == 2);
+        CHECK(engine->cancellations() == 1);
+        CHECK(engine->completions() == 1);
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 2s));
+        information->stop();
+    }
+
+    {
+        const auto bytes = pattern(65543, 34);
+        const auto media_id = node.write("/media/copy-a.mp4", bytes);
+        REQUIRE(node.write("/media/copy-b.mp4", bytes) == media_id);
+        auto engine = std::make_shared<PriorityMediaInformationEngine>();
+        auto information = node.information(engine);
+        REQUIRE(information->request_path("/media/copy-a.mp4"));
+        information->start();
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 2s));
+        node.filesystem().unlink("/media/copy-a.mp4");
+        information->request_prune();
+        std::this_thread::sleep_for(100ms);
+        CHECK(node.catalogue().media_profile(media_id).has_value());
+        node.filesystem().unlink("/media/copy-b.mp4");
+        information->request_prune();
+        REQUIRE(wait_until([&] { return !node.catalogue().media_profile(media_id).has_value(); }, 2s));
+        information->stop();
+    }
+
+    {
+        const std::string path = "/media/retry-publication.mp4";
+        const auto media_id = node.write(path, pattern(65547, 35));
+        auto engine = std::make_shared<PriorityMediaInformationEngine>();
+        std::atomic_uint publication_attempts{};
+        auto information = node.information(engine, [&](std::string id, MediaProbeResult profile) {
+            if (++publication_attempts == 1) throw std::runtime_error("synthetic catalogue conflict");
+            node.catalogue().put_media_profile(id, std::move(profile));
+        });
+        REQUIRE(information->request_path(path));
+        information->start();
+        REQUIRE(wait_until([&] { return node.catalogue().media_profile(media_id).has_value(); }, 3s));
+        CHECK(publication_attempts.load() == 2);
+        CHECK(engine->starts() == 1);
+        CHECK(engine->completions() == 1);
+        information->stop();
+    }
 }
 
 namespace {
-// A remux engine with a keyframe every 10 s, so an off-keyframe seek lands
-// before the request (FakeMediaEngine's empty index makes every offset zero).
-class KeyframedRemuxMediaEngine final : public FakeMediaEngine {
+// A fragment request run as HttpServer runs it, one step at a time: a held
+// request comes back deferred with its hold, and the test decides whether it
+// resumes woken or at its deadline.
+class FragmentRequest {
+    PlaybackManager& playback_;
+    HttpRequest request_;
+    HttpResponse response_;
+
   public:
-    HlsVodPlan prepare_hls_vod(const MediaSource& source, const PlaybackPlan& plan,
-                               double duration_seconds,
-                               std::chrono::milliseconds segment_duration,
-                               bool allow_video_transcode_fallback,
-                               std::chrono::milliseconds timeout = {}) override {
-        auto vod = FakeMediaEngine::prepare_hls_vod(source, plan, duration_seconds,
-                                                    segment_duration,
-                                                    allow_video_transcode_fallback, timeout);
-        for (double seconds = 0.0; seconds < duration_seconds; seconds += 10.0)
-            vod.video_random_access_points.push_back(seconds);
-        const auto requested_ms =
-            media_vod::clamp_seek_ms(plan.seek.count(), duration_seconds);
-        // Only a stream copy is bound to a sync sample; a transcode starts on the frame asked for.
-        if (plan.video != MediaTransform::copy) {
-            vod.playback.seek = std::chrono::milliseconds(requested_ms);
-            vod.playback.seek_offset = {};
-            vod.playback.seek_requested = std::chrono::milliseconds(requested_ms);
-            return vod;
-        }
-        auto indexed = media_vod::indexed_plan(vod.video_random_access_points, duration_seconds,
-                                               requested_ms, vod.seek_segment_seconds);
-        REQUIRE(indexed.has_value());
-        vod.playback.seek = std::chrono::milliseconds(indexed->seek_ms);
-        vod.playback.seek_offset = std::chrono::milliseconds(indexed->seek_offset_ms);
-        vod.playback.seek_requested = std::chrono::milliseconds(indexed->seek_requested_ms);
-        vod.segment_durations = std::move(indexed->segment_durations);
-        return vod;
+    FragmentRequest(PlaybackManager& playback, std::string path)
+        : playback_(playback), request_(playback_request("GET", std::move(path))),
+          response_(playback_.handle(request_)) {}
+
+    const HttpResponse& response() const { return response_; }
+    bool held() const { return response_.defer.has_value(); }
+    Clock::time_point deadline() const { return response_.defer->deadline; }
+    // True once the store has fired the deferral's waker.
+    bool woken() const {
+        auto fired = std::make_shared<std::atomic_bool>();
+        response_.defer->waker->arm([fired] { fired->store(true); });
+        return fired->load();
+    }
+    // Re-runs the request as the server does when woken or once its deadline
+    // has passed; the hold goes with the deferral unless it defers again.
+    const HttpResponse& resume(bool deadline_passed) {
+        REQUIRE(held());
+        auto deferral = std::move(*response_.defer);
+        request_.resumed = true;
+        request_.resumed_state = std::move(deferral.state);
+        request_.resume_deadline = deadline_passed ? Clock::now() - 1ms : deferral.deadline;
+        response_ = playback_.handle(request_);
+        request_.resumed_state.reset();
+        return response_;
     }
 };
 } // namespace
 
-MACHA_TEST("media_playback", test_a_seek_goes_where_it_was_asked_to_go) {
-    // A seek never starts after the position asked for: seek_ms + seek_offset_ms
-    // equals the request exactly, with a non-negative offset.
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto c = config_for(t.path() / "node", keyfile, free_port());
-    c.replication = 1;
-    c.metadata_min_write_replicas = 1;
-    c.catalogue.api.enabled = false;
-    Service service(c, keys);
-    service.start();
-    service.filesystem().mkdir("/media", 0755, getuid(), getgid());
-    service.filesystem().create_file("/media/film.mkv", 0644, getuid(), getgid());
-    auto bytes = pattern(64 * 1024);
-    auto writer = service.filesystem().open_write("/media/film.mkv", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    auto media_id = file_media_id(service.filesystem().getattr("/media/film.mkv"));
-
-    CatalogueApiConfig api;
-    StreamingConfig streaming;
-    streaming.enabled = true;
-    streaming.temp_path = t.path() / "playback";
-    streaming.startup_timeout = 2s;
-    PlaybackManager playback(service.filesystem(), service.resources().transcode_rates,
-                            service.resources().memory, service.catalogue(), api, streaming,
-                             std::make_unique<KeyframedRemuxMediaEngine>());
-    playback.start();
-
-    const auto honoured = [](const Json& payload) {
-        REQUIRE(payload.find("seek_ms") != nullptr);
-        REQUIRE(payload.find("seek_offset_ms") != nullptr);
-        REQUIRE(payload.find("seek_requested_ms") != nullptr);
-        const auto seek = payload.find("seek_ms")->asInt64();
-        const auto offset = payload.find("seek_offset_ms")->asInt64();
-        const auto requested = payload.find("seek_requested_ms")->asInt64();
-        // Exact, in integer milliseconds.
-        CHECK(seek + offset == requested);
-        // Never negative, so the generation contains the position asked for.
-        CHECK(offset >= 0);
-        return requested;
+MACHA_TEST("media_playback", test_playback_holds_admitted_fragment_requests_and_refuses_the_rest_at_once) {
+    // A fragment request is served if produced, held if admitted (one in
+    // flight plus one prefetch per session, inside the hold window), and
+    // otherwise refused at once as a retryable 500 that never advances the
+    // producer. A held request costs no thread, is woken by publication, and
+    // answers retryably at its deadline. Control traffic answers while holds
+    // and subtitle extractions are outstanding.
+    PlaybackNode node;
+    const auto remux = Json::Object{{"mode", "remux"}, {"container", "fmp4"}};
+    const auto stream_base = [](const HttpResponse& created) {
+        const auto url = body_of(created).find("stream")->find("url")->asString();
+        return url.substr(0, url.rfind('/') + 1);
+    };
+    const auto not_ready = [](const HttpResponse& response, std::string_view reason) {
+        CHECK(!response.defer.has_value());
+        CHECK(response.status == 500);
+        const auto text = std::string(response.body.begin(), response.body.end());
+        CHECK(text.find("segment_not_ready") != std::string::npos);
+        CHECK(text.find(reason) != std::string::npos);
+        CHECK(response.headers.at("Retry-After") == "1");
     };
 
-    auto create = [&](const char* mode, int64_t seek_ms) {
-        Json::Object root{{"media_id", media_id},
-                          {"seek_ms", seek_ms},
-                          {"preferences", Json(Json::Object{{"mode", mode}, {"container", "fmp4"}})}};
-        auto text = Json(std::move(root)).dump();
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/playback/sessions";
-        request.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-        request.body.assign(text.begin(), text.end());
-        auto response = playback.handle(request);
-        REQUIRE(response.status == 201);
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
+    {
+        const auto media_id = node.write("/media/window.mkv", pattern(64 * 1024, 41));
+        auto streaming = node.streaming();
+        streaming.startup_timeout = 2s;
+        streaming.segment_timeout = 400ms;
+        streaming.segment_hold_window = 8;
+        auto engine = std::make_shared<ObservableHlsMediaEngine>();
+        auto playback = node.playback(streaming, engine);
+        auto created = create_session(*playback, media_id, remux);
+        REQUIRE(created.status == 201);
+        const auto base = stream_base(created);
+        auto store = engine->store();
+        REQUIRE(store != nullptr);
+        REQUIRE(store->snapshot().segment_count == 1);
+        REQUIRE(store->snapshot().planned_segments == 15);
 
-    // Remux: baseline at the last keyframe at or before 23 s, remainder published.
-    auto remux = create("remux", 23'000);
-    CHECK(remux.find("mode")->asString() == "remux");
-    CHECK(honoured(remux) == 23'000);
-    CHECK(remux.find("seek_ms")->asInt64() == 20'000);
-    CHECK(remux.find("seek_offset_ms")->asInt64() == 3'000);
+        // Produced already: served with no admission at all.
+        CHECK(FragmentRequest(*playback, base + segment_name(0)).response().status == 200);
 
-    // A seek-only PATCH follows the same rule as a create seek.
-    Json::Object patch_root{{"seek_ms", 35'000}};
-    auto patch_text = Json(std::move(patch_root)).dump();
-    HttpRequest patch;
-    patch.method = "PATCH";
-    patch.path = "/api/v1/playback/sessions/" + remux.find("session_id")->asString();
-    patch.session = SessionIdentity{.id = "", .roles = {"anonymous"}};
-    patch.body.assign(patch_text.begin(), patch_text.end());
-    auto patch_response = playback.handle(patch);
-    REQUIRE(patch_response.status == 200);
-    auto patched = Json::parse(std::string(patch_response.body.begin(), patch_response.body.end()));
-    CHECK(honoured(patched) == 35'000);
-    CHECK(patched.find("seek_ms")->asInt64() == 30'000);
-    CHECK(patched.find("seek_offset_ms")->asInt64() == 5'000);
-    // The mode is never substituted.
-    CHECK(patched.find("mode")->asString() == "remux");
+        // Beyond the window (frontier one fragment, window eight): refused at
+        // once, and the producer is not told.
+        FragmentRequest refused(*playback, base + segment_name(9));
+        not_ready(refused.response(), "beyond_hold_window");
+        CHECK(refused.response().headers.at("Cache-Control") == "no-store");
+        CHECK(store->snapshot().highest_requested == 0);
+        // Past the end of the plan is a genuine miss: 404, not "come back later".
+        CHECK(FragmentRequest(*playback, base + segment_name(99)).response().status == 404);
+        CHECK(store->snapshot().highest_requested == 0);
 
-    // A request on a keyframe has offset zero.
-    auto aligned = create("remux", 30'000);
-    CHECK(honoured(aligned) == 30'000);
-    CHECK(aligned.find("seek_offset_ms")->asInt64() == 0);
+        // Inside the window: held until the segment timeout, admitted (so the
+        // frontier moves), and served when the fragment arrives.
+        const auto asked = Clock::now();
+        FragmentRequest held(*playback, base + segment_name(1));
+        REQUIRE(held.held());
+        CHECK(held.deadline() >= asked + streaming.segment_timeout);
+        CHECK(held.deadline() <= Clock::now() + streaming.segment_timeout);
+        CHECK(store->snapshot().highest_requested == 1);
+        CHECK(!held.woken());
+        // Fragment 0 is four bytes, so eleven bytes identifies fragment 1.
+        REQUIRE(store->publish_segment(Bytes(11, 0x31), 4.0));
+        CHECK(held.woken());
+        const auto& served = held.resume(false);
+        CHECK(served.status == 200);
+        CHECK(served.content_length() == 11);
 
-    // Transcode is frame-accurate: the offset is always zero.
-    auto transcode = create("transcode", 23'000);
-    CHECK(transcode.find("mode")->asString() == "transcode");
-    CHECK(honoured(transcode) == 23'000);
-    CHECK(transcode.find("seek_ms")->asInt64() == 23'000);
-    CHECK(transcode.find("seek_offset_ms")->asInt64() == 0);
+        // A held request that reaches its deadline answers retryably.
+        FragmentRequest timed_out(*playback, base + segment_name(2));
+        REQUIRE(timed_out.held());
+        not_ready(timed_out.resume(true), "hold_timed_out");
+    }
 
-    // Direct has no generation; the client byte-ranges the source.
-    auto direct = create("direct", 23'000);
-    CHECK(direct.find("mode")->asString() == "direct");
-    CHECK(honoured(direct) == 23'000);
-    CHECK(direct.find("seek_offset_ms")->asInt64() == 0);
+    {
+        // A deeply prefetching client gets its share of holds and no more.
+        const auto media_id = node.write("/media/prefetch.mkv", pattern(64 * 1024, 42));
+        auto streaming = node.streaming();
+        streaming.startup_timeout = 2s;
+        streaming.max_session_holds = 2;
+        streaming.max_concurrent_holds = 8;
+        streaming.segment_hold_window = 8;
+        auto engine = std::make_shared<ObservableHlsMediaEngine>();
+        auto playback = node.playback(streaming, engine);
+        auto created = create_session(*playback, media_id, remux);
+        REQUIRE(created.status == 201);
+        const auto base = stream_base(created);
+        // The playlist is complete and closed before a second fragment exists.
+        FragmentRequest playlist(*playback, base + "media.m3u8");
+        REQUIRE(playlist.response().status == 200);
+        const auto text = response_text(playlist.response());
+        CHECK(text.find("#EXT-X-PLAYLIST-TYPE:VOD") != std::string::npos);
+        CHECK(text.find("#EXT-X-ENDLIST") != std::string::npos);
+        CHECK(text.find(segment_name(14)) != std::string::npos);
+
+        // Two requests for unproduced fragments are the session's whole share;
+        // the third is refused immediately, naming the limit it met.
+        FragmentRequest first(*playback, base + segment_name(1));
+        FragmentRequest second(*playback, base + segment_name(2));
+        REQUIRE(first.held());
+        REQUIRE(second.held());
+        not_ready(FragmentRequest(*playback, base + segment_name(3)).response(), "session_hold_limit");
+        // Control traffic answers while both holds are outstanding (law 1).
+        CHECK(playback_status(*playback).find("sessions")->asUInt64() == 1);
+
+        // Both reach their deadline and answer retryably, not as missing, and
+        // their release returns the session's share.
+        not_ready(first.resume(true), "hold_timed_out");
+        not_ready(second.resume(true), "hold_timed_out");
+        auto store = engine->store();
+        REQUIRE(store != nullptr);
+        FragmentRequest again(*playback, base + segment_name(1));
+        REQUIRE(again.held());
+        REQUIRE(store->publish_segment(Bytes(11, 0x31), 4.0));
+        const auto& served = again.resume(false);
+        CHECK(served.status == 200);
+        CHECK(served.content_length() == 11);
+    }
+
+    {
+        // A slow subtitle extraction holds only its session's subtitle cache:
+        // status reads it with try_lock, and an unrelated create is not stuck
+        // behind it.
+        const auto media_id = node.write("/media/subtitled.mp4", pattern(65549, 43));
+        TestGate gate;
+        auto playback = node.playback(node.streaming(), std::make_shared<GatedSubtitleMediaEngine>(gate));
+        const auto preferences = Json::Object{{"mode", "remux"}, {"container", "fmp4"}, {"subtitle_stream", 2}};
+        auto created = create_session(*playback, media_id, preferences);
+        REQUIRE(created.status == 201);
+        const auto subtitle_url = body_of(created).find("stream")->find("subtitle_url")->asString();
+        HttpResponse segment_response;
+        std::jthread segment_request([&] {
+            segment_response = playback->handle(
+                playback_request("GET", subtitle_url.substr(0, subtitle_url.rfind('/')) + "/segment-0.vtt"));
+        });
+        REQUIRE(gate.wait_for_entries(1));
+
+        const auto status = playback_status(*playback);
+        CHECK(status.find("sessions")->asUInt64() == 1);
+        CHECK(status.find("subtitle_cache_entries")->asUInt64() == 0);
+        CHECK(create_session(*playback, media_id, preferences).status == 201);
+
+        gate.open();
+        segment_request.join();
+        REQUIRE(segment_response.status == 200);
+        CHECK(segment_response.content_type.starts_with("text/vtt"));
+    }
 }
 
-} // namespace
+MACHA_TEST("media_playback", test_playback_idle_clocks_release_what_is_not_used) {
+    // Each idle clock releases only what it governs: an abandoned pipeline is
+    // reclaimed while its session keeps the entitlement; an entitlement lapses
+    // without stream fetches although session polls keep the session; a session
+    // never streamed from is reclaimed on its short clock, one stream fetch
+    // moving it to the long one; and creating a session wakes the otherwise
+    // blocked cleanup worker. Time is stepped, so no margin depends on the host.
+    PlaybackNode node;
+    const auto transcode = Json::Object{{"mode", "transcode"}, {"container", "fmp4"}};
+    SteppedTime time;
+    // Runs one cleanup pass at the current time: reconfiguring wakes the
+    // worker, whose pass begins by reading the time and decides under the lock
+    // every later request takes.
+    const auto cleanup_pass = [&](PlaybackManager& playback, const StreamingConfig& streaming) {
+        const auto reads = time.reads();
+        playback.reconfigure(streaming);
+        REQUIRE(wait_until([&] { return time.reads() > reads; }, 5s));
+    };
+    const auto count = [](PlaybackManager& playback, const char* field) {
+        return playback_status(playback).find(field)->asUInt64();
+    };
+
+    {
+        const auto media_id = node.write("/media/abandoned.mp4", pattern(65549, 51));
+        auto streaming = node.streaming();
+        streaming.max_video_transcodes = 1;
+        streaming.video_decoder_threads = 3;
+        streaming.pipeline_idle = 500ms;
+        streaming.session_idle = 5min;
+        auto playback = node.playback(streaming, std::make_shared<FakeMediaEngine>(), {}, nullptr, {}, time);
+        auto first = create_session(*playback, media_id, transcode);
+        REQUIRE(first.status == 201);
+        auto stale_stream = body_of(first).find("stream")->find("url")->asString();
+        const auto current_stream = stale_stream;
+        const auto generation = stale_stream.find("/1/master.m3u8");
+        REQUIRE(generation != std::string::npos);
+        stale_stream.replace(generation, std::string("/1/master.m3u8").size(), "/0/master.m3u8");
+        CHECK(count(*playback, "sessions") == 1);
+        CHECK(count(*playback, "video_transcodes") == 1);
+        CHECK(count(*playback, "video_decoder_threads") == 3);
+
+        // Current-generation traffic renews the pipeline lease: 800 ms on, the
+        // last fetch is 400 ms old and the pipeline still runs.
+        time.advance(400ms);
+        CHECK(playback->handle(playback_request("GET", current_stream)).status == 200);
+        time.advance(400ms);
+        cleanup_pass(*playback, streaming);
+        CHECK(count(*playback, "running_video_transcode_pipelines") == 1);
+        CHECK(count(*playback, "idle_pipelines_reclaimed") == 0);
+
+        // Requests for an obsolete generation are gone and renew nothing.
+        CHECK(playback->handle(playback_request("GET", stale_stream)).status == 410);
+        time.advance(100ms);
+        cleanup_pass(*playback, streaming);
+        // The entitlement is on its own clock, transcode_entitlement_idle, left
+        // at its default here; the heap is reclaimed once no pipeline runs.
+        REQUIRE(wait_until([&] {
+            const auto status = playback_status(*playback);
+            return status.find("sessions")->asUInt64() == 1 &&
+                   status.find("video_transcodes")->asUInt64() == 1 &&
+                   status.find("running_video_transcode_pipelines")->asUInt64() == 0 &&
+                   !status.find("heap_reclaim_pending")->asBool() &&
+                   status.find("heap_reclaim_requests")->asUInt64() >= 1 &&
+                   status.find("idle_pipelines_reclaimed")->asUInt64() == 1 &&
+                   status.find("heap_reclaim_runs")->asUInt64() >= 1;
+        }, 5s));
+        // Reclaiming the pipeline does not surrender the entitlement, so a
+        // resume or seek after an idle pipeline is not refused; a create is,
+        // node-scoped since another node may serve it.
+        auto second = create_session(*playback, media_id, transcode);
+        REQUIRE(second.status == 429);
+        const auto second_body = body_of(second);
+        const auto* error = second_body.find("error");
+        REQUIRE(error != nullptr);
+        CHECK(error->find("code")->asString() == "resource_limit");
+        CHECK(error->find("scope")->asString() == "node");
+        CHECK(error->find("node_healthy")->asBool());
+        CHECK(error->find("alternative_may_succeed")->asBool());
+        REQUIRE(session_call(*playback, "DELETE", session_id_of(first)).status == 204);
+        REQUIRE(create_session(*playback, media_id, transcode).status == 201);
+    }
+
+    {
+        const auto media_id = node.write("/media/keepalive.mp4", pattern(65549, 52));
+        auto streaming = node.streaming();
+        streaming.max_video_transcodes = 1;
+        streaming.pipeline_idle = 250ms;
+        // Clamped into [pipeline_idle, session_idle].
+        streaming.transcode_entitlement_idle = 600ms;
+        streaming.session_idle = 5min;
+        auto playback = node.playback(streaming, std::make_shared<FakeMediaEngine>(), {}, nullptr, {}, time);
+        auto created = create_session(*playback, media_id, transcode);
+        REQUIRE(created.status == 201);
+        const auto session_id = session_id_of(created);
+        REQUIRE(count(*playback, "video_transcodes") == 1);
+        // Polling the session is not stream activity: just short of the window
+        // the slot is held, at the window it is released, and the session
+        // itself survives.
+        time.advance(599ms);
+        CHECK(session_call(*playback, "GET", session_id).status == 200);
+        cleanup_pass(*playback, streaming);
+        CHECK(count(*playback, "video_transcodes") == 1);
+        time.advance(1ms);
+        CHECK(session_call(*playback, "GET", session_id).status == 200);
+        cleanup_pass(*playback, streaming);
+        CHECK(count(*playback, "video_transcodes") == 0);
+        CHECK(session_call(*playback, "GET", session_id).status == 200);
+
+        // A fresh session kept warm by a playlist fetch every 100 ms holds its
+        // pipeline and its entitlement through 1500 ms, a window and a half
+        // twice over.
+        auto second = create_session(*playback, media_id, transcode);
+        REQUIRE(second.status == 201);
+        const auto fetch = playback_request("GET", body_of(second).find("stream")->find("url")->asString());
+        REQUIRE(count(*playback, "video_transcodes") == 1);
+        for (int i = 0; i < 15; ++i) {
+            time.advance(100ms);
+            CHECK(playback->handle(fetch).status == 200);
+            cleanup_pass(*playback, streaming);
+        }
+        CHECK(count(*playback, "video_transcodes") == 1);
+    }
+
+    {
+        const auto media_id = node.write("/media/never-watched.mp4", pattern(65549, 53));
+        auto streaming = node.streaming();
+        streaming.max_video_transcodes = 1;
+        // The clock under test; the others stay long, so only this one can fire.
+        streaming.session_unused_idle = 150ms;
+        streaming.session_idle = 5min;
+        streaming.pipeline_idle = 5min;
+        auto playback = node.playback(streaming, std::make_shared<FakeMediaEngine>(), {}, nullptr, {}, time);
+        // A session created and never used again (app killed, DELETE never sent).
+        auto abandoned = create_session(*playback, media_id, transcode);
+        REQUIRE(abandoned.status == 201);
+        CHECK(count(*playback, "video_transcodes") == 1);
+        time.advance(149ms);
+        cleanup_pass(*playback, streaming);
+        CHECK(count(*playback, "sessions") == 1);
+        time.advance(1ms);
+        cleanup_pass(*playback, streaming);
+        CHECK(count(*playback, "sessions") == 0);
+        CHECK(count(*playback, "video_transcodes") == 0);
+        CHECK(count(*playback, "unused_sessions_reclaimed") == 1);
+        CHECK(count(*playback, "session_unused_idle_ms") == 150);
+        // The slot is genuinely released, not merely reported free.
+        auto admitted = create_session(*playback, media_id, transcode);
+        REQUIRE(admitted.status == 201);
+        CHECK(session_id_of(admitted) != session_id_of(abandoned));
+        // One stream fetch moves a session onto the long clock.
+        REQUIRE(playback->handle(playback_request("GET", body_of(admitted).find("stream")->find("url")->asString()))
+                    .status == 200);
+        time.advance(400ms);
+        cleanup_pass(*playback, streaming);
+        CHECK(count(*playback, "sessions") == 1);
+        CHECK(count(*playback, "video_transcodes") == 1);
+        CHECK(count(*playback, "unused_sessions_reclaimed") == 1);
+    }
+
+    {
+        // With no session the worker waits on nothing; creating one must wake
+        // it to learn the new expiry, or the session below would never expire.
+        const auto media_id = node.write("/media/expiring.mp4", pattern(64 * 1024, 54));
+        auto streaming = node.streaming();
+        streaming.session_idle = 50ms;
+        auto playback = node.playback(streaming, std::make_shared<FakeMediaEngine>(), {}, nullptr, {}, time);
+        REQUIRE(create_session(*playback, media_id, Json::Object{{"mode", "direct"}}).status == 201);
+        time.advance(50ms);
+        REQUIRE(wait_until([&] { return count(*playback, "sessions") == 0; }, 5s));
+    }
+}
+
+MACHA_TEST("media_playback", test_an_async_start_answers_at_once_and_reports_its_progress) {
+    // start=async answers 202 with a pending generation the client polls or
+    // long-polls; progress outlives the elapsed budget, a stall fails it and
+    // frees its slot at once, a delete stops it, and an update keeps the
+    // playing generation until the replacement is ready or abandoned. Direct
+    // play and keyed replays never start a second pipeline.
+    PlaybackNode node;
+    const auto media_id = node.write("/media/async.mkv", pattern(64 * 1024, 61));
+    const SessionIdentity viewer{.id = "viewer", .roles = {"media_viewer"}};
+    // Idle clocks and a failed start's retention run on stepped time; the start
+    // monitor's progress and stall detection are real.
+    SteppedTime time;
+    constexpr auto failed_retention = 1000ms;
+    struct Async {
+        std::shared_ptr<ProgressingMediaEngine> engine = std::make_shared<ProgressingMediaEngine>();
+        std::unique_ptr<PlaybackManager> playback;
+    };
+    const auto async_manager = [&](std::chrono::milliseconds no_progress) {
+        Async out;
+        auto streaming = node.streaming();
+        streaming.max_sessions = 4;
+        streaming.max_video_transcodes = 1;
+        streaming.max_audio_transcodes = 1;
+        streaming.startup_timeout = 1s;
+        streaming.startup_no_progress = no_progress;
+        streaming.start_wait_max = 5s;
+        streaming.start_failed_retention = failed_retention;
+        out.playback = node.playback(streaming, out.engine, {}, nullptr, {}, time);
+        return out;
+    };
+    const auto create = [&](Async& f, const std::string& mode, const std::string& key = {}) {
+        Json::Object preferences{{"mode", mode}};
+        if (mode != "direct") preferences["container"] = std::string("fmp4");
+        std::map<std::string, std::string, std::less<>> query{{"start", "async"}};
+        if (!key.empty()) query["idempotency_key"] = key;
+        return create_session(*f.playback, media_id, preferences, {}, viewer, std::move(query));
+    };
+    const auto call = [&](Async& f, const std::string& method, const std::string& id,
+                          std::map<std::string, std::string, std::less<>> query = {},
+                          const Json::Object& body = {}) {
+        auto request = playback_request(method, "/api/v1/playback/sessions/" + id, body, viewer);
+        request.query = std::move(query);
+        return f.playback->handle(request);
+    };
+    const auto stage = [&](Async& f, const std::string& id) {
+        auto response = call(f, "GET", id);
+        if (response.status != 200) return "status-" + std::to_string(response.status);
+        return body_of(response).find("start")->find("stage")->asString();
+    };
+    const auto pending_stage = [&](Async& f, const std::string& id) {
+        const auto json = body_of(call(f, "GET", id));
+        const auto* pending = json.find("pending");
+        return pending ? pending->find("start")->find("stage")->asString() : std::string("none");
+    };
+    // A ready session: created, released, swapped in.
+    const auto ready_session = [&](Async& f) {
+        auto created = create(f, "transcode");
+        REQUIRE(created.status == 202);
+        const auto id = session_id_of(created);
+        REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
+        f.engine->release();
+        REQUIRE(wait_until([&] { return stage(f, id) == "ready"; }, 2s));
+        return id;
+    };
+
+    {
+        // Still going past startup_timeout (1 s), because it keeps progressing.
+        auto f = async_manager(1000ms);
+        auto created = create(f, "transcode");
+        REQUIRE(created.status == 202);
+        const auto json = body_of(created);
+        CHECK(json.find("status")->asString() == "playback_starting");
+        const auto id = json.find("session_id")->asString();
+        CHECK(json.find("stream")->find("url")->isNull());
+        CHECK(json.find("stream")->find("close_url")->asString().ends_with("/close"));
+        CHECK(json.find("mode")->asString() == "transcode");
+        REQUIRE(wait_until([&] { return f.engine->starts() == 1; }, 2s));
+        for (int ms = 250; ms <= 1250; ms += 250) {
+            f.engine->advance(ms / 2);
+            std::this_thread::sleep_for(250ms);
+        }
+        CHECK(stage(f, id) == "encoding");
+        const auto polled = body_of(call(f, "GET", id));
+        const auto* start = polled.find("start");
+        REQUIRE(start != nullptr);
+        CHECK(start->find("output_media_ms")->asInt64() == 625);
+        CHECK(start->find("first_fragment_ms")->asInt64() == 2000);
+        CHECK(start->find("source_bytes_read")->asUInt64() > 0);
+        CHECK(start->find("preroll_total_ms") == nullptr);
+
+        // A long-poll on the current sequence parks; a PATCH is refused while pending.
+        const auto seq = std::to_string(start->find("progress_seq")->asUInt64());
+        CHECK(call(f, "GET", id, {{"after", seq}, {"wait_ms", "60000"}}).defer.has_value());
+        auto patch = call(f, "PATCH", id, {}, Json::Object{{"seek_ms", 1000}});
+        CHECK(patch.status == 409);
+        CHECK(body_of(patch).find("error")->find("code")->asString() == "playback_starting");
+
+        f.engine->release();
+        REQUIRE(wait_until([&] { return stage(f, id) == "ready"; }, 2s));
+        CHECK(body_of(call(f, "GET", id)).find("stream")->find("url")->asString().ends_with("/master.m3u8"));
+        CHECK(call(f, "DELETE", id).status == 204);
+
+        // Deleting a pending start stops it and frees the slot.
+        auto pending = create(f, "transcode");
+        REQUIRE(pending.status == 202);
+        REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
+        CHECK(call(f, "DELETE", session_id_of(pending)).status == 204);
+        REQUIRE(wait_until([&] { return !f.engine->last()->running.load(); }, 2s));
+        auto next = create(f, "transcode");
+        CHECK(next.status == 202);
+        CHECK(call(f, "DELETE", session_id_of(next)).status == 204);
+
+        // Direct play has no pipeline: it answers as a blocking create would.
+        auto direct = create(f, "direct");
+        REQUIRE(direct.status == 201);
+        CHECK(body_of(direct).find("start") == nullptr);
+        CHECK(call(f, "DELETE", session_id_of(direct)).status == 204);
+        // A retried keyed create while pending answers the same pending session.
+        const auto starts_before = f.engine->starts();
+        auto keyed = create(f, "transcode", "retry-1");
+        REQUIRE(keyed.status == 202);
+        auto again = create(f, "transcode", "retry-1");
+        REQUIRE(again.status == 202);
+        CHECK(idempotency_of(again) == "replayed");
+        CHECK(session_id_of(again) == session_id_of(keyed));
+        CHECK(f.engine->starts() <= starts_before + 1);
+        CHECK(call(f, "DELETE", session_id_of(keyed)).status == 204);
+    }
+
+    {
+        // An async update keeps the playing generation until its replacement is
+        // ready; abandoning the pending update leaves it playing and frees the
+        // replacement's reservation; deleting the session takes both.
+        auto f = async_manager(1000ms);
+        const auto id = ready_session(f);
+        const auto first = f.engine->last();
+        auto patched = call(f, "PATCH", id, {{"start", "async"}}, Json::Object{{"seek_ms", 30000}});
+        REQUIRE(patched.status == 202);
+        const auto json = body_of(patched);
+        CHECK(json.find("status")->asString() == "playback_starting");
+        CHECK(json.find("generation")->asUInt64() == 1);
+        CHECK(json.find("stream")->find("url")->asString().ends_with("/1/master.m3u8"));
+        REQUIRE(json.find("pending") != nullptr);
+        REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
+        CHECK(first->running.load());
+        f.engine->advance(500);
+        REQUIRE(wait_until([&] { return pending_stage(f, id) == "encoding"; }, 2s));
+        f.engine->release();
+        REQUIRE(wait_until([&] { return pending_stage(f, id) == "none"; }, 2s));
+        const auto swapped = body_of(call(f, "GET", id));
+        CHECK(swapped.find("generation")->asUInt64() == 2);
+        CHECK(swapped.find("seek_ms")->asUInt64() == 30000);
+        CHECK(!first->running.load());
+
+        const auto playing = f.engine->last();
+        REQUIRE(call(f, "PATCH", id, {{"start", "async"}}, Json::Object{{"seek_ms", 20000}}).status == 202);
+        REQUIRE(wait_until([&] { return f.engine->starts() == 3; }, 2s));
+        const auto abandoned = f.engine->last();
+        CHECK(call(f, "DELETE", id + "/pending").status == 204);
+        CHECK(!abandoned->running.load());
+        CHECK(playing->running.load());
+        const auto after = body_of(call(f, "GET", id));
+        CHECK(after.find("pending") == nullptr);
+        CHECK(after.find("generation")->asUInt64() == 2);
+        CHECK(call(f, "PATCH", id, {{"start", "async"}}, Json::Object{{"seek_ms", 40000}}).status == 202);
+        REQUIRE(wait_until([&] { return f.engine->starts() == 4; }, 2s));
+        const auto replacement = f.engine->last();
+        CHECK(call(f, "DELETE", id).status == 204);
+        CHECK(!replacement->running.load());
+        CHECK(!playing->running.load());
+    }
+
+    {
+        // A start that stops progressing fails with its stage and frees the
+        // only slot at once; the failure is kept for its retention. A stalled
+        // update fails under `pending` and the generation plays on.
+        auto f = async_manager(600ms);
+        auto created = create(f, "transcode");
+        REQUIRE(created.status == 202);
+        const auto id = session_id_of(created);
+        REQUIRE(wait_until([&] { return stage(f, id) == "failed"; }, 3s));
+        const auto failed = body_of(call(f, "GET", id));
+        const auto* error = failed.find("start")->find("error");
+        REQUIRE(error != nullptr);
+        CHECK(error->find("code")->asString() == "playback_pipeline_start_failed");
+        CHECK(error->find("start_stage")->asString() == "encoding");
+        auto next = create(f, "transcode");
+        CHECK(next.status == 202);
+        CHECK(call(f, "DELETE", session_id_of(next)).status == 204);
+        // The failure is readable for its retention and then gone.
+        CHECK(stage(f, id) == "failed");
+        time.advance(failed_retention);
+        CHECK(call(f, "GET", id).status == 404);
+
+        const auto playing_id = [&] {
+            auto playing = create(f, "transcode");
+            REQUIRE(playing.status == 202);
+            const auto playing_session = session_id_of(playing);
+            REQUIRE(wait_until([&] { return f.engine->starts() == 3; }, 2s));
+            f.engine->release();
+            REQUIRE(wait_until([&] { return stage(f, playing_session) == "ready"; }, 2s));
+            return playing_session;
+        }();
+        const auto playing = f.engine->last();
+        REQUIRE(call(f, "PATCH", playing_id, {{"start", "async"}}, Json::Object{{"seek_ms", 20000}}).status == 202);
+        REQUIRE(wait_until([&] { return pending_stage(f, playing_id) == "failed"; }, 3s));
+        const auto json = body_of(call(f, "GET", playing_id));
+        CHECK(json.find("pending")->find("start")->find("error")->find("code")->asString() ==
+              "playback_pipeline_start_failed");
+        CHECK(json.find("generation")->asUInt64() == 1);
+        CHECK(playing->running.load());
+        CHECK(call(f, "DELETE", playing_id).status == 204);
+    }
+}
+
