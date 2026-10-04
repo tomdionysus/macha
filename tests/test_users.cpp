@@ -137,7 +137,24 @@ MACHA_FAST_TEST("users", test_role_policy) {
          "/api/v1/manage/providers/musicbrainz/releases/0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41/tracks",
          role_manager},
         {"GET", "/api/v1/users", role_manage_users},
+        {"DELETE", "/api/v1/users/some-id", role_manage_users},
         {"PATCH", "/api/v1/users/me", role_media_viewer},
+        // Acquisition: reading it is a viewer's, changing it an importer's.
+        {"GET", "/api/v1/ingest/jobs", role_media_viewer},
+        {"POST", "/api/v1/acquisition/search", role_importer},
+        {"PUT", "/api/v1/ingest/jobs/7", role_importer},
+        {"DELETE", "/api/v1/torrents/requests/7", role_importer},
+        // Any other change is a manager's, by any mutating method; a read of
+        // the same path is not.
+        {"POST", "/api/v1/manage/hints/7/match", role_manager},
+        {"PUT", "/api/v1/catalogue/items/movie:one", role_manager},
+        {"PATCH", "/api/v1/catalogue/items/movie:one", role_manager},
+        {"DELETE", "/api/v1/catalogue/items/movie:one/metadata", role_manager},
+        {"DELETE", "/api/v1/status/nodes/one", role_manager},
+        {"HEAD", "/api/v1/catalogue/items/movie:one", role_media_viewer},
+        // Playing is a viewer's act, whatever the method.
+        {"POST", "/api/v1/playback/sessions", role_media_viewer},
+        {"DELETE", "/api/v1/playback/sessions/7", role_media_viewer},
     };
     for (const auto& route : routes) {
         HttpRequest request;
