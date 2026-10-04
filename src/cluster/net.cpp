@@ -2955,9 +2955,18 @@ void RpcClient::broadcast(const RpcMessage& message) {
 }
 
 size_t RpcClient::broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
+    return notify_control_routes(message, frame_type, false);
+}
+
+size_t RpcClient::broadcast_notify(const RpcMessage& message, FrameType frame_type) {
+    return notify_control_routes(message, frame_type, true);
+}
+
+size_t RpcClient::notify_control_routes(const RpcMessage& message, FrameType frame_type,
+                                        bool wait) {
     std::vector<std::shared_ptr<PeerConnection>> outbound;
     std::vector<std::function<bool(const RpcMessage&, FrameType)>> inbound;
-    if (!try_control_routes(outbound, inbound))
+    if (!try_control_routes(outbound, inbound, wait))
         return 0;
 
     size_t queued = 0;
@@ -2978,8 +2987,10 @@ size_t RpcClient::broadcast_best_effort(const RpcMessage& message, FrameType fra
 
 bool RpcClient::try_control_routes(
     std::vector<std::shared_ptr<PeerConnection>>& outbound,
-    std::vector<std::function<bool(const RpcMessage&, FrameType)>>& inbound) {
-    if (!mutex_.try_lock())
+    std::vector<std::function<bool(const RpcMessage&, FrameType)>>& inbound, bool wait) {
+    if (wait)
+        mutex_.lock();
+    else if (!mutex_.try_lock())
         return false;
     Lock lock(mutex_, std::adopt_lock);
     for (const auto& [_, connection] : connections_)

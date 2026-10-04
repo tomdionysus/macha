@@ -2869,6 +2869,16 @@ MACHA_TEST("media_playback", test_an_async_start_answers_at_once_and_reports_its
             std::this_thread::sleep_for(250ms);
         }
         CHECK(stage(f, id) == "encoding");
+        // The monitor publishes the engine's progress on its own sample; wait
+        // for the last advance to appear.
+        REQUIRE(wait_until(
+            [&] {
+                const auto now = body_of(call(f, "GET", id));
+                const auto* start = now.find("start");
+                return start && start->find("output_media_ms") &&
+                       start->find("output_media_ms")->asInt64() == 625;
+            },
+            2s));
         const auto polled = body_of(call(f, "GET", id));
         const auto* start = polled.find("start");
         REQUIRE(start != nullptr);
