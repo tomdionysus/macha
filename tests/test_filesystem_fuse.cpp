@@ -13,2204 +13,100 @@ using namespace macha::test_support;
 
 namespace {
 
-MACHA_TEST("filesystem_fuse", test_fuse_signal_exit_is_a_clean_service_shutdown) {
-    CHECK(!fuse_loop_result_is_error(0));
-    CHECK(!fuse_loop_result_is_error(SIGTERM));
-    CHECK(!fuse_loop_result_is_error(SIGINT));
-    CHECK(fuse_loop_result_is_error(-EIO));
-}
+// One node's FileSystem and stores with no Service around them: everything the
+// FUSE frontend and the publication writers take, and nothing more. Behaviours
+// owned by those components share one node per test; each frontend started on
+// it gets its own spool and journal, so frontends started in turn recover only
+// their own work.
+class FilesystemNode {
+    TestNode node_;
 
-MACHA_TEST("filesystem_fuse", test_status_exposes_filesystem_and_convergence_counters) {
-    TestService fixture("status-operational-counters", ConfigProfile::isolated);
-    auto& config = fixture.config();
-    config.catalogue.api.enabled = true;
-    config.catalogue.api.listen = "127.0.0.1";
-    config.catalogue.api.port = free_port();
-    config.fuse.publication_quiet = 0ms;
-    auto& service = fixture.start();
-
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    service.registry().publish_fuse(frontend);
-    frontend->mkdir("/status-counter", 0755, getuid(), getgid());
-    REQUIRE(frontend->wait_for_idle(10s));
-    REQUIRE(wait_until([&] {
-        const auto current = service.metadata_convergence_diagnostics();
-        return !current.scheduled && current.runs_scheduled == current.runs_completed;
-    }));
-
-    const auto response =
-        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
-    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
-    const auto diagnostics_root =
-        status_diagnostics_response(config.catalogue.api.port, service);
-    const auto* diagnostics = diagnostics_root.find("diagnostics");
-    REQUIRE(diagnostics != nullptr);
-
-    const auto* data_store = diagnostics->find("data_store");
-    REQUIRE(data_store != nullptr);
-    CHECK(data_store->find("available")->asBool());
-    REQUIRE(data_store->find("loose_reaffirmation_fast_paths") != nullptr);
-    REQUIRE(data_store->find("loose_reaffirmation_full_validations") != nullptr);
-
-    const auto* retained_memory = diagnostics->find("retained_memory");
-    REQUIRE(retained_memory != nullptr);
-    CHECK(retained_memory->find("capacity_bytes")->asUInt64() ==
-          config.runtime.retained_memory_bytes);
-    REQUIRE(retained_memory->find("owners") != nullptr);
-    REQUIRE(retained_memory->find("owners")->find("rpc_frame") != nullptr);
-    REQUIRE(retained_memory->find("owners")->find("fuse_operation") != nullptr);
-
-    const auto* filesystem = diagnostics->find("filesystem");
-    REQUIRE(filesystem != nullptr);
-    CHECK(filesystem->find("available")->asBool());
-    CHECK(filesystem->find("namespace_operations_admitted")->asUInt64() == 1);
-    CHECK(filesystem->find("namespace_publication_batches")->asUInt64() == 1);
-    CHECK(filesystem->find("namespace_operations_batched")->asUInt64() == 1);
-    CHECK(filesystem->find("namespace_operations_published")->asUInt64() == 1);
-    CHECK(filesystem->find("namespace_operations_confirmed")->asUInt64() == 1);
-    // A new live inode durably appends its descriptor and operation before
-    // returning, followed by published and done. Recovery frontends report
-    // only the latter two because both admission records predate restart.
-    CHECK(filesystem->find("journal_append_batches")->asUInt64() == 4);
-    CHECK(filesystem->find("journal_records_appended")->asUInt64() == 4);
-    CHECK(filesystem->find("journal_durability_barriers")->asUInt64() == 4);
-    CHECK(filesystem->find("spool_bytes")->asUInt64() == 0);
-    CHECK(filesystem->find("spool_limit_bytes")->asUInt64() ==
-          config.fuse.max_spool_bytes);
-    REQUIRE(filesystem->find("spool_publish_rate_bytes_per_second") != nullptr);
-    REQUIRE(filesystem->find("spool_publish_rate_window_bytes") != nullptr);
-    REQUIRE(filesystem->find("spool_publish_rate_window_ms") != nullptr);
-    REQUIRE(filesystem->find("spool_throttle_waits") != nullptr);
-    REQUIRE(filesystem->find("spool_throttle_wait_ms") != nullptr);
-    REQUIRE(filesystem->find("pending_write_request_bytes") != nullptr);
-    REQUIRE(filesystem->find("peak_pending_write_request_bytes") != nullptr);
-    REQUIRE(filesystem->find("pending_write_request_limit_bytes") != nullptr);
-    CHECK(filesystem->find("pending_write_request_limit_bytes")->asUInt64() ==
-          config.fuse.max_pending_write_bytes);
-    REQUIRE(filesystem->find("extent_executor_workers") != nullptr);
-    REQUIRE(filesystem->find("extent_executor_queued") != nullptr);
-    REQUIRE(filesystem->find("extent_executor_active") != nullptr);
-    REQUIRE(filesystem->find("extent_executor_peak_queued") != nullptr);
-    REQUIRE(filesystem->find("extent_executor_peak_active") != nullptr);
-    REQUIRE(filesystem->find("extent_executor_submitted") != nullptr);
-    REQUIRE(filesystem->find("inode_count") != nullptr);
-    REQUIRE(filesystem->find("peak_inode_count") != nullptr);
-    REQUIRE(filesystem->find("reclaimed_inode_count") != nullptr);
-    REQUIRE(filesystem->find("data_publication_requests") != nullptr);
-    REQUIRE(filesystem->find("data_publication_notifications_suppressed") != nullptr);
-    REQUIRE(filesystem->find("spool_pressure_publication_sweeps") != nullptr);
-    REQUIRE(filesystem->find("data_publication_coalesced_queued") != nullptr);
-    REQUIRE(filesystem->find("data_publication_coalesced_running") != nullptr);
-    REQUIRE(filesystem->find("data_publication_coalesced_unconfirmed") != nullptr);
-    REQUIRE(filesystem->find("data_publications_started") != nullptr);
-    REQUIRE(filesystem->find("data_publications_completed") != nullptr);
-    REQUIRE(filesystem->find("data_publication_peak_active") != nullptr);
-    REQUIRE(filesystem->find("data_publication_quanta") != nullptr);
-    REQUIRE(filesystem->find("data_publication_yields") != nullptr);
-    REQUIRE(filesystem->find("data_publication_peak_inflight_bytes") != nullptr);
-    REQUIRE(filesystem->find("data_publication_pipeline_limit_bytes") != nullptr);
-    REQUIRE(filesystem->find("data_publication_peak_pipeline_extents") != nullptr);
-    CHECK(filesystem->find("data_publication_pipeline_limit_bytes")->asUInt64() ==
-          2 * config.extent_size);
-    REQUIRE(filesystem->find("data_closed_priority_selections") != nullptr);
-    REQUIRE(filesystem->find("data_retirement_priority_selections") != nullptr);
-    REQUIRE(filesystem->find("data_publication_bytes_read") != nullptr);
-    REQUIRE(filesystem->find("data_publication_bytes_committed") != nullptr);
-    REQUIRE(filesystem->find("data_publication_bytes_confirmed") != nullptr);
-    REQUIRE(filesystem->find("data_publication_completed_spool_bytes_read") != nullptr);
-    REQUIRE(filesystem->find("data_publication_completed_source_bytes_read") != nullptr);
-    REQUIRE(filesystem->find("data_publication_completed_reused_extents") != nullptr);
-    REQUIRE(filesystem->find("data_publication_completed_put_extents") != nullptr);
-    REQUIRE(filesystem->find("data_overlay_read_queries") != nullptr);
-    REQUIRE(filesystem->find("data_overlay_ranges_examined") != nullptr);
-    REQUIRE(filesystem->find("data_overlay_descriptors_copied") != nullptr);
-    REQUIRE(filesystem->find("retained_data_operations") != nullptr);
-    REQUIRE(filesystem->find("retained_data_operation_bytes") != nullptr);
-    REQUIRE(filesystem->find("retained_overlay_ranges") != nullptr);
-    REQUIRE(filesystem->find("retained_overlay_bytes") != nullptr);
-    REQUIRE(filesystem->find("retained_publication_operations") != nullptr);
-    REQUIRE(filesystem->find("retained_publication_operation_bytes") != nullptr);
-    REQUIRE(filesystem->find("operation_metadata_bytes") != nullptr);
-    REQUIRE(filesystem->find("peak_operation_metadata_bytes") != nullptr);
-    REQUIRE(filesystem->find("operation_metadata_limit_bytes") != nullptr);
-    REQUIRE(filesystem->find("operation_metadata_waits") != nullptr);
-    CHECK(filesystem->find("operation_metadata_limit_bytes")->asUInt64() ==
-          config.fuse.max_operation_metadata_bytes);
-    REQUIRE(filesystem->find("retained_durability_tickets") != nullptr);
-    REQUIRE(filesystem->find("data_publication_inflight_bytes") != nullptr);
-
-    const auto* convergence = diagnostics->find("convergence");
-    REQUIRE(convergence != nullptr);
-    CHECK(convergence->find("available")->asBool());
-    CHECK(convergence->find("events_received")->asUInt64() >= 1);
-    CHECK(convergence->find("runs_scheduled")->asUInt64() >= 1);
-    CHECK(convergence->find("runs_completed")->asUInt64() ==
-          convergence->find("runs_scheduled")->asUInt64());
-    CHECK(convergence->find("requested_epoch")->asUInt64() ==
-          convergence->find("completed_epoch")->asUInt64());
-    CHECK(convergence->find("latest_generation")->asUInt64() ==
-          service.metadata_server().known_generation());
-    CHECK(!convergence->find("scheduled")->asBool());
-
-    service.registry().withdraw_fuse(frontend.get());
-    const auto detached = status_diagnostics_response(config.catalogue.api.port, service);
-    CHECK(!detached.find("diagnostics")->find("filesystem")->find("available")->asBool());
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_pending_overlay_reads_only_intersecting_ranges) {
-    TestService fixture("fuse-indexed-pending-overlay", ConfigProfile::isolated);
-    auto& config = fixture.config();
-    config.fuse.publication_quiet = 30s;
-    config.fuse.max_spool_bytes = 64ULL * 1024 * 1024;
-    config.fuse.spool_reserve_free = 0;
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-    auto handle = frontend->create("/append-verify.bin", 0644, getuid(), getgid(), true, true,
-                                   false);
-    constexpr size_t chunk_size = 4096;
-    constexpr size_t chunks = 256;
-    Bytes expected(chunk_size * chunks);
-    for (size_t chunk = 0; chunk < chunks; ++chunk) {
-        auto bytes = pattern(chunk_size, static_cast<uint8_t>(chunk));
-        std::copy(bytes.begin(), bytes.end(), expected.begin() + chunk * chunk_size);
-        REQUIRE(frontend->write(handle.inode, chunk * chunk_size, bytes, false) == bytes.size());
+  public:
+    explicit FilesystemNode(std::string_view name,
+                            const std::function<void(Config&)>& configure = {})
+        : node_(name) {
+        auto& config = node_.config();
+        config.replication = 1;
+        config.metadata_min_write_replicas = 1;
+        config.min_write_replicas = 1;
+        config.extent_size = 1024 * 1024;
+        if (configure)
+            configure(config);
+        node_.start();
+        // No Service runs the metadata owner here; the first commit forms the
+        // one-node replica set.
+        node_.filesystem().mkdir("/.ready", 0755, getuid(), getgid());
     }
 
-    // The durable journal still contains all 256 write records. The derived
-    // runtime index coalesces their contiguous spool mappings, so a small
-    // append-verify read copies and examines one intersecting descriptor rather
-    // than cloning and replaying the complete history.
-    const auto before = frontend->diagnostics();
-    CHECK(before.retained_data_operations == chunks);
-    CHECK(before.retained_data_operation_bytes >= chunks * sizeof(uint64_t));
-    CHECK(before.retained_overlay_ranges == 1);
-    CHECK(before.retained_overlay_bytes > 0);
-    CHECK(before.retained_publication_operations == 0);
-    CHECK(before.retained_publication_operation_bytes == 0);
-    Bytes probe(1024);
-    const uint64_t probe_offset = 173 * chunk_size + 777;
-    REQUIRE(frontend->read(handle, probe_offset, probe) == probe.size());
-    CHECK(std::equal(probe.begin(), probe.end(), expected.begin() + probe_offset));
-    const auto after = frontend->diagnostics();
-    CHECK(after.data_overlay_read_queries == before.data_overlay_read_queries + 1);
-    CHECK(after.data_overlay_ranges_examined - before.data_overlay_ranges_examined == 1);
-    CHECK(after.data_overlay_descriptors_copied - before.data_overlay_descriptors_copied == 1);
+    TestNode& node() { return node_; }
+    FileSystem& fs() { return node_.filesystem(); }
+    RetainedMemoryLedger& memory() { return node_.resources().memory; }
+    LocalState& local() { return node_.node().local_state(); }
+    const Config& config() { return node_.config(); }
+    const std::filesystem::path& path() const { return node_.path(); }
 
-    // A later overwrite splits the compact range but a read contained by that
-    // overwrite still examines only that newest interval.
-    auto replacement = pattern(257, 0xe3);
-    const uint64_t replacement_offset = 91 * chunk_size + 123;
-    REQUIRE(frontend->write(handle.inode, replacement_offset, replacement, false) ==
-            replacement.size());
-    std::copy(replacement.begin(), replacement.end(), expected.begin() + replacement_offset);
-    const auto overwrite_before = frontend->diagnostics();
-    Bytes overwritten(replacement.size());
-    REQUIRE(frontend->read(handle, replacement_offset, overwritten) == overwritten.size());
-    CHECK(overwritten == replacement);
-    const auto overwrite_after = frontend->diagnostics();
-    CHECK(overwrite_after.data_overlay_ranges_examined -
-              overwrite_before.data_overlay_ranges_examined ==
-          1);
-
-    // Shrink followed by regrowth must expose zeros, never bytes from the old
-    // base or an earlier pending write beyond the truncate boundary.
-    const uint64_t truncated = expected.size() / 2;
-    frontend->truncate(handle.inode, truncated);
-    frontend->truncate(handle.inode, truncated + 8192);
-    Bytes zero_tail(8192, 0xff);
-    REQUIRE(frontend->read(handle, truncated, zero_tail) == zero_tail.size());
-    CHECK(std::all_of(zero_tail.begin(), zero_tail.end(), [](uint8_t byte) { return byte == 0; }));
-
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_open_write_metadata_merge) {
-    TestService fixture("single-write");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/copy.mkv", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/copy.mkv", true);
-    CHECK(service.resources().memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] == 0);
-    auto input = pattern(3 * config.extent_size + 12345);
-    size_t offset = 0;
-    while (offset < input.size()) {
-        size_t n = std::min<size_t>(4096, input.size() - offset);
-        REQUIRE(writer->write(offset, {input.data() + offset, n}) == n);
-        offset += n;
-    }
-    CHECK(service.resources().memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] > 0);
-
-    // macOS copyfile/cp can apply mode/ownership/timestamps through the still-open
-    // file descriptor before FUSE flush/release publishes the data manifest.
-    // These are metadata-only changes and must not invalidate the writer.
-    const int64_t preserved_mtime = 1700000000123456789LL;
-    service.filesystem().chmod("/copy.mkv", 0600);
-    service.filesystem().chown("/copy.mkv", getuid(), getgid(), true, true);
-    service.filesystem().utimens("/copy.mkv", preserved_mtime);
-    writer->commit();
-    CHECK(service.resources().memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] == 0);
-
-    auto entry = service.filesystem().getattr("/copy.mkv");
-    CHECK(entry.size == input.size());
-    CHECK(entry.mode == 0600);
-    CHECK(entry.uid == static_cast<uint32_t>(getuid()));
-    CHECK(entry.gid == static_cast<uint32_t>(getgid()));
-    CHECK(entry.mtime_ns == preserved_mtime);
-
-    auto reader = service.filesystem().open_read("/copy.mkv");
-    Bytes output(input.size());
-    size_t got = 0;
-    while (got < output.size()) {
-        auto n = reader->read(got, {output.data() + got, output.size() - got});
-        REQUIRE(n > 0);
-        got += n;
-    }
-    CHECK(output == input);
-
-    // A real concurrent content update is still a conflict.
-    service.filesystem().create_file("/conflict.bin", 0644, getuid(), getgid());
-    auto first = service.filesystem().open_write("/conflict.bin", true);
-    auto second = service.filesystem().open_write("/conflict.bin", true);
-    auto a = pattern(8192);
-    auto b = pattern(8193);
-    REQUIRE(first->write(0, a) == a.size());
-    REQUIRE(second->write(0, b) == b.size());
-    first->commit();
-    bool conflicted = false;
-    try {
-        second->commit();
-    } catch (const FsError& e) {
-        conflicted = e.code() == EAGAIN;
-    }
-    CHECK(conflicted);
-}
-
-MACHA_TEST("filesystem_fuse", test_publication_buffer_admission_fails_only_without_progress) {
-    TestService fixture("publication-no-progress-budget");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/stalled.bin", 0644, getuid(), getgid());
-    const auto contents = pattern(4096);
-
-    // Hold the whole non-control budget, which is the state a wedged
-    // publication pipeline puts the ledger in: its own predecessors' buffers
-    // fill it and no admission can succeed until one of them is released.
-    auto& ledger = service.resources().memory;
-    const auto capacity = ledger.stats().capacity_bytes;
-    // Viewer class, because it is bounded only by the non-control capacity: a
-    // loader-class lease could not take the whole budget it is meant to fill.
-    auto hog = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment,
-                                  capacity - ledger.stats().control_reserve_bytes);
-    REQUIRE(hog.has_value());
-
-    // A pipeline where nothing completes fails within the budget rather than
-    // waiting forever, so the failure reaches retry-and-park.
-    std::atomic_uint64_t stalled_progress{0};
-    auto stalled = service.filesystem().open_write(
-        "/stalled.bin", false, false, WriteDurability::publication_generation, 0,
-        DataWorkContext(FrameType::loader, config.extent_size, {}, nullptr, &stalled_progress,
-                        300ms));
-    const auto stalled_started = std::chrono::steady_clock::now();
-    int stalled_code = 0;
-    try {
-        (void)stalled->write(0, contents);
-    } catch (const FsError& e) {
-        stalled_code = e.code();
-    }
-    const auto stalled_elapsed = std::chrono::steady_clock::now() - stalled_started;
-    CHECK(stalled_code == EAGAIN);
-    CHECK(stalled_elapsed < 10s);
-
-    // But progress anywhere in the pipeline re-arms the window, so a node that
-    // is merely slow is never failed for being slow. This counter advances for
-    // roughly a second before stopping, and the write must outlast it.
-    service.filesystem().create_file("/moving.bin", 0644, getuid(), getgid());
-    std::atomic_uint64_t moving_progress{0};
-    std::atomic_bool advancing{true};
-    std::jthread progress_thread([&] {
-        while (advancing.load()) {
-            moving_progress.fetch_add(1, std::memory_order_relaxed);
-            std::this_thread::sleep_for(100ms);
-        }
-    });
-    auto moving = service.filesystem().open_write(
-        "/moving.bin", false, false, WriteDurability::publication_generation, 0,
-        DataWorkContext(FrameType::loader, config.extent_size, {}, nullptr, &moving_progress,
-                        300ms));
-    const auto moving_started = std::chrono::steady_clock::now();
-    std::jthread stop_after([&] {
-        std::this_thread::sleep_for(1200ms);
-        advancing.store(false);
-    });
-    int moving_code = 0;
-    try {
-        (void)moving->write(0, contents);
-    } catch (const FsError& e) {
-        moving_code = e.code();
-    }
-    const auto moving_elapsed = std::chrono::steady_clock::now() - moving_started;
-    CHECK(moving_code == EAGAIN);
-    // It must have waited past the point where a plain 300ms budget would have
-    // given up, which is what makes this a no-progress rule and not a timeout.
-    CHECK(moving_elapsed > 1s);
-}
-
-MACHA_TEST("filesystem_fuse", test_write_data_work_context_preserves_loader_provenance) {
-    TestService fixture("write-data-work-context");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    auto& service = fixture.start();
-
-    bool rejected_control = false;
-    try {
-        (void)DataWorkContext(FrameType::control, config.extent_size);
-    } catch (const std::invalid_argument&) {
-        rejected_control = true;
-    }
-    CHECK(rejected_control);
-
-    service.filesystem().create_file("/loader.bin", 0644, getuid(), getgid());
-    auto contents = pattern(2 * config.extent_size + 123);
-    auto seed = service.filesystem().open_write("/loader.bin", true);
-    REQUIRE(seed->write(0, contents) == contents.size());
-    seed->commit();
-    seed.reset();
-    (void)service.filesystem().store().take_interactive_bytes();
-
-    // A non-sequential overwrite uses a changed-range rebuild. It must inherit
-    // loader provenance without rereading the unchanged committed prefix.
-    auto loader = service.filesystem().open_write(
-        "/loader.bin", false, false, WriteDurability::publication_generation, 0,
-        DataWorkContext(FrameType::loader, config.extent_size));
-    const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x5a);
-    REQUIRE(loader->write(17, {&replacement, 1}) == 1);
-    loader->commit();
-    const auto loader_diagnostics = loader->diagnostics();
-    CHECK(!loader_diagnostics.temp_open);
-    CHECK(loader_diagnostics.materialize_source_reads == 0);
-    CHECK(loader_diagnostics.materialize_source_bytes == 0);
-    CHECK(loader_diagnostics.rebuild_source_bytes == config.extent_size + 1);
-    CHECK(loader_diagnostics.rebuild_reused_extents == 2);
-    CHECK(loader_diagnostics.rebuild_put_extents == 1);
-    CHECK(loader_diagnostics.work_frame_type == FrameType::loader);
-    CHECK(loader_diagnostics.work_quantum_bytes == config.extent_size);
-    CHECK(service.filesystem().store().take_interactive_bytes() == 0);
-    CHECK(service.filesystem().store().take_foreground_bytes() == 0);
-
-    // The same context remains usable for genuinely interactive DATA work;
-    // only those viewer classes may refresh viewer demand accounting.
-    service.filesystem().create_file("/interactive.bin", 0644, getuid(), getgid());
-    auto interactive = service.filesystem().open_write(
-        "/interactive.bin", true, false, WriteDurability::immediate, 0,
-        DataWorkContext(FrameType::read_ahead, config.extent_size));
-    const auto bytes = pattern(4096);
-    REQUIRE(interactive->write(0, bytes) == bytes.size());
-    CHECK(service.filesystem().store().take_interactive_bytes() == bytes.size());
-}
-
-MACHA_TEST("filesystem_fuse", test_loader_materialization_is_resumable_and_byte_bounded) {
-    TestService fixture("resumable-loader-materialization");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/large.bin", 0644, getuid(), getgid());
-    auto contents = pattern(4 * config.extent_size);
-    auto seed = service.filesystem().open_write("/large.bin", true);
-    REQUIRE(seed->write(0, contents) == contents.size());
-    seed->commit();
-    seed.reset();
-
-    auto loader = service.filesystem().open_write(
-        "/large.bin", false, false, WriteDurability::publication_generation, 0,
-        DataWorkContext(FrameType::loader, config.extent_size));
-    const auto overlay = loader->prepare_write(17, config.extent_size);
-    CHECK(overlay.ready);
-    CHECK(overlay.bytes_processed == 0);
-    CHECK(service.filesystem().getattr("/large.bin").size == contents.size());
-    CHECK(loader->diagnostics().materialize_source_reads == 0);
-
-    // Once prepared, the original write is accepted without repeating any
-    // source read. Rebuild then rereads/hashes exactly one canonical extent per
-    // fresh grant while the old authoritative generation remains visible.
-    const auto original = contents;
-    const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x6d);
-    contents[17] = replacement;
-    REQUIRE(loader->write(17, {&replacement, 1}) == 1);
-    CHECK(loader->diagnostics().materialize_source_reads == 0);
-    for (size_t step = 0; step < 4; ++step) {
-        const auto preparation = loader->prepare_commit(config.extent_size);
-        CHECK(preparation.bytes_processed == config.extent_size);
-        CHECK(preparation.ready == (step == 3));
-        const auto diagnostics = loader->diagnostics();
-        CHECK(diagnostics.rebuild_source_bytes == config.extent_size + 1);
-        CHECK(diagnostics.rebuild_steps == step + 1);
-        auto old_reader = service.filesystem().open_read("/large.bin");
-        Bytes visible(original.size());
-        REQUIRE(old_reader->read(0, visible) == visible.size());
-        CHECK(visible == original);
-    }
-    const auto rebuilt = loader->diagnostics();
-    CHECK(rebuilt.rebuild_reused_extents == 3);
-    CHECK(rebuilt.rebuild_put_extents == 1);
-    loader->commit();
-    auto reader = service.filesystem().open_read("/large.bin");
-    Bytes output(contents.size());
-    REQUIRE(reader->read(0, output) == output.size());
-    CHECK(output == contents);
-}
-
-MACHA_TEST("filesystem_fuse", test_sparse_changed_range_overlay_avoids_whole_file_amplification) {
-    TestService fixture("sparse-changed-range-overlay");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/changed.bin", 0644, getuid(), getgid());
-    auto expected = pattern(8 * config.extent_size);
-    auto seed = service.filesystem().open_write("/changed.bin", true);
-    REQUIRE(seed->write(0, expected) == expected.size());
-    seed->commit();
-    seed.reset();
-    const auto original = expected;
-
-    auto writer = service.filesystem().open_write(
-        "/changed.bin", false, false, WriteDurability::publication_generation, 0,
-        DataWorkContext(FrameType::loader, config.extent_size));
-    const Bytes first{0xa1, 0xa2, 0xa3};
-    const Bytes overlapping{0xb1, 0xb2, 0xb3};
-    const Bytes distant{0xc1, 0xc2};
-    REQUIRE(writer->write(17, first) == first.size());
-    REQUIRE(writer->write(18, overlapping) == overlapping.size());
-    const uint64_t distant_offset = 5 * config.extent_size + 10;
-    REQUIRE(writer->write(distant_offset, distant) == distant.size());
-    std::copy(first.begin(), first.end(), expected.begin() + 17);
-    std::copy(overlapping.begin(), overlapping.end(), expected.begin() + 18);
-    std::copy(distant.begin(), distant.end(), expected.begin() + distant_offset);
-
-    for (size_t step = 0; step < 8; ++step) {
-        const auto preparation = writer->prepare_commit(config.extent_size);
-        CHECK(preparation.bytes_processed == config.extent_size);
-        CHECK(preparation.ready == (step == 7));
-        auto visible = service.filesystem().open_read("/changed.bin");
-        Bytes bytes(original.size());
-        REQUIRE(visible->read(0, bytes) == bytes.size());
-        CHECK(bytes == original);
+    FuseConfig fuse(std::string_view name) {
+        auto fuse = node_.config().fuse;
+        const auto spool = node_.path() / "fuse" / std::string(name);
+        fuse.spool_path = spool;
+        fuse.operation_journal_path = spool / "operations.log";
+        return fuse;
     }
 
-    const auto diagnostics = writer->diagnostics();
-    CHECK(diagnostics.materialize_source_bytes == 0);
-    // Two touched base extents plus six unique overlay bytes. The overlapping
-    // writes are merged and do not cause either base extent to be reread.
-    CHECK(diagnostics.rebuild_source_bytes == 2 * config.extent_size + 6);
-    CHECK(diagnostics.rebuild_reused_extents == 6);
-    CHECK(diagnostics.rebuild_put_extents == 2);
-    writer->commit();
-
-    auto reader = service.filesystem().open_read("/changed.bin");
-    Bytes actual(expected.size());
-    REQUIRE(reader->read(0, actual) == actual.size());
-    CHECK(actual == expected);
-
-    // A direction change after sequential appends must seed a touched extent
-    // from this handle's provisional immutable extent, not from zeros or the
-    // older committed generation.
-    service.filesystem().create_file("/append-then-overwrite.bin", 0644, getuid(), getgid());
-    auto combined = pattern(4 * config.extent_size, 91);
-    auto prefix = service.filesystem().open_write("/append-then-overwrite.bin", true);
-    REQUIRE(prefix->write(0, {combined.data(), 2 * config.extent_size}) ==
-            2 * config.extent_size);
-    prefix->commit();
-    prefix.reset();
-
-    auto direction_change =
-        service.filesystem().open_write("/append-then-overwrite.bin", false);
-    REQUIRE(direction_change->write(2 * config.extent_size,
-                                    {combined.data() + 2 * config.extent_size,
-                                     2 * config.extent_size}) ==
-            2 * config.extent_size);
-    const uint64_t appended_change = 2 * config.extent_size + 11;
-    const uint8_t final_byte = static_cast<uint8_t>(combined[appended_change] ^ 0x7c);
-    combined[appended_change] = final_byte;
-    REQUIRE(direction_change->write(appended_change, {&final_byte, 1}) == 1);
-    direction_change->commit();
-    const auto direction_diagnostics = direction_change->diagnostics();
-    CHECK(direction_diagnostics.materialize_source_bytes == 0);
-    CHECK(direction_diagnostics.rebuild_source_bytes == config.extent_size + 1);
-    CHECK(direction_diagnostics.rebuild_reused_extents == 3);
-    CHECK(direction_diagnostics.rebuild_put_extents == 1);
-    auto direction_reader = service.filesystem().open_read("/append-then-overwrite.bin");
-    Bytes direction_actual(combined.size());
-    REQUIRE(direction_reader->read(0, direction_actual) == direction_actual.size());
-    CHECK(direction_actual == combined);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_overwrite_materialization_yields_between_quanta) {
-    TestService fixture("fuse-overwrite-materialization-quanta");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    config.fuse.publication_inflight_bytes = config.extent_size;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/overwrite.bin", 0644, getuid(), getgid());
-    auto contents = pattern(4 * config.extent_size);
-    auto seed = service.filesystem().open_write("/overwrite.bin", true);
-    REQUIRE(seed->write(0, contents) == contents.size());
-    seed->commit();
-    seed.reset();
-
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle = frontend->open("/overwrite.bin", true, true, false, false);
-    const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x39);
-    contents[17] = replacement;
-    REQUIRE(frontend->write(handle.inode, 17, {&replacement, 1}) == 1);
-    frontend->release(handle.inode, true);
-    REQUIRE(frontend->wait_for_idle(20s));
-
-    const auto status = frontend->status();
-    CHECK(status.data_publications_completed == 1);
-    CHECK(status.data_publication_bytes_read == 1);
-    CHECK(status.data_publication_completed_spool_bytes_read == 1);
-    CHECK(status.data_publication_completed_source_bytes_read == config.extent_size + 1);
-    CHECK(status.data_publication_completed_reused_extents == 3);
-    CHECK(status.data_publication_completed_put_extents == 1);
-    // WAL replay yields before the extent-aligned rebuild, which yields at four
-    // bounded checkpoints; the file is never materialised whole.
-    CHECK(status.data_publication_yields >= 5);
-    auto reader = service.filesystem().open_read("/overwrite.bin");
-    Bytes output(contents.size());
-    REQUIRE(reader->read(0, output) == output.size());
-    CHECK(output == contents);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_is_bounded_and_atomic) {
-    TestService fixture("publication-extent-pipeline");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/pipeline.bin", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write(
-        "/pipeline.bin", true, false, WriteDurability::publication_generation,
-        2 * config.extent_size);
-    const auto input = pattern(4 * config.extent_size);
-    for (size_t offset = 0; offset < input.size(); offset += config.extent_size) {
-        REQUIRE(writer->write(offset,
-                              {input.data() + offset, config.extent_size}) ==
-                config.extent_size);
+    std::shared_ptr<FuseFrontend> frontend(const FuseConfig& fuse) {
+        return make_fuse_frontend(fs(), memory(), fuse);
     }
-
-    // Enqueueing a third extent must retire the oldest one first. Completed
-    // provisional objects are intentionally not namespace-visible.
-    auto staged = writer->diagnostics();
-    CHECK(staged.peak_pending_extent_puts == 2);
-    CHECK(staged.pending_extent_puts == 2);
-    CHECK(staged.new_extent_puts == 2);
-    CHECK(service.resources().memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] ==
-          2 * config.extent_size);
-    CHECK(service.filesystem().getattr("/pipeline.bin").size == 0);
-
-    // A fairness/viewer boundary drains the bounded admitted set while leaving
-    // the complete-file metadata transaction uncommitted.
-    writer->drain_staging();
-    staged = writer->diagnostics();
-    CHECK(staged.pending_extent_puts == 0);
-    CHECK(staged.new_extent_puts == 4);
-    CHECK(service.resources().memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::publication)] == 0);
-    CHECK(service.filesystem().getattr("/pipeline.bin").size == 0);
-
-    writer->commit();
-    CHECK(service.filesystem().getattr("/pipeline.bin").size == input.size());
-    auto reader = service.filesystem().open_read("/pipeline.bin");
-    Bytes output(input.size());
-    REQUIRE(reader->read(0, output) == output.size());
-    CHECK(output == input);
-}
-
-MACHA_TEST("filesystem_fuse", test_publication_extent_pipeline_failure_stays_invisible) {
-    TestService fixture("publication-extent-pipeline-failure");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.storage_backends.front().limit = 2 * config.extent_size;
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/pipeline-failure.bin", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write(
-        "/pipeline-failure.bin", true, false, WriteDurability::publication_generation,
-        2 * config.extent_size);
-    const auto input = pattern(4 * config.extent_size);
-    bool failed = false;
-    try {
-        for (size_t offset = 0; offset < input.size(); offset += config.extent_size)
-            writer->write(offset, {input.data() + offset, config.extent_size});
-        writer->drain_staging();
-    } catch (const std::exception&) {
-        failed = true;
+    std::shared_ptr<FuseFrontend> frontend(const FuseConfig& fuse,
+                                           std::unique_ptr<LoaderAdmission> admission) {
+        return make_fuse_frontend(fs(), memory(), fuse, std::move(admission));
     }
-    CHECK(failed);
-    writer.reset();
-
-    // Successful provisional extents from the abandoned generation are not a
-    // partial file. The durable spool caller remains free to replay the whole
-    // generation after storage becomes available.
-    CHECK(service.filesystem().getattr("/pipeline-failure.bin").size == 0);
-}
-
-MACHA_TEST("filesystem_fuse", test_fresh_and_resumed_write_exactness) {
-    TestService fixture("write-exactness");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-
-    auto& service = fixture.start();
-
-    const auto read_exact = [&](const std::string& path, size_t size) {
-        auto reader = service.filesystem().open_read(path);
-        Bytes output(size);
-        size_t offset = 0;
-        while (offset < output.size()) {
-            const auto n = reader->read(
-                offset, {output.data() + offset, std::min<size_t>(131071, output.size() - offset)});
-            REQUIRE(n > 0);
-            offset += n;
-        }
-        return output;
-    };
-
-    // Fresh rsync-style sequential write: varied FUSE-sized chunks cross many
-    // extent boundaries and the final extent is deliberately partial.
-    auto fresh = pattern(5 * config.extent_size + 123457);
-    service.filesystem().create_file("/fresh.bin", 0644, getuid(), getgid());
-    auto fresh_writer = service.filesystem().open_write("/fresh.bin", true);
-    size_t offset = 0;
-    while (offset < fresh.size()) {
-        const auto n = std::min<size_t>(65537, fresh.size() - offset);
-        REQUIRE(fresh_writer->write(offset, {fresh.data() + offset, n}) == n);
-        offset += n;
+    std::shared_ptr<FuseFrontend> frontend(const FuseConfig& fuse, PublicationTarget& target,
+                                           std::unique_ptr<LoaderAdmission> admission = {}) {
+        if (!admission)
+            admission = std::make_unique<ViewerWeightedAdmission>(fs(), fuse);
+        return std::make_shared<FuseFrontend>(fs(), memory(), fuse, std::move(admission), target);
     }
-    fresh_writer->commit();
-    CHECK(read_exact("/fresh.bin", fresh.size()) == fresh);
-
-    // --append/--append-verify style resume: an existing committed prefix is
-    // reopened without truncation and writing resumes exactly at EOF.
-    auto resumed = pattern(6 * config.extent_size + 654321);
-    const size_t prefix = 2 * config.extent_size + 77777;
-    service.filesystem().create_file("/resumed.bin", 0644, getuid(), getgid());
-    auto prefix_writer = service.filesystem().open_write("/resumed.bin", true);
-    REQUIRE(prefix_writer->write(0, {resumed.data(), prefix}) == prefix);
-    prefix_writer->commit();
-    prefix_writer.reset();
-
-    const auto prefix_entry = service.filesystem().getattr("/resumed.bin");
-    REQUIRE(prefix_entry.extents.size() == 3);
-    const auto first_full = prefix_entry.extents[0];
-    const auto second_full = prefix_entry.extents[1];
-
-    auto resumed_writer = service.filesystem().open_write("/resumed.bin", false);
-    offset = prefix;
-    while (offset < resumed.size()) {
-        const auto n = std::min<size_t>(98317, resumed.size() - offset);
-        REQUIRE(resumed_writer->write(offset, {resumed.data() + offset, n}) == n);
-        offset += n;
-    }
-    resumed_writer->commit();
-    const auto resume_diag = resumed_writer->diagnostics();
-    CHECK(resume_diag.sequential);
-    CHECK(!resume_diag.temp_open);
-    CHECK(resume_diag.append_tail_fetches == 1);
-    CHECK(resume_diag.materialize_source_reads == 0);
-    CHECK(resume_diag.rebuild_reused_extents == 0);
-    CHECK(resume_diag.rebuild_put_extents == 0);
-
-    const auto resumed_entry = service.filesystem().getattr("/resumed.bin");
-    REQUIRE(resumed_entry.extents.size() >= 2);
-    CHECK(resumed_entry.extents[0] == first_full);
-    CHECK(resumed_entry.extents[1] == second_full);
-    CHECK(read_exact("/resumed.bin", resumed.size()) == resumed);
-
-    // Extent-aligned resume is even cheaper: no old object is fetched at all.
-    auto aligned = pattern(5 * config.extent_size + 333);
-    service.filesystem().create_file("/aligned.bin", 0644, getuid(), getgid());
-    auto aligned_prefix = service.filesystem().open_write("/aligned.bin", true);
-    REQUIRE(aligned_prefix->write(0, {aligned.data(), 3 * config.extent_size}) ==
-            3 * config.extent_size);
-    aligned_prefix->commit();
-    aligned_prefix.reset();
-    const auto aligned_before = service.filesystem().getattr("/aligned.bin");
-    REQUIRE(aligned_before.extents.size() == 3);
-
-    auto aligned_writer = service.filesystem().open_write("/aligned.bin", false);
-    offset = 3 * config.extent_size;
-    while (offset < aligned.size()) {
-        const auto n = std::min<size_t>(77777, aligned.size() - offset);
-        REQUIRE(aligned_writer->write(offset, {aligned.data() + offset, n}) == n);
-        offset += n;
-    }
-    aligned_writer->commit();
-    const auto aligned_diag = aligned_writer->diagnostics();
-    CHECK(aligned_diag.sequential);
-    CHECK(!aligned_diag.temp_open);
-    CHECK(aligned_diag.append_tail_fetches == 0);
-    CHECK(aligned_diag.materialize_source_reads == 0);
-    CHECK(aligned_diag.rebuild_put_extents == 0);
-    const auto aligned_after = service.filesystem().getattr("/aligned.bin");
-    REQUIRE(aligned_after.extents.size() >= aligned_before.extents.size());
-    for (size_t i = 0; i < aligned_before.extents.size(); ++i)
-        CHECK(aligned_after.extents[i] == aligned_before.extents[i]);
-    CHECK(read_exact("/aligned.bin", aligned.size()) == aligned);
-
-    // A FUSE flush does not close the handle.  Appending again after a commit
-    // must lazily reopen only the newly committed partial tail, not materialise
-    // the complete file.
-    auto more = pattern(777);
-    const auto aligned_old_size = aligned.size();
-    aligned.insert(aligned.end(), more.begin(), more.end());
-    REQUIRE(aligned_writer->write(aligned_old_size, more) == more.size());
-    aligned_writer->commit();
-    const auto aligned_again_diag = aligned_writer->diagnostics();
-    CHECK(!aligned_again_diag.temp_open);
-    CHECK(aligned_again_diag.append_tail_fetches == 1);
-    CHECK(aligned_again_diag.materialize_source_reads == 0);
-    CHECK(aligned_again_diag.rebuild_put_extents == 0);
-    CHECK(read_exact("/aligned.bin", aligned.size()) == aligned);
-
-    // Arbitrary overwrite uses a sparse changed-range overlay. Change one byte
-    // in a four-extent file and assert only the touched base extent is fetched
-    // and newly stored; unchanged extents are reused without source reads.
-    auto random_write = pattern(4 * config.extent_size);
-    service.filesystem().create_file("/random.bin", 0644, getuid(), getgid());
-    auto random_seed = service.filesystem().open_write("/random.bin", true);
-    REQUIRE(random_seed->write(0, random_write) == random_write.size());
-    random_seed->commit();
-    random_seed.reset();
-    auto random_writer = service.filesystem().open_write("/random.bin", false);
-    const uint64_t changed_offset = config.extent_size + 1234;
-    const uint8_t changed = static_cast<uint8_t>(random_write[changed_offset] ^ 0x5a);
-    random_write[changed_offset] = changed;
-    REQUIRE(random_writer->write(changed_offset, {&changed, 1}) == 1);
-    random_writer->commit();
-    const auto random_diag = random_writer->diagnostics();
-    CHECK(!random_diag.temp_open);
-    CHECK(random_diag.materialize_source_reads == 0);
-    CHECK(random_diag.rebuild_source_bytes == config.extent_size + 1);
-    CHECK(random_diag.rebuild_reused_extents == 3);
-    CHECK(random_diag.rebuild_put_extents == 1);
-    CHECK(read_exact("/random.bin", random_write.size()) == random_write);
-}
-
-MACHA_TEST("filesystem_fuse", test_active_write_size_visibility) {
-    TestService fixture("active-size");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/.active.tmp", 0600, getuid(), getgid());
-    CHECK(!service.filesystem().active_write_size("/.active.tmp").has_value());
-
-    auto writer = service.filesystem().open_write("/.active.tmp", true);
-    auto input = pattern(2 * 1024 * 1024 + 12345);
-    REQUIRE(writer->write(0, input) == input.size());
-
-    // Authoritative metadata remains uncommitted until close, but FUSE must be
-    // able to project the live writer size to the kernel while the handle is open.
-    CHECK(service.filesystem().getattr("/.active.tmp").size == 0);
-    auto active = service.filesystem().active_write_size("/.active.tmp");
-    REQUIRE(active.has_value());
-    CHECK(*active == input.size());
-
-    writer->truncate(65536);
-    active = service.filesystem().active_write_size("/.active.tmp");
-    REQUIRE(active.has_value());
-    CHECK(*active == 65536);
-
-    service.filesystem().rename("/.active.tmp", "/active.bin");
-    CHECK(!service.filesystem().active_write_size("/.active.tmp").has_value());
-    active = service.filesystem().active_write_size("/active.bin");
-    REQUIRE(active.has_value());
-    CHECK(*active == 65536);
-
-    writer->commit();
-    CHECK(service.filesystem().getattr("/active.bin").size == 65536);
-    writer.reset();
-    CHECK(!service.filesystem().active_write_size("/active.bin").has_value());
-}
-
-MACHA_TEST("filesystem_fuse", test_open_write_survives_rename) {
-    TestService fixture("single-rename");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-
-    auto& service = fixture.start();
-
-    service.filesystem().create_file("/.upload.tmp", 0600, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/.upload.tmp", true);
-    auto input = pattern(3 * config.extent_size + 12345);
-    size_t offset = 0;
-    while (offset < input.size()) {
-        size_t n = std::min<size_t>(128 * 1024, input.size() - offset);
-        REQUIRE(writer->write(offset, {input.data() + offset, n}) == n);
-        offset += n;
-    }
-
-    // rsync writes a temporary file, renames it to the destination while the
-    // descriptor is still open, then flushes/closes that same descriptor.
-    service.filesystem().rename("/.upload.tmp", "/movie.mkv");
-    writer->commit();
-
-    bool old_missing = false;
-    try {
-        (void)service.filesystem().getattr("/.upload.tmp");
-    } catch (const FsError& e) {
-        old_missing = e.code() == ENOENT;
-    }
-    CHECK(old_missing);
-
-    auto entry = service.filesystem().getattr("/movie.mkv");
-    CHECK(entry.size == input.size());
-
-    auto reader = service.filesystem().open_read("/movie.mkv");
-    Bytes output(input.size());
-    size_t got = 0;
-    while (got < output.size()) {
-        auto n = reader->read(got, {output.data() + got, output.size() - got});
-        REQUIRE(n > 0);
-        got += n;
-    }
-    CHECK(output == input);
-}
-
-MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_forms) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-
-    auto c1 = config_for(cluster.path() / "genesis-n1", cluster.keyfile(), p1);
-    auto c2 = config_for(cluster.path() / "genesis-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
-
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    REQUIRE(s1.node().wait_local_state_ready(5s));
-
-    // Available before the metadata write floor forms: it reflects only the
-    // local replica and must not enter MetadataManager, which would throw
-    // MetadataNotReady.
-    CHECK(!s1.metadata_manager().available_snapshot_view().has_value());
-    const auto local_record = s1.local_state().replica().current();
-    const auto first_local = s1.filesystem().local_snapshot_view();
-    CHECK(first_local.generation == local_record.generation);
-    CHECK(first_local.hash == local_record.hash);
-    CHECK(first_local.snapshot->entries.contains("/"));
-    const auto second_local = s1.filesystem().local_snapshot_view();
-    CHECK(second_local.snapshot == first_local.snapshot);
-    CHECK(!s1.metadata_manager().available_snapshot_view().has_value());
-
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-
-    REQUIRE(wait_until([&] {
-        return s1.filesystem().local_snapshot_view().generation > local_record.generation;
-    }));
-    REQUIRE(wait_until([&] {
-        return s2.filesystem().local_snapshot_view().generation > local_record.generation;
-    }));
-
-    auto f1 = make_fuse_frontend(s1.filesystem(), s1.resources().memory, c1.fuse);
-    auto f2 = make_fuse_frontend(s2.filesystem(), s2.resources().memory, c2.fuse);
-    CHECK(s1.local_state().replica().current().generation > 1);
-    CHECK(s2.local_state().replica().current().generation > 1);
-
-    f1->stop();
-    f2->stop();
-    f1.reset();
-    f2.reset();
-    s2.stop();
-    s1.stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_event) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-
-    auto c1 = config_for(cluster.path() / "event-maint-n1", cluster.keyfile(), p1);
-    auto c2 =
-        config_for(cluster.path() / "event-maint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
-    c1.heartbeat = c2.heartbeat = 50ms;
-    c1.dead_after = c2.dead_after = 500ms;
-    c1.maintenance.no_progress_backoff = c2.maintenance.no_progress_backoff = 30s;
-    // This tests event-driven parking, not credit accrual: make the final
-    // startup slice immediately affordable so no credit deadline lands inside
-    // the quiet window, however CPU accounting is inflated.
-    c1.maintenance.initial_bandwidth = c2.maintenance.initial_bandwidth = 1024ULL * 1024 * 1024;
-    c1.maintenance.cpu_target = c2.maintenance.cpu_target = 1.0;
-    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
-    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
-
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    REQUIRE(s1.node().wait_local_state_ready(5s));
-    (void)s1.filesystem();
-
-    // Allow the initial event and one bounded repair slice to settle. With no
-    // peer and no new input, the scheduler must remain parked rather than
-    // rediscovering the same unavailable write floor on an interval.
-    REQUIRE(wait_until(
-        [&] {
-            const auto before = s1.maintenance_wakeups();
-            std::this_thread::sleep_for(300ms);
-            return s1.maintenance_wakeups() == before;
-        },
-        3s));
-    const auto parked = s1.maintenance_wakeups();
-    const auto parked_wait = s1.maintenance_sleep_diagnostic();
-    std::this_thread::sleep_for(1500ms);
-    if (s1.maintenance_wakeups() != parked)
-        std::cerr << "woke while parked: before " << parked_wait << ", after "
-                  << s1.maintenance_sleep_diagnostic() << ", stage " << s1.maintenance_stage()
-                  << "\n";
-    CHECK(s1.maintenance_wakeups() == parked);
-
-    // A peer/membership event must bypass the outstanding retry deadline and
-    // immediately form the metadata floor.
-    s2.start();
-    REQUIRE(wait_until(
-        [&] {
-            return s1.local_state().replica().current().generation > 1 &&
-                   s2.local_state().replica().current().generation > 1;
-        },
-        5s));
-
-    // Identical membership exchanges are heartbeats, not maintenance events.
-    // Once the event-triggered convergence and quiet follow-up have completed,
-    // rapid connected heartbeats must leave both maintenance workers parked.
-    REQUIRE(wait_until(
-        [&] {
-            const auto before1 = s1.maintenance_wakeups();
-            const auto before2 = s2.maintenance_wakeups();
-            std::this_thread::sleep_for(300ms);
-            return s1.maintenance_wakeups() == before1 && s2.maintenance_wakeups() == before2;
-        },
-        5s));
-    const auto connected_parked1 = s1.maintenance_wakeups();
-    const auto connected_parked2 = s2.maintenance_wakeups();
-    std::this_thread::sleep_for(500ms);
-    CHECK(s1.maintenance_wakeups() == connected_parked1);
-    CHECK(s2.maintenance_wakeups() == connected_parked2);
-
-    s2.stop();
-    s1.stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage_grace) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("coalesced-garbage-grace");
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.maintenance.garbage_grace = 750ms;
-    config.maintenance.foreground_quiet = 10ms;
-    config.maintenance.no_progress_backoff = 500ms;
-
-    TestGate repair_gate;
-    std::atomic_bool gate_repair{};
-    std::atomic_bool gate_once{};
-    Service service(config, cluster.keys(), {}, [&](std::string_view stage) {
-        if (stage == "metadata-repair-begin" && gate_repair.load(std::memory_order_acquire) &&
-            !gate_once.exchange(true, std::memory_order_acq_rel)) {
-            repair_gate.enter_and_wait();
-        }
-    });
-    struct GateOpener {
-        TestGate& gate;
-        ~GateOpener() {
-            gate.open();
-        }
-    } open_on_exit{repair_gate};
-
-    service.start();
-    auto& fs = service.filesystem();
-    std::vector<ObjectId> retired_ids;
-    for (size_t index = 0; index < 3; ++index) {
-        const auto path = "/garbage-grace-" + std::to_string(index);
-        write_file(fs, path, pattern(64 * 1024 + index, static_cast<uint8_t>(index + 7)));
-        const auto entry = fs.getattr(path);
-        REQUIRE(entry.extents.size() == 1);
-        retired_ids.push_back(entry.extents.front().id);
-        REQUIRE(service.local_state().data().has(retired_ids.back()));
-    }
-    REQUIRE(wait_until(
-        [&] {
-            const auto diagnostics = service.metadata_convergence_diagnostics();
-            return !diagnostics.scheduled &&
-                   diagnostics.runs_scheduled == diagnostics.runs_completed;
-        },
-        5s));
-
-    const auto before = service.metadata_convergence_diagnostics();
-    gate_repair.store(true, std::memory_order_release);
-    fs.unlink("/garbage-grace-0");
-    REQUIRE(repair_gate.wait_for_entries(1, 5s));
-    fs.unlink("/garbage-grace-1");
-    fs.unlink("/garbage-grace-2");
-
-    auto snapshot = service.metadata_manager().snapshot();
-    int64_t latest_retirement{};
-    for (const auto& id : retired_ids) {
-        auto found = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
-                                  [&](const GarbageRef& garbage) { return garbage.id == id; });
-        REQUIRE(found != snapshot.garbage.end());
-        latest_retirement = std::max(latest_retirement, found->retired_at_ns);
-        CHECK(service.local_state().data().has(id));
-    }
-
-    repair_gate.open();
-    const auto grace_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(config.maintenance.garbage_grace)
-            .count();
-    const auto before_deadline_ns = latest_retirement + grace_ns - wall_time_ns();
-    if (before_deadline_ns > 100'000'000)
-        std::this_thread::sleep_for(std::chrono::nanoseconds(before_deadline_ns - 50'000'000));
-    CHECK(service.local_state().data().has(retired_ids.back()));
-    const auto before_grace = service.metadata_convergence_diagnostics();
-    // On mismatch, report the direction: an extra run means a metadata or
-    // topology event arrived after the follow-up began; a missing one means the
-    // unlinks coalesced differently.
-    if (before_grace.runs_scheduled != before.runs_scheduled + 2 ||
-        before_grace.runs_completed != before.runs_completed + 2) {
-        std::cerr << "convergence before grace: runs_scheduled " << before.runs_scheduled
-                  << " -> " << before_grace.runs_scheduled << ", runs_completed "
-                  << before.runs_completed << " -> " << before_grace.runs_completed
-                  << ", events " << before.events_received << " -> "
-                  << before_grace.events_received << ", epoch requested/completed "
-                  << before_grace.requested_epoch << "/" << before_grace.completed_epoch
-                  << ", scheduled " << before_grace.scheduled << "\n";
-    }
-    CHECK(before_grace.runs_scheduled == before.runs_scheduled + 2);
-    CHECK(before_grace.runs_completed == before.runs_completed + 2);
-
-    REQUIRE(wait_until(
-        [&] {
-            return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
-                return service.local_state().data().has(id);
-            });
-        },
-        5s));
-    REQUIRE(wait_until(
-        [&] {
-            const auto current = service.metadata_manager().snapshot();
-            return std::none_of(current.garbage.begin(), current.garbage.end(),
-                                [&](const GarbageRef& garbage) {
-                                    return std::find(retired_ids.begin(), retired_ids.end(),
-                                                     garbage.id) != retired_ids.end();
-                                });
-        },
-        5s));
-
-    REQUIRE(wait_until(
-        [&] {
-            const auto diagnostics = service.metadata_convergence_diagnostics();
-            return !diagnostics.scheduled &&
-                   diagnostics.runs_scheduled == diagnostics.runs_completed &&
-                   diagnostics.runs_completed >= before.runs_completed + 3;
-        },
-        5s));
-
-    const auto after = service.metadata_convergence_diagnostics();
-    CHECK(after.runs_scheduled >= before.runs_scheduled + 3);
-    CHECK(after.runs_scheduled <= before.runs_scheduled + 5);
-    CHECK(after.runs_completed == after.runs_scheduled);
-    CHECK(!after.scheduled);
-    service.stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_frontend_ordering_merging_and_cache) {
-    TestService fixture("fuse-ordering");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.cache.path = fixture.path() / "cache";
-    config.cache.max_blocks = 64;
-    config.fuse.commit_workers = 2;
-    config.fuse.read_ahead_extents = 2;
-    config.fuse.write_through_cache = true;
-
-    auto& service = fixture.start();
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->create("/.rsync.tmp", 0600, getuid(), getgid(), true, true, false);
-        const auto inode = handle.inode;
-        REQUIRE(inode != 0);
-
-        Bytes expected(3 * config.extent_size + 8192, 0);
-        auto first = pattern(config.extent_size + 32768);
-        REQUIRE(frontend->write(inode, 0, first) == first.size());
-        std::copy(first.begin(), first.end(), expected.begin());
-
-        // Adjacent and overlapping writes are retained in exact byte order but
-        // expose one coalesced dirty range to the frontend scheduler.
-        auto adjacent = pattern(config.extent_size);
-        REQUIRE(frontend->write(inode, first.size(), adjacent) == adjacent.size());
-        std::copy(adjacent.begin(), adjacent.end(),
-                  expected.begin() + static_cast<ptrdiff_t>(first.size()));
-        auto patch = pattern(131072);
-        const uint64_t patch_offset = config.extent_size - 65536;
-        for (auto& byte : patch)
-            byte ^= 0xa5;
-        REQUIRE(frontend->write(inode, patch_offset, patch) == patch.size());
-        std::copy(patch.begin(), patch.end(),
-                  expected.begin() + static_cast<ptrdiff_t>(patch_offset));
-
-        auto ranges = frontend->dirty_ranges(inode);
-        REQUIRE(ranges.size() == 1);
-        CHECK(ranges.front().offset == 0);
-        CHECK(ranges.front().length == first.size() + adjacent.size());
-
-        // Queue publication more than once. It is legal for the first commit to
-        // complete very quickly on a one-node test cluster, but pending work may
-        // never be double-counted and no duplicate bytes may result.
-        frontend->flush(inode);
-        frontend->flush(inode);
-        auto during = frontend->status();
-        CHECK(during.pending_data <= 1);
-        CHECK(during.active_data <= config.fuse.commit_workers);
-
-        // Rename twice while retaining the same open file description, then
-        // continue writing through that inode. No path lookup participates in
-        // the subsequent write/close sequence.
-        frontend->rename("/.rsync.tmp", "/.stage.tmp");
-        REQUIRE(frontend->inode_for_path("/.stage.tmp") == inode);
-        CHECK(frontend->path_for_inode(inode) == "/.stage.tmp");
-        frontend->rename("/.stage.tmp", "/movie.bin");
-        REQUIRE(frontend->inode_for_path("/movie.bin") == inode);
-        CHECK(!frontend->inode_for_path("/.rsync.tmp").has_value());
-        CHECK(!frontend->inode_for_path("/.stage.tmp").has_value());
-
-        auto tail = pattern(8192);
-        for (auto& byte : tail)
-            byte ^= 0x3c;
-        const uint64_t tail_offset = 3 * config.extent_size;
-        REQUIRE(frontend->write(inode, tail_offset, tail) == tail.size());
-        std::copy(tail.begin(), tail.end(), expected.begin() + static_cast<ptrdiff_t>(tail_offset));
-        frontend->release(inode, true);
-        REQUIRE(frontend->wait_for_idle(10s));
-
-        // Publication replay must not mark its own chunks as foreground, or the
-        // quiet policy would throttle it by one quiet interval per chunk.
-        CHECK(service.filesystem().foreground_idle_for() >= 1h);
-        CHECK(frontend->status().pending_data == 0);
-        auto entry = service.filesystem().getattr("/movie.bin");
-        CHECK(entry.size == expected.size());
-
-        // Even a read-only FUSE handle is loader traffic and must not refresh
-        // either viewer clock.
-        auto fuse_reader = frontend->open("/movie.bin", true, false, false, false);
-        Bytes fuse_probe(4096);
-        const auto foreground_before = service.filesystem().foreground_idle_for();
-        const auto interactive_before = service.filesystem().store().interactive_idle_for();
-        REQUIRE(frontend->read(fuse_reader, 0, fuse_probe) == fuse_probe.size());
-        CHECK(service.filesystem().foreground_idle_for() >= foreground_before);
-        CHECK(service.filesystem().store().interactive_idle_for() >= interactive_before);
-        frontend->release(fuse_reader.inode, false);
-
-        auto reader = service.filesystem().open_read("/movie.bin");
-        Bytes actual(expected.size());
-        size_t offset = 0;
-        while (offset < actual.size()) {
-            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
-            REQUIRE(n > 0);
-            offset += n;
-        }
-        CHECK(actual == expected);
-
-        // Publication uses the ordinary extent writer and, when requested,
-        // promotes each immutable extent into the persistent block cache.
-        REQUIRE(!entry.extents.empty());
-        for (const auto& extent : entry.extents)
-            if (!extent.hole)
-                CHECK(service.local_state().cache().has(extent.id));
-    }
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_completed_publication_unlinks_retired_spool) {
-    TestService fixture("fuse-spool-retire-unlink");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle =
-        frontend->create("/retire-spool.bin", 0600, getuid(), getgid(), true, true, false);
-    const auto payload = pattern(2 * 1024 * 1024 + 17, 71);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    frontend->release(handle.inode, true);
-    REQUIRE(frontend->wait_for_idle(10s));
-
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
-    CHECK(!std::filesystem::exists(spool));
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_spool_capacity_backpressures_until_publication) {
-    TestService fixture("fuse-spool-backpressure");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-    config.fuse.max_spool_bytes = 384 * 1024;
-    config.fuse.spool_reserve_free = 0;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle =
-        frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(), true, true, false);
-    const auto first = pattern(128 * 1024, 41);
-    REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
-
-    auto second_write = std::async(std::launch::async, [&] {
-        const auto second = pattern(300 * 1024, 42);
-        return frontend->write(handle.inode, first.size(), second);
-    });
-    // The second write cannot fit, but saturation is backpressure rather than
-    // ENOSPC. Pressure starts publication of the already-durable prefix and the
-    // writer wakes only after that progress creates capacity.
-    CHECK(second_write.wait_for(10ms) == std::future_status::timeout);
-    REQUIRE(second_write.wait_for(10s) == std::future_status::ready);
-    CHECK(second_write.get() == 300 * 1024);
-
-    const auto pressure = frontend->status();
-    CHECK(pressure.spool_limit_bytes == config.fuse.max_spool_bytes);
-    CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
-    CHECK(pressure.spool_throttle_waits >= 1);
-    CHECK(pressure.spool_pressure_publication_sweeps == 1);
-    CHECK(pressure.spool_publish_rate_bytes_per_second > 0);
-    CHECK(pressure.spool_publish_rate_window_bytes >= first.size());
-    CHECK(pressure.spool_publish_rate_window_ms > 0);
-
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto spool = spool_dir / ("inode-" + std::to_string(handle.inode) + ".spool");
-    REQUIRE(std::filesystem::exists(spool));
-    CHECK(std::filesystem::file_size(spool) <= config.fuse.max_spool_bytes);
-    frontend->release(handle.inode, true);
-    REQUIRE(frontend->wait_for_idle(10s));
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_spool_threshold_bootstraps_from_partial_publication) {
-    TestService fixture("fuse-spool-progress-bootstrap");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-    config.fuse.publication_quantum_bytes = 1024 * 1024;
-    config.fuse.publication_inflight_bytes = 1024 * 1024;
-    config.fuse.publication_pipeline_bytes = 1024 * 1024;
-    config.fuse.max_spool_bytes = 8 * 1024 * 1024;
-    config.fuse.spool_reserve_free = 0;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto first = frontend->create("/large-open.bin", 0600, getuid(), getgid(), true, true,
-                                  false);
-    auto follower = frontend->create("/follower.bin", 0600, getuid(), getgid(), true, true,
-                                     false);
-
-    // Cross the 50% soft threshold before any whole-file retirement can
-    // establish a rate. A seven-quantum open file leaves enough work after the
-    // first drained quantum to demonstrate that admission does not depend on
-    // whole-file retirement. This isolates the spool progress-credit contract.
-    const auto initial = pattern(7 * 1024 * 1024, 61);
-    REQUIRE(frontend->write(first.inode, 0, initial) == initial.size());
-
-    auto admitted = std::async(std::launch::async, [&] {
-        const auto next = pattern(1024 * 1024, 62);
-        return frontend->write(follower.inode, 0, next);
-    });
-    CHECK(admitted.wait_for(20ms) == std::future_status::timeout);
-    REQUIRE(wait_until(
-        [&] {
-            const auto state = frontend->status();
-            return state.data_publication_yields >= 1 &&
-                   state.data_publication_bytes_read >= 1024 * 1024;
-        },
-        10s));
-    REQUIRE(admitted.wait_for(1s) == std::future_status::ready);
-    CHECK(admitted.get() == 1024 * 1024);
-
-    const auto progress = frontend->status();
-    CHECK(progress.spool_bytes <= progress.spool_limit_bytes);
-    CHECK(progress.spool_throttle_waits >= 1);
-    CHECK(progress.spool_pressure_publication_sweeps == 1);
-    CHECK(progress.data_publication_yields >= 1);
-    // Admission was released by drained partial publication, not by the
-    // whole-file retirement rate which is deliberately still unavailable.
-    CHECK(progress.spool_publish_rate_bytes_per_second == 0);
-    CHECK(progress.data_publications_completed == 0);
-
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_spool_stalled_publisher_blocks_without_enospc) {
-    TestService fixture("fuse-spool-stalled-backpressure");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-    config.fuse.max_spool_bytes = 384 * 1024;
-    config.fuse.spool_reserve_free = 0;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle = frontend->create("/stalled-spool.bin", 0600, getuid(), getgid(), true, true,
-                                   false);
-    // Viewer demand comes from the HTTP playback path, never from the mount:
-    // FUSE traffic is loader traffic by design, so hold the foreground window
-    // open on the filesystem the way playback does.
-    service.filesystem().note_foreground_activity();
-    const auto first = pattern(256 * 1024, 51);
-    REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
-
-    auto blocked = std::async(std::launch::async, [&] {
-        const auto second = pattern(256 * 1024, 52);
-        try {
-            (void)frontend->write(handle.inode, first.size(), second);
-            return 0;
-        } catch (const FsError& error) {
-            return error.code();
-        }
-    });
-    CHECK(blocked.wait_for(150ms) == std::future_status::timeout);
-    const auto pressure = frontend->status();
-    CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
-    CHECK(pressure.spool_throttle_waits >= 1);
-    CHECK(pressure.spool_pressure_publication_sweeps == 1);
-
-    // Shutdown is a real wake event for blocked admissions. A permanently
-    // stalled publisher does not busy-poll and does not manufacture ENOSPC;
-    // stopping the mount cancels the waiting request explicitly.
-    frontend->stop();
-    REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
-    CHECK(blocked.get() == EINTR);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_operation_journal_admission_is_bounded_while_busy) {
-    TestService fixture("fuse-journal-budget");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-    config.fuse.max_operation_journal_bytes = 12 * 1024;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-    // Keep one durable DATA operation outstanding so unrelated namespace work
-    // cannot take the normal "pending == 0" journal reset fast path.
-    auto hold = frontend->create("/journal-hold.bin", 0600, getuid(), getgid(), true, true, false);
-    const auto payload = pattern(64 * 1024, 91);
-    REQUIRE(frontend->write(hold.inode, 0, payload) == payload.size());
-    frontend->release(hold.inode, true); // local durability only; publication remains quiet
-
-    const auto journal = config.fuse.operation_journal_path.value_or(
-        config.state_path / "fuse-spool" / "operations.log");
-    REQUIRE(std::filesystem::exists(journal));
-
-    bool refused = false;
-    for (size_t i = 0; i < 256 && !refused; ++i) {
-        try {
-            frontend->mkdir("/journal-budget-" + std::to_string(i), 0700, getuid(), getgid());
-        } catch (const FsError& error) {
-            if (error.code() == ENOSPC)
-                refused = true;
-            else
-                throw;
-        }
-    }
-    REQUIRE(refused);
-
-    // Completion records for work admitted just before the ceiling are allowed
-    // to drain beyond the admission threshold. Rejected *new* work must not keep
-    // extending the WAL indefinitely.
-    REQUIRE(wait_until([&] { return frontend->status().pending_namespace == 0; }, 5s));
-    const auto bounded_size = std::filesystem::file_size(journal);
-    for (size_t i = 0; i < 8; ++i) {
-        bool rejected_again = false;
-        try {
-            frontend->mkdir("/journal-refused-" + std::to_string(i), 0700, getuid(), getgid());
-        } catch (const FsError& error) {
-            rejected_again = error.code() == ENOSPC;
-        }
-        CHECK(rejected_again);
-    }
-    CHECK(std::filesystem::file_size(journal) == bounded_size);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_orphan_quarantine_is_byte_bounded_on_recovery) {
-    TestService fixture("fuse-orphan-budget");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.max_orphan_bytes = 1024;
-
-    // Start the service before planting unreferenced recovery artifacts:
-    // populating state_path first trips the unversioned-state guard.
-    auto& service = fixture.start();
-    const auto spool_dir = config.state_path / "fuse-spool";
-    std::filesystem::create_directories(spool_dir);
-    const auto older = spool_dir / "inode-900.spool.orphan.1";
-    const auto newer = spool_dir / "inode-901.spool.orphan.2";
-    {
-        std::ofstream out(older, std::ios::binary | std::ios::trunc);
-        out << std::string(800, 'a');
-    }
-    {
-        std::ofstream out(newer, std::ios::binary | std::ios::trunc);
-        out << std::string(800, 'b');
-    }
-    const auto now = std::filesystem::file_time_type::clock::now();
-    std::filesystem::last_write_time(older, now - 2h);
-    std::filesystem::last_write_time(newer, now - 1h);
-
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-    uint64_t orphan_bytes = 0;
-    size_t orphan_files = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(spool_dir)) {
-        if (!entry.is_regular_file() ||
-            entry.path().filename().string().find(".orphan.") == std::string::npos)
-            continue;
-        orphan_bytes += entry.file_size();
-        ++orphan_files;
-    }
-    CHECK(orphan_bytes <= config.fuse.max_orphan_bytes);
-    CHECK(orphan_files == 1);
-    CHECK(!std::filesystem::exists(older));
-    CHECK(std::filesystem::exists(newer));
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_publication_yields_to_playback) {
-    TestService fixture("fuse-playback-yield");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 500ms;
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    config.fuse.publication_inflight_bytes = config.extent_size;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-
-    auto& service = fixture.start();
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle =
-            frontend->create("/playback-yield.bin", 0600, getuid(), getgid(), true, true, false);
-        const auto inode = handle.inode;
-        REQUIRE(inode != 0);
-        REQUIRE(frontend->wait_for_idle(5s));
-
-        auto payload = pattern(8 * config.extent_size);
-        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
-        frontend->release(inode, true);
-        REQUIRE(wait_until([&] { return frontend->status().data_publication_yields >= 1; }, 5s));
-
-        // Inject genuine viewer activity. The already-running bounded quantum
-        // yields promptly, but weighted priority must not stop loader work for
-        // the complete viewer window.
-        service.filesystem().note_foreground_activity(1);
-        REQUIRE(wait_until([&] { return frontend->status().active_data == 0; }, 2s));
-        const auto paused_quanta = frontend->status().data_publication_quanta;
-        REQUIRE(wait_until(
-            [&] {
-                service.filesystem().note_foreground_activity(1); // sustained genuine viewing
-                return frontend->status().data_publication_quanta > paused_quanta;
-            },
-            3s, 25ms));
-
-        REQUIRE(frontend->wait_for_idle(10s));
-        CHECK(service.filesystem().getattr("/playback-yield.bin").size == payload.size());
-    }
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_open_loaders_use_available_publication_workers) {
-    TestService fixture("fuse-open-loader-concurrency");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 4;
-    // Must not classify open loader writers as viewers or cap them at one publisher.
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 500ms;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    constexpr size_t files = 4;
-    std::vector<FuseOpenHandle> handles;
-    handles.reserve(files);
-    for (size_t i = 0; i < files; ++i)
-        handles.push_back(frontend->create("/loader-" + std::to_string(i) + ".bin", 0644,
-                                           getuid(), getgid(), false, true, false));
-    REQUIRE(frontend->wait_for_idle(10s));
-
-    const auto payload = pattern(8 * config.extent_size, 37);
-    for (const auto& handle : handles)
-        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == files; }, 10s));
-
-    for (const auto& handle : handles) {
-        frontend->flush(handle.inode);
-        frontend->flush(handle.inode); // repeated demand must coalesce
-    }
-    REQUIRE(frontend->wait_for_idle(30s));
-
-    const auto status = frontend->status();
-    CHECK(status.data_publications_started == files);
-    CHECK(status.data_publications_completed == files);
-    CHECK(status.data_publication_requests == files);
-    CHECK(status.data_publication_notifications_suppressed >= files);
-    CHECK(status.data_publication_peak_active >= 2);
-    CHECK(status.data_publication_peak_active <= config.fuse.commit_workers);
-    CHECK(status.data_publication_coalesced_queued +
-              status.data_publication_coalesced_running +
-              status.data_publication_coalesced_unconfirmed ==
-          0);
-    CHECK(status.data_publication_bytes_read == files * payload.size());
-    CHECK(status.data_publication_bytes_committed == files * payload.size());
-    CHECK(status.data_publication_bytes_confirmed == files * payload.size());
-    CHECK(status.extent_executor_workers == config.fuse.commit_workers);
-    CHECK(status.extent_executor_submitted >= files * 8);
-    CHECK(status.extent_executor_peak_active >= 1);
-    CHECK(status.extent_executor_peak_active <= config.fuse.commit_workers);
-    CHECK(status.extent_executor_peak_queued <= config.fuse.commit_workers * 2);
-    CHECK(status.extent_executor_active == 0);
-    CHECK(status.extent_executor_queued == 0);
-
-    for (const auto& handle : handles)
-        frontend->release(handle.inode, true);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_pending_write_payloads_are_byte_bounded) {
-    TestService fixture("fuse-write-byte-admission");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.max_spool_bytes = 128 * 1024;
-    config.fuse.spool_reserve_free = 0;
-    config.fuse.max_pending_write_bytes = 128 * 1024;
-    config.fuse.timeouts.write = 2s;
-
-    auto& service = fixture.start();
+};
+
+// A frontend whose loader publication (data and namespace) the test holds and
+// releases.
+struct HeldFrontend {
+    HeldLoaderAdmission* loader{};
+    std::shared_ptr<FuseFrontend> frontend;
+    FuseFrontend* operator->() const { return frontend.get(); }
+};
+
+HeldFrontend held_frontend(FilesystemNode& node, const FuseConfig& fuse, bool hold = true) {
     auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-    auto handle = frontend->create("/write-byte-bound.bin", 0600, getuid(), getgid(), true,
-                                   true, false);
-    // Hold publication so spool pressure cannot publish the first write and
-    // invalidate the pending-byte ownership state this test is measuring.
-    loader.hold();
-    const auto payload = pattern(128 * 1024, 91);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
-
-    auto blocked_in_spool = std::async(std::launch::async, [&] {
-        try {
-            (void)frontend->write(handle.inode, payload.size(), payload);
-            return 0;
-        } catch (const FsError& error) {
-            return error.code();
-        }
-    });
-    REQUIRE(wait_until(
-        [&] {
-            return frontend->status().pending_write_request_bytes == payload.size();
-        },
-        1s));
-
-    auto blocked_before_copy = std::async(std::launch::async, [&] {
-        try {
-            (void)frontend->write(handle.inode, payload.size() * 2, payload);
-            return 0;
-        } catch (const FsError& error) {
-            return error.code();
-        }
-    });
-    CHECK(blocked_before_copy.wait_for(100ms) == std::future_status::timeout);
-    const auto bounded = frontend->status();
-    CHECK(bounded.pending_write_request_bytes == payload.size());
-    CHECK(bounded.peak_pending_write_request_bytes == payload.size());
-    CHECK(bounded.pending_write_request_limit_bytes == payload.size());
-
-    frontend->stop();
-    REQUIRE(blocked_in_spool.wait_for(2s) == std::future_status::ready);
-    REQUIRE(blocked_before_copy.wait_for(2s) == std::future_status::ready);
-    CHECK(blocked_in_spool.get() == EINTR);
-    CHECK(blocked_before_copy.get() == EINTR);
+    auto* loader = admission.get();
+    if (hold)
+        loader->hold();
+    return {loader, node.frontend(fuse, std::move(admission))};
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_operation_metadata_backpressures_at_heap_bound) {
-    TestService fixture("fuse-operation-metadata-bound");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.max_operation_metadata_bytes = 2048;
-    config.fuse.max_spool_bytes = 1024 * 1024;
-    config.fuse.spool_reserve_free = 0;
-
-    auto& service = fixture.start();
+HeldFrontend held_frontend(FilesystemNode& node, const FuseConfig& fuse,
+                           PublicationTarget& target, bool hold = true) {
     auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-    auto handle = frontend->create("/metadata-bound.bin", 0600, getuid(), getgid(), true, true,
-                                   false);
-    loader.hold();
-    const auto payload = pattern(4096, 37);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    REQUIRE(frontend->write(handle.inode, payload.size(), payload) == payload.size());
-    REQUIRE(frontend->write(handle.inode, payload.size() * 2, payload) == payload.size());
-
-    auto blocked = std::async(std::launch::async, [&] {
-        try {
-            (void)frontend->write(handle.inode, payload.size() * 3, payload);
-            return 0;
-        } catch (const FsError& error) {
-            return error.code();
-        }
-    });
-    REQUIRE(wait_until([&] { return frontend->status().operation_metadata_waits >= 1; }, 2s));
-    CHECK(blocked.wait_for(100ms) == std::future_status::timeout);
-    const auto bounded = frontend->status();
-    CHECK(bounded.operation_metadata_bytes <= bounded.operation_metadata_limit_bytes);
-    CHECK(bounded.peak_operation_metadata_bytes <= bounded.operation_metadata_limit_bytes);
-
-    // Shutdown is an explicit wake event. The blocked mutation owns no durable
-    // operation and returns cancellation rather than polling or overcommitting.
-    frontend->stop();
-    REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
-    CHECK(blocked.get() == EINTR);
+    auto* loader = admission.get();
+    if (hold)
+        loader->hold();
+    return {loader, node.frontend(fuse, target, std::move(admission))};
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_operation_metadata_retirement_wakes_blocked_writer) {
-    TestService fixture("fuse-operation-metadata-retirement");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-    config.fuse.max_operation_metadata_bytes = 1024;
-    config.fuse.max_spool_bytes = 1024 * 1024;
-    config.fuse.spool_reserve_free = 0;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle = frontend->create("/metadata-retirement.bin", 0600, getuid(), getgid(), true,
-                                   true, false);
-    const auto payload = pattern(4096, 73);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
-
-    auto waiting = std::async(std::launch::async, [&] {
-        return frontend->write(handle.inode, payload.size(), payload);
-    });
-    REQUIRE(waiting.wait_for(10s) == std::future_status::ready);
-    CHECK(waiting.get() == payload.size());
-    const auto progressed = frontend->status();
-    CHECK(progressed.operation_metadata_waits >= 1);
-    CHECK(progressed.data_publications_completed >= 1);
-    CHECK(progressed.operation_metadata_bytes <= progressed.operation_metadata_limit_bytes);
-    CHECK(progressed.peak_operation_metadata_bytes <= progressed.operation_metadata_limit_bytes);
-    frontend->release(handle.inode, true);
-    REQUIRE(frontend->wait_for_idle(10s));
-    REQUIRE(wait_until(
-        [&] {
-            const auto memory = service.resources().memory.stats();
-            return memory.owner_bytes[static_cast<size_t>(MemoryOwner::fuse_request)] == 0 &&
-                   memory.owner_bytes[static_cast<size_t>(MemoryOwner::fuse_operation)] == 0;
-        },
-        5s));
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_publication_notifications_coalesce_to_durable_watermarks) {
-    TestService fixture("fuse-publication-notification-watermarks");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-
-    auto& service = fixture.start();
-    auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-    auto handle =
-        frontend->create("/notification-watermark.bin", 0600, getuid(), getgid(), true, true,
-                         false);
-    REQUIRE(frontend->wait_for_idle(5s));
-    // Retain the queued owner so this test measures notification and watermark
-    // coalescing rather than publication throughput.
-    loader.hold();
-
-    const auto first = pattern(64 * 1024, 71);
-    REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
-    frontend->flush(handle.inode);
-    for (size_t i = 0; i < 500; ++i)
-        frontend->flush(handle.inode);
-
-    const auto second = pattern(64 * 1024, 72);
-    REQUIRE(frontend->write(handle.inode, first.size(), second) == second.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 5s));
-    frontend->flush(handle.inode); // one new durable watermark
-    for (size_t i = 0; i < 500; ++i)
-        frontend->flush(handle.inode);
-
-    const auto status = frontend->status();
-    CHECK(status.data_publication_requests == 2);
-    CHECK(status.data_publication_notifications_suppressed == 1000);
-    CHECK(status.data_publication_coalesced_queued == 1);
-    CHECK(status.data_publication_coalesced_running == 0);
-    CHECK(status.data_publication_coalesced_unconfirmed == 0);
-    CHECK(status.data_publications_started == 0);
-    CHECK(status.pending_data == 1);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_closed_file_is_selected_ahead_of_open_loader) {
-    TestService fixture("fuse-closed-file-priority");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-    auto open_large = frontend->create("/open-large.bin", 0644, getuid(), getgid(), false, true,
-                                       false);
-    auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
-                                         true, false);
-    REQUIRE(frontend->wait_for_idle(10s));
-
-    const auto large = pattern(8 * config.extent_size, 51);
-    const auto small = pattern(64 * 1024, 52);
-    REQUIRE(frontend->write(open_large.inode, 0, large) == large.size());
-    REQUIRE(frontend->write(closed_small.inode, 0, small) == small.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
-
-    // Both are queued before the loader may run.
-    loader.hold();
-    frontend->flush(open_large.inode); // queued first, but remains open
-    frontend->release(closed_small.inode, true); // queued second and closed
-    loader.release();
-    REQUIRE(frontend->wait_for_idle(30s));
-
-    const auto status = frontend->status();
-    CHECK(status.data_closed_priority_selections >= 1);
-    CHECK(service.filesystem().getattr("/closed-small.bin").size == small.size());
-    CHECK(service.filesystem().getattr("/open-large.bin").size == large.size());
-    frontend->release(open_large.inode, true);
-    frontend->stop();
-}
-
-// An fsync waits, with no deadline, for its data to be published. On a
-// stopping node that can never finish and the mount cannot exit while the fsync
-// is outstanding, so interrupt_waits() ends the wait with EIO; the data is
-// already journalled and publishes after the restart.
-MACHA_TEST("filesystem_fuse", test_an_fsync_waiting_for_publication_ends_when_waits_are_interrupted) {
-    TestService fixture("fuse-fsync-interrupted");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    auto& service = fixture.start();
-    auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-    auto handle = frontend->create("/fsync-held.bin", 0644, getuid(), getgid(), false, true, false);
-    REQUIRE(frontend->wait_for_idle(10s));
-    // Loader publication is held, so the fsync's publication cannot complete,
-    // as it cannot on a stopping node.
-    loader.hold();
-    const auto bytes = pattern(64 * 1024, 91);
-    REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
-
-    auto synced = std::async(std::launch::async, [&] {
-        try {
-            frontend->fsync(handle.inode);
-            return 0;
-        } catch (const FsError& error) {
-            return error.code();
-        }
-    });
-    CHECK(synced.wait_for(300ms) == std::future_status::timeout);
-    frontend->interrupt_waits();
-    REQUIRE(synced.wait_for(10s) == std::future_status::ready);
-    CHECK(synced.get() == EIO);
-
-    loader.release();
-    frontend->release(handle.inode, true);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_spool_pressure_selects_nearest_retirement) {
-    TestService fixture("fuse-pressure-retirement-selection");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    config.fuse.publication_inflight_bytes = config.extent_size;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-    config.fuse.max_spool_bytes = 16 * config.extent_size;
-    config.fuse.spool_reserve_free = 0;
-
-    auto& service = fixture.start();
-    auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-    auto pathological = frontend->create("/open-pathological.bin", 0644, getuid(), getgid(),
-                                         false, true, false);
-    auto closed_large = frontend->create("/closed-large.bin", 0644, getuid(), getgid(), false,
-                                         true, false);
-    auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
-                                         true, false);
-    auto blocked_follower = frontend->create("/blocked-follower.bin", 0644, getuid(), getgid(),
-                                             false, true, false);
-    REQUIRE(frontend->wait_for_idle(10s));
-    // From here loader publication is held until the test lets go below,
-    // however long the setup takes.
-    loader.hold();
-
-    // The queue is populated in deliberately bad FIFO order. The three
-    // generations fill the spool exactly to its 50% pressure threshold: an
-    // open pathological inode, then a large closed file, then a much nearer
-    // closed retirement.
-    const auto open_bytes = pattern(3 * config.extent_size, 81);
-    const auto large_bytes = pattern(4 * config.extent_size, 82);
-    const auto small_bytes = pattern(config.extent_size, 83);
-    REQUIRE(frontend->write(pathological.inode, 0, open_bytes) == open_bytes.size());
-    REQUIRE(frontend->write(closed_large.inode, 0, large_bytes) == large_bytes.size());
-    REQUIRE(frontend->write(closed_small.inode, 0, small_bytes) == small_bytes.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 3; }, 10s));
-
-    frontend->flush(pathological.inode);
-    frontend->release(closed_large.inode, true);
-    frontend->release(closed_small.inode, true);
-
-    // The first byte above the pressure threshold is event-driven
-    // backpressure: while publication is held, nothing can retire, so the
-    // byte cannot be admitted.
-    auto admitted = std::async(std::launch::async, [&] {
-        const auto byte = pattern(1, 84);
-        return frontend->write(blocked_follower.inode, 0, byte);
-    });
-    CHECK(admitted.wait_for(100ms) == std::future_status::timeout);
-    CHECK(service.filesystem().getattr("/closed-small.bin").size == 0);
-    CHECK(service.filesystem().getattr("/closed-large.bin").size == 0);
-
-    // Released, the pressure drain selects the nearest closed retirement ahead
-    // of the earlier queued large generation, and that retirement is what
-    // admits the byte.
-    loader.release();
-    REQUIRE(admitted.wait_for(10s) == std::future_status::ready);
-    CHECK(admitted.get() == 1);
-    // Retiring its data is what freed the spool; its size reaches the
-    // namespace with the namespace publication that follows.
-    REQUIRE(wait_until(
-        [&] {
-            return service.filesystem().getattr("/closed-small.bin").size == small_bytes.size();
-        },
-        10s));
-
-    const auto selected = frontend->status();
-    CHECK(selected.spool_pressure_publication_sweeps == 1);
-    CHECK(selected.data_retirement_priority_selections >= 1);
-
-    frontend->release(pathological.inode, true);
-    frontend->release(blocked_follower.inode, true);
-    REQUIRE(frontend->wait_for_idle(30s));
-    CHECK(service.filesystem().getattr("/closed-large.bin").size == large_bytes.size());
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_publication_quanta_are_fair_and_byte_bounded) {
-    TestService fixture("fuse-publication-quanta");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 4;
-    config.fuse.publication_quiet = 80ms;
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    // Although four workers exist, only one logical quantum may be admitted.
-    config.fuse.publication_inflight_bytes = config.fuse.publication_quantum_bytes;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto large_handle =
-        frontend->create("/quantum-large.bin", 0644, getuid(), getgid(), false, true, false);
-    auto small_handle =
-        frontend->create("/quantum-small.bin", 0644, getuid(), getgid(), false, true, false);
-    REQUIRE(frontend->wait_for_idle(10s));
-
-    const auto large = pattern(8 * config.extent_size, 61);
-    const auto small = pattern(64 * 1024, 62);
-    REQUIRE(frontend->write(large_handle.inode, 0, large) == large.size());
-    REQUIRE(frontend->write(small_handle.inode, 0, small) == small.size());
-    REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
-
-    // Queue in this order. The large generation is selected first, but must
-    // return to the tail after one quantum; the small generation can then
-    // become atomically visible before the large one.
-    frontend->release(large_handle.inode, true);
-    frontend->release(small_handle.inode, true);
-
-    bool observed_small_first = false;
-    REQUIRE(wait_until(
-        [&] {
-            const auto small_entry = service.filesystem().getattr("/quantum-small.bin");
-            const auto large_entry = service.filesystem().getattr("/quantum-large.bin");
-            if (small_entry.size == small.size() && large_entry.size == 0)
-                observed_small_first = true;
-            return observed_small_first;
-        },
-        10s));
-    CHECK(observed_small_first);
-    REQUIRE(frontend->wait_for_idle(30s));
-
-    const auto status = frontend->status();
-    CHECK(status.data_publications_started == 2);
-    CHECK(status.data_publications_completed == 2);
-    CHECK(status.data_publication_yields >= large.size() /
-                                                  config.fuse.publication_quantum_bytes -
-                                              1);
-    CHECK(status.data_publication_quanta > status.data_publications_completed);
-    CHECK(status.data_publication_peak_active == 1);
-    CHECK(status.data_publication_peak_inflight_bytes ==
-          config.fuse.publication_inflight_bytes);
-    // Cursor preservation is important: yielding must not reread or restage a
-    // prefix merely to provide fairness.
-    CHECK(status.data_publication_bytes_read == large.size() + small.size());
-    CHECK(service.filesystem().getattr("/quantum-large.bin").size == large.size());
-    frontend->stop();
-}
-
-// A publication writer keeps a retained-memory extent lease across clean
-// yields, and scheduling is breadth-first, so unbounded open writers would fill
-// the durable-lower budget with partial buffers and none could finish. The
-// backlog here is wider than the ledger can hold writers for; the open-writer
-// bound makes publication depth-first over the open set and every file completes.
-MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_completes) {
-    TestService fixture("fuse-publication-backlog-width");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    // Durable-lower is capacity - control - viewer = 16M, so the ledger holds
-    // at most 16 concurrent extent leases for publication.
-    config.runtime.retained_memory_bytes = 32ULL * 1024 * 1024;
-    config.runtime.control_memory_reserve_bytes = 8ULL * 1024 * 1024;
-    config.runtime.viewer_memory_reserve_bytes = 8ULL * 1024 * 1024;
-    config.runtime.loader_memory_reserve_bytes = 8ULL * 1024 * 1024;
-    config.runtime.reassembly_memory_reserve_bytes = 4ULL * 1024 * 1024;
-    config.fuse.commit_workers = 2;
-    // Quantum == extent size makes every quantum yield mid-extent, which is
-    // what leaves a partial buffer -- and its lease -- on the retained writer.
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    config.fuse.publication_inflight_bytes = 2 * config.fuse.publication_quantum_bytes;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-    config.fuse.publication_no_progress_deadline = 2s;
-    // Worst case 4 x (1M buffer + 1M pipeline) = 8M, the loader reserve. Pinned
-    // explicitly because this frontend is built from the fixture's config, not
-    // the service's normalised copy.
-    config.fuse.publication_max_open_writers = 4;
-
-    auto& service = fixture.start();
-    auto admission = std::make_unique<HeldLoaderAdmission>();
-    auto& loader = *admission;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                       config.fuse, std::move(admission));
-
-    // Hold publication off while the backlog is staged, so the whole width
-    // arrives at the scheduler at once instead of draining as it is written.
-    loader.hold();
-    constexpr size_t files = 20;
-    const auto contents = pattern(2 * 1024 * 1024 + 12345, 91);
-    for (size_t i = 0; i < files; ++i) {
-        const auto path = "/backlog-" + std::to_string(i) + ".bin";
-        auto handle = frontend->create(path, 0644, getuid(), getgid(), false, true, false);
-        REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
-        frontend->release(handle.inode, true);
-    }
-
-    // Released, publication is work-conserving with the entire backlog
-    // already queued.
-    loader.release();
-    REQUIRE(frontend->wait_for_idle(180s));
-
-    const auto status = frontend->status();
-    const auto diagnostics = frontend->diagnostics();
-    CHECK(status.data_publications_started == files);
-    CHECK(status.data_publications_completed == files);
-    CHECK(diagnostics.parked_publications == 0);
-    // Never more writers open than the ledger was sized for.
-    CHECK(diagnostics.peak_open_publications <= config.fuse.publication_max_open_writers);
-    // The bound must actually have bitten, or this passes for the wrong reason.
-    CHECK(diagnostics.data_publication_selections_under_writer_cap > 0);
-    CHECK(diagnostics.open_publications == 0);
-    CHECK(diagnostics.backend_failures == 0);
-    for (size_t i = 0; i < files; ++i)
-        CHECK(service.filesystem().getattr("/backlog-" + std::to_string(i) + ".bin").size ==
-              contents.size());
-    // Every lease taken for publication is back.
-    CHECK(service.resources().memory.stats().owner_bytes[static_cast<size_t>(
-              MemoryOwner::publication)] == 0);
-    frontend->stop();
-}
-
-// The no-progress deadline must watch events that release retained memory
-// (retired extents, commits), not admitted quanta: admitting a new publication
-// must not re-arm every blocked writer's window. A publication yields far more
-// often than it retires an extent, so the two counters differ.
-MACHA_TEST("filesystem_fuse", test_publication_progress_counts_releases_not_admissions) {
-    TestService fixture("fuse-publication-progress-counter");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-    // Quantum == extent size yields after one 256K spool chunk, so a 4M file
-    // takes many quanta while retiring only four extents plus one commit.
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    config.fuse.publication_inflight_bytes = config.fuse.publication_quantum_bytes;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle = frontend->create("/progress-counter.bin", 0644, getuid(), getgid(), false,
-                                   true, false);
-    const auto contents = pattern(4 * config.extent_size, 77);
-    REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
-    frontend->release(handle.inode, true);
-    REQUIRE(frontend->wait_for_idle(60s));
-
-    const auto diagnostics = frontend->diagnostics();
-    CHECK(diagnostics.data_publications_completed == 1);
-    CHECK(diagnostics.data_publication_progress_events > 0);
-    CHECK(diagnostics.data_publication_quanta > diagnostics.data_publication_progress_events);
-    CHECK(service.filesystem().getattr("/progress-counter.bin").size == contents.size());
-    frontend->stop();
-}
-
-// Publishes into a real target, but the first drain of staged extents after a
-// writer has taken `after_bytes` fails retryably, as when a staged extent put
-// does not land. The failed drain leaves the writer as it was.
-class DrainFailingTarget final : public PublicationTarget {
+// Publishes into a real target; a test hooks each writer's open, staging
+// drain and commit to fail, hold or record them. Hooks are set before the
+// frontend starts.
+class InterposedTarget final : public PublicationTarget {
     class Writer final : public PublicationWriter {
-        DrainFailingTarget& target_;
+        InterposedTarget& target_;
+        const std::string path_;
         std::shared_ptr<PublicationWriter> inner_;
         std::atomic_uint64_t written_{};
 
       public:
-        Writer(DrainFailingTarget& target, std::shared_ptr<PublicationWriter> inner)
-            : target_(target), inner_(std::move(inner)) {}
+        Writer(InterposedTarget& target, std::string path,
+               std::shared_ptr<PublicationWriter> inner)
+            : target_(target), path_(std::move(path)), inner_(std::move(inner)) {}
 
         WritePreparation prepare_write(uint64_t offset, uint64_t byte_budget) override {
             return inner_->prepare_write(offset, byte_budget);
@@ -2220,1020 +116,111 @@ class DrainFailingTarget final : public PublicationTarget {
         }
         size_t write(uint64_t offset, std::span<const uint8_t> bytes) override {
             const auto written = inner_->write(offset, bytes);
-            written_.fetch_add(written, std::memory_order_relaxed);
+            const auto total = written_.fetch_add(written, std::memory_order_relaxed) + written;
+            if (target_.after_write)
+                target_.after_write(total);
             return written;
         }
         void truncate(uint64_t size) override { inner_->truncate(size); }
         void drain_staging() override {
-            if (written_.load(std::memory_order_relaxed) >= target_.after_bytes_ &&
-                !target_.failed_.exchange(true, std::memory_order_acq_rel))
-                throw FsError(EIO, "staged extent put failed");
+            if (target_.before_drain)
+                target_.before_drain(written_.load(std::memory_order_relaxed));
             inner_->drain_staging();
         }
         void set_committed_mtime(int64_t mtime_ns) override {
             inner_->set_committed_mtime(mtime_ns);
         }
-        void commit() override { inner_->commit(); }
+        void commit() override {
+            inner_->commit();
+            if (target_.after_commit)
+                target_.after_commit(path_);
+        }
         FsEntry committed_entry() const override { return inner_->committed_entry(); }
         WriteHandleDiagnostics diagnostics() const override { return inner_->diagnostics(); }
     };
 
     PublicationTarget& real_;
-    const uint64_t after_bytes_;
-    std::atomic_bool failed_{};
 
   public:
-    DrainFailingTarget(PublicationTarget& real, uint64_t after_bytes)
-        : real_(real), after_bytes_(after_bytes) {}
+    // Throws to fail the open; may block.
+    std::function<void(const std::string& path)> before_open;
+    // Given the bytes the writer has taken; throws to fail the drain, which
+    // leaves the writer as it was.
+    std::function<void(uint64_t written)> before_drain;
+    // Given the bytes the writer has taken, after each write.
+    std::function<void(uint64_t written)> after_write;
+    std::function<void(const std::string& path)> after_commit;
+
+    explicit InterposedTarget(PublicationTarget& real) : real_(real) {}
 
     std::shared_ptr<PublicationWriter> open_publication(const std::string& path, bool cache_puts,
                                                         uint64_t pipeline_bytes,
                                                         DataWorkContext work_context) override {
+        if (before_open)
+            before_open(path);
         return std::make_shared<Writer>(
-            *this, real_.open_publication(path, cache_puts, pipeline_bytes, std::move(work_context)));
+            *this, path,
+            real_.open_publication(path, cache_puts, pipeline_bytes, std::move(work_context)));
     }
 };
 
-MACHA_TEST("filesystem_fuse", test_fuse_retryable_publication_failure_preserves_cursor) {
-    TestService fixture("fuse-publication-transient-cursor");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-    config.fuse.publication_quantum_bytes = config.extent_size;
-    config.fuse.publication_inflight_bytes = config.extent_size;
-    config.fuse.publication_pipeline_bytes = config.extent_size;
-
-    auto& service = fixture.start();
-    DrainFailingTarget target(service.filesystem(), config.extent_size);
-    auto frontend = std::make_shared<FuseFrontend>(
-        service.filesystem(), service.resources().memory, config.fuse,
-        std::make_unique<ViewerWeightedAdmission>(service.filesystem(), config.fuse), target);
-    auto handle = frontend->create("/transient-cursor.bin", 0644, getuid(), getgid(), false,
-                                   true, false);
-    REQUIRE(frontend->wait_for_idle(10s));
-
-    const auto contents = pattern(3 * config.extent_size + 12345, 73);
-    REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
-    frontend->release(handle.inode, true);
-    REQUIRE(frontend->wait_for_idle(20s));
-
-    const auto status = frontend->status();
-    CHECK(status.backend_failures == 1);
-    CHECK(status.data_publications_started == 1);
-    CHECK(status.data_publications_completed == 1);
-    // The retry resumes after the failed drain. Discarding the publication
-    // would reread the first extent and increment starts a second time.
-    CHECK(status.data_publication_bytes_read == contents.size());
-    CHECK(status.data_publication_completed_spool_bytes_read == contents.size());
-
-    auto reader = service.filesystem().open_read("/transient-cursor.bin");
-    Bytes output(contents.size());
-    REQUIRE(reader->read(0, output) == output.size());
-    CHECK(output == contents);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_publication_with_a_stale_basis_asks_for_replay_not_retry) {
-    // A write handle captures the entry it opened against; if the entry moves
-    // past it, commit_file's content-change guard rejects the commit. An
-    // in-place retry of a publication would repeat the same comparison forever,
-    // so a publication reports ESTALE and the frontend replays the generation
-    // from the spool. Foreground handles get EAGAIN: retrying is meaningful.
-    TestService fixture("stale-basis");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    auto& fs = service.filesystem();
-
-    const auto first = pattern(32 * 1024, 7);
-    const auto longer = pattern(96 * 1024, 9);
-
-    auto stale_commit_code = [&](WriteDurability durability) {
-        const std::string path =
-            durability == WriteDurability::publication_generation ? "/stale-pub.bin" : "/stale-fg.bin";
-        fs.create_file(path, 0644, getuid(), getgid());
-        auto writer = fs.open_write(path, false, false, durability);
-        REQUIRE(writer->write(0, first) == first.size());
-
-        // Move the entry underneath it: a separate handle commits different
-        // content, advancing version, size and extents together.
-        auto other = fs.open_write(path, false);
-        REQUIRE(other->write(0, longer) == longer.size());
-        other->commit();
-
-        try {
-            writer->commit();
-        } catch (const FsError& e) {
-            return e.code();
-        }
-        return 0;
-    };
-
-    CHECK(stale_commit_code(WriteDurability::publication_generation) == ESTALE);
-    CHECK(stale_commit_code(WriteDurability::immediate) == EAGAIN);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_publication_failing_repeatedly_is_reported_before_it_parks) {
-    // A long failure run is escalated to WARN and counted, before and
-    // independently of parking.
-    TestService fixture("fuse-publication-escalation");
-    auto& config = fixture.config();
-    config.replication = 2;
-    config.min_write_replicas = 2; // one node: the floor can never be met
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-    // Room for well over the escalation threshold (10) before the budget runs
-    // out, so this measures escalation rather than parking.
-    config.fuse.publication_retry = RetryPolicy{500, 60s, 1ms, 2ms};
-    config.fuse.publication_retry.max_failing_duration = 60s;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle = frontend->create("/noisy.bin", 0644, getuid(), getgid(), true, true, false);
-    const auto payload = pattern(64 * 1024 + 3, 51);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    frontend->release(handle.inode, true);
-
-    // Crossing the threshold is counted exactly once for the run.
-    REQUIRE(wait_until(
-        [&] { return frontend->diagnostics().publications_retrying_persistently == 1; }, 10s));
-    CHECK(frontend->diagnostics().parked_publications == 0);
-    std::this_thread::sleep_for(100ms);
-    CHECK(frontend->diagnostics().publications_retrying_persistently == 1);
-    CHECK(frontend->diagnostics().publication_retries_backed_off >= 10);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_publication_backs_off_then_parks_for_operator) {
-    // A publication that keeps failing retryably backs off, and past its budget
-    // it is parked: visible, actionable, and not poisoning the inode. The write
-    // floor can never be met here (two replicas, one node), so every attempt fails.
-    TestService fixture("fuse-publication-park");
-    auto& config = fixture.config();
-    config.replication = 2;
-    config.min_write_replicas = 2;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-    config.fuse.publication_retry = RetryPolicy{3, 60s, 5ms, 20ms};
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    auto handle = frontend->create("/parked.bin", 0644, getuid(), getgid(), true, true, false);
-    const auto payload = pattern(64 * 1024 + 3, 44);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    frontend->release(handle.inode, true);
-
-    // More than max_failures_in_window (3) failures park it; with 5-20 ms
-    // backoff that is well under a second.
-    REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
-    auto parked = frontend->parked_publications();
-    REQUIRE(parked.size() == 1);
-    CHECK(parked.front().inode == handle.inode);
-    CHECK(parked.front().path == "/parked.bin");
-    CHECK(parked.front().attempts == 4);
-    CHECK(parked.front().pending_bytes == payload.size());
-    CHECK(frontend->diagnostics().publication_retries_backed_off == 3);
-
-    // Parked is quiet and not poisoned: no further attempts, and the file is
-    // still readable through the mount.
-    const auto failures_at_park = frontend->status().backend_failures;
-    std::this_thread::sleep_for(150ms);
-    CHECK(frontend->status().backend_failures == failures_at_park);
-    CHECK(frontend->status().pending_data == 0);
-    Bytes back(payload.size());
-    REQUIRE(frontend->read(handle.inode, 0, back) == back.size());
-    CHECK(back == payload);
-
-    // Operator retry: budget reset, attempts resume, and it parks again.
-    REQUIRE(frontend->retry_parked_publication(handle.inode));
-    CHECK(frontend->diagnostics().parked_publications == 0);
-    REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
-    CHECK(frontend->status().backend_failures > failures_at_park);
-
-    // Operator abandon: the dirty generation is dropped and nothing is parked.
-    CHECK(!frontend->retry_parked_publication(handle.inode + 1000));
-    REQUIRE(frontend->abandon_parked_publication(handle.inode));
-    CHECK(frontend->parked_publications().empty());
-    CHECK(frontend->diagnostics().parked_publications == 0);
-    CHECK(frontend->getattr("/parked.bin").size == 0);
-    REQUIRE(frontend->wait_for_idle(5s));
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_terminal_recovery_failure_is_not_readmitted) {
-    TestService fixture("fuse-terminal-recovery-failure");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    service.filesystem().create_file("/healthy.bin", 0644, getuid(), getgid());
-    service.filesystem().create_file("/removed-before-replay.bin", 0644, getuid(), getgid());
-
-    const auto contents = pattern(256 * 1024 + 17, 91);
-    {
-        // Publication is held outright, so the write is still pending when this
-        // frontend stops.
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        admission->hold();
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        auto handle = frontend->open("/removed-before-replay.bin", true, true, false, false);
-        REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
-        frontend->release(handle.inode, true);
-        REQUIRE(wait_until([&] { return frontend->status().pending_data == 1; }, 10s));
-        frontend->stop();
-    }
-
-    // Model a cluster namespace generation accepted while this node was down.
-    // Its durable local write must not become an unbounded recovery retry when
-    // the path it was going to update no longer exists in the accepted state.
-    service.filesystem().unlink("/removed-before-replay.bin");
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(wait_until([&] { return recovered->status().backend_failures >= 1; }, 10s));
-    REQUIRE(recovered->wait_for_idle(2s));
-
-    const auto settled = recovered->status();
-    CHECK(settled.backend_failures == 1);
-    CHECK(settled.pending_data == 0);
-    CHECK(settled.active_data == 0);
-    std::this_thread::sleep_for(100ms);
-    CHECK(recovered->status().backend_failures == settled.backend_failures);
-    CHECK(recovered->getattr("/healthy.bin").type == EntryType::file);
-    recovered->stop();
-}
-
-MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_keeps_the_node_up) {
-    // A burst of empty-directory removals, as `find -depth -type d -empty
-    // -delete` issues, with concurrent readers. Every removal is a metadata
-    // change and every metadata change asks the media-information service to prune.
-    TestService fixture("fuse-empty-directory-burst");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.fuse.publication_quiet = 0ms;
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-    constexpr int titles = 60;
-    frontend->mkdir("/Movies", 0755, getuid(), getgid());
-    for (int i = 0; i < titles; ++i) {
-        const auto title = "/Movies/Title " + std::to_string(i);
-        frontend->mkdir(title, 0755, getuid(), getgid());
-        frontend->mkdir(title + "/Subs", 0755, getuid(), getgid());
-        frontend->mkdir(title + "/Featurettes", 0755, getuid(), getgid());
-        if (i % 2 == 0) {
-            auto handle = frontend->create(title + "/film.mkv", 0644, getuid(), getgid(), false,
-                                           true, false);
-            const auto bytes = pattern(4096 + static_cast<size_t>(i), static_cast<uint8_t>(i));
-            REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
-            frontend->release(handle.inode, true);
-        }
-    }
-    REQUIRE(frontend->wait_for_idle(60s));
-
-    // As on a real mount, other threads stat and list neighbours during removals.
-    std::mutex unexpected_mutex;
-    std::vector<std::string> unexpected;
-    const auto note_unexpected = [&](std::string what) {
-        std::lock_guard lock(unexpected_mutex);
-        unexpected.push_back(std::move(what));
-    };
-    // jthreads, so a failure below stops and joins them on the way out.
-    std::vector<std::jthread> readers;
-    for (int r = 0; r < 4; ++r) {
-        readers.emplace_back([&, r](std::stop_token stop) {
-            while (!stop.stop_requested()) {
-                for (int i = r; i < titles; i += 4) {
-                    const auto title = "/Movies/Title " + std::to_string(i);
-                    for (const auto& path : {title, title + "/Subs", title + "/Featurettes"}) {
-                        try {
-                            (void)frontend->getattr(path);
-                            (void)frontend->readdir(path);
-                        } catch (const FsError& error) {
-                            if (error.code() != ENOENT)
-                                note_unexpected(path + ": FsError " + std::to_string(error.code()) +
-                                                " " + error.what());
-                        } catch (const std::exception& error) {
-                            note_unexpected(path + ": " + error.what());
-                        }
-                    }
-                }
-                try {
-                    (void)frontend->readdir("/Movies");
-                } catch (const std::exception& error) {
-                    note_unexpected(std::string("/Movies: ") + error.what());
-                }
-            }
-        });
-    }
-
-    // Bottom-up, as find -depth does: each directory is listed, then removed.
-    for (int i = 0; i < titles; ++i) {
-        const auto title = "/Movies/Title " + std::to_string(i);
-        (void)frontend->readdir(title);
-        frontend->rmdir(title + "/Subs");
-        frontend->rmdir(title + "/Featurettes");
-        if (i % 2 == 1) frontend->rmdir(title);
-    }
-    REQUIRE(frontend->wait_for_idle(60s));
-    for (auto& reader : readers) reader.request_stop();
-    readers.clear();
-    for (const auto& what : unexpected) std::cerr << "unexpected: " << what << "\n";
-    CHECK(unexpected.empty());
-
-    const auto listed = frontend->readdir("/Movies");
-    size_t directories = 0;
-    for (const auto& [name, attributes] : listed)
-        if (name != "." && name != "..") ++directories;
-    CHECK(directories == titles / 2);
-    CHECK(service.filesystem().getattr("/Movies/Title 0/film.mkv").type == EntryType::file);
-    frontend->stop();
-}
-
-MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_namespace_and_data) {
-    TestService fixture("fuse-journal-recovery");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-    config.fuse.spool_path = fixture.path() / "external-fuse-spool";
-    config.fuse.operation_journal_path =
-        fixture.path() / "external-fuse-journal" / "operations.log";
-
-    auto& service = fixture.start();
-    uint64_t inode = 0;
-    auto payload = pattern(384 * 1024 + 17);
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-        // Publication is held behind a quiet window, yet the operations below
-        // succeeded and must be reconstructable from local state.
-        service.filesystem().store().foreground_activity(1);
-        frontend->mkdir("/TV", 0755, getuid(), getgid());
-        frontend->mkdir("/TV/Buffy", 0755, getuid(), getgid());
-        auto handle =
-            frontend->create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(), true, true, false);
-        inode = handle.inode;
-        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
-        frontend->release(inode, true);
-
-        CHECK(frontend->inode_for_path("/TV").has_value());
-        CHECK(frontend->inode_for_path("/TV/Buffy/S07E01.mp4") == inode);
-        auto before = frontend->getattr("/TV/Buffy/S07E01.mp4");
-        CHECK(before.size == payload.size());
-
-        // Simulate the frontend process boundary while distributed publication
-        // is still blocked. stop() must not need to publish the accepted work.
-        frontend->stop();
-    }
-
-    auto replay_config = config.fuse;
-    replay_config.publication_quiet = 0ms;
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay_config);
-        REQUIRE(recovered->inode_for_path("/TV").has_value());
-        REQUIRE(recovered->inode_for_path("/TV/Buffy").has_value());
-        auto recovered_inode = recovered->inode_for_path("/TV/Buffy/S07E01.mp4");
-        REQUIRE(recovered_inode.has_value());
-        CHECK(recovered->getattr("/TV/Buffy/S07E01.mp4").size == payload.size());
-
-        Bytes local(payload.size());
-        REQUIRE(recovered->read(*recovered_inode, 0, local) == local.size());
-        CHECK(local == payload);
-
-        REQUIRE(recovered->wait_for_idle(15s));
-        auto committed = service.filesystem().getattr("/TV/Buffy/S07E01.mp4");
-        CHECK(committed.size == payload.size());
-        auto reader = service.filesystem().open_read("/TV/Buffy/S07E01.mp4");
-        Bytes actual(payload.size());
-        size_t offset = 0;
-        while (offset < actual.size()) {
-            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
-            REQUIRE(n > 0);
-            offset += n;
-        }
-        CHECK(actual == payload);
-
-        const auto journal = *config.fuse.operation_journal_path;
-        REQUIRE(std::filesystem::exists(journal));
-        CHECK(std::filesystem::file_size(journal) == 8);
-        CHECK(std::filesystem::exists(*config.fuse.spool_path));
-        CHECK(!std::filesystem::exists(config.state_path / "fuse-spool"));
-    }
-}
-
-MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_durable_journal_recovers_ordered_mutations) {
-    TestService fixture("fuse-journal-ordering");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-
-    auto& service = fixture.start();
-
-    const auto initial = pattern(192 * 1024 + 31);
-    const auto tail = pattern(24 * 1024 + 7);
-    Bytes expected(initial.begin(), initial.begin() + 64 * 1024);
-    expected.resize(96 * 1024, 0);
-    expected.insert(expected.end(), tail.begin(), tail.end());
-
-    constexpr std::string_view old_path = "/TV/Buffy/S07E01.mp4";
-    constexpr std::string_view new_dir = "/TV/Buffy The Vampire Slayer";
-    constexpr std::string_view new_path = "/TV/Buffy The Vampire Slayer/S07E01.mp4";
-    constexpr std::string_view removed_path = "/TV/Buffy The Vampire Slayer/S07E02.mp4";
-
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        service.filesystem().store().foreground_activity(1);
-
-        frontend->mkdir("/TV", 0755, getuid(), getgid());
-        frontend->mkdir("/TV/Buffy", 0755, getuid(), getgid());
-        auto first = frontend->create(old_path, 0644, getuid(), getgid(), true, true, false);
-        REQUIRE(frontend->write(first.inode, 0, initial) == initial.size());
-        frontend->truncate(first.inode, 64 * 1024);
-        REQUIRE(frontend->write(first.inode, 96 * 1024, tail) == tail.size());
-        frontend->release(first.inode, true);
-
-        frontend->rename("/TV/Buffy", new_dir);
-        auto removed = frontend->create(removed_path, 0644, getuid(), getgid(), true, true, false);
-        auto removed_bytes = pattern(32 * 1024 + 3);
-        REQUIRE(frontend->write(removed.inode, 0, removed_bytes) == removed_bytes.size());
-        frontend->release(removed.inode, true);
-        frontend->unlink(removed_path);
-
-        // Root metadata uses inode 1 and therefore exercises recovery of the
-        // one stable inode which is never allocated from next_inode.
-        frontend->chmod("/", 0700);
-
-        CHECK(!frontend->inode_for_path(old_path).has_value());
-        REQUIRE(frontend->inode_for_path(new_path).has_value());
-        CHECK(!frontend->inode_for_path(removed_path).has_value());
-        CHECK(frontend->getattr(new_path).size == expected.size());
-        CHECK(frontend->getattr("/").mode == 0700);
-        frontend->stop();
-    }
-
-    // First recovery stays publication-blocked, so these assertions see only
-    // reconstruction from committed metadata plus the local journal.
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        CHECK(!recovered->inode_for_path(old_path).has_value());
-        auto recovered_inode = recovered->inode_for_path(new_path);
-        REQUIRE(recovered_inode.has_value());
-        CHECK(!recovered->inode_for_path(removed_path).has_value());
-        CHECK(recovered->getattr(new_path).size == expected.size());
-        CHECK(recovered->getattr("/").mode == 0700);
-
-        Bytes local(expected.size());
-        REQUIRE(recovered->read(*recovered_inode, 0, local) == local.size());
-        CHECK(local == expected);
-        recovered->stop();
-    }
-
-    // Without the quiet window, the recovered operations converge to the filesystem.
-    auto replay_config = config.fuse;
-    replay_config.publication_quiet = 0ms;
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay_config);
-        REQUIRE(recovered->wait_for_idle(20s));
-
-        bool old_missing = false;
-        try {
-            (void)service.filesystem().getattr(std::string(old_path));
-        } catch (const FsError& e) {
-            old_missing = e.code() == ENOENT;
-        }
-        CHECK(old_missing);
-
-        bool removed_missing = false;
-        try {
-            (void)service.filesystem().getattr(std::string(removed_path));
-        } catch (const FsError& e) {
-            removed_missing = e.code() == ENOENT;
-        }
-        CHECK(removed_missing);
-
-        auto committed = service.filesystem().getattr(std::string(new_path));
-        CHECK(committed.size == expected.size());
-        CHECK(service.filesystem().getattr("/").mode == 0700);
-
-        auto reader = service.filesystem().open_read(std::string(new_path));
-        Bytes actual(expected.size());
-        size_t offset = 0;
-        while (offset < actual.size()) {
-            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
-            REQUIRE(n > 0);
-            offset += n;
-        }
-        CHECK(actual == expected);
-    }
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_namespace_publication_and_markers) {
-    TestService fixture("fuse-namespace-publication-amplification");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    constexpr size_t operations = 8;
-
-    // Admit an ordered durable namespace backlog while publication is held
-    // behind the foreground quiet boundary, then cross a frontend restart so
-    // the ordinary recovery path owns the entire backlog.
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (size_t i = 0; i < operations; ++i)
-            frontend->mkdir("/pending-" + std::to_string(i), 0755, getuid(), getgid());
-        CHECK(frontend->status().namespace_operations_admitted == operations);
-        frontend->stop();
-    }
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    replay.namespace_batch_operations = 3;
-    const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-    constexpr size_t expected_batches = (operations + 3 - 1) / 3;
-
-    CHECK(status.namespace_operations_recovered == operations);
-    CHECK(status.namespace_publication_attempts == expected_batches);
-    CHECK(status.namespace_publication_batches == expected_batches);
-    CHECK(status.namespace_operations_batched == operations);
-    CHECK(status.namespace_operations_published == operations);
-    CHECK(status.namespace_operations_confirmed == operations);
-    CHECK(service.filesystem().local_committed_metadata_generation() ==
-          generation_before + expected_batches);
-    // Each publication durably journals its batch identity, then all
-    // individual published markers, then all individual done markers.
-    CHECK(status.journal_append_batches == expected_batches * 3);
-    CHECK(status.journal_records_appended == operations * 2 + expected_batches);
-    CHECK(status.journal_durability_barriers == expected_batches * 3);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_thousand_operations_have_bounded_publications) {
-    TestService fixture("fuse-namespace-thousand-batch");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    constexpr size_t operations = 1000;
-    constexpr size_t batch_limit = 256;
-
-    std::vector<FilesystemNamespaceMutation> creates;
-    creates.reserve(operations);
-    for (size_t i = 0; i < operations; ++i) {
-        FilesystemNamespaceMutation op;
-        op.kind = FilesystemNamespaceMutation::Kind::create;
-        op.from = "/bulk-" + std::to_string(i);
-        op.mode = 0644;
-        op.uid = getuid();
-        op.gid = getgid();
-        creates.push_back(std::move(op));
-    }
-    CHECK(service.filesystem().apply_namespace_batch(creates).applied == operations);
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (size_t i = 0; i < operations; ++i)
-            frontend->unlink("/bulk-" + std::to_string(i));
-        CHECK(frontend->status().namespace_operations_admitted == operations);
-        frontend->stop();
-    }
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    replay.namespace_batch_operations = batch_limit;
-    const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(30s));
-    const auto status = recovered->status();
-    constexpr size_t expected_batches = (operations + batch_limit - 1) / batch_limit;
-
-    CHECK(status.namespace_operations_recovered == operations);
-    CHECK(status.namespace_publication_attempts == expected_batches);
-    CHECK(status.namespace_publication_batches == expected_batches);
-    CHECK(status.namespace_operations_batched == operations);
-    CHECK(status.namespace_operations_published == operations);
-    CHECK(status.namespace_operations_confirmed == operations);
-    CHECK(status.journal_append_batches == expected_batches * 3); // identity, published, done
-    CHECK(status.journal_records_appended == operations * 2 + expected_batches);
-    CHECK(status.journal_durability_barriers == expected_batches * 3);
-    CHECK(service.filesystem().local_committed_metadata_generation() ==
-          generation_before + expected_batches);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_encoded_size_limit_is_hard) {
-    TestService fixture("fuse-namespace-byte-limit");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    constexpr size_t operations = 4;
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (size_t i = 0; i < operations; ++i)
-            frontend->mkdir("/byte-limited-" + std::to_string(i), 0755, getuid(), getgid());
-        frontend->stop();
-    }
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    replay.namespace_batch_bytes = 1;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    // One oversized operation is allowed to make progress, but no second
-    // operation may join it once the encoded-byte bound is exceeded.
-    CHECK(status.namespace_publication_batches == operations);
-    CHECK(status.namespace_operations_batched == operations);
-    CHECK(status.journal_append_batches == operations * 2); // singletons: published, done
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_batches_unlinks_then_parent_rmdir) {
-    TestService fixture("fuse-namespace-delete-batch");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-
-    service.filesystem().mkdir("/doomed", 0755, getuid(), getgid());
-    service.filesystem().create_file("/doomed/one", 0644, getuid(), getgid());
-    service.filesystem().create_file("/doomed/two", 0644, getuid(), getgid());
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->unlink("/doomed/one");
-        frontend->unlink("/doomed/two");
-        frontend->rmdir("/doomed");
-        frontend->stop();
-    }
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    CHECK(status.namespace_operations_recovered == 3);
-    CHECK(status.namespace_publication_batches == 1);
-    CHECK(status.namespace_operations_batched == 3);
-    CHECK(status.namespace_operations_published == 3);
-    CHECK(status.namespace_operations_confirmed == 3);
-    CHECK(status.journal_append_batches == 3); // batch identity, published, done
-    CHECK(status.journal_records_appended == 7);
-    CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 1);
-    bool missing = false;
+// Opens a gate when it goes out of scope, so a failing check never leaves a
+// worker parked in it.
+struct GateOpener {
+    TestGate& gate;
+    ~GateOpener() { gate.open(); }
+};
+
+bool absent(FileSystem& fs, const std::string& path) {
     try {
-        (void)service.filesystem().getattr("/doomed");
-    } catch (const FsError& error) {
-        missing = error.code() == ENOENT;
+        (void)fs.getattr(path);
+    } catch (const FsError& e) {
+        return e.code() == ENOENT;
     }
-    CHECK(missing);
+    return false;
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_all_idempotent_batch_uses_no_generation) {
-    TestService fixture("fuse-namespace-idempotent-batch");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    constexpr size_t operations = 4;
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (size_t i = 0; i < operations; ++i)
-            frontend->mkdir("/already-" + std::to_string(i), 0755, getuid(), getgid());
-        frontend->stop();
+bool absent(FuseFrontend& frontend, std::string_view path) {
+    try {
+        (void)frontend.getattr(path);
+    } catch (const FsError& e) {
+        return e.code() == ENOENT;
     }
-    for (size_t i = 0; i < operations; ++i)
-        service.filesystem().mkdir("/already-" + std::to_string(i), 0755, getuid(), getgid());
-
-    const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    CHECK(status.namespace_operations_recovered == operations);
-    CHECK(status.namespace_publication_attempts == 0);
-    CHECK(status.namespace_publication_batches == 0);
-    CHECK(status.namespace_operations_batched == 0);
-    CHECK(status.namespace_operations_published == operations);
-    CHECK(status.namespace_operations_confirmed == operations);
-    CHECK(status.journal_append_batches == 2);
-    CHECK(status.journal_records_appended == operations * 2);
-    CHECK(service.filesystem().local_committed_metadata_generation() == generation_before);
+    return false;
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_commits_largest_valid_namespace_prefix) {
-    TestService fixture("fuse-namespace-valid-prefix");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/prefix", 0755, getuid(), getgid());
-        frontend->mkdir("/concurrent", 0755, getuid(), getgid());
-        frontend->mkdir("/after", 0755, getuid(), getgid());
-        frontend->stop();
+Bytes read_back(FileSystem& fs, const std::string& path, size_t size) {
+    auto reader = fs.open_read(path);
+    Bytes output(size);
+    size_t offset = 0;
+    while (offset < output.size()) {
+        const auto n = reader->read(
+            offset, {output.data() + offset, std::min<size_t>(131071, output.size() - offset)});
+        REQUIRE(n > 0);
+        offset += n;
     }
-
-    // Make operation two already true in the backend. The first recovery
-    // transaction must commit only operation one; operation three cannot pass
-    // the semantic boundary and is committed by the following transaction.
-    service.filesystem().mkdir("/concurrent", 0755, getuid(), getgid());
-    const auto generation_before = service.filesystem().local_committed_metadata_generation();
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    // The identity batch [1,2,3] is refused atomically at op two (one
-    // uncommitted attempt, one identity record), so op one is published alone;
-    // then in [2,3] op two is already achieved and op three commits: two commits.
-    CHECK(status.namespace_operations_recovered == 3);
-    CHECK(status.namespace_publication_attempts == 3);
-    CHECK(status.namespace_publication_batches == 2);
-    CHECK(status.namespace_operations_batched == 2);
-    CHECK(status.namespace_operations_published == 3);
-    CHECK(status.namespace_operations_confirmed == 3);
-    CHECK(status.journal_append_batches == 5);
-    CHECK(status.journal_records_appended == 7);
-    CHECK(service.filesystem().local_committed_metadata_generation() == generation_before + 2);
-    CHECK(service.filesystem().getattr("/prefix").type == EntryType::directory);
-    CHECK(service.filesystem().getattr("/concurrent").type == EntryType::directory);
-    CHECK(service.filesystem().getattr("/after").type == EntryType::directory);
+    return output;
 }
 
-MACHA_TEST("filesystem_fuse",
-          test_fuse_namespace_operator_skip_unwedges_a_non_retryable_backend_error) {
-    // A queued mkdir whose path is concurrently occupied by a file can never
-    // be reconciled as already achieved, so it fails with EEXIST on every
-    // replay until the operator skips it.
-    TestService fixture("fuse-namespace-operator-skip");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.api.enabled = true;
-    config.catalogue.api.listen = "127.0.0.1";
-    config.catalogue.api.port = free_port();
-    auto& service = fixture.start();
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/wedge", 0755, getuid(), getgid());
-        frontend->stop();
-    }
-    service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    service.registry().publish_fuse(recovered);
-
-    REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
-    auto blocked = recovered->blocked_namespace_operation();
-    REQUIRE(blocked.has_value());
-    CHECK(blocked->kind == "mkdir");
-    CHECK(blocked->path == "/wedge");
-    CHECK(blocked->error_code == EEXIST);
-
-    // The GET route surfaces the same thing over HTTP.
-    const auto get_response = raw_http_get(
-        config.catalogue.api.port, "/api/v1/manage/filesystem/blocked-namespace-operation",
-        bearer_header(service));
-    CHECK(get_response.find("HTTP/1.1 200") != std::string::npos);
-    const auto get_body_at = get_response.find("\r\n\r\n");
-    REQUIRE(get_body_at != std::string::npos);
-    const auto get_json = Json::parse(get_response.substr(get_body_at + 4));
-    CHECK(get_json.find("sequence")->asUInt64() == blocked->sequence);
-    CHECK(get_json.find("kind")->asString() == "mkdir");
-    CHECK(get_json.find("path")->asString() == "/wedge");
-
-    // Naming the wrong sequence must refuse, not skip whatever is blocked.
-    CHECK(!recovered->skip_blocked_namespace_operation(blocked->sequence + 1));
-    CHECK(recovered->blocked_namespace_operation().has_value());
-
-    CHECK(service.skip_blocked_namespace_operation(blocked->sequence));
-    REQUIRE(recovered->wait_for_idle(10s));
-    CHECK(!recovered->blocked_namespace_operation().has_value());
-
-    // The abandoned mkdir must never be claimed as achieved: the file placed
-    // concurrently is exactly what survives.
-    CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
+uint64_t publication_bytes(RetainedMemoryLedger& memory) {
+    return memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::publication)];
 }
 
-MACHA_TEST("filesystem_fuse",
-          test_fuse_journal_replays_operator_skipped_op_without_a_published_marker) {
-    // skip_blocked_namespace_operation() journals namespace_done for an
-    // operation that was never published. A restart must replay that marker
-    // cleanly rather than treat it as corrupt journal state.
-    TestService fixture("fuse-skip-then-restart");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-
-    // A second wedge queued behind the first stops the journal compacting once
-    // the first is skipped, so the lone namespace_done is still there to replay.
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/wedge", 0755, getuid(), getgid());
-        frontend->mkdir("/wedge2", 0755, getuid(), getgid());
-        frontend->stop();
+template <class Fn>
+int error_code_of(Fn&& fn) {
+    try {
+        fn();
+    } catch (const FsError& e) {
+        return e.code();
     }
-    service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
-    service.filesystem().create_file("/wedge2", 0644, getuid(), getgid());
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    uint64_t skipped_sequence = 0;
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-        service.registry().publish_fuse(recovered);
-        REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
-        auto blocked = recovered->blocked_namespace_operation();
-        REQUIRE(blocked.has_value());
-        REQUIRE(blocked->path == "/wedge");
-        skipped_sequence = blocked->sequence;
-        REQUIRE(recovered->skip_blocked_namespace_operation(skipped_sequence));
-        // /wedge2 stays unresolved, so wait for it to block; idle is unreachable.
-        REQUIRE(wait_until([&] {
-            auto next = recovered->blocked_namespace_operation();
-            return next && next->path == "/wedge2";
-        }, 10s));
-        recovered->stop();
-    }
-
-    // Restart replays namespace_done for the skipped sequence with no
-    // namespace_published recorded for it.
-    auto restarted = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    service.registry().publish_fuse(restarted);
-    REQUIRE(wait_until([&] {
-        auto blocked = restarted->blocked_namespace_operation();
-        return blocked && blocked->path == "/wedge2";
-    }, 10s));
-    CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
-    CHECK(service.filesystem().getattr("/wedge2").type == EntryType::file);
-    REQUIRE(restarted->skip_blocked_namespace_operation(restarted->blocked_namespace_operation()->sequence));
-    REQUIRE(restarted->wait_for_idle(10s));
-    restarted->stop();
+    return 0;
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_torn_tail) {
-    TestService fixture("fuse-journal-torn-tail");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/pending", 0755, getuid(), getgid());
-        REQUIRE(frontend->inode_for_path("/pending").has_value());
-        frontend->stop();
-    }
-
-    const auto journal = config.state_path / "fuse-spool" / "operations.log";
-    const auto valid_size = std::filesystem::file_size(journal);
-    REQUIRE(valid_size > 8);
-    {
-        std::ofstream out(journal, std::ios::binary | std::ios::app);
-        REQUIRE(out.good());
-        const char torn[] = {char(0), char(0), char(0)};
-        out.write(torn, sizeof(torn));
-        REQUIRE(out.good());
-    }
-    REQUIRE(std::filesystem::file_size(journal) == valid_size + 3);
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        admission->hold();
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                            config.fuse, std::move(admission));
-        REQUIRE(recovered->inode_for_path("/pending").has_value());
-        CHECK(std::filesystem::file_size(journal) == valid_size);
-        recovered->stop();
-    }
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_trims_checksum_invalid_complete_tail) {
-    TestService fixture("fuse-journal-checksum-tail");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/pending-checksum", 0755, getuid(), getgid());
-        frontend->stop();
-    }
-
-    const auto journal = config.state_path / "fuse-spool" / "operations.log";
-    const auto valid_size = std::filesystem::file_size(journal);
-    REQUIRE(valid_size > 8);
-    {
-        std::ofstream out(journal, std::ios::binary | std::ios::app);
-        REQUIRE(out.good());
-        std::array<char, 37> torn{};
-        torn[3] = 1;
-        torn[4] = static_cast<char>(0xff);
-        out.write(torn.data(), static_cast<std::streamsize>(torn.size()));
-        REQUIRE(out.good());
-    }
-    REQUIRE(std::filesystem::file_size(journal) == valid_size + 37);
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        admission->hold();
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                            config.fuse, std::move(admission));
-        REQUIRE(recovered->inode_for_path("/pending-checksum").has_value());
-        CHECK(std::filesystem::file_size(journal) == valid_size);
-        recovered->stop();
-    }
+MACHA_TEST("filesystem_fuse", test_fuse_signal_exit_is_a_clean_service_shutdown) {
+    CHECK(!fuse_loop_result_is_error(0));
+    CHECK(!fuse_loop_result_is_error(SIGTERM));
+    CHECK(!fuse_loop_result_is_error(SIGINT));
+    CHECK(fuse_loop_result_is_error(-EIO));
 }
 
 MACHA_FAST_TEST("filesystem_fuse", test_fuse_journal_frame_scanner_exhaustive_tail_model) {
@@ -3248,8 +235,8 @@ MACHA_FAST_TEST("filesystem_fuse", test_fuse_journal_frame_scanner_exhaustive_ta
     const auto first_end = prefix.size();
 
     // Every possible crash boundary inside a valid next frame must retain only
-    // the preceding durable prefix. This is the exhaustive state-space check;
-    // the two integration tests above prove the disk loader applies the result.
+    // the preceding durable prefix. The journal recovery test proves the disk
+    // loader applies the result.
     for (size_t cut = 1; cut < second.size(); ++cut) {
         auto bytes = prefix;
         bytes.insert(bytes.end(), second.begin(), second.begin() + static_cast<ptrdiff_t>(cut));
@@ -3315,313 +302,1800 @@ MACHA_FAST_TEST("filesystem_fuse", test_fuse_journal_frame_scanner_exhaustive_ta
     }
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_preserves_unreferenced_spool) {
-    TestService fixture("fuse-journal-orphan");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+// FileSystem's publication writers (WriteHandle): generation staging, the
+// changed-range overlay, the extent pipeline, the no-progress budget, size
+// projection and the commit guard. WriteHandle's collaborators are the node's
+// concrete stores, so it runs against one node's.
+MACHA_TEST("filesystem_fuse", test_publication_writers_stage_and_commit_generations) {
+    FilesystemNode node("publication-writers");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
 
-    auto& service = fixture.start();
-    const auto spool_dir = config.state_path / "fuse-spool";
-    std::filesystem::create_directories(spool_dir);
+    // Metadata-only changes through an open writer (macOS cp applies mode,
+    // owner and times before close) do not invalidate it; a real concurrent
+    // content update is still a conflict.
     {
-        std::ofstream out(spool_dir / "inode-999.spool", std::ios::binary | std::ios::trunc);
-        REQUIRE(out.good());
-        out << "unattributed bytes";
-        REQUIRE(out.good());
-    }
-
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        recovered->stop();
-    }
-
-    const auto original = spool_dir / "inode-999.spool";
-    CHECK(!std::filesystem::exists(original));
-    bool preserved = false;
-    for (const auto& entry : std::filesystem::directory_iterator(spool_dir)) {
-        const auto name = entry.path().filename().string();
-        if (!name.starts_with("inode-999.spool.orphan."))
-            continue;
-        std::ifstream in(entry.path(), std::ios::binary);
-        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        CHECK(bytes == "unattributed bytes");
-        preserved = true;
-    }
-    CHECK(preserved);
-}
-
-#if defined(__linux__)
-size_t linux_open_fd_count() {
-    std::error_code ec;
-    size_t count = 0;
-    for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end; !ec && it != end;
-         it.increment(ec))
-        ++count;
-    REQUIRE(!ec);
-    return count;
-}
-#endif
-
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_spool_descriptors_are_bounded) {
-#if defined(__linux__)
-    TestService fixture("fuse-recovery-fd-bound");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-
-    auto& service = fixture.start();
-    constexpr size_t dirty_inodes = 16;
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        service.filesystem().store().foreground_activity(1);
-        const auto before_dirty = linux_open_fd_count();
-        for (size_t i = 0; i < dirty_inodes; ++i) {
-            auto handle = frontend->create("/fd-" + std::to_string(i), 0644, getuid(), getgid(),
-                                           true, true, false);
-            const Bytes byte{static_cast<uint8_t>(i)};
-            REQUIRE(frontend->write(handle.inode, 0, byte) == byte.size());
-            frontend->release(handle.inode, true);
-        }
-        // Publication remains deliberately blocked, so every inode still has a
-        // durable dirty spool. Those spools must not retain one live descriptor
-        // each after their local durability batches have completed.
-        const auto after_dirty = linux_open_fd_count();
-        CHECK(after_dirty <= before_dirty + 8);
-        frontend->stop();
-    }
-
-    const auto before_recovery = linux_open_fd_count();
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        const auto after_recovery = linux_open_fd_count();
-        CHECK(after_recovery <= before_recovery + 8);
-        recovered->stop();
-    }
-
-    auto drain = config.fuse;
-    drain.publication_quiet = 0ms;
-    const auto before_drain = linux_open_fd_count();
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, drain);
-        REQUIRE(recovered->wait_for_idle(30s));
-        const auto after_drain = linux_open_fd_count();
-        CHECK(after_drain <= before_drain + 8);
-        recovered->stop();
-    }
-#endif
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_idle_spool_descriptor_reopens_for_append) {
-    TestService fixture("fuse-idle-spool-reopen");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-
-    auto& service = fixture.start();
-    const auto first = pattern(64 * 1024 + 13, 17);
-    const auto second = pattern(48 * 1024 + 7, 93);
-    Bytes expected = first;
-    expected.insert(expected.end(), second.begin(), second.end());
-
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        service.filesystem().store().foreground_activity(1);
-        auto created =
-            frontend->create("/append-after-idle.bin", 0644, getuid(), getgid(), true, true, false);
-        const auto inode = created.inode;
-        REQUIRE(frontend->write(inode, 0, first) == first.size());
-        frontend->release(inode, true);
-
-#if defined(__linux__)
-        // release() waits for local durability. The idle dirty inode may retain
-        // its spool pathname and bytes, but not the write-time descriptor.
-        const auto before_reopen = linux_open_fd_count();
-#endif
-
-        auto reopened = frontend->open("/append-after-idle.bin", true, true, true, false);
-        REQUIRE(reopened.inode == inode);
-        REQUIRE(frontend->write(inode, 0, second, true) == second.size());
-        frontend->release(inode, true);
-
-#if defined(__linux__)
-        const auto after_reopen = linux_open_fd_count();
-        CHECK(after_reopen <= before_reopen + 2);
-#endif
-
-        Bytes local(expected.size());
-        REQUIRE(frontend->read(inode, 0, local) == local.size());
-        CHECK(local == expected);
-        frontend->stop();
-    }
-
-    auto drain = config.fuse;
-    drain.publication_quiet = 0ms;
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, drain);
-        REQUIRE(recovered->wait_for_idle(15s));
-        auto committed = service.filesystem().getattr("/append-after-idle.bin");
-        CHECK(committed.size == expected.size());
-        auto reader = service.filesystem().open_read("/append-after-idle.bin");
-        Bytes actual(expected.size());
-        size_t offset = 0;
-        while (offset < actual.size()) {
-            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
-            REQUIRE(n > 0);
+        fs.create_file("/copy.mkv", 0644, getuid(), getgid());
+        auto writer = fs.open_write("/copy.mkv", true);
+        CHECK(publication_bytes(node.memory()) == 0);
+        const auto input = pattern(3 * extent + 12345);
+        for (size_t offset = 0; offset < input.size();) {
+            const size_t n = std::min<size_t>(4096, input.size() - offset);
+            REQUIRE(writer->write(offset, {input.data() + offset, n}) == n);
             offset += n;
         }
-        CHECK(actual == expected);
-        recovered->stop();
+        CHECK(publication_bytes(node.memory()) > 0);
+
+        const int64_t preserved_mtime = 1700000000123456789LL;
+        fs.chmod("/copy.mkv", 0600);
+        fs.chown("/copy.mkv", getuid(), getgid(), true, true);
+        fs.utimens("/copy.mkv", preserved_mtime);
+        writer->commit();
+        CHECK(publication_bytes(node.memory()) == 0);
+
+        const auto entry = fs.getattr("/copy.mkv");
+        CHECK(entry.size == input.size());
+        CHECK(entry.mode == 0600);
+        CHECK(entry.uid == static_cast<uint32_t>(getuid()));
+        CHECK(entry.gid == static_cast<uint32_t>(getgid()));
+        CHECK(entry.mtime_ns == preserved_mtime);
+        CHECK(read_back(fs, "/copy.mkv", input.size()) == input);
+
+        fs.create_file("/conflict.bin", 0644, getuid(), getgid());
+        auto first = fs.open_write("/conflict.bin", true);
+        auto second = fs.open_write("/conflict.bin", true);
+        const auto a = pattern(8192);
+        const auto b = pattern(8193);
+        REQUIRE(first->write(0, a) == a.size());
+        REQUIRE(second->write(0, b) == b.size());
+        first->commit();
+        CHECK(error_code_of([&] { second->commit(); }) == EAGAIN);
+    }
+
+    // A publication whose entry moved underneath it reports ESTALE, so the
+    // frontend replays the generation from the spool; a foreground handle
+    // gets EAGAIN, where retrying is meaningful.
+    {
+        const auto first = pattern(32 * 1024, 7);
+        const auto longer = pattern(96 * 1024, 9);
+        const auto stale_commit_code = [&](WriteDurability durability) {
+            const std::string path = durability == WriteDurability::publication_generation
+                                         ? "/stale-pub.bin"
+                                         : "/stale-fg.bin";
+            fs.create_file(path, 0644, getuid(), getgid());
+            auto writer = fs.open_write(path, false, false, durability);
+            REQUIRE(writer->write(0, first) == first.size());
+            auto other = fs.open_write(path, false);
+            REQUIRE(other->write(0, longer) == longer.size());
+            other->commit();
+            return error_code_of([&] { writer->commit(); });
+        };
+        CHECK(stale_commit_code(WriteDurability::publication_generation) == ESTALE);
+        CHECK(stale_commit_code(WriteDurability::immediate) == EAGAIN);
+    }
+
+    // Retained-memory admission fails a writer only when nothing anywhere in
+    // the pipeline progresses for its budget; progress re-arms the window, so
+    // a merely slow node is never failed for being slow.
+    {
+        fs.create_file("/stalled.bin", 0644, getuid(), getgid());
+        fs.create_file("/moving.bin", 0644, getuid(), getgid());
+        const auto contents = pattern(4096);
+        auto& ledger = node.memory();
+        // Viewer class, because it is bounded only by the non-control
+        // capacity: a loader-class lease could not take the whole budget a
+        // wedged publication pipeline fills.
+        auto hog = ledger.try_acquire(MemoryClass::viewer, MemoryOwner::playback_segment,
+                                      ledger.stats().capacity_bytes -
+                                          ledger.stats().control_reserve_bytes);
+        REQUIRE(hog.has_value());
+
+        std::atomic_uint64_t stalled_progress{0};
+        auto stalled = fs.open_write("/stalled.bin", false, false,
+                                     WriteDurability::publication_generation, 0,
+                                     DataWorkContext(FrameType::loader, extent, {}, nullptr,
+                                                     &stalled_progress, 100ms));
+        const auto stalled_started = std::chrono::steady_clock::now();
+        CHECK(error_code_of([&] { (void)stalled->write(0, contents); }) == EAGAIN);
+        CHECK(std::chrono::steady_clock::now() - stalled_started < 10s);
+
+        // Progress for 500 ms, then none: the write must outlast the progress,
+        // which a plain 100 ms timeout would not.
+        std::atomic_uint64_t moving_progress{0};
+        const auto moving_started = std::chrono::steady_clock::now();
+        std::jthread progress_thread([&] {
+            while (std::chrono::steady_clock::now() - moving_started < 500ms) {
+                moving_progress.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::sleep_for(20ms);
+            }
+        });
+        auto moving = fs.open_write("/moving.bin", false, false,
+                                    WriteDurability::publication_generation, 0,
+                                    DataWorkContext(FrameType::loader, extent, {}, nullptr,
+                                                    &moving_progress, 100ms));
+        CHECK(error_code_of([&] { (void)moving->write(0, contents); }) == EAGAIN);
+        CHECK(std::chrono::steady_clock::now() - moving_started > 500ms);
+    }
+
+    // A loader context keeps loader provenance through a changed-range
+    // rebuild without rereading the unchanged prefix; only viewer classes may
+    // refresh viewer demand accounting. A control context is refused.
+    {
+        bool rejected_control = false;
+        try {
+            (void)DataWorkContext(FrameType::control, extent);
+        } catch (const std::invalid_argument&) {
+            rejected_control = true;
+        }
+        CHECK(rejected_control);
+
+        fs.create_file("/loader.bin", 0644, getuid(), getgid());
+        const auto contents = pattern(2 * extent + 123);
+        write_file(fs, "/loader.bin", contents);
+        (void)fs.store().take_interactive_bytes();
+
+        auto loader = fs.open_write("/loader.bin", false, false,
+                                    WriteDurability::publication_generation, 0,
+                                    DataWorkContext(FrameType::loader, extent));
+        const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x5a);
+        REQUIRE(loader->write(17, {&replacement, 1}) == 1);
+        loader->commit();
+        const auto diagnostics = loader->diagnostics();
+        CHECK(!diagnostics.temp_open);
+        CHECK(diagnostics.materialize_source_reads == 0);
+        CHECK(diagnostics.materialize_source_bytes == 0);
+        CHECK(diagnostics.rebuild_source_bytes == extent + 1);
+        CHECK(diagnostics.rebuild_reused_extents == 2);
+        CHECK(diagnostics.rebuild_put_extents == 1);
+        CHECK(diagnostics.work_frame_type == FrameType::loader);
+        CHECK(diagnostics.work_quantum_bytes == extent);
+        CHECK(fs.store().take_interactive_bytes() == 0);
+        CHECK(fs.store().take_foreground_bytes() == 0);
+
+        fs.create_file("/interactive.bin", 0644, getuid(), getgid());
+        auto interactive = fs.open_write("/interactive.bin", true, false,
+                                         WriteDurability::immediate, 0,
+                                         DataWorkContext(FrameType::read_ahead, extent));
+        const auto bytes = pattern(4096);
+        REQUIRE(interactive->write(0, bytes) == bytes.size());
+        CHECK(fs.store().take_interactive_bytes() == bytes.size());
+    }
+
+    // Loader materialisation is resumable and byte bounded: one canonical
+    // extent per grant, with the old generation visible throughout.
+    {
+        auto contents = pattern(4 * extent);
+        write_file(fs, "/large.bin", contents);
+        auto loader = fs.open_write("/large.bin", false, false,
+                                    WriteDurability::publication_generation, 0,
+                                    DataWorkContext(FrameType::loader, extent));
+        const auto overlay = loader->prepare_write(17, extent);
+        CHECK(overlay.ready);
+        CHECK(overlay.bytes_processed == 0);
+        CHECK(fs.getattr("/large.bin").size == contents.size());
+        CHECK(loader->diagnostics().materialize_source_reads == 0);
+
+        const auto original = contents;
+        const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x6d);
+        contents[17] = replacement;
+        REQUIRE(loader->write(17, {&replacement, 1}) == 1);
+        CHECK(loader->diagnostics().materialize_source_reads == 0);
+        for (size_t step = 0; step < 4; ++step) {
+            const auto preparation = loader->prepare_commit(extent);
+            CHECK(preparation.bytes_processed == extent);
+            CHECK(preparation.ready == (step == 3));
+            const auto diagnostics = loader->diagnostics();
+            CHECK(diagnostics.rebuild_source_bytes == extent + 1);
+            CHECK(diagnostics.rebuild_steps == step + 1);
+            CHECK(read_back(fs, "/large.bin", original.size()) == original);
+        }
+        const auto rebuilt = loader->diagnostics();
+        CHECK(rebuilt.rebuild_reused_extents == 3);
+        CHECK(rebuilt.rebuild_put_extents == 1);
+        loader->commit();
+        CHECK(read_back(fs, "/large.bin", contents.size()) == contents);
+    }
+
+    // Sparse changed-range overlay: overlapping writes merge, only touched
+    // base extents are reread, and a direction change after appends seeds
+    // from this handle's provisional extent.
+    {
+        auto expected = pattern(8 * extent);
+        write_file(fs, "/changed.bin", expected);
+        const auto original = expected;
+        auto writer = fs.open_write("/changed.bin", false, false,
+                                    WriteDurability::publication_generation, 0,
+                                    DataWorkContext(FrameType::loader, extent));
+        const Bytes first{0xa1, 0xa2, 0xa3};
+        const Bytes overlapping{0xb1, 0xb2, 0xb3};
+        const Bytes distant{0xc1, 0xc2};
+        REQUIRE(writer->write(17, first) == first.size());
+        REQUIRE(writer->write(18, overlapping) == overlapping.size());
+        const uint64_t distant_offset = 5 * extent + 10;
+        REQUIRE(writer->write(distant_offset, distant) == distant.size());
+        std::copy(first.begin(), first.end(), expected.begin() + 17);
+        std::copy(overlapping.begin(), overlapping.end(), expected.begin() + 18);
+        std::copy(distant.begin(), distant.end(), expected.begin() + distant_offset);
+        for (size_t step = 0; step < 8; ++step) {
+            const auto preparation = writer->prepare_commit(extent);
+            CHECK(preparation.bytes_processed == extent);
+            CHECK(preparation.ready == (step == 7));
+            CHECK(read_back(fs, "/changed.bin", original.size()) == original);
+        }
+        const auto diagnostics = writer->diagnostics();
+        CHECK(diagnostics.materialize_source_bytes == 0);
+        CHECK(diagnostics.rebuild_source_bytes == 2 * extent + 6);
+        CHECK(diagnostics.rebuild_reused_extents == 6);
+        CHECK(diagnostics.rebuild_put_extents == 2);
+        writer->commit();
+        CHECK(read_back(fs, "/changed.bin", expected.size()) == expected);
+
+        auto combined = pattern(4 * extent, 91);
+        write_file(fs, "/append-then-overwrite.bin", {combined.data(), 2 * extent});
+        auto direction_change = fs.open_write("/append-then-overwrite.bin", false);
+        REQUIRE(direction_change->write(2 * extent, {combined.data() + 2 * extent, 2 * extent}) ==
+                2 * extent);
+        const uint64_t appended_change = 2 * extent + 11;
+        const uint8_t final_byte = static_cast<uint8_t>(combined[appended_change] ^ 0x7c);
+        combined[appended_change] = final_byte;
+        REQUIRE(direction_change->write(appended_change, {&final_byte, 1}) == 1);
+        direction_change->commit();
+        const auto direction = direction_change->diagnostics();
+        CHECK(direction.materialize_source_bytes == 0);
+        CHECK(direction.rebuild_source_bytes == extent + 1);
+        CHECK(direction.rebuild_reused_extents == 3);
+        CHECK(direction.rebuild_put_extents == 1);
+        CHECK(read_back(fs, "/append-then-overwrite.bin", combined.size()) == combined);
+    }
+
+    // The extent pipeline is bounded (a third extent retires the oldest) and
+    // atomic: drained provisional extents are not namespace-visible until the
+    // commit.
+    {
+        fs.create_file("/pipeline.bin", 0644, getuid(), getgid());
+        auto writer = fs.open_write("/pipeline.bin", true, false,
+                                    WriteDurability::publication_generation, 2 * extent);
+        const auto input = pattern(4 * extent);
+        for (size_t offset = 0; offset < input.size(); offset += extent)
+            REQUIRE(writer->write(offset, {input.data() + offset, extent}) == extent);
+        auto staged = writer->diagnostics();
+        CHECK(staged.peak_pending_extent_puts == 2);
+        CHECK(staged.pending_extent_puts == 2);
+        CHECK(staged.new_extent_puts == 2);
+        CHECK(publication_bytes(node.memory()) == 2 * extent);
+        CHECK(fs.getattr("/pipeline.bin").size == 0);
+
+        writer->drain_staging();
+        staged = writer->diagnostics();
+        CHECK(staged.pending_extent_puts == 0);
+        CHECK(staged.new_extent_puts == 4);
+        CHECK(publication_bytes(node.memory()) == 0);
+        CHECK(fs.getattr("/pipeline.bin").size == 0);
+
+        writer->commit();
+        CHECK(fs.getattr("/pipeline.bin").size == input.size());
+        CHECK(read_back(fs, "/pipeline.bin", input.size()) == input);
+    }
+
+    // rsync-style writes: a fresh sequential write across many extents, an
+    // --append resume reopening only the committed tail, an extent-aligned
+    // resume fetching nothing, re-appending after a flush, and a one-byte
+    // overwrite rebuilding only its extent.
+    {
+        auto fresh = pattern(5 * extent + 123457);
+        fs.create_file("/fresh.bin", 0644, getuid(), getgid());
+        auto fresh_writer = fs.open_write("/fresh.bin", true);
+        for (size_t offset = 0; offset < fresh.size();) {
+            const auto n = std::min<size_t>(65537, fresh.size() - offset);
+            REQUIRE(fresh_writer->write(offset, {fresh.data() + offset, n}) == n);
+            offset += n;
+        }
+        fresh_writer->commit();
+        CHECK(read_back(fs, "/fresh.bin", fresh.size()) == fresh);
+
+        auto resumed = pattern(6 * extent + 654321);
+        const size_t prefix = 2 * extent + 77777;
+        write_file(fs, "/resumed.bin", {resumed.data(), prefix});
+        const auto prefix_entry = fs.getattr("/resumed.bin");
+        REQUIRE(prefix_entry.extents.size() == 3);
+        auto resumed_writer = fs.open_write("/resumed.bin", false);
+        for (size_t offset = prefix; offset < resumed.size();) {
+            const auto n = std::min<size_t>(98317, resumed.size() - offset);
+            REQUIRE(resumed_writer->write(offset, {resumed.data() + offset, n}) == n);
+            offset += n;
+        }
+        resumed_writer->commit();
+        const auto resume_diag = resumed_writer->diagnostics();
+        CHECK(resume_diag.sequential);
+        CHECK(!resume_diag.temp_open);
+        CHECK(resume_diag.append_tail_fetches == 1);
+        CHECK(resume_diag.materialize_source_reads == 0);
+        CHECK(resume_diag.rebuild_reused_extents == 0);
+        CHECK(resume_diag.rebuild_put_extents == 0);
+        const auto resumed_entry = fs.getattr("/resumed.bin");
+        REQUIRE(resumed_entry.extents.size() >= 2);
+        CHECK(resumed_entry.extents[0] == prefix_entry.extents[0]);
+        CHECK(resumed_entry.extents[1] == prefix_entry.extents[1]);
+        CHECK(read_back(fs, "/resumed.bin", resumed.size()) == resumed);
+
+        auto aligned = pattern(5 * extent + 333);
+        write_file(fs, "/aligned.bin", {aligned.data(), 3 * extent});
+        const auto aligned_before = fs.getattr("/aligned.bin");
+        REQUIRE(aligned_before.extents.size() == 3);
+        auto aligned_writer = fs.open_write("/aligned.bin", false);
+        for (size_t offset = 3 * extent; offset < aligned.size();) {
+            const auto n = std::min<size_t>(77777, aligned.size() - offset);
+            REQUIRE(aligned_writer->write(offset, {aligned.data() + offset, n}) == n);
+            offset += n;
+        }
+        aligned_writer->commit();
+        const auto aligned_diag = aligned_writer->diagnostics();
+        CHECK(aligned_diag.sequential);
+        CHECK(!aligned_diag.temp_open);
+        CHECK(aligned_diag.append_tail_fetches == 0);
+        CHECK(aligned_diag.materialize_source_reads == 0);
+        CHECK(aligned_diag.rebuild_put_extents == 0);
+        const auto aligned_after = fs.getattr("/aligned.bin");
+        REQUIRE(aligned_after.extents.size() >= aligned_before.extents.size());
+        for (size_t i = 0; i < aligned_before.extents.size(); ++i)
+            CHECK(aligned_after.extents[i] == aligned_before.extents[i]);
+        CHECK(read_back(fs, "/aligned.bin", aligned.size()) == aligned);
+
+        // A FUSE flush does not close the handle: appending again reopens only
+        // the newly committed partial tail.
+        const auto more = pattern(777);
+        const auto aligned_old_size = aligned.size();
+        aligned.insert(aligned.end(), more.begin(), more.end());
+        REQUIRE(aligned_writer->write(aligned_old_size, more) == more.size());
+        aligned_writer->commit();
+        const auto again = aligned_writer->diagnostics();
+        CHECK(!again.temp_open);
+        CHECK(again.append_tail_fetches == 1);
+        CHECK(again.materialize_source_reads == 0);
+        CHECK(again.rebuild_put_extents == 0);
+        CHECK(read_back(fs, "/aligned.bin", aligned.size()) == aligned);
+
+        auto random_write = pattern(4 * extent);
+        write_file(fs, "/random.bin", random_write);
+        auto random_writer = fs.open_write("/random.bin", false);
+        const uint64_t changed_offset = extent + 1234;
+        const uint8_t changed = static_cast<uint8_t>(random_write[changed_offset] ^ 0x5a);
+        random_write[changed_offset] = changed;
+        REQUIRE(random_writer->write(changed_offset, {&changed, 1}) == 1);
+        random_writer->commit();
+        const auto random_diag = random_writer->diagnostics();
+        CHECK(!random_diag.temp_open);
+        CHECK(random_diag.materialize_source_reads == 0);
+        CHECK(random_diag.rebuild_source_bytes == extent + 1);
+        CHECK(random_diag.rebuild_reused_extents == 3);
+        CHECK(random_diag.rebuild_put_extents == 1);
+        CHECK(read_back(fs, "/random.bin", random_write.size()) == random_write);
+    }
+
+    // An open writer's size is projected before commit, follows truncate and
+    // rename, and is gone once the writer is.
+    {
+        fs.create_file("/.active.tmp", 0600, getuid(), getgid());
+        CHECK(!fs.active_write_size("/.active.tmp").has_value());
+        auto writer = fs.open_write("/.active.tmp", true);
+        const auto input = pattern(2 * extent + 12345);
+        REQUIRE(writer->write(0, input) == input.size());
+        CHECK(fs.getattr("/.active.tmp").size == 0);
+        CHECK(fs.active_write_size("/.active.tmp") == std::optional<uint64_t>(input.size()));
+        writer->truncate(65536);
+        CHECK(fs.active_write_size("/.active.tmp") == std::optional<uint64_t>(65536));
+        fs.rename("/.active.tmp", "/active.bin");
+        CHECK(!fs.active_write_size("/.active.tmp").has_value());
+        CHECK(fs.active_write_size("/active.bin") == std::optional<uint64_t>(65536));
+        writer->commit();
+        CHECK(fs.getattr("/active.bin").size == 65536);
+        writer.reset();
+        CHECK(!fs.active_write_size("/active.bin").has_value());
+    }
+
+    // rsync renames its temporary file while the descriptor is still open;
+    // the commit lands on the new name.
+    {
+        fs.create_file("/.upload.tmp", 0600, getuid(), getgid());
+        auto writer = fs.open_write("/.upload.tmp", true);
+        const auto input = pattern(3 * extent + 12345);
+        for (size_t offset = 0; offset < input.size();) {
+            const size_t n = std::min<size_t>(128 * 1024, input.size() - offset);
+            REQUIRE(writer->write(offset, {input.data() + offset, n}) == n);
+            offset += n;
+        }
+        fs.rename("/.upload.tmp", "/movie.mkv");
+        writer->commit();
+        CHECK(absent(fs, "/.upload.tmp"));
+        CHECK(fs.getattr("/movie.mkv").size == input.size());
+        CHECK(read_back(fs, "/movie.mkv", input.size()) == input);
+    }
+
+    // The local snapshot view is the local replica's, cached per generation.
+    {
+        const auto first = fs.local_snapshot_view();
+        CHECK(fs.local_snapshot_view().snapshot == first.snapshot);
+        fs.mkdir("/local-view", 0755, getuid(), getgid());
+        const auto advanced = fs.local_snapshot_view();
+        CHECK(advanced.generation > first.generation);
+        CHECK(advanced.snapshot != first.snapshot);
+        CHECK(advanced.snapshot->entries.contains("/local-view"));
     }
 }
 
-MACHA_HEAVY_TEST("filesystem_fuse", test_fuse_recovered_loader_starts_without_new_fuse_activity) {
-    TestService fixture("fuse-recovery-autostart");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 4;
-    config.fuse.recovery_commit_workers = 2;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 80ms;
+// A staged extent put that fails leaves the abandoned generation invisible:
+// its successful provisional extents are not a partial file.
+MACHA_TEST("filesystem_fuse", test_publication_writer_failure_stays_invisible) {
+    FilesystemNode node("publication-writer-failure", [](Config& config) {
+        config.storage_backends.front().limit = 2 * config.extent_size;
+    });
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    fs.create_file("/pipeline-failure.bin", 0644, getuid(), getgid());
+    auto writer = fs.open_write("/pipeline-failure.bin", true, false,
+                                WriteDurability::publication_generation, 2 * extent);
+    const auto input = pattern(4 * extent);
+    bool failed = false;
+    try {
+        for (size_t offset = 0; offset < input.size(); offset += extent)
+            writer->write(offset, {input.data() + offset, extent});
+        writer->drain_staging();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    CHECK(failed);
+    writer.reset();
+    CHECK(fs.getattr("/pipeline-failure.bin").size == 0);
+}
 
-    auto& service = fixture.start();
+// Before the metadata write floor forms, the local snapshot view reflects the
+// local replica alone and never enters MetadataManager, which would throw
+// MetadataNotReady.
+MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_forms) {
+    TestNode fixture("local-view-before-floor");
+    fixture.config().replication = 1;
+    fixture.config().metadata_min_write_replicas = 2;
+    fixture.start();
+    auto& fs = fixture.filesystem();
+    CHECK(!fixture.metadata().available_snapshot_view().has_value());
+    const auto local_record = fixture.node().local_state().replica().current();
+    const auto first = fs.local_snapshot_view();
+    CHECK(first.generation == local_record.generation);
+    CHECK(first.hash == local_record.hash);
+    CHECK(first.snapshot->entries.contains("/"));
+    CHECK(fs.local_snapshot_view().snapshot == first.snapshot);
+    CHECK(!fixture.metadata().available_snapshot_view().has_value());
+}
 
-    // Create the paths through FUSE and let their namespace operations settle,
-    // so the journal holds inode descriptors with old namespace sequence numbers
-    // but no unpublished namespace work, as after restarting a long copy.
-    constexpr size_t files = 4;
+// The FUSE frontend's local semantics over one node: the pending overlay,
+// reads, truncation, hydration hints, write ordering and merging, inode
+// identity across rename and unlink, inode ownership, close and fsync
+// durability, demand-driven namespace refresh and mtime preservation. The
+// frontend's namespace collaborator is the concrete FileSystem, so it runs
+// against one node's.
+MACHA_TEST("filesystem_fuse", test_fuse_frontend_local_semantics) {
+    FilesystemNode node("fuse-frontend-semantics", [](Config& config) {
+        config.cache.path = config.state_path.parent_path() / "cache";
+        config.cache.max_blocks = 64;
+    });
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+
+    // The derived overlay index coalesces contiguous spool mappings, so a
+    // small read examines one intersecting descriptor rather than replaying
+    // the history; a shrink then regrowth exposes zeros.
     {
-        // A long quiet window while staging, so no publisher can start before
-        // the frontend stops, however the host schedules threads.
-        auto staging_fuse = config.fuse;
-        staging_fuse.publication_quiet = 5s;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, staging_fuse);
-        for (size_t i = 0; i < files; ++i) {
-            auto created = frontend->create("/recover-autostart-" + std::to_string(i) + ".bin",
-                                            0644, getuid(), getgid(), true, true, false);
-            frontend->release(created.inode, true);
+        auto fuse = node.fuse("overlay");
+        fuse.max_spool_bytes = 64ULL * 1024 * 1024;
+        auto frontend = held_frontend(node, fuse);
+        auto handle = frontend->create("/append-verify.bin", 0644, getuid(), getgid(), true, true,
+                                       false);
+        constexpr size_t chunk_size = 4096;
+        constexpr size_t chunks = 256;
+        Bytes expected(chunk_size * chunks);
+        for (size_t chunk = 0; chunk < chunks; ++chunk) {
+            auto bytes = pattern(chunk_size, static_cast<uint8_t>(chunk));
+            std::copy(bytes.begin(), bytes.end(), expected.begin() + chunk * chunk_size);
+            REQUIRE(frontend->write(handle.inode, chunk * chunk_size, bytes, false) ==
+                    bytes.size());
         }
+        const auto before = frontend->diagnostics();
+        CHECK(before.retained_data_operations == chunks);
+        CHECK(before.retained_data_operation_bytes >= chunks * sizeof(uint64_t));
+        CHECK(before.retained_overlay_ranges == 1);
+        CHECK(before.retained_overlay_bytes > 0);
+        CHECK(before.retained_publication_operations == 0);
+        CHECK(before.retained_publication_operation_bytes == 0);
+        Bytes probe(1024);
+        const uint64_t probe_offset = 173 * chunk_size + 777;
+        REQUIRE(frontend->read(handle, probe_offset, probe) == probe.size());
+        CHECK(std::equal(probe.begin(), probe.end(), expected.begin() + probe_offset));
+        const auto after = frontend->diagnostics();
+        CHECK(after.data_overlay_read_queries == before.data_overlay_read_queries + 1);
+        CHECK(after.data_overlay_ranges_examined - before.data_overlay_ranges_examined == 1);
+        CHECK(after.data_overlay_descriptors_copied - before.data_overlay_descriptors_copied == 1);
+
+        const auto replacement = pattern(257, 0xe3);
+        const uint64_t replacement_offset = 91 * chunk_size + 123;
+        REQUIRE(frontend->write(handle.inode, replacement_offset, replacement, false) ==
+                replacement.size());
+        std::copy(replacement.begin(), replacement.end(), expected.begin() + replacement_offset);
+        const auto overwrite_before = frontend->diagnostics();
+        Bytes overwritten(replacement.size());
+        REQUIRE(frontend->read(handle, replacement_offset, overwritten) == overwritten.size());
+        CHECK(overwritten == replacement);
+        CHECK(frontend->diagnostics().data_overlay_ranges_examined -
+                  overwrite_before.data_overlay_ranges_examined ==
+              1);
+
+        const uint64_t truncated = expected.size() / 2;
+        frontend->truncate(handle.inode, truncated);
+        frontend->truncate(handle.inode, truncated + 8192);
+        Bytes zero_tail(8192, 0xff);
+        REQUIRE(frontend->read(handle, truncated, zero_tail) == zero_tail.size());
+        CHECK(std::all_of(zero_tail.begin(), zero_tail.end(), [](uint8_t b) { return b == 0; }));
+        frontend->stop();
+    }
+
+    // Adjacent and overlapping writes keep exact byte order behind one
+    // coalesced dirty range; repeated flushes never double-count; renames
+    // keep the open inode; publication is loader traffic and, when asked,
+    // writes extents through to the persistent block cache.
+    {
+        auto fuse = node.fuse("ordering");
+        fuse.commit_workers = 2;
+        fuse.read_ahead_extents = 2;
+        fuse.write_through_cache = true;
+        auto frontend = node.frontend(fuse);
+        auto handle = frontend->create("/.rsync.tmp", 0600, getuid(), getgid(), true, true, false);
+        const auto inode = handle.inode;
+        REQUIRE(inode != 0);
+
+        Bytes expected(3 * extent + 8192, 0);
+        const auto first = pattern(extent + 32768);
+        REQUIRE(frontend->write(inode, 0, first) == first.size());
+        std::copy(first.begin(), first.end(), expected.begin());
+        const auto adjacent = pattern(extent);
+        REQUIRE(frontend->write(inode, first.size(), adjacent) == adjacent.size());
+        std::copy(adjacent.begin(), adjacent.end(),
+                  expected.begin() + static_cast<ptrdiff_t>(first.size()));
+        auto patch = pattern(131072);
+        const uint64_t patch_offset = extent - 65536;
+        for (auto& byte : patch)
+            byte ^= 0xa5;
+        REQUIRE(frontend->write(inode, patch_offset, patch) == patch.size());
+        std::copy(patch.begin(), patch.end(),
+                  expected.begin() + static_cast<ptrdiff_t>(patch_offset));
+        const auto ranges = frontend->dirty_ranges(inode);
+        REQUIRE(ranges.size() == 1);
+        CHECK(ranges.front().offset == 0);
+        CHECK(ranges.front().length == first.size() + adjacent.size());
+
+        frontend->flush(inode);
+        frontend->flush(inode);
+        const auto during = frontend->status();
+        CHECK(during.pending_data <= 1);
+        CHECK(during.active_data <= fuse.commit_workers);
+
+        frontend->rename("/.rsync.tmp", "/.stage.tmp");
+        REQUIRE(frontend->inode_for_path("/.stage.tmp") == inode);
+        CHECK(frontend->path_for_inode(inode) == "/.stage.tmp");
+        frontend->rename("/.stage.tmp", "/movie.bin");
+        REQUIRE(frontend->inode_for_path("/movie.bin") == inode);
+        CHECK(!frontend->inode_for_path("/.rsync.tmp").has_value());
+        CHECK(!frontend->inode_for_path("/.stage.tmp").has_value());
+
+        auto tail = pattern(8192);
+        for (auto& byte : tail)
+            byte ^= 0x3c;
+        const uint64_t tail_offset = 3 * extent;
+        REQUIRE(frontend->write(inode, tail_offset, tail) == tail.size());
+        std::copy(tail.begin(), tail.end(), expected.begin() + static_cast<ptrdiff_t>(tail_offset));
+        frontend->release(inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
 
-        // One activity sample holds the foreground gate closed for the whole
-        // staging, since the 5 s quiet window outlasts it.
-        auto payload = pattern(4 * config.extent_size);
-        service.filesystem().store().foreground_activity(1);
-        for (size_t i = 0; i < files; ++i) {
-            auto handle = frontend->open("/recover-autostart-" + std::to_string(i) + ".bin", true,
-                                         true, false, false);
-            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-            frontend->release(handle.inode, true);
-        }
-        const auto staged = frontend->status();
-        CHECK(staged.pending_data >= files);
-        CHECK(staged.active_data == 0);
+        // Publication replay must not mark its own chunks as foreground, or
+        // the quiet policy would throttle it by one quiet interval per chunk.
+        CHECK(fs.foreground_idle_for() >= 1h);
+        CHECK(frontend->status().pending_data == 0);
+        const auto entry = fs.getattr("/movie.bin");
+        CHECK(entry.size == expected.size());
+
+        // A read-only FUSE handle is loader traffic too: neither viewer clock
+        // moves.
+        auto fuse_reader = frontend->open("/movie.bin", true, false, false, false);
+        Bytes fuse_probe(4096);
+        const auto foreground_before = fs.foreground_idle_for();
+        const auto interactive_before = fs.store().interactive_idle_for();
+        REQUIRE(frontend->read(fuse_reader, 0, fuse_probe) == fuse_probe.size());
+        CHECK(fs.foreground_idle_for() >= foreground_before);
+        CHECK(fs.store().interactive_idle_for() >= interactive_before);
+        frontend->release(fuse_reader.inode, false);
+
+        CHECK(read_back(fs, "/movie.bin", expected.size()) == expected);
+        REQUIRE(!entry.extents.empty());
+        for (const auto& stored : entry.extents)
+            if (!stored.hole)
+                CHECK(node.local().cache().has(stored.id));
         frontend->stop();
     }
 
-    // Let the playback gate expire but keep the interactive activity clock hot.
-    // Recovery must ignore that clock, since its own object writes feed it. No
-    // FUSE request follows the restart, so recovery must start unprompted.
-    REQUIRE(wait_until(
-        [&] { return service.filesystem().foreground_idle_for() >= config.fuse.publication_quiet; },
-        2s));
-    service.filesystem().store().interactive_activity(1);
-
-    // Journal restoration is provenance, not a background scheduling class:
-    // recovered files may use loader capacity beyond recovery_commit_workers.
-    size_t max_recovery_active = 0;
+    // Reads overlay pending writes on the committed base; a committed-range
+    // read emits one deduplicated FUSE hydration run per inode; truncation
+    // before publication never resurrects the old suffix.
     {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        const auto deadline = Clock::now() + 3s;
-        while (Clock::now() < deadline) {
-            const auto status = recovered->status();
-            max_recovery_active = std::max(max_recovery_active, status.active_recovery_data);
-            if (max_recovery_active > config.fuse.recovery_commit_workers)
-                break;
-            std::this_thread::sleep_for(1ms);
-        }
-        REQUIRE(max_recovery_active > config.fuse.recovery_commit_workers);
-        CHECK(max_recovery_active <= config.fuse.commit_workers);
-        recovered->stop();
-    }
-}
+        const auto committed = pattern(4 * extent + 4096);
+        write_file(fs, "/read.bin", committed);
+        const auto base_entry = fs.getattr("/read.bin");
+        REQUIRE(base_entry.extents.size() >= 5);
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovered_loader_uses_loader_worker_bound) {
-    TestService fixture("fuse-recovery-concurrency");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.commit_workers = 4;
-    config.fuse.recovery_commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
+        auto fuse = node.fuse("read-overlay");
+        fuse.read_ahead_extents = 2;
+        fuse.hydration_priority = 2718;
+        auto frontend = node.frontend(fuse);
+        auto handle = frontend->open("/read.bin", true, true, false, false);
+        auto patch = pattern(16384);
+        for (auto& byte : patch)
+            byte ^= 0x91;
+        const uint64_t patch_offset = 4096;
+        REQUIRE(frontend->write(handle.inode, patch_offset, patch) == patch.size());
+        Bytes view(32768);
+        REQUIRE(frontend->read(handle.inode, 0, view) == view.size());
+        auto expected_view =
+            Bytes(committed.begin(), committed.begin() + static_cast<ptrdiff_t>(view.size()));
+        std::copy(patch.begin(), patch.end(),
+                  expected_view.begin() + static_cast<ptrdiff_t>(patch_offset));
+        CHECK(view == expected_view);
 
-    auto& service = fixture.start();
-    constexpr size_t files = 4;
-    auto payload = pattern(4 * config.extent_size);
-    for (size_t i = 0; i < files; ++i)
-        service.filesystem().create_file("/recover-" + std::to_string(i) + ".bin", 0644, getuid(),
-                                         getgid());
+        Bytes demand(4096);
+        REQUIRE(frontend->read(handle.inode, extent + 1024, demand) == demand.size());
+        REQUIRE(frontend->read(handle.inode, extent + 1024, demand) == demand.size());
+        const auto hints = frontend->hints();
+        REQUIRE(hints.size() == 1);
+        CHECK(hints.front().run_id == "fuse:" + std::to_string(handle.inode));
+        CHECK(hints.front().priority == fuse.hydration_priority);
+        CHECK(hints.front().frame_type == FrameType::read_ahead);
+        REQUIRE(hints.front().objects.size() == 3);
+        CHECK(hints.front().objects[0] == base_entry.extents[1].id);
+        CHECK(hints.front().objects[1] == base_entry.extents[2].id);
+        CHECK(hints.front().objects[2] == base_entry.extents[3].id);
+        const std::set<ObjectId> unique(hints.front().objects.begin(),
+                                        hints.front().objects.end());
+        CHECK(unique.size() == hints.front().objects.size());
 
-    // Foreground activity holds publication so the first frontend leaves a durable backlog.
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        service.filesystem().store().foreground_activity(1);
-        for (size_t i = 0; i < files; ++i) {
-            auto handle =
-                frontend->open("/recover-" + std::to_string(i) + ".bin", true, true, false, false);
-            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-            frontend->release(handle.inode, true);
-        }
-        CHECK(frontend->status().pending_data >= files);
+        frontend->truncate(handle.inode, 32768);
+        frontend->truncate(handle.inode, 65536);
+        Bytes extended(32768, 0xff);
+        REQUIRE(frontend->read(handle.inode, 32768, extended) == extended.size());
+        CHECK(std::all_of(extended.begin(), extended.end(), [](uint8_t b) { return b == 0; }));
+        Bytes beyond_eof(4096, 0xff);
+        CHECK(frontend->read(handle.inode, extent + 1024, beyond_eof) == 0);
+        const std::array<uint8_t, 6> marker{{'M', 'A', 'C', 'H', 'A', '!'}};
+        REQUIRE(frontend->write(handle.inode, 40000, marker) == marker.size());
+        Bytes marker_view(64, 0xff);
+        REQUIRE(frontend->read(handle.inode, 39984, marker_view) == marker_view.size());
+        CHECK(std::equal(marker.begin(), marker.end(), marker_view.begin() + 16));
+
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        CHECK(fs.getattr("/read.bin").size == 65536);
+        const auto final_bytes = read_back(fs, "/read.bin", 65536);
+        CHECK(std::equal(patch.begin(), patch.end(),
+                         final_bytes.begin() + static_cast<ptrdiff_t>(patch_offset)));
+        CHECK(std::equal(marker.begin(), marker.end(), final_bytes.begin() + 40000));
+        CHECK(std::all_of(final_bytes.begin() + 32768, final_bytes.begin() + 40000,
+                          [](uint8_t b) { return b == 0; }));
         frontend->stop();
     }
 
-    auto drain = config.fuse;
-    drain.publication_quiet = 0ms;
-    size_t max_recovery_active = 0;
+    // An open read handle caches its whole immutable extent until the
+    // manifest changes; a fresh handle reads the store and finds the object
+    // gone. Cached payload memory is returned when the handles close.
     {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, drain);
-        const auto deadline = Clock::now() + 30s;
-        while (Clock::now() < deadline) {
-            auto status = recovered->status();
-            max_recovery_active = std::max(max_recovery_active, status.active_recovery_data);
-            CHECK(status.active_recovery_data <= drain.commit_workers);
-            CHECK(status.pending_recovery_data <= status.pending_data);
-            if (!status.pending_data && !status.active_data)
-                break;
-            std::this_thread::sleep_for(1ms);
+        const auto bytes = pattern(extent * 2);
+        write_file(fs, "/read-cache.bin", bytes);
+        const auto entry = fs.getattr("/read-cache.bin");
+        REQUIRE(entry.extents.size() >= 2);
+        const auto payload_bytes = [&] {
+            return node.memory().stats().owner_bytes[static_cast<size_t>(
+                MemoryOwner::object_payload)];
+        };
+        {
+            auto frontend = node.frontend(node.fuse("read-cache"));
+            auto handle = frontend->open("/read-cache.bin", true, false, false, false);
+            Bytes first(4096);
+            REQUIRE(frontend->read(handle, 0, first) == first.size());
+            CHECK(std::equal(first.begin(), first.end(), bytes.begin()));
+            CHECK(payload_bytes() >= extent);
+
+            // erase_all() refuses to remove a retained live object, so remove
+            // the local and cached copies to model its loss.
+            REQUIRE(node.local().data().remove(entry.extents.front().id));
+            (void)node.local().cache().remove(entry.extents.front().id);
+            Bytes second(4096);
+            REQUIRE(frontend->read(handle, 8192, second) == second.size());
+            CHECK(std::equal(second.begin(), second.end(), bytes.begin() + 8192));
+
+            auto fresh = frontend->open("/read-cache.bin", true, false, false, false);
+            const auto code = error_code_of([&] {
+                Bytes probe(4096);
+                (void)frontend->read(fresh, 16384, probe);
+            });
+            CHECK((code == EIO || code == ETIMEDOUT));
+            frontend->release(fresh.inode, false);
+            frontend->release(handle.inode, false);
+            frontend->stop();
         }
-        REQUIRE(recovered->wait_for_idle(30s));
-        recovered->stop();
+        CHECK(payload_bytes() == 0);
     }
 
-    // Recovered loader work uses the loader worker bound, not recovery_commit_workers.
-    CHECK(max_recovery_active > drain.recovery_commit_workers);
-    CHECK(max_recovery_active <= drain.commit_workers);
-    for (size_t i = 0; i < files; ++i) {
-        auto entry = service.filesystem().getattr("/recover-" + std::to_string(i) + ".bin");
+    // write() does not wait for a local fsync pair, so one sequential writer
+    // builds a batch; release() returns only once every accepted write has
+    // reached spool fsync, journal append and journal fsync, and buffered
+    // writes are visible through the mount before then.
+    {
+        auto fuse = node.fuse("group-commit");
+        fuse.request_workers = 24;
+        auto frontend = held_frontend(node, fuse);
+        auto handle = frontend->create("/batch.bin", 0644, getuid(), getgid(), true, true, false);
+        constexpr size_t writes = 128;
+        constexpr size_t chunk_size = 4096;
+        std::vector<Bytes> chunks;
+        chunks.reserve(writes);
+        for (size_t i = 0; i < writes; ++i) {
+            auto chunk = pattern(chunk_size);
+            for (auto& byte : chunk)
+                byte ^= static_cast<uint8_t>(i * 17U + 3U);
+            chunks.push_back(std::move(chunk));
+            REQUIRE(frontend->write(handle.inode, i * chunk_size, chunks.back()) == chunk_size);
+        }
+        Bytes actual(writes * chunk_size);
+        REQUIRE(frontend->read(handle, 0, actual) == actual.size());
+        for (size_t i = 0; i < writes; ++i)
+            CHECK(std::equal(chunks[i].begin(), chunks[i].end(),
+                             actual.begin() + static_cast<ptrdiff_t>(i * chunk_size)));
+        frontend->release(handle.inode, true);
+        const auto status = frontend->status();
+        CHECK(status.durability_writes == writes);
+        CHECK(status.durability_batches < status.durability_writes);
+        frontend->stop();
+    }
+
+    // fsync is the cluster-durability boundary: once it returns, the plain
+    // FileSystem view, which cannot see the spool overlay, holds the whole
+    // generation.
+    {
+        auto fuse = node.fuse("fsync");
+        fuse.timeouts.sync = 10s;
+        auto frontend = node.frontend(fuse);
+        auto handle = frontend->create("/sync.bin", 0644, getuid(), getgid(), true, true, false);
+        const auto bytes = pattern(2 * extent + 12345);
+        REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+        frontend->fsync(handle.inode);
+        CHECK(fs.getattr("/sync.bin").size == bytes.size());
+        CHECK(read_back(fs, "/sync.bin", bytes.size()) == bytes);
+        frontend->release(handle.inode, true);
+        frontend->stop();
+    }
+
+    // A completed publication unlinks the retired spool file.
+    {
+        auto fuse = node.fuse("retire-spool");
+        fuse.commit_workers = 1;
+        auto frontend = node.frontend(fuse);
+        auto handle =
+            frontend->create("/retire-spool.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(2 * extent + 17, 71);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        CHECK(!std::filesystem::exists(*fuse.spool_path /
+                                       ("inode-" + std::to_string(handle.inode) + ".spool")));
+        frontend->stop();
+    }
+
+    // Closing a basis reader (rsync --append-verify) while the writer still
+    // holds dirty data does not publish the writer's data.
+    {
+        auto fuse = node.fuse("read-release");
+        fuse.commit_workers = 1;
+        auto frontend = node.frontend(fuse);
+        auto writer = frontend->create("/growing.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto bytes = pattern(256 * 1024);
+        REQUIRE(frontend->write(writer.inode, 0, bytes) == bytes.size());
+        auto reader = frontend->open("/growing.bin", true, false, false, false);
+        CHECK(reader.inode == writer.inode);
+        frontend->release(reader.inode, false);
+        REQUIRE(frontend->wait_for_idle(2s));
+        CHECK(fs.getattr("/growing.bin").size == 0);
+        REQUIRE(frontend->dirty_ranges(writer.inode).size() == 1);
+        frontend->release(writer.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        CHECK(fs.getattr("/growing.bin").size == bytes.size());
+        CHECK(read_back(fs, "/growing.bin", bytes.size()) == bytes);
+        frontend->stop();
+    }
+
+    // A dirty inode unlinked before release never recreates its path; a
+    // destination replaced by rename while still open keeps its open
+    // identity but loses the path, so its dirty release cannot overwrite the
+    // new file, and its inode is reclaimed once released.
+    {
+        auto fuse = node.fuse("replace");
+        fuse.commit_workers = 2;
+        auto frontend = node.frontend(fuse);
+        auto doomed = frontend->create("/doomed.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto doomed_data = pattern(65536);
+        REQUIRE(frontend->write(doomed.inode, 0, doomed_data) == doomed_data.size());
+        frontend->unlink("/doomed.bin");
+        frontend->release(doomed.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        CHECK(!frontend->inode_for_path("/doomed.bin").has_value());
+        CHECK(absent(fs, "/doomed.bin"));
+
+        auto destination =
+            frontend->create("/target.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto old_bytes = pattern(32768);
+        REQUIRE(frontend->write(destination.inode, 0, old_bytes) == old_bytes.size());
+        frontend->release(destination.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+
+        auto old_open = frontend->open("/target.bin", true, true, false, false);
+        const std::array<uint8_t, 8> stale{{'S', 'T', 'A', 'L', 'E', '!', '!', '!'}};
+        REQUIRE(frontend->write(old_open.inode, 0, stale) == stale.size());
+        auto source =
+            frontend->create("/replacement.bin", 0600, getuid(), getgid(), true, true, false);
+        auto replacement = pattern(98304);
+        for (auto& byte : replacement)
+            byte ^= 0x7d;
+        REQUIRE(frontend->write(source.inode, 0, replacement) == replacement.size());
+        frontend->flush(source.inode);
+        frontend->rename("/replacement.bin", "/target.bin");
+        REQUIRE(frontend->inode_for_path("/target.bin") == source.inode);
+        frontend->release(source.inode, true);
+        frontend->release(old_open.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        CHECK(error_code_of([&] { (void)frontend->path_for_inode(old_open.inode); }) == EBADF);
+        CHECK(fs.getattr("/target.bin").size == replacement.size());
+        CHECK(read_back(fs, "/target.bin", replacement.size()) == replacement);
+        frontend->stop();
+    }
+
+    // A detached inode stays owned while a descriptor is open, even after its
+    // unlink is confirmed, and is reclaimed at the last release; repeated
+    // create/close/unlink cycles return the owner table to its baseline.
+    {
+        auto fuse = node.fuse("inode-ownership");
+        auto frontend = node.frontend(fuse);
+        const auto baseline = frontend->status().inode_count;
+        auto created = frontend->create("/open-unlinked.bin", 0600, getuid(), getgid(), true,
+                                        false, false);
+        REQUIRE(frontend->wait_for_idle(10s));
+        frontend->unlink("/open-unlinked.bin");
+        REQUIRE(frontend->wait_for_idle(10s));
+        const auto detached = frontend->status();
+        CHECK(detached.inode_count == baseline + 1);
+        CHECK(detached.detached_inode_count == 1);
+        frontend->release(created.inode, false);
+        const auto released = frontend->status();
+        CHECK(released.inode_count == baseline);
+        CHECK(released.detached_inode_count == 0);
+        CHECK(released.reclaimed_inode_count == 1);
+
+        constexpr size_t cycles = 64;
+        for (size_t i = 0; i < cycles; ++i) {
+            const auto path = "/lifecycle-" + std::to_string(i);
+            auto handle = frontend->create(path, 0600, getuid(), getgid(), true, false, false);
+            frontend->release(handle.inode, false);
+            frontend->unlink(path);
+        }
+        REQUIRE(frontend->wait_for_idle(20s));
+        const auto final_status = frontend->status();
+        CHECK(final_status.inode_count == baseline);
+        CHECK(final_status.detached_inode_count == 0);
+        CHECK(final_status.reclaimed_inode_count == cycles + 1);
+        CHECK(final_status.peak_inode_count <= baseline + cycles);
+        frontend->stop();
+    }
+
+    // There is no refresh timer: the next namespace-facing request observes
+    // a namespace change made outside the frontend.
+    {
+        auto frontend = node.frontend(node.fuse("demand-refresh"));
+        CHECK(absent(*frontend, "/external"));
+        fs.mkdir("/external", 0755, getuid(), getgid());
+        CHECK(frontend->getattr("/external").type == EntryType::directory);
+        fs.create_file("/external/media.bin", 0644, getuid(), getgid());
+        const auto entries = frontend->readdir("/external");
+        CHECK(std::any_of(entries.begin(), entries.end(),
+                          [](const auto& item) { return item.first == "media.bin"; }));
+        fs.unlink("/external/media.bin");
+        CHECK(absent(*frontend, "/external/media.bin"));
+        frontend->stop();
+    }
+
+    // rsync's write, close, utimens, rename: a data publication committing
+    // after the utimens has published keeps the inode's visible mtime rather
+    // than stamping its own.
+    {
+        InterposedTarget target(fs);
+        TestGate data_gate;
+        target.before_open = [&](const std::string&) { data_gate.enter_and_wait(); };
+        auto frontend = node.frontend(node.fuse("utimens"), target);
+        GateOpener open_on_exit{data_gate};
+        auto handle = frontend->create("/.song.tmp", 0600, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(48 * 1024, 5);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        constexpr int64_t source_mtime = 1600000000000000000LL;
+        frontend->utimens("/.song.tmp", source_mtime);
+        frontend->rename("/.song.tmp", "/song.mp3", false);
+        REQUIRE(data_gate.wait_for_entries(1, 10s));
+        REQUIRE(wait_until([&] { return frontend->status().pending_namespace == 0; }, 10s));
+        CHECK(fs.getattr("/song.mp3").mtime_ns == source_mtime);
+        data_gate.open();
+        REQUIRE(frontend->wait_for_idle(30s));
+        const auto entry = fs.getattr("/song.mp3");
         CHECK(entry.size == payload.size());
+        CHECK(entry.mtime_ns == source_mtime);
+        frontend->stop();
     }
 }
 
-void append_fuse_journal_test_records(const std::filesystem::path& journal,
-                                      std::span<const Bytes> payloads) {
+// The FUSE frontend's data-publication scheduler over one node: notification
+// coalescing, closed-file and nearest-retirement priority, fair byte-bounded
+// quanta, worker concurrency, yielding to loader admission, retry cursors,
+// the progress counter and interrupted fsync waits.
+MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
+    FilesystemNode node("fuse-publication-scheduling");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+
+    // Repeated flushes of one durable watermark coalesce into one queued
+    // owner; a new watermark is one more request.
+    {
+        auto frontend = held_frontend(node, node.fuse("notifications"), false);
+        auto handle = frontend->create("/notification-watermark.bin", 0600, getuid(), getgid(),
+                                       true, true, false);
+        REQUIRE(frontend->wait_for_idle(5s));
+        frontend.loader->hold();
+        const auto first = pattern(64 * 1024, 71);
+        REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
+        frontend->flush(handle.inode);
+        for (size_t i = 0; i < 500; ++i)
+            frontend->flush(handle.inode);
+        const auto second = pattern(64 * 1024, 72);
+        REQUIRE(frontend->write(handle.inode, first.size(), second) == second.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 5s));
+        frontend->flush(handle.inode);
+        for (size_t i = 0; i < 500; ++i)
+            frontend->flush(handle.inode);
+        const auto status = frontend->status();
+        CHECK(status.data_publication_requests == 2);
+        CHECK(status.data_publication_notifications_suppressed == 1000);
+        CHECK(status.data_publication_coalesced_queued == 1);
+        CHECK(status.data_publication_coalesced_running == 0);
+        CHECK(status.data_publication_coalesced_unconfirmed == 0);
+        CHECK(status.data_publications_started == 0);
+        CHECK(status.pending_data == 1);
+        frontend->stop();
+    }
+
+    // A closed file queued behind a large open one is selected first.
+    {
+        auto fuse = node.fuse("closed-first");
+        fuse.commit_workers = 1;
+        auto frontend = held_frontend(node, fuse, false);
+        auto open_large = frontend->create("/open-large.bin", 0644, getuid(), getgid(), false, true,
+                                           false);
+        auto closed_small = frontend->create("/closed-small.bin", 0644, getuid(), getgid(), false,
+                                             true, false);
+        REQUIRE(frontend->wait_for_idle(10s));
+        const auto large = pattern(8 * extent, 51);
+        const auto small = pattern(64 * 1024, 52);
+        REQUIRE(frontend->write(open_large.inode, 0, large) == large.size());
+        REQUIRE(frontend->write(closed_small.inode, 0, small) == small.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
+        frontend.loader->hold();
+        frontend->flush(open_large.inode);
+        frontend->release(closed_small.inode, true);
+        frontend.loader->release();
+        REQUIRE(frontend->wait_for_idle(30s));
+        CHECK(frontend->status().data_closed_priority_selections >= 1);
+        CHECK(fs.getattr("/closed-small.bin").size == small.size());
+        CHECK(fs.getattr("/open-large.bin").size == large.size());
+        frontend->release(open_large.inode, true);
+        frontend->stop();
+    }
+
+    // Under spool pressure the drain selects the nearest closed retirement
+    // ahead of earlier queued work, and that retirement admits the blocked
+    // writer: backpressure wakes on retirement, never by polling.
+    {
+        auto fuse = node.fuse("nearest-retirement");
+        fuse.commit_workers = 1;
+        fuse.publication_quantum_bytes = extent;
+        fuse.publication_inflight_bytes = extent;
+        fuse.publication_pipeline_bytes = extent;
+        fuse.max_spool_bytes = 16 * extent;
+        auto frontend = held_frontend(node, fuse, false);
+        auto pathological = frontend->create("/open-pathological.bin", 0644, getuid(), getgid(),
+                                             false, true, false);
+        auto closed_large = frontend->create("/closed-large.bin", 0644, getuid(), getgid(), false,
+                                             true, false);
+        auto closed_small = frontend->create("/closed-small-2.bin", 0644, getuid(), getgid(),
+                                             false, true, false);
+        auto blocked_follower = frontend->create("/blocked-follower.bin", 0644, getuid(), getgid(),
+                                                 false, true, false);
+        REQUIRE(frontend->wait_for_idle(10s));
+        frontend.loader->hold();
+        // Deliberately bad FIFO order filling the spool exactly to its 50%
+        // pressure threshold: an open inode, a large closed file, then a much
+        // nearer closed retirement.
+        const auto open_bytes = pattern(3 * extent, 81);
+        const auto large_bytes = pattern(4 * extent, 82);
+        const auto small_bytes = pattern(extent, 83);
+        REQUIRE(frontend->write(pathological.inode, 0, open_bytes) == open_bytes.size());
+        REQUIRE(frontend->write(closed_large.inode, 0, large_bytes) == large_bytes.size());
+        REQUIRE(frontend->write(closed_small.inode, 0, small_bytes) == small_bytes.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 3; }, 10s));
+        frontend->flush(pathological.inode);
+        frontend->release(closed_large.inode, true);
+        frontend->release(closed_small.inode, true);
+
+        const auto throttled = frontend->status().spool_throttle_waits;
+        auto admitted = std::async(std::launch::async, [&] {
+            const auto byte = pattern(1, 84);
+            return frontend->write(blocked_follower.inode, 0, byte);
+        });
+        REQUIRE(wait_until(
+            [&] { return frontend->status().spool_throttle_waits > throttled; }, 10s));
+        CHECK(admitted.wait_for(0s) == std::future_status::timeout);
+        CHECK(fs.getattr("/closed-small-2.bin").size == 0);
+        CHECK(fs.getattr("/closed-large.bin").size == 0);
+
+        frontend.loader->release();
+        REQUIRE(admitted.wait_for(10s) == std::future_status::ready);
+        CHECK(admitted.get() == 1);
+        // Its size reaches the namespace with the namespace publication that
+        // follows the retirement.
+        REQUIRE(wait_until(
+            [&] { return fs.getattr("/closed-small-2.bin").size == small_bytes.size(); }, 10s));
+        const auto selected = frontend->status();
+        CHECK(selected.spool_pressure_publication_sweeps == 1);
+        CHECK(selected.data_retirement_priority_selections >= 1);
+        frontend->release(pathological.inode, true);
+        frontend->release(blocked_follower.inode, true);
+        REQUIRE(frontend->wait_for_idle(30s));
+        CHECK(fs.getattr("/closed-large.bin").size == large_bytes.size());
+        frontend->stop();
+    }
+
+    // Quanta are fair and byte bounded: with one quantum in flight, a large
+    // generation selected first returns to the tail after its quantum, so a
+    // small one queued after it commits first, and the cursor survives every
+    // yield without rereading.
+    {
+        auto fuse = node.fuse("quanta");
+        fuse.commit_workers = 4;
+        fuse.publication_quantum_bytes = extent;
+        fuse.publication_inflight_bytes = fuse.publication_quantum_bytes;
+        fuse.publication_pipeline_bytes = extent;
+        InterposedTarget target(fs);
+        std::mutex order_mutex;
+        std::vector<std::string> commit_order;
+        target.after_commit = [&](const std::string& path) {
+            std::lock_guard lock(order_mutex);
+            commit_order.push_back(path);
+        };
+        auto frontend = held_frontend(node, fuse, target, false);
+        auto large_handle =
+            frontend->create("/quantum-large.bin", 0644, getuid(), getgid(), false, true, false);
+        auto small_handle =
+            frontend->create("/quantum-small.bin", 0644, getuid(), getgid(), false, true, false);
+        REQUIRE(frontend->wait_for_idle(10s));
+        const auto large = pattern(8 * extent, 61);
+        const auto small = pattern(64 * 1024, 62);
+        REQUIRE(frontend->write(large_handle.inode, 0, large) == large.size());
+        REQUIRE(frontend->write(small_handle.inode, 0, small) == small.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 2; }, 10s));
+        frontend.loader->hold();
+        frontend->release(large_handle.inode, true);
+        frontend->release(small_handle.inode, true);
+        frontend.loader->release();
+        REQUIRE(frontend->wait_for_idle(30s));
+        {
+            std::lock_guard lock(order_mutex);
+            const std::vector<std::string> small_first{"/quantum-small.bin",
+                                                       "/quantum-large.bin"};
+            CHECK(commit_order == small_first);
+        }
+        const auto status = frontend->status();
+        CHECK(status.data_publications_started == 2);
+        CHECK(status.data_publications_completed == 2);
+        CHECK(status.data_publication_yields >= large.size() / fuse.publication_quantum_bytes - 1);
+        CHECK(status.data_publication_quanta > status.data_publications_completed);
+        CHECK(status.data_publication_peak_active == 1);
+        CHECK(status.data_publication_peak_inflight_bytes == fuse.publication_inflight_bytes);
+        CHECK(status.data_publication_bytes_read == large.size() + small.size());
+        CHECK(fs.getattr("/quantum-large.bin").size == large.size());
+        frontend->stop();
+    }
+
+    // Open loader writers use every available publication worker, repeated
+    // demand coalesces, and the extent executor stays within its bounds.
+    {
+        auto fuse = node.fuse("open-loaders");
+        fuse.commit_workers = 4;
+        // Open loader writers are neither viewers nor capped at one publisher.
+        fuse.foreground_commit_workers = 1;
+        InterposedTarget target(fs);
+        TestGate concurrent;
+        target.before_open = [&](const std::string&) { concurrent.enter_and_wait(); };
+        auto frontend = node.frontend(fuse, target);
+        GateOpener open_on_exit{concurrent};
+        constexpr size_t files = 4;
+        std::vector<FuseOpenHandle> handles;
+        for (size_t i = 0; i < files; ++i)
+            handles.push_back(frontend->create("/loader-" + std::to_string(i) + ".bin", 0644,
+                                               getuid(), getgid(), false, true, false));
+        REQUIRE(frontend->wait_for_idle(10s));
+        const auto payload = pattern(8 * extent, 37);
+        for (const auto& handle : handles)
+            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == files; }, 10s));
+        for (const auto& handle : handles) {
+            frontend->flush(handle.inode);
+            frontend->flush(handle.inode);
+        }
+        // Two publications inside the target at once: neither leaves until
+        // the gate opens.
+        CHECK(concurrent.wait_for_entries(2, 10s));
+        concurrent.open();
+        REQUIRE(frontend->wait_for_idle(30s));
+        const auto status = frontend->status();
+        CHECK(status.data_publications_started == files);
+        CHECK(status.data_publications_completed == files);
+        CHECK(status.data_publication_requests == files);
+        CHECK(status.data_publication_notifications_suppressed >= files);
+        CHECK(status.data_publication_peak_active >= 2);
+        CHECK(status.data_publication_peak_active <= fuse.commit_workers);
+        CHECK(status.data_publication_coalesced_queued + status.data_publication_coalesced_running +
+                  status.data_publication_coalesced_unconfirmed ==
+              0);
+        CHECK(status.data_publication_bytes_read == files * payload.size());
+        CHECK(status.data_publication_bytes_committed == files * payload.size());
+        CHECK(status.data_publication_bytes_confirmed == files * payload.size());
+        // The extent executor is the FileSystem's, sized by the node.
+        const auto executor_workers = node.config().fuse.commit_workers;
+        CHECK(status.extent_executor_workers == executor_workers);
+        CHECK(status.extent_executor_submitted >= files * 8);
+        CHECK(status.extent_executor_peak_active >= 1);
+        CHECK(status.extent_executor_peak_active <= executor_workers);
+        CHECK(status.extent_executor_peak_queued <= executor_workers * 2);
+        CHECK(status.extent_executor_active == 0);
+        CHECK(status.extent_executor_queued == 0);
+        for (const auto& handle : handles)
+            frontend->release(handle.inode, true);
+        frontend->stop();
+    }
+
+    // A one-byte overwrite publishes by bounded quanta: spool replay yields
+    // before the extent-aligned rebuild, which yields at four checkpoints;
+    // the file is never materialised whole.
+    {
+        auto contents = pattern(4 * extent);
+        write_file(fs, "/overwrite.bin", contents);
+        auto fuse = node.fuse("overwrite-quanta");
+        fuse.commit_workers = 1;
+        fuse.publication_quantum_bytes = extent;
+        fuse.publication_inflight_bytes = extent;
+        fuse.publication_pipeline_bytes = extent;
+        auto frontend = node.frontend(fuse);
+        auto handle = frontend->open("/overwrite.bin", true, true, false, false);
+        const uint8_t replacement = static_cast<uint8_t>(contents[17] ^ 0x39);
+        contents[17] = replacement;
+        REQUIRE(frontend->write(handle.inode, 17, {&replacement, 1}) == 1);
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(20s));
+        const auto status = frontend->status();
+        CHECK(status.data_publications_completed == 1);
+        CHECK(status.data_publication_bytes_read == 1);
+        CHECK(status.data_publication_completed_spool_bytes_read == 1);
+        CHECK(status.data_publication_completed_source_bytes_read == extent + 1);
+        CHECK(status.data_publication_completed_reused_extents == 3);
+        CHECK(status.data_publication_completed_put_extents == 1);
+        CHECK(status.data_publication_yields >= 5);
+        CHECK(read_back(fs, "/overwrite.bin", contents.size()) == contents);
+        frontend->stop();
+    }
+
+    // The no-progress deadline watches events that release retained memory
+    // (retired extents, commits), not admitted quanta, which a publication
+    // takes far more often.
+    {
+        auto fuse = node.fuse("progress-counter");
+        fuse.commit_workers = 1;
+        fuse.publication_quantum_bytes = extent;
+        fuse.publication_inflight_bytes = fuse.publication_quantum_bytes;
+        fuse.publication_pipeline_bytes = extent;
+        auto frontend = node.frontend(fuse);
+        // The progress counter is the FileSystem's, shared by every writer.
+        const auto progress_before = frontend->diagnostics().data_publication_progress_events;
+        auto handle = frontend->create("/progress-counter.bin", 0644, getuid(), getgid(), false,
+                                       true, false);
+        // Sixteen writes, each its own quantum (a quantum equal to the extent
+        // yields after one write), retiring four extents and one commit.
+        const auto contents = pattern(4 * extent, 77);
+        const auto piece = extent / 4;
+        for (size_t offset = 0; offset < contents.size(); offset += piece)
+            REQUIRE(frontend->write(handle.inode, offset, {contents.data() + offset, piece}) ==
+                    piece);
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(60s));
+        const auto diagnostics = frontend->diagnostics();
+        CHECK(diagnostics.data_publications_completed == 1);
+        const auto progress = diagnostics.data_publication_progress_events - progress_before;
+        CHECK(progress > 0);
+        CHECK(diagnostics.data_publication_quanta >= 2 * progress);
+        CHECK(fs.getattr("/progress-counter.bin").size == contents.size());
+        frontend->stop();
+    }
+
+    // A retryable failure of a staged drain keeps the publication and its
+    // cursor: the retry resumes after the failed drain rather than rereading
+    // the spool from the start.
+    {
+        auto fuse = node.fuse("transient-cursor");
+        fuse.commit_workers = 1;
+        fuse.publication_quantum_bytes = extent;
+        fuse.publication_inflight_bytes = extent;
+        fuse.publication_pipeline_bytes = extent;
+        InterposedTarget target(fs);
+        std::atomic_bool failed{};
+        target.before_drain = [&](uint64_t written) {
+            if (written >= extent && !failed.exchange(true))
+                throw FsError(EIO, "staged extent put failed");
+        };
+        auto frontend = node.frontend(fuse, target);
+        auto handle = frontend->create("/transient-cursor.bin", 0644, getuid(), getgid(), false,
+                                       true, false);
+        REQUIRE(frontend->wait_for_idle(10s));
+        const auto contents = pattern(3 * extent + 12345, 73);
+        REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(20s));
+        const auto status = frontend->status();
+        CHECK(failed.load());
+        CHECK(status.backend_failures == 1);
+        CHECK(status.data_publications_started == 1);
+        CHECK(status.data_publications_completed == 1);
+        CHECK(status.data_publication_bytes_read == contents.size());
+        CHECK(status.data_publication_completed_spool_bytes_read == contents.size());
+        CHECK(read_back(fs, "/transient-cursor.bin", contents.size()) == contents);
+        frontend->stop();
+    }
+
+    // A running publication yields at its next chunk when its admission
+    // asks it to, well inside its quantum, and resumes from its cursor when
+    // admitted again.
+    {
+        auto fuse = node.fuse("yield");
+        fuse.commit_workers = 1;
+        fuse.publication_quantum_bytes = 4 * extent;
+        fuse.publication_inflight_bytes = 4 * extent;
+        fuse.publication_pipeline_bytes = extent;
+        InterposedTarget target(fs);
+        HeldLoaderAdmission* loader = nullptr;
+        std::atomic_bool held{};
+        target.after_write = [&](uint64_t) {
+            if (!held.exchange(true))
+                loader->hold();
+        };
+        auto frontend = held_frontend(node, fuse, target, false);
+        loader = frontend.loader;
+        auto handle =
+            frontend->create("/playback-yield.bin", 0600, getuid(), getgid(), true, true, false);
+        REQUIRE(frontend->wait_for_idle(5s));
+        const auto payload = pattern(8 * extent);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        REQUIRE(wait_until([&] { return held.load() && frontend->status().active_data == 0; },
+                           10s));
+        const auto paused = frontend->status();
+        // Held after its first chunk, it stops before taking a whole extent.
+        CHECK(paused.data_publication_bytes_read < extent);
+        CHECK(paused.pending_data == 1);
+        CHECK(paused.data_publications_completed == 0);
+        loader->release();
+        REQUIRE(frontend->wait_for_idle(10s));
+        const auto resumed = frontend->status();
+        CHECK(resumed.data_publications_completed == 1);
+        CHECK(resumed.data_publication_bytes_read == payload.size());
+        CHECK(fs.getattr("/playback-yield.bin").size == payload.size());
+        frontend->stop();
+    }
+
+    // An fsync waits, with no deadline, for its publication. A stopping node
+    // can never finish it, so interrupt_waits() ends the wait with EIO; the
+    // data is journalled and publishes after the restart.
+    {
+        auto frontend = held_frontend(node, node.fuse("fsync-interrupted"), false);
+        auto handle =
+            frontend->create("/fsync-held.bin", 0644, getuid(), getgid(), false, true, false);
+        REQUIRE(frontend->wait_for_idle(10s));
+        frontend.loader->hold();
+        const auto bytes = pattern(64 * 1024, 91);
+        REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+        auto synced = std::async(std::launch::async, [&] {
+            return error_code_of([&] { frontend->fsync(handle.inode); });
+        });
+        REQUIRE(wait_until([&] { return frontend->status().pending_data == 1; }, 10s));
+        CHECK(synced.wait_for(0s) == std::future_status::timeout);
+        frontend->interrupt_waits();
+        REQUIRE(synced.wait_for(10s) == std::future_status::ready);
+        CHECK(synced.get() == EIO);
+        frontend.loader->release();
+        frontend->release(handle.inode, true);
+        frontend->stop();
+    }
+
+    // Production admission (law 2): only the foreground clock, which HTTP
+    // playback alone advances, makes a viewer active; loader work is then
+    // paced by its weighted share, never stopped. The interactive clock,
+    // which the node's own object writes feed, does not count.
+    {
+        auto fuse = node.fuse("viewer-admission");
+        fuse.publication_quiet = 1h;
+        ViewerWeightedAdmission admission(fs, fuse);
+        const LoaderAdmission::TimePoint t0{};
+        CHECK(admission.can_start(t0));
+        CHECK(!admission.should_yield(t0));
+        CHECK(admission.retry_after(t0) == std::optional<std::chrono::milliseconds>(0ms));
+        fs.note_interactive_activity(1);
+        CHECK(admission.can_start(t0));
+        CHECK(!admission.should_yield(t0));
+
+        fs.note_foreground_activity(1);
+        CHECK(admission.can_start(t0));
+        admission.started(t0, true);
+        CHECK(!admission.should_yield(t0));
+        CHECK(admission.should_yield(t0 + 1s));
+        admission.finished(t0 + 1s);
+        CHECK(!admission.can_start(t0 + 2s));
+        const auto retry = admission.retry_after(t0 + 2s);
+        REQUIRE(retry.has_value());
+        CHECK(*retry > 0ms);
+        CHECK(admission.can_start(t0 + 2s + *retry));
+    }
+}
+
+// The FUSE frontend's admission bounds over one node: spool capacity, the
+// spool's soft threshold, the operation journal, pending write payloads and
+// operation metadata. Saturation is backpressure that wakes on progress or
+// shutdown; it never manufactures ENOSPC for data and never polls.
+MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
+    FilesystemNode node("fuse-admission-backpressure");
+    auto& fs = node.fs();
+
+    // A write that cannot fit waits rather than failing; spool pressure
+    // starts publication of the durable prefix and the writer wakes once
+    // that progress frees capacity.
+    {
+        auto fuse = node.fuse("spool-capacity");
+        fuse.commit_workers = 1;
+        fuse.max_spool_bytes = 384 * 1024;
+        auto frontend = held_frontend(node, fuse);
+        auto handle =
+            frontend->create("/bounded-spool.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto first = pattern(128 * 1024, 41);
+        REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
+        auto second_write = std::async(std::launch::async, [&] {
+            const auto second = pattern(300 * 1024, 42);
+            return frontend->write(handle.inode, first.size(), second);
+        });
+        REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
+        CHECK(second_write.wait_for(0s) == std::future_status::timeout);
+        frontend.loader->release();
+        REQUIRE(second_write.wait_for(10s) == std::future_status::ready);
+        CHECK(second_write.get() == 300 * 1024);
+
+        const auto pressure = frontend->status();
+        CHECK(pressure.spool_limit_bytes == fuse.max_spool_bytes);
+        CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
+        CHECK(pressure.spool_pressure_publication_sweeps == 1);
+        CHECK(pressure.spool_publish_rate_bytes_per_second > 0);
+        CHECK(pressure.spool_publish_rate_window_bytes >= first.size());
+        CHECK(pressure.spool_publish_rate_window_ms > 0);
+        const auto spool = *fuse.spool_path / ("inode-" + std::to_string(handle.inode) + ".spool");
+        REQUIRE(std::filesystem::exists(spool));
+        CHECK(std::filesystem::file_size(spool) <= fuse.max_spool_bytes);
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        frontend->stop();
+    }
+
+    // Past the 50% soft threshold, before any whole-file retirement has
+    // established a rate, a drained partial quantum of an open file is
+    // enough progress to admit the next writer.
+    {
+        auto fuse = node.fuse("spool-bootstrap");
+        fuse.commit_workers = 1;
+        fuse.publication_quantum_bytes = 1024 * 1024;
+        fuse.publication_inflight_bytes = 1024 * 1024;
+        fuse.publication_pipeline_bytes = 1024 * 1024;
+        fuse.max_spool_bytes = 8 * 1024 * 1024;
+        auto frontend = held_frontend(node, fuse);
+        auto first =
+            frontend->create("/large-open.bin", 0600, getuid(), getgid(), true, true, false);
+        auto follower =
+            frontend->create("/follower.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto initial = pattern(7 * 1024 * 1024, 61);
+        REQUIRE(frontend->write(first.inode, 0, initial) == initial.size());
+        auto admitted = std::async(std::launch::async, [&] {
+            const auto next = pattern(1024 * 1024, 62);
+            return frontend->write(follower.inode, 0, next);
+        });
+        REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
+        CHECK(admitted.wait_for(0s) == std::future_status::timeout);
+        frontend.loader->release();
+        REQUIRE(admitted.wait_for(10s) == std::future_status::ready);
+        CHECK(admitted.get() == 1024 * 1024);
+        const auto progress = frontend->status();
+        CHECK(progress.spool_bytes <= progress.spool_limit_bytes);
+        CHECK(progress.spool_pressure_publication_sweeps == 1);
+        CHECK(progress.data_publication_yields >= 1);
+        // Released by drained partial publication, not by the whole-file
+        // retirement rate, which is still unavailable.
+        CHECK(progress.spool_publish_rate_bytes_per_second == 0);
+        CHECK(progress.data_publications_completed == 0);
+        frontend->stop();
+    }
+
+    // A permanently stalled publisher blocks the writer without busy-polling
+    // or ENOSPC; stopping the mount cancels the wait with EINTR.
+    {
+        auto fuse = node.fuse("spool-stalled");
+        fuse.commit_workers = 1;
+        fuse.max_spool_bytes = 384 * 1024;
+        auto frontend = held_frontend(node, fuse);
+        auto handle =
+            frontend->create("/stalled-spool.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto first = pattern(256 * 1024, 51);
+        REQUIRE(frontend->write(handle.inode, 0, first) == first.size());
+        auto blocked = std::async(std::launch::async, [&] {
+            const auto second = pattern(256 * 1024, 52);
+            return error_code_of([&] { (void)frontend->write(handle.inode, first.size(), second); });
+        });
+        REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
+        CHECK(blocked.wait_for(0s) == std::future_status::timeout);
+        const auto pressure = frontend->status();
+        CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
+        CHECK(pressure.spool_pressure_publication_sweeps == 1);
+        frontend->stop();
+        REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
+        CHECK(blocked.get() == EINTR);
+    }
+
+    // With one durable data operation outstanding, so the journal cannot take
+    // its idle reset, new namespace work is refused with ENOSPC at the
+    // journal bound; completion records for admitted work may drain past it,
+    // but refused work never extends the journal.
+    {
+        auto fuse = node.fuse("journal-budget");
+        fuse.commit_workers = 1;
+        fuse.max_operation_journal_bytes = 12 * 1024;
+        InterposedTarget target(fs);
+        TestGate data_gate;
+        target.before_open = [&](const std::string&) { data_gate.enter_and_wait(); };
+        auto frontend = node.frontend(fuse, target);
+        GateOpener open_on_exit{data_gate};
+        auto hold =
+            frontend->create("/journal-hold.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(64 * 1024, 91);
+        REQUIRE(frontend->write(hold.inode, 0, payload) == payload.size());
+        frontend->release(hold.inode, true);
+        REQUIRE(data_gate.wait_for_entries(1, 10s));
+        const auto journal = *fuse.operation_journal_path;
+        REQUIRE(std::filesystem::exists(journal));
+        bool refused = false;
+        for (size_t i = 0; i < 256 && !refused; ++i) {
+            const auto code = error_code_of(
+                [&] { frontend->mkdir("/journal-budget-" + std::to_string(i), 0700, getuid(), getgid()); });
+            REQUIRE((code == 0 || code == ENOSPC));
+            refused = code == ENOSPC;
+        }
+        REQUIRE(refused);
+        REQUIRE(wait_until([&] { return frontend->status().pending_namespace == 0; }, 5s));
+        const auto bounded_size = std::filesystem::file_size(journal);
+        for (size_t i = 0; i < 8; ++i)
+            CHECK(error_code_of([&] {
+                      frontend->mkdir("/journal-refused-" + std::to_string(i), 0700, getuid(),
+                                      getgid());
+                  }) == ENOSPC);
+        CHECK(std::filesystem::file_size(journal) == bounded_size);
+        data_gate.open();
+        frontend->stop();
+    }
+
+    // Write payloads not yet in the spool are byte bounded: with one write
+    // waiting on the spool, the next waits before copying its payload; both
+    // end with EINTR at shutdown.
+    {
+        auto fuse = node.fuse("write-bytes");
+        fuse.commit_workers = 1;
+        fuse.max_spool_bytes = 128 * 1024;
+        fuse.max_pending_write_bytes = 128 * 1024;
+        fuse.timeouts.write = 2s;
+        auto frontend = held_frontend(node, fuse);
+        auto handle = frontend->create("/write-byte-bound.bin", 0600, getuid(), getgid(), true,
+                                       true, false);
+        const auto payload = pattern(128 * 1024, 91);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
+        auto blocked_in_spool = std::async(std::launch::async, [&] {
+            return error_code_of(
+                [&] { (void)frontend->write(handle.inode, payload.size(), payload); });
+        });
+        REQUIRE(wait_until(
+            [&] { return frontend->status().pending_write_request_bytes == payload.size(); }, 5s));
+        auto blocked_before_copy = std::async(std::launch::async, [&] {
+            return error_code_of(
+                [&] { (void)frontend->write(handle.inode, payload.size() * 2, payload); });
+        });
+        // Nothing reports a payload waiting for admission, so this one
+        // negative check is bounded by time: in the window the second payload
+        // must not be admitted beside the first.
+        CHECK(blocked_before_copy.wait_for(100ms) == std::future_status::timeout);
+        const auto bounded = frontend->status();
+        CHECK(bounded.pending_write_request_bytes == payload.size());
+        CHECK(bounded.peak_pending_write_request_bytes == payload.size());
+        CHECK(bounded.pending_write_request_limit_bytes == payload.size());
+        frontend->stop();
+        REQUIRE(blocked_in_spool.wait_for(2s) == std::future_status::ready);
+        REQUIRE(blocked_before_copy.wait_for(2s) == std::future_status::ready);
+        CHECK(blocked_in_spool.get() == EINTR);
+        CHECK(blocked_before_copy.get() == EINTR);
+        CHECK(frontend->status().peak_pending_write_request_bytes == payload.size());
+    }
+
+    // Operation metadata is bounded on the heap: a mutation past the bound
+    // waits owning no durable operation, and shutdown ends it with EINTR.
+    {
+        auto fuse = node.fuse("operation-metadata");
+        fuse.commit_workers = 1;
+        fuse.max_operation_metadata_bytes = 2048;
+        fuse.max_spool_bytes = 1024 * 1024;
+        auto frontend = held_frontend(node, fuse);
+        auto handle =
+            frontend->create("/metadata-bound.bin", 0600, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(4096, 37);
+        for (size_t i = 0; i < 3; ++i)
+            REQUIRE(frontend->write(handle.inode, payload.size() * i, payload) == payload.size());
+        auto blocked = std::async(std::launch::async, [&] {
+            return error_code_of(
+                [&] { (void)frontend->write(handle.inode, payload.size() * 3, payload); });
+        });
+        REQUIRE(wait_until([&] { return frontend->status().operation_metadata_waits >= 1; }, 5s));
+        CHECK(blocked.wait_for(0s) == std::future_status::timeout);
+        const auto bounded = frontend->status();
+        CHECK(bounded.operation_metadata_bytes <= bounded.operation_metadata_limit_bytes);
+        CHECK(bounded.peak_operation_metadata_bytes <= bounded.operation_metadata_limit_bytes);
+        frontend->stop();
+        REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
+        CHECK(blocked.get() == EINTR);
+    }
+
+    // Retiring operation metadata through publication wakes the blocked
+    // writer, and every request and operation lease is returned.
+    {
+        auto fuse = node.fuse("metadata-retirement");
+        fuse.commit_workers = 1;
+        fuse.max_operation_metadata_bytes = 1024;
+        fuse.max_spool_bytes = 1024 * 1024;
+        auto frontend = node.frontend(fuse);
+        auto handle = frontend->create("/metadata-retirement.bin", 0600, getuid(), getgid(), true,
+                                       true, false);
+        const auto payload = pattern(4096, 73);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        REQUIRE(wait_until([&] { return frontend->status().durability_writes == 1; }, 5s));
+        auto waiting = std::async(std::launch::async, [&] {
+            return frontend->write(handle.inode, payload.size(), payload);
+        });
+        REQUIRE(waiting.wait_for(10s) == std::future_status::ready);
+        CHECK(waiting.get() == payload.size());
+        const auto progressed = frontend->status();
+        CHECK(progressed.operation_metadata_waits >= 1);
+        CHECK(progressed.data_publications_completed >= 1);
+        CHECK(progressed.operation_metadata_bytes <= progressed.operation_metadata_limit_bytes);
+        CHECK(progressed.peak_operation_metadata_bytes <= progressed.operation_metadata_limit_bytes);
+        frontend->release(handle.inode, true);
+        REQUIRE(frontend->wait_for_idle(10s));
+        REQUIRE(wait_until(
+            [&] {
+                const auto memory = node.memory().stats();
+                return memory.owner_bytes[static_cast<size_t>(MemoryOwner::fuse_request)] == 0 &&
+                       memory.owner_bytes[static_cast<size_t>(MemoryOwner::fuse_operation)] == 0;
+            },
+            5s));
+        frontend->stop();
+    }
+}
+
+// Publication failures over one node, whose target fails every attempt as an
+// unreachable write floor does: a long failure run is reported, then the file
+// is parked for the operator, who may retry or abandon it; a recovered write
+// whose path has left the namespace fails once and is not readmitted.
+MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) {
+    FilesystemNode node("fuse-publication-failures");
+    auto& fs = node.fs();
+    InterposedTarget failing(fs);
+    failing.before_open = [](const std::string&) {
+        throw FsError(EIO, "metadata write durability floor unavailable");
+    };
+
+    // Crossing the escalation threshold (10 failures) is counted once for the
+    // run, before and independently of parking.
+    {
+        auto fuse = node.fuse("escalation");
+        fuse.commit_workers = 1;
+        fuse.publication_retry = RetryPolicy{500, 60s, 1ms, 2ms};
+        fuse.publication_retry.max_failing_duration = 60s;
+        auto frontend = node.frontend(fuse, failing);
+        auto handle = frontend->create("/noisy.bin", 0644, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(64 * 1024 + 3, 51);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        REQUIRE(wait_until(
+            [&] { return frontend->diagnostics().publications_retrying_persistently == 1; }, 10s));
+        REQUIRE(wait_until(
+            [&] { return frontend->diagnostics().publication_retries_backed_off >= 30; }, 10s));
+        CHECK(frontend->diagnostics().publications_retrying_persistently == 1);
+        CHECK(frontend->diagnostics().parked_publications == 0);
+        frontend->stop();
+    }
+
+    // Past its budget (more than 3 failures) the publication is parked:
+    // visible, actionable, quiet and not poisoning the inode. An operator
+    // retry resets the budget; an abandon drops the dirty generation.
+    {
+        auto fuse = node.fuse("park");
+        fuse.commit_workers = 1;
+        fuse.publication_retry = RetryPolicy{3, 60s, 5ms, 20ms};
+        auto frontend = node.frontend(fuse, failing);
+        auto handle = frontend->create("/parked.bin", 0644, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(64 * 1024 + 3, 44);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
+        const auto parked = frontend->parked_publications();
+        REQUIRE(parked.size() == 1);
+        CHECK(parked.front().inode == handle.inode);
+        CHECK(parked.front().path == "/parked.bin");
+        CHECK(parked.front().attempts == 4);
+        CHECK(parked.front().pending_bytes == payload.size());
+        CHECK(frontend->diagnostics().publication_retries_backed_off == 3);
+
+        // Parked is not scheduled: nothing pending or running, so nothing
+        // can attempt it again.
+        const auto failures_at_park = frontend->status().backend_failures;
+        REQUIRE(frontend->wait_for_idle(5s));
+        CHECK(frontend->status().pending_data == 0);
+        CHECK(frontend->status().backend_failures == failures_at_park);
+        Bytes back(payload.size());
+        REQUIRE(frontend->read(handle.inode, 0, back) == back.size());
+        CHECK(back == payload);
+
+        REQUIRE(frontend->retry_parked_publication(handle.inode));
+        CHECK(frontend->diagnostics().parked_publications == 0);
+        REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
+        CHECK(frontend->status().backend_failures > failures_at_park);
+
+        CHECK(!frontend->retry_parked_publication(handle.inode + 1000));
+        REQUIRE(frontend->abandon_parked_publication(handle.inode));
+        CHECK(frontend->parked_publications().empty());
+        CHECK(frontend->diagnostics().parked_publications == 0);
+        CHECK(frontend->getattr("/parked.bin").size == 0);
+        REQUIRE(frontend->wait_for_idle(5s));
+        frontend->stop();
+    }
+
+    // A recovered write whose path was removed while the node was down (a
+    // cluster generation accepted meanwhile) fails once, terminally, and is
+    // not readmitted as an unbounded recovery retry.
+    {
+        auto fuse = node.fuse("terminal-recovery");
+        fuse.commit_workers = 1;
+        fs.create_file("/healthy.bin", 0644, getuid(), getgid());
+        fs.create_file("/removed-before-replay.bin", 0644, getuid(), getgid());
+        const auto contents = pattern(256 * 1024 + 17, 91);
+        {
+            auto frontend = held_frontend(node, fuse);
+            auto handle =
+                frontend->open("/removed-before-replay.bin", true, true, false, false);
+            REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
+            frontend->release(handle.inode, true);
+            REQUIRE(wait_until([&] { return frontend->status().pending_data == 1; }, 10s));
+            frontend->stop();
+        }
+        fs.unlink("/removed-before-replay.bin");
+        auto recovered = node.frontend(fuse);
+        REQUIRE(wait_until([&] { return recovered->status().backend_failures >= 1; }, 10s));
+        REQUIRE(recovered->wait_for_idle(5s));
+        const auto settled = recovered->status();
+        CHECK(settled.backend_failures == 1);
+        CHECK(settled.pending_data == 0);
+        CHECK(settled.active_data == 0);
+        CHECK(recovered->getattr("/healthy.bin").type == EntryType::file);
+        recovered->stop();
+    }
+}
+
+// A publication writer keeps a retained-memory extent lease across clean
+// yields, and scheduling is breadth-first, so unbounded open writers would fill
+// the durable-lower budget with partial buffers and none could finish. The
+// backlog here is wider than the ledger can hold writers for; the open-writer
+// bound makes publication depth-first over the open set and every file
+// completes. Its own node, for the small ledger.
+MACHA_TEST("filesystem_fuse", test_fuse_publication_backlog_wider_than_ledger_completes) {
+    FilesystemNode node("fuse-publication-backlog-width", [](Config& config) {
+        // Durable-lower is capacity - control - viewer = 16M: at most 16
+        // concurrent extent leases for publication.
+        config.runtime.retained_memory_bytes = 32ULL * 1024 * 1024;
+        config.runtime.control_memory_reserve_bytes = 8ULL * 1024 * 1024;
+        config.runtime.viewer_memory_reserve_bytes = 8ULL * 1024 * 1024;
+        config.runtime.loader_memory_reserve_bytes = 8ULL * 1024 * 1024;
+        config.runtime.reassembly_memory_reserve_bytes = 4ULL * 1024 * 1024;
+    });
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    auto fuse = node.fuse("backlog");
+    fuse.commit_workers = 2;
+    // Quantum == extent size makes every quantum yield mid-extent, leaving a
+    // partial buffer, and its lease, on the retained writer.
+    fuse.publication_quantum_bytes = extent;
+    fuse.publication_inflight_bytes = 2 * fuse.publication_quantum_bytes;
+    fuse.publication_pipeline_bytes = extent;
+    fuse.publication_no_progress_deadline = 2s;
+    // Worst case 4 x (1M buffer + 1M pipeline) = 8M, the loader reserve.
+    fuse.publication_max_open_writers = 4;
+
+    auto frontend = held_frontend(node, fuse);
+    constexpr size_t files = 20;
+    const auto contents = pattern(2 * 1024 * 1024 + 12345, 91);
+    for (size_t i = 0; i < files; ++i) {
+        auto handle = frontend->create("/backlog-" + std::to_string(i) + ".bin", 0644, getuid(),
+                                       getgid(), false, true, false);
+        REQUIRE(frontend->write(handle.inode, 0, contents) == contents.size());
+        frontend->release(handle.inode, true);
+    }
+    // Released, publication is work-conserving with the whole width queued.
+    frontend.loader->release();
+    REQUIRE(frontend->wait_for_idle(180s));
+    const auto status = frontend->status();
+    const auto diagnostics = frontend->diagnostics();
+    CHECK(status.data_publications_started == files);
+    CHECK(status.data_publications_completed == files);
+    CHECK(diagnostics.parked_publications == 0);
+    CHECK(diagnostics.peak_open_publications <= fuse.publication_max_open_writers);
+    // The bound must have bitten, or this passes for the wrong reason.
+    CHECK(diagnostics.data_publication_selections_under_writer_cap > 0);
+    CHECK(diagnostics.open_publications == 0);
+    CHECK(diagnostics.backend_failures == 0);
+    for (size_t i = 0; i < files; ++i)
+        CHECK(fs.getattr("/backlog-" + std::to_string(i) + ".bin").size == contents.size());
+    CHECK(publication_bytes(node.memory()) == 0);
+    frontend->stop();
+}
+
+void append_fuse_journal_records(const std::filesystem::path& journal,
+                                 std::span<const Bytes> payloads) {
     Bytes bytes;
     for (const auto& payload : payloads) {
         auto frame = fuse_journal_frame(payload);
         bytes.insert(bytes.end(), frame.begin(), frame.end());
     }
-
     const int fd = ::open(journal.c_str(), O_WRONLY | O_APPEND);
     REQUIRE(fd >= 0);
     size_t offset = 0;
@@ -3636,11 +2110,17 @@ void append_fuse_journal_test_records(const std::filesystem::path& journal,
     REQUIRE(::close(fd) == 0);
 }
 
-void append_fuse_journal_test_record(const std::filesystem::path& journal,
-                                     std::span<const uint8_t> payload) {
+void append_fuse_journal_record(const std::filesystem::path& journal,
+                                std::span<const uint8_t> payload) {
     const std::array<Bytes, 1> records{Bytes(payload.begin(), payload.end())};
-    append_fuse_journal_test_records(journal, records);
+    append_fuse_journal_records(journal, records);
 }
+
+// Persisted JournalRecord values.
+constexpr uint8_t journal_namespace_published = 4;
+constexpr uint8_t journal_namespace_done = 5;
+constexpr uint8_t journal_data_done = 7;
+constexpr uint8_t journal_namespace_batch = 9;
 
 Bytes fuse_namespace_marker(uint8_t type, uint64_t sequence) {
     Writer payload;
@@ -3651,17 +2131,41 @@ Bytes fuse_namespace_marker(uint8_t type, uint64_t sequence) {
 
 std::vector<Bytes> fuse_namespace_markers(uint8_t type, uint64_t first, uint64_t last_exclusive) {
     std::vector<Bytes> records;
-    records.reserve(static_cast<size_t>(last_exclusive - first));
     for (uint64_t sequence = first; sequence < last_exclusive; ++sequence)
         records.push_back(fuse_namespace_marker(type, sequence));
     return records;
 }
 
-std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& journal) {
-    std::ifstream in(journal, std::ios::binary);
+Bytes fuse_data_done(uint64_t inode, uint64_t sequence) {
+    Writer payload;
+    payload.u8(journal_data_done);
+    payload.u64(inode);
+    payload.u64(sequence);
+    return payload.take();
+}
+
+Bytes read_all_bytes(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
     REQUIRE(in.good());
     std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    Bytes bytes(raw.begin(), raw.end());
+    return Bytes(raw.begin(), raw.end());
+}
+
+void write_all_bytes(const std::filesystem::path& path, const Bytes& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.good());
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(out.good());
+}
+
+void restore_directory(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::filesystem::remove_all(to);
+    std::filesystem::copy(from, to, std::filesystem::copy_options::recursive);
+}
+
+std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& journal) {
+    const auto bytes = read_all_bytes(journal);
     constexpr size_t header_size = 8; // "MACHFUS1"
     REQUIRE(bytes.size() >= header_size);
     std::vector<uint8_t> types;
@@ -3674,878 +2178,590 @@ std::vector<uint8_t> fuse_journal_record_types(const std::filesystem::path& jour
     return types;
 }
 
-MACHA_TEST("filesystem_fuse",
-           test_fuse_namespace_recovery_survives_partial_published_marker_group) {
-    TestService fixture("fuse-namespace-partial-published-group");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    constexpr uint64_t operations = 6;
-    constexpr uint64_t published_prefix = 3;
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (uint64_t i = 0; i < operations; ++i)
-            frontend->mkdir("/published-crash-" + std::to_string(i), 0755, getuid(), getgid());
-        frontend->stop();
-    }
-
-    std::vector<FilesystemNamespaceMutation> committed;
-    committed.reserve(operations);
-    for (uint64_t i = 0; i < operations; ++i) {
-        FilesystemNamespaceMutation mutation;
-        mutation.kind = FilesystemNamespaceMutation::Kind::mkdir;
-        mutation.from = "/published-crash-" + std::to_string(i);
-        mutation.mode = 0755;
-        mutation.uid = getuid();
-        mutation.gid = getgid();
-        committed.push_back(std::move(mutation));
-    }
-    CHECK(service.filesystem().apply_namespace_batch(committed).applied == operations);
-    const auto generation_after_commit = service.filesystem().local_committed_metadata_generation();
-
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
-    // A crash can expose any prefix of a grouped append. Sequence zero is
-    // reserved; this fresh journal's namespace operations are 1..operations.
-    const auto published = fuse_namespace_markers(4, 1, 1 + published_prefix);
-    append_fuse_journal_test_records(journal, published);
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    CHECK(status.namespace_operations_recovered == operations - published_prefix);
-    CHECK(status.namespace_publication_attempts == 0);
-    CHECK(status.namespace_operations_published == operations - published_prefix);
-    CHECK(status.namespace_operations_confirmed == operations - published_prefix);
-    CHECK(service.filesystem().local_committed_metadata_generation() == generation_after_commit);
-    CHECK(std::filesystem::file_size(journal) == 8);
-    for (uint64_t i = 0; i < operations; ++i)
-        CHECK(service.filesystem().getattr("/published-crash-" + std::to_string(i)).type ==
-              EntryType::directory);
+// The sequences of the namespace operations a journal holds, in order. A
+// node's namespace sequences continue above its committed batch clock, so a
+// fresh journal's do not start at one.
+std::vector<uint64_t> journal_namespace_sequences(const std::filesystem::path& journal) {
+    const auto bytes = read_all_bytes(journal);
+    std::vector<uint64_t> sequences;
+    const auto scan =
+        scan_fuse_journal_frames(bytes, 8, [&](std::span<const uint8_t> payload, size_t) {
+            Reader reader(payload);
+            if (reader.u8() != 2) // JournalRecord::namespace_op
+                return;
+            (void)reader.u8(); // kind
+            sequences.push_back(reader.u64());
+        });
+    REQUIRE(scan.discarded_tail == 0);
+    return sequences;
 }
 
-MACHA_TEST("filesystem_fuse",
-           test_fuse_recovery_retires_published_namespace_op_whose_effect_was_superseded) {
-    // A published marker means the backend held the op durable at the write
-    // floor, so whatever the head shows now is its effect or a legitimate
-    // successor. Recovery retires it rather than waiting to see the effect,
-    // which a superseded op never shows, leaving the mount behind its replica.
-    TestService fixture("fuse-recovery-superseded-published-op");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/superseded", 0755, getuid(), getgid());
-        frontend->stop();
-    }
-
-    // The op did reach the backend (commit it out of band, as the backend
-    // would have), and its published marker made it to the journal.
-    {
-        FilesystemNamespaceMutation mutation;
-        mutation.kind = FilesystemNamespaceMutation::Kind::mkdir;
-        mutation.from = "/superseded";
-        mutation.mode = 0755;
-        mutation.uid = getuid();
-        mutation.gid = getgid();
-        const std::array<FilesystemNamespaceMutation, 1> committed{mutation};
-        REQUIRE(service.filesystem().apply_namespace_batch(committed).applied == 1);
-    }
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
-    append_fuse_journal_test_records(journal, fuse_namespace_markers(4, 1, 2));
-
-    // Then the effect was overwritten before the frontend came back, and the
-    // rest of the cluster kept moving.
-    service.filesystem().rmdir("/superseded");
-    service.filesystem().mkdir("/external", 0755, getuid(), getgid());
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-    CHECK(status.pending_namespace == 0);
-    CHECK(status.namespace_operations_recovered == 0);
-    CHECK(status.namespace_publication_attempts == 0);
-    CHECK(std::filesystem::file_size(journal) == 8);
-
-    // The mount must not be stale: the cluster's directory is visible, and the
-    // superseded one is not resurrected.
-    CHECK(recovered->getattr("/external").type == EntryType::directory);
-    bool superseded_gone = false;
-    try {
-        (void)recovered->getattr("/superseded");
-    } catch (const FsError& e) {
-        superseded_gone = e.code() == ENOENT;
-    }
-    CHECK(superseded_gone);
+FilesystemNamespaceMutation namespace_mutation(FilesystemNamespaceMutation::Kind kind,
+                                               std::string from, std::string to = {}) {
+    FilesystemNamespaceMutation mutation;
+    mutation.kind = kind;
+    mutation.from = std::move(from);
+    mutation.to = std::move(to);
+    mutation.mode = kind == FilesystemNamespaceMutation::Kind::mkdir ? 0755 : 0644;
+    mutation.uid = getuid();
+    mutation.gid = getgid();
+    return mutation;
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_namespace_recovery_survives_partial_done_marker_group) {
-    TestService fixture("fuse-namespace-partial-done-group");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    constexpr uint64_t operations = 6;
-    constexpr uint64_t done_prefix = 2;
-
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (uint64_t i = 0; i < operations; ++i)
-            frontend->mkdir("/done-crash-" + std::to_string(i), 0755, getuid(), getgid());
-        frontend->stop();
-    }
-
-    std::vector<FilesystemNamespaceMutation> committed;
-    committed.reserve(operations);
-    for (uint64_t i = 0; i < operations; ++i) {
-        FilesystemNamespaceMutation mutation;
-        mutation.kind = FilesystemNamespaceMutation::Kind::mkdir;
-        mutation.from = "/done-crash-" + std::to_string(i);
-        mutation.mode = 0755;
-        mutation.uid = getuid();
-        mutation.gid = getgid();
-        committed.push_back(std::move(mutation));
-    }
-    CHECK(service.filesystem().apply_namespace_batch(committed).applied == operations);
-    const auto generation_after_commit = service.filesystem().local_committed_metadata_generation();
-
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
-    const auto published = fuse_namespace_markers(4, 1, 1 + operations);
-    append_fuse_journal_test_records(journal, published);
-    const auto done = fuse_namespace_markers(5, 1, 1 + done_prefix);
-    append_fuse_journal_test_records(journal, done);
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, replay);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    // Constructor reconciliation confirms the surviving published suffix and
-    // retires it in one done-marker append; no publication worker is needed.
-    CHECK(status.namespace_operations_recovered == 0);
-    CHECK(status.namespace_publication_attempts == 0);
-    CHECK(status.namespace_operations_published == 0);
-    CHECK(status.namespace_operations_confirmed == 0);
-    CHECK(status.journal_append_batches == 1);
-    CHECK(status.journal_records_appended == operations - done_prefix);
-    CHECK(service.filesystem().local_committed_metadata_generation() == generation_after_commit);
-    CHECK(std::filesystem::file_size(journal) == 8);
-    for (uint64_t i = 0; i < operations; ++i)
-        CHECK(service.filesystem().getattr("/done-crash-" + std::to_string(i)).type ==
-              EntryType::directory);
+// Admits `operations` through a frontend whose publication is held, then
+// stops it: the journal holds them unpublished, as at a crash.
+void admit_unpublished(FilesystemNode& node, const FuseConfig& fuse,
+                       const std::function<void(FuseFrontend&)>& operations) {
+    auto frontend = held_frontend(node, fuse);
+    operations(*frontend.frontend);
+    frontend->stop();
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_live_admission_during_recovery_publication_is_not_blocked) {
-    TestGate publication_gate;
-    TestNode fixture("fuse-live-admission-during-recovery");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    fixture.start();
-    // TestNode deliberately omits Service's background metadata owner. A
-    // synchronous seed mutation forms the one-node replica set before the
-    // generation baseline below, removing that unrelated startup race.
-    fixture.filesystem().mkdir("/fixture-ready", 0755, getuid(), getgid());
-    constexpr size_t recovered_operations = 4;
+// Recovery of the FUSE namespace journal over one node, case by case: each
+// case admits operations whose publication is held, then changes the backend
+// or the journal as a crash or the cluster would, then recovers. Batching and
+// its bounds, idempotent and already-achieved operations, partial marker
+// groups, superseded effects, batch identity across a crash, an operator skip
+// across a restart, live admission during recovery and ordered mixed
+// mutations.
+MACHA_TEST("filesystem_fuse", test_fuse_namespace_journal_recovery) {
+    FilesystemNode node("fuse-namespace-recovery");
+    auto& fs = node.fs();
+    const auto make_root = [&](const std::string& name) {
+        const auto root = "/" + name;
+        fs.mkdir(root, 0755, getuid(), getgid());
+        return root;
+    };
+    using Kind = FilesystemNamespaceMutation::Kind;
 
+    // An ordered backlog publishes in batches of namespace_batch_operations,
+    // each journalling its identity, then all published, then all done markers.
     {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(fixture.filesystem(), fixture.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        for (size_t i = 0; i < recovered_operations; ++i)
-            frontend->mkdir("/recovery-live-" + std::to_string(i), 0755, getuid(), getgid());
-        frontend->stop();
-    }
-
-    std::atomic_bool gate_once{};
-    fixture.set_publication_guard([&](const MetadataPublicationContext&) {
-        if (!gate_once.exchange(true))
-            publication_gate.enter_and_wait();
-    });
-
-    auto replay = config.fuse;
-    replay.publication_quiet = 0ms;
-    replay.namespace_batch_operations = recovered_operations;
-    const auto generation_before = fixture.filesystem().local_committed_metadata_generation();
-    auto recovered = make_fuse_frontend(fixture.filesystem(), fixture.resources().memory, replay);
-    const bool publication_entered = publication_gate.wait_for_entries(1, 5s);
-    CHECK(publication_entered);
-
-    bool live_admitted = false;
-    if (publication_entered) {
-        try {
-            recovered->mkdir("/live-during-recovery", 0755, getuid(), getgid());
-            live_admitted = recovered->inode_for_path("/live-during-recovery").has_value();
-        } catch (...) {
-            publication_gate.open();
-            throw;
-        }
-    }
-    publication_gate.open();
-    REQUIRE(publication_entered);
-    CHECK(live_admitted);
-    REQUIRE(recovered->wait_for_idle(20s));
-    const auto status = recovered->status();
-
-    CHECK(status.namespace_operations_recovered == recovered_operations);
-    CHECK(status.namespace_operations_admitted == 1);
-    CHECK(status.namespace_publication_batches == 2);
-    CHECK(status.namespace_operations_batched == recovered_operations + 1);
-    CHECK(status.namespace_operations_published == recovered_operations + 1);
-    CHECK(status.namespace_operations_confirmed == recovered_operations + 1);
-    CHECK(fixture.filesystem().local_committed_metadata_generation() == generation_before + 2);
-    for (size_t i = 0; i < recovered_operations; ++i)
-        CHECK(fixture.filesystem().getattr("/recovery-live-" + std::to_string(i)).type ==
-              EntryType::directory);
-    CHECK(fixture.filesystem().getattr("/live-during-recovery").type == EntryType::directory);
-}
-
-MACHA_TEST("filesystem_fuse",
-           test_fuse_durable_journal_accepts_authoritative_data_done_without_published_prefix) {
-    TestService fixture("fuse-journal-done-recovery");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 1s;
-
-    auto& service = fixture.start();
-
-    uint64_t inode = 0;
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->create("/done-authoritative.bin", 0644, getuid(), getgid(), true,
-                                       true, false);
-        inode = handle.inode;
-        const Bytes payload{0x10, 0x20, 0x30, 0x40};
-        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
-        // Start the real publication quiet window immediately before close.
-        // release() still waits only for local spool+journal durability, leaving
-        // the distributed publication marker absent without paying a 30-second
-        // test delay.
-        service.filesystem().store().foreground_activity(1);
-        frontend->release(inode, true);
-        frontend->stop();
-    }
-
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
-
-    // Prove the setup actually produced the intended pre-publication state;
-    // this test must not pass merely because publication raced the quiet gate.
-    const auto record_types = fuse_journal_record_types(journal);
-    CHECK(std::find(record_types.begin(), record_types.end(), 3) != record_types.end());
-    CHECK(std::find(record_types.begin(), record_types.end(), 6) == record_types.end());
-    CHECK(std::find(record_types.begin(), record_types.end(), 7) == record_types.end());
-
-    // Crash state: the checksum-valid completion marker survives but its
-    // earlier data_published record does not.
-    // A newly created inode's first data operation has sequence 1.
-    Writer done;
-    done.u8(7); // persisted JournalRecord::data_done value
-    done.u64(inode);
-    done.u64(1);
-    append_fuse_journal_test_record(journal, done.data());
-
-    {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        CHECK(recovered->inode_for_path("/done-authoritative.bin").has_value());
+        const auto root = make_root("batched");
+        auto fuse = node.fuse("batched");
+        constexpr size_t operations = 8;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (size_t i = 0; i < operations; ++i)
+                frontend.mkdir(root + "/pending-" + std::to_string(i), 0755, getuid(), getgid());
+            CHECK(frontend.status().namespace_operations_admitted == operations);
+        });
+        fuse.namespace_batch_operations = 3;
+        const auto generation_before = fs.local_committed_metadata_generation();
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        constexpr size_t batches = (operations + 3 - 1) / 3;
+        CHECK(status.namespace_operations_recovered == operations);
+        CHECK(status.namespace_publication_attempts == batches);
+        CHECK(status.namespace_publication_batches == batches);
+        CHECK(status.namespace_operations_batched == operations);
+        CHECK(status.namespace_operations_published == operations);
+        CHECK(status.namespace_operations_confirmed == operations);
+        CHECK(fs.local_committed_metadata_generation() == generation_before + batches);
+        CHECK(status.journal_append_batches == batches * 3);
+        CHECK(status.journal_records_appended == operations * 2 + batches);
+        CHECK(status.journal_durability_barriers == batches * 3);
         recovered->stop();
     }
-}
 
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_skips_unbacked_data_done) {
-    TestService fixture("fuse-journal-unbacked-done");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-
-    auto& service = fixture.start();
+    // A thousand operations publish in a bounded number of commits.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        frontend->stop();
+        const auto root = make_root("thousand");
+        auto fuse = node.fuse("thousand");
+        constexpr size_t operations = 1000;
+        constexpr size_t batch_limit = 256;
+        std::vector<FilesystemNamespaceMutation> creates;
+        for (size_t i = 0; i < operations; ++i)
+            creates.push_back(namespace_mutation(Kind::create, root + "/bulk-" + std::to_string(i)));
+        CHECK(fs.apply_namespace_batch(creates).applied == operations);
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (size_t i = 0; i < operations; ++i)
+                frontend.unlink(root + "/bulk-" + std::to_string(i));
+            CHECK(frontend.status().namespace_operations_admitted == operations);
+        });
+        fuse.namespace_batch_operations = batch_limit;
+        const auto generation_before = fs.local_committed_metadata_generation();
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(30s));
+        const auto status = recovered->status();
+        constexpr size_t batches = (operations + batch_limit - 1) / batch_limit;
+        CHECK(status.namespace_operations_recovered == operations);
+        CHECK(status.namespace_publication_attempts == batches);
+        CHECK(status.namespace_publication_batches == batches);
+        CHECK(status.namespace_operations_batched == operations);
+        CHECK(status.namespace_operations_published == operations);
+        CHECK(status.namespace_operations_confirmed == operations);
+        CHECK(status.journal_append_batches == batches * 3);
+        CHECK(status.journal_records_appended == operations * 2 + batches);
+        CHECK(status.journal_durability_barriers == batches * 3);
+        CHECK(fs.local_committed_metadata_generation() == generation_before + batches);
+        recovered->stop();
     }
 
-    const auto spool_dir = config.fuse.spool_path.value_or(config.state_path / "fuse-spool");
-    const auto journal = config.fuse.operation_journal_path.value_or(spool_dir / "operations.log");
-
-    Writer done;
-    done.u8(7); // persisted JournalRecord::data_done value
-    done.u64(999);
-    done.u64(1);
-    append_fuse_journal_test_record(journal, done.data());
-
-    // A completion marker with no operation behind it retires nothing, so it
-    // is skipped and counted, and the frontend starts.
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 1);
-    recovered->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_durable_journal_drops_only_inode_with_missing_spool) {
-    TestService fixture("fuse-journal-missing-spool");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-
-    auto& service = fixture.start();
-    service.filesystem().create_file("/recover.bin", 0600, getuid(), getgid());
-    uint64_t inode = 0;
+    // The encoded-byte bound is hard: one oversized operation may progress
+    // alone, but no second joins it.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->open("/recover.bin", true, true, false, false);
-        inode = handle.inode;
-        auto payload = pattern(128 * 1024);
-        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
-        service.filesystem().store().foreground_activity(1);
-        frontend->release(inode, true);
-        frontend->stop();
+        const auto root = make_root("byte-limited");
+        auto fuse = node.fuse("byte-limited");
+        constexpr size_t operations = 4;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (size_t i = 0; i < operations; ++i)
+                frontend.mkdir(root + "/op-" + std::to_string(i), 0755, getuid(), getgid());
+        });
+        fuse.namespace_batch_bytes = 1;
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_publication_batches == operations);
+        CHECK(status.namespace_operations_batched == operations);
+        CHECK(status.journal_append_batches == operations * 2); // singletons: published, done
+        recovered->stop();
     }
 
-    const auto spool =
-        config.state_path / "fuse-spool" / ("inode-" + std::to_string(inode) + ".spool");
-    REQUIRE(std::filesystem::exists(spool));
-    REQUIRE(std::filesystem::remove(spool));
-
-    // The spool/journal is a per-inode WAL. Losing one dirty spool invalidates
-    // that generation, not the complete filesystem. Recovery journals the
-    // abandonment and falls back to the last committed manifest (empty here).
-    config.fuse.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    REQUIRE(recovered->wait_for_idle(10s));
-    CHECK(service.filesystem().getattr("/recover.bin").size == 0);
-    recovered->stop();
-}
-
-MACHA_TEST("filesystem_fuse",
-           test_fuse_recovery_checksum_drops_corrupt_generation_and_preserves_published_file) {
-    TestService fixture("fuse-journal-corrupt-spool");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-
-    auto& service = fixture.start();
-    const auto published = pattern(768 * 1024, 61);
-    write_file(service.filesystem(), "/recover-corrupt.bin", published);
-
-    uint64_t inode = 0;
+    // Unlinks and their parent's rmdir publish as one commit.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->open("/recover-corrupt.bin", true, true, false, false);
-        inode = handle.inode;
-        const auto replacement = pattern(published.size(), 62);
-        REQUIRE(frontend->write(inode, 0, replacement) == replacement.size());
-        service.filesystem().store().foreground_activity(1);
-        frontend->release(inode, true);
-        frontend->stop();
+        const auto root = make_root("delete-batch");
+        fs.mkdir(root + "/doomed", 0755, getuid(), getgid());
+        fs.create_file(root + "/doomed/one", 0644, getuid(), getgid());
+        fs.create_file(root + "/doomed/two", 0644, getuid(), getgid());
+        auto fuse = node.fuse("delete-batch");
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.unlink(root + "/doomed/one");
+            frontend.unlink(root + "/doomed/two");
+            frontend.rmdir(root + "/doomed");
+        });
+        const auto generation_before = fs.local_committed_metadata_generation();
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_recovered == 3);
+        CHECK(status.namespace_publication_batches == 1);
+        CHECK(status.namespace_operations_batched == 3);
+        CHECK(status.namespace_operations_published == 3);
+        CHECK(status.namespace_operations_confirmed == 3);
+        CHECK(status.journal_append_batches == 3); // batch identity, published, done
+        CHECK(status.journal_records_appended == 7);
+        CHECK(fs.local_committed_metadata_generation() == generation_before + 1);
+        CHECK(absent(fs, root + "/doomed"));
+        recovered->stop();
     }
 
-    const auto spool =
-        config.state_path / "fuse-spool" / ("inode-" + std::to_string(inode) + ".spool");
-    REQUIRE(std::filesystem::exists(spool));
+    // A batch whose every effect is already present retires with no commit.
     {
-        std::fstream file(spool, std::ios::binary | std::ios::in | std::ios::out);
-        REQUIRE(file.good());
-        char byte{};
-        file.read(&byte, 1);
-        REQUIRE(file.good());
-        byte ^= 0x5a;
-        file.seekp(0);
-        file.write(&byte, 1);
-        file.flush();
-        REQUIRE(file.good());
+        const auto root = make_root("idempotent");
+        auto fuse = node.fuse("idempotent");
+        constexpr size_t operations = 4;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (size_t i = 0; i < operations; ++i)
+                frontend.mkdir(root + "/already-" + std::to_string(i), 0755, getuid(), getgid());
+        });
+        for (size_t i = 0; i < operations; ++i)
+            fs.mkdir(root + "/already-" + std::to_string(i), 0755, getuid(), getgid());
+        const auto generation_before = fs.local_committed_metadata_generation();
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_recovered == operations);
+        CHECK(status.namespace_publication_attempts == 0);
+        CHECK(status.namespace_publication_batches == 0);
+        CHECK(status.namespace_operations_batched == 0);
+        CHECK(status.namespace_operations_published == operations);
+        CHECK(status.namespace_operations_confirmed == operations);
+        CHECK(status.journal_append_batches == 2);
+        CHECK(status.journal_records_appended == operations * 2);
+        CHECK(fs.local_committed_metadata_generation() == generation_before);
+        recovered->stop();
     }
 
-    config.fuse.publication_quiet = 0ms;
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    REQUIRE(recovered->wait_for_idle(10s));
-
-    const auto committed = service.filesystem().getattr("/recover-corrupt.bin");
-    CHECK(committed.size == published.size());
-    auto reader = service.filesystem().open_read("/recover-corrupt.bin");
-    Bytes actual(published.size());
-    size_t done = 0;
-    while (done < actual.size()) {
-        const auto count = reader->read(done, {actual.data() + done, actual.size() - done});
-        REQUIRE(count > 0);
-        done += count;
-    }
-    CHECK(actual == published);
-    if (std::filesystem::exists(spool))
-        CHECK(std::filesystem::file_size(spool) == 0);
-    recovered->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_read_only_release_does_not_publish_writer_data) {
-    TestService fixture("fuse-read-release");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-
-    auto& service = fixture.start();
+    // With the middle operation already true in the backend, the identity
+    // batch [1,2,3] is refused atomically at op two, so op one publishes
+    // alone; then in [2,3] op two is achieved and op three commits.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto writer = frontend->create("/growing.bin", 0600, getuid(), getgid(), true, true, false);
-        auto bytes = pattern(256 * 1024);
-        REQUIRE(frontend->write(writer.inode, 0, bytes) == bytes.size());
+        const auto root = make_root("valid-prefix");
+        auto fuse = node.fuse("valid-prefix");
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir(root + "/prefix", 0755, getuid(), getgid());
+            frontend.mkdir(root + "/concurrent", 0755, getuid(), getgid());
+            frontend.mkdir(root + "/after", 0755, getuid(), getgid());
+        });
+        fs.mkdir(root + "/concurrent", 0755, getuid(), getgid());
+        const auto generation_before = fs.local_committed_metadata_generation();
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_recovered == 3);
+        CHECK(status.namespace_publication_attempts == 3);
+        CHECK(status.namespace_publication_batches == 2);
+        CHECK(status.namespace_operations_batched == 2);
+        CHECK(status.namespace_operations_published == 3);
+        CHECK(status.namespace_operations_confirmed == 3);
+        CHECK(status.journal_append_batches == 5);
+        CHECK(status.journal_records_appended == 7);
+        CHECK(fs.local_committed_metadata_generation() == generation_before + 2);
+        for (const auto* name : {"/prefix", "/concurrent", "/after"})
+            CHECK(fs.getattr(root + name).type == EntryType::directory);
+        recovered->stop();
+    }
 
-        // A second process such as rsync --append-verify may open the file for
-        // basis reads while the writer still has dirty local data. Closing that
-        // reader must not turn into an implicit writer flush/publication.
-        auto reader = frontend->open("/growing.bin", true, false, false, false);
-        CHECK(reader.inode == writer.inode);
-        frontend->release(reader.inode, false);
-        REQUIRE(frontend->wait_for_idle(2s));
+    // A crash can expose any prefix of a grouped published append; the
+    // surviving markers retire their operations and the rest confirm
+    // against the backend without a commit.
+    {
+        const auto root = make_root("published-group");
+        auto fuse = node.fuse("published-group");
+        constexpr uint64_t operations = 6;
+        constexpr uint64_t published_prefix = 3;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (uint64_t i = 0; i < operations; ++i)
+                frontend.mkdir(root + "/op-" + std::to_string(i), 0755, getuid(), getgid());
+        });
+        std::vector<FilesystemNamespaceMutation> committed;
+        for (uint64_t i = 0; i < operations; ++i)
+            committed.push_back(namespace_mutation(Kind::mkdir, root + "/op-" + std::to_string(i)));
+        CHECK(fs.apply_namespace_batch(committed).applied == operations);
+        const auto generation_after_commit = fs.local_committed_metadata_generation();
+        const auto first = journal_namespace_sequences(*fuse.operation_journal_path).front();
+        append_fuse_journal_records(
+            *fuse.operation_journal_path,
+            fuse_namespace_markers(journal_namespace_published, first, first + published_prefix));
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_recovered == operations - published_prefix);
+        CHECK(status.namespace_publication_attempts == 0);
+        CHECK(status.namespace_operations_published == operations - published_prefix);
+        CHECK(status.namespace_operations_confirmed == operations - published_prefix);
+        CHECK(fs.local_committed_metadata_generation() == generation_after_commit);
+        CHECK(std::filesystem::file_size(*fuse.operation_journal_path) == 8);
+        for (uint64_t i = 0; i < operations; ++i)
+            CHECK(fs.getattr(root + "/op-" + std::to_string(i)).type == EntryType::directory);
+        recovered->stop();
+    }
 
-        auto backend_before_writer_close = service.filesystem().getattr("/growing.bin");
-        CHECK(backend_before_writer_close.size == 0);
-        REQUIRE(frontend->dirty_ranges(writer.inode).size() == 1);
+    // With every published marker and a prefix of the done group surviving,
+    // construction confirms the published suffix and retires it in one
+    // done-marker append; no publication worker is needed.
+    {
+        const auto root = make_root("done-group");
+        auto fuse = node.fuse("done-group");
+        constexpr uint64_t operations = 6;
+        constexpr uint64_t done_prefix = 2;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (uint64_t i = 0; i < operations; ++i)
+                frontend.mkdir(root + "/op-" + std::to_string(i), 0755, getuid(), getgid());
+        });
+        std::vector<FilesystemNamespaceMutation> committed;
+        for (uint64_t i = 0; i < operations; ++i)
+            committed.push_back(namespace_mutation(Kind::mkdir, root + "/op-" + std::to_string(i)));
+        CHECK(fs.apply_namespace_batch(committed).applied == operations);
+        const auto generation_after_commit = fs.local_committed_metadata_generation();
+        const auto first = journal_namespace_sequences(*fuse.operation_journal_path).front();
+        append_fuse_journal_records(
+            *fuse.operation_journal_path,
+            fuse_namespace_markers(journal_namespace_published, first, first + operations));
+        append_fuse_journal_records(
+            *fuse.operation_journal_path,
+            fuse_namespace_markers(journal_namespace_done, first, first + done_prefix));
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_recovered == 0);
+        CHECK(status.namespace_publication_attempts == 0);
+        CHECK(status.namespace_operations_published == 0);
+        CHECK(status.namespace_operations_confirmed == 0);
+        CHECK(status.journal_append_batches == 1);
+        CHECK(status.journal_records_appended == operations - done_prefix);
+        CHECK(fs.local_committed_metadata_generation() == generation_after_commit);
+        CHECK(std::filesystem::file_size(*fuse.operation_journal_path) == 8);
+        recovered->stop();
+    }
 
-        frontend->release(writer.inode, true);
-        REQUIRE(frontend->wait_for_idle(10s));
-        auto backend_after_writer_close = service.filesystem().getattr("/growing.bin");
-        CHECK(backend_after_writer_close.size == bytes.size());
+    // A published marker means the backend held the operation at the write
+    // floor, so whatever the head shows now is its effect or a legitimate
+    // successor: recovery retires it rather than waiting for an effect a
+    // superseded operation never shows, and the mount is not left stale.
+    {
+        const auto root = make_root("superseded");
+        auto fuse = node.fuse("superseded");
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir(root + "/superseded", 0755, getuid(), getgid());
+        });
+        const std::array<FilesystemNamespaceMutation, 1> committed{
+            namespace_mutation(Kind::mkdir, root + "/superseded")};
+        REQUIRE(fs.apply_namespace_batch(committed).applied == 1);
+        const auto first = journal_namespace_sequences(*fuse.operation_journal_path).front();
+        append_fuse_journal_records(
+            *fuse.operation_journal_path,
+            fuse_namespace_markers(journal_namespace_published, first, first + 1));
+        fs.rmdir(root + "/superseded");
+        fs.mkdir(root + "/external", 0755, getuid(), getgid());
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.pending_namespace == 0);
+        CHECK(status.namespace_operations_recovered == 0);
+        CHECK(status.namespace_publication_attempts == 0);
+        CHECK(std::filesystem::file_size(*fuse.operation_journal_path) == 8);
+        CHECK(recovered->getattr(root + "/external").type == EntryType::directory);
+        CHECK(absent(*recovered, root + "/superseded"));
+        recovered->stop();
+    }
 
-        auto stored = service.filesystem().open_read("/growing.bin");
-        Bytes actual(bytes.size());
-        size_t offset = 0;
-        while (offset < actual.size()) {
-            auto n = stored->read(offset, {actual.data() + offset, actual.size() - offset});
-            REQUIRE(n > 0);
-            offset += n;
+    // A batch [create temp, rename temp -> final] committed under its batch
+    // identity, but the crash came before its published markers. Re-deriving
+    // effects would re-create an empty temp and rename it over the real file;
+    // the snapshot's clock says the batch committed, so recovery leaves it.
+    {
+        const auto root = make_root("batch-identity");
+        auto fuse = node.fuse("batch-identity");
+        const auto payload = pattern(32 * 1024, 77);
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            auto handle =
+                frontend.create(root + "/.film.tmp", 0600, getuid(), getgid(), true, true, false);
+            REQUIRE(frontend.write(handle.inode, 0, payload) == payload.size());
+            frontend.release(handle.inode, true);
+            frontend.rename(root + "/.film.tmp", root + "/film.mkv", false);
+            CHECK(frontend.status().namespace_operations_admitted == 2);
+        });
+        // The journal and spool as the crash leaves them: the operations, the
+        // batch record, and no marker.
+        const auto journal = *fuse.operation_journal_path;
+        const auto first = journal_namespace_sequences(journal).front();
+        Writer batch_record;
+        batch_record.u8(journal_namespace_batch);
+        batch_record.u64(first);
+        batch_record.u32(2);
+        append_fuse_journal_record(journal, batch_record.data());
+        const auto crash_image = node.path() / "batch-identity-crash";
+        std::filesystem::copy(*fuse.spool_path, crash_image,
+                              std::filesystem::copy_options::recursive);
+        {
+            auto committing = node.frontend(fuse);
+            REQUIRE(committing->wait_for_idle(20s));
+            const auto status = committing->status();
+            CHECK(status.namespace_publication_batches == 1);
+            CHECK(status.namespace_operations_batched == 2);
+            committing->stop();
         }
-        CHECK(actual == bytes);
+        REQUIRE(fs.getattr(root + "/film.mkv").size == payload.size());
+        restore_directory(crash_image, *fuse.spool_path);
+
+        auto recovered = node.frontend(fuse);
+        // Operations recovered by identity retire at the next namespace-facing
+        // request, as every confirmation does.
+        CHECK(recovered->status().pending_namespace == 2);
+        CHECK(recovered->getattr(root + "/film.mkv").size == payload.size());
+        REQUIRE(recovered->wait_for_idle(20s));
+        CHECK(recovered->status().namespace_publication_attempts == 0);
+        CHECK(fs.getattr(root + "/film.mkv").size == payload.size());
+        CHECK(read_back(fs, root + "/film.mkv", payload.size()) == payload);
+        CHECK(absent(fs, root + "/.film.tmp"));
+        recovered->stop();
     }
-}
 
-MACHA_TEST("filesystem_fuse", test_fuse_frontend_unlink_and_rename_over_open_inode_ordering) {
-    TestService fixture("fuse-replace");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 2;
-
-    auto& service = fixture.start();
+    // rsync's create-temp, write, utimens, rename per file: mixed namespace
+    // kinds, renames included, batch into a few commits.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-        // A dirty inode that is unlinked before release must never recreate its
-        // old pathname when the data-publication worker eventually sees it.
-        auto doomed = frontend->create("/doomed.bin", 0600, getuid(), getgid(), true, true, false);
-        auto doomed_data = pattern(65536);
-        REQUIRE(frontend->write(doomed.inode, 0, doomed_data) == doomed_data.size());
-        frontend->unlink("/doomed.bin");
-        frontend->release(doomed.inode, true);
-        REQUIRE(frontend->wait_for_idle(10s));
-        CHECK(!frontend->inode_for_path("/doomed.bin").has_value());
-        bool missing = false;
-        try {
-            (void)service.filesystem().getattr("/doomed.bin");
-        } catch (const FsError& e) {
-            missing = e.code() == ENOENT;
+        const auto root = make_root("rsync-batching");
+        auto fuse = node.fuse("rsync-batching");
+        constexpr size_t files = 8;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir(root + "/album", 0755, getuid(), getgid());
+            for (size_t i = 0; i < files; ++i) {
+                const auto temp = root + "/album/.track-" + std::to_string(i) + ".tmp";
+                const auto final_name = root + "/album/track-" + std::to_string(i) + ".mp3";
+                auto handle = frontend.create(temp, 0600, getuid(), getgid(), true, true, false);
+                const auto payload = pattern(16 * 1024, static_cast<uint8_t>(i));
+                REQUIRE(frontend.write(handle.inode, 0, payload) == payload.size());
+                frontend.release(handle.inode, true);
+                frontend.utimens(temp, 1700000000000000000LL + static_cast<int64_t>(i));
+                frontend.rename(temp, final_name, false);
+            }
+            CHECK(frontend.status().namespace_operations_admitted == 1 + files * 3);
+        });
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->wait_for_idle(30s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_published + status.namespace_operations_recovered >=
+              1 + files * 3);
+        CHECK(status.namespace_publication_batches <= 4);
+        for (size_t i = 0; i < files; ++i) {
+            const auto entry = fs.getattr(root + "/album/track-" + std::to_string(i) + ".mp3");
+            CHECK(entry.size == 16 * 1024);
+            CHECK(entry.mtime_ns == 1700000000000000000LL + static_cast<int64_t>(i));
+            CHECK(absent(fs, root + "/album/.track-" + std::to_string(i) + ".tmp"));
         }
-        CHECK(missing);
-
-        // More subtle: POSIX rename may replace a destination which still has
-        // an open descriptor. The displaced inode remains a valid open identity,
-        // but it no longer owns that pathname. Releasing dirty data through the
-        // old descriptor must not overwrite/resurrect the new destination.
-        auto destination =
-            frontend->create("/target.bin", 0600, getuid(), getgid(), true, true, false);
-        auto old_bytes = pattern(32768);
-        REQUIRE(frontend->write(destination.inode, 0, old_bytes) == old_bytes.size());
-        frontend->release(destination.inode, true);
-        REQUIRE(frontend->wait_for_idle(10s));
-
-        auto old_open = frontend->open("/target.bin", true, true, false, false);
-        std::array<uint8_t, 8> stale{{'S', 'T', 'A', 'L', 'E', '!', '!', '!'}};
-        REQUIRE(frontend->write(old_open.inode, 0, stale) == stale.size());
-
-        auto source =
-            frontend->create("/replacement.bin", 0600, getuid(), getgid(), true, true, false);
-        auto replacement = pattern(98304);
-        for (auto& byte : replacement)
-            byte ^= 0x7d;
-        REQUIRE(frontend->write(source.inode, 0, replacement) == replacement.size());
-        frontend->flush(source.inode);
-        frontend->rename("/replacement.bin", "/target.bin");
-        REQUIRE(frontend->inode_for_path("/target.bin") == source.inode);
-        frontend->release(source.inode, true);
-        frontend->release(old_open.inode, true);
-        REQUIRE(frontend->wait_for_idle(10s));
-
-        // release() ended the final descriptor owner; once its detached dirty
-        // generation is retired, the stale inode number must no longer resolve.
-        bool stale_inode_reclaimed = false;
-        try {
-            (void)frontend->path_for_inode(old_open.inode);
-        } catch (const FsError& e) {
-            stale_inode_reclaimed = e.code() == EBADF;
-        }
-        CHECK(stale_inode_reclaimed);
-        auto final = service.filesystem().getattr("/target.bin");
-        CHECK(final.size == replacement.size());
-        auto reader = service.filesystem().open_read("/target.bin");
-        Bytes actual(replacement.size());
-        size_t offset = 0;
-        while (offset < actual.size()) {
-            auto n = reader->read(offset, {actual.data() + offset, actual.size() - offset});
-            REQUIRE(n > 0);
-            offset += n;
-        }
-        CHECK(actual == replacement);
+        recovered->stop();
     }
-}
 
-MACHA_TEST("filesystem_fuse", test_fuse_inode_ownership_reclaims_only_after_all_owners_release) {
-    TestService fixture("fuse-inode-ownership");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.publication_quiet = 0ms;
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    const auto baseline = frontend->status().inode_count;
-
-    // A detached inode remains owned by an open descriptor even after the
-    // durable unlink is fully confirmed.
-    auto created = frontend->create("/open-unlinked.bin", 0600, getuid(), getgid(), true, false,
-                                    false);
-    REQUIRE(frontend->wait_for_idle(10s));
-    frontend->unlink("/open-unlinked.bin");
-    REQUIRE(frontend->wait_for_idle(10s));
-    auto detached = frontend->status();
-    CHECK(detached.inode_count == baseline + 1);
-    CHECK(detached.detached_inode_count == 1);
-
-    frontend->release(created.inode, false);
-    auto released = frontend->status();
-    CHECK(released.inode_count == baseline);
-    CHECK(released.detached_inode_count == 0);
-    CHECK(released.reclaimed_inode_count == 1);
-
-    // Repeated create/close/unlink cycles must return the authoritative owner
-    // table to the same baseline; neither success batching nor container
-    // capacity is allowed to manufacture a process-lifetime inode owner.
-    constexpr size_t cycles = 64;
-    for (size_t i = 0; i < cycles; ++i) {
-        const auto path = "/lifecycle-" + std::to_string(i);
-        auto handle = frontend->create(path, 0600, getuid(), getgid(), true, false, false);
-        frontend->release(handle.inode, false);
-        frontend->unlink(path);
-    }
-    REQUIRE(frontend->wait_for_idle(20s));
-    const auto final = frontend->status();
-    CHECK(final.inode_count == baseline);
-    CHECK(final.detached_inode_count == 0);
-    CHECK(final.reclaimed_inode_count == cycles + 1);
-    CHECK(final.peak_inode_count <= baseline + cycles);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_frontend_read_overlay_truncate_and_hydration_hints) {
-    TestService fixture("fuse-read");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-    config.fuse.read_ahead_extents = 2;
-    config.fuse.hydration_priority = 2718;
-
-    auto& service = fixture.start();
-    auto committed = pattern(4 * config.extent_size + 4096);
-    service.filesystem().create_file("/read.bin", 0644, getuid(), getgid());
-    auto seed = service.filesystem().open_write("/read.bin", true);
-    REQUIRE(seed->write(0, committed) == committed.size());
-    seed->commit();
-    seed.reset();
-    auto base_entry = service.filesystem().getattr("/read.bin");
-    REQUIRE(base_entry.extents.size() >= 5);
-
+    // A queued mkdir whose path is concurrently a file can never be reconciled,
+    // so it blocks, reported, until the operator skips it by its sequence; the
+    // skip journals namespace_done with no published marker, which a restart
+    // replays cleanly, and the abandoned mkdir is never claimed as achieved.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->open("/read.bin", true, true, false, false);
-
-        auto patch = pattern(16384);
-        for (auto& byte : patch)
-            byte ^= 0x91;
-        const uint64_t patch_offset = 4096;
-        REQUIRE(frontend->write(handle.inode, patch_offset, patch) == patch.size());
-        Bytes view(32768);
-        REQUIRE(frontend->read(handle.inode, 0, view) == view.size());
-        auto expected_view =
-            Bytes(committed.begin(), committed.begin() + static_cast<ptrdiff_t>(view.size()));
-        std::copy(patch.begin(), patch.end(),
-                  expected_view.begin() + static_cast<ptrdiff_t>(patch_offset));
-        CHECK(view == expected_view);
-
-        // A committed-range read emits one high-priority FUSE run into the
-        // ordinary hydration scheduler. Re-reading the same range replaces the
-        // inode's hint rather than duplicating work, and object IDs are unique.
-        // This must be tested while the committed extent is still inside the
-        // inode's logical EOF.
-        Bytes demand(4096);
-        REQUIRE(frontend->read(handle.inode, config.extent_size + 1024, demand) == demand.size());
-        REQUIRE(frontend->read(handle.inode, config.extent_size + 1024, demand) == demand.size());
-        auto hints = frontend->hints();
-        REQUIRE(hints.size() == 1);
-        CHECK(hints.front().run_id == "fuse:" + std::to_string(handle.inode));
-        CHECK(hints.front().priority == config.fuse.hydration_priority);
-        CHECK(hints.front().frame_type == FrameType::read_ahead);
-        REQUIRE(hints.front().objects.size() == 3);
-        CHECK(hints.front().objects[0] == base_entry.extents[1].id);
-        CHECK(hints.front().objects[1] == base_entry.extents[2].id);
-        CHECK(hints.front().objects[2] == base_entry.extents[3].id);
-        std::set<ObjectId> unique(hints.front().objects.begin(), hints.front().objects.end());
-        CHECK(unique.size() == hints.front().objects.size());
-
-        // Shrink then extend before publication. Bytes from the old committed
-        // suffix must not reappear; the extended region is logically zero until
-        // a later write overlays it.
-        frontend->truncate(handle.inode, 32768);
-        frontend->truncate(handle.inode, 65536);
-        Bytes extended(32768, 0xff);
-        REQUIRE(frontend->read(handle.inode, 32768, extended) == extended.size());
-        CHECK(std::all_of(extended.begin(), extended.end(), [](uint8_t b) { return b == 0; }));
-        Bytes beyond_eof(4096, 0xff);
-        CHECK(frontend->read(handle.inode, config.extent_size + 1024, beyond_eof) == 0);
-        std::array<uint8_t, 6> marker{{'M', 'A', 'C', 'H', 'A', '!'}};
-        REQUIRE(frontend->write(handle.inode, 40000, marker) == marker.size());
-        Bytes marker_view(64, 0xff);
-        REQUIRE(frontend->read(handle.inode, 39984, marker_view) == marker_view.size());
-        CHECK(std::equal(marker.begin(), marker.end(), marker_view.begin() + 16));
-
-        frontend->release(handle.inode, true);
-        REQUIRE(frontend->wait_for_idle(10s));
-        auto final = service.filesystem().getattr("/read.bin");
-        CHECK(final.size == 65536);
-        auto reader = service.filesystem().open_read("/read.bin");
-        Bytes final_bytes(65536);
-        size_t offset = 0;
-        while (offset < final_bytes.size()) {
-            auto n =
-                reader->read(offset, {final_bytes.data() + offset, final_bytes.size() - offset});
-            REQUIRE(n > 0);
-            offset += n;
+        const auto root = make_root("operator-skip");
+        auto fuse = node.fuse("operator-skip");
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir(root + "/wedge", 0755, getuid(), getgid());
+            frontend.mkdir(root + "/wedge2", 0755, getuid(), getgid());
+        });
+        fs.create_file(root + "/wedge", 0644, getuid(), getgid());
+        fs.create_file(root + "/wedge2", 0644, getuid(), getgid());
+        const auto blocked_on = [](FuseFrontend& frontend, const std::string& path) {
+            return wait_until(
+                [&] {
+                    const auto blocked = frontend.blocked_namespace_operation();
+                    return blocked && blocked->path == path;
+                },
+                10s);
+        };
+        {
+            auto recovered = node.frontend(fuse);
+            REQUIRE(blocked_on(*recovered, root + "/wedge"));
+            const auto blocked = recovered->blocked_namespace_operation();
+            REQUIRE(blocked.has_value());
+            CHECK(blocked->kind == "mkdir");
+            CHECK(blocked->error_code == EEXIST);
+            CHECK(!recovered->skip_blocked_namespace_operation(blocked->sequence + 1));
+            CHECK(recovered->blocked_namespace_operation().has_value());
+            REQUIRE(recovered->skip_blocked_namespace_operation(blocked->sequence));
+            // The second wedge stops the journal compacting, so the lone
+            // namespace_done is still there to replay.
+            REQUIRE(blocked_on(*recovered, root + "/wedge2"));
+            recovered->stop();
         }
-        CHECK(std::equal(patch.begin(), patch.end(),
-                         final_bytes.begin() + static_cast<ptrdiff_t>(patch_offset)));
-        CHECK(std::equal(marker.begin(), marker.end(), final_bytes.begin() + 40000));
-        CHECK(std::all_of(final_bytes.begin() + 32768, final_bytes.begin() + 40000,
-                          [](uint8_t b) { return b == 0; }));
+        auto restarted = node.frontend(fuse);
+        REQUIRE(blocked_on(*restarted, root + "/wedge2"));
+        CHECK(fs.getattr(root + "/wedge").type == EntryType::file);
+        CHECK(fs.getattr(root + "/wedge2").type == EntryType::file);
+        REQUIRE(restarted->skip_blocked_namespace_operation(
+            restarted->blocked_namespace_operation()->sequence));
+        REQUIRE(restarted->wait_for_idle(10s));
+        CHECK(!restarted->blocked_namespace_operation().has_value());
+        CHECK(fs.getattr(root + "/wedge2").type == EntryType::file);
+        restarted->stop();
     }
-}
 
-MACHA_TEST("filesystem_fuse", test_fuse_buffered_writes_batch_until_close_durability) {
-    TestService fixture("fuse-group-commit");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.publication_quiet = 30s;
-    config.fuse.request_workers = 24;
-
-    auto& service = fixture.start();
+    // Live namespace admission is not blocked while a recovered batch is
+    // mid-commit; it publishes in the batch that follows.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->create("/batch.bin", 0644, getuid(), getgid(), true, true, false);
-
-        // write() does not wait for a local fsync pair, so one sequential writer
-        // builds a batch before close/release sets the local durability boundary.
-        constexpr size_t writes = 128;
-        constexpr size_t chunk_size = 4096;
-        std::vector<Bytes> chunks;
-        chunks.reserve(writes);
-        for (size_t i = 0; i < writes; ++i) {
-            auto chunk = pattern(chunk_size);
-            for (auto& byte : chunk)
-                byte ^= static_cast<uint8_t>(i * 17U + 3U);
-            chunks.push_back(std::move(chunk));
-            REQUIRE(frontend->write(handle.inode, i * chunk_size, chunks.back()) == chunk_size);
-        }
-
-        // POSIX-buffered writes are immediately visible through the local FUSE
-        // view before their close-time stable-storage barrier.
-        Bytes actual(writes * chunk_size);
-        REQUIRE(frontend->read(handle, 0, actual) == actual.size());
-        for (size_t i = 0; i < writes; ++i)
-            CHECK(std::equal(chunks[i].begin(), chunks[i].end(),
-                             actual.begin() + static_cast<ptrdiff_t>(i * chunk_size)));
-
-        // close/release must not return until every accepted write has completed
-        // spool fsync -> journal append -> journal fsync.
-        frontend->release(handle.inode, true);
-        auto status = frontend->status();
-        CHECK(status.durability_writes == writes);
-        CHECK(status.durability_batches < status.durability_writes);
+        const auto root = make_root("live-during-recovery");
+        auto fuse = node.fuse("live-during-recovery");
+        constexpr size_t recovered_operations = 4;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (size_t i = 0; i < recovered_operations; ++i)
+                frontend.mkdir(root + "/recovered-" + std::to_string(i), 0755, getuid(), getgid());
+        });
+        TestGate publication_gate;
+        std::atomic_bool gated{};
+        node.node().set_publication_guard([&](const MetadataPublicationContext&) {
+            if (!gated.exchange(true))
+                publication_gate.enter_and_wait();
+        });
+        fuse.namespace_batch_operations = recovered_operations;
+        const auto generation_before = fs.local_committed_metadata_generation();
+        auto recovered = node.frontend(fuse);
+        GateOpener open_on_exit{publication_gate};
+        REQUIRE(publication_gate.wait_for_entries(1, 5s));
+        recovered->mkdir(root + "/live", 0755, getuid(), getgid());
+        CHECK(recovered->inode_for_path(root + "/live").has_value());
+        publication_gate.open();
+        REQUIRE(recovered->wait_for_idle(20s));
+        const auto status = recovered->status();
+        CHECK(status.namespace_operations_recovered == recovered_operations);
+        CHECK(status.namespace_operations_admitted == 1);
+        CHECK(status.namespace_publication_batches == 2);
+        CHECK(status.namespace_operations_batched == recovered_operations + 1);
+        CHECK(status.namespace_operations_published == recovered_operations + 1);
+        CHECK(status.namespace_operations_confirmed == recovered_operations + 1);
+        CHECK(fs.local_committed_metadata_generation() == generation_before + 2);
+        for (size_t i = 0; i < recovered_operations; ++i)
+            CHECK(fs.getattr(root + "/recovered-" + std::to_string(i)).type ==
+                  EntryType::directory);
+        CHECK(fs.getattr(root + "/live").type == EntryType::directory);
+        recovered->stop();
+        node.node().set_publication_guard({});
     }
-}
 
-MACHA_TEST("filesystem_fuse", test_fuse_fsync_waits_for_distributed_publication) {
-    TestService fixture("fuse-fsync-publication");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.publication_quiet = 0ms;
-    config.fuse.timeouts.sync = 10s;
-
-    auto& service = fixture.start();
+    // Ordered mixed mutations (write, truncate, sparse extend, directory
+    // rename, create then unlink, and the root's own inode) are reconstructed
+    // from committed metadata plus the journal while publication is held, and
+    // converge to the backend once it is not.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->create("/sync.bin", 0644, getuid(), getgid(), true, true, false);
-        auto bytes = pattern(2 * 1024 * 1024 + 12345);
-        REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+        const auto root = make_root("ordered");
+        auto fuse = node.fuse("ordered");
+        const auto root_mode = fs.getattr("/").mode;
+        const auto initial = pattern(192 * 1024 + 31);
+        const auto tail = pattern(24 * 1024 + 7);
+        Bytes expected(initial.begin(), initial.begin() + 64 * 1024);
+        expected.resize(96 * 1024, 0);
+        expected.insert(expected.end(), tail.begin(), tail.end());
+        const auto old_path = root + "/TV/Buffy/S07E01.mp4";
+        const auto new_dir = root + "/TV/Buffy The Vampire Slayer";
+        const auto new_path = new_dir + "/S07E01.mp4";
+        const auto removed_path = new_dir + "/S07E02.mp4";
 
-        // fsync is Macha's cluster-durability boundary: after it returns, the
-        // ordinary FileSystem view (which has no access to the FUSE spool
-        // overlay) must already expose the complete committed generation.
-        frontend->fsync(handle.inode);
-        auto committed = service.filesystem().getattr("/sync.bin");
-        CHECK(committed.size == bytes.size());
-        auto reader = service.filesystem().open_read("/sync.bin");
-        Bytes actual(bytes.size());
-        size_t done = 0;
-        while (done < actual.size()) {
-            auto n = reader->read(done, {actual.data() + done, actual.size() - done});
-            REQUIRE(n > 0);
-            done += n;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir(root + "/TV", 0755, getuid(), getgid());
+            frontend.mkdir(root + "/TV/Buffy", 0755, getuid(), getgid());
+            auto first = frontend.create(old_path, 0644, getuid(), getgid(), true, true, false);
+            REQUIRE(frontend.write(first.inode, 0, initial) == initial.size());
+            frontend.truncate(first.inode, 64 * 1024);
+            REQUIRE(frontend.write(first.inode, 96 * 1024, tail) == tail.size());
+            frontend.release(first.inode, true);
+            frontend.rename(root + "/TV/Buffy", new_dir);
+            auto removed = frontend.create(removed_path, 0644, getuid(), getgid(), true, true, false);
+            const auto removed_bytes = pattern(32 * 1024 + 3);
+            REQUIRE(frontend.write(removed.inode, 0, removed_bytes) == removed_bytes.size());
+            frontend.release(removed.inode, true);
+            frontend.unlink(removed_path);
+            // The root is inode 1, the one stable inode never allocated from
+            // next_inode.
+            frontend.chmod("/", 0700);
+            CHECK(!frontend.inode_for_path(old_path).has_value());
+            REQUIRE(frontend.inode_for_path(new_path).has_value());
+            CHECK(!frontend.inode_for_path(removed_path).has_value());
+            CHECK(frontend.getattr(new_path).size == expected.size());
+            CHECK(frontend.getattr("/").mode == 0700);
+        });
+        {
+            auto recovered = held_frontend(node, fuse);
+            CHECK(!recovered->inode_for_path(old_path).has_value());
+            const auto inode = recovered->inode_for_path(new_path);
+            REQUIRE(inode.has_value());
+            CHECK(!recovered->inode_for_path(removed_path).has_value());
+            CHECK(recovered->getattr(new_path).size == expected.size());
+            CHECK(recovered->getattr("/").mode == 0700);
+            Bytes local(expected.size());
+            REQUIRE(recovered->read(*inode, 0, local) == local.size());
+            CHECK(local == expected);
+            recovered->stop();
         }
-        CHECK(actual == bytes);
-        frontend->release(handle.inode, true);
+        {
+            auto recovered = node.frontend(fuse);
+            REQUIRE(recovered->wait_for_idle(20s));
+            CHECK(absent(fs, old_path));
+            CHECK(absent(fs, removed_path));
+            CHECK(fs.getattr(new_path).size == expected.size());
+            CHECK(fs.getattr("/").mode == 0700);
+            CHECK(read_back(fs, new_path, expected.size()) == expected);
+            recovered->stop();
+        }
+        fs.chmod("/", root_mode);
     }
 }
 
-MACHA_TEST("filesystem_fuse", test_fuse_open_read_reuses_extent_until_manifest_changes) {
-    TestService fixture("fuse-open-read-cache");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.extent_size = 1024 * 1024;
-
-    auto& service = fixture.start();
-    auto bytes = pattern(config.extent_size * 2);
-    service.filesystem().create_file("/read-cache.bin", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/read-cache.bin", true);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    writer.reset();
-    auto entry = service.filesystem().getattr("/read-cache.bin");
-    REQUIRE(entry.extents.size() >= 2);
-
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->open("/read-cache.bin", true, false, false, false);
-
-        Bytes first(4096);
-        REQUIRE(frontend->read(handle, 0, first) == first.size());
-        CHECK(std::equal(first.begin(), first.end(), bytes.begin()));
-        CHECK(service.resources().memory.stats()
-                  .owner_bytes[static_cast<size_t>(MemoryOwner::object_payload)] >=
-              config.extent_size);
-
-        // ReadHandle caches the whole immutable extent. Removing the backing
-        // object makes reuse observable: the same open handle still reads it,
-        // a fresh handle cannot. erase_all() refuses to remove a retained live
-        // object, so simulate physical loss by removing the local and cached copies.
-        REQUIRE(service.local_state().data().remove(entry.extents.front().id));
-        (void)service.local_state().cache().remove(entry.extents.front().id);
-        Bytes second(4096);
-        REQUIRE(frontend->read(handle, 8192, second) == second.size());
-        CHECK(std::equal(second.begin(), second.end(), bytes.begin() + 8192));
-
-        auto fresh = frontend->open("/read-cache.bin", true, false, false, false);
-        bool unavailable = false;
-        try {
-            Bytes probe(4096);
-            (void)frontend->read(fresh, 16384, probe);
-        } catch (const FsError& e) {
-            unavailable = e.code() == EIO || e.code() == ETIMEDOUT;
-        }
-        CHECK(unavailable);
-        frontend->release(fresh.inode, false);
-        frontend->release(handle.inode, false);
-    }
-    CHECK(service.resources().memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::object_payload)] == 0);
+#if defined(__linux__)
+size_t linux_open_fd_count() {
+    std::error_code ec;
+    size_t count = 0;
+    for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end; !ec && it != end;
+         it.increment(ec))
+        ++count;
+    REQUIRE(!ec);
+    return count;
 }
-
-MACHA_TEST("filesystem_fuse", test_fuse_frontend_namespace_refresh_is_demand_driven) {
-    TestService fixture("fuse-demand-refresh");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-
-    auto& service = fixture.start();
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-
-        bool missing = false;
-        try {
-            (void)frontend->getattr("/external");
-        } catch (const FsError& e) {
-            missing = e.code() == ENOENT;
-        }
-        CHECK(missing);
-
-        // Mutate the namespace outside the FUSE frontend. There is no refresh
-        // timer: the next namespace-facing FUSE request observes the metadata
-        // generation advance and adopts MetadataManager's shared decoded view.
-        service.filesystem().mkdir("/external", 0755, getuid(), getgid());
-        auto external = frontend->getattr("/external");
-        CHECK(external.type == EntryType::directory);
-
-        service.filesystem().create_file("/external/media.bin", 0644, getuid(), getgid());
-        auto entries = frontend->readdir("/external");
-        CHECK(std::any_of(entries.begin(), entries.end(),
-                          [](const auto& item) { return item.first == "media.bin"; }));
-
-        service.filesystem().unlink("/external/media.bin");
-        missing = false;
-        try {
-            (void)frontend->getattr("/external/media.bin");
-        } catch (const FsError& e) {
-            missing = e.code() == ENOENT;
-        }
-        CHECK(missing);
-    }
-}
-
-// Recovery resolves bad journal state; it does not refuse to start.
+#endif
 
 struct JournalFrame {
     size_t offset{};
@@ -4563,370 +2779,982 @@ std::vector<JournalFrame> fuse_journal_frames(const Bytes& bytes) {
     return frames;
 }
 
-Bytes read_all_bytes(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    REQUIRE(in.good());
-    std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    return Bytes(raw.begin(), raw.end());
+void corrupt_first_byte(const std::filesystem::path& path) {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    REQUIRE(file.good());
+    char byte{};
+    file.read(&byte, 1);
+    REQUIRE(file.good());
+    byte ^= 0x5a;
+    file.seekp(0);
+    file.write(&byte, 1);
+    file.flush();
+    REQUIRE(file.good());
 }
 
-void write_all_bytes(const std::filesystem::path& path, const Bytes& bytes) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    REQUIRE(out.good());
-    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    REQUIRE(out.good());
-}
-
-void restore_directory(const std::filesystem::path& from, const std::filesystem::path& to) {
-    std::filesystem::remove_all(to);
-    std::filesystem::copy(from, to, std::filesystem::copy_options::recursive);
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_journal_fuzz_every_frame_mutation_still_starts) {
-    // Truncate the journal at every frame boundary, or drop, duplicate or
-    // corrupt any frame: the frontend starts every time.
-    TestService fixture("fuse-journal-fuzz");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    service.filesystem().mkdir("/fz-seeded", 0755, getuid(), getgid());
-    uint64_t inode_a = 0;
-    {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/fz", 0755, getuid(), getgid());
-        auto a = frontend->create("/fz/a.bin", 0600, getuid(), getgid(), true, true, false);
-        inode_a = a.inode;
-        const auto bytes_a = pattern(48 * 1024, 71);
-        REQUIRE(frontend->write(inode_a, 0, bytes_a) == bytes_a.size());
-        frontend->release(inode_a, true);
-        frontend->rename("/fz/a.bin", "/fz/b.bin", false);
-        frontend->mkdir("/fz/sub", 0755, getuid(), getgid());
-        auto c = frontend->create("/fz-seeded/c.bin", 0600, getuid(), getgid(), true, true, false);
-        const auto bytes_c = pattern(8 * 1024, 72);
-        REQUIRE(frontend->write(c.inode, 0, bytes_c) == bytes_c.size());
-        frontend->release(c.inode, true);
-        frontend->stop();
-    }
-
-    const auto spool_dir = config.state_path / "fuse-spool";
-    const auto journal = spool_dir / "operations.log";
-    // Add marker kinds the loader must also tolerate losing or duplicating.
-    {
-        Writer done;
-        done.u8(7); // JournalRecord::data_done
-        done.u64(inode_a);
-        done.u64(1);
-        const std::array<Bytes, 2> records{fuse_namespace_marker(4, 1), done.take()};
-        append_fuse_journal_test_records(journal, records);
-    }
-
-    const auto pristine = read_all_bytes(journal);
-    const auto frames = fuse_journal_frames(pristine);
-    REQUIRE(frames.size() >= 6);
-    const auto pristine_spool = fixture.path() / "spool-pristine";
-    std::filesystem::copy(spool_dir, pristine_spool, std::filesystem::copy_options::recursive);
-
-    size_t variants = 0;
-    auto run_variant = [&](const std::string& name, const Bytes& bytes,
-                           const std::function<void(FuseFrontend&)>& check) {
-        restore_directory(pristine_spool, spool_dir);
-        write_all_bytes(journal, bytes);
-        std::shared_ptr<FuseFrontend> frontend;
-        try {
-            auto admission = std::make_unique<HeldLoaderAdmission>();
-            admission->hold();
-            frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                          config.fuse, std::move(admission));
-        } catch (const std::exception& e) {
-            const auto message = name + ": frontend refused to start: " + e.what();
-            ::macha::test::check(false, message.c_str(), __FILE__, __LINE__);
-            return;
-        }
-        check(*frontend);
-        frontend->stop();
-        ++variants;
+// Recovery of the FUSE data journal and spool over one node, case by case:
+// accepted data and namespace survive a frontend restart and publish; torn,
+// corrupt, unbacked or orphaned journal and spool state is resolved (trimmed,
+// skipped, quarantined within a byte bound, or dropped for the one inode it
+// affects) rather than refused; recovered publications start unprompted at
+// the loader worker bound; and every single-frame mutation of a journal still
+// starts.
+MACHA_TEST("filesystem_fuse", test_fuse_data_journal_recovery) {
+    FilesystemNode node("fuse-data-recovery");
+    auto& fs = node.fs();
+    const auto extent = node.config().extent_size;
+    const auto spool_of = [](const FuseConfig& fuse, uint64_t inode) {
+        return *fuse.spool_path / ("inode-" + std::to_string(inode) + ".spool");
     };
 
-    for (size_t i = 0; i < frames.size(); ++i) {
-        const auto& frame = frames[i];
-        const auto label = "frame " + std::to_string(i) + " of " + std::to_string(frames.size());
-
-        Bytes truncated(pristine.begin(),
-                        pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
-        // Recovery may append to the journal (re-journaled descriptors,
-        // markers for dropped operations), so only the start is asserted.
-        run_variant("truncate after " + label, truncated, [&](FuseFrontend&) {
-            CHECK(std::filesystem::file_size(journal) >= 8);
-        });
-
-        Bytes dropped = pristine;
-        dropped.erase(dropped.begin() + static_cast<ptrdiff_t>(frame.offset),
-                      dropped.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
-        run_variant("drop " + label, dropped, [&](FuseFrontend&) {});
-
-        Bytes duplicated = pristine;
-        duplicated.insert(duplicated.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size),
-                          pristine.begin() + static_cast<ptrdiff_t>(frame.offset),
-                          pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
-        run_variant("duplicate " + label, duplicated, [&](FuseFrontend&) {});
-
-        Bytes corrupted = pristine;
-        corrupted[frame.offset + 4] ^= 0x5a;
-        run_variant("corrupt " + label, corrupted, [&](FuseFrontend& frontend) {
-            const bool last = i + 1 == frames.size();
-            const auto status = frontend.diagnostics();
-            if (last) {
-                // EOF checksum failure is a torn append: trimmed, not quarantined.
-                CHECK(status.journal_recovery_quarantined_bytes == 0);
-            } else {
-                CHECK(status.journal_recovery_quarantined_bytes == pristine.size() - frame.offset);
-                bool quarantined = false;
-                for (const auto& entry : std::filesystem::directory_iterator(spool_dir))
-                    if (entry.path().filename().string().find("operations.log.corrupt.") == 0)
-                        quarantined = true;
-                CHECK(quarantined);
-            }
-        });
-    }
-    CHECK(variants == frames.size() * 4);
-
-    // The pristine journal still recovers everything.
-    restore_directory(pristine_spool, spool_dir);
-    write_all_bytes(journal, pristine);
-    auto admission = std::make_unique<HeldLoaderAdmission>();
-    admission->hold();
-    auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                        config.fuse, std::move(admission));
-    CHECK(recovered->inode_for_path("/fz/b.bin").has_value());
-    CHECK(recovered->inode_for_path("/fz/sub").has_value());
-    CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 0);
-    recovered->stop();
-}
-
-// Namespace batches under a batch identity.
-
-MACHA_TEST("filesystem_fuse", test_fuse_namespace_loop_batches_rsync_pattern_into_few_commits) {
-    // rsync writes each file as create-temp / write / utimens / rename; mixed
-    // namespace kinds, renames included, batch into a few commits.
-    TestService fixture("fuse-namespace-batching");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-
-    auto& service = fixture.start();
-    constexpr size_t files = 24;
+    // Accepted namespace and data are reconstructable from local state alone
+    // after a restart, readable through the mount before publication, and
+    // converge to the backend; the journal resets once retired, and the spool
+    // and journal live where configured.
     {
-        auto admission = std::make_unique<HeldLoaderAdmission>();
-        auto& loader = *admission;
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                           config.fuse, std::move(admission));
-        loader.hold();
-        frontend->mkdir("/album", 0755, getuid(), getgid());
-        for (size_t i = 0; i < files; ++i) {
-            const auto temp = "/album/.track-" + std::to_string(i) + ".tmp";
-            const auto final_name = "/album/track-" + std::to_string(i) + ".mp3";
-            auto handle = frontend->create(temp, 0600, getuid(), getgid(), true, true, false);
-            const auto payload = pattern(16 * 1024, static_cast<uint8_t>(i));
-            REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-            frontend->release(handle.inode, true);
-            frontend->utimens(temp, 1700000000000000000LL + static_cast<int64_t>(i));
-            frontend->rename(temp, final_name, false);
-        }
-        CHECK(frontend->status().namespace_operations_admitted == 1 + files * 3);
-        frontend->stop();
-    }
-    // The recovered queue (mkdir + 3 ops per file) publishes in a handful of commits.
-    config.fuse.publication_quiet = 0ms;
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    REQUIRE(frontend->wait_for_idle(30s));
-    const auto status = frontend->status();
-    std::cout << "batching: admitted=" << status.namespace_operations_admitted
-              << " recovered=" << status.namespace_operations_recovered
-              << " published=" << status.namespace_operations_published
-              << " confirmed=" << status.namespace_operations_confirmed
-              << " batches=" << status.namespace_publication_batches
-              << " attempts=" << status.namespace_publication_attempts << '\n';
-    CHECK(status.namespace_operations_published + status.namespace_operations_recovered >= 1 + files * 3);
-    CHECK(status.namespace_publication_batches <= 4);
-    for (size_t i = 0; i < files; ++i) {
-        const auto final_name = "/album/track-" + std::to_string(i) + ".mp3";
-        auto entry = service.filesystem().getattr(final_name);
-        CHECK(entry.size == 16 * 1024);
-        CHECK(entry.mtime_ns == 1700000000000000000LL + static_cast<int64_t>(i));
-        bool temp_present = true;
-        try {
-            (void)service.filesystem().getattr("/album/.track-" + std::to_string(i) + ".tmp");
-        } catch (const FsError& e) {
-            temp_present = e.code() != ENOENT;
-        }
-        CHECK(!temp_present);
-    }
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_utimens_after_write_survives_async_publication) {
-    // rsync: write, close, utimens, rename. The asynchronous data publication
-    // that follows must not overwrite the utimens value.
-    TestService fixture("fuse-utimens-vs-publication");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 2s; // namespace ops publish now, data after the quiet window
-
-    auto& service = fixture.start();
-    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-    service.filesystem().store().foreground_activity(1);
-    auto handle = frontend->create("/.song.tmp", 0600, getuid(), getgid(), true, true, false);
-    const auto payload = pattern(48 * 1024, 5);
-    REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-    frontend->release(handle.inode, true);
-    constexpr int64_t source_mtime = 1600000000000000000LL;
-    frontend->utimens("/.song.tmp", source_mtime);
-    frontend->rename("/.song.tmp", "/song.mp3", false);
-    REQUIRE(frontend->wait_for_idle(30s));
-    const auto entry = service.filesystem().getattr("/song.mp3");
-    CHECK(entry.size == payload.size());
-    CHECK(entry.mtime_ns == source_mtime);
-    frontend->stop();
-}
-
-MACHA_TEST("filesystem_fuse", test_fuse_namespace_batch_committed_before_crash_is_not_reapplied) {
-    // A batch [create temp, rename temp -> final] committed but the process
-    // died before the per-op published markers were journaled. Re-deriving
-    // effects would re-create an empty temp and rename it over the real file;
-    // the batch identity in the snapshot's clock says it committed, so
-    // recovery must not touch the file.
-    TestService fixture("fuse-namespace-batch-identity");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 0ms;
-
-    auto& service = fixture.start();
-    const auto payload = pattern(32 * 1024, 77);
-    {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->create("/.film.tmp", 0600, getuid(), getgid(), true, true, false);
-        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
-        frontend->release(handle.inode, true);
-        frontend->rename("/.film.tmp", "/film.mkv", false);
-        REQUIRE(frontend->wait_for_idle(30s));
-        CHECK(frontend->status().namespace_publication_batches >= 1);
-        frontend->stop();
-    }
-    REQUIRE(service.filesystem().getattr("/film.mkv").size == payload.size());
-
-    // Simulate the crash window: strip every namespace published/done marker
-    // from the journal, keeping the ops and the batch record(s).
-    const auto journal = config.state_path / "fuse-spool" / "operations.log";
-    auto bytes = read_all_bytes(journal);
-    Bytes stripped(bytes.begin(), bytes.begin() + 8);
-    size_t stripped_markers = 0, kept_batches = 0;
-    const auto scan = scan_fuse_journal_frames(
-        bytes, 8, [&](std::span<const uint8_t> record, size_t) {
-            const auto type = record.front();
-            if (type == 4 || type == 5) { // namespace_published, namespace_done
-                ++stripped_markers;
-                return;
-            }
-            if (type == 9)
-                ++kept_batches;
-            auto frame = fuse_journal_frame(record);
-            stripped.insert(stripped.end(), frame.begin(), frame.end());
+        auto fuse = node.fuse("namespace-and-data");
+        fuse.commit_workers = 1;
+        fuse.operation_journal_path = node.path() / "external-fuse-journal" / "operations.log";
+        const auto payload = pattern(384 * 1024 + 17);
+        uint64_t inode = 0;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir("/TV", 0755, getuid(), getgid());
+            frontend.mkdir("/TV/Buffy", 0755, getuid(), getgid());
+            auto handle =
+                frontend.create("/TV/Buffy/S07E01.mp4", 0644, getuid(), getgid(), true, true, false);
+            inode = handle.inode;
+            REQUIRE(frontend.write(inode, 0, payload) == payload.size());
+            frontend.release(inode, true);
+            CHECK(frontend.inode_for_path("/TV").has_value());
+            CHECK(frontend.inode_for_path("/TV/Buffy/S07E01.mp4") == inode);
+            CHECK(frontend.getattr("/TV/Buffy/S07E01.mp4").size == payload.size());
         });
-    REQUIRE(scan.discarded_tail == 0);
-    if (stripped_markers == 0 && kept_batches == 0) {
-        // The journal reset to its header once everything retired.
-        REQUIRE(bytes.size() == 8);
-    } else {
-        REQUIRE(kept_batches >= 1);
-        write_all_bytes(journal, stripped);
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
+        auto recovered = node.frontend(fuse);
+        REQUIRE(recovered->inode_for_path("/TV").has_value());
+        REQUIRE(recovered->inode_for_path("/TV/Buffy").has_value());
+        const auto recovered_inode = recovered->inode_for_path("/TV/Buffy/S07E01.mp4");
+        REQUIRE(recovered_inode.has_value());
+        CHECK(recovered->getattr("/TV/Buffy/S07E01.mp4").size == payload.size());
+        Bytes local(payload.size());
+        REQUIRE(recovered->read(*recovered_inode, 0, local) == local.size());
+        CHECK(local == payload);
+        REQUIRE(recovered->wait_for_idle(15s));
+        CHECK(fs.getattr("/TV/Buffy/S07E01.mp4").size == payload.size());
+        CHECK(read_back(fs, "/TV/Buffy/S07E01.mp4", payload.size()) == payload);
+        CHECK(std::filesystem::file_size(*fuse.operation_journal_path) == 8);
+        CHECK(std::filesystem::exists(*fuse.spool_path));
+        CHECK(!std::filesystem::exists(node.config().state_path / "fuse-spool"));
+        recovered->stop();
+    }
+
+    // A torn tail, and a complete final frame failing its checksum, are both
+    // a crash mid-append: trimmed to the last good frame.
+    for (const bool complete_frame : {false, true}) {
+        auto fuse = node.fuse(complete_frame ? "checksum-tail" : "torn-tail");
+        const std::string path = complete_frame ? "/pending-checksum" : "/pending-torn";
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir(path, 0755, getuid(), getgid());
+        });
+        const auto journal = *fuse.operation_journal_path;
+        const auto valid_size = std::filesystem::file_size(journal);
+        REQUIRE(valid_size > 8);
+        Bytes tail(complete_frame ? 37 : 3, 0);
+        if (complete_frame) {
+            tail[3] = 1;
+            tail[4] = 0xff;
+        }
+        {
+            std::ofstream out(journal, std::ios::binary | std::ios::app);
+            out.write(reinterpret_cast<const char*>(tail.data()),
+                      static_cast<std::streamsize>(tail.size()));
+            REQUIRE(out.good());
+        }
+        REQUIRE(std::filesystem::file_size(journal) == valid_size + tail.size());
+        auto recovered = held_frontend(node, fuse);
+        REQUIRE(recovered->inode_for_path(path).has_value());
+        CHECK(std::filesystem::file_size(journal) == valid_size);
+        recovered->stop();
+    }
+
+    // A spool file no journal record refers to is preserved as an orphan,
+    // not deleted; orphans are kept within max_orphan_bytes, oldest dropped.
+    {
+        auto fuse = node.fuse("orphans");
+        fuse.max_orphan_bytes = 1024;
+        const auto spool_dir = *fuse.spool_path;
+        std::filesystem::create_directories(spool_dir);
+        const auto unattributed = spool_dir / "inode-999.spool";
+        const auto older = spool_dir / "inode-900.spool.orphan.1";
+        const auto newer = spool_dir / "inode-901.spool.orphan.2";
+        {
+            std::ofstream out(unattributed, std::ios::binary | std::ios::trunc);
+            out << "unattributed bytes";
+            std::ofstream a(older, std::ios::binary | std::ios::trunc);
+            a << std::string(800, 'a');
+            std::ofstream b(newer, std::ios::binary | std::ios::trunc);
+            b << std::string(800, 'b');
+        }
+        const auto now = std::filesystem::file_time_type::clock::now();
+        std::filesystem::last_write_time(older, now - 2h);
+        std::filesystem::last_write_time(newer, now - 1h);
+        node.frontend(fuse)->stop();
+
+        CHECK(!std::filesystem::exists(unattributed));
+        CHECK(!std::filesystem::exists(older));
+        uint64_t orphan_bytes = 0;
+        bool preserved = false;
+        for (const auto& entry : std::filesystem::directory_iterator(spool_dir)) {
+            const auto name = entry.path().filename().string();
+            if (name.find(".orphan.") == std::string::npos)
+                continue;
+            orphan_bytes += entry.file_size();
+            if (name.starts_with("inode-999.spool.orphan.")) {
+                std::ifstream in(entry.path(), std::ios::binary);
+                const std::string bytes((std::istreambuf_iterator<char>(in)),
+                                        std::istreambuf_iterator<char>());
+                CHECK(bytes == "unattributed bytes");
+                preserved = true;
+            }
+        }
+        CHECK(preserved);
+        CHECK(orphan_bytes <= fuse.max_orphan_bytes);
+    }
+
+    // An idle dirty inode keeps its spool path and bytes but not its
+    // descriptor; reopening for append continues the same spool, and
+    // recovery publishes both writes. Recovery holds a bounded number of
+    // spool descriptors however many inodes are dirty.
+    {
+        auto fuse = node.fuse("idle-spool");
+        const auto first = pattern(64 * 1024 + 13, 17);
+        const auto second = pattern(48 * 1024 + 7, 93);
+        Bytes expected = first;
+        expected.insert(expected.end(), second.begin(), second.end());
+        // The descriptor bound is measurable only through /proc.
+#if defined(__linux__)
+        constexpr size_t dirty_inodes = 16;
+#else
+        constexpr size_t dirty_inodes = 0;
+#endif
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            auto created = frontend.create("/append-after-idle.bin", 0644, getuid(), getgid(), true,
+                                           true, false);
+            const auto inode = created.inode;
+            REQUIRE(frontend.write(inode, 0, first) == first.size());
+            frontend.release(inode, true);
+#if defined(__linux__)
+            const auto before_reopen = linux_open_fd_count();
+#endif
+            auto reopened = frontend.open("/append-after-idle.bin", true, true, true, false);
+            REQUIRE(reopened.inode == inode);
+            REQUIRE(frontend.write(inode, 0, second, true) == second.size());
+            frontend.release(inode, true);
+#if defined(__linux__)
+            CHECK(linux_open_fd_count() <= before_reopen + 2);
+            const auto before_dirty = linux_open_fd_count();
+#endif
+            Bytes local(expected.size());
+            REQUIRE(frontend.read(inode, 0, local) == local.size());
+            CHECK(local == expected);
+            for (size_t i = 0; i < dirty_inodes; ++i) {
+                auto handle = frontend.create("/fd-" + std::to_string(i), 0644, getuid(), getgid(),
+                                              true, true, false);
+                const Bytes byte{static_cast<uint8_t>(i)};
+                REQUIRE(frontend.write(handle.inode, 0, byte) == byte.size());
+                frontend.release(handle.inode, true);
+            }
+#if defined(__linux__)
+            CHECK(linux_open_fd_count() <= before_dirty + 8);
+#endif
+        });
+#if defined(__linux__)
+        const auto before_recovery = linux_open_fd_count();
+        {
+            auto recovered = held_frontend(node, fuse);
+            CHECK(linux_open_fd_count() <= before_recovery + 8);
+            recovered->stop();
+        }
+#endif
+        auto recovered = node.frontend(fuse);
         REQUIRE(recovered->wait_for_idle(30s));
-        const auto status = recovered->status();
-        CHECK(status.namespace_publication_attempts == 0); // nothing re-applied
+#if defined(__linux__)
+        CHECK(linux_open_fd_count() <= before_recovery + 8);
+#endif
+        CHECK(fs.getattr("/append-after-idle.bin").size == expected.size());
+        CHECK(read_back(fs, "/append-after-idle.bin", expected.size()) == expected);
+        for (size_t i = 0; i < dirty_inodes; ++i)
+            CHECK(fs.getattr("/fd-" + std::to_string(i)).size == 1);
         recovered->stop();
-        CHECK(service.filesystem().getattr("/film.mkv").size == payload.size());
-        bool temp_present = true;
-        try {
-            (void)service.filesystem().getattr("/.film.tmp");
-        } catch (const FsError& e) {
-            temp_present = e.code() != ENOENT;
-        }
-        CHECK(!temp_present);
     }
-}
 
-MACHA_TEST("filesystem_fuse", test_fuse_recovery_abandons_publication_for_file_removed_from_namespace) {
-    // A recovered publication whose file has left the namespace is abandoned
-    // (journaled) on the first boot, freeing its spool and the journal; the
-    // second boot sees nothing.
-    TestService fixture("fuse-recovery-removed-file");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.fuse.commit_workers = 1;
-    config.fuse.foreground_commit_workers = 1;
-    config.fuse.publication_quiet = 30s;
-
-    auto& service = fixture.start();
-    service.filesystem().create_file("/gone.bin", 0600, getuid(), getgid());
-    uint64_t inode = 0;
+    // Restored spool is provenance, not a scheduling class: recovered
+    // publications start with no new FUSE request, ignore the interactive
+    // clock the node's own object writes feed, and use the loader worker
+    // bound rather than recovery_commit_workers.
     {
-        auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
-        auto handle = frontend->open("/gone.bin", true, true, false, false);
-        inode = handle.inode;
-        const auto payload = pattern(256 * 1024, 73);
-        REQUIRE(frontend->write(inode, 0, payload) == payload.size());
-        service.filesystem().store().foreground_activity(1);
-        frontend->release(inode, true);
-        frontend->stop();
+        auto fuse = node.fuse("recovered-loader");
+        fuse.commit_workers = 4;
+        fuse.recovery_commit_workers = 2;
+        constexpr size_t files = 4;
+        const auto payload = pattern(4 * extent);
+        for (size_t i = 0; i < files; ++i)
+            fs.create_file("/recover-" + std::to_string(i) + ".bin", 0644, getuid(), getgid());
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            for (size_t i = 0; i < files; ++i) {
+                auto handle = frontend.open("/recover-" + std::to_string(i) + ".bin", true, true,
+                                            false, false);
+                REQUIRE(frontend.write(handle.inode, 0, payload) == payload.size());
+                frontend.release(handle.inode, true);
+            }
+            const auto staged = frontend.status();
+            CHECK(staged.pending_data >= files);
+            CHECK(staged.active_data == 0);
+        });
+        fs.note_interactive_activity(1);
+        InterposedTarget target(fs);
+        TestGate concurrent;
+        target.before_open = [&](const std::string&) { concurrent.enter_and_wait(); };
+        auto recovered = node.frontend(fuse, target);
+        GateOpener open_on_exit{concurrent};
+        CHECK(concurrent.wait_for_entries(fuse.recovery_commit_workers + 1, 10s));
+        const auto running = recovered->status();
+        CHECK(running.active_recovery_data > fuse.recovery_commit_workers);
+        CHECK(running.active_recovery_data <= fuse.commit_workers);
+        CHECK(running.pending_recovery_data <= running.pending_data);
+        concurrent.open();
+        REQUIRE(recovered->wait_for_idle(30s));
+        CHECK(recovered->status().data_publication_peak_active <= fuse.commit_workers);
+        for (size_t i = 0; i < files; ++i)
+            CHECK(fs.getattr("/recover-" + std::to_string(i) + ".bin").size == payload.size());
+        recovered->stop();
     }
-    const auto spool_dir = config.state_path / "fuse-spool";
-    const auto journal = spool_dir / "operations.log";
-    const auto spool = spool_dir / ("inode-" + std::to_string(inode) + ".spool");
-    REQUIRE(std::filesystem::exists(spool));
-    REQUIRE(std::filesystem::file_size(spool) == 256 * 1024);
-    REQUIRE(std::filesystem::file_size(journal) > 8);
 
-    // The file leaves the accepted namespace while the write is unpublished.
-    service.filesystem().unlink("/gone.bin");
-
-    config.fuse.publication_quiet = 0ms;
+    // A checksum-valid data_done whose data_published record did not survive
+    // the crash is authoritative and the frontend starts.
     {
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
+        auto fuse = node.fuse("authoritative-done");
+        uint64_t inode = 0;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            auto handle = frontend.create("/done-authoritative.bin", 0644, getuid(), getgid(), true,
+                                          true, false);
+            inode = handle.inode;
+            const Bytes payload{0x10, 0x20, 0x30, 0x40};
+            REQUIRE(frontend.write(inode, 0, payload) == payload.size());
+            frontend.release(inode, true);
+        });
+        const auto journal = *fuse.operation_journal_path;
+        // The intended pre-publication state: a data op, nothing published.
+        const auto record_types = fuse_journal_record_types(journal);
+        CHECK(std::find(record_types.begin(), record_types.end(), 3) != record_types.end());
+        CHECK(std::find(record_types.begin(), record_types.end(), 6) == record_types.end());
+        CHECK(std::find(record_types.begin(), record_types.end(), 7) == record_types.end());
+        // A new inode's first data operation has sequence 1.
+        append_fuse_journal_record(journal, fuse_data_done(inode, 1));
+        auto recovered = held_frontend(node, fuse);
+        CHECK(recovered->inode_for_path("/done-authoritative.bin").has_value());
+        recovered->stop();
+    }
+
+    // A completion marker with no operation behind it retires nothing: it is
+    // skipped and counted, and the frontend starts.
+    {
+        auto fuse = node.fuse("unbacked-done");
+        node.frontend(fuse)->stop();
+        append_fuse_journal_record(*fuse.operation_journal_path, fuse_data_done(999, 1));
+        auto recovered = node.frontend(fuse);
+        CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 1);
+        recovered->stop();
+    }
+
+    // The spool and journal are a per-inode WAL: a lost dirty spool, or one
+    // failing its checksum, invalidates that generation alone, which recovery
+    // abandons, falling back to the last committed manifest.
+    for (const bool corrupt : {false, true}) {
+        auto fuse = node.fuse(corrupt ? "corrupt-spool" : "missing-spool");
+        const std::string path = corrupt ? "/recover-corrupt.bin" : "/recover-missing.bin";
+        const auto published = corrupt ? pattern(768 * 1024, 61) : Bytes{};
+        if (corrupt)
+            write_file(fs, path, published);
+        else
+            fs.create_file(path, 0600, getuid(), getgid());
+        uint64_t inode = 0;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            auto handle = frontend.open(path, true, true, false, false);
+            inode = handle.inode;
+            const auto replacement = pattern(corrupt ? published.size() : 128 * 1024, 62);
+            REQUIRE(frontend.write(inode, 0, replacement) == replacement.size());
+            frontend.release(inode, true);
+        });
+        const auto spool = spool_of(fuse, inode);
+        REQUIRE(std::filesystem::exists(spool));
+        if (corrupt)
+            corrupt_first_byte(spool);
+        else
+            REQUIRE(std::filesystem::remove(spool));
+        auto recovered = node.frontend(fuse);
         REQUIRE(recovered->wait_for_idle(10s));
-        const auto diagnostics = recovered->diagnostics();
-        CHECK(diagnostics.publications_abandoned == 1);
-        CHECK(diagnostics.parked_publications == 0);
-        CHECK(recovered->status().pending_data == 0);
-        CHECK(!recovered->inode_for_path("/gone.bin").has_value());
+        CHECK(fs.getattr(path).size == published.size());
+        if (corrupt)
+            CHECK(read_back(fs, path, published.size()) == published);
+        CHECK(!std::filesystem::exists(spool) || std::filesystem::file_size(spool) == 0);
         recovered->stop();
     }
-    // Resolved once: the spool is gone and the journal has reset.
-    CHECK(!std::filesystem::exists(spool) || std::filesystem::file_size(spool) == 0);
-    CHECK(std::filesystem::file_size(journal) == 8);
+
+    // A recovered publication whose file has left the namespace is abandoned
+    // (journalled) on the first boot, freeing its spool and the journal; the
+    // second boot sees nothing.
     {
-        auto again = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
+        auto fuse = node.fuse("removed-file");
+        fuse.commit_workers = 1;
+        fs.create_file("/gone.bin", 0600, getuid(), getgid());
+        uint64_t inode = 0;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            auto handle = frontend.open("/gone.bin", true, true, false, false);
+            inode = handle.inode;
+            const auto payload = pattern(256 * 1024, 73);
+            REQUIRE(frontend.write(inode, 0, payload) == payload.size());
+            frontend.release(inode, true);
+        });
+        const auto spool = spool_of(fuse, inode);
+        REQUIRE(std::filesystem::file_size(spool) == 256 * 1024);
+        REQUIRE(std::filesystem::file_size(*fuse.operation_journal_path) > 8);
+        fs.unlink("/gone.bin");
+        {
+            auto recovered = node.frontend(fuse);
+            REQUIRE(recovered->wait_for_idle(10s));
+            const auto diagnostics = recovered->diagnostics();
+            CHECK(diagnostics.publications_abandoned == 1);
+            CHECK(diagnostics.parked_publications == 0);
+            CHECK(recovered->status().pending_data == 0);
+            CHECK(!recovered->inode_for_path("/gone.bin").has_value());
+            recovered->stop();
+        }
+        CHECK(!std::filesystem::exists(spool) || std::filesystem::file_size(spool) == 0);
+        CHECK(std::filesystem::file_size(*fuse.operation_journal_path) == 8);
+        auto again = node.frontend(fuse);
         REQUIRE(again->wait_for_idle(10s));
         CHECK(again->diagnostics().publications_abandoned == 0);
         CHECK(again->status().pending_data == 0);
         again->stop();
     }
+
+    // Truncate the journal at every frame boundary, or drop, duplicate or
+    // corrupt any frame: the frontend starts every time; mid-journal
+    // corruption is quarantined, an EOF checksum failure trimmed; and the
+    // pristine journal still recovers everything.
+    {
+        auto fuse = node.fuse("fuzz");
+        fuse.commit_workers = 1;
+        fs.mkdir("/fz-seeded", 0755, getuid(), getgid());
+        uint64_t inode_a = 0;
+        admit_unpublished(node, fuse, [&](FuseFrontend& frontend) {
+            frontend.mkdir("/fz", 0755, getuid(), getgid());
+            auto a = frontend.create("/fz/a.bin", 0600, getuid(), getgid(), true, true, false);
+            inode_a = a.inode;
+            const auto bytes_a = pattern(48 * 1024, 71);
+            REQUIRE(frontend.write(inode_a, 0, bytes_a) == bytes_a.size());
+            frontend.release(inode_a, true);
+            frontend.rename("/fz/a.bin", "/fz/b.bin", false);
+            frontend.mkdir("/fz/sub", 0755, getuid(), getgid());
+            auto c = frontend.create("/fz-seeded/c.bin", 0600, getuid(), getgid(), true, true, false);
+            const auto bytes_c = pattern(8 * 1024, 72);
+            REQUIRE(frontend.write(c.inode, 0, bytes_c) == bytes_c.size());
+            frontend.release(c.inode, true);
+        });
+        const auto spool_dir = *fuse.spool_path;
+        const auto journal = *fuse.operation_journal_path;
+        // Marker kinds the loader must also tolerate losing or duplicating.
+        const std::array<Bytes, 2> markers{
+            fuse_namespace_marker(journal_namespace_published,
+                                  journal_namespace_sequences(journal).front()),
+            fuse_data_done(inode_a, 1)};
+        append_fuse_journal_records(journal, markers);
+
+        const auto pristine = read_all_bytes(journal);
+        const auto frames = fuse_journal_frames(pristine);
+        REQUIRE(frames.size() >= 6);
+        const auto pristine_spool = node.path() / "spool-pristine";
+        std::filesystem::copy(spool_dir, pristine_spool, std::filesystem::copy_options::recursive);
+
+        size_t variants = 0;
+        const auto run_variant = [&](const std::string& name, const Bytes& bytes,
+                                     const std::function<void(FuseFrontend&)>& check) {
+            restore_directory(pristine_spool, spool_dir);
+            write_all_bytes(journal, bytes);
+            HeldFrontend frontend;
+            try {
+                frontend = held_frontend(node, fuse);
+            } catch (const std::exception& e) {
+                const auto message = name + ": frontend refused to start: " + e.what();
+                ::macha::test::check(false, message.c_str(), __FILE__, __LINE__);
+                return;
+            }
+            check(*frontend.frontend);
+            frontend->stop();
+            ++variants;
+        };
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const auto& frame = frames[i];
+            const auto label = "frame " + std::to_string(i) + " of " + std::to_string(frames.size());
+            const Bytes truncated(pristine.begin(),
+                                  pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+            // Recovery may append (re-journalled descriptors, markers for
+            // dropped operations), so only the start is asserted.
+            run_variant("truncate after " + label, truncated, [&](FuseFrontend&) {
+                CHECK(std::filesystem::file_size(journal) >= 8);
+            });
+            Bytes dropped = pristine;
+            dropped.erase(dropped.begin() + static_cast<ptrdiff_t>(frame.offset),
+                          dropped.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+            run_variant("drop " + label, dropped, [](FuseFrontend&) {});
+            Bytes duplicated = pristine;
+            duplicated.insert(duplicated.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size),
+                              pristine.begin() + static_cast<ptrdiff_t>(frame.offset),
+                              pristine.begin() + static_cast<ptrdiff_t>(frame.offset + frame.size));
+            run_variant("duplicate " + label, duplicated, [](FuseFrontend&) {});
+            Bytes corrupted = pristine;
+            corrupted[frame.offset + 4] ^= 0x5a;
+            run_variant("corrupt " + label, corrupted, [&](FuseFrontend& frontend) {
+                const auto status = frontend.diagnostics();
+                if (i + 1 == frames.size()) {
+                    CHECK(status.journal_recovery_quarantined_bytes == 0);
+                } else {
+                    CHECK(status.journal_recovery_quarantined_bytes ==
+                          pristine.size() - frame.offset);
+                    bool quarantined = false;
+                    for (const auto& entry : std::filesystem::directory_iterator(spool_dir))
+                        if (entry.path().filename().string().starts_with("operations.log.corrupt."))
+                            quarantined = true;
+                    CHECK(quarantined);
+                }
+            });
+        }
+        CHECK(variants == frames.size() * 4);
+
+        restore_directory(pristine_spool, spool_dir);
+        write_all_bytes(journal, pristine);
+        auto recovered = held_frontend(node, fuse);
+        CHECK(recovered->inode_for_path("/fz/b.bin").has_value());
+        CHECK(recovered->inode_for_path("/fz/sub").has_value());
+        CHECK(recovered->diagnostics().journal_recovery_skipped_frames == 0);
+        recovered->stop();
+    }
+}
+
+// Waits until the maintenance pass is parked in its wait with no wake-up for
+// five consecutive looks: done with all it can at the clock's current time.
+void settle_maintenance(Service& service) {
+    const auto deadline = Clock::now() + 20s;
+    uint64_t seen = service.maintenance_wakeups();
+    int quiet = 0;
+    while (Clock::now() < deadline && quiet < 5) {
+        std::this_thread::sleep_for(20ms);
+        const auto wakeups = service.maintenance_wakeups();
+        const bool parked = std::string_view(service.maintenance_stage()) == "wait";
+        quiet = parked && wakeups == seen ? quiet + 1 : 0;
+        seen = wakeups;
+    }
+    REQUIRE(quiet >= 5);
+}
+
+// The deadline the parked pass sleeps to, in ms from when it slept; -1 when
+// only an event can wake it.
+int64_t parked_wait_ms(const Service& service) {
+    const auto diagnostic = service.maintenance_sleep_diagnostic();
+    const auto at = diagnostic.find("wait_ms=");
+    REQUIRE(at != std::string::npos);
+    return std::stoll(diagnostic.substr(at + 8));
+}
+
+Service make_service(const Config& config, const ClusterKeys& keys,
+                     std::shared_ptr<MaintenanceClock> clock,
+                     Service::MaintenanceStageHook stage_hook = {}) {
+    ServiceInstruments instruments;
+    instruments.clock = std::move(clock);
+    return Service(config, keys, NodeRuntime::StartupStageHook{}, std::move(stage_hook),
+                   Service::StartupStallHandler{}, std::move(instruments));
+}
+
+// The management API over a Service: Status reports the published FUSE
+// frontend's counters beside the node's metadata convergence and withdraws
+// them with the frontend; a blocked namespace operation is reported over HTTP
+// and skipped through the Service. Integrated: the behaviour is the Service's
+// wiring of the subsystem registry into its routes.
+MACHA_TEST("filesystem_fuse", test_management_api_reports_and_skips_fuse_state) {
+    TestService fixture("fuse-management-api", ConfigProfile::isolated);
+    auto& config = fixture.config();
+    config.catalogue.api.enabled = true;
+    config.catalogue.api.listen = "127.0.0.1";
+    config.catalogue.api.port = free_port();
+    config.fuse.publication_quiet = 0ms;
+    auto& service = fixture.start();
+    const auto fuse_config = [&](std::string_view name) {
+        auto fuse = config.fuse;
+        fuse.spool_path = fixture.path() / "fuse" / std::string(name);
+        fuse.operation_journal_path = *fuse.spool_path / "operations.log";
+        return fuse;
+    };
+
+    {
+        auto frontend =
+            make_fuse_frontend(service.filesystem(), service.resources().memory, fuse_config("status"));
+        service.registry().publish_fuse(frontend);
+        frontend->mkdir("/status-counter", 0755, getuid(), getgid());
+        REQUIRE(frontend->wait_for_idle(10s));
+        REQUIRE(wait_until([&] {
+            const auto current = service.metadata_convergence_diagnostics();
+            return !current.scheduled && current.runs_scheduled == current.runs_completed;
+        }));
+
+        const auto response =
+            raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
+        CHECK(response.find("HTTP/1.1 200") != std::string::npos);
+        const auto diagnostics_root = status_diagnostics_response(config.catalogue.api.port, service);
+        const auto* diagnostics = diagnostics_root.find("diagnostics");
+        REQUIRE(diagnostics != nullptr);
+
+        const auto* data_store = diagnostics->find("data_store");
+        REQUIRE(data_store != nullptr);
+        CHECK(data_store->find("available")->asBool());
+        REQUIRE(data_store->find("loose_reaffirmation_fast_paths") != nullptr);
+        REQUIRE(data_store->find("loose_reaffirmation_full_validations") != nullptr);
+
+        const auto* retained_memory = diagnostics->find("retained_memory");
+        REQUIRE(retained_memory != nullptr);
+        CHECK(retained_memory->find("capacity_bytes")->asUInt64() ==
+              config.runtime.retained_memory_bytes);
+        REQUIRE(retained_memory->find("owners") != nullptr);
+        REQUIRE(retained_memory->find("owners")->find("rpc_frame") != nullptr);
+        REQUIRE(retained_memory->find("owners")->find("fuse_operation") != nullptr);
+
+        const auto* filesystem = diagnostics->find("filesystem");
+        REQUIRE(filesystem != nullptr);
+        CHECK(filesystem->find("available")->asBool());
+        CHECK(filesystem->find("namespace_operations_admitted")->asUInt64() == 1);
+        CHECK(filesystem->find("namespace_publication_batches")->asUInt64() == 1);
+        CHECK(filesystem->find("namespace_operations_batched")->asUInt64() == 1);
+        CHECK(filesystem->find("namespace_operations_published")->asUInt64() == 1);
+        CHECK(filesystem->find("namespace_operations_confirmed")->asUInt64() == 1);
+        // A new live inode durably appends its descriptor and operation before
+        // returning, then published and done.
+        CHECK(filesystem->find("journal_append_batches")->asUInt64() == 4);
+        CHECK(filesystem->find("journal_records_appended")->asUInt64() == 4);
+        CHECK(filesystem->find("journal_durability_barriers")->asUInt64() == 4);
+        CHECK(filesystem->find("spool_bytes")->asUInt64() == 0);
+        CHECK(filesystem->find("spool_limit_bytes")->asUInt64() == config.fuse.max_spool_bytes);
+        CHECK(filesystem->find("pending_write_request_limit_bytes")->asUInt64() ==
+              config.fuse.max_pending_write_bytes);
+        CHECK(filesystem->find("data_publication_pipeline_limit_bytes")->asUInt64() ==
+              2 * config.extent_size);
+        CHECK(filesystem->find("operation_metadata_limit_bytes")->asUInt64() ==
+              config.fuse.max_operation_metadata_bytes);
+        for (const auto* field :
+             {"spool_publish_rate_bytes_per_second", "spool_publish_rate_window_bytes",
+              "spool_publish_rate_window_ms", "spool_throttle_waits", "spool_throttle_wait_ms",
+              "pending_write_request_bytes", "peak_pending_write_request_bytes",
+              "extent_executor_workers", "extent_executor_queued", "extent_executor_active",
+              "extent_executor_peak_queued", "extent_executor_peak_active",
+              "extent_executor_submitted", "inode_count", "peak_inode_count",
+              "reclaimed_inode_count", "data_publication_requests",
+              "data_publication_notifications_suppressed", "spool_pressure_publication_sweeps",
+              "data_publication_coalesced_queued", "data_publication_coalesced_running",
+              "data_publication_coalesced_unconfirmed", "data_publications_started",
+              "data_publications_completed", "data_publication_peak_active",
+              "data_publication_quanta", "data_publication_yields",
+              "data_publication_peak_inflight_bytes", "data_publication_peak_pipeline_extents",
+              "data_closed_priority_selections", "data_retirement_priority_selections",
+              "data_publication_bytes_read", "data_publication_bytes_committed",
+              "data_publication_bytes_confirmed", "data_publication_completed_spool_bytes_read",
+              "data_publication_completed_source_bytes_read",
+              "data_publication_completed_reused_extents",
+              "data_publication_completed_put_extents", "data_overlay_read_queries",
+              "data_overlay_ranges_examined", "data_overlay_descriptors_copied",
+              "retained_data_operations", "retained_data_operation_bytes",
+              "retained_overlay_ranges", "retained_overlay_bytes",
+              "retained_publication_operations", "retained_publication_operation_bytes",
+              "operation_metadata_bytes", "peak_operation_metadata_bytes",
+              "operation_metadata_waits", "retained_durability_tickets",
+              "data_publication_inflight_bytes"}) {
+            if (filesystem->find(field) == nullptr)
+                std::cerr << "status filesystem lacks " << field << "\n";
+            CHECK(filesystem->find(field) != nullptr);
+        }
+
+        const auto* convergence = diagnostics->find("convergence");
+        REQUIRE(convergence != nullptr);
+        CHECK(convergence->find("available")->asBool());
+        CHECK(convergence->find("events_received")->asUInt64() >= 1);
+        CHECK(convergence->find("runs_scheduled")->asUInt64() >= 1);
+        CHECK(convergence->find("runs_completed")->asUInt64() ==
+              convergence->find("runs_scheduled")->asUInt64());
+        CHECK(convergence->find("requested_epoch")->asUInt64() ==
+              convergence->find("completed_epoch")->asUInt64());
+        CHECK(convergence->find("latest_generation")->asUInt64() ==
+              service.metadata_server().known_generation());
+        CHECK(!convergence->find("scheduled")->asBool());
+
+        service.registry().withdraw_fuse(frontend.get());
+        const auto detached = status_diagnostics_response(config.catalogue.api.port, service);
+        CHECK(!detached.find("diagnostics")->find("filesystem")->find("available")->asBool());
+        frontend->stop();
+    }
+
+    {
+        const auto fuse = fuse_config("skip");
+        {
+            auto admission = std::make_unique<HeldLoaderAdmission>();
+            admission->hold();
+            auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
+                                               fuse, std::move(admission));
+            frontend->mkdir("/wedge", 0755, getuid(), getgid());
+            frontend->stop();
+        }
+        service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
+        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, fuse);
+        service.registry().publish_fuse(recovered);
+        REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
+        const auto blocked = recovered->blocked_namespace_operation();
+        REQUIRE(blocked.has_value());
+        const auto get_response = raw_http_get(
+            config.catalogue.api.port, "/api/v1/manage/filesystem/blocked-namespace-operation",
+            bearer_header(service));
+        CHECK(get_response.find("HTTP/1.1 200") != std::string::npos);
+        const auto get_body_at = get_response.find("\r\n\r\n");
+        REQUIRE(get_body_at != std::string::npos);
+        const auto get_json = Json::parse(get_response.substr(get_body_at + 4));
+        CHECK(get_json.find("sequence")->asUInt64() == blocked->sequence);
+        CHECK(get_json.find("kind")->asString() == "mkdir");
+        CHECK(get_json.find("path")->asString() == "/wedge");
+        CHECK(service.skip_blocked_namespace_operation(blocked->sequence));
+        REQUIRE(recovered->wait_for_idle(10s));
+        CHECK(!recovered->blocked_namespace_operation().has_value());
+        CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
+        service.registry().withdraw_fuse(recovered.get());
+        recovered->stop();
+    }
+}
+
+// A burst of empty-directory removals, as `find -depth -type d -empty
+// -delete` issues, with concurrent readers, keeps the node serving. Every
+// removal is a metadata change and every metadata change asks the
+// media-information service to prune. Integrated: the load lands on the
+// Service's maintenance pass and media-information service at once.
+MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_keeps_the_node_up) {
+    TestService fixture("fuse-empty-directory-burst");
+    auto& config = fixture.config();
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.min_write_replicas = 1;
+    config.fuse.publication_quiet = 0ms;
+    auto& service = fixture.start();
+    auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
+
+    constexpr int titles = 60;
+    frontend->mkdir("/Movies", 0755, getuid(), getgid());
+    for (int i = 0; i < titles; ++i) {
+        const auto title = "/Movies/Title " + std::to_string(i);
+        frontend->mkdir(title, 0755, getuid(), getgid());
+        frontend->mkdir(title + "/Subs", 0755, getuid(), getgid());
+        frontend->mkdir(title + "/Featurettes", 0755, getuid(), getgid());
+        if (i % 2 == 0) {
+            auto handle = frontend->create(title + "/film.mkv", 0644, getuid(), getgid(), false,
+                                           true, false);
+            const auto bytes = pattern(4096 + static_cast<size_t>(i), static_cast<uint8_t>(i));
+            REQUIRE(frontend->write(handle.inode, 0, bytes) == bytes.size());
+            frontend->release(handle.inode, true);
+        }
+    }
+    REQUIRE(frontend->wait_for_idle(60s));
+
+    std::mutex unexpected_mutex;
+    std::vector<std::string> unexpected;
+    const auto note_unexpected = [&](std::string what) {
+        std::lock_guard lock(unexpected_mutex);
+        unexpected.push_back(std::move(what));
+    };
+    // jthreads, so a failure below stops and joins them on the way out.
+    std::vector<std::jthread> readers;
+    for (int r = 0; r < 4; ++r) {
+        readers.emplace_back([&, r](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                for (int i = r; i < titles; i += 4) {
+                    const auto title = "/Movies/Title " + std::to_string(i);
+                    for (const auto& path : {title, title + "/Subs", title + "/Featurettes"}) {
+                        try {
+                            (void)frontend->getattr(path);
+                            (void)frontend->readdir(path);
+                        } catch (const FsError& error) {
+                            if (error.code() != ENOENT)
+                                note_unexpected(path + ": FsError " + std::to_string(error.code()) +
+                                                " " + error.what());
+                        } catch (const std::exception& error) {
+                            note_unexpected(path + ": " + error.what());
+                        }
+                    }
+                }
+                try {
+                    (void)frontend->readdir("/Movies");
+                } catch (const std::exception& error) {
+                    note_unexpected(std::string("/Movies: ") + error.what());
+                }
+            }
+        });
+    }
+
+    // Bottom-up, as find -depth does: each directory is listed, then removed.
+    for (int i = 0; i < titles; ++i) {
+        const auto title = "/Movies/Title " + std::to_string(i);
+        (void)frontend->readdir(title);
+        frontend->rmdir(title + "/Subs");
+        frontend->rmdir(title + "/Featurettes");
+        if (i % 2 == 1)
+            frontend->rmdir(title);
+    }
+    // The readers go first: their own requests keep the request broker busy,
+    // and idle is only ever observed with none in flight.
+    for (auto& reader : readers)
+        reader.request_stop();
+    readers.clear();
+    REQUIRE(frontend->wait_for_idle(60s));
+    for (const auto& what : unexpected)
+        std::cerr << "unexpected: " << what << "\n";
+    CHECK(unexpected.empty());
+
+    const auto listed = frontend->readdir("/Movies");
+    size_t directories = 0;
+    for (const auto& [name, attributes] : listed)
+        if (name != "." && name != "..")
+            ++directories;
+    CHECK(directories == titles / 2);
+    CHECK(service.filesystem().getattr("/Movies/Title 0/film.mkv").type == EntryType::file);
+    frontend->stop();
+}
+
+// With no peer and no new input, the maintenance pass parks rather than
+// rediscovering an unavailable write floor on an interval; a peer joining
+// wakes it at once and the floor forms; identical membership exchanges
+// (heartbeats) then wake neither node. On a manual clock, so a pass that
+// polled would wake when the clock moves past its interval. Integrated: the
+// wake under test is a peer joining over the network.
+MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_event) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "event-maint-n1", cluster.keyfile(), p1);
+    auto c2 =
+        config_for(cluster.path() / "event-maint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 1;
+    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
+    c1.heartbeat = c2.heartbeat = 50ms;
+    c1.dead_after = c2.dead_after = 500ms;
+    c1.maintenance.no_progress_backoff = c2.maintenance.no_progress_backoff = 30s;
+    // Event-driven parking, not credit accrual: the startup slice is
+    // immediately affordable, so no credit deadline is pending.
+    c1.maintenance.initial_bandwidth = c2.maintenance.initial_bandwidth = 1024ULL * 1024 * 1024;
+    c1.maintenance.cpu_target = c2.maintenance.cpu_target = 1.0;
+    c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
+    c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
+
+    auto clock = std::make_shared<ManualMaintenanceClock>();
+    auto s1 = make_service(c1, keys, clock);
+    auto s2 = make_service(c2, keys, clock);
+    s1.start();
+    REQUIRE(s1.node().wait_local_state_ready(5s));
+    (void)s1.filesystem();
+
+    // Steps the clock through the pass's own short deadlines (formation
+    // settling, the GC quiet window) until every pass sleeps to its long
+    // back-off or to an event alone, then moves the clock well inside that
+    // back-off: nothing may wake.
+    const auto check_parked = [&](std::initializer_list<Service*> services) {
+        const auto longest = std::chrono::milliseconds(c1.maintenance.no_progress_backoff).count();
+        bool parked = false;
+        for (int step = 0; step < 10 && !parked; ++step) {
+            int64_t next = -1;
+            for (auto* service : services) {
+                settle_maintenance(*service);
+                const auto wait_ms = parked_wait_ms(*service);
+                if (wait_ms >= 0 && wait_ms < longest)
+                    next = next < 0 ? wait_ms : std::min(next, wait_ms);
+            }
+            parked = next < 0;
+            if (!parked)
+                clock->advance(std::chrono::milliseconds(next));
+        }
+        REQUIRE(parked);
+        std::vector<std::pair<uint64_t, std::string>> before;
+        for (auto* service : services)
+            before.emplace_back(service->maintenance_wakeups(),
+                                service->maintenance_sleep_diagnostic());
+        clock->advance(5s);
+        size_t index = 0;
+        for (auto* service : services) {
+            settle_maintenance(*service);
+            if (service->maintenance_wakeups() != before[index].first)
+                std::cerr << "node " << index << " woke while parked: before "
+                          << before[index].second << ", after "
+                          << service->maintenance_sleep_diagnostic() << ", stage "
+                          << service->maintenance_stage() << "\n";
+            CHECK(service->maintenance_wakeups() == before[index].first);
+            ++index;
+        }
+    };
+
+    check_parked({&s1});
+
+    // A peer event bypasses the outstanding retry deadline and forms the floor
+    // without the clock moving.
+    s2.start();
+    REQUIRE(wait_until(
+        [&] {
+            return s1.local_state().replica().current().generation > 1 &&
+                   s2.local_state().replica().current().generation > 1;
+        },
+        5s));
+
+    // Heartbeats keep arriving in real time while the passes settle.
+    check_parked({&s1, &s2});
+    s2.stop();
+    s1.stop();
+}
+
+// A coalesced burst of deletes schedules exactly one follow-up convergence
+// run and arms one wake at the exact end of the garbage grace: the objects
+// survive to the last moment before it and are collected once it passes.
+// On a manual clock, so the boundary is stepped rather than slept through.
+// Integrated: convergence demand, the garbage inventory and the collector
+// meet only in the Service's maintenance pass.
+MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage_grace) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("coalesced-garbage-grace");
+    config.replication = 1;
+    config.metadata_min_write_replicas = 1;
+    config.maintenance.garbage_grace = 750ms;
+    config.maintenance.foreground_quiet = 10ms;
+    config.maintenance.no_progress_backoff = 500ms;
+
+    TestGate repair_gate;
+    std::atomic_bool gate_repair{};
+    std::atomic_bool gate_once{};
+    auto clock = std::make_shared<ManualMaintenanceClock>();
+    auto service = make_service(config, cluster.keys(), clock, [&](std::string_view stage) {
+        if (stage == "metadata-repair-begin" && gate_repair.load(std::memory_order_acquire) &&
+            !gate_once.exchange(true, std::memory_order_acq_rel))
+            repair_gate.enter_and_wait();
+    });
+    GateOpener open_on_exit{repair_gate};
+    service.start();
+    auto& fs = service.filesystem();
+
+    const auto converged = [&] {
+        const auto diagnostics = service.metadata_convergence_diagnostics();
+        return !diagnostics.scheduled && diagnostics.runs_scheduled == diagnostics.runs_completed;
+    };
+    std::vector<ObjectId> retired_ids;
+    for (size_t index = 0; index < 3; ++index) {
+        const auto path = "/garbage-grace-" + std::to_string(index);
+        write_file(fs, path, pattern(64 * 1024 + index, static_cast<uint8_t>(index + 7)));
+        const auto entry = fs.getattr(path);
+        REQUIRE(entry.extents.size() == 1);
+        retired_ids.push_back(entry.extents.front().id);
+        REQUIRE(service.local_state().data().has(retired_ids.back()));
+    }
+    settle_maintenance(service);
+    REQUIRE(converged());
+
+    const auto before = service.metadata_convergence_diagnostics();
+    gate_repair.store(true, std::memory_order_release);
+    fs.unlink("/garbage-grace-0");
+    REQUIRE(repair_gate.wait_for_entries(1, 5s));
+    fs.unlink("/garbage-grace-1");
+    fs.unlink("/garbage-grace-2");
+
+    const auto snapshot = service.metadata_manager().snapshot();
+    int64_t latest_retirement{};
+    for (const auto& id : retired_ids) {
+        const auto found = std::find_if(snapshot.garbage.begin(), snapshot.garbage.end(),
+                                        [&](const GarbageRef& garbage) { return garbage.id == id; });
+        REQUIRE(found != snapshot.garbage.end());
+        latest_retirement = std::max(latest_retirement, found->retired_at_ns);
+        CHECK(service.local_state().data().has(id));
+    }
+    repair_gate.open();
+    settle_maintenance(service);
+    const auto held = [&] {
+        return std::all_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
+            return service.local_state().data().has(id);
+        });
+    };
+    const auto collected = [&] {
+        return std::none_of(retired_ids.begin(), retired_ids.end(), [&](const ObjectId& id) {
+            return service.local_state().data().has(id);
+        });
+    };
+
+    // The last moment before the grace ends.
+    const auto grace_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(config.maintenance.garbage_grace)
+            .count();
+    const auto to_grace = latest_retirement + grace_ns - clock->wall_ns();
+    REQUIRE(to_grace > 1'000'000);
+    clock->advance(std::chrono::nanoseconds(to_grace - 1'000'000));
+    settle_maintenance(service);
+    CHECK(held());
+    const auto before_grace = service.metadata_convergence_diagnostics();
+    // On mismatch, report the direction: an extra run means a metadata or
+    // topology event arrived after the follow-up began; a missing one means
+    // the unlinks coalesced differently.
+    if (before_grace.runs_scheduled != before.runs_scheduled + 2 ||
+        before_grace.runs_completed != before.runs_completed + 2)
+        std::cerr << "convergence before grace: runs_scheduled " << before.runs_scheduled << " -> "
+                  << before_grace.runs_scheduled << ", runs_completed " << before.runs_completed
+                  << " -> " << before_grace.runs_completed << ", events "
+                  << before.events_received << " -> " << before_grace.events_received
+                  << ", epoch requested/completed " << before_grace.requested_epoch << "/"
+                  << before_grace.completed_epoch << ", scheduled " << before_grace.scheduled
+                  << "\n";
+    CHECK(before_grace.runs_scheduled == before.runs_scheduled + 2);
+    CHECK(before_grace.runs_completed == before.runs_completed + 2);
+    // The pass sleeps to the grace's end exactly: the one millisecond left.
+    CHECK(parked_wait_ms(service) >= 0);
+    CHECK(parked_wait_ms(service) <= 1);
+
+    // Past the grace the pass wakes at once; collection follows its GC quiet
+    // window, which that wake arms.
+    clock->advance(1ms);
+    settle_maintenance(service);
+    CHECK(held());
+    CHECK(parked_wait_ms(service) >= 0);
+    CHECK(parked_wait_ms(service) <=
+          std::chrono::milliseconds(config.maintenance.foreground_quiet).count());
+    // The collector also ages an unclaimed object by its file's own time,
+    // which the clock seam does not cover: step the pass's deadlines until
+    // that age has passed as well.
+    REQUIRE(wait_until(
+        [&] {
+            if (collected())
+                return true;
+            const auto wait_ms = parked_wait_ms(service);
+            if (wait_ms >= 0 && wait_ms < 10'000)
+                clock->advance(std::chrono::milliseconds(std::max<int64_t>(wait_ms, 1)));
+            settle_maintenance(service);
+            return collected();
+        },
+        10s));
+    settle_maintenance(service);
+    CHECK(collected());
+    const auto current = service.metadata_manager().snapshot();
+    CHECK(std::none_of(current.garbage.begin(), current.garbage.end(),
+                       [&](const GarbageRef& garbage) {
+                           return std::find(retired_ids.begin(), retired_ids.end(), garbage.id) !=
+                                  retired_ids.end();
+                       }));
+    const auto after = service.metadata_convergence_diagnostics();
+    CHECK(converged());
+    CHECK(after.runs_scheduled >= before.runs_scheduled + 3);
+    CHECK(after.runs_scheduled <= before.runs_scheduled + 5);
+    service.stop();
 }
 
 } // namespace
