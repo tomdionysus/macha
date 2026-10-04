@@ -452,7 +452,7 @@ bool MetadataManager::push_history_to_peer(const NodeInfo& owner, const Hash256&
     auto& local = local_.replica();
     if (owner.id == node_.node_id())
         return local.history_contains(target);
-    if (!local.history_contains(target))
+    if (!local.history_contains(target) || stalled(owner.id))
         return false;
 
     std::map<Hash256, bool> remote_presence;
@@ -606,6 +606,45 @@ MetadataHistoryEntry MetadataManager::commit_history_entry(
     return entry;
 }
 
+bool MetadataManager::stalled(const NodeId& id) const {
+    Lock lock(stalled_mutex_);
+    const auto found = stalled_until_.find(id);
+    if (found == stalled_until_.end())
+        return false;
+    if (Clock::now() < found->second)
+        return true;
+    stalled_until_.erase(found);
+    return false;
+}
+
+RpcReply MetadataManager::commit_call(const NodeInfo& owner, MessageType type,
+                                      std::span<const uint8_t> payload, FrameType frame_type) {
+    if (stalled(owner.id))
+        throw std::runtime_error("peer stalled on an earlier commit call");
+    auto rpc = node_.call_async(owner, type, payload, frame_type);
+    const auto stall = node_.config().write_stall;
+    const auto started = Clock::now();
+    while (rpc.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+        // A route that cannot say how long it has been idle is judged by how
+        // long the call has taken.
+        auto quiet = rpc.idle_for();
+        if (quiet == std::chrono::milliseconds::max())
+            quiet = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
+        if (quiet < stall)
+            continue;
+        rpc.cancel();
+        {
+            Lock lock(stalled_mutex_);
+            stalled_until_[owner.id] = Clock::now() + node_.config().dead_after;
+        }
+        Log::warn("metadata commit call stalled peer=" + owner.host + " no_progress_ms=" +
+                  std::to_string(stall.count()) + "; not asked again for " +
+                  std::to_string(node_.config().dead_after.count()) + " ms");
+        throw std::runtime_error("peer made no progress on a commit call");
+    }
+    return rpc.get();
+}
+
 bool MetadataManager::store_commit_on(const NodeInfo& owner,
                                       const MetadataHistoryEntry& compact,
     const MetadataRecord& record,
@@ -626,7 +665,7 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
 
     try {
         auto encoded = encode_metadata_history_entry(compact);
-        auto reply = node_.call(owner, MessageType::put_metadata_commit, encoded, frame_type);
+        auto reply = commit_call(owner, MessageType::put_metadata_commit, encoded, frame_type);
         if (bool_reply(reply))
             return true;
 
@@ -637,13 +676,13 @@ bool MetadataManager::store_commit_on(const NodeInfo& owner,
             if (push_history_to_peer(owner, compact.previous, frame_type)) {
                 encoded = encode_metadata_history_entry(compact);
                 if (bool_reply(
-                        node_.call(owner, MessageType::put_metadata_commit, encoded, frame_type)))
+                        commit_call(owner, MessageType::put_metadata_commit, encoded, frame_type)))
                     return true;
             }
             auto full = commit_history_entry(record);
             encoded = encode_metadata_history_entry(full);
             return bool_reply(
-                node_.call(owner, MessageType::put_metadata_commit, encoded, frame_type));
+                commit_call(owner, MessageType::put_metadata_commit, encoded, frame_type));
         }
     } catch (const std::exception& error) {
         Log::debug("metadata commit store " + owner.host + ": " + error.what());
@@ -661,7 +700,7 @@ bool MetadataManager::accept_commit_on(const NodeInfo& owner,
     try {
         const auto encoded = encode_metadata_acceptance(acceptance);
         return bool_reply(
-            node_.call(owner, MessageType::accept_metadata_commit, encoded, frame_type));
+            commit_call(owner, MessageType::accept_metadata_commit, encoded, frame_type));
     } catch (const std::exception& error) {
         Log::debug("metadata acceptance " + owner.host + ": " + error.what());
         return false;
