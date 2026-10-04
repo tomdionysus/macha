@@ -1046,26 +1046,35 @@ std::vector<MetadataRecord> MetadataManager::usable_heads() const {
 }
 
 MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& heads) const {
-    const auto self = node_.node_id();
-    const MetadataRecord* best = nullptr;
-    uint64_t best_sequence = 0;
+    // The head carrying the most of what this node authored: by its current
+    // author id first, then by each earlier one.
+    std::vector<std::pair<std::vector<uint64_t>, const MetadataRecord*>> ranked;
+    std::optional<std::vector<NodeId>> authors;
     for (const auto& head : heads) {
-        uint64_t sequence = 0;
         try {
             const auto snapshot = decode_snapshot(head.payload);
-            if (const auto found = snapshot.mutation_sequences.find(self);
-                found != snapshot.mutation_sequences.end())
-                sequence = found->second;
+            if (!authors)
+                authors = local_.replica().author_ids(node_.node_id(),
+                                                      snapshot.mutation_sequences);
+            std::vector<uint64_t> sequences;
+            for (const auto& author : *authors) {
+                const auto found = snapshot.mutation_sequences.find(author);
+                sequences.push_back(found == snapshot.mutation_sequences.end() ? 0
+                                                                               : found->second);
+            }
+            ranked.emplace_back(std::move(sequences), &head);
         } catch (const std::exception&) {
-            continue;
-        }
-        if (!best || sequence > best_sequence ||
-            (sequence == best_sequence && head.hash < best->hash)) {
-            best = &head;
-            best_sequence = sequence;
         }
     }
-    return best ? *best : heads.front();
+    if (ranked.empty())
+        return heads.front();
+    const auto best = std::max_element(ranked.begin(), ranked.end(),
+                                       [](const auto& a, const auto& b) {
+                                           if (a.first != b.first)
+                                               return a.first < b.first;
+                                           return a.second->hash > b.second->hash;
+                                       });
+    return *best->second;
 }
 
 void MetadataManager::set_aside(const MetadataRecord& head, std::string_view reason) const {
@@ -1326,12 +1335,11 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         // no earlier release here can void the claim; the head that carries
         // this node's next mutation covers it.
         if (publication_retention_) {
-            const auto origin = node_.node_id();
-            const auto seen = merged.snapshot.mutation_sequences.find(origin);
-            const auto sequence = local_.replica().reserve_mutation_sequence(
-                seen == merged.snapshot.mutation_sequences.end() ? 0 : seen->second);
+            const auto claim = local_.replica().reserve_mutation_dot(
+                node_.node_id(), merged.snapshot.mutation_sequences);
             publication_retention_(MetadataPublicationContext{
-                origin, sequence, primary.record, merged.snapshot, delta ? &*delta : nullptr});
+                claim.author, claim.sequence, primary.record, merged.snapshot,
+                delta ? &*delta : nullptr});
         }
         const auto retention_ms = stage_ms();
         (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
@@ -1649,8 +1657,9 @@ MetadataRecord MetadataManager::mutate_impl(
     const std::function<void(MetadataSnapshot&, MetadataDelta*)>& mutate, bool exact_delta,
     size_t retries, std::optional<MetadataMutationIdentity> identity) {
     Lock lock(mutation_mutex_);
-    const auto origin = node_.node_id();
-    std::optional<uint64_t> sequence;
+    // This mutation's dot, kept across retries so an attempt that was
+    // accepted after all is recognised rather than made twice.
+    std::optional<MetadataDot> dot;
     if (identity && !identity->sequence)
         throw std::invalid_argument("metadata mutation identity sequence must be non-zero");
 
@@ -1692,8 +1701,7 @@ MetadataRecord MetadataManager::mutate_impl(
 
         auto snapshot = decode_snapshot(current.payload);
         const bool clear_merge_parent_topology = !snapshot.merge_parents.empty();
-        auto seen = snapshot.mutation_sequences.find(origin);
-        if (sequence && seen != snapshot.mutation_sequences.end() && seen->second >= *sequence) {
+        if (dot && clock_covers(snapshot.mutation_sequences, *dot)) {
             offer_accepted_head(active, current, FrameType::read_ahead);
             cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             return current;
@@ -1708,13 +1716,11 @@ MetadataRecord MetadataManager::mutate_impl(
                 return current;
             }
         }
-        if (!sequence) {
-            const uint64_t previous =
-                seen == snapshot.mutation_sequences.end() ? 0 : seen->second;
-            if (previous == std::numeric_limits<uint64_t>::max())
-                throw std::runtime_error("metadata mutation sequence exhausted");
-            sequence = local_.replica().reserve_mutation_sequence(previous);
-        }
+        if (!dot)
+            dot = local_.replica().reserve_mutation_dot(node_.node_id(),
+                                                        snapshot.mutation_sequences);
+        const auto origin = dot->author;
+        const std::optional<uint64_t> sequence = dot->sequence;
 
         std::optional<MetadataSnapshot> before;
         if (!exact_delta)
@@ -1828,6 +1834,7 @@ MetadataRecord MetadataManager::mutate_impl(
         try {
             const auto publish_started = Clock::now();
             (void)publish_commit(active, proposed, delta_payload, FrameType::read_ahead);
+            local_.replica().note_author_accepted(*dot);
             const auto publish_ms = elapsed_ms(publish_started);
             mutations_.fetch_add(1, std::memory_order_relaxed);
             mutation_retention_ms_total_.fetch_add(retention_ms, std::memory_order_relaxed);

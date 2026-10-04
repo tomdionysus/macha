@@ -2039,21 +2039,84 @@ MACHA_FAST_TEST("storage_metadata",
     CHECK(!reopened.acceptance(record.hash).has_value());
 }
 
-MACHA_FAST_TEST("storage_metadata",
-                test_metadata_local_mutation_sequence_never_regresses_with_branch_state) {
+// A node authors under its node id, its sequence never regresses, and a
+// restart continues it.
+MACHA_FAST_TEST("storage_metadata", test_an_author_sequence_never_regresses) {
     TempDir t;
     auto keyfile = t.path() / "key";
     write_key(keyfile);
     const auto keys = load_cluster_keys(keyfile);
-    const auto path = t.path() / "mutation-sequence";
+    const auto path = t.path() / "author";
+    const auto node = random_node_id();
+    const auto other = random_node_id();
     {
         MetadataReplica replica(path, keys.storage);
-        CHECK(replica.reserve_mutation_sequence(5) == 6);
-        CHECK(replica.reserve_mutation_sequence(2) == 7);
+        CHECK((replica.reserve_mutation_dot(node, {}) == MetadataDot{node, 1}));
+        // A head that has seen further (merged from a peer) moves it on.
+        CHECK((replica.reserve_mutation_dot(node, {{node, 5}, {other, 9}}) ==
+               MetadataDot{node, 6}));
+        // A head that has seen less does not move it back.
+        CHECK((replica.reserve_mutation_dot(node, {{node, 2}}) == MetadataDot{node, 7}));
     }
     MetadataReplica reopened(path, keys.storage);
-    CHECK(reopened.reserve_mutation_sequence(1) == 8);
-    CHECK(reopened.reserve_mutation_sequence(100) == 101);
+    CHECK((reopened.reserve_mutation_dot(node, {{node, 1}}) == MetadataDot{node, 8}));
+    CHECK((reopened.reserve_mutation_dot(node, {{node, 100}}) == MetadataDot{node, 101}));
+    CHECK((reopened.author_ids(node, {}) == std::vector<NodeId>{node}));
+}
+
+// One author's commits form a chain. A head that lacks a mutation this node
+// had accepted cannot be extended under the same author: the node takes a
+// new author id and starts again, and keeps doing so across a restart.
+MACHA_FAST_TEST("storage_metadata", test_a_broken_author_chain_starts_a_new_author) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto path = t.path() / "author";
+    const auto node = random_node_id();
+    NodeId second{};
+    {
+        MetadataReplica replica(path, keys.storage);
+        const auto first = replica.reserve_mutation_dot(node, {});
+        replica.note_author_accepted(first);
+        const auto next = replica.reserve_mutation_dot(node, {{node, 1}});
+        CHECK((next == MetadataDot{node, 2}));
+        replica.note_author_accepted(next);
+
+        // The head on offer carries only the first.
+        const auto fresh = replica.reserve_mutation_dot(node, {{node, 1}});
+        CHECK(fresh.author != node);
+        CHECK(fresh.sequence == 1);
+        second = fresh.author;
+        CHECK((replica.author_ids(node, {}) == std::vector<NodeId>{second, node}));
+        // The new author continues normally.
+        replica.note_author_accepted(fresh);
+        CHECK((replica.reserve_mutation_dot(node, {{node, 1}, {second, 1}}) ==
+               MetadataDot{second, 2}));
+    }
+    MetadataReplica reopened(path, keys.storage);
+    CHECK((reopened.author_ids(node, {}) == std::vector<NodeId>{second, node}));
+    CHECK((reopened.reserve_mutation_dot(node, {{second, 2}}) == MetadataDot{second, 3}));
+}
+
+// A node whose author record is gone while a head shows it has authored
+// before may not continue the old sequence.
+MACHA_FAST_TEST("storage_metadata", test_a_lost_author_record_starts_a_new_author) {
+    TempDir t;
+    auto keyfile = t.path() / "key";
+    write_key(keyfile);
+    const auto keys = load_cluster_keys(keyfile);
+    const auto node = random_node_id();
+    MetadataReplica replica(t.path() / "author", keys.storage);
+    const auto dot = replica.reserve_mutation_dot(node, {{node, 41}});
+    CHECK(dot.author != node);
+    CHECK(dot.sequence == 1);
+    CHECK((replica.author_ids(node, {}) == std::vector<NodeId>{dot.author, node}));
+
+    CHECK(clock_covers({{node, 41}}, MetadataDot{node, 41}));
+    CHECK(!clock_covers({{node, 41}}, MetadataDot{node, 42}));
+    CHECK(!clock_covers({{node, 41}}, dot));
+    CHECK(!static_cast<bool>(MetadataDot{}));
 }
 
 MACHA_FAST_TEST("storage_metadata", test_protocol20_delta_preserves_governance_snapshot_encoding) {

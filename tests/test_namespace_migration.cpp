@@ -822,19 +822,21 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     REQUIRE(merged.namespace_root.has_value());
     // A pure join: the clock is the branches', so any reconciler mints it.
     CHECK(merged.mutation_sequences == left_snapshot.mutation_sequences);
-    const auto merged_sequence = merged.mutation_sequences.at(node_id);
 
     const auto& primary = head.previous == left.hash ? left_snapshot : right_snapshot;
     std::vector<ObjectId> introduced;
     collect_namespace_tree_changes(primary.namespace_root, *merged.namespace_root,
                                    service.filesystem().namespace_nodes(), introduced);
     REQUIRE(!introduced.empty());
-    for (const auto& node : introduced) {
+    // The claim's dot: this node's, under whichever author id it holds now.
+    const auto claim_of = [&](const ObjectId& node) {
         const auto held = claims.claims(RetentionClass::control, node);
-        const auto add = held.adds.find(node_id);
-        REQUIRE(add != held.adds.end());
+        REQUIRE(held.adds.size() == 1);
+        return MetadataDot{held.adds.begin()->first, held.adds.begin()->second};
+    };
+    for (const auto& node : introduced) {
         // Beyond this head's clock: a release at this head keeps it.
-        CHECK(add->second > merged_sequence);
+        CHECK(!clock_covers(merged.mutation_sequences, claim_of(node)));
     }
     REQUIRE(!merged.conflicts.empty());
     for (const auto* entry : {&first, &second})
@@ -845,8 +847,7 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     service.filesystem().mkdir("/after-merge", 0755, getuid(), getgid());
     const auto after = service.metadata_manager().snapshot();
     for (const auto& node : introduced)
-        CHECK(after.mutation_sequences.at(node_id) >=
-              claims.claims(RetentionClass::control, node).adds.at(node_id));
+        CHECK(clock_covers(after.mutation_sequences, claim_of(node)));
     CHECK(service.filesystem().getattr("/Films/left").type == EntryType::directory);
     CHECK(service.filesystem().getattr("/Films/right").type == EntryType::directory);
     service.stop();

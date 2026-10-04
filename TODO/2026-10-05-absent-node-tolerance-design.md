@@ -210,3 +210,78 @@ design the question stops mattering: es-1 returning is a merge.
 - Why the baseline was needed in addition to the head's live set.
 - Whether a node that loses its state and returns under the same id can reuse sequence numbers.
   If it can, P2 needs a fresh author id per state lifetime.
+
+## Stage B in detail
+
+Written after stages A and C landed (0.88.0). This is the working design for the exact merge.
+
+### What a head carries
+
+- `mutation_sequences`, as now: per author, the highest sequence incorporated. A merge joins by
+  max.
+- `legacy_clock`: the head's `mutation_sequences` as it stood when its lineage was first written by
+  code that stamps dots. Frozen from then on; a merge joins by max.
+
+### What an entry carries
+
+- `content_dot` (author, sequence): its last change of content or attributes.
+- `name_dot` (author, sequence): when it came to be at this path, by creation or rename.
+- `file_id` (16 bytes): set at creation, carried by a rename.
+
+An entry written before stamping has none of these and is left exactly as it is: no leaf is
+rewritten for the upgrade. Such an entry gets a `content_dot` the first time it is changed, and a
+`file_id` derived from the path it sat at (so two branches that touch the same legacy file agree on
+its identity).
+
+### Authors
+
+A dot's author is not the node id but an author id the node holds beside its sequence counter. The
+node also persists the highest sequence it has had accepted. If the head it is about to extend
+carries a lower entry for its author id than that (state restored from an older copy, a recovery
+from a seed, a re-root), it takes a new author id and starts at 1. So one author's commits always
+form a chain, which is what "the vector covers the dot" relies on. Retention claim dots use the
+same author and sequence.
+
+### The merge of two heads
+
+For each path that differs between the two namespaces:
+
+1. Present on one side only.
+   - The entry has a dot: if the other side's vector covers both its `name_dot` and its
+     `content_dot`, the other side knew this very entry and removed it, so it stays removed. If it
+     covers neither, the other side never saw it, so it is kept. If it covers the name but not the
+     content, the entry was edited on one side while the other removed it: the edit is kept.
+   - The entry has no dot (legacy): it is removed only if the other side's vector covers this
+     side's `legacy_clock`, which proves the other side saw every commit that could have created
+     it. Otherwise it is kept.
+2. Present on both sides, different.
+   - Same content, different dots: no conflict; the greater dot is kept.
+   - One side's vector covers the other's `content_dot` and not the reverse: the newer wins.
+   - Neither covers the other: a concurrent edit. The later modification time is installed (ties
+     by content hash) and both are recorded in a conflict record, which carries no base.
+
+Then two passes over the result:
+
+- **Identity.** If one `file_id` now sits at two paths, one side renamed it while the other still
+  had it at the old path. The path whose `name_dot` the other side's vector does not cover is the
+  newer name and is kept; the content is settled between the two entries by rule 2. Two concurrent
+  renames of one file keep the later-modified path and record a conflict.
+- **Parents.** Every surviving entry needs its directories. A missing parent is taken from the side
+  that has it. A directory with surviving descendants wins a file/directory clash at its path.
+
+A merge mints no dots, so every reconciler computes the same record.
+
+Known limit, accepted: a directory renamed on one side while the other adds a child under the old
+name ends with both directories. Nothing is lost.
+
+### What goes
+
+- The three-way merge, the common-ancestor lookup, and the "no known common ancestor" set-aside.
+  A head is still set aside when its content cannot be fetched from a node present.
+- The history checkpoint protocol. Each node truncates its own history when it has one head.
+
+### Formats
+
+A new namespace leaf form for entries that carry dots (legacy leaves stay readable and unchanged),
+a new snapshot form carrying `legacy_clock`, and a new delta form. A build without these cannot
+read a head written with them, so the cluster upgrades together.

@@ -25,7 +25,17 @@ run 0.87 and 0.88 together for longer than the upgrade takes.
 this node last heard of it); an older build cannot read it. Two new files,
 `<state_path>/retention/unreferenced-data.bin` and
 `unreferenced-control.bin`, record when this node first saw each object it
-holds unreferenced.
+holds unreferenced. `<state_path>/metadata/author.meta` replaces
+`mutation-sequence.meta`.
+
+**One author's mutations form a chain.** A node authors under its node id
+and a sequence. If the head it is about to extend lacks a mutation it had
+accepted (state restored from an older copy), or its head set was replaced
+(a recovery from the cache seed, a re-root), or its author record is gone
+while a head shows it authored before, it takes a new author id and starts
+again at 1 rather than reuse a sequence. Claim release and, later, the
+merge rely on a clock entry meaning "every mutation of that author up to
+here".
 
 **Writes are accepted on the nodes present.** A metadata commit, a merge
 commit, a namespace tree node, a catalogue shard or manifest and a retention

@@ -3390,9 +3390,10 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     s1.stop();
 }
 
-MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_resumes_when_it_returns) {
-    // An ingest that meets MetadataNotReady blocks with metadata_unavailable,
-    // is retried, and completes once metadata is writable again.
+MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_on_a_node_with_no_namespace_yet_resumes_when_it_has_one) {
+    // A node still waiting for its bootstrap peer has no namespace to write:
+    // an ingest there blocks with metadata_unavailable, is retried, and
+    // completes once the peer has arrived and the namespace has formed.
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -3409,15 +3410,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_re
         config->ingest.enabled = false;
     }
     Service s1(c1, keys, test_durability_window);
-    auto s2 = std::make_unique<Service>(c2, keys, test_durability_window);
+    std::unique_ptr<Service> s2;
     s1.start();
-    s2->start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 2 && s2->node().membership().active().size() == 2;
-    }));
-    s2->stop();
-    s2.reset();
-    REQUIRE(wait_until([&] { return s1.node().membership().active().size() == 1; }));
 
     const auto root = cluster.path() / "source";
     std::filesystem::create_directories(root);
