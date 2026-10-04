@@ -21,8 +21,8 @@ void Service::reload_config() {
     if (updated.extent_size != node_.config().extent_size)
         throw std::runtime_error("extent_size cannot be changed for an existing namespace");
     if (updated.replication != node_.config().replication ||
-        updated.metadata_min_write_replicas != node_.config().metadata_min_write_replicas)
-        throw std::runtime_error("replica policy changes require a coordinated cluster restart");
+        updated.metadata_write_copies != node_.config().metadata_write_copies)
+        throw std::runtime_error("dht.replicas and dht.metadata_write_copies changes require a restart");
     if (updated.runtime.glibc_arena_max != node_.config().runtime.glibc_arena_max)
         throw std::runtime_error("runtime.glibc_arena_max changes require a process restart");
     const auto& current_streaming = node_.config().streaming;

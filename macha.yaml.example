@@ -275,23 +275,22 @@ network:
     enabled: false
     timeout_ms: 3000
 
-# Cluster policy. Keep replica counts identical everywhere and change them as a
-# coordinated cluster operation. Every node is metadata-capable.
-# `min_write_replicas` is the foreground DATA durability floor; `replicas` is
-# the DATA convergence target restored by repair. `metadata_min_write_replicas`
-# is the number of distinct active nodes required to publish metadata/control.
+# Cluster policy. Every node is metadata-capable and any node accepts a write
+# on its own. `replicas` is the DATA copy count repair converges to.
+# `write_copies` and `metadata_write_copies` are the copies sought before a
+# write returns, of a DATA object and of a metadata commit: with that many
+# nodes present and answering, the write is on that many when it returns;
+# with fewer, it returns on the copies it has and repair delivers the rest.
 #
 # extent_size is fixed once a namespace exists. It is a logical file-chunk
 # ceiling and is unrelated to the physical small-object packing threshold.
 dht:
   replicas: 3
-  metadata_min_write_replicas: 2
+  metadata_write_copies: 2
 
-  # DATA may publish after min_write_replicas durable authoritative copies.
-  # Repair converges missing copies toward replicas. A full/offline/stalled
-  # preferred owner falls through to the next deterministic capacity-aware
-  # candidate. Metadata/control writes use their separate any-node write floor.
-  min_write_replicas: 1
+  # A full, offline or stalled preferred owner falls through to the next
+  # deterministic capacity-aware candidate.
+  write_copies: 1
   write_stall_ms: 2500
   extent_size: 4M
   # Bound simultaneous blocking DATA work by bytes, while preserving headroom
@@ -415,13 +414,14 @@ maintenance:
   # at a 30-second cadence independently of this data-plane backoff.
   no_progress_backoff_ms: 300000
 
-  # Recently retired objects and otherwise-unreachable physical objects must
-  # remain untouched for this long before reachability GC may reclaim them.
-  # Retirement tombstones are pruned after the same grace period.
-  garbage_grace_ms: 86400000
+  # The absence horizon (30 days). A node removes an object's bytes only once
+  # it has itself seen the object unreferenced for this long, so a node may be
+  # away this long and still find what its branch refers to. A node unheard of
+  # for this long is forgotten. Retirement tombstones are pruned after it.
+  garbage_grace_ms: 2592000000
 
 # Catalogue structure is CONTROL metadata: sharded content-addressed objects are
-# durable on the metadata write floor and then converged to all active nodes.
+# written by the committing node and then converged to all active nodes.
 # Artwork is ordinary DATA. The scanner and HTTP/JSON API are optional.
 # Each scan provider owns the roots
 # it is allowed to classify. Every enabled provider root must be readable for

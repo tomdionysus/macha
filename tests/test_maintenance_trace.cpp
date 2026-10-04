@@ -185,8 +185,8 @@ class TracedNode {
     // Settings for every node of a trace fixture, traced or not.
     static void apply_trace_settings(Config& config) {
         config.replication = 1;
-        config.metadata_min_write_replicas = 1;
-        config.min_write_replicas = 1;
+        config.metadata_write_copies = 1;
+        config.write_copies = 1;
         // On the manual clock; the fixture steps past it explicitly.
         config.maintenance.foreground_quiet = 50ms;
         config.maintenance.garbage_grace = 1h;
@@ -566,8 +566,8 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     node.config().replication = 2;
     config_b.replication = 2;
     // Write claims on both, not on whichever the barrier found first.
-    node.config().min_write_replicas = 2;
-    config_b.min_write_replicas = 2;
+    node.config().write_copies = 2;
+    config_b.write_copies = 2;
     node.ignore("repair");
     // Whether a GC-due pass falls while the peer is away depends on topology
     // event timing; node conditions and every action are still compared.

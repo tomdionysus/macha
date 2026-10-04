@@ -52,6 +52,12 @@ struct MetadataMutationIdentity {
 
 // Mutation wall time since start: the pre-publication retention barrier and
 // the commit fan-out, totals and maxima in ms.
+struct MetadataHeadStanding {
+    uint64_t holders{};
+    uint64_t present{};
+    uint64_t set_aside{};
+};
+
 struct MetadataMutationTiming {
     uint64_t mutations{};
     uint64_t retention_ms_total{};
@@ -131,6 +137,10 @@ class MetadataView {
     virtual uint64_t conflicts_superseded() const noexcept = 0;
     virtual uint64_t conflicts_resolved() const noexcept = 0;
     virtual MetadataMutationTiming mutation_timing() const noexcept = 0;
+    // Where the current head stands: how many of the nodes present held it
+    // at the last repair pass, and how many accepted heads are set aside as
+    // unmergeable for now.
+    virtual MetadataHeadStanding head_standing() const noexcept = 0;
 
 };
 

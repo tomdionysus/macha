@@ -672,11 +672,11 @@ class StorageClusterNode {
 
 Config storage_node_config(const TestCluster& cluster, std::string_view name, uint16_t port,
                            uint64_t data_limit, size_t replicas, size_t metadata_replicas,
-                           std::vector<Endpoint> bootstrap = {}, size_t min_write_replicas = 1) {
+                           std::vector<Endpoint> bootstrap = {}, size_t write_copies = 1) {
     auto config = cluster.node_config(name, port, std::move(bootstrap));
     config.replication = replicas;
-    config.min_write_replicas = min_write_replicas;
-    config.metadata_min_write_replicas = metadata_replicas;
+    config.write_copies = write_copies;
+    config.metadata_write_copies = metadata_replicas;
     // Loopback test nodes are independent storage failure domains even though
     // they share 127.0.0.1 as their transport host.
     config.failure_domain = std::string(name);
@@ -1040,7 +1040,7 @@ MACHA_TEST("storage_v18", test_nodes_replicating_to_each_other_do_not_hold_their
 MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_within_bounded_time) {
     // One publication referencing thousands of extents: retain_data() must
     // batch presence checks rather than make a round trip per extent.
-    // min_write_replicas == replication == 2, so both the local presence path
+    // write_copies == replication == 2, so both the local presence path
     // and the batched remote have_objects path are exercised.
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
