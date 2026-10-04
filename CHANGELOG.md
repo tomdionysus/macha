@@ -1,5 +1,17 @@
 # Current release
 
+## 0.84.1 — reconciliation is timed (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**How long a reconciliation holds the lock.** Merging two metadata heads
+records `metadata.reconcile_us` (the merge, its commit and the work under
+`reconciliation_mutex_`) and its log line gains `ms=`; a caller that waits
+for the lock to reconcile or to read the result records
+`metadata.reconcile_wait_us`. Instrumentation for the shutdown stall found
+under load at 0.84.0, where a background reader's reconciliation held a
+FUSE commit for 54 s.
+
 ## 0.84.0 — availability is the last known answer, not `unknown` (experiment)
 
 No wire format or protocol changes. New on-disk file
