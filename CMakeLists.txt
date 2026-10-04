@@ -611,7 +611,10 @@ if(MACHA_BUILD_TESTS)
         tests/test_predicates.cpp
         tests/test_catalogue_maintenance.cpp
         tests/test_namespace_entries.cpp
-        tests/test_claim_walk.cpp)
+        tests/test_claim_walk.cpp
+        tests/test_root_parts.cpp
+        tests/test_service_root.cpp
+        tests/test_node_services.cpp)
     target_link_libraries(macha-tests PRIVATE macha_core)
     target_compile_definitions(macha-tests PRIVATE
         MACHA_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"

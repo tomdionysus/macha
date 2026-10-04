@@ -597,6 +597,36 @@ inline RawHttpResponse raw_http_exchange(int fd, std::string_view request) {
     return raw_http_read_response(fd);
 }
 
+// One request of any method on a connection of its own, and the whole reply.
+struct HttpReply {
+    int status{};
+    std::string body;
+    std::map<std::string, std::string> headers; // lowercased keys
+    bool has(std::string_view text) const { return body.find(text) != std::string::npos; }
+    Json json() const { return Json::parse(body); }
+};
+
+inline HttpReply http_request(uint16_t port, std::string_view method, std::string_view path,
+                              const std::map<std::string, std::string>& headers = {},
+                              std::string_view body = {}) {
+    const int fd = connect_idle(port);
+    auto request =
+        std::string(method) + " " + std::string(path) + " HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+    for (const auto& [key, value] : headers)
+        request += key + ": " + value + "\r\n";
+    request += "Content-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+    request += std::string(body);
+    RawHttpResponse response;
+    try {
+        response = raw_http_exchange(fd, request);
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+    close(fd);
+    return {response.status, std::move(response.body), std::move(response.headers)};
+}
+
 // Loader admission a test holds: while held no loader publication starts and
 // running loader work yields at its next chunk; released, loader work is
 // always admitted, as with no viewer. Starts released.

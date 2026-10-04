@@ -3279,10 +3279,10 @@ Service make_service(const Config& config, const ClusterKeys& keys,
 
 // The management API over a Service: Status reports the published FUSE
 // frontend's counters beside the node's metadata convergence and withdraws
-// them with the frontend; a blocked namespace operation is reported over HTTP
-// and skipped through the Service. Integrated: the behaviour is the Service's
-// wiring of the subsystem registry into its routes.
-MACHA_TEST("filesystem_fuse", test_management_api_reports_and_skips_fuse_state) {
+// them with the frontend; a blocked namespace operation and a parked
+// publication are each reported and acted on over HTTP. Integrated: the
+// behaviour is the Service's wiring of the subsystem registry into its routes.
+MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state) {
     TestService fixture("fuse-management-api", ConfigProfile::isolated);
     auto& config = fixture.config();
     config.catalogue.api.enabled = true;
@@ -3401,38 +3401,187 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_skips_fuse_state) 
         frontend->stop();
     }
 
+    const auto port = config.catalogue.api.port;
+    const auto admin = bearer_header(service);
+
+    // A namespace operation the cluster refuses blocks the journal behind it.
+    // The operator reads it and skips it by the sequence read, so a skip aimed
+    // at an operation that has since changed fails closed.
     {
-        const auto fuse = fuse_config("skip");
-        {
-            auto admission = std::make_unique<HeldLoaderAdmission>();
-            admission->hold();
-            auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory,
-                                               fuse, std::move(admission));
-            frontend->mkdir("/wedge", 0755, getuid(), getgid());
-            frontend->stop();
+        const std::string route = "/api/v1/manage/filesystem/blocked-namespace-operation";
+        const auto skip = [&](const std::string& query) {
+            return http_request(port, "POST", route + "/skip" + query, admin);
+        };
+
+        // No mount: nothing blocked, nothing to skip.
+        CHECK(http_request(port, "GET", route, admin).status == 404);
+        CHECK(skip("?sequence=1").status == 409);
+
+        struct Wedge {
+            const char* name;
+            const char* kind;
+            const char* path;
+            const char* destination;
+        };
+        for (const Wedge& wedge : {Wedge{"skip-mkdir", "mkdir", "/wedge", nullptr},
+                                   Wedge{"skip-rename", "rename", "/moved", "/moved-away"}}) {
+            const bool rename = wedge.destination != nullptr;
+            const auto fuse = fuse_config(wedge.name);
+            if (rename)
+                service.filesystem().mkdir("/moved", 0755, getuid(), getgid());
+            {
+                auto admission = std::make_unique<HeldLoaderAdmission>();
+                admission->hold();
+                auto frontend = make_fuse_frontend(service.filesystem(),
+                                                   service.resources().memory, fuse,
+                                                   std::move(admission));
+                if (rename)
+                    frontend->rename("/moved", "/moved-away");
+                else
+                    frontend->mkdir("/wedge", 0755, getuid(), getgid());
+                frontend->stop();
+            }
+            // The namespace changes underneath the journalled operation.
+            if (rename)
+                service.filesystem().rmdir("/moved");
+            else
+                service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
+            auto recovered =
+                make_fuse_frontend(service.filesystem(), service.resources().memory, fuse);
+            service.registry().publish_fuse(recovered);
+            REQUIRE(wait_until(
+                [&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
+            const auto blocked = recovered->blocked_namespace_operation();
+            REQUIRE(blocked.has_value());
+
+            CHECK(http_request(port, "POST", route, admin).status == 405);
+            const auto read = http_request(port, "GET", route, admin);
+            REQUIRE(read.status == 200);
+            const auto json = read.json();
+            CHECK(json.find("sequence")->asUInt64() == blocked->sequence);
+            CHECK(json.find("kind")->asString() == wedge.kind);
+            CHECK(json.find("path")->asString() == wedge.path);
+            CHECK(json.find("error_code")->asInt64() == blocked->error_code);
+            CHECK(json.find("error_message")->asString() == blocked->error_message);
+            CHECK(json.find("blocked_for_ms") != nullptr);
+            if (rename)
+                CHECK(json.find("destination_path")->asString() == wedge.destination);
+            else
+                CHECK(json.find("destination_path") == nullptr);
+
+            // A skip names the operation it means, or changes nothing.
+            CHECK(http_request(port, "GET", route + "/skip?sequence=1", admin).status == 405);
+            for (const char* query : {"", "?sequence="}) {
+                const auto refused = skip(query);
+                CHECK(refused.status == 400);
+                CHECK(refused.has("missing_sequence"));
+            }
+            for (const char* query : {"?sequence=first", "?sequence=7th"}) {
+                const auto refused = skip(query);
+                CHECK(refused.status == 400);
+                CHECK(refused.has("bad_sequence"));
+            }
+            const auto other = skip("?sequence=" + std::to_string(blocked->sequence + 1));
+            CHECK(other.status == 409);
+            CHECK(other.has("not_blocked"));
+            CHECK(recovered->blocked_namespace_operation().has_value());
+
+            CHECK(skip("?sequence=" + std::to_string(blocked->sequence)).status == 204);
+            REQUIRE(recovered->wait_for_idle(10s));
+            CHECK(!recovered->blocked_namespace_operation().has_value());
+            CHECK(http_request(port, "GET", route, admin).status == 404);
+            if (rename)
+                CHECK(absent(service.filesystem(), "/moved-away"));
+            else
+                CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
+            service.registry().withdraw_fuse(recovered.get());
+            recovered->stop();
         }
-        service.filesystem().create_file("/wedge", 0644, getuid(), getgid());
-        auto recovered = make_fuse_frontend(service.filesystem(), service.resources().memory, fuse);
-        service.registry().publish_fuse(recovered);
-        REQUIRE(wait_until([&] { return recovered->blocked_namespace_operation().has_value(); }, 10s));
-        const auto blocked = recovered->blocked_namespace_operation();
-        REQUIRE(blocked.has_value());
-        const auto get_response = raw_http_get(
-            config.catalogue.api.port, "/api/v1/manage/filesystem/blocked-namespace-operation",
-            bearer_header(service));
-        CHECK(get_response.find("HTTP/1.1 200") != std::string::npos);
-        const auto get_body_at = get_response.find("\r\n\r\n");
-        REQUIRE(get_body_at != std::string::npos);
-        const auto get_json = Json::parse(get_response.substr(get_body_at + 4));
-        CHECK(get_json.find("sequence")->asUInt64() == blocked->sequence);
-        CHECK(get_json.find("kind")->asString() == "mkdir");
-        CHECK(get_json.find("path")->asString() == "/wedge");
-        CHECK(service.skip_blocked_namespace_operation(blocked->sequence));
-        REQUIRE(recovered->wait_for_idle(10s));
-        CHECK(!recovered->blocked_namespace_operation().has_value());
-        CHECK(service.filesystem().getattr("/wedge").type == EntryType::file);
-        service.registry().withdraw_fuse(recovered.get());
-        recovered->stop();
+    }
+
+    // A publication past its retry budget is parked. The operator lists it
+    // and retries or abandons it by inode.
+    {
+        const std::string route = "/api/v1/manage/filesystem/parked-publications";
+        const auto act = [&](const std::string& tail) {
+            return http_request(port, "POST", route + "/" + tail, admin);
+        };
+
+        // No mount: nothing parked, nothing to act on.
+        const auto none = http_request(port, "GET", route, admin);
+        CHECK(none.status == 200);
+        CHECK(none.json().find("parked")->asArray().empty());
+        CHECK(act("7/retry").status == 409);
+        CHECK(act("7/abandon").status == 409);
+
+        InterposedTarget failing(service.filesystem());
+        failing.before_open = [](const std::string&) {
+            throw FsError(EIO, "metadata write durability floor unavailable");
+        };
+        auto fuse = fuse_config("parked");
+        fuse.commit_workers = 1;
+        fuse.publication_retry = RetryPolicy{3, 60s, 5ms, 20ms};
+        auto frontend = std::make_shared<FuseFrontend>(
+            service.filesystem(), service.resources().memory, fuse,
+            std::make_unique<ViewerWeightedAdmission>(service.filesystem(), fuse), failing);
+        service.registry().publish_fuse(frontend);
+        auto handle = frontend->create("/parked.bin", 0644, getuid(), getgid(), true, true, false);
+        const auto payload = pattern(64 * 1024 + 3, 44);
+        REQUIRE(frontend->write(handle.inode, 0, payload) == payload.size());
+        frontend->release(handle.inode, true);
+        REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
+        const auto parked = frontend->parked_publications();
+        REQUIRE(parked.size() == 1);
+        const auto inode = std::to_string(handle.inode);
+
+        CHECK(http_request(port, "POST", route, admin).status == 405);
+        const auto listed = http_request(port, "GET", route, admin);
+        REQUIRE(listed.status == 200);
+        const auto listing = listed.json();
+        const auto& items = listing.find("parked")->asArray();
+        REQUIRE(items.size() == 1);
+        CHECK(items.front().find("inode")->asUInt64() == handle.inode);
+        CHECK(items.front().find("path")->asString() == "/parked.bin");
+        CHECK(items.front().find("error_code")->asInt64() == parked.front().error_code);
+        CHECK(items.front().find("error_message")->asString() == parked.front().error_message);
+        CHECK(items.front().find("attempts")->asUInt64() == parked.front().attempts);
+        CHECK(items.front().find("pending_bytes")->asUInt64() == payload.size());
+        CHECK(items.front().find("failing_for_ms") != nullptr);
+        CHECK(items.front().find("parked_for_ms") != nullptr);
+
+        // An action names an inode and is one of retry or abandon.
+        CHECK(http_request(port, "GET", route + "/" + inode + "/retry", admin).status == 405);
+        CHECK(act(inode).status == 404);
+        CHECK(act(inode + "/forget").status == 404);
+        for (const char* bad : {"first/retry", "7th/retry"}) {
+            const auto refused = act(bad);
+            CHECK(refused.status == 400);
+            CHECK(refused.has("bad_inode"));
+        }
+        const auto elsewhere = std::to_string(handle.inode + 1000);
+        CHECK(act(elsewhere + "/retry").status == 409);
+        CHECK(act(elsewhere + "/abandon").status == 409);
+        CHECK(frontend->parked_publications().size() == 1);
+
+        // A retry gives it a fresh budget; the target still fails, so it
+        // parks again.
+        const auto failures_at_park = frontend->status().backend_failures;
+        CHECK(act(inode + "/retry").status == 204);
+        REQUIRE(wait_until(
+            [&] {
+                return frontend->status().backend_failures > failures_at_park &&
+                       frontend->diagnostics().parked_publications == 1;
+            },
+            10s));
+
+        // An abandon drops the unpublished bytes.
+        CHECK(act(inode + "/abandon").status == 204);
+        CHECK(frontend->parked_publications().empty());
+        CHECK(http_request(port, "GET", route, admin).json().find("parked")->asArray().empty());
+        CHECK(frontend->getattr("/parked.bin").size == 0);
+        REQUIRE(frontend->wait_for_idle(5s));
+        service.registry().withdraw_fuse(frontend.get());
+        frontend->stop();
     }
 }
 

@@ -4894,6 +4894,71 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     s1.stop();
 }
 
+// The claims barrier before a commit, across a write floor of two: the
+// commit's control objects must be claimed on both replicas. A replica that
+// holds them and never answers the claim leaves the floor unreached, so the
+// commit is refused and nothing is published; once it answers, the same
+// commit goes through and both replicas hold the claim.
+MACHA_TEST("rpc_cluster", test_a_commit_is_refused_until_its_control_claims_reach_the_write_floor) {
+    auto log = std::make_shared<ConcurrentCapturingLogger>(LogLevel::debug);
+    Log::set_logger(log);
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "claims-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "claims-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    c1.replication = c2.replication = 2;
+
+    auto links = std::make_shared<FaultyLinks>();
+    ServiceInstruments instruments;
+    instruments.links = links;
+    Service s1(c1, keys, test_durability_window, {}, {}, {}, instruments);
+    Service s2(c2, keys, test_durability_window);
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_metadata_writable(s1));
+    REQUIRE(wait_metadata_writable(s2));
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/established", 0755, getuid(), getgid()); }));
+
+    CatalogueItem item;
+    item.id = "movie:claimed";
+    item.kind = CatalogueKind::movie;
+    item.title = "Claimed";
+
+    const auto peer = s2.node().node_id();
+    links->stall(peer, MessageType::retain_objects);
+    std::string refusal;
+    try {
+        (void)s1.catalogue().upsert(item);
+    } catch (const std::exception& error) {
+        refusal = error.what();
+    }
+    CHECK(refusal.find("CONTROL retention floor unavailable before metadata publication") !=
+          std::string::npos);
+    CHECK(links->stalled_calls() >= 1);
+    CHECK(!s1.metadata_manager().snapshot().catalogue_root.has_value());
+    bool named = false;
+    for (const auto& [level, line] : log->records())
+        named = named || (line.find("metadata retention barrier") != std::string::npos &&
+                          line.find("outcome=control-floor-unavailable") != std::string::npos);
+    CHECK(named);
+
+    links->release(peer);
+    REQUIRE(retry_while_not_ready([&] { (void)s1.catalogue().upsert(item); }));
+    const auto root = s1.metadata_manager().snapshot().catalogue_root;
+    REQUIRE(root.has_value());
+    CHECK(s1.local_state().retention().retained(RetentionClass::control, *root));
+    CHECK(s2.local_state().retention().retained(RetentionClass::control, *root));
+
+    s2.stop();
+    s1.stop();
+    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
+}
+
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
