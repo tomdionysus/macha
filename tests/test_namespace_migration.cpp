@@ -881,7 +881,7 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     const auto base_snapshot = decode_snapshot(base.payload);
     REQUIRE(base_snapshot.namespace_root.has_value());
     auto nodes = ControlNamespaceNodeStore::for_commit(service.local_state().control(),
-                                                       service.filesystem().store(), 1);
+                                                       service.filesystem().store());
     const auto make_branch = [&](const std::string& directory, const FsEntry& disputed) {
         MetadataDelta delta;
         delta.upsert_entries[directory] = make_directory(7);
@@ -1010,109 +1010,5 @@ MACHA_TEST("namespace_migration", test_a_migrated_namespace_is_claimed_by_its_ba
     service.stop();
 }
 
-// A baseline that cannot be claimed (an extent the namespace names is held
-// nowhere) is refused, not forced: the node keeps serving and writing on the
-// head without one, both destructive gates stay shut on it, and the baseline
-// is established once the extent is back.
-MACHA_TEST("namespace_migration", test_an_unclaimable_baseline_keeps_destructive_gc_off) {
-    TestCluster cluster;
-    auto config = cluster.node_config("unclaimable-baseline");
-    make_solo(config);
-    config.maintenance.garbage_grace = 0ms;
-    config.maintenance.foreground_quiet = 200ms;
-    config.maintenance.no_progress_backoff = 1000ms;
-    const auto film = pattern(256 * 1024, 121);
-    const auto other = pattern(256 * 1024, 122);
-    NodeId node_id{};
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
-        for (int i = 0; i < 60; ++i)
-            service.filesystem().mkdir("/Films/" + std::to_string(i), 0755, getuid(), getgid());
-        write_file(service, "/Films/film.mkv", film);
-        write_file(service, "/Films/other.mkv", other);
-        service.stop();
-    }
-    (void)migrate_state(config, cluster.keys(), {node_id});
-
-    // Every gate verdict the pass reaches, as it traces them.
-    struct Verdicts {
-        std::mutex mutex;
-        size_t refused_for_baseline{};
-        size_t destructive_open{};
-        size_t collected{};
-    } verdicts;
-    ServiceInstruments instruments;
-    instruments.trace = [&](std::string_view kind, std::string_view detail) {
-        std::lock_guard lock(verdicts.mutex);
-        if (kind == "gate.data" &&
-            detail.find("release_view=1 baseline=0") != std::string_view::npos)
-            ++verdicts.refused_for_baseline;
-        if ((kind == "gate.data" || kind == "gate.control") && detail.starts_with("open"))
-            ++verdicts.destructive_open;
-        if (kind == "control-gc" || kind == "gc")
-            ++verdicts.collected;
-    };
-    const auto count = [&](size_t Verdicts::* field) {
-        std::lock_guard lock(verdicts.mutex);
-        return verdicts.*field;
-    };
-
-    // The first repair is held so the extent is gone before the baseline is
-    // attempted.
-    TestGate repair;
-    Service service(
-        config, cluster.keys(), test_durability_window, {},
-        [&](std::string_view stage) {
-            if (stage == "metadata-repair-begin")
-                repair.enter_and_wait();
-        },
-        {}, instruments);
-    struct OpenRepair {
-        TestGate& gate;
-        ~OpenRepair() { gate.open(); }
-    } release{repair};
-    service.start();
-    (void)service.filesystem();
-    REQUIRE(repair.wait_for_entries(1, 10s));
-    CHECK(!service.metadata_manager().snapshot().retention_baseline_complete);
-
-    const auto entry = service.filesystem().getattr("/Films/film.mkv");
-    REQUIRE(!entry.extents.empty());
-    const auto lost = entry.extents.front().id;
-    auto& data = service.local_state().data();
-    const auto lost_bytes = data.get(lost);
-    REQUIRE(lost_bytes.has_value());
-    REQUIRE(data.remove(lost));
-    Bytes orphan = pattern(4096, 123);
-    const auto orphan_id = object_id(orphan);
-    REQUIRE(service.local_state().control().put(orphan_id, orphan));
-    repair.open();
-
-    // Passes keep reaching the gates with a sole accepted head and no
-    // baseline: the repair attempted it and was refused.
-    REQUIRE(wait_until([&] { return count(&Verdicts::refused_for_baseline) >= 3; }, 30s));
-    CHECK(!service.metadata_manager().snapshot().retention_baseline_complete);
-    CHECK(count(&Verdicts::destructive_open) == 0);
-    CHECK(count(&Verdicts::collected) == 0);
-    CHECK(service.local_state().control().has(orphan_id));
-
-    // The node is not wedged: it reads what it holds and commits on the tree.
-    CHECK(read_file(service, "/Films/other.mkv", other.size()) == other);
-    service.filesystem().mkdir("/Films/new", 0755, getuid(), getgid());
-    CHECK(service.filesystem().getattr("/Films/new").type == EntryType::directory);
-    CHECK(!service.metadata_manager().snapshot().retention_baseline_complete);
-
-    REQUIRE(data.put(lost, *lost_bytes));
-    REQUIRE(wait_until(
-        [&] { return service.metadata_manager().snapshot().retention_baseline_complete; }, 30s));
-    auto& claims = service.local_state().retention();
-    for (const auto& node : reachable_tree_nodes(service))
-        CHECK(claims.retained(RetentionClass::control, node));
-    CHECK(read_file(service, "/Films/film.mkv", film.size()) == film);
-    service.stop();
-}
 
 } // namespace

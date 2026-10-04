@@ -112,8 +112,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
 
     std::optional<NodeInfo> node_info(const NodeId&) const;
     std::vector<NodeInfo> replica_nodes(const std::vector<NodeId>&) const;
-    std::vector<NodeInfo> compatible_replicas(const std::vector<NodeInfo>&) const;
-    void require_metadata_policy_match(const std::vector<NodeInfo>&) const;
     MetadataRecord discover_or_form();
     struct RecoverySurvey {
         bool complete{};
@@ -144,7 +142,6 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     bool store_commit_on(const NodeInfo&, const MetadataHistoryEntry&,
                          const MetadataRecord&, FrameType);
     bool accept_commit_on(const NodeInfo&, const MetadataAcceptance&, FrameType);
-    size_t acceptance_floor_for(const MetadataRecord&) const;
     PublishedCommit publish_commit(const std::vector<NodeInfo>&, const MetadataRecord&,
                                    std::span<const uint8_t> delta, FrameType);
     std::vector<std::pair<NodeInfo, MetadataAcceptance>> discover_accepted_heads(
@@ -156,8 +153,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     discover_accepted_heads_required(const std::vector<NodeInfo>&, FrameType);
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
                                  const MetadataAcceptance&, FrameType);
-    void ensure_accepted_head_durable(const std::vector<NodeInfo>&, const MetadataRecord&,
-                                      size_t, FrameType);
+    // Offers a head this node already holds to the nodes present.
+    void offer_accepted_head(const std::vector<NodeInfo>&, const MetadataRecord&, FrameType);
     bool propose_history_floor_on(const NodeInfo&, const HistoryCheckpointProof&, FrameType);
     bool commit_history_floor_on(const NodeInfo&, const Hash256& floor_hash, const Hash256& epoch,
                                  FrameType);

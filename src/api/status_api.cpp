@@ -716,15 +716,11 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
     const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
 
     // Read availability comes from the already-decoded committed snapshot.
-    // Write availability is the durability floor: validation/stability is
-    // reported separately because reconciliation debt does not revoke the right
-    // of any reachable floor-sized cohort to attempt a metadata mutation.
+    // Any node holding a head may write; validation/stability is reported
+    // separately.
     MetadataAvailability metadata_availability = published_metadata.availability;
     if (metadata) {
         if (metadata_availability == MetadataAvailability::unavailable)
-            metadata_availability = MetadataAvailability::read_only;
-        if (metadata_availability == MetadataAvailability::writable &&
-            active_metadata_replicas < metadata_min_write_replicas)
             metadata_availability = MetadataAvailability::read_only;
     } else {
         metadata_availability = MetadataAvailability::unavailable;

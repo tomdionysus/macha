@@ -89,35 +89,21 @@ MetadataClusterStatus MetadataManager::cluster_status() const noexcept {
 }
 
 void MetadataManager::publish_replica_state(bool validated, std::string_view reason) {
-    // Every known node is metadata-capable. The write policy is a durability
-    // floor, not a voter set: any metadata_min_write_replicas reachable replicas
-    // may accept a mutation.
+    // Every known node is metadata-capable and any node may accept a mutation
+    // alone; copies on other nodes are sought, never required.
     auto view = available_snapshot_view();
     const auto membership = node_.membership().snapshot();
     const size_t required = node_.config().metadata_min_write_replicas;
-    const auto expected_policy = static_cast<uint32_t>(required);
     const size_t known = membership.all.size();
-    const bool peer_policy_mismatch = std::any_of(
-        membership.active.begin(), membership.active.end(), [&](const NodeInfo& peer) {
-            return peer.metadata_write_replicas_required != expected_policy;
-        });
-    const bool local_policy_mismatch =
-        view && view->snapshot->metadata_write_replicas_required &&
-        view->snapshot->metadata_write_replicas_required != expected_policy;
-    const size_t online = static_cast<size_t>(std::count_if(
-        membership.active.begin(), membership.active.end(), [&](const NodeInfo& peer) {
-            return peer.metadata_write_replicas_required == expected_policy;
-        }));
+    const size_t online = membership.active.size();
     const uint64_t generation = view ? view->generation : 0;
 
     MetadataAvailability next = MetadataAvailability::unavailable;
-    if (view) {
-        // Validation describes convergence, not write authority: a local committed
-        // branch plus the floor of reachable replicas suffices to attempt a
-        // mutation; divergent peers are reconciled by the mutation/read path.
-        next = !local_policy_mismatch && online >= required ? MetadataAvailability::writable
-                                                            : MetadataAvailability::read_only;
-    }
+    // Validation describes convergence, not write authority: a local committed
+    // branch suffices to mutate; divergent peers are reconciled by the
+    // mutation/read path.
+    if (view)
+        next = MetadataAvailability::writable;
 
     replica_generation_.store(generation, std::memory_order_release);
     metadata_replicas_.store(static_cast<uint32_t>(known), std::memory_order_release);
@@ -127,8 +113,7 @@ void MetadataManager::publish_replica_state(bool validated, std::string_view rea
     replica_observed_unix_ms_.store(unix_ms(), std::memory_order_release);
     metadata_write_available_.store(next == MetadataAvailability::writable,
                                     std::memory_order_release);
-    metadata_replica_set_stable_.store(validated && !peer_policy_mismatch && !local_policy_mismatch,
-                                       std::memory_order_release);
+    metadata_replica_set_stable_.store(validated, std::memory_order_release);
 
     const auto previous = metadata_availability_.exchange(next, std::memory_order_acq_rel);
     if (previous == next)
@@ -136,19 +121,8 @@ void MetadataManager::publish_replica_state(bool validated, std::string_view rea
 
     std::string transition_reason;
     if (next == MetadataAvailability::writable) {
-        transition_reason = validated ? "metadata write durability floor available"
-                                      : "metadata write durability floor available; reconciliation pending";
-    } else if (next == MetadataAvailability::read_only) {
-        if (local_policy_mismatch)
-            transition_reason = "local metadata write-floor policy mismatch";
-        else if (peer_policy_mismatch && online < required)
-            transition_reason = "metadata write-floor policy mismatch leaves too few compatible replicas";
-        else if (previous == MetadataAvailability::writable)
-            transition_reason = "metadata write durability floor lost";
-        else if (!reason.empty())
-            transition_reason.assign(reason);
-        else
-            transition_reason = "local metadata state ready; metadata write durability floor unavailable";
+        transition_reason = validated ? "local metadata state ready"
+                                      : "local metadata state ready; reconciliation pending";
     } else if (!reason.empty()) {
         transition_reason.assign(reason);
     } else {
@@ -191,30 +165,6 @@ std::vector<NodeInfo> MetadataManager::replica_nodes(const std::vector<NodeId>& 
             out.push_back(*node);
     }
     return out;
-}
-
-std::vector<NodeInfo> MetadataManager::compatible_replicas(
-    const std::vector<NodeInfo>& nodes) const {
-    const auto required = static_cast<uint32_t>(node_.config().metadata_min_write_replicas);
-    std::vector<NodeInfo> out;
-    out.reserve(nodes.size());
-    for (const auto& peer : nodes) {
-        if (peer.metadata_write_replicas_required == required)
-            out.push_back(peer);
-    }
-    return out;
-}
-
-void MetadataManager::require_metadata_policy_match(const std::vector<NodeInfo>& nodes) const {
-    const auto required = static_cast<uint32_t>(node_.config().metadata_min_write_replicas);
-    for (const auto& peer : nodes) {
-        if (peer.metadata_write_replicas_required == required)
-            continue;
-        throw MetadataNotReady(
-            "metadata write-floor policy mismatch peer=" + to_string(peer.id) +
-            " local=" + std::to_string(required) +
-            " peer_required=" + std::to_string(peer.metadata_write_replicas_required));
-    }
 }
 
 MetadataRecord MetadataManager::cache_record(
@@ -448,7 +398,7 @@ size_t MetadataManager::repair_unreconstructable_heads(FrameType frame_type) {
     if (broken.empty())
         return 0;
     std::vector<NodeInfo> peers;
-    for (auto& peer : compatible_replicas(node_.membership().active()))
+    for (auto& peer : node_.membership().active())
         if (peer.id != node_.node_id())
             peers.push_back(std::move(peer));
     if (peers.empty()) {
@@ -718,51 +668,24 @@ bool MetadataManager::accept_commit_on(const NodeInfo& owner,
     }
 }
 
-size_t MetadataManager::acceptance_floor_for(const MetadataRecord& record) const {
-    const auto snapshot_floor = [](const MetadataSnapshot& snapshot) -> size_t {
-        if (snapshot.metadata_write_replicas_required)
-            return snapshot.metadata_write_replicas_required;
-        if (!snapshot.metadata_voters.empty())
-            return snapshot.metadata_voters.size() / 2 + 1;
-        return 0;
-    };
-
-    const auto current = decode_snapshot(record.payload);
-    size_t required = snapshot_floor(current);
-    if (!required)
-        throw std::runtime_error("protocol-20 metadata commit has no write-floor policy");
-
-    // Policy transitions are certified at the strongest policy on any parent
-    // edge: this covers lowering the floor and merges with an older sibling.
-    for (const auto& parent_hash : metadata_record_parents(record)) {
-        auto parent = local_.replica().materialized(parent_hash);
-        if (!parent)
-            throw MetadataNotReady("metadata commit parent unavailable for policy validation");
-        required = std::max(required, snapshot_floor(*parent->snapshot));
-    }
-    return required;
-}
-
 MetadataManager::PublishedCommit MetadataManager::publish_commit(
     const std::vector<NodeInfo>& nodes, const MetadataRecord& record,
     std::span<const uint8_t> delta, FrameType frame_type) {
-    const size_t required = acceptance_floor_for(record);
-    auto compatible = compatible_replicas(nodes);
-    if (compatible.size() < required)
-        throw MetadataNotReady("metadata write durability floor unavailable: too few policy-compatible replicas");
+    // A commit is accepted once this node holds it. Further copies are sought
+    // from the nodes present and owed to the rest; repair_once() delivers them.
+    const size_t sought = node_.config().metadata_min_write_replicas;
 
     const auto compact = commit_history_entry(record, delta);
     PublishedCommit out;
     out.record = record;
 
-    auto ordered = order_commit_replicas(compatible, node_.node_id(), [&](const NodeId& peer) {
+    auto ordered = order_commit_replicas(nodes, node_.node_id(), [&](const NodeId& peer) {
         return node_.peer_latency(peer);
     });
 
-    // Store the commit on the nearest registered replicas until the floor is
-    // reached. Receivers validate and append to the DAG without comparing to
-    // their head. The local replica must participate so the caller can
-    // continue from the commit.
+    // Store the commit on the nearest replicas until enough hold it or none is
+    // left to ask. Receivers validate and append to the DAG without comparing
+    // to their head. The local replica must hold it.
     const bool trace = Log::enabled(LogLevel::debug);
     for (const auto& owner : ordered) {
         const auto started = Clock::now();
@@ -776,11 +699,9 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
                            " stored=" + (stored ? "yes" : "no") + " ms=" + std::to_string(ms) +
                            " generation=" + std::to_string(record.generation));
         }
-        if (out.stored_on.size() >= required)
+        if (out.stored_on.size() >= sought)
             break;
     }
-    if (out.stored_on.size() < required)
-        throw MetadataNotReady("metadata commit durability floor unavailable");
     if (std::none_of(out.stored_on.begin(), out.stored_on.end(), [&](const NodeInfo& owner) {
             return owner.id == node_.node_id();
         }))
@@ -788,7 +709,7 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
 
     out.acceptance.generation = record.generation;
     out.acceptance.hash = record.hash;
-    out.acceptance.required = static_cast<uint32_t>(required);
+    out.acceptance.required = static_cast<uint32_t>(out.stored_on.size());
     out.acceptance.replicas.reserve(out.stored_on.size());
     for (const auto& owner : out.stored_on)
         out.acceptance.replicas.push_back(owner.id);
@@ -798,12 +719,17 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
         out.acceptance.replicas.end());
 
     // Acceptance is evidence about completed stores, not a second consensus.
-    // Each holder first receives the commit's parent policy/history, needed to
-    // validate a lowering transition and to reconstruct the branch later.
+    // Each holder first receives the commit's parent history, needed to
+    // reconstruct the branch later.
     const auto parents = metadata_record_parents(record);
-    size_t accepted = 0;
+    // Local first: a peer must never hold an accepted commit its author lacks.
+    std::stable_partition(out.stored_on.begin(), out.stored_on.end(), [&](const NodeInfo& owner) {
+        return owner.id == node_.node_id();
+    });
     bool local_accepted = false;
     for (const auto& owner : out.stored_on) {
+        if (owner.id != node_.node_id() && !local_accepted)
+            throw std::runtime_error("local metadata acceptance persistence failed");
         bool ancestry_ready = true;
         if (owner.id != node_.node_id()) {
             for (const auto& parent : parents) {
@@ -816,10 +742,8 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
         const auto accept_started = Clock::now();
         const bool accepted_here =
             ancestry_ready && accept_commit_on(owner, out.acceptance, frame_type);
-        if (accepted_here) {
-            ++accepted;
+        if (accepted_here)
             local_accepted = local_accepted || owner.id == node_.node_id();
-        }
         if (trace && owner.id != node_.node_id()) {
             const auto ms = elapsed_ms(accept_started);
             if (ms >= 250 || !accepted_here)
@@ -832,9 +756,6 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     }
     if (!local_accepted)
         throw std::runtime_error("local metadata acceptance persistence failed");
-    if (accepted < required)
-        throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
-
     return out;
 }
 
@@ -879,28 +800,20 @@ bool MetadataManager::replicate_accepted_head(const NodeInfo& owner,
     return accept_commit_on(owner, acceptance, frame_type);
 }
 
-void MetadataManager::ensure_accepted_head_durable(
-    const std::vector<NodeInfo>& nodes, const MetadataRecord& record, size_t required,
-    FrameType frame_type) {
+void MetadataManager::offer_accepted_head(
+    const std::vector<NodeInfo>& nodes, const MetadataRecord& record, FrameType frame_type) {
     auto acceptance = local_.replica().acceptance(record.hash);
     if (!acceptance)
         throw MetadataNotReady("metadata mutation is visible locally without acceptance certificate");
-    if (acceptance->required != acceptance_floor_for(record))
-        throw MetadataNotReady("metadata acceptance certificate policy mismatch");
 
-    const auto compatible = compatible_replicas(nodes);
-    if (compatible.size() < required)
-        throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
-
-    size_t durable = 0;
-    for (const auto& owner : compatible) {
+    const size_t sought = node_.config().metadata_min_write_replicas;
+    size_t holding = 0;
+    for (const auto& owner : nodes) {
         if (replicate_accepted_head(owner, record, *acceptance, frame_type))
-            ++durable;
-        if (durable >= required)
+            ++holding;
+        if (holding >= sought)
             break;
     }
-    if (durable < required)
-        throw MetadataNotReady("metadata acceptance certificate durability floor unavailable");
 }
 
 std::optional<std::vector<std::pair<NodeInfo, MetadataAcceptance>>>
@@ -1062,7 +975,7 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
 
 MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                                            FrameType frame_type) {
-    auto nodes = compatible_replicas(replica_nodes(replicas));
+    auto nodes = replica_nodes(replicas);
     if (nodes.empty())
         throw MetadataNotReady("metadata replicas unavailable");
 
@@ -1142,7 +1055,6 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         }
     }
 
-    const size_t need = node_.config().metadata_min_write_replicas;
     // Serialises only merge-and-publish, so concurrent readers seeing one
     // divergence do not each mint a reconciliation commit. Taken lazily on
     // seeing more than one head; heads are re-read once held.
@@ -1189,10 +1101,6 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             stage_started = now;
             return ms;
         };
-
-        if (compatible_replicas(nodes).size() < need)
-            throw MetadataNotReady(
-                "divergent metadata heads await reconciliation; write durability floor unavailable");
 
         // Fold the maximal head set deterministically, two branches at a time.
         // Each merge names both parents and applies three-way conflict-presence
@@ -1266,9 +1174,8 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         // The merged namespace's tree; its nodes are written and replicated
         // before the record naming the root is published.
         if (tree_backed) {
-            auto commit_nodes = ControlNamespaceNodeStore::for_commit(
-                local_.control(), *namespace_store_,
-                merged.snapshot.metadata_write_replicas_required);
+            auto commit_nodes =
+                ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_);
             if (tree_merge)
                 merged.snapshot.namespace_root =
                     update_namespace_tree(tree_merge->onto, commit_nodes, tree_merge->changes);
@@ -1352,24 +1259,12 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     if (snapshot.extent_size && snapshot.extent_size != node_.config().extent_size)
         throw std::runtime_error("cluster extent size does not match local configuration");
 
-    const size_t configured = node_.config().metadata_min_write_replicas;
-    const size_t persisted = snapshot.metadata_write_replicas_required
-                                 ? snapshot.metadata_write_replicas_required
-                                 : (!snapshot.metadata_voters.empty()
-                                        ? snapshot.metadata_voters.size() / 2 + 1
-                                        : 0);
-    const bool policy_transition = persisted != configured;
+    // Zero marks a legacy snapshot; any other value is only that marker.
+    const bool policy_transition = snapshot.metadata_write_replicas_required == 0;
     const bool clear_legacy_metadata_voters = !snapshot.metadata_voters.empty();
     const bool data_policy_change = snapshot.data_replication != node_.config().replication;
 
     const auto active = node_.membership().active();
-    // Until a durable protocol-20 policy exists, every active peer must agree
-    // on the write floor, or two incompatible cohorts could each establish
-    // authority from the same genesis. Once established, mismatched peers
-    // are ignored while the floor remains satisfiable.
-    if (!snapshot.metadata_write_replicas_required)
-        require_metadata_policy_match(active);
-    const auto compatible = compatible_replicas(active);
 
     // `metadata_participants` is a migration roster, not authority. Kept only
     // until the one-time legacy retention baseline is established, then
@@ -1398,14 +1293,9 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
         !migration_roster_change && !clear_migration_roster)
         return initial;
 
-    // Policy transitions are commits certified at the stronger of the old and
-    // new floors.
-    const size_t transition_floor = std::max(configured, persisted);
-    if (compatible.size() < transition_floor)
-        return initial;
-
     snapshot.metadata_voters.clear();
-    snapshot.metadata_write_replicas_required = static_cast<uint32_t>(configured);
+    if (policy_transition)
+        snapshot.metadata_write_replicas_required = 1;
     snapshot.metadata_participants = snapshot.retention_baseline_complete
                                          ? std::set<NodeId>{}
                                          : std::move(participants);
@@ -1417,12 +1307,9 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     proposed.payload =
         snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
     proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
-    (void)publish_commit(compatible, proposed, {}, FrameType::control);
+    (void)publish_commit(active, proposed, {}, FrameType::control);
     Log::info("metadata policy/migration transition committed generation=" +
               std::to_string(proposed.generation) +
-              " old_write_floor=" + std::to_string(persisted) +
-              " new_write_floor=" + std::to_string(configured) +
-              " acceptance_floor=" + std::to_string(transition_floor) +
               " participants=" + std::to_string(snapshot.metadata_participants.size()));
     return cache_record(proposed,
                         std::make_shared<MetadataSnapshot>(std::move(snapshot)));
@@ -1493,20 +1380,6 @@ MetadataManager::RecoverySurvey MetadataManager::recover_from_committed_checkpoi
 
 MetadataRecord MetadataManager::discover_or_form() {
     const auto active = node_.membership().active();
-    const size_t need = node_.config().metadata_min_write_replicas;
-    const auto local_snapshot = decode_snapshot(local_.replica().committed().payload);
-    if (local_snapshot.metadata_write_replicas_required &&
-        local_snapshot.metadata_write_replicas_required != need)
-        throw MetadataNotReady("local metadata write-floor policy does not match configuration");
-    const bool established_policy = local_snapshot.metadata_write_replicas_required != 0;
-    if (!established_policy)
-        require_metadata_policy_match(active);
-    const auto write_active = compatible_replicas(active);
-    if (write_active.size() < need) {
-        throw MetadataNotReady("metadata replica set forming: need " + std::to_string(need) +
-                               " policy-compatible active nodes, have " +
-                               std::to_string(write_active.size()));
-    }
     if (!node_.config().bootstrap.empty() && active.size() == 1)
         throw MetadataNotReady("metadata replica set forming: waiting for bootstrap peer");
 
@@ -1551,7 +1424,7 @@ MetadataRecord MetadataManager::discover_or_form() {
     snapshot.metadata_voters.clear();
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     snapshot.extent_size = node_.config().extent_size;
-    snapshot.metadata_write_replicas_required = static_cast<uint32_t>(need);
+    snapshot.metadata_write_replicas_required = 1;
     snapshot.metadata_participants.clear();
     // Genesis is the first branch point; background convergence advances the
     // horizon to generation 2 once every founder has durably accepted it.
@@ -1563,10 +1436,9 @@ MetadataRecord MetadataManager::discover_or_form() {
     formed.previous = base.hash;
     formed.payload = encode_snapshot(snapshot);
     formed.hash = metadata_hash(formed.generation, formed.previous, formed.payload);
-    (void)publish_commit(write_active, formed, {}, FrameType::control);
+    (void)publish_commit(active, formed, {}, FrameType::control);
 
-    Log::info("metadata replica set formed active=" + std::to_string(write_active.size()) +
-              " required=" + std::to_string(need));
+    Log::info("metadata replica set formed active=" + std::to_string(active.size()));
     return cache_record(formed,
                         std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
@@ -1694,10 +1566,7 @@ MetadataRecord MetadataManager::mutate_impl(
     for (size_t attempt = 0; attempt < retries; ++attempt) {
         const auto total_started = Clock::now();
         const auto all_active = node_.membership().active();
-        const auto active = compatible_replicas(all_active);
-        const size_t need = node_.config().metadata_min_write_replicas;
-        if (active.size() < need)
-            throw MetadataNotReady("metadata write durability floor unavailable: too few policy-compatible replicas");
+        const auto& active = all_active;
 
         MetadataRecord current;
         auto local_heads = local_.replica().accepted_heads();
@@ -1728,12 +1597,10 @@ MetadataRecord MetadataManager::mutate_impl(
         }
 
         auto snapshot = decode_snapshot(current.payload);
-        if (snapshot.metadata_write_replicas_required != need)
-            throw MetadataNotReady("metadata write-floor transition is not durably accepted");
         const bool clear_merge_parent_topology = !snapshot.merge_parents.empty();
         auto seen = snapshot.mutation_sequences.find(origin);
         if (sequence && seen != snapshot.mutation_sequences.end() && seen->second >= *sequence) {
-            ensure_accepted_head_durable(active, current, need, FrameType::read_ahead);
+            offer_accepted_head(active, current, FrameType::read_ahead);
             cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
             return current;
         }
@@ -1742,7 +1609,7 @@ MetadataRecord MetadataManager::mutate_impl(
             if (clock != snapshot.mutation_sequences.end() &&
                 clock->second >= identity->sequence) {
                 // Already accepted (before a crash, or merged by a peer).
-                ensure_accepted_head_durable(active, current, need, FrameType::read_ahead);
+                offer_accepted_head(active, current, FrameType::read_ahead);
                 cache_record(current, std::make_shared<MetadataSnapshot>(std::move(snapshot)));
                 return current;
             }
@@ -1821,7 +1688,7 @@ MetadataRecord MetadataManager::mutate_impl(
             if (!namespace_store_)
                 throw MetadataNotReady("no namespace node store is configured");
             auto nodes =
-                ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_, need);
+                ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_);
             snapshot.namespace_root = apply_delta_to_namespace_tree(*snapshot.namespace_root,
                                                                     nodes, supplied_delta);
         }
@@ -1927,7 +1794,7 @@ MetadataRecord MetadataManager::mutate_impl(
         }
     }
 
-    throw MetadataNotReady("metadata mutation could not reach durable acceptance floor");
+    throw MetadataNotReady("metadata mutation could not be accepted");
 }
 
 MetadataRecord MetadataManager::mutate(const std::function<void(MetadataSnapshot&)>& mutate,
@@ -1995,7 +1862,7 @@ void MetadataManager::repair_once() {
     {
         Lock mutation_lock(mutation_mutex_);
         const auto all_active = node_.membership().active();
-        active = compatible_replicas(all_active);
+        active = all_active;
         if (active.empty())
             throw MetadataNotReady("metadata replicas unavailable");
 

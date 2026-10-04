@@ -16,29 +16,23 @@ namespace macha {
 // built offline) meets the cluster.
 class ControlNamespaceNodeStore final : public NamespaceNodeStore {
   public:
-    // `required` is the commit's metadata write floor: a root may be
-    // committed only once every node it addresses has durably reached it.
-    // A reader (floor zero) refuses `put`; zero never means "no floor".
+    // A reader refuses `put`.
     static ControlNamespaceNodeStore for_reading(LocalStore& control, DistributedStore& store) {
-        return ControlNamespaceNodeStore(control, store, nullptr, 0, Mode::read);
+        return ControlNamespaceNodeStore(control, store, nullptr, Mode::read);
     }
-    static ControlNamespaceNodeStore for_commit(LocalStore& control, DistributedStore& store,
-                                                size_t required) {
-        if (!required)
-            throw std::invalid_argument("namespace commit requires a metadata write floor");
-        return ControlNamespaceNodeStore(control, store, &store, required, Mode::commit);
+    // A commit writes each node here and offers it to every node present; a
+    // root is committed once this node holds every node it addresses.
+    static ControlNamespaceNodeStore for_commit(LocalStore& control, DistributedStore& store) {
+        return ControlNamespaceNodeStore(control, store, &store, Mode::commit);
     }
-    // Replay writes locally and replicates nothing: a materialised history
-    // entry already reached the floor when committed, and replicating would
-    // stop a node with peers down from rebuilding its own head. Content
-    // addressing makes a locally rebuilt node identical to the committed one.
+    // Replay writes locally and replicates nothing: content addressing makes
+    // a locally rebuilt node identical to the committed one.
     static ControlNamespaceNodeStore for_replay(LocalStore& control, ControlObjectSource& source) {
-        return ControlNamespaceNodeStore(control, source, nullptr, 0, Mode::replay);
+        return ControlNamespaceNodeStore(control, source, nullptr, Mode::replay);
     }
 
-    // Writes the node and returns its content address. Throws
-    // MetadataNotReady when the node fails to reach the floor, so a commit
-    // never publishes a root addressing an unreachable node.
+    // Writes the node and returns its content address. Throws when this node
+    // cannot hold it, so a commit never publishes a root it cannot read.
     ObjectId put(std::span<const uint8_t> node) override;
 
     // Fetches the node, pulling it local first. Empty, not a throw, when it
@@ -55,13 +49,12 @@ class ControlNamespaceNodeStore final : public NamespaceNodeStore {
   private:
     enum class Mode : uint8_t { read, commit, replay };
     ControlNamespaceNodeStore(LocalStore& control, ControlObjectSource& source,
-                              DistributedStore* replicas, size_t required, Mode mode);
+                              DistributedStore* replicas, Mode mode);
 
     LocalStore& control_;
     ControlObjectSource& source_;
     // Set only in commit mode, the one that replicates.
     DistributedStore* replicas_;
-    size_t required_;
     Mode mode_;
     std::vector<ObjectId> written_;
 };

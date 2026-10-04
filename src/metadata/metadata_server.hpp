@@ -27,8 +27,7 @@ class PersistentBlockCache;
 class MetadataServer {
   public:
     MetadataServer(NodeRuntime& node, MetadataReplica& replica, PersistentBlockCache& cache,
-                   MessageRoutes& routes, size_t min_write_replicas,
-                   std::chrono::milliseconds refresh_interval);
+                   MessageRoutes& routes, std::chrono::milliseconds refresh_interval);
     ~MetadataServer();
     MetadataServer(const MetadataServer&) = delete;
     MetadataServer& operator=(const MetadataServer&) = delete;
@@ -50,7 +49,6 @@ class MetadataServer {
     MetadataReplica& replica_;
     PersistentBlockCache& cache_;
     MessageRoutes& routes_;
-    const size_t min_write_replicas_;
     const std::chrono::milliseconds refresh_interval_;
     std::vector<MessageType> bound_;
     // Guards nothing; the refresher waits on it.
