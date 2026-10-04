@@ -27,7 +27,9 @@
 #include "torrent/torrent.hpp"
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <string>
 #include <string_view>
 
 // The node's services, built once local state has recovered: the composition
@@ -93,6 +95,11 @@ class NodeServices {
     void stop();
     // The live-reloadable limits of the services that have any.
     void reconfigure(const Config&);
+    // What an observation window samples of the services: each class's idle
+    // time, repair's figures (cumulative since start, as Status reports them;
+    // a window's rate is the difference between consecutive windows) and,
+    // while a mount is published, the frontend's.
+    std::map<std::string, uint64_t> observation_gauges();
 
     PlaybackTracker& playback() { return playback_; }
     DistributedStore& store() { return store_; }

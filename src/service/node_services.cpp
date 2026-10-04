@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "service/node_services.hpp"
 
+#include "fuse/fuse_frontend.hpp"
 #include "log.hpp"
 #include "media/media_engine.hpp"
 #include "metadata/namespace_control_store.hpp"
@@ -129,6 +130,37 @@ void NodeServices::reconfigure(const Config& updated) {
     ingest_.reconfigure(updated.ingest);
     cluster_jobs_.reconfigure(updated.torrent);
     streaming_.reconfigure(updated.streaming);
+}
+
+std::map<std::string, uint64_t> NodeServices::observation_gauges() {
+    std::map<std::string, uint64_t> gauges;
+    const auto idle_ms = [](std::chrono::milliseconds idle) {
+        return static_cast<uint64_t>(std::max<int64_t>(0, idle.count()));
+    };
+    gauges["foreground_idle_ms"] = idle_ms(store_.foreground_idle_for());
+    gauges["interactive_idle_ms"] = idle_ms(store_.interactive_idle_for());
+    gauges["loader_idle_ms"] = idle_ms(store_.loader_idle_for());
+    const auto repair = store_.repair_diagnostics();
+    gauges["repair_push_examined"] = repair.push_examined;
+    gauges["repair_pull_examined"] = repair.pull_examined;
+    gauges["repair_bytes_transferred"] = repair.bytes_transferred;
+    gauges["repair_passes_completed"] = repair.passes_completed;
+    gauges["repair_pull_unsourceable"] = repair.pull_unsourceable;
+    gauges["repair_gate_ran"] = repair.gate_ran;
+    gauges["repair_gate_share"] = repair.gate_share;
+    gauges["repair_gate_credit"] = repair.gate_credit;
+    gauges["repair_prompt_copies"] = repair.prompt_copies;
+    // Held for the call, so a subsystem restart cannot pull the frontend out
+    // from under it.
+    if (auto frontend = registry_.fuse()) {
+        const auto fuse = frontend->diagnostics();
+        gauges["fuse_publications_completed"] = fuse.data_publications_completed;
+        gauges["fuse_publication_bytes_committed"] = fuse.data_publication_bytes_committed;
+        gauges["fuse_publication_bytes_confirmed"] = fuse.data_publication_bytes_confirmed;
+        gauges["fuse_spool_bytes"] = fuse.spool_bytes;
+        gauges["fuse_parked_publications"] = fuse.parked_publications;
+    }
+    return gauges;
 }
 
 NodeServices::~NodeServices() {
