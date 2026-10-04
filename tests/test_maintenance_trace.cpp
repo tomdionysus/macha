@@ -215,7 +215,8 @@ class TracedNode {
         instruments.trace = [this](std::string_view kind, std::string_view detail) {
             trace_.add(kind, detail);
         };
-        service_ = std::make_unique<Service>(config_, keys_, NodeRuntime::StartupStageHook{},
+        service_ = std::make_unique<Service>(config_, keys_, test_durability_window,
+                                             NodeRuntime::StartupStageHook{},
                                              Service::MaintenanceStageHook{},
                                              Service::StartupStallHandler{}, instruments);
         service_->start();
@@ -571,7 +572,7 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     // Whether a GC-due pass falls while the peer is away depends on topology
     // event timing; node conditions and every action are still compared.
     node.skip_verdicts();
-    auto peer = std::make_unique<Service>(config_b, cluster.keys());
+    auto peer = std::make_unique<Service>(config_b, cluster.keys(), test_durability_window);
     auto& service = node.start();
     peer->start();
     REQUIRE(wait_until([&] { return service.node().membership().all_known_reachable() &&
@@ -591,7 +592,7 @@ MACHA_TEST("maintenance_trace", test_trace_peer_unreachable_and_back) {
     node.advance(2h);
     node.step("peer gone past the grace");
 
-    peer = std::make_unique<Service>(config_b, cluster.keys());
+    peer = std::make_unique<Service>(config_b, cluster.keys(), test_durability_window);
     peer->start();
     // Rejoining runs on real time and restarts GC's quiet window, so step only
     // once the cluster has settled. The rejoin's convergence retry is

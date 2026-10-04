@@ -28,14 +28,15 @@ void stage(const LocalState::StageHook& hook, std::string_view name, std::stop_t
 } // namespace
 
 LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
-                       RecoveryProgress& progress, const StageHook& hook, std::stop_token stop) {
+                       RecoveryProgress& progress, const StageHook& hook, std::stop_token stop,
+                       std::chrono::milliseconds durability_batch_window) {
     // The DATA pool and the control-side chain are independent; recover them
     // side by side, as a large pool can take a while.
     std::exception_ptr data_failure;
     std::jthread data_recovery([&](std::stop_token) {
         run_supervised_once("cluster-storage-recovery", [&] {
             try {
-                recover_data(cfg, identity, progress, hook, stop);
+                recover_data(cfg, identity, progress, hook, stop, durability_batch_window);
             } catch (...) {
                 data_failure = std::current_exception();
             }
@@ -57,12 +58,12 @@ LocalState::~LocalState() = default;
 
 void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
                               RecoveryProgress& progress, const StageHook& hook,
-                              std::stop_token stop) {
+                              std::stop_token stop,
+                              std::chrono::milliseconds durability_batch_window) {
     try {
         stage(hook, "data-storage", stop);
         auto pool = std::make_unique<StoragePool>(cfg.state_path, identity.id, cfg.storage_backends,
-                                                  identity.keys.storage,
-                                                  std::chrono::milliseconds(500),
+                                                  identity.keys.storage, durability_batch_window,
                                                   cfg.storage_packing);
         if (stop.stop_requested())
             throw RecoveryCancelled();

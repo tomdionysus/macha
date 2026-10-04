@@ -47,6 +47,10 @@ inline CatalogueMaintenance maintenance_inventory(CatalogueManager& catalogue) {
 
 using namespace std::chrono_literals;
 
+// The durability batch window the suite's nodes run with: a barrier at once,
+// so no publication waits for company. Tests of batching name their own.
+inline constexpr std::chrono::milliseconds test_durability_window{0};
+
 enum class ConfigProfile {
     functional,
     isolated,
@@ -246,7 +250,7 @@ class TestService {
 
     Service& start() {
         REQUIRE(!service_);
-        service_ = std::make_unique<Service>(config_, keys_);
+        service_ = std::make_unique<Service>(config_, keys_, test_durability_window);
         service_->start();
         // Return a fully ready service; lifecycle tests that observe the early
         // phases construct Service directly.
@@ -281,11 +285,13 @@ struct BareNodeResources {
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
     BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {},
-             TelemetryStore::Now telemetry_now = {})
+             TelemetryStore::Now telemetry_now = {},
+             std::chrono::milliseconds durability_batch_window = test_durability_window)
         : BareNodeResources(config, keys, hook),
           NodeRuntime(std::move(config), identity, progress, resources.memory,
                       resources.transcode_rates, routes,
-                      resources.events, links, std::move(hook), std::move(telemetry_now)) {}
+                      resources.events, links, std::move(hook), std::move(telemetry_now)),
+          durability_batch_window_(durability_batch_window) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;
@@ -299,7 +305,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
                 try {
                     local_ = std::make_unique<LocalServices>(config(), identity, progress,
                                                              stage_hook, stop, *this, resources,
-                                                             routes);
+                                                             routes, durability_batch_window_);
                 } catch (const std::exception&) {
                     // Cancelled, or recorded in `progress`.
                     return;
@@ -363,6 +369,7 @@ class BareNode : public BareNodeResources, public NodeRuntime {
         return *local_;
     }
 
+    std::chrono::milliseconds durability_batch_window_;
     Accounts accounts_{config(), identity, *this, resources.events, routes};
     // Declared in this order so the recovery thread goes before what it built.
     std::unique_ptr<LocalServices> local_;

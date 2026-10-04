@@ -820,7 +820,7 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     config.metadata_min_write_replicas = 1;
     config.metadata_cache = 20ms;
     auto keys = load_cluster_keys(key);
-    Service service(config, keys);
+    Service service(config, keys, test_durability_window);
     service.start();
 
     service.filesystem().mkdir("/Music", 0755, getuid(), getgid());

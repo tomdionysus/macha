@@ -48,7 +48,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("cannot block service signals: " +
                                      std::string(std::strerror(blocked)));
 
-        macha::Service service(config, keys);
+        // How long a DATA commit that asks for durability waits so that others
+        // share its physical sync.
+        constexpr std::chrono::milliseconds durability_batch_window{500};
+        macha::Service service(config, keys, durability_batch_window);
         service.start();
 
         while (true) {

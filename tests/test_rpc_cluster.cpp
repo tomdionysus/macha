@@ -1111,8 +1111,8 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         config->maintenance.busy_bandwidth_fraction = 0.0;
     }
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -2310,7 +2310,7 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     config.ingest.enabled = false;
     config.torrent.enabled = false;
 
-    Service service(config, keys);
+    Service service(config, keys, test_durability_window);
     service.start();
     (void)service.filesystem();
 
@@ -2602,8 +2602,8 @@ MACHA_TEST("rpc_cluster", test_metadata_write_floor_policy_mismatch_fails_closed
     c1.metadata_min_write_replicas = 1;
     c2.metadata_min_write_replicas = 2;
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -2639,8 +2639,8 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -2665,7 +2665,7 @@ MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3,
                          {{"127.0.0.1", p1}, {"127.0.0.1", p2}});
     c3.metadata_min_write_replicas = 1; // deliberately wrong
-    Service s3(c3, keys);
+    Service s3(c3, keys, test_durability_window);
     s3.start();
     REQUIRE(wait_until([&] { return s1.node().membership().active().size() >= 3; }));
 
@@ -2711,8 +2711,8 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     c1.min_write_replicas = c2.min_write_replicas = 2;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -2808,13 +2808,13 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     TestGate repair_gate;
     std::atomic_bool gate_repair{};
     std::atomic_bool gate_once{};
-    Service s1(c1, keys, {}, [&](std::string_view stage) {
+    Service s1(c1, keys, test_durability_window, {}, [&](std::string_view stage) {
         if (stage == "metadata-repair-begin" && gate_repair.load(std::memory_order_acquire) &&
             !gate_once.exchange(true, std::memory_order_acq_rel)) {
             repair_gate.enter_and_wait();
         }
     });
-    Service s2(c2, keys);
+    Service s2(c2, keys, test_durability_window);
     struct GateOpener {
         TestGate& gate;
         ~GateOpener() {
@@ -2926,13 +2926,13 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     std::atomic_bool gate_repairs{};
     std::atomic_bool gate_once1{};
     std::atomic_bool gate_once2{};
-    Service s1(c1, keys, {}, [&](std::string_view stage) {
+    Service s1(c1, keys, test_durability_window, {}, [&](std::string_view stage) {
         if (stage == "metadata-repair-begin" && gate_repairs.load(std::memory_order_acquire) &&
             !gate_once1.exchange(true, std::memory_order_acq_rel)) {
             repair_gate1.enter_and_wait();
         }
     });
-    Service s2(c2, keys, {}, [&](std::string_view stage) {
+    Service s2(c2, keys, test_durability_window, {}, [&](std::string_view stage) {
         if (stage == "metadata-repair-begin" && gate_repairs.load(std::memory_order_acquire) &&
             !gate_once2.exchange(true, std::memory_order_acq_rel)) {
             repair_gate2.enter_and_wait();
@@ -3198,7 +3198,7 @@ MACHA_TEST("rpc_cluster", test_service_startup_gate_spares_progress_and_ends_a_s
     std::atomic_bool handler_called{false};
     std::string diagnostic;
     Service service(
-        c1, cluster.keys(),
+        c1, cluster.keys(), test_durability_window,
         [&](std::string_view stage) {
             if (stage == "data-storage")
                 stall_gate.enter_and_wait();
@@ -3282,9 +3282,9 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
         config->torrent.enabled = false;
     }
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    auto s3 = std::make_unique<Service>(c3, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    auto s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s1.start();
     s2.start();
     s3->start();
@@ -3330,7 +3330,7 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     REQUIRE(wait_until([&] { return s2.local_state().replica().committed().hash == final.hash; },
                        10s));
 
-    s3 = std::make_unique<Service>(c3, keys);
+    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s3->start();
     (void)s3->filesystem();
     REQUIRE(wait_until(
@@ -3385,8 +3385,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_re
         config->catalogue.scanner.enabled = false;
         config->ingest.enabled = false;
     }
-    Service s1(c1, keys);
-    auto s2 = std::make_unique<Service>(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    auto s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s1.start();
     s2->start();
     REQUIRE(wait_until([&] {
@@ -3420,7 +3420,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_re
     std::this_thread::sleep_for(1s);
     CHECK(ingest.job(id)->state != IngestJobState::failed);
 
-    s2 = std::make_unique<Service>(c2, keys);
+    s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s2->start();
     REQUIRE(wait_until([&] {
         const auto job = ingest.job(id);
@@ -3457,9 +3457,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
         config->dead_after = 200ms;
     }
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    auto s3 = std::make_unique<Service>(c3, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    auto s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s1.start();
     s2.start();
     s3->start();
@@ -3516,7 +3516,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     CHECK(s1.local_state().replica().committed().hash == before.hash);
     CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0644U);
 
-    s3 = std::make_unique<Service>(c3, keys);
+    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s3->start();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() == 3 &&
@@ -3606,9 +3606,9 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         config->maintenance.garbage_grace = 0ms;
     }
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    auto s3 = std::make_unique<Service>(c3, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    auto s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s1.start();
     s2.start();
     s3->start();
@@ -3683,7 +3683,7 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
 
     // The third node returns from its persistent state; metadata must converge
     // before GC may reclaim the delete.
-    s3 = std::make_unique<Service>(c3, keys);
+    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s3->start();
     REQUIRE(wait_until(
         [&] {
@@ -3746,9 +3746,9 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
         config->maintenance.no_progress_backoff = 500ms;
     }
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    auto s3 = std::make_unique<Service>(c3, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
+    auto s3 = std::make_unique<Service>(c3, keys, test_durability_window);
     s1.start();
     s2.start();
     s3->start();
@@ -3824,8 +3824,8 @@ MACHA_TEST("rpc_cluster", test_held_retention_claims_cost_repair_no_credit) {
         config->maintenance.max_bandwidth = config->extent_size;
     }
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -3885,10 +3885,10 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
     Hash256 left_head{};
     NodeId node2_id{};
     {
-        Service s1(c1, keys);
-        Service s2(c2, keys);
-        Service s3(c3, keys);
-        Service s4(c4, keys);
+        Service s1(c1, keys, test_durability_window);
+        Service s2(c2, keys, test_durability_window);
+        Service s3(c3, keys, test_durability_window);
+        Service s4(c4, keys, test_durability_window);
         s1.start();
         s2.start();
         s3.start();
@@ -3941,8 +3941,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
     Hash256 right_head{};
     {
         // Nodes 3 and 4 never saw /left but satisfy the floor, so stay writable.
-        Service s3(c3, keys);
-        Service s4(c4, keys);
+        Service s3(c3, keys, test_durability_window);
+        Service s4(c4, keys, test_durability_window);
         s3.start();
         s4.start();
         REQUIRE(wait_until([&] {
@@ -3972,7 +3972,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
         // With one member of the other pair back, two accepted sibling histories
         // meet; reconciliation must descend from both.
         s4.stop();
-        Service s2(c2, keys);
+        Service s2(c2, keys, test_durability_window);
         s2.start();
         REQUIRE(s2.node().node_id() == node2_id);
         REQUIRE(wait_until([&] {
@@ -4031,8 +4031,8 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     ObjectId object;
     Bytes input = pattern(128 * 1024);
     {
-        Service s1(c1, keys);
-        Service s2(c2, keys);
+        Service s1(c1, keys, test_durability_window);
+        Service s2(c2, keys, test_durability_window);
         s1.start();
         s2.start();
         REQUIRE(wait_until([&] {
@@ -4064,8 +4064,8 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     c1.replication = c2.replication = 2;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
     {
-        Service s1(c1, keys);
-        Service s2(c2, keys);
+        Service s1(c1, keys, test_durability_window);
+        Service s2(c2, keys, test_durability_window);
         s1.start();
         s2.start();
         REQUIRE(wait_until([&] {
@@ -4098,8 +4098,8 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
     {
-        Service s1(c1, keys);
-        Service s2(c2, keys);
+        Service s1(c1, keys, test_durability_window);
+        Service s2(c2, keys, test_durability_window);
         s1.start();
         s2.start();
         REQUIRE(wait_until([&] {
@@ -4141,8 +4141,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     Bytes input = pattern(2 * 1024 * 1024 + 12345);
     NodeId old_n1;
 
-    auto s1 = std::make_unique<Service>(c1, keys);
-    auto s2 = std::make_unique<Service>(c2, keys);
+    auto s1 = std::make_unique<Service>(c1, keys, test_durability_window);
+    auto s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s1->start();
     s2->start();
     REQUIRE(wait_until([&] {
@@ -4200,7 +4200,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     // A wiped node needs a bootstrap route to find the survivor.
     auto replacement_config = c1;
     replacement_config.bootstrap = {{"127.0.0.1", p2}};
-    auto replacement = std::make_unique<Service>(replacement_config, keys);
+    auto replacement = std::make_unique<Service>(replacement_config, keys, test_durability_window);
     replacement->start();
     CHECK(replacement->node().node_id() != old_n1);
 
@@ -4290,7 +4290,8 @@ struct DurableTrio {
             configs.push_back(std::move(config));
         }
         for (const auto& config : configs)
-            nodes.push_back(std::make_unique<Service>(config, cluster.keys()));
+            nodes.push_back(
+                std::make_unique<Service>(config, cluster.keys(), test_durability_window));
         for (auto& node : nodes)
             node->start();
         REQUIRE(wait_until(
@@ -4484,8 +4485,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
         config.metadata_min_write_replicas = 2;
         return config;
     };
-    Service n1(node_config(0), cluster.keys());
-    Service n2(node_config(1), cluster.keys());
+    Service n1(node_config(0), cluster.keys(), test_durability_window);
+    Service n2(node_config(1), cluster.keys(), test_durability_window);
     n1.start();
     n2.start();
     REQUIRE(wait_until([&] { return n1.node().membership().active().size() >= 2; }, 60s));
@@ -4506,8 +4507,9 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
     auto clock = std::make_shared<ManualMaintenanceClock>();
     ServiceInstruments instruments;
     instruments.clock = clock;
-    Service n3(node_config(2), cluster.keys(), NodeRuntime::StartupStageHook{},
-               Service::MaintenanceStageHook{}, Service::StartupStallHandler{}, instruments);
+    Service n3(node_config(2), cluster.keys(), test_durability_window,
+               NodeRuntime::StartupStageHook{}, Service::MaintenanceStageHook{},
+               Service::StartupStallHandler{}, instruments);
     n3.start();
     REQUIRE(wait_until([&] { return n3.node().membership().active().size() >= 3; }, 60s));
     (void)n3.filesystem(); // services ready
@@ -4741,8 +4743,8 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     auto links = std::make_shared<FaultyLinks>();
     ServiceInstruments instruments;
     instruments.links = links;
-    Service s1(c1, keys, {}, {}, {}, instruments);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window, {}, {}, {}, instruments);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -4838,8 +4840,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     }
     c1.plugin_path = c2.plugin_path = plugin_dir.path();
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -5106,8 +5108,8 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_rounds_across_a_pair)
     auto p2 = free_port();
     auto c1 = config_for(cluster.path() / "checkpoint-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "checkpoint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -5207,8 +5209,8 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
     auto p2 = free_port();
     auto c1 = config_for(cluster.path() / "repair-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "repair-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    Service s1(c1, keys);
-    auto s2 = std::make_unique<Service>(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    auto s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s1.start();
     s2->start();
     REQUIRE(wait_until([&] {
@@ -5241,7 +5243,7 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
         MetadataReplica damaged(c2.state_path, keys.storage, {}, false);
         REQUIRE(damaged.unreconstructable_heads() == std::vector<Hash256>{head});
     }
-    s2 = std::make_unique<Service>(c2, keys);
+    s2 = std::make_unique<Service>(c2, keys, test_durability_window);
     s2->start();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() >= 2 &&
@@ -5291,8 +5293,8 @@ MACHA_TEST("rpc_cluster", test_a_hung_health_probe_is_retried_inside_the_livenes
     auto links = std::make_shared<FaultyLinks>();
     ServiceInstruments instruments;
     instruments.links = links;
-    Service s1(c1, keys, {}, {}, {}, instruments);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window, {}, {}, {}, instruments);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {

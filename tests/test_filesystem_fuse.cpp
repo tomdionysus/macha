@@ -3273,8 +3273,8 @@ Service make_service(const Config& config, const ClusterKeys& keys,
                      Service::MaintenanceStageHook stage_hook = {}) {
     ServiceInstruments instruments;
     instruments.clock = std::move(clock);
-    return Service(config, keys, NodeRuntime::StartupStageHook{}, std::move(stage_hook),
-                   Service::StartupStallHandler{}, std::move(instruments));
+    return Service(config, keys, test_durability_window, NodeRuntime::StartupStageHook{},
+                   std::move(stage_hook), Service::StartupStallHandler{}, std::move(instruments));
 }
 
 // The management API over a Service: Status reports the published FUSE
