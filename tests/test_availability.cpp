@@ -777,9 +777,14 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
             [&] {
                 // The later file with its data: it is named before its
                 // extent is committed.
+                // And a survey the peer could answer in full: while the peer
+                // catches up with the new namespace its answer leaves extents
+                // unknown, and the table shows their last known counts.
                 const auto holed = path_of(*service, "/dir/holed.bin");
                 const auto later = path_of(*service, "/later.bin");
-                return holed && holed->extents_unavailable == 1 && later && later->extents == 1;
+                const auto survey = service->availability().snapshot();
+                return holed && holed->extents_unavailable == 1 && later && later->extents == 1 &&
+                       survey->survey.unknown.empty() && survey->survey.unavailable.size() == 1;
             },
             20s));
         const auto snapshot = service->availability().snapshot();
