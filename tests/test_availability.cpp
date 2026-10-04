@@ -775,8 +775,11 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
     for (auto* service : {&first, &second}) {
         REQUIRE(wait_until(
             [&] {
+                // The later file with its data: it is named before its
+                // extent is committed.
                 const auto holed = path_of(*service, "/dir/holed.bin");
-                return holed && holed->extents_unavailable == 1 && path_of(*service, "/later.bin");
+                const auto later = path_of(*service, "/later.bin");
+                return holed && holed->extents_unavailable == 1 && later && later->extents == 1;
             },
             20s));
         const auto snapshot = service->availability().snapshot();

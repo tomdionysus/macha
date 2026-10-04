@@ -1175,7 +1175,7 @@ MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
 // extents), each branch one cycle of a loader: the materialising merge
 // against the tree merge. Prints "BENCH name=<name> ns_per_op=<n> ops=1";
 // run with `--filter baseline --verbose`.
-MACHA_TEST("baseline", test_baseline_reconcile_materialised_against_tree) {
+MACHA_HEAVY_TEST("baseline", test_baseline_reconcile_materialised_against_tree) {
     MemoryNamespaceNodeStore store;
     MetadataSnapshot base;
     base.extent_size = 4 * 1024 * 1024;
