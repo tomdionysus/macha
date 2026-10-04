@@ -321,3 +321,22 @@ not collected; its journal figures are below).
   interleave and is not comparable between hours; the time for each is.
 - FUSE publication in the 0.87.0 hour: 11.4 and 13.6 MB/min (T0: 9.8 and
   11.6).
+
+### 0.87.1: a reconciliation by stage (2026-10-04, 13:07Z to 13:37Z)
+
+Half an hour of the same load, seven reconciliations per node, each a delta
+of 313 to 1,822 bytes:
+
+| stage | time |
+|---|---|
+| materialise the three snapshots | 0 to 3 ms |
+| merge (tree diff, rules, change set) | 23 to 62 ms |
+| write the changed tree nodes through the commit store | 2 ms to 2.4 s |
+| encode and hash | 11 to 18 ms |
+| publish (store and accept on the peer) | 0.8 to 2.7 s |
+| whole reconciliation | 1.2 to 4.5 s |
+
+What remains is the peer: replicating new tree nodes and the two rounds of
+a durable commit, which an ordinary commit in the same journals also pays
+(0.4 to 1.5 s to store, about as long to accept). The local work is under
+0.1 s.
