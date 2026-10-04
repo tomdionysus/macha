@@ -188,7 +188,7 @@ MACHA_TEST("namespace_entries", test_the_metadata_view_pages_a_live_namespace) {
     macha::test_support::TestService fixture("entries-live");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.catalogue.scanner.enabled = false;
     config.catalogue.api.enabled = false;
     config.ingest.enabled = false;

@@ -394,7 +394,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_is_loader_activity_not_viewer_acti
     CHECK(!activity.viewer_recently_active(30s));
 }
 
-// A put publishes at min_write_replicas with the local copy, never waiting
+// A put publishes at write_copies with the local copy, never waiting
 // for owners beyond the floor; the prompt worker then copies it to one more
 // owner, and never to an owner that gossips no room.
 MACHA_FAST_TEST("rpc_cluster", test_store_put_publishes_at_the_floor_and_copies_promptly) {
@@ -457,7 +457,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_publishes_at_the_floor_and_copies_
 MACHA_FAST_TEST("rpc_cluster", test_store_put_replaces_a_replica_that_cannot_be_launched) {
     StoreBench bench([](Config& c) {
         c.replication = 3;
-        c.min_write_replicas = 2;
+        c.write_copies = 2;
     });
     bench.node.add_peer(StoreBench::peer());
     bench.node.add_peer(StoreBench::peer());
@@ -496,7 +496,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_replaces_a_replica_that_cannot_be_
 MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_returns_on_the_local_copy) {
     StoreBench bench([](Config& c) {
         c.replication = 2;
-        c.min_write_replicas = 2;
+        c.write_copies = 2;
         c.write_stall = 50ms;
     });
     const auto peer_puts = [&] {
@@ -1049,6 +1049,7 @@ struct SurveyCountingView final : MetadataView {
     bool resolve_conflict(const std::string&, std::string_view) override { return false; }
     uint64_t conflicts_superseded() const noexcept override { return 0; }
     uint64_t conflicts_resolved() const noexcept override { return 0; }
+    MetadataHeadStanding head_standing() const noexcept override { return {}; }
     MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {
@@ -1101,8 +1102,8 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     for (auto* config : {&c1, &c2}) {
         config->replication = 1;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 1;
+        config->write_copies = 1;
+        config->metadata_write_copies = 1;
         config->maintenance.interval = 50ms;
         config->maintenance.foreground_quiet = 500ms;
         config->maintenance.no_progress_backoff = 500ms;
@@ -1574,7 +1575,7 @@ MACHA_TEST("rpc_cluster", test_mutual_bootstrap_prunes_cross_dial) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
     BareNode n1(c1, keys);
@@ -2309,7 +2310,7 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     const auto& keys = cluster.keys();
     auto config = config_for(cluster.path() / "shutdown-client", cluster.keyfile(), free_port());
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.catalogue.scanner.enabled = false;
     config.catalogue.api.enabled = false;
     config.ingest.enabled = false;
@@ -2522,7 +2523,7 @@ MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
     auto& config = fixture.config();
     config.bootstrap = {{"127.0.0.1", config.port}};
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
 
     auto& service = fixture.start();
     // A pristine bootstrap node holds genesis only as local codec material,
@@ -2545,7 +2546,7 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     auto config = config_for(cluster.path() / "checkpoint-survey", cluster.keyfile(), free_port(),
                              {{"127.0.0.1", unreachable_port}});
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.dead_after = 10s;
 
     BareNode node(config, keys);
@@ -2607,8 +2608,8 @@ MACHA_TEST("rpc_cluster", test_nodes_seeking_different_copy_counts_share_one_nam
 
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.metadata_min_write_replicas = 1;
-    c2.metadata_min_write_replicas = 2;
+    c1.metadata_write_copies = 1;
+    c2.metadata_write_copies = 2;
 
     Service s1(c1, keys, test_durability_window);
     Service s2(c2, keys, test_durability_window);
@@ -2636,7 +2637,7 @@ MACHA_TEST("rpc_cluster", test_nodes_seeking_different_copy_counts_share_one_nam
 
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3,
                          {{"127.0.0.1", p1}, {"127.0.0.1", p2}});
-    c3.metadata_min_write_replicas = 3;
+    c3.metadata_write_copies = 3;
     Service s3(c3, keys, test_durability_window);
     s3.start();
     REQUIRE(wait_until([&] { return s1.node().membership().active().size() >= 3; }));
@@ -2661,8 +2662,8 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 2;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
+    c1.write_copies = c2.write_copies = 2;
+    c1.metadata_write_copies = c2.metadata_write_copies = 2;
 
     Service s1(c1, keys, test_durability_window);
     Service s2(c2, keys, test_durability_window);
@@ -2751,8 +2752,8 @@ MACHA_TEST("rpc_cluster", test_service_metadata_repair_coalesces_real_generation
     auto c2 = config_for(cluster.path() / "coalesced-repair-n2", cluster.keyfile(), p2,
                          {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.write_copies = c2.write_copies = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
     c1.ingest.enabled = c2.ingest.enabled = false;
@@ -2867,8 +2868,8 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     auto c2 = config_for(cluster.path() / "sibling-notice-n2", cluster.keyfile(), p2,
                          {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.write_copies = c2.write_copies = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
     c1.ingest.enabled = c2.ingest.enabled = false;
@@ -3079,6 +3080,7 @@ MACHA_TEST("rpc_cluster", test_a_head_that_cannot_be_merged_is_set_aside) {
     // Reads serve this node's own head.
     const auto read = metadata.read_record();
     CHECK(read.hash == mine.hash);
+    CHECK(metadata.head_standing().set_aside == 1);
     CHECK(metadata.snapshot().entries.contains("/mine"));
     CHECK(!metadata.snapshot().entries.contains("/theirs"));
 
@@ -3114,8 +3116,8 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     auto c2 = config_for(cluster.path() / "concurrent-reconcile-n2", cluster.keyfile(), p2,
                          {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.write_copies = c2.write_copies = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     // No cache TTL: every reader must actually read.
     c1.metadata_cache = std::chrono::milliseconds(0);
 
@@ -3291,8 +3293,8 @@ MACHA_TEST("rpc_cluster", test_lagging_third_replica_catches_up_linear_burst_in_
     auto c3 = config_for(cluster.path() / "lagging-burst-n3", cluster.keyfile(), p3, peers(p3));
     for (auto* config : {&c1, &c2, &c3}) {
         config->replication = 3;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 1;
+        config->metadata_write_copies = 2;
         config->heartbeat = 50ms;
         // Well above scheduler jitter, yet short enough for the 5 s wait below
         // to see s3 drop out.
@@ -3399,8 +3401,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_re
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     for (auto* config : {&c1, &c2}) {
         config->replication = 1;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 1;
+        config->metadata_write_copies = 2;
         config->heartbeat = 50ms;
         config->dead_after = 200ms;
         config->catalogue.scanner.enabled = false;
@@ -3473,8 +3475,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, peers(p3));
     for (auto* config : {&c1, &c2, &c3}) {
         config->replication = 3;
-        config->min_write_replicas = 3;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 3;
+        config->metadata_write_copies = 2;
         config->heartbeat = 50ms;
         config->dead_after = 200ms;
     }
@@ -3605,8 +3607,8 @@ MACHA_TEST("rpc_cluster", test_a_delete_is_reclaimed_while_a_node_is_away) {
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, peers(p3));
     for (auto* config : {&c1, &c2, &c3}) {
         config->replication = 2;
-        config->min_write_replicas = 2;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 2;
+        config->metadata_write_copies = 2;
         config->heartbeat = 50ms;
         config->dead_after = 200ms;
         config->maintenance.interval = 50ms;
@@ -3711,8 +3713,8 @@ MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_r
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, peers(p3));
     for (auto* config : {&c1, &c2, &c3}) {
         config->replication = 1;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 1;
+        config->metadata_write_copies = 2;
         config->heartbeat = 50ms;
         config->dead_after = 200ms;
         config->maintenance.interval = 50ms;
@@ -3788,8 +3790,8 @@ MACHA_TEST("rpc_cluster", test_held_retention_claims_cost_repair_no_credit) {
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     for (auto* config : {&c1, &c2}) {
         config->replication = 1;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 1;
+        config->write_copies = 1;
+        config->metadata_write_copies = 1;
         config->maintenance.interval = 50ms;
         config->maintenance.foreground_quiet = 10ms;
         config->maintenance.no_progress_backoff = 500ms;
@@ -3850,8 +3852,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_disjoint_metadata_pairs_branch_and_reconcil
     auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, all_except(p4));
     for (auto* config : {&c1, &c2, &c3, &c4}) {
         config->replication = 1;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 1;
+        config->metadata_write_copies = 2;
         config->heartbeat = 50ms;
         config->dead_after = 200ms;
     }
@@ -4000,7 +4002,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
 
     ObjectId object;
     Bytes input = pattern(128 * 1024);
@@ -4036,7 +4038,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     // The replica policy changes while the cluster is stopped; on restart the
     // new policy is committed and repair converges content to it.
     c1.replication = c2.replication = 2;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
+    c1.metadata_write_copies = c2.metadata_write_copies = 2;
     {
         Service s1(c1, keys, test_durability_window);
         Service s2(c2, keys, test_durability_window);
@@ -4068,7 +4070,7 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     }
 
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     {
         Service s1(c1, keys, test_durability_window);
         Service s2(c2, keys, test_durability_window);
@@ -4107,7 +4109,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_rep
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
 
     std::vector<ObjectId> objects;
     Bytes input = pattern(2 * 1024 * 1024 + 12345);
@@ -4256,8 +4258,8 @@ struct DurableTrio {
                                               {{"127.0.0.1", first}});
             config.storage_packing = StoragePackingConfig{0, 0};
             config.replication = 3;
-            config.min_write_replicas = data_floor;
-            config.metadata_min_write_replicas = metadata_floor;
+            config.write_copies = data_floor;
+            config.metadata_write_copies = metadata_floor;
             config.metadata_cache = 5000ms; // the longest allowed
             configs.push_back(std::move(config));
         }
@@ -4369,7 +4371,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_commits_with_whichever_nodes_remai
 MACHA_TEST("rpc_cluster", test_unlink_retires_an_object_from_the_maintenance_inventory) {
     TestService fixture("inventory");
     fixture.config().replication = 1;
-    fixture.config().metadata_min_write_replicas = 1;
+    fixture.config().metadata_write_copies = 1;
     auto& service = fixture.start();
     auto& fs = service.filesystem();
     fs.mkdir("/media", 0755, getuid(), getgid());
@@ -4403,7 +4405,7 @@ MACHA_TEST("rpc_cluster", test_unlink_retires_an_object_from_the_maintenance_inv
 MACHA_TEST("rpc_cluster", test_rename_of_a_file_onto_a_directory_is_eisdir) {
     TestService fixture("rename-eisdir");
     fixture.config().replication = 1;
-    fixture.config().metadata_min_write_replicas = 1;
+    fixture.config().metadata_write_copies = 1;
     auto& fs = fixture.start().filesystem();
     fs.mkdir("/media", 0755, getuid(), getgid());
     fs.create_file("/media/file.bin", 0644, getuid(), getgid());
@@ -4447,8 +4449,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_joining_node_pulls_its_objects_through_ma
                                           {{"127.0.0.1", first}});
         config.storage_packing = StoragePackingConfig{0, 0};
         config.replication = 3;
-        config.min_write_replicas = 2;
-        config.metadata_min_write_replicas = 2;
+        config.write_copies = 2;
+        config.metadata_write_copies = 2;
         return config;
     };
     Service n1(node_config(0), cluster.keys(), test_durability_window);
@@ -4798,7 +4800,7 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     auto c2 = config_for(cluster.path() / "silent-repair-n2", cluster.keyfile(), p2,
                          {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
 
     auto links = std::make_shared<FaultyLinks>();
     ServiceInstruments instruments;
@@ -4927,8 +4929,8 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
     auto c2 = config_for(cluster.path() / "jobvis-n2", cluster.keyfile(), p2,
                          {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.write_copies = c2.write_copies = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     // ingest.enabled requires the scanner; provider lookups are off (no jobs
     // reach cataloguing, and they would need a TMDB token).
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = true;

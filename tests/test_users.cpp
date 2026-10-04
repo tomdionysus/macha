@@ -768,7 +768,7 @@ MACHA_TEST("users", test_accounts_converge_across_nodes) {
     auto c1 = cluster.node_config("n1", p1, {{"127.0.0.1", p2}});
     auto c2 = cluster.node_config("n2", p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
     // The gossip backstop rides the telemetry tick.
     c1.telemetry_interval = c2.telemetry_interval = 250ms;

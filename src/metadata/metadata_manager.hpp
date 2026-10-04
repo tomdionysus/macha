@@ -79,6 +79,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // membership changes, when the merge is tried again. This is the
     // membership the heads were set aside under.
     mutable std::atomic_uint64_t set_aside_stamp_{};
+    mutable std::atomic_uint64_t set_aside_count_{};
+    std::atomic_uint64_t head_holders_{};
+    std::atomic_uint64_t head_present_{};
     uint64_t membership_stamp() const;
     // The accepted heads not set aside.
     std::vector<MetadataRecord> usable_heads() const;
@@ -213,6 +216,11 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
                 mutation_retention_ms_max_.load(std::memory_order_relaxed),
                 mutation_publish_ms_total_.load(std::memory_order_relaxed),
                 mutation_publish_ms_max_.load(std::memory_order_relaxed)};
+    }
+    MetadataHeadStanding head_standing() const noexcept override {
+        return {head_holders_.load(std::memory_order_relaxed),
+                head_present_.load(std::memory_order_relaxed),
+                set_aside_count_.load(std::memory_order_relaxed)};
     }
     uint64_t conflicts_superseded() const noexcept override {
         return conflicts_superseded_.load(std::memory_order_relaxed);

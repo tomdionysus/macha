@@ -170,7 +170,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     bool repair_push_complete_{};
     bool repair_pull_complete_{};
     std::atomic<double> network_bps_{};
-    // Prompt second copy. A put stops at min_write_replicas; objects that
+    // Prompt second copy. A put stops at write_copies; objects that
     // reached only that floor are queued here and pushed to the next owner by
     // one worker as speculative DATA work, so a writer's death does not
     // strand recent data until the repair cursor comes round.

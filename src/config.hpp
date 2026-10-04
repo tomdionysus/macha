@@ -54,8 +54,11 @@ struct CacheConfig {
 struct MaintenanceConfig {
     std::chrono::milliseconds interval{1000};
     std::chrono::milliseconds foreground_quiet{2000};
-    // Minimum retirement/orphan age before reachability GC may reclaim an object.
-    std::chrono::milliseconds garbage_grace{std::chrono::hours(24)};
+    // The absence horizon. An object's bytes go only once this node has seen
+    // it unreferenced for this long, which is how long a node may be away and
+    // still find what its branch refers to; a node unheard of for this long
+    // is forgotten.
+    std::chrono::milliseconds garbage_grace{std::chrono::hours(24 * 30)};
     // Rebalance and scrub only; repair always earns credit at the idle fraction
     // and shares time by the weights below.
     double busy_bandwidth_fraction{0.0};
@@ -587,8 +590,11 @@ struct Config {
     ExternalIpConfig external_ip;
     ConnectivityCheckConfig connectivity_check;
     size_t replication{3};
-    size_t metadata_min_write_replicas{2};
-    size_t min_write_replicas{1};
+    // Copies sought before a write returns: of a metadata commit, and of a
+    // DATA object. A write is accepted on one; the rest are owed to repair
+    // when no further node present can take one.
+    size_t metadata_write_copies{2};
+    size_t write_copies{1};
     // retain_data() batches presence checks into have_objects RPCs: ids per
     // message (well under max_frame_size), and batches in flight across all peers.
     size_t retention_check_batch_size{2000};

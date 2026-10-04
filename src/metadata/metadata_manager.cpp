@@ -93,7 +93,7 @@ void MetadataManager::publish_replica_state(bool validated, std::string_view rea
     // alone; copies on other nodes are sought, never required.
     auto view = available_snapshot_view();
     const auto membership = node_.membership().snapshot();
-    const size_t required = node_.config().metadata_min_write_replicas;
+    const size_t required = node_.config().metadata_write_copies;
     const size_t known = membership.all.size();
     const size_t online = membership.active.size();
     const uint64_t generation = view ? view->generation : 0;
@@ -673,7 +673,7 @@ MetadataManager::PublishedCommit MetadataManager::publish_commit(
     std::span<const uint8_t> delta, FrameType frame_type) {
     // A commit is accepted once this node holds it. Further copies are sought
     // from the nodes present and owed to the rest; repair_once() delivers them.
-    const size_t sought = node_.config().metadata_min_write_replicas;
+    const size_t sought = node_.config().metadata_write_copies;
 
     const auto compact = commit_history_entry(record, delta);
     PublishedCommit out;
@@ -806,7 +806,7 @@ void MetadataManager::offer_accepted_head(
     if (!acceptance)
         throw MetadataNotReady("metadata mutation is visible locally without acceptance certificate");
 
-    const size_t sought = node_.config().metadata_min_write_replicas;
+    const size_t sought = node_.config().metadata_write_copies;
     size_t holding = 0;
     for (const auto& owner : nodes) {
         if (replicate_accepted_head(owner, record, *acceptance, frame_type))
@@ -995,7 +995,15 @@ std::vector<MetadataRecord> MetadataManager::usable_heads() const {
     if (local_.replica().set_aside_generation() &&
         set_aside_stamp_.load(std::memory_order_acquire) != membership_stamp())
         local_.replica().clear_set_aside();
-    return local_.replica().usable_heads();
+    if (!local_.replica().set_aside_generation()) {
+        set_aside_count_.store(0, std::memory_order_relaxed);
+        return local_.replica().accepted_heads();
+    }
+    const auto all = local_.replica().accepted_heads().size();
+    auto usable = local_.replica().usable_heads();
+    set_aside_count_.store(all > usable.size() ? all - usable.size() : 0,
+                           std::memory_order_relaxed);
+    return usable;
 }
 
 MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& heads) const {
@@ -1938,11 +1946,15 @@ void MetadataManager::repair_once() {
     // and does not hold convergence back.
     const auto selected_generation = record.generation;
     bool incomplete = false;
+    uint64_t holders = 0;
     for (const auto& owner : active) {
-        if (!replicate_accepted_head(owner, record, *acceptance, FrameType::speculative) &&
-            node_.membership().directly_reachable(owner.id))
+        if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
+            ++holders;
+        else if (node_.membership().directly_reachable(owner.id))
             incomplete = true;
     }
+    head_holders_.store(holders, std::memory_order_relaxed);
+    head_present_.store(active.size(), std::memory_order_relaxed);
     Lock mutation_lock(mutation_mutex_);
     if (incomplete)
         throw MetadataNotReady("metadata accepted-head replication incomplete");

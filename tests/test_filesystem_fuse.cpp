@@ -27,8 +27,8 @@ class FilesystemNode {
         : node_(name) {
         auto& config = node_.config();
         config.replication = 1;
-        config.metadata_min_write_replicas = 1;
-        config.min_write_replicas = 1;
+        config.metadata_write_copies = 1;
+        config.write_copies = 1;
         config.extent_size = 1024 * 1024;
         if (configure)
             configure(config);
@@ -754,7 +754,7 @@ MACHA_TEST("filesystem_fuse", test_publication_writer_failure_stays_invisible) {
 MACHA_TEST("filesystem_fuse", test_local_snapshot_view_is_local_before_cluster_forms) {
     TestNode fixture("local-view-before-floor");
     fixture.config().replication = 1;
-    fixture.config().metadata_min_write_replicas = 2;
+    fixture.config().metadata_write_copies = 2;
     fixture.start();
     auto& fs = fixture.filesystem();
     CHECK(!fixture.metadata().available_snapshot_view().has_value());
@@ -3594,8 +3594,8 @@ MACHA_HEAVY_TEST("filesystem_fuse", test_removing_empty_directories_in_a_burst_k
     TestService fixture("fuse-empty-directory-burst");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
+    config.metadata_write_copies = 1;
+    config.write_copies = 1;
     config.fuse.publication_quiet = 0ms;
     auto& service = fixture.start();
     auto frontend = make_fuse_frontend(service.filesystem(), service.resources().memory, config.fuse);
@@ -3696,7 +3696,7 @@ MACHA_TEST("filesystem_fuse", test_disconnected_maintenance_sleeps_until_peer_ev
     auto c2 =
         config_for(cluster.path() / "event-maint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
+    c1.metadata_write_copies = c2.metadata_write_copies = 2;
     c1.heartbeat = c2.heartbeat = 50ms;
     c1.dead_after = c2.dead_after = 500ms;
     c1.maintenance.no_progress_backoff = c2.maintenance.no_progress_backoff = 30s;
@@ -3780,7 +3780,7 @@ MACHA_TEST("filesystem_fuse", test_coalesced_delete_burst_wakes_at_exact_garbage
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("coalesced-garbage-grace");
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.maintenance.garbage_grace = 750ms;
     config.maintenance.foreground_quiet = 10ms;
     config.maintenance.no_progress_backoff = 500ms;

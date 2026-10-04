@@ -42,7 +42,7 @@ NodeInfo self_info(const Config& config, const NodeId& id, uint64_t used, uint64
     node.seen_unix_ms = unix_ms();
     node.metadata_generation = metadata_generation;
     node.metadata_write_replicas_required =
-        static_cast<uint32_t>(config.metadata_min_write_replicas);
+        static_cast<uint32_t>(config.metadata_write_copies);
     return node;
 }
 

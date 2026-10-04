@@ -46,11 +46,11 @@ class CatalogueBench {
     std::optional<CatalogueHintQueue> hints_;
 
   public:
-    explicit CatalogueBench(std::string_view name, size_t metadata_min_write_replicas = 1)
+    explicit CatalogueBench(std::string_view name, size_t metadata_write_copies = 1)
         : node_(name) {
         auto& config = node_.config();
         config.replication = 1;
-        config.metadata_min_write_replicas = metadata_min_write_replicas;
+        config.metadata_write_copies = metadata_write_copies;
         config.hydration.enabled = false;
         config.catalogue.scanner.enabled = false;
         config.maintenance.interval = std::chrono::hours(1);
@@ -1265,7 +1265,7 @@ MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
     TestCluster cluster(ConfigProfile::isolated);
     auto config = cluster.node_config("status-render");
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
     // The peer stays membership-online past the telemetry freshness floor.
@@ -1612,7 +1612,7 @@ MACHA_TEST("invariants", test_metadata_availability_logs_only_transitions) {
     TestNode fixture("metadata-availability-log");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     auto& node = fixture.start();
     (void)node;
     auto& metadata = fixture.metadata();
@@ -1987,8 +1987,8 @@ MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_he
     auto c1 = config_for(t.path() / "n1", keyfile, p1);
     auto c2 = config_for(t.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 2;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.write_copies = c2.write_copies = 2;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.storage_packing = c2.storage_packing = StoragePackingConfig{0, 0};
 
     BareNode n1(c1, keys);
@@ -2631,7 +2631,7 @@ MACHA_TEST("invariants", test_publication_generation_barrier_precedes_metadata_c
     TestNode fixture("publication-generation");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.extent_size = 1024 * 1024;
     fixture.start();
     auto& fs = fixture.filesystem();
@@ -2727,7 +2727,7 @@ MACHA_TEST("invariants", test_deferred_object_barrier_rejects_stale_process_epoc
     auto server_config = cluster.node_config("durability-epoch-server");
     auto client_config = cluster.node_config("durability-epoch-client");
     server_config.replication = client_config.replication = 1;
-    server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
+    server_config.metadata_write_copies = client_config.metadata_write_copies = 1;
     BareNode server(server_config, cluster.keys());
     BareNode client(client_config, cluster.keys());
     server.start();
@@ -2783,7 +2783,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     auto server_config = cluster.node_config("durability-group-rpc-server");
     auto client_config = cluster.node_config("durability-group-rpc-client");
     server_config.replication = client_config.replication = 1;
-    server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
+    server_config.metadata_write_copies = client_config.metadata_write_copies = 1;
     // A window the three barriers below, 75 ms apart, all fall inside.
     BareNode server(server_config, cluster.keys(), {}, {}, 500ms);
     BareNode client(client_config, cluster.keys());
@@ -2862,7 +2862,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     auto server_config = cluster.node_config("durability-generation-rpc-server");
     auto client_config = cluster.node_config("durability-generation-rpc-client");
     server_config.replication = client_config.replication = 1;
-    server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
+    server_config.metadata_write_copies = client_config.metadata_write_copies = 1;
     BareNode server(server_config, cluster.keys(), {}, {}, 500ms);
     BareNode client(client_config, cluster.keys());
     server.start();

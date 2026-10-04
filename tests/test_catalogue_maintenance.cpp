@@ -48,6 +48,7 @@ struct FakeMetadataView final : MetadataView {
     bool resolve_conflict(const std::string&, std::string_view) override { return false; }
     uint64_t conflicts_superseded() const noexcept override { return 0; }
     uint64_t conflicts_resolved() const noexcept override { return 0; }
+    MetadataHeadStanding head_standing() const noexcept override { return {}; }
     MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {
@@ -64,7 +65,7 @@ struct Node {
         config = macha::test_support::config_for(cluster.path() / "node", cluster.keyfile(),
                                                  macha::test_support::free_port());
         config.replication = 1;
-        config.metadata_min_write_replicas = 1;
+        config.metadata_write_copies = 1;
         node.emplace(config, cluster.keys());
         node->start();
         REQUIRE(node->wait_local_state_ready(10s));

@@ -195,8 +195,8 @@ class StoreBench {
     static Config configure(const TestCluster& cluster, const std::function<void(Config&)>& tune) {
         auto config = config_for(cluster.path() / "node", cluster.keyfile(), 1);
         config.replication = 1;
-        config.min_write_replicas = 1;
-        config.metadata_min_write_replicas = 1;
+        config.write_copies = 1;
+        config.metadata_write_copies = 1;
         if (tune)
             tune(config);
         return normalize_config(std::move(config));

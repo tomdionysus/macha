@@ -664,7 +664,7 @@ bool CatalogueManager::converge_control_replicas(const MetadataSnapshot& metadat
             control_converged_nodes_ = std::move(active_nodes);
             control_convergence_retry_ = {};
         } else {
-            // Publication needs only metadata_min_write_replicas copies; missing
+            // Publication needs only metadata_write_copies copies; missing
             // replicas are convergence debt, not an invalid root.
             control_converged_root_.reset();
             control_converged_nodes_.clear();
