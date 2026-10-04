@@ -2805,7 +2805,12 @@ void RpcClient::health_loop(std::stop_token stop) {
                 if (probe.done)
                     continue;
 
-                if (now >= probe.deadline) {
+                // An answered ping is proof of life however late this pass
+                // reads it: the deadline is for a peer that has not answered.
+                const bool answered =
+                    probe.rpc && probe.rpc->wait_for(std::chrono::milliseconds(0)) ==
+                                     std::future_status::ready;
+                if (now >= probe.deadline && !answered) {
                     const auto reason =
                         probe.last_error.empty()
                             ? std::string("health could not be established before dead_after")
@@ -2894,7 +2899,9 @@ void RpcClient::health_loop(std::stop_token stop) {
                                                            MessageType::ping, {},
                                                            FrameType::control));
                     }
-                    probe.attempt_started = now;
+                    // Placing the ping may have dialled: the attempt starts
+                    // once it is placed.
+                    probe.attempt_started = Clock::now();
                     progressed = true;
                 } catch (const std::exception& error) {
                     probe.last_error = error.what();

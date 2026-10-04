@@ -431,11 +431,11 @@ int run_all(int argc, char** argv) {
         return std::min(options.slots, slots_for(test.cost));
     };
 
-    // Two runners on one machine would hand the same case index, and so the
-    // same 64-port block, to two tests. Test clusters share one key, so a
-    // collision lets a foreign node join the cluster. Each runner shifts the
-    // block namespace by a salt its children inherit; set it explicitly to
-    // reproduce a run's exact ports.
+    // Two runners on one machine can hand the same 64-port block to two
+    // cases. Each runner takes a salt its children inherit: it shifts the
+    // block namespace and, with the case index, makes each case's cluster
+    // key, so a node of the other run cannot join. Set it explicitly to
+    // reproduce a run's exact ports and keys.
     if (!std::getenv("MACHA_TEST_PORT_SALT")) {
         const auto salt = static_cast<unsigned>(
             (static_cast<unsigned long>(::getpid()) * 2654435761UL) ^
