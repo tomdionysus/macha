@@ -1168,7 +1168,7 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     return true;
 }
 
-DistributedStore::DistributedStore(NodeRuntime& n, LocalState& local, ActivityClocks& activity,
+DistributedStore::DistributedStore(ClusterNode& n, LocalState& local, ActivityClocks& activity,
                                    DataResourceArbiter& data_resources,
                                    RetainedMemoryLedger& retained_memory, NodeEvents& events,
                                    DistributedStoreOptions options)

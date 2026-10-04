@@ -122,7 +122,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
         ObjectData result MACHA_GUARDED_BY(mutex);
     };
 
-    NodeRuntime& n_;
+    ClusterNode& n_;
     LocalState& local_;
     ActivityClocks& activity_;
     DataResourceArbiter& data_resources_;
@@ -291,7 +291,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     void note_network(uint64_t, Clock::duration);
 
   public:
-    DistributedStore(NodeRuntime& n, LocalState& local, ActivityClocks& activity,
+    DistributedStore(ClusterNode& n, LocalState& local, ActivityClocks& activity,
                      DataResourceArbiter& data_resources,
                      RetainedMemoryLedger& retained_memory, NodeEvents& events,
                      DistributedStoreOptions options = {});

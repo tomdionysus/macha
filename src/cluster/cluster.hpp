@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "contract/thread_safety.hpp"
 #include "cluster/activity_clocks.hpp"
+#include "cluster/cluster_node.hpp"
 #include "cluster/data_work.hpp"
 #include "cluster/message_routes.hpp"
 #include "cluster/node_events.hpp"
@@ -61,7 +62,7 @@ struct NodeReadiness {
     std::string error;
 };
 
-class NodeRuntime {
+class NodeRuntime : public ClusterNode {
   public:
     using StartupStageHook = std::function<void(std::string_view)>;
 
@@ -162,7 +163,7 @@ class NodeRuntime {
     NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, RetainedMemoryLedger&,
                 TranscodeRateBook&, MessageRoutes&, NodeEvents&, RpcLinks&,
                 StartupStageHook startup_stage_hook = {});
-    ~NodeRuntime();
+    ~NodeRuntime() override;
     void start();
     void request_stop();
     // Closes client routes and fails every pending synchronous call now, so
@@ -172,22 +173,22 @@ class NodeRuntime {
     // Local-state facts the control plane publishes. The owners of the stores
     // push them; membership and telemetry carry the latest. Lock-free, any
     // thread.
-    void advertise_storage(uint64_t used, uint64_t capacity);
+    void advertise_storage(uint64_t used, uint64_t capacity) override;
     void advertise_storage_backends(uint32_t online);
     void advertise_metadata_generation(uint64_t generation);
     void advertise_cache(uint64_t capacity, uint64_t used, const CacheActivity& activity);
     bool wait_local_state_ready(std::chrono::milliseconds timeout);
     NodeReadiness readiness() const;
-    const Config& config() const {
+    const Config& config() const override {
         return cfg_;
     }
     const ClusterKeys& keys() const {
         return identity_.keys;
     }
-    NodeId node_id() const {
+    NodeId node_id() const override {
         return identity_.id;
     }
-    NodeId durability_epoch() const {
+    NodeId durability_epoch() const override {
         return identity_.durability_epoch;
     }
     // Republishes this node's NodeInfo (storage figures, metadata
@@ -196,10 +197,10 @@ class NodeRuntime {
     // Republishes telemetry now rather than at the next sample, e.g. when
     // the node's phase changes.
     void signal_telemetry_refresh();
-    Membership& membership() {
+    Membership& membership() override {
         return members_;
     }
-    const Membership& membership() const {
+    const Membership& membership() const override {
         return members_;
     }
     TelemetryStore& telemetry() {
@@ -215,11 +216,12 @@ class NodeRuntime {
     }
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
-    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
+    RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType) override;
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
-    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
+    AsyncRpc call_async(const NodeInfo&, MessageType, std::span<const uint8_t>,
+                        FrameType) override;
     AsyncRpc call_async(const Endpoint&, MessageType, std::span<const uint8_t>, FrameType);
     // Tells peers this node's accepted metadata changed: advances the
     // announcement epoch, advertises the generation and broadcasts a notice.
@@ -257,7 +259,7 @@ class NodeRuntime {
     RpcStats rpc_stats() const {
         return client_.stats();
     }
-    std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const {
+    std::optional<std::chrono::milliseconds> peer_latency(const NodeId& peer) const override {
         return client_.peer_latency(peer);
     }
     std::map<NodeId, std::chrono::milliseconds> peer_latencies() const {

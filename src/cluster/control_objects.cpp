@@ -9,7 +9,7 @@
 
 namespace macha {
 
-ControlObjectFetch::ControlObjectFetch(NodeRuntime& node, LocalStore& control)
+ControlObjectFetch::ControlObjectFetch(ClusterNode& node, LocalStore& control)
     : node_(node), control_(control) {}
 
 bool ControlObjectFetch::pull(const ObjectId& id, const Observer& observe) {
