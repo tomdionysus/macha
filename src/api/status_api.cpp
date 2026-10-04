@@ -1334,20 +1334,11 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             gates["credit"] = values.gate_credit;
             repair_diagnostics["pass_gates"] = std::move(gates);
             repair_diagnostics["last_credit_bytes"] = values.last_credit_bytes;
-            // What the latest pass did with repair, and when a higher class
-            // held it to its share, which classes were active.
-            const char* pace = "unknown";
-            if (values.last_gate) {
-                switch (*values.last_gate) {
-                case DistributedStore::RepairGate::ran: pace = "running"; break;
-                case DistributedStore::RepairGate::share: pace = "paced"; break;
-                case DistributedStore::RepairGate::quiescent: pace = "settling"; break;
-                case DistributedStore::RepairGate::credit: pace = "awaiting_credit"; break;
-                }
-            }
-            repair_diagnostics["pace"] = pace;
+            // Repair under a higher class takes turns on a weighted share,
+            // so one pass's gate does not say whether it is being held back:
+            // the classes active at the latest pass do.
             Json::Array paced_by;
-            if (values.last_gate == DistributedStore::RepairGate::share) {
+            if (values.last_gate) {
                 if (values.paced_by & DistributedStore::paced_by_playback)
                     paced_by.push_back("playback");
                 if (values.paced_by & DistributedStore::paced_by_mounted_filesystem)
@@ -1357,6 +1348,18 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
                 if (values.paced_by & DistributedStore::paced_by_peer_playback)
                     paced_by.push_back("peer_playback");
             }
+            const char* pace = "unknown";
+            if (!paced_by.empty()) {
+                pace = "paced";
+            } else if (values.last_gate) {
+                switch (*values.last_gate) {
+                case DistributedStore::RepairGate::ran:
+                case DistributedStore::RepairGate::share: pace = "running"; break;
+                case DistributedStore::RepairGate::quiescent: pace = "settling"; break;
+                case DistributedStore::RepairGate::credit: pace = "awaiting_credit"; break;
+                }
+            }
+            repair_diagnostics["pace"] = pace;
             repair_diagnostics["paced_by"] = std::move(paced_by);
             // The quick second copy of each new object.
             Json::Object prompt;
