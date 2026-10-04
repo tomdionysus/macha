@@ -114,15 +114,11 @@ class LocalState {
     LocalState& operator=(const LocalState&) = delete;
 
     StoragePool& data() noexcept { return *data_; }
-    const StoragePool& data() const noexcept { return *data_; }
     LocalStore& control() noexcept { return *control_; }
-    const LocalStore& control() const noexcept { return *control_; }
     ControlObjectFetch& control_fetch() noexcept { return *control_fetch_; }
     PersistentBlockCache& cache() noexcept { return *cache_; }
     RetentionStore& retention() noexcept { return *retention_; }
-    const RetentionStore& retention() const noexcept { return *retention_; }
     MetadataReplica& replica() noexcept { return *replica_; }
-    const MetadataReplica& replica() const noexcept { return *replica_; }
 
     // Applies a live reload's storage backends and cache settings.
     void reconfigure(const Config&);

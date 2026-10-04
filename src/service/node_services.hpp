@@ -101,7 +101,6 @@ class NodeServices {
     // while a mount is published, the frontend's.
     std::map<std::string, uint64_t> observation_gauges();
 
-    PlaybackTracker& playback() { return playback_; }
     DistributedStore& store() { return store_; }
     MetadataManager& metadata() { return metadata_; }
     CatalogueManager& catalogue() { return catalogue_; }
@@ -109,7 +108,6 @@ class NodeServices {
     FilesApi& files_api() { return files_api_; }
     FileSystem& filesystem() { return filesystem_; }
     CatalogueHintQueue& catalogue_hints() { return catalogue_hints_; }
-    MediaInformationService& media_information() { return media_information_; }
     HydrationManager& hydration() { return hydration_; }
     IngestManager& ingest() { return ingest_; }
     ClusterJobView& cluster_jobs() { return cluster_jobs_; }

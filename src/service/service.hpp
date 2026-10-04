@@ -172,10 +172,6 @@ class Service {
         wait_services_ready();
         return services_->metadata();
     }
-    DistributedStore& store() {
-        wait_services_ready();
-        return services_->store();
-    }
     CatalogueManager& catalogue() {
         wait_services_ready();
         return services_->catalogue();
@@ -241,11 +237,6 @@ class Service {
     DistributedStore::RepairDiagnostics repair_diagnostics() {
         wait_services_ready();
         return services_->store().repair_diagnostics();
-    }
-    // Null when this node has no mount: not configured for one, or its FUSE
-    // subsystem is faulted between restarts. See SubsystemRegistry.
-    std::shared_ptr<FuseFrontend> fuse() {
-        return registry_.fuse();
     }
     // Where subsystems publish what they provide. A test driving its own
     // FuseFrontend publishes here, as FuseSubsystem does.
