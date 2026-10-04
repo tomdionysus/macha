@@ -4909,6 +4909,71 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answ
     s1.stop();
 }
 
+// A peer that stops answering commit calls costs one commit the stall time
+// and the next ones nothing: it is not asked again until it has had time to
+// be dropped or to recover, and then repair brings it up to date.
+MACHA_TEST("rpc_cluster", test_a_peer_that_stalls_on_a_commit_is_not_waited_for_again) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = config_for(cluster.path() / "stall-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
+    auto c2 = config_for(cluster.path() / "stall-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->write_stall = 150ms;
+        config->heartbeat = 50ms;
+        config->dead_after = 1500ms;
+    }
+
+    auto links = std::make_shared<FaultyLinks>();
+    ServiceInstruments instruments;
+    instruments.links = links;
+    Service s1(c1, keys, test_durability_window, {}, {}, {}, instruments);
+    Service s2(c2, keys, test_durability_window);
+    s1.start();
+    s2.start();
+    (void)s1.filesystem();
+    (void)s2.filesystem();
+    REQUIRE(wait_metadata_writable(s1));
+    REQUIRE(wait_metadata_writable(s2));
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/established", 0755, getuid(), getgid()); }));
+    const auto sees = [](Service& service, const std::string& path) {
+        return wait_until([&] {
+            try {
+                return service.filesystem().getattr(path).type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }, 20s);
+    };
+    REQUIRE(sees(s2, "/established"));
+
+    const auto peer = s2.node().node_id();
+    links->stall(peer, MessageType::put_metadata_commit);
+    const auto timed = [&](const std::string& path) {
+        const auto started = Clock::now();
+        s1.filesystem().mkdir(path, 0755, getuid(), getgid());
+        return Clock::now() - started;
+    };
+    const auto first = timed("/while-stalled");
+    CHECK(first >= 150ms);
+    CHECK(first < scaled(5s));
+    const auto asked = links->stalled_calls();
+    CHECK(asked >= 1);
+    const auto second = timed("/not-asked");
+    CHECK(second < first);
+    CHECK(links->stalled_calls() == asked);
+    CHECK(s1.filesystem().getattr("/not-asked").type == EntryType::directory);
+
+    links->release(peer);
+    CHECK(sees(s2, "/while-stalled"));
+    CHECK(sees(s2, "/not-asked"));
+
+    s2.stop();
+    s1.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
     TestCluster cluster;
     const auto& keys = cluster.keys();

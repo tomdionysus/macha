@@ -154,6 +154,15 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     };
     MetadataHistoryEntry commit_history_entry(const MetadataRecord&,
                                                std::span<const uint8_t> delta = {}) const;
+    // A peer that made no progress on a commit call for write_stall is not
+    // asked again until dead_after has passed: by then membership has either
+    // dropped it or it is answering.
+    mutable Mutex stalled_mutex_;
+    mutable std::map<NodeId, Clock::time_point> stalled_until_ MACHA_GUARDED_BY(stalled_mutex_);
+    bool stalled(const NodeId&) const;
+    // A call to a peer on the commit path, waited for only while it makes
+    // progress. Throws when the peer is stalled or stalls.
+    RpcReply commit_call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType);
     bool store_commit_on(const NodeInfo&, const MetadataHistoryEntry&,
                          const MetadataRecord&, FrameType);
     bool accept_commit_on(const NodeInfo&, const MetadataAcceptance&, FrameType);
