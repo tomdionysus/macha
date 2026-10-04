@@ -93,6 +93,8 @@ Maintenance::Maintenance(MaintenanceDependencies dependencies)
       metadata_server_(dependencies.metadata_server), store_(dependencies.store), metadata_(dependencies.metadata),
       metadata_upkeep_(dependencies.metadata_upkeep), catalogue_(dependencies.catalogue),
       builder_(dependencies.builder), ledger_(dependencies.ledger),
+      data_unreferenced_(dependencies.data_unreferenced),
+      control_unreferenced_(dependencies.control_unreferenced),
       availability_(dependencies.availability),
       media_information_(dependencies.media_information), events_(dependencies.events),
       port_(dependencies.port),
@@ -130,6 +132,18 @@ void Maintenance::stop() {
     Log::debug("shutdown: service maintenance joining");
     thread_.join();
     Log::debug("shutdown: service maintenance joined");
+}
+
+// A sweep slice can add sightings every pass; the table is written when a
+// sweep completes and otherwise at most twice a minute. A sighting lost to a
+// crash is taken again, which only delays that object's deletion.
+void Maintenance::save_sightings(UnreferencedSince& sightings, Clock::time_point& saved,
+                                 bool complete) {
+    const auto now = clock_->now();
+    if (!complete && now - saved < std::chrono::seconds(30))
+        return;
+    saved = now;
+    sightings.save();
 }
 
 std::vector<GarbageRef> Maintenance::collect_garbage(const std::vector<GarbageRef>& garbage) {
@@ -703,10 +717,8 @@ void Maintenance::run(std::stop_token stop) {
                     // credit deadline wakes the loop for it.
                 }
 
-                const bool cluster_gc_healthy = node_.membership().all_known_reachable();
-                const bool metadata_stable =
-                    cluster_gc_healthy && metadata_.status().stable;
-                const bool cluster_gc_stable = cluster_gc_healthy && metadata_stable;
+                const bool cluster_gc_stable =
+                    node_.membership().all_known_reachable() && metadata_.status().stable;
                 if (cluster_gc_stable && !cluster_stable_observed_) {
                     // Recovery after a restart: every known node reached and
                     // metadata stable, for the first time in this process.
@@ -725,8 +737,6 @@ void Maintenance::run(std::stop_token stop) {
                 facts.busy = busy;
                 facts.gc_waiting_for_event = gc_quiescent_until == Clock::time_point::max();
                 facts.rebuilt_inventory = rebuilt_inventory;
-                facts.reachable = cluster_gc_healthy;
-                facts.metadata_stable = metadata_stable;
                 const auto& garbage = inventory ? inventory->garbage() : no_garbage;
 
                 const auto tombstones = tombstone_gate(facts, inventory.get());
@@ -788,8 +798,6 @@ void Maintenance::run(std::stop_token stop) {
                 }
 
                 facts.release_view = release_metadata_view.has_value();
-                facts.retention_baseline_complete =
-                    release_metadata_view && release_metadata_view->snapshot->retention_baseline_complete;
                 facts.known_generation = metadata_server_.known_generation();
                 const auto control = control_gate(facts, inventory.get());
                 // The rule the DATA and tombstone gates keep: a newly built
@@ -800,9 +808,9 @@ void Maintenance::run(std::stop_token stop) {
                                  control.permitted ? "open" : "shut");
                 trace_gate("gate.control", control.permitted, control.conditions);
                 if (control.permitted) {
-                    // Destructive retention release is fenced by direct reachability of
-                    // every durably-known node. A partition may continue to accumulate
-                    // causal tombstones/claims, but it cannot reclaim authoritative bytes.
+                    // Release follows this node's sole head and its causal clock.
+                    // What another node's branch may still refer to is kept by
+                    // the grace the sweep applies below, on this node's clock.
                     if (release) {
                         const auto released =
                             ledger_.release_unreferenced(RetentionClass::control, *release, 64);
@@ -811,9 +819,11 @@ void Maintenance::run(std::stop_token stop) {
                             trace_action("release.control", std::to_string(released));
                     }
                     enter_stage("control-gc");
+                    const auto now_unix_ms = static_cast<uint64_t>(clock_->wall_ns() / 1'000'000);
                     const auto removed = catalogue_.control_gc_step(
                         inventory->referenced_ids(RetentionClass::control), policy.garbage_grace,
-                        32);
+                        32, &control_unreferenced_, now_unix_ms);
+                    save_sightings(control_unreferenced_, control_sightings_saved_);
                     observations().add("catalogue.control_gc.removed", removed);
                     if (removed)
                         trace_action("control-gc", std::to_string(removed));
@@ -893,7 +903,10 @@ void Maintenance::run(std::stop_token stop) {
                         },
                         [this](const ObjectId& id) {
                             return ledger_.retained(RetentionClass::data, id);
-                        });
+                        },
+                        &data_unreferenced_, static_cast<uint64_t>(now_ns / 1'000'000),
+                        policy.garbage_grace);
+                    save_sightings(data_unreferenced_, data_sightings_saved_, gc.complete);
                     if (gc.bytes)
                         trace_action("gc", "reclaimed_bytes=" + std::to_string(gc.bytes));
                     {

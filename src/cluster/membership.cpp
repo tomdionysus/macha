@@ -14,13 +14,20 @@ constexpr std::array<uint8_t, 8> known_magic_v2{'M', 'A', 'C', 'H', 'M', 'E', 'M
 // v3 appends NodeInfo::flags to every entry, so a restarting node knows which
 // peers it must not dial before it has heard from anyone.
 constexpr std::array<uint8_t, 8> known_magic_v3{'M', 'A', 'C', 'H', 'M', 'E', 'M', '3'};
+// v4 appends this node's wall clock when it last heard of each entry.
+constexpr std::array<uint8_t, 8> known_magic_v4{'M', 'A', 'C', 'H', 'M', 'E', 'M', '4'};
+// How far a node's last-heard time may move before the roster is rewritten.
+constexpr uint64_t seen_persist_step_ms = 60ULL * 60 * 1000;
 constexpr uint32_t max_known_nodes = 65536;
 constexpr uint32_t max_identity_resets = 65536;
 constexpr uint64_t max_known_bytes = 16ULL * 1024 * 1024;
 }
 
-Membership::Membership(NodeInfo s, std::chrono::milliseconds d, std::filesystem::path known_path)
-    : self_(std::move(s)), dead_(d), known_path_(std::move(known_path)) {
+Membership::Membership(NodeInfo s, std::chrono::milliseconds d, std::filesystem::path known_path,
+                       std::chrono::milliseconds forget_after)
+    // Never sooner than a node is given up for dead.
+    : self_(std::move(s)), dead_(d), forget_after_(std::max(forget_after, 2 * d)),
+      known_path_(std::move(known_path)) {
     Lock lock(m_);
     load_known();
 }
@@ -39,7 +46,8 @@ void Membership::load_known() {
         throw std::runtime_error("cannot read known-node roster " + known_path_.string());
     Reader reader(bytes);
     const auto magic = reader.fixed<8>();
-    const bool version3 = magic == known_magic_v3;
+    const bool version4 = magic == known_magic_v4;
+    const bool version3 = version4 || magic == known_magic_v3;
     const bool version2 = version3 || magic == known_magic_v2;
     if (magic != known_magic_v1 && !version2)
         throw DecodeError("bad known-node roster magic");
@@ -58,9 +66,12 @@ void Membership::load_known() {
         // v1/v2 carry no flags: NodeInfo's default (dialable storage node) applies.
         if (version3)
             node.flags = reader.u8();
+        // An older roster has no last-heard time: the wait starts now.
+        const uint64_t last_seen = version4 ? reader.u64() : unix_ms();
         if (node.id == NodeId{} || node.id == self_.id || node.host.empty() || !node.port)
             throw DecodeError("bad known-node roster entry");
-        if (!nodes_.emplace(node.id, R{std::move(node), stale, std::nullopt}).second)
+        if (!nodes_.emplace(node.id, R{std::move(node), stale, std::nullopt, last_seen, last_seen})
+                 .second)
             throw DecodeError("duplicate known-node roster entry");
     }
     if (version2) {
@@ -97,28 +108,30 @@ void Membership::load_known() {
     reader.finish();
 }
 
-void Membership::persist_known_locked() const {
+void Membership::persist_known_locked() {
     if (known_path_.empty())
         return;
     if (nodes_.size() > max_known_nodes)
         throw std::runtime_error("too many known nodes");
-    std::vector<NodeInfo> ordered;
+    std::vector<const R*> ordered;
     ordered.reserve(nodes_.size());
     for (const auto& [_, record] : nodes_)
-        ordered.push_back(record.info);
-    std::sort(ordered.begin(), ordered.end(), [](const NodeInfo& a, const NodeInfo& b) {
-        return a.id < b.id;
+        ordered.push_back(&record);
+    std::sort(ordered.begin(), ordered.end(), [](const R* a, const R* b) {
+        return a->info.id < b->info.id;
     });
     Writer writer;
-    writer.fixed(known_magic_v3);
+    writer.fixed(known_magic_v4);
     writer.u32(static_cast<uint32_t>(ordered.size()));
-    for (const auto& node : ordered) {
+    for (const auto* record : ordered) {
+        const auto& node = record->info;
         writer.fixed(node.id.bytes);
         writer.string(node.host);
         writer.string(node.failure_domain);
         writer.u16(node.port);
         writer.u64(node.seen_unix_ms);
         writer.u8(node.flags);
+        writer.u64(record->last_seen_unix_ms);
     }
     if (identity_resets_.size() > max_identity_resets)
         throw std::runtime_error("too many identity association resets");
@@ -144,6 +157,8 @@ void Membership::persist_known_locked() const {
         throw std::runtime_error("known-node roster is too large");
     durable_replace_file(
         known_path_, std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+    for (auto& [_, record] : nodes_)
+        record.persisted_seen_unix_ms = record.last_seen_unix_ms;
 }
 
 NodeInfo Membership::self() const {
@@ -215,10 +230,17 @@ void Membership::observe(NodeInfo n, bool direct) {
             return;
     }
     auto now = Clock::now();
+    const auto wall = unix_ms();
     auto i = nodes_.find(n.id);
     bool durable_roster_changed = false;
     if (i == nodes_.end()) {
-        R record{std::move(n), now, direct ? std::optional<Clock::time_point>(now) : std::nullopt};
+        // Gossip about a node nobody has heard from for the forgetting
+        // horizon would only teach back what was forgotten.
+        if (!direct && wall >= n.seen_unix_ms &&
+            wall - n.seen_unix_ms >= static_cast<uint64_t>(forget_after_.count()))
+            return;
+        R record{std::move(n), now, direct ? std::optional<Clock::time_point>(now) : std::nullopt,
+                 wall, 0};
         nodes_.emplace(record.info.id, std::move(record));
         durable_roster_changed = true;
     } else {
@@ -239,6 +261,12 @@ void Membership::observe(NodeInfo n, bool direct) {
         }
         if (direct)
             i->second.direct_seen = now;
+        if (newer || direct) {
+            i->second.last_seen_unix_ms = wall;
+            durable_roster_changed =
+                durable_roster_changed ||
+                wall - i->second.persisted_seen_unix_ms >= seen_persist_step_ms;
+        }
     }
     if (durable_roster_changed)
         persist_known_locked();
@@ -311,6 +339,30 @@ std::vector<NodeInfo> Membership::active() const {
         if (now - record.seen <= dead_)
             out.push_back(record.info);
     return out;
+}
+
+bool Membership::directly_reachable(const NodeId& id) const {
+    Lock g(m_);
+    if (id == self_.id)
+        return true;
+    const auto found = nodes_.find(id);
+    return found != nodes_.end() && found->second.direct_seen &&
+           Clock::now() - *found->second.direct_seen <= dead_;
+}
+
+size_t Membership::forget_unseen() {
+    Lock g(m_);
+    const auto horizon = forget_after_;
+    const auto now = Clock::now();
+    const auto wall = unix_ms();
+    const auto forgotten = std::erase_if(nodes_, [&](const auto& item) {
+        const auto& record = item.second;
+        return now - record.seen > dead_ && wall >= record.last_seen_unix_ms &&
+               wall - record.last_seen_unix_ms >= static_cast<uint64_t>(horizon.count());
+    });
+    if (forgotten)
+        persist_known_locked();
+    return forgotten;
 }
 
 bool Membership::all_known_reachable() const {

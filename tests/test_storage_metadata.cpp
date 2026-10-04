@@ -3014,6 +3014,45 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
     }
 }
 
+// A merge is total: values both branches changed join to one answer that
+// does not depend on which reconciler computes it.
+MACHA_FAST_TEST("storage_metadata", test_a_merge_of_values_changed_on_both_branches_never_refuses) {
+    const auto genesis = genesis_metadata();
+    auto base = decode_snapshot(genesis.payload);
+    base.data_replication = 1;
+    MetadataConflict settled;
+    settled.key = "/settled";
+    settled.left_head = sha256(pattern(8, 1));
+    MetadataConflict changed;
+    changed.key = "/changed";
+    changed.left_head = sha256(pattern(8, 2));
+    base.conflicts["settled"] = settled;
+    base.conflicts["changed"] = changed;
+
+    auto left = base;
+    left.data_replication = 2;
+    left.conflicts.erase("settled");
+    left.conflicts["changed"].right_head = sha256(pattern(8, 3));
+    auto right = base;
+    right.data_replication = 3;
+    right.conflicts["settled"].right_head = sha256(pattern(8, 4));
+    right.conflicts["changed"].right_head = sha256(pattern(8, 5));
+
+    const auto left_head = sha256(pattern(71));
+    const auto right_head = sha256(pattern(72));
+    const auto merged = merge_metadata_snapshots(base, left, right, left_head, right_head);
+    CHECK(merged.snapshot.data_replication == 3);
+    // Settled on one branch and changed on the other: it stays settled.
+    CHECK(!merged.snapshot.conflicts.contains("settled"));
+    REQUIRE(merged.snapshot.conflicts.contains("changed"));
+    CHECK(merged.snapshot.conflicts.at("changed") ==
+          std::min(left.conflicts.at("changed"), right.conflicts.at("changed")));
+
+    const auto mirrored = merge_metadata_snapshots(base, right, left, right_head, left_head);
+    CHECK(mirrored.snapshot.data_replication == merged.snapshot.data_replication);
+    CHECK(mirrored.snapshot.conflicts == merged.snapshot.conflicts);
+}
+
 MACHA_FAST_TEST("storage_metadata", test_metadata_divergent_renames_become_conflicts) {
     const auto genesis = genesis_metadata();
     auto base = decode_snapshot(genesis.payload);

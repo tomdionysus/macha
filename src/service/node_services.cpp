@@ -40,6 +40,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
                 },
                 steady_time_source()),
       ledger_(local_.retention(), local_.data(), local_.control()),
+      data_unreferenced_(node_.config().state_path / "retention" / "unreferenced-data.bin"),
+      control_unreferenced_(node_.config().state_path / "retention" / "unreferenced-control.bin"),
       availability_(node_, local_, store_, ledger_, resources_.events, routes_,
                     node_.config().state_path / "availability" / "last-survey.bin"),
       catalogue_(node_, local_, metadata_server_, store_, metadata_, ledger_),
@@ -102,7 +104,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       files_api_(filesystem_, availability_),
       maintenance_(
           MaintenanceDependencies{node_, local_, metadata_server_, store_, metadata_, metadata_,
-                                  catalogue_, horizon_builder_, ledger_, availability_,
+                                  catalogue_, horizon_builder_, ledger_, data_unreferenced_,
+                                  control_unreferenced_, availability_,
                                   media_information_,
                                   resources_.events, port_, instruments_.clock, instruments_.trace,
                                   instruments_.maintenance_stage_hook, instruments_.constructed}) {
@@ -323,28 +326,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     // primitives. An entry missed here never gets liveness evidence and can be
     // collected while still referenced.
     auto namespace_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), store_);
-    const bool establish_baseline =
-        !before.retention_baseline_complete && context.proposed.retention_baseline_complete;
-    if (establish_baseline) {
-        // Baseline: before retention-aware GC is enabled for a namespace, every
-        // object reachable from the reconciled view must acquire liveness evidence.
-        // One-time and potentially large.
-        for_each_namespace_entry(context.proposed, &namespace_nodes,
-                                 [&](const std::string&, const FsEntry& entry) {
-                                     add_entry(entry);
-                                 });
-        const auto conflict_extents = metadata_conflict_extent_roots(context.proposed);
-        data.insert(data.end(), conflict_extents.begin(), conflict_extents.end());
-        for (const auto& root : metadata_catalogue_root_set(context.proposed)) {
-            auto objects = catalogue_.retention_objects(std::nullopt, root);
-            data.insert(data.end(), objects.data.begin(), objects.data.end());
-            control.insert(control.end(), objects.control.begin(), objects.control.end());
-        }
-        // Tree nodes are control objects, all reachable only from the root.
-        if (context.proposed.namespace_root)
-            collect_namespace_tree_nodes(*context.proposed.namespace_root, namespace_nodes,
-                                         control);
-    } else {
+    {
         const bool merge = !context.proposed.merge_parents.empty();
         if (context.delta) {
             if (!merge)

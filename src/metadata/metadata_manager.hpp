@@ -73,6 +73,18 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     mutable Mutex unacceptable_head_mutex_;
     mutable std::map<Hash256, Clock::time_point>
         unacceptable_head_retry_at_ MACHA_GUARDED_BY(unacceptable_head_mutex_);
+    // A head this node cannot merge with its own now (no ancestor in common
+    // is known, or its content cannot be fetched from a node present) is set
+    // aside in the replica: out of reads, writes and release until the
+    // membership changes, when the merge is tried again. This is the
+    // membership the heads were set aside under.
+    mutable std::atomic_uint64_t set_aside_stamp_{};
+    uint64_t membership_stamp() const;
+    // The accepted heads not set aside.
+    std::vector<MetadataRecord> usable_heads() const;
+    // Of several heads, the one carrying this node's own latest mutation.
+    MetadataRecord own_head(const std::vector<MetadataRecord>&) const;
+    void set_aside(const MetadataRecord&, std::string_view reason) const;
     mutable Mutex cache_mutex_;
     std::optional<MetadataRecord> cache_ MACHA_GUARDED_BY(cache_mutex_);
     Clock::time_point cache_until_ MACHA_GUARDED_BY(cache_mutex_){};

@@ -458,6 +458,13 @@ class MetadataReplica {
     // Payloads live in history.log; memory holds ancestry and frame offsets.
     std::map<Hash256, HistoryIndexEntry> history_ MACHA_GUARDED_BY(m_);
     std::map<Hash256, MetadataAcceptance> accepted_heads_ MACHA_GUARDED_BY(m_);
+    // Accepted heads this node cannot merge with its own now, with their
+    // generations. They stay accepted and are still offered to peers, but
+    // never become the committed record. Not persisted: a restart tries the
+    // merge again.
+    std::map<Hash256, uint64_t> set_aside_ MACHA_GUARDED_BY(m_);
+    std::atomic_uint64_t set_aside_generation_{};
+    void note_set_aside_locked() MACHA_REQUIRES(m_);
     // Per-hash retry cooldown for an accepted head that fails to reconstruct,
     // so callers that catch and retry cannot spin. Between attempts the head
     // is treated as absent and the replica serves its last good state.
@@ -589,6 +596,17 @@ class MetadataReplica {
     bool reanchor_history(const MetadataHistoryEntry& entry);
     // Accepted heads flagged unreconstructable, for the live-repair driver.
     std::vector<Hash256> unreconstructable_heads() const;
+    // Sets an accepted head aside; false when it is the only head not set
+    // aside, since a node always keeps a head to work on.
+    bool set_aside(const Hash256&);
+    void clear_set_aside();
+    // The highest generation among heads set aside, zero when none is. An
+    // atomic read.
+    uint64_t set_aside_generation() const noexcept {
+        return set_aside_generation_.load(std::memory_order_acquire);
+    }
+    // accepted_heads() without those set aside.
+    std::vector<MetadataRecord> usable_heads() const;
     bool import_history(const MetadataHistoryEntry&);
     bool history_contains(const Hash256&) const;
     bool store_commit(const MetadataRecord&, std::span<const uint8_t> delta = {});
