@@ -26,6 +26,16 @@ namespace gains from.
 **Rename detection scans only removed sources** in the path-wise merge,
 which was quadratic in the namespace.
 
+**A pause or cancel accepted late in an import stands.** An ingest worker
+inside the final rename of its copy wrote its own view of the job back
+afterwards, so a job answered as paused or cancelled went on to be
+catalogued. The worker's progress is now recorded under the newer state.
+
+**Tests.** The suites are consolidated onto components tested against
+fakes at their constructor seams, with stepped time where code decides by
+elapsed time (`TimeSource`, `ClusterNode`, `StartupStallGate`,
+telemetry's `Now`): 725 cases became 499.
+
 ## 0.84.1 — reconciliation is timed (experiment)
 
 No wire, protocol, API or on-disk changes.
