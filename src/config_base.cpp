@@ -66,10 +66,10 @@ void validate(Config& config) {
     };
     validate_packing(config.storage_packing, "storage.data.packing");
     validate_packing(config.metadata_store.packing, "storage.metadata.packing");
-    if (!config.replication || !config.metadata_min_write_replicas || !config.min_write_replicas)
+    if (!config.replication || !config.metadata_write_copies || !config.write_copies)
         throw std::runtime_error("replication must be nonzero");
-    if (config.min_write_replicas > config.replication)
-        throw std::runtime_error("dht.min_write_replicas must be <= dht.replicas");
+    if (config.write_copies > config.replication)
+        throw std::runtime_error("dht.write_copies must be <= dht.replicas");
     if (config.write_stall.count() <= 0)
         throw std::runtime_error("dht.write_stall_ms must be > 0");
     if (!config.data_inflight_bytes || !config.data_viewer_reserve_bytes ||

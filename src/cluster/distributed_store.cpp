@@ -238,7 +238,7 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
     // Copies sought before the write returns. One copy is a write; the rest
     // are sought from the nodes present and otherwise left to repair.
     const size_t floor =
-        std::max<size_t>(1, std::min(n_.config().min_write_replicas, nodes.size()));
+        std::max<size_t>(1, std::min(n_.config().write_copies, nodes.size()));
     const size_t need = floor;
 
     Writer writer;
@@ -863,7 +863,7 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
 
     // Claims sought per object. A holder that is away is not claimed on: its
     // own head and the deletion grace protect its copy until it returns.
-    const size_t floor = std::max<size_t>(1, n_.config().min_write_replicas);
+    const size_t floor = std::max<size_t>(1, n_.config().write_copies);
 
     // Plan claims first, then persist one RetainBatch per selected node, so a
     // multi-extent file is not one fsync/RPC per object. Single-object
@@ -1006,7 +1006,7 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
     if (ids.empty())
         return true;
 
-    const size_t sought = std::max<size_t>(1, n_.config().metadata_min_write_replicas);
+    const size_t sought = std::max<size_t>(1, n_.config().metadata_write_copies);
     const auto started = Clock::now();
     auto active = n_.membership().active();
     // Local first, then the nearest measured peer: this runs inside the

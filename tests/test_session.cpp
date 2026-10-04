@@ -214,7 +214,7 @@ MACHA_TEST("session", test_session_cluster_propagation) {
     auto c1 = cluster.node_config("n1", p1, {{"127.0.0.1", p2}});
     auto c2 = cluster.node_config("n2", p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
     BareNode n1(c1, cluster.keys());
@@ -244,7 +244,7 @@ MACHA_TEST("session", test_session_revoke_propagates_cluster_wide) {
     auto c1 = cluster.node_config("n1", p1, {{"127.0.0.1", p2}});
     auto c2 = cluster.node_config("n2", p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.heartbeat = c2.heartbeat = 20ms;
 
     BareNode n1(c1, cluster.keys());

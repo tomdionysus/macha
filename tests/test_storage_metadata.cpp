@@ -3964,7 +3964,7 @@ MACHA_TEST("storage_metadata", test_metadata_identity_rpc) {
     auto c2 = config_for(cluster.path() / "identity-2", cluster.keyfile(), free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
 
     BareNode n1(c1, keys);
     BareNode n2(c2, keys);
@@ -4003,7 +4003,7 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     // Both nodes own every object, so the one object below is repair's to
     // push to n2; n2's own repair never pulls it first, having no credit.
     c1.replication = c2.replication = 2;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.maintenance.idle_bandwidth_fraction = 0.0;
     c2.maintenance.idle_bandwidth_fraction = 0.0;
 
@@ -4068,7 +4068,7 @@ MACHA_TEST("storage_metadata", test_genesis_root_configuration) {
     TestService fixture("single");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.filesystem.root_uid = 501;
     config.filesystem.root_gid = 20;
     config.filesystem.root_mode = 0750;
@@ -4118,7 +4118,7 @@ MACHA_TEST("storage_metadata", test_local_metadata_store_falls_back_from_invalid
     TestService fixture("local-delta-fallback");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.catalogue.scanner.enabled = false;
     config.catalogue.api.enabled = false;
     config.ingest.enabled = false;

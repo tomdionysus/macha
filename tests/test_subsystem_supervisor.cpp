@@ -293,8 +293,8 @@ MACHA_TEST("subsystem_supervisor", test_service_stops_plugins_before_the_store) 
     TestService fixture("plugins-stop-before-the-store");
     auto& config = fixture.config();
     config.replication = 1;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
+    config.write_copies = 1;
+    config.metadata_write_copies = 1;
     config.plugin_path = plugins.path();
     auto& service = fixture.start();
 

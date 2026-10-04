@@ -385,8 +385,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
             << "    timeout_ms: 2600\n"
             << "dht:\n"
             << "  replicas: 3\n"
-            << "  metadata_replicas: 3\n"
-            << "  min_write_replicas: 2\n"
+            << "  metadata_write_copies: 2\n"
+            << "  write_copies: 2\n"
             << "  write_stall_ms: 1750\n"
             << "  extent_size: 16M\n"
             << "  data_inflight_bytes: 96M\n"
@@ -590,8 +590,8 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     CHECK(yc.connectivity_check.timeout == 2600ms);
     CHECK(yc.inbound_capable == Tristate::no);
     CHECK(yc.hosts_extents == Tristate::automatic);
-    CHECK(yc.metadata_min_write_replicas == 2); // from metadata_replicas: 3
-    CHECK(yc.min_write_replicas == 2);
+    CHECK(yc.metadata_write_copies == 2);
+    CHECK(yc.write_copies == 2);
     CHECK(yc.write_stall == 1750ms);
     CHECK(yc.data_inflight_bytes == 96ULL * 1024 * 1024);
     CHECK(yc.data_viewer_reserve_bytes == 24ULL * 1024 * 1024);
@@ -741,7 +741,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     // Configuration starts from an explicit YAML file; the CLI overrides it.
     std::vector<std::string> override_args{"macha", "--config", yaml.string(),
                                             "--port", "8123", "--replicas", "5",
-                                            "--min-write-replicas", "3",
+                                            "--write-copies", "3",
                                             "--write-stall", "1600",
                                             "--read-ahead", "4", "--failure-domain", "site-a",
                                             "--connect-timeout", "1700",
@@ -757,7 +757,7 @@ MACHA_FAST_TEST("runtime_dependencies", test_yaml_config) {
     auto overridden = parse_config(static_cast<int>(override_argv.size()), override_argv.data());
     CHECK(overridden.port == 8123);
     CHECK(overridden.replication == 5);
-    CHECK(overridden.min_write_replicas == 3);
+    CHECK(overridden.write_copies == 3);
     CHECK(overridden.write_stall == 1600ms);
     CHECK(overridden.read_ahead_extents == 4);
     CHECK(overridden.failure_domain == "site-a");
@@ -817,7 +817,7 @@ MACHA_HEAVY_TEST("runtime_dependencies", test_embedded_music_metadata_and_artwor
     write_key(key);
     auto config = config_for(t.path() / "disk", key, free_port());
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.metadata_cache = 20ms;
     auto keys = load_cluster_keys(key);
     Service service(config, keys, test_durability_window);

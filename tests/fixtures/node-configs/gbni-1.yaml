@@ -98,8 +98,8 @@ network:
 
 dht:
   replicas: 2
-  min_write_replicas: 1
-  metadata_replicas: 2
+  write_copies: 1
+  metadata_write_copies: 2
   write_stall_ms: 2500
   extent_size: 4M
   # 16 extents was unnecessarily aggressive for a stability-first baseline.

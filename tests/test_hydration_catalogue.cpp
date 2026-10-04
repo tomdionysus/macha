@@ -354,7 +354,7 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     auto c1 = config_for(temp.path() / "n1", keyfile, p1);
     auto c2 = config_for(temp.path() / "n2", keyfile, p2, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c2.cache.path = temp.path() / "cache2";
     c2.cache.max_blocks = 32;
 
@@ -1933,7 +1933,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     auto c2 = config_for(temp.path() / "catalogue-idle-2", keyfile, free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
 
@@ -3340,7 +3340,7 @@ MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_
     TestService fixture("node");
     auto& config = fixture.config();
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     config.catalogue.scanner.enabled = false;
     config.ingest.enabled = false;
     auto& service = fixture.start();
@@ -3375,7 +3375,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh
     auto c2 = config_for(cluster.path() / "catalogue-live-2", cluster.keyfile(), free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     c1.metadata_cache = c2.metadata_cache = 30ms;
 
     BareNode n1(c1, keys);
@@ -3507,7 +3507,7 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     auto c2 = config_for(cluster.path() / "metadata-ttl-2", cluster.keyfile(), free_port(),
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = 1;
     // Keep ordinary heartbeat propagation outside this test window. We install a
     // valid newer committed metadata head directly to simulate a generation notice
     // that was missed by node two; TTL validation must still discover it from replicas.
@@ -4243,7 +4243,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     auto c2 = config_for(cluster.path() / "cat2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     auto c3 = config_for(cluster.path() / "cat3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
     c1.replication = c2.replication = c3.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = c3.metadata_min_write_replicas = 1;
+    c1.metadata_write_copies = c2.metadata_write_copies = c3.metadata_write_copies = 1;
     c1.maintenance.garbage_grace = 0ms;
     c2.maintenance.garbage_grace = 0ms;
     c3.maintenance.garbage_grace = 0ms;
@@ -4458,7 +4458,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
                          {{"127.0.0.1", p1}});
     for (auto* config : {&c1, &c2}) {
         config->replication = 1;
-        config->metadata_min_write_replicas = 1;
+        config->metadata_write_copies = 1;
         config->maintenance.garbage_grace = 0ms;
         config->maintenance.foreground_quiet = 10ms;
         config->maintenance.no_progress_backoff = 500ms;

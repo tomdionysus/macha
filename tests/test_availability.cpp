@@ -720,7 +720,7 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
         cluster.node_config("availability-second", second_port, {{"127.0.0.1", first_port}});
     for (auto* config : {&first_config, &second_config}) {
         config->replication = 2;
-        config->min_write_replicas = 2;
+        config->write_copies = 2;
         config->catalogue.scanner.enabled = false;
         config->ingest.enabled = false;
         config->torrent.enabled = false;

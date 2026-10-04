@@ -713,7 +713,7 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
         metadata_manager ? metadata_manager->status() : MetadataClusterStatus{};
     const size_t metadata_replicas = known_nodes == 0 ? published_metadata.replicas : known_nodes;
     const size_t active_metadata_replicas = online_nodes;
-    const size_t metadata_min_write_replicas = node_.config().metadata_min_write_replicas;
+    const size_t metadata_write_copies = node_.config().metadata_write_copies;
 
     // Read availability comes from the already-decoded committed snapshot.
     // Any node holding a head may write; validation/stability is reported
@@ -787,12 +787,12 @@ HttpResponse ClusterStatusService::status_response(const StatusSources& sources,
         metadata_generation ? metadata_generation : published_metadata.generation;
     cluster["metadata_replicas"] = static_cast<uint64_t>(metadata_replicas);
     cluster["metadata_replicas_online"] = static_cast<uint64_t>(active_metadata_replicas);
-    cluster["metadata_min_write_replicas"] = static_cast<uint64_t>(metadata_min_write_replicas);
+    cluster["metadata_min_write_replicas"] = static_cast<uint64_t>(metadata_write_copies);
     // Compatibility aliases carrying the current values; not a fixed voter set or
     // majority quorum.
     cluster["metadata_voters"] = static_cast<uint64_t>(metadata_replicas);
     cluster["metadata_voters_online"] = static_cast<uint64_t>(active_metadata_replicas);
-    cluster["metadata_quorum_required"] = static_cast<uint64_t>(metadata_min_write_replicas);
+    cluster["metadata_quorum_required"] = static_cast<uint64_t>(metadata_write_copies);
     cluster["metadata_availability"] = metadata_availability_name(metadata_availability);
     cluster["metadata_read_available"] = metadata_read_available;
     cluster["metadata_quorum_available"] = metadata_write_available; // deprecated alias
@@ -950,6 +950,14 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
     if (metadata_manager) {
         metadata_diagnostics["conflicts_superseded"] = metadata_manager->conflicts_superseded();
         metadata_diagnostics["conflicts_resolved"] = metadata_manager->conflicts_resolved();
+        // What a lone or partitioned node owes the rest: how many of the
+        // nodes present held the current head at the last repair pass, and
+        // how many accepted heads wait, unmergeable, for the membership to
+        // change.
+        const auto standing = metadata_manager->head_standing();
+        metadata_diagnostics["head_holders"] = standing.holders;
+        metadata_diagnostics["head_holders_present"] = standing.present;
+        metadata_diagnostics["heads_set_aside"] = standing.set_aside;
         // Where a mutation's wall time goes since start: the pre-publication
         // retention barrier and the commit fan-out (totals and maxima, ms).
         const auto timing = metadata_manager->mutation_timing();

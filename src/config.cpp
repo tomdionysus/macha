@@ -192,18 +192,10 @@ void parse_dht(const ConfigNode& root, Config& c) {
         return;
     if (d["replicas"])
         c.replication = d["replicas"].as<size_t>();
-    if (d["metadata_min_write_replicas"] && d["metadata_replicas"])
-        throw std::runtime_error(
-            "dht.metadata_min_write_replicas and legacy dht.metadata_replicas are mutually exclusive");
-    if (d["metadata_min_write_replicas"])
-        c.metadata_min_write_replicas = d["metadata_min_write_replicas"].as<size_t>();
-    else if (d["metadata_replicas"]) {
-        // Legacy key: a voter count with a majority write floor.
-        const auto legacy = d["metadata_replicas"].as<size_t>();
-        c.metadata_min_write_replicas = legacy ? legacy / 2 + 1 : 0;
-    }
-    if (d["min_write_replicas"])
-        c.min_write_replicas = d["min_write_replicas"].as<size_t>();
+    if (d["metadata_write_copies"])
+        c.metadata_write_copies = d["metadata_write_copies"].as<size_t>();
+    if (d["write_copies"])
+        c.write_copies = d["write_copies"].as<size_t>();
     if (d["retention_check_batch_size"])
         c.retention_check_batch_size = d["retention_check_batch_size"].as<size_t>();
     if (d["retention_check_concurrency"])
@@ -935,7 +927,7 @@ void print_usage(const char* executable) {
         << "--bootstrap HOST[:PORT] (repeatable)  --listen ADDR  --advertise HOST  --port PORT\n"
         << "--failure-domain NAME  --connect-timeout MS  --max-frame-size SIZE\n"
         << "--control-stall-notice MS  --data-stall-notice MS\n"
-        << "--metadata-cache MS  --replicas N  --metadata-min-write-replicas N  --min-write-replicas N\n"
+        << "--metadata-cache MS  --replicas N  --metadata-write-copies N  --write-copies N\n"
         << "--write-stall MS  --extent-size SIZE\n"
         << "--read-ahead N  --mount PATH  --state-path PATH  --cache-path PATH --cache-blocks N\n"
         << "--plugin-path PATH\n"
@@ -1000,15 +992,12 @@ Config parse_config(int argc, char** argv) {
             config.port = static_cast<uint16_t>(port);
         } else if (option == "--replicas") {
             config.replication = parse_unsigned(need(i, "--replicas"), "replica count");
-        } else if (option == "--metadata-min-write-replicas") {
-            config.metadata_min_write_replicas = parse_unsigned(
-                need(i, option.c_str()), "minimum metadata write replica count");
-        } else if (option == "--metadata-replicas") {
-            const auto legacy = parse_unsigned(need(i, option.c_str()), "legacy metadata replica count");
-            config.metadata_min_write_replicas = legacy ? legacy / 2 + 1 : 0;
-        } else if (option == "--min-write-replicas") {
-            config.min_write_replicas =
-                parse_unsigned(need(i, "--min-write-replicas"), "minimum write replica count");
+        } else if (option == "--metadata-write-copies") {
+            config.metadata_write_copies = parse_unsigned(
+                need(i, option.c_str()), "metadata write copies");
+        } else if (option == "--write-copies") {
+            config.write_copies =
+                parse_unsigned(need(i, "--write-copies"), "write copies");
         } else if (option == "--write-stall") {
             config.write_stall = std::chrono::milliseconds(
                 parse_unsigned(need(i, "--write-stall"), "write stall"));

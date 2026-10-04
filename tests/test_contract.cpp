@@ -353,7 +353,7 @@ MACHA_FAST_TEST("contract", test_published_readers_see_whole_snapshots_in_order)
 MACHA_TEST("contract", test_the_wait_guard_on_snapshot_views) {
     macha::test_support::TestService fixture("wait-guard");
     fixture.config().replication = 1;
-    fixture.config().metadata_min_write_replicas = 1;
+    fixture.config().metadata_write_copies = 1;
     auto& service = fixture.start();
     (void)service.catalogue().snapshot_view();
 
@@ -379,7 +379,7 @@ MACHA_TEST("contract", test_the_wait_guard_on_a_cold_catalogue) {
     auto config = macha::test_support::config_for(cluster.path() / "node", cluster.keyfile(),
                                                   macha::test_support::free_port());
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
+    config.metadata_write_copies = 1;
     test_support::BareNode node(config, cluster.keys());
     node.start();
     REQUIRE(node.wait_local_state_ready(10s));

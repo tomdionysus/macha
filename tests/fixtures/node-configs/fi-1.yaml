@@ -107,8 +107,8 @@ dht:
   metadata_materialization_cache_bytes: 512M
   # Cluster policy: identical to es-1.
   replicas: 2
-  min_write_replicas: 1
-  metadata_min_write_replicas: 2
+  write_copies: 1
+  metadata_write_copies: 2
   write_stall_ms: 2500
   extent_size: 4M
   read_ahead: 3

@@ -79,8 +79,8 @@ std::vector<ObjectId> reachable_tree_nodes(Service& service) {
 // a write floor of one.
 void make_solo(Config& config) {
     config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
+    config.metadata_write_copies = 1;
+    config.write_copies = 1;
 }
 
 // A snapshot with the policy fields a real one carries, so encode/merge paths
@@ -321,8 +321,8 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
         TestCluster floor_cluster;
         auto floor_config = floor_cluster.node_config("migrate-floor");
         floor_config.replication = 1;
-        floor_config.min_write_replicas = 1;
-        floor_config.metadata_min_write_replicas = 1;
+        floor_config.write_copies = 1;
+        floor_config.metadata_write_copies = 1;
         NodeId floor_node{};
         {
             Service service(floor_config, floor_cluster.keys(), test_durability_window);
@@ -612,8 +612,8 @@ MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_uncl
     auto c2 = cluster.node_config("keep-tree-2", p2, {{"127.0.0.1", p1}});
     for (auto* config : {&c1, &c2}) {
         config->replication = 2;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 2;
+        config->write_copies = 1;
+        config->metadata_write_copies = 2;
         config->catalogue.scanner.enabled = false;
         config->ingest.enabled = false;
         config->torrent.enabled = false;
