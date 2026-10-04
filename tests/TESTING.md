@@ -23,6 +23,8 @@ The test implementation is split by the subsystem that owns the invariant:
 
 Shared deterministic infrastructure lives in `test_support.hpp` and `test_backend_support.hpp`. Prefer `TestService`, `TestNode`, `TestCluster`, `TestGate`, declarative case tables and exhaustive boundary loops over rebuilding keys, ports, state directories or ad-hoc sleeps in individual tests.
 
+A component that decides by elapsed time takes a `TimeSource` (`src/contract/time_source.hpp`) at construction. Hand it a `SteppedTime` (`stepped_time.hpp`) and advance it, rather than sleeping past an interval; `SteppedTime::reads()` tells a test that another thread has taken its reading.
+
 ## Build and run
 
 A normal server build still requires yaml-cpp and FFmpeg. On a constrained development host, build only the portable core and tests:

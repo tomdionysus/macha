@@ -2,6 +2,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "contract/time_source.hpp"
 
 #include <functional>
 #include <stop_token>
@@ -48,6 +49,9 @@ struct SubsystemContext {
     SubsystemRegistry* registry{};
     FileSystem* filesystem{};
     HydrationManager* hydration{};
+    // What a subsystem's periodic work is timed by; the process's steady
+    // clock when null.
+    const TimeSource* time{};
     // Cancels a construction that may block indefinitely (FUSE waits for the
     // first namespace); the lifecycle thread's token, per attempt. A factory
     // that cannot block may ignore it.

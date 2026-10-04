@@ -152,6 +152,10 @@ struct ProviderRequestError : std::runtime_error {
 // MusicBrainz allows one request a second per client: every MusicBrainzProvider
 // on a node shares this gate and its circuit.
 struct MusicBrainzGate {
+    // The least time between two requests.
+    const std::chrono::steady_clock::duration interval;
+    explicit MusicBrainzGate(std::chrono::steady_clock::duration interval = std::chrono::seconds(1))
+        : interval(interval) {}
     // Held across the pacing sleep and the MusicBrainz HTTP request.
     IoMutex mutex;
     std::chrono::steady_clock::time_point last_request MACHA_GUARDED_BY(mutex){};

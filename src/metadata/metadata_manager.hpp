@@ -4,6 +4,7 @@
 #include "metadata/metadata_server.hpp"
 #include "contract/metadata_view.hpp"
 #include "contract/thread_safety.hpp"
+#include "contract/time_source.hpp"
 #include "contract/work.hpp"
 #include "cluster/cluster.hpp"
 
@@ -58,6 +59,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     LocalState& local_;
     MetadataServer& metadata_server_;
     DistributedStore* namespace_store_{};
+    const TimeSource& time_;
     // Guards no state: serialises mutations, repair and history checkpoints.
     // Held across replica RPCs and metadata commits.
     IoMutex mutation_mutex_;
@@ -172,9 +174,12 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // each commit is published (the claims barrier: every object the new head
     // refers to is durably claimed first).
     using PublicationRetention = std::function<void(const MetadataPublicationContext&)>;
+    // `time`: what the decoded cache's lifetime (config metadata_cache) is
+    // measured by.
     MetadataManager(NodeRuntime&, LocalState&, MetadataServer&,
                     DistributedStore* namespace_store = nullptr,
-                             PublicationRetention publication_retention = {});
+                    PublicationRetention publication_retention = {},
+                    const TimeSource& time = steady_time_source());
 
     MetadataRecord read_record();
     MetadataRecord record() override { return read_record(); }
