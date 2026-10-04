@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <ctime>
 #include <map>
 #include <mutex>
@@ -169,11 +170,17 @@ Bytes encode_telemetry_set(const std::vector<NodeTelemetry>&);
 std::vector<NodeTelemetry> decode_telemetry_set(std::span<const uint8_t>);
 
 class TelemetryStore {
+  public:
+    // The steady time a record's age is measured by; empty reads Clock::now().
+    using Now = std::function<Clock::time_point()>;
+
+  private:
     struct Record {
         NodeTelemetry telemetry;
-        Clock::time_point received{Clock::now()};
+        Clock::time_point received;
     };
 
+    Now now_;
     mutable Mutex mutex_;
     std::map<NodeId, Record> records_ MACHA_GUARDED_BY(mutex_);
     std::map<NodeId, NodeTelemetry> persisted_ MACHA_GUARDED_BY(mutex_);
@@ -197,7 +204,7 @@ class TelemetryStore {
         Lock lock(mutex_);
         node_name_ = std::move(name);
     }
-    TelemetryStore(NodeId self, std::filesystem::path persisted_path = {});
+    TelemetryStore(NodeId self, std::filesystem::path persisted_path = {}, Now now = {});
     NodeId boot_id() const { return boot_id_; }
     NodeTelemetry refresh_local(const NodeInfo&, std::string version, uint64_t cache_capacity,
                                 uint64_t cache_used, uint32_t storage_backends_online,

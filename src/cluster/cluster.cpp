@@ -163,10 +163,44 @@ std::vector<IdentityAssociationReset> decode_identity_resets(std::span<const uin
 
 } // namespace
 
+std::string advertised_api_endpoint(const CatalogueApiConfig& api, std::string host) {
+    if (!api.enabled)
+        return {};
+    if (!api.advertised_endpoint.empty())
+        return api.advertised_endpoint;
+    // IPv6 literals are bracketed for the URL.
+    if (host.find(':') != std::string::npos && host.front() != '[')
+        host = "[" + host + "]";
+    return "http://" + host + ":" + std::to_string(api.port);
+}
+
+PlaybackBudgets enforced_playback_budgets(const StreamingConfig& streaming) {
+    PlaybackBudgets playback;
+    if (!streaming.enabled)
+        return playback;
+    const auto ms = [](std::chrono::milliseconds value) {
+        return static_cast<uint32_t>(std::max<int64_t>(0, value.count()));
+    };
+    playback.startup_timeout_ms = ms(streaming.startup_timeout);
+    playback.segment_timeout_ms = ms(streaming.segment_timeout);
+    playback.pipeline_idle_ms = ms(streaming.pipeline_idle);
+    playback.session_idle_ms = ms(streaming.session_idle);
+    playback.max_sessions_per_account = static_cast<uint32_t>(streaming.max_sessions_per_account);
+    playback.max_transcodes_per_account =
+        static_cast<uint32_t>(streaming.max_transcodes_per_account);
+    playback.max_sessions = static_cast<uint32_t>(streaming.max_sessions);
+    playback.transcode_entitlement_idle_ms = ms(streaming.transcode_entitlement_idle);
+    playback.startup_no_progress_ms = ms(streaming.startup_no_progress);
+    playback.start_wait_max_ms = ms(streaming.start_wait_max);
+    playback.start_failed_retention_ms = ms(streaming.start_failed_retention);
+    return playback;
+}
+
 NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryProgress& progress,
                          RetainedMemoryLedger& retained_memory,
                          TranscodeRateBook& transcode_rates, MessageRoutes& routes, NodeEvents& events,
-                         RpcLinks& links, StartupStageHook startup_stage_hook)
+                         RpcLinks& links, StartupStageHook startup_stage_hook,
+                         TelemetryStore::Now telemetry_now)
     : cfg_(normalize_config(std::move(config))), identity_(identity), progress_(progress),
       retained_memory_(retained_memory),
       transcode_rates_(transcode_rates), routes_(routes), events_(events),
@@ -175,7 +209,8 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
                cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
       public_connectivity_(cfg_, identity_.id, Endpoint{members_.self().host, members_.self().port}),
-      telemetry_(identity_.id, cfg_.state_path / "telemetry" / "last-known.bin"),
+      telemetry_(identity_.id, cfg_.state_path / "telemetry" / "last-known.bin",
+                 std::move(telemetry_now)),
       client_(
           links, identity_.keys, [this] { return members_.self(); },
           [this](const NodeInfo& peer) {
@@ -899,50 +934,11 @@ void NodeRuntime::refresh_telemetry() {
                         : local_readiness.control_plane_online ? NodePhase::recovering
                                                                 : NodePhase::starting;
 
-    // Client API endpoint (Status nodes[].api_endpoint); empty when no
-    // catalogue API runs. A configured endpoint is used as given: behind a TLS
-    // proxy the outer scheme and port differ from the bind. The default uses
-    // the resolved RPC advertise host, not catalogue.api.listen, which is
-    // usually an undialable wildcard. IPv6 literals are bracketed for the URL.
-    std::string api_endpoint;
-    if (cfg_.catalogue.api.enabled) {
-        if (!cfg_.catalogue.api.advertised_endpoint.empty()) {
-            api_endpoint = cfg_.catalogue.api.advertised_endpoint;
-        } else {
-            auto host = info.host;
-            if (host.find(':') != std::string::npos && host.front() != '[')
-                host = "[" + host + "]";
-            api_endpoint = "http://" + host + ":" + std::to_string(cfg_.catalogue.api.port);
-        }
-    }
+    auto api_endpoint = advertised_api_endpoint(cfg_.catalogue.api, info.host);
 
-    // The playback budgets this node enforces. A node serving no playback
-    // reports zeros ("cannot say") rather than figures it would not honour.
-    PlaybackBudgets playback;
-    if (cfg_.streaming.enabled) {
-        playback.startup_timeout_ms =
-            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.startup_timeout.count()));
-        playback.segment_timeout_ms =
-            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.segment_timeout.count()));
-        playback.pipeline_idle_ms =
-            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.pipeline_idle.count()));
-        playback.session_idle_ms =
-            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.session_idle.count()));
-        playback.max_sessions_per_account =
-            static_cast<uint32_t>(cfg_.streaming.max_sessions_per_account);
-        playback.max_transcodes_per_account =
-            static_cast<uint32_t>(cfg_.streaming.max_transcodes_per_account);
-        playback.max_sessions = static_cast<uint32_t>(cfg_.streaming.max_sessions);
-        playback.transcode_entitlement_idle_ms = static_cast<uint32_t>(
-            std::max<int64_t>(0, cfg_.streaming.transcode_entitlement_idle.count()));
-        playback.startup_no_progress_ms = static_cast<uint32_t>(
-            std::max<int64_t>(0, cfg_.streaming.startup_no_progress.count()));
-        playback.start_wait_max_ms =
-            static_cast<uint32_t>(std::max<int64_t>(0, cfg_.streaming.start_wait_max.count()));
-        playback.start_failed_retention_ms = static_cast<uint32_t>(
-            std::max<int64_t>(0, cfg_.streaming.start_failed_retention.count()));
+    auto playback = enforced_playback_budgets(cfg_.streaming);
+    if (cfg_.streaming.enabled)
         playback.transcode_rates = transcode_rates_.summary();
-    }
     telemetry_.set_node_name(cfg_.node_name);
     telemetry_.refresh_local(info, std::string(kServerVersion), cache_capacity, cache_used,
                              storage_backends_online, peers_known, peers_active, 0, 0,
