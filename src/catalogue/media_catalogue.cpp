@@ -1818,7 +1818,7 @@ Json MusicBrainzProvider::api(std::string_view path,
         throw ProviderTemporarilyUnavailable("musicbrainz", "MusicBrainz circuit open");
 
     if (gate_->last_request != std::chrono::steady_clock::time_point{}) {
-        const auto due = gate_->last_request + std::chrono::seconds(1);
+        const auto due = gate_->last_request + gate_->interval;
         while (std::chrono::steady_clock::now() < due) {
             if (http_.stop_requested())
                 throw std::runtime_error("MusicBrainz request cancelled");

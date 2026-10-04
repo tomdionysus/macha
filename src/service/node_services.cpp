@@ -36,7 +36,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
       metadata_(node_, local_, metadata_server_, &store_,
                 [this](const MetadataPublicationContext& context) {
                     retain_metadata_publication(context);
-                }),
+                },
+                steady_time_source()),
       ledger_(local_.retention(), local_.data(), local_.control()),
       availability_(node_, local_, store_, ledger_, resources_.events, routes_,
                     node_.config().state_path / "availability" / "last-survey.bin"),
@@ -93,7 +94,8 @@ NodeServices::NodeServices(NodeRuntime& node, NodeResources& resources, LocalSta
           &media_information_,
           [this](Json::Object& entry, std::string_view media_id) {
               put_media_availability(entry, availability_.snapshot().get(), media_id);
-          }),
+          },
+          steady_time_source()),
       subsystems_(node_.config().plugin_path.value_or(std::filesystem::path{})),
       horizon_builder_(filesystem_, catalogue_, local_.control(), store_),
       files_api_(filesystem_, availability_),
@@ -164,6 +166,7 @@ void NodeServices::start() {
     context.registry = &registry_;
     context.filesystem = &filesystem_;
     context.hydration = &hydration_;
+    context.time = &steady_time_source();
     note("start subsystems");
     subsystems_.start(context);
     for (const auto& subsystem : subsystems_.statuses())

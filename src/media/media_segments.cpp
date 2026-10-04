@@ -32,6 +32,7 @@ struct MediaSegmentStore::Impl {
     // target_duration, are fixed at construction.
     std::vector<double> vod_segment_durations;
     MediaContainer container{MediaContainer::fmp4};
+    const TimeSource* time{&steady_time_source()};
     bool finished MACHA_GUARDED_BY(mutex){};
     bool cancelled MACHA_GUARDED_BY(mutex){};
     bool superseded MACHA_GUARDED_BY(mutex){};
@@ -125,7 +126,7 @@ struct MediaSegmentStore::Impl {
         Wakeups wakeups;
         // Encode time is the gap since the previous call returned; the demand wait
         // comes after this point, so parked time is excluded.
-        const auto entered = std::chrono::steady_clock::now();
+        const auto entered = time->now();
         Lock lock(mutex);
         if (produced_since) producing += entered - *produced_since;
         const auto index = static_cast<uint64_t>(segments.size());
@@ -148,7 +149,7 @@ struct MediaSegmentStore::Impl {
         segments.push_back(std::move(segment));
         maybe_spill_locked();
         notify_locked(wakeups);
-        produced_since = std::chrono::steady_clock::now();
+        produced_since = time->now();
         return true;
     }
 
@@ -190,9 +191,10 @@ MediaSegmentStore::MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_
                                      std::filesystem::path spill_directory,
                                      std::chrono::milliseconds target_duration,
                                      std::vector<double> vod_segment_durations,
-                                     MediaContainer container)
+                                     MediaContainer container, const TimeSource& time)
     : impl_(std::make_unique<Impl>()) {
-    impl_->produced_since = std::chrono::steady_clock::now();
+    impl_->time = &time;
+    impl_->produced_since = time.now();
     impl_->container = container;
     impl_->max_ahead = std::max<size_t>(2, max_ahead_segments);
     impl_->memory_limit = memory_limit;
@@ -378,7 +380,7 @@ MediaSegmentStore::Snapshot MediaSegmentStore::snapshot() const {
                 std::chrono::duration_cast<std::chrono::milliseconds>(impl_->producing).count()),
             impl_->produced_since
                 ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                            std::chrono::steady_clock::now() - *impl_->produced_since)
+                                            impl_->time->now() - *impl_->produced_since)
                                             .count())
                 : 0,
             impl_->segments.size() > impl_->highest_requested + impl_->max_ahead};

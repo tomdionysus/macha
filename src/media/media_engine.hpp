@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "contract/time_source.hpp"
 #include "http/http.hpp"
 #include "config.hpp"
 #include "retained_memory.hpp"
@@ -191,11 +192,14 @@ class MediaSegmentStore {
         bool producer_parked{};
     };
 
+    // `time`: what production time and the age of the last publication are
+    // measured by.
     MediaSegmentStore(size_t max_ahead_segments, uint64_t memory_limit,
                       std::filesystem::path spill_directory,
                       std::chrono::milliseconds target_duration,
                       std::vector<double> vod_segment_durations = {},
-                      MediaContainer container = MediaContainer::fmp4);
+                      MediaContainer container = MediaContainer::fmp4,
+                      const TimeSource& time = steady_time_source());
     MediaContainer container() const noexcept;
     ~MediaSegmentStore();
 
