@@ -2090,6 +2090,50 @@ std::vector<ArtworkOption> MusicBrainzProvider::artwork_options(std::string_view
     return out;
 }
 
+namespace {
+
+// Visits each track of a release's media in the release's own order, until
+// `visit(medium, track)` returns true.
+template <typename Visit>
+void walk_release_tracks(const Json& release, Visit&& visit) {
+    const auto* media = release.find("media");
+    if (!media || !media->isArray()) return;
+    for (const auto& medium : media->asArray()) {
+        const auto* tracks = medium.find("tracks");
+        if (!tracks || !tracks->isArray()) continue;
+        for (const auto& track : tracks->asArray())
+            if (visit(medium, track)) return;
+    }
+}
+
+std::optional<int64_t> json_length_ms(const Json* value) {
+    if (!value || !value->isNumber() || value->asInt64() < 0) return {};
+    return value->asInt64();
+}
+
+} // namespace
+
+std::vector<ProviderReleaseTrack> MusicBrainzProvider::release_tracks(std::string_view id) {
+    const auto release = release_by_id(id);
+    std::vector<ProviderReleaseTrack> out;
+    if (!release) return out;
+    walk_release_tracks(*release, [&](const Json& medium, const Json& release_track) {
+        ProviderReleaseTrack track;
+        track.disc_number = json_i32(medium.find("position"));
+        track.track_number = json_i32(release_track.find("position"));
+        track.title = json_string(release_track.find("title"));
+        track.length_ms = json_length_ms(release_track.find("length"));
+        if (const auto* recording = release_track.find("recording");
+            recording && recording->isObject()) {
+            track.recording_id = json_string(recording->find("id"));
+            if (!track.length_ms) track.length_ms = json_length_ms(recording->find("length"));
+        }
+        out.push_back(std::move(track));
+        return false;
+    });
+    return out;
+}
+
 std::optional<ProviderMatch> MusicBrainzProvider::lookup(const MediaProbe& probe) {
     if (!supports(probe.kind)) return {};
 
@@ -2165,31 +2209,28 @@ std::optional<ProviderMatch> MusicBrainzProvider::lookup(const MediaProbe& probe
     const auto wanted_recording_id = probe.musicbrainz_recording_id
         ? *probe.musicbrainz_recording_id
         : recording_detail ? json_string(recording_detail->find("id")) : std::string{};
-    if (auto media = release->find("media"); media && media->isArray()) {
-        for (const auto& medium : media->asArray()) {
-            if (probe.disc) {
-                auto medium_position = json_i32(medium.find("position"));
-                if (medium_position && *medium_position != *probe.disc) continue;
-            }
-            auto tracks = medium.find("tracks");
-            if (!tracks || !tracks->isArray()) continue;
-            for (const auto& release_track : tracks->asArray()) {
-                auto number = json_i32(release_track.find("position"));
-                const auto title = json_string(release_track.find("title"));
-                auto candidate_recording = release_track.find("recording");
-                const auto candidate_id = candidate_recording && candidate_recording->isObject()
-                    ? json_string(candidate_recording->find("id")) : std::string{};
-                const bool id_match = !wanted_recording_id.empty() && candidate_id == wanted_recording_id;
-                const bool number_match = probe.track && number && *probe.track == *number;
-                const bool title_match = !probe.title.empty() && normalized(title) == normalized(probe.title);
-                if (!id_match && !number_match && !title_match) continue;
-                recording = candidate_recording;
-                position = number.value_or(probe.track.value_or(0));
-                break;
-            }
-            if (recording) break;
+    // A medium whose matching track carries no recording is left for the next.
+    const Json* exhausted_medium = nullptr;
+    walk_release_tracks(*release, [&](const Json& medium, const Json& release_track) {
+        if (&medium == exhausted_medium) return false;
+        if (probe.disc) {
+            auto medium_position = json_i32(medium.find("position"));
+            if (medium_position && *medium_position != *probe.disc) return false;
         }
-    }
+        auto number = json_i32(release_track.find("position"));
+        const auto title = json_string(release_track.find("title"));
+        auto candidate_recording = release_track.find("recording");
+        const auto candidate_id = candidate_recording && candidate_recording->isObject()
+            ? json_string(candidate_recording->find("id")) : std::string{};
+        const bool id_match = !wanted_recording_id.empty() && candidate_id == wanted_recording_id;
+        const bool number_match = probe.track && number && *probe.track == *number;
+        const bool title_match = !probe.title.empty() && normalized(title) == normalized(probe.title);
+        if (!id_match && !number_match && !title_match) return false;
+        recording = candidate_recording;
+        position = number.value_or(probe.track.value_or(0));
+        if (!recording) exhausted_medium = &medium;
+        return recording != nullptr;
+    });
     if ((!recording || !recording->isObject()) && recording_detail) recording = &*recording_detail;
     if (!recording || !recording->isObject()) return {};
     auto recording_id = json_string(recording->find("id"));
@@ -3153,6 +3194,27 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
                                        std::string(scan_provider));
     try {
         return metadata->artwork_options(parsed->kind, parsed->id, role, numbers);
+    } catch (const ProviderRecordNotFound& e) {
+        throw ProviderRequestError(404, "provider_not_found", e.what());
+    } catch (const std::exception& e) {
+        throw ProviderRequestError(503, "provider_unavailable", e.what());
+    }
+}
+
+std::vector<ProviderReleaseTrack> CatalogueScanner::release_tracks(std::string_view provider,
+                                                                  std::string_view release_id) {
+    const auto parsed =
+        parse_provider_ref(std::string(provider) + ":release:" + std::string(release_id));
+    if (!parsed) throw ProviderRequestError(400, "bad_ref", "the release id must be an MBID");
+    const auto scan_provider = scan_provider_for(*parsed);
+    Lock editor(editor_mutex_);
+    auto* metadata = editor_metadata(scan_provider, parsed->provider);
+    if (!metadata || !metadata->supports(MediaProbeKind::track))
+        throw ProviderRequestError(400, "provider_not_configured",
+                                   parsed->provider + " is not configured for " +
+                                       std::string(scan_provider));
+    try {
+        return metadata->release_tracks(parsed->id);
     } catch (const ProviderRecordNotFound& e) {
         throw ProviderRequestError(404, "provider_not_found", e.what());
     } catch (const std::exception& e) {

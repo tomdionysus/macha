@@ -1340,6 +1340,83 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) 
     CHECK(tmdb_error_http.requests() == 2);
 }
 
+// A MusicBrainz release's tracks: every medium's tracks in the release's own
+// order, under the track's title rather than the recording's, fetched through
+// the gate the node's MusicBrainz providers share.
+MACHA_FAST_TEST("hydration_catalogue", test_musicbrainz_release_tracks) {
+    FakeHttpClient http;
+    http.add("/ws/2/release/rel-2cd", 200, "application/json",
+             R"JSON({"id":"rel-2cd","title":"Two Discs","media":[
+                 {"position":1,"tracks":[
+                     {"position":1,"number":"A1","title":"Opening","length":215000,
+                      "recording":{"id":"rec-a","title":"Opening (album version)","length":216000}},
+                     {"position":2,"title":"Untimed","length":null,
+                      "recording":{"id":"rec-b","title":"Untimed","length":null}}]},
+                 {"position":2,"tracks":[
+                     {"position":1,"title":"Second Disc","length":null,
+                      "recording":{"id":"rec-c","title":"Second Disc","length":90500}}]}]})JSON");
+    http.add("/ws/2/release/rel-empty", 200, "application/json", R"({"id":"rel-empty"})");
+    CatalogueMusicBrainzConfig config;
+    config.contact = "https://example.test/macha";
+    auto gate = std::make_shared<MusicBrainzGate>(0ms);
+    MusicBrainzProvider mb(http, config, gate);
+    {
+        Lock lock(gate->mutex);
+        CHECK(gate->last_request == std::chrono::steady_clock::time_point{});
+    }
+
+    const auto tracks = mb.release_tracks("rel-2cd");
+    REQUIRE(tracks.size() == 3);
+    struct Expected {
+        int32_t disc;
+        int32_t track;
+        const char* title;
+        std::optional<int64_t> length_ms;
+        const char* recording_id;
+    };
+    const std::vector<Expected> expected{
+        {1, 1, "Opening", 215000, "rec-a"},
+        {1, 2, "Untimed", std::nullopt, "rec-b"},
+        // A track without a length of its own has its recording's.
+        {2, 1, "Second Disc", 90500, "rec-c"},
+    };
+    for (size_t i = 0; i < expected.size(); ++i) {
+        std::cerr << "row: " << expected[i].title << "\n";
+        CHECK(tracks[i].disc_number == expected[i].disc);
+        CHECK(tracks[i].track_number == expected[i].track);
+        CHECK(tracks[i].title == expected[i].title);
+        CHECK(tracks[i].length_ms == expected[i].length_ms);
+        CHECK(tracks[i].recording_id == expected[i].recording_id);
+    }
+    CHECK(http.requests_containing("/ws/2/release/rel-2cd?inc=recordings") == 1);
+    {
+        Lock lock(gate->mutex);
+        CHECK(gate->last_request != std::chrono::steady_clock::time_point{});
+    }
+    // The release is cached, and a release without media has no tracks.
+    CHECK(mb.release_tracks("rel-2cd").size() == 3);
+    CHECK(mb.release_tracks("rel-empty").empty());
+    CHECK(http.requests() == 2);
+
+    // The gate's circuit, opened by another provider's failure, refuses this
+    // provider's next request before it reaches MusicBrainz.
+    FakeHttpClient down;
+    down.add("/ws/2/release/", 503, "application/json", "{}");
+    MusicBrainzProvider failing(down, config, gate);
+    const auto throws = [](MusicBrainzProvider& provider, std::string_view id) {
+        try {
+            (void)provider.release_tracks(id);
+        } catch (const std::exception&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(throws(failing, "rel-down"));
+    CHECK(down.requests() == 1);
+    CHECK(throws(mb, "rel-unfetched"));
+    CHECK(http.requests() == 2);
+}
+
 MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_reconciles_a_library) {
     // CatalogueScanner end to end over one node's namespace and catalogue,
     // with providers answered by a fake HTTP client: match and bind, stay

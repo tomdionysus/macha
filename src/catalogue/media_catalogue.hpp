@@ -203,6 +203,16 @@ struct ProviderSearchResult {
     std::string catalogue_id; // the id a match gives the item
 };
 
+// One track of a provider's release. A number or length the provider does not
+// give is absent.
+struct ProviderReleaseTrack {
+    std::optional<int32_t> disc_number;  // the medium's position
+    std::optional<int32_t> track_number; // the track's position on its medium
+    std::string title;                   // the track's title on this release
+    std::optional<int64_t> length_ms;
+    std::string recording_id;
+};
+
 class MetadataProvider {
   public:
     virtual ~MetadataProvider() = default;
@@ -216,6 +226,10 @@ class MetadataProvider {
                                                        std::string_view /*id*/,
                                                        std::string_view /*role*/,
                                                        const ProviderRefNumbers& /*numbers*/) {
+        return {};
+    }
+    // The tracks of release `id`, in the release's own order.
+    virtual std::vector<ProviderReleaseTrack> release_tracks(std::string_view /*id*/) {
         return {};
     }
 };
@@ -276,6 +290,7 @@ class MusicBrainzProvider final : public MetadataProvider {
     std::vector<ArtworkOption> artwork_options(std::string_view kind, std::string_view id,
                                                std::string_view role,
                                                const ProviderRefNumbers& numbers) override;
+    std::vector<ProviderReleaseTrack> release_tracks(std::string_view id) override;
     size_t cache_entries() const noexcept {
         return release_cache_.size() + release_id_cache_.size() + recording_cache_.size() +
                cover_cache_.size();
@@ -502,6 +517,11 @@ class CatalogueScanner {
     // Throws ProviderRequestError with the API's answer.
     std::vector<ArtworkOption> artwork_options(std::string_view ref, std::string_view role,
                                                const ProviderRefNumbers& numbers);
+    // The tracks of a provider's release (`musicbrainz` and a release MBID),
+    // in the release's own order. Throws ProviderRequestError with the API's
+    // answer.
+    std::vector<ProviderReleaseTrack> release_tracks(std::string_view provider,
+                                                     std::string_view release_id);
     // Fetch one listed option and make it the item's artwork for the role.
     // The reference is the item's own unless `ref` names one. Locks the item
     // unless `lock` is false. Throws ProviderRequestError.

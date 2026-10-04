@@ -54,7 +54,22 @@ It answers `{"status": "ok", "options": [{option_id, role, width, height, langua
 
 Codes, for both: `400 bad_ref`, `400 bad_role` (not a role that reference offers), `400 bad_number`, `400 provider_not_configured`, `404 provider_not_found`, `503 provider_unavailable`; for a choice also `404 not_found` (no such item), `400 no_provider_ref`, `404 option_not_found` (not an option the provider lists for that role now).
 
-Provider search and artwork need the manager role even to read, since they make the node call the provider on the caller's say-so.
+## Provider release tracks
+
+`GET /api/v1/manage/providers/musicbrainz/releases/{mbid}/tracks` lists the tracks of one MusicBrainz release, `{mbid}` being the id in a `musicbrainz:release:<mbid>` reference. It answers:
+
+```json
+{"status": "ok", "tracks": [
+  {"disc_number": 1, "track_number": 4, "title": "...", "length_ms": 215000,
+   "recording_id": "<mbid>"}
+]}
+```
+
+Tracks are in the release's own order: its media in sequence, each medium's tracks in sequence. `disc_number` is the medium's position and `track_number` the track's position on that medium, the numbers a match by provider reference takes. `title` is the track's title on this release, which may differ from its recording's title. `length_ms` is the track's length, or its recording's when the track has none; `recording_id` is the MusicBrainz recording. `disc_number`, `track_number`, `length_ms` and `recording_id` are `null` when MusicBrainz gives none. A release without media answers an empty `tracks`.
+
+Codes: `400 bad_ref` (`{mbid}` is not a MusicBrainz id), `400 provider_not_configured`, `404 provider_not_found` (no such release), `503 provider_unavailable`. The request to MusicBrainz shares the one-a-second pacing of every other MusicBrainz request the node makes, and waits its turn rather than being refused; a release already fetched is answered without one.
+
+Provider search, artwork and release tracks need the manager role even to read, since they make the node call the provider on the caller's say-so.
 
 ## Manual entry
 

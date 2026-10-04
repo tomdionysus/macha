@@ -133,6 +133,9 @@ MACHA_FAST_TEST("users", test_role_policy) {
         {"GET", "/api/v1/manage/unmatched", role_media_viewer},
         {"GET", "/api/v1/manage/providers/search", role_manager},
         {"GET", "/api/v1/manage/providers/artwork", role_manager},
+        {"GET",
+         "/api/v1/manage/providers/musicbrainz/releases/0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41/tracks",
+         role_manager},
         {"GET", "/api/v1/users", role_manage_users},
         {"PATCH", "/api/v1/users/me", role_media_viewer},
     };
