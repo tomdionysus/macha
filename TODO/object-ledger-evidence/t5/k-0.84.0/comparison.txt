@@ -1,0 +1,40 @@
+=== fi-1: T0 (0.74.0) | 0.81.0 | 0.84.0
+  claim.data_barrier_us                      4607/840588 n=110            | 4607/24575 n=566             | 4607/24210 n=122            
+  maintenance.claim_walk.examine_us          3/29 n=25023                 | 1/14 n=4192                  | 1/17 n=28345                
+  maintenance.gc.per_object_ns               2815/28671 n=243             | 2303/21125 n=91              | 2047/6375 n=94              
+  api GET /api/v1/status                     639/3839 n=4427              | 639/3327 n=2246              | 575/3583 n=1697             
+  api GET /api/v1/torrents/jobs              767/6655 n=1890              | 3583/20479 n=714             | 2303/11263 n=718            
+  api GET /api/v1/catalogue/items            212991/9437183 n=877         | 229375/1310719 n=806         | 262143/983039 n=852         
+  api GET /api/v1/catalogue/status           12287/45055 n=739            | 7167/32767 n=714             | 7167/40959 n=718            
+  playback.create_us                         9437183/23068671 n=135       | 10485759/31457279 n=184      | 6815743/25165823 n=247      
+  playback.first_fragment_us                 8388607/14979286 n=535       | 6291455/14680063 n=784       | 5767167/14680063 n=1209     
+  api PATCH /api/v1/playback/sessions/:id    11534335/20971519 n=582      | 11534335/20971519 n=920      | 9437183/18874367 n=1195     
+  maintenance.repair.step_us.loaded          327679/58720255 n=504        | 7340031/301989887 n=117      | 479/67108863 n=755          
+  fuse_publication_bytes_committed           9810238.77/min               | 8508033.68/min               | 11139012.27/min             
+  repair_bytes_transferred                   3190598.49/min               | 163616.03/min                | 871199.76/min               
+  repair_push_examined                       13.6/min                     | 2.31/min                     | 1.09/min                    
+  repair_pull_examined                       1.36/min                     | 2.38/min                     | 109.65/min                  
+  repair_pull_unsourceable                   0.54/min                     | 0.44/min                     | 2.68/min                    
+  maintenance_wakeups                        10.49/min                    | 11.3/min                     | 8.78/min                    
+  rss median/max MB [1379, 1970] | [1463, 2264] | [1325, 2101]
+  shutdowns 0.84.0: shutdown {"elapsed_ms": 5665} | shutdown {"elapsed_ms": 8820} | shutdown {"elapsed_ms": 4507}
+=== gbni-1: T0 (0.74.0) | 0.81.0 | 0.84.0
+  claim.data_barrier_us                      360447/2097151 n=623         | 425983/2883583 n=122         | 393215/2883583 n=110        
+  maintenance.claim_walk.examine_us          4/87 n=21344                 | 2/15359 n=6016               | 1/3583 n=8224               
+  maintenance.gc.per_object_ns               4095/851967 n=102            | 4607/91859 n=55              | 4095/38468 n=17             
+  api GET /api/v1/status                     959/12287 n=869              | 895/6655 n=734               | 1023/8191 n=1190            
+  api GET /api/v1/torrents/jobs              7679/81919 n=796             | 575/5119 n=716               | 511/9215 n=714              
+  api GET /api/v1/catalogue/items            589823/2097151 n=901         | 491519/2097151 n=831         | 851967/2621439 n=876        
+  api GET /api/v1/catalogue/status           36863/5767167 n=741          | 13311/720895 n=716           | 22527/1310719 n=714         
+  playback.create_us                         589823/4718591 n=263         | 524287/6291455 n=228         | 491519/11534335 n=219       
+  playback.first_fragment_us                 589823/14680063 n=1445       | 458751/14680063 n=1279       | 393215/14680063 n=1188      
+  api PATCH /api/v1/playback/sessions/:id    1179647/15525874 n=1292      | 983039/15728639 n=1137       | 524287/15728639 n=1065      
+  maintenance.repair.step_us.loaded          40959/92274687 n=537         | 327679/251658239 n=163       | 81919/75497471 n=204        
+  fuse_publication_bytes_committed           11609345.9/min               | 10254947.45/min              | 10167364.28/min             
+  repair_bytes_transferred                   1790071.2/min                | 763344.75/min                | 1550283.61/min              
+  repair_push_examined                       1.35/min                     | 0.33/min                     | 0.48/min                    
+  repair_pull_examined                       0.17/min                     | 0.01/min                     | 0.13/min                    
+  repair_pull_unsourceable                   0.01/min                     | 0.0/min                      | 0.0/min                     
+  maintenance_wakeups                        19.05/min                    | 4.96/min                     | 7.66/min                    
+  rss median/max MB [0, 0] | [1196, 1913] | [1225, 1582]
+  shutdowns 0.84.0: shutdown {"elapsed_ms": 159} | shutdown {"elapsed_ms": 6039}

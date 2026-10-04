@@ -255,3 +255,40 @@ the stream switched nodes. Their judgement: failover was brittle before the
 experiment and is solid now. The K table has no viewer-continuity measure
 and T0 recorded none, so this stands as qualitative evidence, from the
 person who has watched the cluster's failover throughout.
+
+## 0.84.0 against the K table (2026-10-03 22:29Z to 2026-10-04 04:29Z)
+
+T0's six-hour top-up load again, both nodes on 0.84.0. Differences from the
+0.81.0 run: driven playback ran every cycle whether or not a viewer was
+watching (the operator's permission; a viewer watched on fi-1 throughout),
+restarts went ahead under viewers, and each restart captured every thread's
+stack if the stop took over 15 s. Reports and the three-way comparison (T0,
+0.81.0, 0.84.0) are in `k-0.84.0/`.
+
+- **Same or better than T0:** K1, K2, K3 on both nodes; K7 create, first
+  fragment and seek on fi-1, first fragment and seek on gbni-1; K8 on fi-1
+  (9.8 to 11.1 MB/min: the credit deadlock fix); fi-1's loaded repair step
+  (0.33 s p50 to under 1 ms); every clean shutdown (fi-1 4.5 to 8.8 s,
+  gbni-1 0.2 and 6.0 s).
+- **Worse:** gbni-1 `catalogue/items` p50 590 to 852 ms (each item now
+  carries availability, 0.83.0); gbni-1 `create` p99 4.7 to 11.5 s; gbni-1 K8
+  -12% and repair bytes -13%; fi-1 repair bytes 3.19 to 0.87 MB/min while
+  its pull walk examines 80 times as fast (109.7/min) and finds more
+  unsourceable (2.68/min).
+- **Shutdown: diagnosed.** Five of six stops were clean. gbni-1's at
+  22:53:15Z was killed at 60 s. The stacks show the FUSE frontend's stop
+  joining its namespace worker, whose commit waited on
+  `MetadataManager::reconciliation_mutex_`, held by the torrent
+  coordinator's background `current_view()`, which was reconciling two
+  heads inside `read_group`: three whole-namespace materialisations, a
+  path-wise three-way merge and a commit to the peer, under the lock. Two
+  reconciliations (66972, 66973) filled 54 s. Both nodes reconcile each
+  head pair, about five times in 30 minutes under this load.
+- **A crash:** gbni-1 aborted at 23:56:06Z (glibc heap check, in `malloc`
+  on the maintenance thread during the availability roll-up); systemd
+  restarted it and it served again 52 s later. Third heap corruption on
+  gbni-1 (2026-09-28 media information, 2026-10-03 17:21Z catalogue
+  scanner, now maintenance): the victim thread varies. Both of the last two
+  followed a playback read failing on an unavailable extent within a
+  minute, though such failures are common (85 in 80 minutes without a
+  crash). Core: `/mnt/diskB/crash/core.macha-maint.726890.1791071766`.
