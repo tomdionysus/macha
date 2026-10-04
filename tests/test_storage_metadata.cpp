@@ -2993,7 +2993,7 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
         const auto elapsed = std::chrono::steady_clock::now() - started;
         // A linear scan would need ~10^10 comparisons here; 10 s is generous on a
         // loaded host.
-        CHECK(elapsed < 10s);
+        CHECK(elapsed < scaled(10s));
         CHECK(after.garbage.size() == count + 1 - (edits + 1) + edits);
         CHECK(std::none_of(after.garbage.begin(), after.garbage.end(),
                            [&](const GarbageRef& g) { return g.id == make_id(7); }));

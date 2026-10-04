@@ -87,7 +87,7 @@ class HeldOperation {
             }
         });
     }
-    bool entered() { return entered_future_.wait_for(2s) == std::future_status::ready; }
+    bool entered() { return entered_future_.wait_for(scaled(2s)) == std::future_status::ready; }
     void release() {
         if (!released_once_.exchange(true))
             release_.set_value();
@@ -1080,7 +1080,7 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
     const auto elapsed = std::chrono::steady_clock::now() - started;
     // Batched checks need a handful of round trips; the bound is loose for
     // loaded hardware but still catches one round trip per extent.
-    CHECK(elapsed < 10s);
+    CHECK(elapsed < scaled(10s));
 }
 
 MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget_still_publishes) {

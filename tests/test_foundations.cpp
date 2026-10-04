@@ -122,17 +122,17 @@ MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
     auto blocked_loader = std::async(std::launch::async, [&] {
         return resources.acquire(loader_context, 1);
     });
-    CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
+    CHECK(blocked_loader.wait_for(scaled(20ms)) == std::future_status::timeout);
     auto blocked_speculative = std::async(std::launch::async, [&] {
         return resources.acquire(DataWorkContext(FrameType::speculative, 1), 1);
     });
-    CHECK(blocked_speculative.wait_for(20ms) == std::future_status::timeout);
+    CHECK(blocked_speculative.wait_for(scaled(20ms)) == std::future_status::timeout);
 
     // Lower-class saturation cannot consume the reserved byte; a late viewer
     // starts at once without cancelling loader work in flight.
     auto viewer = resources.acquire(DataWorkContext(FrameType::foreground, 1), 1);
     REQUIRE(viewer.has_value());
-    CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
+    CHECK(blocked_loader.wait_for(scaled(20ms)) == std::future_status::timeout);
     viewer.reset();
 
     // A deadline ends the wait via the condition variable, not a poll.
@@ -141,12 +141,12 @@ MACHA_TEST("foundations", test_data_resource_arbiter_reserves_viewer_headroom) {
     CHECK(!expired.has_value());
 
     first.reset();
-    REQUIRE(blocked_loader.wait_for(1s) == std::future_status::ready);
+    REQUIRE(blocked_loader.wait_for(scaled(1s)) == std::future_status::ready);
     auto admitted_loader = blocked_loader.get();
     REQUIRE(admitted_loader.has_value());
-    CHECK(blocked_speculative.wait_for(20ms) == std::future_status::timeout);
+    CHECK(blocked_speculative.wait_for(scaled(20ms)) == std::future_status::timeout);
     second.reset();
-    REQUIRE(blocked_speculative.wait_for(1s) == std::future_status::ready);
+    REQUIRE(blocked_speculative.wait_for(scaled(1s)) == std::future_status::ready);
     auto admitted_speculative = blocked_speculative.get();
     REQUIRE(admitted_speculative.has_value());
 

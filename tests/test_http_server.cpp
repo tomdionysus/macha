@@ -300,7 +300,7 @@ MACHA_TEST("http_server", test_a_client_that_stops_reading_does_not_delay_anothe
         const auto elapsed = Clock::now() - started;
         CHECK(response.find("HTTP/1.1 200") != std::string::npos);
         CHECK(body_of(response).size() == body_size);
-        CHECK(elapsed < 5s);
+        CHECK(elapsed < scaled(5s));
     }
 
     // The stalled connections held at most a staging window each.
@@ -444,7 +444,7 @@ MACHA_TEST("http_server", test_a_deferred_request_is_resumed_when_woken_and_at_i
     const auto timed_elapsed = Clock::now() - timed_started;
     CHECK(timed_response.find("\"timed_out\":true") != std::string::npos);
     CHECK(timed_elapsed >= 350ms);
-    CHECK(timed_elapsed < 2s);
+    CHECK(timed_elapsed < scaled(2s));
 
     CHECK(server.diagnostics().requests_deferred == 2);
     // A waker fired after its request has been answered is harmless.
