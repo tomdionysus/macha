@@ -144,6 +144,13 @@ Page<NamespaceItem, std::string> namespace_entries(const MetadataSnapshot& snaps
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               const NamespaceVisitor& visit);
 
+// The same walk, also appending to `nodes` every tree node it read: branches,
+// leaves and extent spines, which a complete walk reads all of. Nothing for an
+// inline namespace. A node that cannot be read throws, so a walk that returns
+// has named the whole tree.
+void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                              const NamespaceVisitor& visit, std::vector<ObjectId>& nodes);
+
 // One path from a snapshot in either form. On a tree this fetches at most
 // `depth` nodes, and no extent node when `with_extents` is false. Throws if the
 // snapshot is detached and no store is supplied.

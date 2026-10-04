@@ -40,6 +40,9 @@ struct MaintenanceObjects {
     // millions of objects.
     std::vector<ObjectId> live;
     std::vector<GarbageRef> garbage;
+    // The namespace tree's own nodes, control objects; empty for an inline
+    // namespace.
+    std::vector<ObjectId> namespace_nodes;
     uint64_t metadata_generation{};
     RetentionClock observed_mutations;
     size_t entries{};

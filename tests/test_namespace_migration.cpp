@@ -7,6 +7,7 @@
 #include "metadata/namespace_tree.hpp"
 #include "service/service.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <set>
 #include <string>
@@ -19,6 +20,7 @@ namespace {
 // What macha-namespace-migrate does to one stopped node, through the same
 // plan_namespace_migration the tool uses.
 struct MigrationResult {
+    MetadataRecord record;
     Hash256 hash{};
     ObjectId root{};
     size_t entries{};
@@ -46,8 +48,30 @@ MigrationResult migrate_state(const Config& config, const ClusterKeys& keys,
     const auto migration = plan_namespace_migration(head, nodes);
     if (install)
         REQUIRE(replica.install_migrated_head(migration.record, witnesses, "test migration"));
-    return {migration.record.hash, migration.root, migration.entries, migration.previous_payload_bytes,
-            migration.record.payload.size()};
+    return {migration.record, migration.record.hash, migration.root, migration.entries,
+            migration.previous_payload_bytes, migration.record.payload.size()};
+}
+
+// Two stopped nodes re-rooted onto one record, as the tool's --adopt does:
+// each builds the tree into its own store, and the second installs the
+// first's record once its own namespace yields the same root.
+void migrate_pair(const Config& first, const Config& second, const ClusterKeys& keys,
+                  const std::vector<NodeId>& witnesses) {
+    const auto leader = migrate_state(first, keys, witnesses);
+    const auto follower = migrate_state(second, keys, witnesses, false);
+    REQUIRE(follower.root == leader.root);
+    MetadataReplica replica(second.state_path, keys.storage);
+    REQUIRE(replica.install_migrated_head(leader.record, witnesses, "test migration"));
+}
+
+// Every tree node the service's head reaches, read through its own store.
+std::vector<ObjectId> reachable_tree_nodes(Service& service) {
+    const auto snapshot = service.metadata_manager().snapshot();
+    REQUIRE(snapshot.namespace_root.has_value());
+    std::vector<ObjectId> nodes;
+    collect_namespace_tree_nodes(*snapshot.namespace_root, service.filesystem().namespace_nodes(),
+                                 nodes);
+    return nodes;
 }
 
 // One node is the whole cluster here, so the service writing the library needs
@@ -677,6 +701,126 @@ MACHA_TEST("namespace_migration", test_a_catalogue_change_on_a_tree_leaves_the_t
                                                      *after.catalogue_root));
     CHECK(service.filesystem().getattr("/Movies/film.mkv").size == 256 * 1024);
     service.stop();
+}
+
+// Claims are not what keeps a namespace: with none on either node, a zero
+// grace and the catalogue root moving on, the control collector sweeps what
+// nothing reaches and leaves every node of the accepted tree on both nodes.
+MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_unclaimed_namespace) {
+    TestCluster cluster;
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    auto c1 = cluster.node_config("keep-tree-1", p1, {{"127.0.0.1", p2}});
+    auto c2 = cluster.node_config("keep-tree-2", p2, {{"127.0.0.1", p1}});
+    for (auto* config : {&c1, &c2}) {
+        config->replication = 2;
+        config->min_write_replicas = 1;
+        config->metadata_min_write_replicas = 2;
+        config->catalogue.scanner.enabled = false;
+        config->ingest.enabled = false;
+        config->torrent.enabled = false;
+        config->maintenance.garbage_grace = 0ms;
+        config->maintenance.foreground_quiet = 200ms;
+        config->maintenance.no_progress_backoff = 1000ms;
+    }
+    const auto film = pattern(256 * 1024, 81);
+    const auto converged = [](Service& a, Service& b) {
+        return wait_until([&] {
+            return a.local_state().replica().committed().hash ==
+                       b.local_state().replica().committed().hash &&
+                   a.local_state().replica().accepted_heads().size() == 1 &&
+                   b.local_state().replica().accepted_heads().size() == 1;
+        }, 10s);
+    };
+
+    // A library big enough for a tree of several leaves under a branch.
+    std::vector<NodeId> witnesses;
+    {
+        Service s1(c1, cluster.keys(), test_durability_window);
+        Service s2(c2, cluster.keys(), test_durability_window);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_metadata_writable(s1));
+        witnesses = {s1.node().node_id(), s2.node().node_id()};
+        s1.filesystem().mkdir("/Shows", 0755, getuid(), getgid());
+        for (int i = 0; i < 80; ++i)
+            s1.filesystem().mkdir("/Shows/" + std::to_string(i), 0755, getuid(), getgid());
+        write_file(s1, "/Shows/film.mkv", film);
+        REQUIRE(converged(s1, s2));
+        s2.stop();
+        s1.stop();
+    }
+    migrate_pair(c1, c2, cluster.keys(), witnesses);
+
+    // Started once so whatever a migrated namespace is due is done, then every
+    // claim on both nodes is lost.
+    {
+        Service s1(c1, cluster.keys(), test_durability_window);
+        Service s2(c2, cluster.keys(), test_durability_window);
+        s1.start();
+        s2.start();
+        REQUIRE(wait_until(
+            [&] {
+                return s1.metadata_manager().snapshot().retention_baseline_complete &&
+                       s2.metadata_manager().snapshot().retention_baseline_complete;
+            },
+            30s));
+        REQUIRE(converged(s1, s2));
+        s2.stop();
+        s1.stop();
+    }
+    std::filesystem::remove_all(c1.state_path / "retention");
+    std::filesystem::remove_all(c2.state_path / "retention");
+
+    Service s1(c1, cluster.keys(), test_durability_window);
+    Service s2(c2, cluster.keys(), test_durability_window);
+    s1.start();
+    s2.start();
+    REQUIRE(wait_metadata_writable(s1));
+    REQUIRE(converged(s1, s2));
+    const auto tree = reachable_tree_nodes(s1);
+    REQUIRE(tree.size() > 1);
+    REQUIRE(reachable_tree_nodes(s2) == tree);
+    for (Service* service : {&s1, &s2})
+        for (const auto& node : tree) {
+            REQUIRE(service->local_state().control().has(node));
+            REQUIRE(!service->local_state().retention().retained(RetentionClass::control, node));
+        }
+
+    // An orphan on each node: once the collector has swept it, it has swept
+    // everything it holds unreferenced.
+    std::vector<std::pair<Service*, ObjectId>> orphans;
+    for (Service* service : {&s1, &s2}) {
+        Bytes orphan = pattern(4096, static_cast<uint8_t>(orphans.size() + 90));
+        const auto id = object_id(orphan);
+        REQUIRE(service->local_state().control().put(id, orphan));
+        orphans.emplace_back(service, id);
+    }
+    const auto swept = [&] {
+        return std::none_of(orphans.begin(), orphans.end(), [](const auto& orphan) {
+            return orphan.first->local_state().control().has(orphan.second);
+        });
+    };
+    // The collector deletes only across a catalogue root change, so each
+    // round moves the root.
+    for (int round = 0; round < 20 && !swept(); ++round) {
+        CatalogueItem item;
+        item.id = "movie:round-" + std::to_string(round);
+        item.kind = CatalogueKind::movie;
+        item.title = "Round " + std::to_string(round);
+        (void)s1.catalogue().upsert(item);
+        (void)wait_until(swept, 5s);
+    }
+    REQUIRE(swept());
+
+    for (Service* service : {&s1, &s2}) {
+        for (const auto& node : tree)
+            CHECK(service->local_state().control().has(node));
+        CHECK(service->filesystem().readdir("/Shows").size() == 81);
+        CHECK(read_file(*service, "/Shows/film.mkv", film.size()) == film);
+    }
+    s2.stop();
+    s1.stop();
 }
 
 } // namespace

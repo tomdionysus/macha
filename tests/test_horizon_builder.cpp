@@ -171,6 +171,65 @@ MACHA_FAST_TEST("horizon_builder", test_inventory_is_both_live_sets_and_the_cata
     CHECK(build_inventory(namespace_objects, catalogue)->catalogue_complete());
 }
 
+// The namespace walk names the tree it read, extent spines included, and
+// those nodes join the catalogue's in the inventory's control set; a node it
+// cannot read throws rather than leave a shorter set.
+MACHA_FAST_TEST("horizon_builder", test_inventory_control_set_holds_the_namespace_tree) {
+    MemoryNamespaceNodeStore nodes;
+    std::map<std::string, FsEntry> entries;
+    for (int i = 0; i < 200; ++i)
+        entries["/d" + std::to_string(i)] = directory();
+    FsEntry long_file;
+    long_file.type = EntryType::file;
+    for (uint64_t i = 0; i < 40; ++i) {
+        ExtentRef ref;
+        ref.offset = i * 10;
+        ref.length = 10;
+        ref.id = id(static_cast<uint8_t>(100 + i));
+        long_file.extents.push_back(ref);
+    }
+    entries["/long"] = long_file;
+    MetadataSnapshot snapshot;
+    snapshot.namespace_root = build_namespace_tree(entries, nodes);
+
+    std::vector<ObjectId> walked;
+    size_t visited = 0;
+    for_each_namespace_entry(
+        snapshot, &nodes, [&](const std::string&, const FsEntry&) { ++visited; }, walked);
+    CHECK(visited == entries.size());
+    std::vector<ObjectId> expected;
+    collect_namespace_tree_nodes(*snapshot.namespace_root, nodes, expected);
+    std::sort(walked.begin(), walked.end());
+    std::sort(expected.begin(), expected.end());
+    CHECK(walked == expected);
+    CHECK(walked.size() == nodes.nodes());
+    CHECK(walked.size() > 2);
+
+    MaintenanceObjects namespace_objects;
+    namespace_objects.namespace_nodes = walked;
+    CatalogueMaintenance catalogue;
+    catalogue.control_live = {id(7)};
+    const auto inventory = build_inventory(namespace_objects, catalogue);
+    CHECK(inventory->size(RetentionClass::control) == walked.size() + 1);
+    CHECK(inventory->referenced(RetentionClass::control, id(7)));
+    for (const auto& node : walked)
+        CHECK(inventory->referenced(RetentionClass::control, node));
+
+    // A node served once: the second walk reaches a node it cannot read.
+    OnceNodeStore once(nodes);
+    std::vector<ObjectId> first;
+    for_each_namespace_entry(snapshot, &once, [](const std::string&, const FsEntry&) {}, first);
+    bool threw = false;
+    std::vector<ObjectId> second;
+    try {
+        for_each_namespace_entry(snapshot, &once, [](const std::string&, const FsEntry&) {},
+                                 second);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 MACHA_FAST_TEST("horizon_builder", test_release_over_a_tree_matches_the_pass_build) {
     MemoryNamespaceNodeStore nodes;
     const std::map<std::string, FsEntry> entries{

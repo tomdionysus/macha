@@ -2391,14 +2391,20 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     };
     // The reachability walk GC trusts. for_each_namespace_entry walks a
     // tree-backed namespace; an empty live set would make every extent look
-    // unreachable.
+    // unreachable. The same walk names the tree's nodes, the namespace's own
+    // control objects, and throws on any it cannot read.
     auto namespace_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     size_t walked_entries = 0;
-    for_each_namespace_entry(snapshot, &namespace_nodes,
-                             [&](const std::string&, const FsEntry& entry) {
-                                 ++walked_entries;
-                                 add_entry_extents(entry);
-                             });
+    std::vector<ObjectId> tree_nodes;
+    for_each_namespace_entry(
+        snapshot, &namespace_nodes,
+        [&](const std::string&, const FsEntry& entry) {
+            ++walked_entries;
+            add_entry_extents(entry);
+        },
+        tree_nodes);
+    std::sort(tree_nodes.begin(), tree_nodes.end());
+    tree_nodes.erase(std::unique(tree_nodes.begin(), tree_nodes.end()), tree_nodes.end());
 
     // Unresolved conflict alternatives are reachability roots until resolved;
     // their extents are counted and protected from GC.
@@ -2433,6 +2439,7 @@ std::shared_ptr<const MaintenanceObjects> FileSystem::maintenance_objects_cached
     auto built = std::make_shared<MaintenanceObjects>();
     built->live = std::move(live);
     built->garbage = std::move(garbage);
+    built->namespace_nodes = std::move(tree_nodes);
     built->metadata_generation = view.generation;
     built->observed_mutations = snapshot.mutation_sequences;
     // Counted during the walk: a tree-backed snapshot has no map to size.

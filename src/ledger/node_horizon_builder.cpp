@@ -12,7 +12,11 @@ std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects
                                                         const CatalogueMaintenance& catalogue) {
     std::vector<ObjectId> data = namespace_objects.live;
     data.insert(data.end(), catalogue.live.begin(), catalogue.live.end());
+    // The namespace tree's nodes are as live as the catalogue's objects:
+    // without them the collector would delete the namespace.
     std::vector<ObjectId> control(catalogue.control_live.begin(), catalogue.control_live.end());
+    control.insert(control.end(), namespace_objects.namespace_nodes.begin(),
+                   namespace_objects.namespace_nodes.end());
     return std::make_shared<const InventoryHorizon>(namespace_objects.metadata_generation,
                                                     catalogue.complete, std::move(data),
                                                     std::move(control), namespace_objects.garbage);
