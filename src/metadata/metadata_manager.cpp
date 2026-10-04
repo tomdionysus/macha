@@ -1180,6 +1180,15 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             continue; // re-read heads now that we hold the lock; may already be resolved
         }
         const auto reconcile_started = Clock::now();
+        // Where a reconciliation's time goes, stage by stage.
+        auto stage_started = reconcile_started;
+        const auto stage_ms = [&] {
+            const auto now = Clock::now();
+            const auto ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - stage_started).count();
+            stage_started = now;
+            return ms;
+        };
 
         if (compatible_replicas(nodes).size() < need)
             throw MetadataNotReady(
@@ -1201,6 +1210,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         auto right_materialized = local_.replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
             throw MetadataNotReady("metadata merge head cannot be materialized");
+        const auto materialise_ms = stage_ms();
         // Three trees merge by what differs between them. A branch still held
         // as a map is materialised with the others, and the result re-rooted.
         const auto& base_snapshot = *base_materialized->snapshot;
@@ -1240,6 +1250,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
+        const auto merge_ms = stage_ms();
 
         // The lower hash is the primary parent so every reconciler of the same
         // head pair produces the same merge commit. A merge is a pure join, not a
@@ -1265,6 +1276,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                 merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
         }
 
+        const auto tree_ms = stage_ms();
         MetadataRecord reconciliation;
         reconciliation.generation = std::max(left.generation, right.generation) + 1;
         reconciliation.previous = left.hash;
@@ -1289,7 +1301,9 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             if (encoded.size() < reconciliation.payload.size())
                 reconciliation_delta = std::move(encoded);
         }
+        const auto encode_ms = stage_ms();
         (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
+        const auto publish_ms = stage_ms();
         if (merged.conflicts_superseded)
             conflicts_superseded_.fetch_add(merged.conflicts_superseded, std::memory_order_relaxed);
         const auto reconcile_us = elapsed_us(reconcile_started);
@@ -1297,6 +1311,11 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         Log::info("metadata histories reconciled generation=" +
                   std::to_string(reconciliation.generation) +
                   " ms=" + std::to_string(reconcile_us / 1000) +
+                  " materialise_ms=" + std::to_string(materialise_ms) +
+                  " merge_ms=" + std::to_string(merge_ms) +
+                  " tree_ms=" + std::to_string(tree_ms) +
+                  " encode_ms=" + std::to_string(encode_ms) +
+                  " publish_ms=" + std::to_string(publish_ms) +
                   " history_body=" +
                   std::string(reconciliation_delta.empty() ? "full" : "delta") +
                   " history_bytes=" +
