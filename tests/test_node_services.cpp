@@ -318,7 +318,7 @@ MACHA_TEST("node_services", test_a_node_without_streaming_says_it_cannot_profile
     const auto media_id = file_media_id(fs.getattr("/film.mkv"));
     const auto answered = services.catalogue_api().handle(
         request("GET", "/api/v1/catalogue/media/" + media_id + "/profile"));
-    CHECK(answered.status == 503);
+    CHECK(answered.status == 404);
     CHECK(text_of(answered).find("media_engine_unavailable") != std::string::npos);
     CHECK(!services.catalogue().media_profile(media_id).has_value());
 }
