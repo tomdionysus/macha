@@ -68,7 +68,7 @@ std::vector<std::string> record_lifecycle(std::string_view node) {
         events.emplace_back(event);
     };
     {
-        Service service(config, keys, {}, {}, {}, instruments);
+        Service service(config, keys, test_durability_window, {}, {}, {}, instruments);
         service.start();
         REQUIRE(wait_until([&] { return service.ready(); }, 60s));
         service.stop();

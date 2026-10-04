@@ -141,7 +141,7 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
     {
         // Destroyed, not merely stopped: a stopped Service still holds the
         // storage lock the migration needs.
-        Service service(config, cluster.keys());
+        Service service(config, cluster.keys(), test_durability_window);
         service.start();
         node_id = service.node().node_id();
         service.filesystem().mkdir("/TV", 0755, getuid(), getgid());
@@ -171,7 +171,7 @@ MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_lib
     }
 
     // A new Service over the same state directory: the node restarting.
-    Service service(config, cluster.keys());
+    Service service(config, cluster.keys(), test_durability_window);
     service.start();
     (void)service.filesystem();
 
@@ -224,7 +224,7 @@ MACHA_TEST("namespace_migration", test_every_node_computes_the_same_record_from_
     auto config = cluster.node_config("migrate-agree");
     make_solo(config);
     {
-        Service service(config, cluster.keys());
+        Service service(config, cluster.keys(), test_durability_window);
         service.start();
         service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
         write_file(service, "/Films/a.mkv", pattern(128 * 1024, 5));
@@ -264,7 +264,7 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
     make_solo(config);
     NodeId node_id{};
     {
-        Service service(config, cluster.keys());
+        Service service(config, cluster.keys(), test_durability_window);
         service.start();
         node_id = service.node().node_id();
         service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
@@ -300,7 +300,7 @@ MACHA_TEST("namespace_migration", test_a_migration_refuses_what_it_cannot_re_roo
         floor_config.metadata_min_write_replicas = 1;
         NodeId floor_node{};
         {
-            Service service(floor_config, floor_cluster.keys());
+            Service service(floor_config, floor_cluster.keys(), test_durability_window);
             service.start();
             floor_node = service.node().node_id();
             service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
@@ -341,7 +341,7 @@ MACHA_TEST("namespace_migration", test_the_pre_migration_state_is_kept_not_delet
     make_solo(config);
     NodeId node_id{};
     {
-        Service service(config, cluster.keys());
+        Service service(config, cluster.keys(), test_durability_window);
         service.start();
         node_id = service.node().node_id();
         service.filesystem().mkdir("/Films", 0755, getuid(), getgid());

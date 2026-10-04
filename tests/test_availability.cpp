@@ -726,8 +726,8 @@ MACHA_TEST("availability", test_two_nodes_survey_what_neither_holds) {
         config->torrent.enabled = false;
     }
 
-    Service first(first_config, cluster.keys());
-    Service second(second_config, cluster.keys());
+    Service first(first_config, cluster.keys(), test_durability_window);
+    Service second(second_config, cluster.keys(), test_durability_window);
     first.start();
     second.start();
     (void)first.filesystem();
