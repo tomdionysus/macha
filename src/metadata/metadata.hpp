@@ -31,6 +31,19 @@ struct FsEntry {
     std::vector<ExtentRef> extents;
     auto operator<=>(const FsEntry&) const = default;
 };
+// One mutation of one author. Zero is no dot.
+struct MetadataDot {
+    NodeId author{};
+    uint64_t sequence{};
+    explicit operator bool() const noexcept { return sequence != 0; }
+    auto operator<=>(const MetadataDot&) const = default;
+};
+// Whether a head with this clock has incorporated the mutation.
+inline bool clock_covers(const std::map<NodeId, uint64_t>& clock, const MetadataDot& dot) {
+    const auto found = clock.find(dot.author);
+    return found != clock.end() && found->second >= dot.sequence;
+}
+
 struct GarbageRef {
     ObjectId id{};
     // Wall-clock retirement time. Zero (legacy formats) is stamped by
@@ -435,6 +448,10 @@ class MetadataReplica {
     std::filesystem::path heads_p_;
     std::filesystem::path checkpoint_proof_p_;
     std::filesystem::path mutation_sequence_p_;
+    std::filesystem::path author_p_;
+    // Present from the moment the head set is replaced until the next
+    // mutation takes a new author id.
+    std::filesystem::path author_chain_broken_p_;
     std::filesystem::path recovery_p_;
     std::array<uint8_t, 32> key_;
     // Held across journal appends, heads and checkpoint writes and their
@@ -484,8 +501,26 @@ class MetadataReplica {
     std::optional<HistoryCheckpointProof> checkpoint_proof_ MACHA_GUARDED_BY(m_);
     std::optional<MetadataHistoryEntry> pending_history_ MACHA_GUARDED_BY(m_);
     bool pending_recovered_ MACHA_GUARDED_BY(m_){};
-    bool mutation_sequence_loaded_ MACHA_GUARDED_BY(m_){};
-    uint64_t mutation_sequence_ MACHA_GUARDED_BY(m_){};
+    // This node as an author of mutations. One author's commits form a
+    // chain: each extends a head that already carries the one before. When
+    // that cannot be shown (state restored from an older copy, a recovery
+    // from a seed, a re-root) the node takes a new author id and starts
+    // again at 1, so a head's clock entry for an author always means "every
+    // mutation of that author up to here".
+    struct Author {
+        NodeId id{};
+        // Highest sequence handed out, and highest this node has had accepted.
+        uint64_t reserved{};
+        uint64_t accepted{};
+        // Earlier ids of this node, newest first.
+        std::vector<NodeId> past;
+    };
+    bool author_loaded_ MACHA_GUARDED_BY(m_){};
+    Author author_ MACHA_GUARDED_BY(m_);
+    void load_author_locked(const NodeId& node_id, const std::map<NodeId, uint64_t>& head_clock)
+        MACHA_REQUIRES(m_);
+    void persist_author_locked() MACHA_REQUIRES(m_);
+    void rotate_author_locked(std::string_view why) MACHA_REQUIRES(m_);
     size_t journal_records_ MACHA_GUARDED_BY(m_){};
     uint64_t journal_bytes_ MACHA_GUARDED_BY(m_){};
     size_t history_records_ MACHA_GUARDED_BY(m_){};
@@ -568,7 +603,16 @@ class MetadataReplica {
     bool recovery_required() const;
     void mark_recovered();
 
-    uint64_t reserve_mutation_sequence(uint64_t observed_floor);
+    // The dot for this node's next mutation on a head with `head_clock`:
+    // its author id (the node id until the chain is first broken) and the
+    // next sequence, durable before it returns.
+    MetadataDot reserve_mutation_dot(const NodeId& node_id,
+                                     const std::map<NodeId, uint64_t>& head_clock);
+    // A commit carrying this dot was accepted here.
+    void note_author_accepted(const MetadataDot&);
+    // This node's author ids, the current one first.
+    std::vector<NodeId> author_ids(const NodeId& node_id,
+                                   const std::map<NodeId, uint64_t>& head_clock);
     bool cas(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool cas_delta(uint64_t, const Hash256&, std::span<const uint8_t>, MetadataRecord*);
     bool install_committed_delta(uint64_t, const Hash256&, std::span<const uint8_t>,

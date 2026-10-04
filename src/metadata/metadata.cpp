@@ -28,7 +28,8 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     SM15{'D', 'H', 'T', 'M', 'E', 'T', 'B', '5'}, SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
-    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'};
+    MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'},
+    MAUTHOR{'D', 'H', 'T', 'M', 'A', 'U', 'T', '1'};
 constexpr uint8_t JOURNAL_PREPARE_FULL = 1, JOURNAL_PREPARE_DELTA = 2, JOURNAL_SEED_FULL = 3,
                   JOURNAL_COMMIT = 4;
 
@@ -2258,6 +2259,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
       history_p_(r / "metadata" / "history.log"), heads_p_(r / "metadata" / "heads.meta"),
       checkpoint_proof_p_(r / "metadata" / "checkpoint-proof.meta"),
       mutation_sequence_p_(r / "metadata" / "mutation-sequence.meta"),
+      author_p_(r / "metadata" / "author.meta"),
+      author_chain_broken_p_(r / "metadata" / "author-chain-broken"),
       recovery_p_(r / "metadata" / "recovery.required"), key_(k),
       namespace_applier_(std::move(namespace_applier)),
       accept_pristine_genesis_authority_(accept_pristine_genesis_authority),
@@ -2388,6 +2391,8 @@ MetadataReplica::MetadataReplica(std::filesystem::path r, std::array<uint8_t, 32
 void MetadataReplica::recover_from_seed(const MetadataRecord& seed, const std::string& reason) {
     const auto stamp = ".corrupt." + std::to_string(wall_time_ns());
     durable_replace_file(recovery_p_, reason);
+    // The seed may predate this node's own commits.
+    durable_replace_file(author_chain_broken_p_, reason);
 
     std::vector<std::filesystem::path> quarantined;
     for (const auto& path :
@@ -2470,52 +2475,142 @@ void MetadataReplica::mark_recovered() {
               std::to_string(committed_.generation));
 }
 
-uint64_t MetadataReplica::reserve_mutation_sequence(uint64_t observed_floor) {
-    Lock lock(m_);
-    if (!mutation_sequence_loaded_) {
-        mutation_sequence_ = 0;
-        if (std::filesystem::exists(mutation_sequence_p_)) {
-            try {
-                std::ifstream stream(mutation_sequence_p_, std::ios::binary);
-                if (!stream)
-                    throw std::runtime_error("cannot open");
-                Bytes bytes(std::istreambuf_iterator<char>(stream), {});
-                Reader reader(bytes);
-                auto magic = reader.raw(MS.size());
-                if (!std::equal(magic.begin(), magic.end(), MS.begin()))
-                    throw std::runtime_error("bad metadata mutation-sequence file header");
-                auto nonce = reader.fixed<12>();
-                auto tag = reader.fixed<16>();
-                auto ciphertext = reader.bytes();
-                reader.finish();
-                auto plaintext = aes_gcm_open(key_, nonce, tag, ciphertext, MS);
-                Reader plain(plaintext);
-                mutation_sequence_ = plain.u64();
-                plain.finish();
-            } catch (const std::exception& error) {
-                throw std::runtime_error("metadata mutation-sequence file " +
-                                         mutation_sequence_p_.string() + ": " + error.what());
-            }
+void MetadataReplica::load_author_locked(const NodeId& node_id,
+                                         const std::map<NodeId, uint64_t>& head_clock) {
+    if (author_loaded_)
+        return;
+    author_ = {};
+    const auto open_sealed = [&](const std::filesystem::path& path,
+                                 const std::array<uint8_t, 8>& magic) {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream)
+            throw std::runtime_error("cannot open");
+        Bytes bytes(std::istreambuf_iterator<char>(stream), {});
+        Reader reader(bytes);
+        auto found = reader.raw(magic.size());
+        if (!std::equal(found.begin(), found.end(), magic.begin()))
+            throw std::runtime_error("bad file header");
+        auto nonce = reader.fixed<12>();
+        auto tag = reader.fixed<16>();
+        auto ciphertext = reader.bytes();
+        reader.finish();
+        return aes_gcm_open(key_, nonce, tag, ciphertext, magic);
+    };
+    if (std::filesystem::exists(author_p_)) {
+        try {
+            const auto plaintext = open_sealed(author_p_, MAUTHOR);
+            Reader plain(plaintext);
+            author_.id.bytes = plain.fixed<16>();
+            author_.reserved = plain.u64();
+            author_.accepted = plain.u64();
+            const auto past = plain.u32();
+            if (past > 64)
+                throw std::runtime_error("too many past author ids");
+            for (uint32_t i = 0; i < past; ++i)
+                author_.past.push_back(NodeId{plain.fixed<16>()});
+            plain.finish();
+        } catch (const std::exception& error) {
+            throw std::runtime_error("metadata author file " + author_p_.string() + ": " +
+                                     error.what());
         }
-        mutation_sequence_loaded_ = true;
+    } else if (std::filesystem::exists(mutation_sequence_p_)) {
+        // The sequence counter this file replaces: the author is the node.
+        try {
+            const auto plaintext = open_sealed(mutation_sequence_p_, MS);
+            Reader plain(plaintext);
+            author_.id = node_id;
+            author_.reserved = plain.u64();
+            plain.finish();
+        } catch (const std::exception& error) {
+            throw std::runtime_error("metadata mutation-sequence file " +
+                                     mutation_sequence_p_.string() + ": " + error.what());
+        }
+        author_loaded_ = true;
+        persist_author_locked();
+        std::error_code ignored;
+        std::filesystem::remove(mutation_sequence_p_, ignored);
+    } else {
+        // No record of what this node has authored. If a head says it has
+        // authored before, that record was lost: it may not continue the
+        // old author's sequence.
+        author_.id = head_clock.contains(node_id) ? random_node_id() : node_id;
+        if (author_.id != node_id) {
+            author_.past.push_back(node_id);
+            Log::warn("metadata author record missing; authoring as a new author");
+        }
+        author_loaded_ = true;
+        persist_author_locked();
     }
+    author_loaded_ = true;
+}
 
-    const auto floor = std::max(mutation_sequence_, observed_floor);
-    if (floor == std::numeric_limits<uint64_t>::max())
-        throw std::runtime_error("metadata mutation sequence exhausted");
-    const auto next = floor + 1;
-
+void MetadataReplica::persist_author_locked() {
     Writer plain;
-    plain.u64(next);
-    auto sealed = aes_gcm_seal(key_, plain.data(), MS);
+    plain.fixed(author_.id.bytes);
+    plain.u64(author_.reserved);
+    plain.u64(author_.accepted);
+    plain.u32(static_cast<uint32_t>(author_.past.size()));
+    for (const auto& id : author_.past)
+        plain.fixed(id.bytes);
+    auto sealed = aes_gcm_seal(key_, plain.data(), MAUTHOR);
     Writer file;
-    file.raw(MS);
+    file.raw(MAUTHOR);
     file.fixed(sealed.nonce);
     file.fixed(sealed.tag);
     file.bytes(sealed.ciphertext);
-    writefile(mutation_sequence_p_, file.data());
-    mutation_sequence_ = next;
-    return next;
+    writefile(author_p_, file.data());
+}
+
+void MetadataReplica::rotate_author_locked(std::string_view why) {
+    author_.past.insert(author_.past.begin(), author_.id);
+    if (author_.past.size() > 64)
+        author_.past.resize(64);
+    author_.id = random_node_id();
+    author_.reserved = 0;
+    author_.accepted = 0;
+    Log::warn("metadata author chain cannot be continued (" + std::string(why) +
+              "); authoring as a new author");
+}
+
+MetadataDot MetadataReplica::reserve_mutation_dot(const NodeId& node_id,
+                                                  const std::map<NodeId, uint64_t>& head_clock) {
+    Lock lock(m_);
+    load_author_locked(node_id, head_clock);
+    const auto observed_of = [&]() MACHA_REQUIRES(m_) {
+        const auto found = head_clock.find(author_.id);
+        return found == head_clock.end() ? uint64_t{0} : found->second;
+    };
+    const bool marked = std::filesystem::exists(author_chain_broken_p_);
+    if (marked)
+        rotate_author_locked("the head set was replaced");
+    else if (observed_of() < author_.accepted)
+        rotate_author_locked("the head lacks a mutation this node had accepted");
+
+    const auto floor = std::max(author_.reserved, observed_of());
+    if (floor == std::numeric_limits<uint64_t>::max())
+        throw std::runtime_error("metadata mutation sequence exhausted");
+    author_.reserved = floor + 1;
+    persist_author_locked();
+    if (marked) {
+        std::error_code ignored;
+        std::filesystem::remove(author_chain_broken_p_, ignored);
+    }
+    return {author_.id, author_.reserved};
+}
+
+void MetadataReplica::note_author_accepted(const MetadataDot& dot) {
+    Lock lock(m_);
+    if (author_loaded_ && dot.author == author_.id)
+        author_.accepted = std::max(author_.accepted, dot.sequence);
+}
+
+std::vector<NodeId> MetadataReplica::author_ids(const NodeId& node_id,
+                                                const std::map<NodeId, uint64_t>& head_clock) {
+    Lock lock(m_);
+    load_author_locked(node_id, head_clock);
+    std::vector<NodeId> ids{author_.id};
+    ids.insert(ids.end(), author_.past.begin(), author_.past.end());
+    return ids;
 }
 
 void MetadataReplica::append_journal(uint8_t kind, const MetadataRecord& record,
@@ -4544,6 +4639,7 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     Lock lock(m_);
 
     const auto stamp = ".pre-migration." + std::to_string(wall_time_ns());
+    durable_replace_file(author_chain_broken_p_, reason);
     std::vector<std::filesystem::path> quarantined;
     for (const auto& path :
          {checkpoint_p_, journal_p_, history_p_, heads_p_, checkpoint_proof_p_, p_, committed_p_}) {
