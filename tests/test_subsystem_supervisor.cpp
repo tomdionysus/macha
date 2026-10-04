@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Fault injection for SubsystemSupervisor over real plugins loaded by dlopen. A
-// plugin whose construction or start() throws degrades to a per-subsystem
+// SubsystemSupervisor: what discovery makes of each kind of file it dlopens,
+// and how one entry's lifecycle settles, driven by scripted builtins. A
+// subsystem whose construction or start() throws degrades to a per-subsystem
 // faulted/disabled state; an escaped exception would crash the case's process.
+// Retry policies use a zero backoff, so no outcome waits on real time.
 #include "subsystem/subsystem_supervisor.hpp"
 #include "test_backend_support.hpp" // ConcurrentCapturingLogger
 
 #include <atomic>
 #include <condition_variable>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -27,345 +30,258 @@ void copy_plugin(const std::filesystem::path& source, const std::filesystem::pat
     REQUIRE(!ec);
 }
 
+SubsystemRetryPolicy immediate_retries(size_t max_failures) {
+    SubsystemRetryPolicy policy;
+    policy.max_failures_in_window = max_failures;
+    policy.failure_window = 1h;
+    policy.initial_backoff = 0ms;
+    policy.max_backoff = 0ms;
+    return policy;
+}
+
+// The single entry's status once it reaches `state` after `restarts`
+// rebuilds; nullopt if it never does.
+std::optional<SubsystemStatus> settle_on(const SubsystemSupervisor& supervisor,
+                                         SubsystemState state, size_t restarts) {
+    std::optional<SubsystemStatus> settled;
+    (void)wait_until([&] {
+        const auto statuses = supervisor.statuses();
+        if (statuses.size() == 1 && statuses.front().state == state &&
+            statuses.front().restart_count == restarts)
+            settled = statuses.front();
+        return settled.has_value();
+    });
+    return settled;
+}
+
+bool logged(const ConcurrentCapturingLogger& capture, LogLevel level,
+            std::initializer_list<std::string_view> parts) {
+    for (const auto& [record_level, message] : capture.records()) {
+        if (record_level != level)
+            continue;
+        if (std::all_of(parts.begin(), parts.end(), [&](std::string_view part) {
+                return message.find(part) != std::string::npos;
+            }))
+            return true;
+    }
+    return false;
+}
+
+// A builtin subsystem whose start() may report a fault through its sink, and
+// which records its lifecycle into a shared journal.
+struct Journal {
+    std::mutex mutex;
+    std::vector<std::string> events;
+    void add(std::string event) {
+        std::lock_guard lock(mutex);
+        events.push_back(std::move(event));
+    }
+    std::vector<std::string> read() {
+        std::lock_guard lock(mutex);
+        return events;
+    }
+};
+
+class ScriptedSubsystem final : public Subsystem {
+    Journal& journal_;
+    int number_;
+    bool fault_in_start_;
+    FaultSink sink_;
+
+  public:
+    ScriptedSubsystem(Journal& journal, int number, bool fault_in_start)
+        : journal_(journal), number_(number), fault_in_start_(fault_in_start) {
+        journal_.add("create " + std::to_string(number_));
+    }
+    ~ScriptedSubsystem() override { journal_.add("destroy " + std::to_string(number_)); }
+    std::string_view name() const noexcept override { return "scripted"; }
+    void attach_fault_sink(FaultSink sink) override { sink_ = std::move(sink); }
+    void start() override {
+        journal_.add("start " + std::to_string(number_));
+        if (fault_in_start_ && sink_)
+            sink_("instance " + std::to_string(number_) + " lost its work");
+    }
+    void stop() override { journal_.add("stop " + std::to_string(number_)); }
+};
+
 } // namespace
 
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_loads_and_stops_a_real_plugin) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_OK, dir.path());
+// Each kind of file in the plugin directory, loaded through dlopen as in
+// production: a plugin's exceptions and fault reports cross the library
+// boundary and settle the entry like a builtin's.
+MACHA_FAST_TEST("subsystem_supervisor", test_plugin_discovery_settles_each_kind_of_file) {
+    struct Row {
+        const char* what;
+        const char* plugin;      // copied into the directory; null for none
+        bool directory_exists;
+        std::optional<SubsystemState> settles_on; // nullopt: no Status entry
+        bool retried;            // restart_count beyond the failure budget
+        const char* fault;       // in last_fault; null for none
+        const char* info_log;    // an INFO line naming the plugin; null for none
+    };
+    const std::vector<Row> rows{
+        {"a working plugin runs", MACHA_TEST_PLUGIN_OK, true, SubsystemState::running, false,
+         nullptr, "loaded and running"},
+        {"a declining plugin is unavailable, never retried", MACHA_TEST_PLUGIN_DECLINING, true,
+         SubsystemState::unavailable, false, nullptr, "not enabled on this node"},
+        {"a plugin whose start() throws is disabled", MACHA_TEST_PLUGIN_FAULTING, true,
+         SubsystemState::disabled, true, "always fails to start", nullptr},
+        {"a plugin that keeps faulting after start is disabled",
+         MACHA_TEST_PLUGIN_FAULTING_AFTER_START, true, SubsystemState::disabled, true,
+         "lost its work", nullptr},
+        {"a plugin built for another core is refused", MACHA_TEST_PLUGIN_MISMATCHED_ABI, true,
+         SubsystemState::disabled, false, nullptr, nullptr},
+        {"a library without the entry symbol is not a plugin", MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL,
+         true, std::nullopt, false, nullptr, nullptr},
+        {"an empty directory loads nothing", nullptr, true, std::nullopt, false, nullptr, nullptr},
+        {"a missing directory loads nothing", nullptr, false, std::nullopt, false, nullptr,
+         nullptr},
+    };
+    const auto policy = immediate_retries(2);
 
-    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
-    Log::set_logger(capture);
+    for (const auto& row : rows) {
+        std::cerr << "row: " << row.what << "\n";
+        TempDir temp;
+        const auto dir = temp.path() / "plugins";
+        if (row.directory_exists)
+            std::filesystem::create_directories(dir);
+        if (row.plugin)
+            copy_plugin(row.plugin, dir);
+        const auto stem = row.plugin ? std::filesystem::path(row.plugin).stem().string() : "";
 
-    SubsystemSupervisor supervisor(dir.path());
-    supervisor.start(SubsystemContext{});
+        auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
+        Log::set_logger(capture);
+        SubsystemSupervisor supervisor(dir, policy);
+        supervisor.start(SubsystemContext{});
 
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::running;
-    }));
+        if (!row.settles_on) {
+            CHECK(supervisor.statuses().empty());
+        } else if (row.settles_on == SubsystemState::disabled && !row.retried) {
+            // Refused at discovery, before any lifecycle thread or retry.
+            const auto statuses = supervisor.statuses();
+            REQUIRE(statuses.size() == 1);
+            CHECK(statuses[0].name == stem);
+            CHECK(statuses[0].state == SubsystemState::disabled);
+            CHECK(statuses[0].restart_count == 0);
+        } else {
+            const auto settled = settle_on(supervisor, *row.settles_on,
+                                           row.retried ? policy.max_failures_in_window + 1 : 0);
+            REQUIRE(settled.has_value());
+            CHECK(settled->name == stem);
+            if (row.fault)
+                CHECK(settled->last_fault.find(row.fault) != std::string::npos);
+            else
+                CHECK(settled->last_fault.empty());
+        }
+        if (row.info_log)
+            CHECK(logged(*capture, LogLevel::info, {stem, row.info_log, dir.string()}));
 
-    auto statuses = supervisor.statuses();
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].name == "test_plugin_ok");
-    CHECK(statuses[0].restart_count == 0);
-
-    // A successful load is logged at INFO, naming the file it came from.
-    bool announced = false;
-    for (const auto& [level, message] : capture->records()) {
-        if (level != LogLevel::info) continue;
-        if (message.find("test_plugin_ok") == std::string::npos) continue;
-        if (message.find("loaded and running") == std::string::npos) continue;
-        CHECK(message.find(dir.path().string()) != std::string::npos);
-        announced = true;
+        supervisor.stop();
+        CHECK(supervisor.statuses().empty());
+        Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
     }
-    CHECK(announced);
-
-    supervisor.stop();
-    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }
 
-MACHA_TEST("subsystem_supervisor",
-          test_subsystem_supervisor_disables_a_repeatedly_faulting_plugin) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_FAULTING, dir.path());
-
-    // A fast retry policy; production defaults would take tens of seconds.
-    SubsystemRetryPolicy policy;
-    policy.max_failures_in_window = 2;
-    policy.failure_window = 60s;
-    policy.initial_backoff = 5ms;
-    policy.max_backoff = 20ms;
-
-    SubsystemSupervisor supervisor(dir.path(), policy);
-    supervisor.start(SubsystemContext{});
-
-    // Reached without crashing, though the plugin's start() always throws.
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::disabled;
-    }, 5s));
-
-    auto statuses = supervisor.statuses();
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].name == "test_plugin_faulting");
-    CHECK(statuses[0].restart_count > policy.max_failures_in_window);
-    CHECK(statuses[0].last_fault.find("always fails to start") != std::string::npos);
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor",
-          test_subsystem_supervisor_reports_a_declining_plugin_as_unavailable) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_DECLINING, dir.path());
-
-    // A factory that returns no instance means the capability is configured
-    // off: it settles on `unavailable`, not `faulted`, and is never retried.
-    SubsystemRetryPolicy policy;
-    policy.max_failures_in_window = 2;
-    policy.initial_backoff = 5ms;
-    policy.max_backoff = 20ms;
-
-    auto capture = std::make_shared<ConcurrentCapturingLogger>(LogLevel::info);
-    Log::set_logger(capture);
-
-    SubsystemSupervisor supervisor(dir.path(), policy);
-    supervisor.start(SubsystemContext{});
-
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::unavailable;
-    }, 5s));
-
-    // Declining is decided once: the entry is never retried.
-    auto statuses = supervisor.statuses();
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].state == SubsystemState::unavailable);
-    CHECK(statuses[0].restart_count == 0);
-    CHECK(statuses[0].last_fault.empty());
-
-    // Declining is logged too, distinguishing "switched off" from "missing".
-    bool announced = false;
-    for (const auto& [level, message] : capture->records())
-        if (level == LogLevel::info && message.find("test_plugin_declining") != std::string::npos &&
-            message.find("not enabled on this node") != std::string::npos)
-            announced = true;
-    CHECK(announced);
-
-    supervisor.stop();
-    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
-}
-
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_refuses_a_mismatched_plugin) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_MISMATCHED_ABI, dir.path());
-
-    SubsystemSupervisor supervisor(dir.path());
-    supervisor.start(SubsystemContext{});
-
-    // Refused at discovery, before any lifecycle thread or retry.
-    auto statuses = supervisor.statuses();
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].name == "test_plugin_mismatched_abi");
-    CHECK(statuses[0].state == SubsystemState::disabled);
-    CHECK(statuses[0].restart_count == 0);
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor",
-          test_subsystem_supervisor_silently_skips_a_non_plugin_library) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_NO_ENTRY_SYMBOL, dir.path());
-
-    SubsystemSupervisor supervisor(dir.path());
-    supervisor.start(SubsystemContext{});
-
-    // A shared library without the entry symbol is not a plugin and gets no Status entry.
-    CHECK(supervisor.statuses().empty());
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_empty_directory_loads_nothing) {
-    TempDir dir;
-    SubsystemSupervisor supervisor(dir.path());
-    supervisor.start(SubsystemContext{});
-    CHECK(supervisor.statuses().empty());
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_missing_directory_loads_nothing) {
-    TempDir dir;
-    const auto missing = dir.path() / "does-not-exist";
-    SubsystemSupervisor supervisor(missing);
-    supervisor.start(SubsystemContext{});
-    CHECK(supervisor.statuses().empty());
-    supervisor.stop();
-}
-
-// Faults a running subsystem reports through its fault sink after start().
-
-MACHA_TEST("subsystem_supervisor",
-          test_subsystem_supervisor_rebuilds_a_subsystem_that_faults_after_starting) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_FAULTING_AFTER_START, dir.path());
-
-    // Room for several restarts, so the cycle is observable before `disabled`.
-    SubsystemRetryPolicy policy;
-    policy.max_failures_in_window = 20;
-    policy.failure_window = 60s;
-    policy.initial_backoff = 5ms;
-    policy.max_backoff = 20ms;
-
-    SubsystemSupervisor supervisor(dir.path(), policy);
-    supervisor.start(SubsystemContext{});
-
-    // It reaches `running` first; the fault comes later.
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::running;
-    }, 5s));
-
-    // Then it is rebuilt, with the subsystem's own reason recorded.
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].restart_count >= 1;
-    }, 5s));
-
-    auto statuses = supervisor.statuses();
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].last_fault.find("lost its work") != std::string::npos);
-
-    // The replacement runs: a fault is a restart, not a stop.
-    REQUIRE(wait_until([&] {
-        auto current = supervisor.statuses();
-        return current.size() == 1 && current[0].state == SubsystemState::running &&
-               current[0].restart_count >= 1;
-    }, 5s));
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor",
-          test_subsystem_supervisor_disables_a_subsystem_that_keeps_faulting_after_starting) {
-    TempDir dir;
-    copy_plugin(MACHA_TEST_PLUGIN_FAULTING_AFTER_START, dir.path());
-
-    // A subsystem that starts and immediately faults must not restart forever:
-    // a clean start resets the backoff but keeps the failure window.
-    SubsystemRetryPolicy policy;
-    policy.max_failures_in_window = 3;
-    policy.failure_window = 60s;
-    policy.initial_backoff = 5ms;
-    policy.max_backoff = 20ms;
-
-    SubsystemSupervisor supervisor(dir.path(), policy);
-    supervisor.start(SubsystemContext{});
-
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::disabled;
-    }, 10s));
-
-    auto statuses = supervisor.statuses();
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].restart_count > policy.max_failures_in_window);
-    CHECK(statuses[0].last_fault.find("lost its work") != std::string::npos);
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_supervises_a_builtin) {
-    // A builtin gets the same lifecycle as a plugin: retry/disable policy and Status entry.
-    TempDir dir; // no plugins in it, and no plugin directory is fine too.
-
-    SubsystemRetryPolicy policy;
-    policy.max_failures_in_window = 2;
-    policy.initial_backoff = 5ms;
-    policy.max_backoff = 20ms;
-
-    struct CountingSubsystem final : Subsystem {
-        std::atomic_int* started;
-        std::atomic_int* stopped;
-        explicit CountingSubsystem(std::atomic_int* s, std::atomic_int* t)
-            : started(s), stopped(t) {}
-        std::string_view name() const noexcept override { return "counting"; }
-        void start() override { ++*started; }
-        void stop() override { ++*stopped; }
+// One builtin's lifecycle from each kind of factory and instance: what Status
+// settles on, how often the factory is asked, and that a faulted instance is
+// stopped and destroyed before its replacement is built.
+MACHA_FAST_TEST("subsystem_supervisor", test_builtin_lifecycle_settles_each_outcome) {
+    struct Row {
+        const char* what;
+        // Whether the factory throws, declines, or builds an instance; and, per
+        // instance number (1-based), whether its start() reports a fault.
+        enum class Factory { builds, throws, declines } factory;
+        std::function<bool(int)> faults;
+        SubsystemState settles_on;
+        size_t factory_calls;
+        size_t restart_count;
+        const char* fault;
+        std::vector<std::string> journal; // up to and including stop()
+    };
+    const auto never = [](int) { return false; };
+    const auto always = [](int) { return true; };
+    const auto first_only = [](int number) { return number == 1; };
+    const std::vector<Row> rows{
+        {"an instance that starts cleanly runs until stopped", Row::Factory::builds, never,
+         SubsystemState::running, 1, 0, nullptr, {"create 1", "start 1", "stop 1", "destroy 1"}},
+        {"a factory that throws is retried, then disabled", Row::Factory::throws, never,
+         SubsystemState::disabled, 3, 3, "journal replay failed", {}},
+        {"a factory that declines is unavailable and never retried", Row::Factory::declines,
+         never, SubsystemState::unavailable, 1, 0, nullptr, {}},
+        {"an instance that faults after starting is rebuilt in place", Row::Factory::builds,
+         first_only, SubsystemState::running, 2, 1, "instance 1 lost its work",
+         {"create 1", "start 1", "stop 1", "destroy 1", "create 2", "start 2", "stop 2",
+          "destroy 2"}},
+        // A clean start resets the backoff but keeps the failure window.
+        {"an instance that keeps faulting after starting is disabled", Row::Factory::builds,
+         always, SubsystemState::disabled, 3, 3, "instance 3 lost its work",
+         {"create 1", "start 1", "stop 1", "destroy 1", "create 2", "start 2", "stop 2",
+          "destroy 2", "create 3", "start 3", "stop 3", "destroy 3"}},
     };
 
-    std::atomic_int started{};
-    std::atomic_int stopped{};
+    for (const auto& row : rows) {
+        std::cerr << "row: " << row.what << "\n";
+        Journal journal;
+        std::atomic_int calls{};
+        SubsystemSupervisor supervisor(std::filesystem::path{}, immediate_retries(2));
+        supervisor.add_builtin("fuse", [&](const SubsystemContext&) -> std::unique_ptr<Subsystem> {
+            const int number = ++calls;
+            switch (row.factory) {
+            case Row::Factory::throws:
+                throw std::runtime_error("journal replay failed");
+            case Row::Factory::declines:
+                return {};
+            case Row::Factory::builds:
+                break;
+            }
+            return std::make_unique<ScriptedSubsystem>(journal, number, row.faults(number));
+        });
+        supervisor.start(SubsystemContext{});
 
-    SubsystemSupervisor supervisor(dir.path() / "no-plugins-here", policy);
-    supervisor.add_builtin("fuse", [&](const SubsystemContext&) -> std::unique_ptr<Subsystem> {
-        return std::make_unique<CountingSubsystem>(&started, &stopped);
-    });
-    supervisor.start(SubsystemContext{});
+        const auto settled = settle_on(supervisor, row.settles_on, row.restart_count);
+        REQUIRE(settled.has_value());
+        CHECK(settled->name == "fuse");
+        if (row.fault)
+            CHECK(settled->last_fault == row.fault);
+        else
+            CHECK(settled->last_fault.empty());
 
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::running;
-    }, 5s));
-    CHECK(supervisor.statuses()[0].name == "fuse");
-    CHECK(started.load() == 1);
-
-    supervisor.stop();
-    CHECK(stopped.load() >= 1);
+        supervisor.stop();
+        CHECK(static_cast<size_t>(calls.load()) == row.factory_calls);
+        CHECK(journal.read() == row.journal);
+    }
 }
 
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_retries_a_builtin_that_cannot_start) {
-    // A builtin whose constructor throws faults that subsystem only; an
-    // escaped exception would crash the process rather than fail a CHECK.
-    SubsystemRetryPolicy policy;
-    policy.max_failures_in_window = 2;
-    policy.failure_window = 60s;
-    policy.initial_backoff = 5ms;
-    policy.max_backoff = 20ms;
-
-    SubsystemSupervisor supervisor(std::filesystem::path{}, policy);
-    supervisor.add_builtin("fuse", [](const SubsystemContext&) -> std::unique_ptr<Subsystem> {
-        throw std::runtime_error("journal replay failed");
-    });
-    supervisor.start(SubsystemContext{});
-
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::disabled;
-    }, 5s));
-    CHECK(supervisor.statuses()[0].last_fault.find("journal replay failed") != std::string::npos);
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_reports_a_declining_builtin) {
-    // "This node is not configured to mount" is not a fault: no instance, no
-    // retry, and Status says unavailable rather than disabled.
-    SubsystemSupervisor supervisor(std::filesystem::path{});
-    supervisor.add_builtin("fuse",
-                          [](const SubsystemContext&) -> std::unique_ptr<Subsystem> { return {}; });
-    supervisor.start(SubsystemContext{});
-
-    REQUIRE(wait_until([&] {
-        auto statuses = supervisor.statuses();
-        return statuses.size() == 1 && statuses[0].state == SubsystemState::unavailable;
-    }, 5s));
-    CHECK(supervisor.statuses()[0].restart_count == 0);
-
-    supervisor.stop();
-}
-
-MACHA_TEST("subsystem_supervisor", test_subsystem_supervisor_stops_while_a_factory_is_blocked) {
-    // A factory may block indefinitely (FuseFrontend waits for the first
-    // namespace); SubsystemContext::startup_stop lets stop() cancel it.
-    std::atomic_bool entered{};
+// A factory may block indefinitely (FuseFrontend waits for the first
+// namespace); SubsystemContext::startup_stop lets stop() cancel it.
+MACHA_FAST_TEST("subsystem_supervisor", test_stop_cancels_a_blocked_factory) {
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
     std::atomic_bool cancelled{};
 
     SubsystemSupervisor supervisor(std::filesystem::path{});
     supervisor.add_builtin("blocking", [&](const SubsystemContext& context)
                                            -> std::unique_ptr<Subsystem> {
-        entered.store(true);
-        // A cancellable wait that returns only when the token is requested.
         std::mutex mutex;
         std::condition_variable_any cv;
         std::unique_lock lock(mutex);
+        entered.set_value();
+        // A cancellable wait that returns only when the token is requested.
         cv.wait(lock, context.startup_stop, [] { return false; });
         cancelled.store(true);
         throw std::runtime_error("construction cancelled");
     });
     supervisor.start(SubsystemContext{});
+    REQUIRE(entered_future.wait_for(5s) == std::future_status::ready);
 
-    REQUIRE(wait_until([&] { return entered.load(); }, 5s));
-
-    const auto started = std::chrono::steady_clock::now();
+    // Without cancellation stop() joins a thread that never returns, and the
+    // case's deadline fails it.
     supervisor.stop();
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-
     CHECK(cancelled.load());
-    CHECK(elapsed < 2s);
 }
 
+// Kept integrated: the order is Service::stop's, the composition root's, and
+// the write that proves it lands in the real store.
 MACHA_TEST("subsystem_supervisor", test_service_stops_plugins_before_the_store) {
     // Plugins write into the store until they stop, so Service::stop stops
     // every plugin before it withdraws DATA admission and outbound RPC.

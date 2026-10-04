@@ -24,601 +24,518 @@ size_t regular_files_below(const std::filesystem::path& root) {
     return count;
 }
 
-MACHA_TEST("storage_v18", test_small_objects_are_packed_and_recover_after_restart) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
+std::array<uint8_t, 32> storage_key(const TempDir& t) {
+    const auto keyfile = t.path() / "key";
     write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
-
-    std::vector<std::pair<ObjectId, Bytes>> objects;
-    {
-        LocalStore store(t.path() / "store", options, keys.storage);
-        for (size_t i = 0; i < 40; ++i) {
-            auto data = pattern(48 * 1024 + i);
-            data[0] ^= static_cast<uint8_t>(i);
-            auto id = object_id(data);
-            REQUIRE(store.put(id, data));
-            objects.push_back({id, std::move(data)});
-        }
-
-        for (const auto& [id, data] : objects) {
-            REQUIRE(store.get(id).has_value());
-            CHECK(*store.get(id) == data);
-            CHECK(store.is_packed(id));
-        }
-        CHECK(regular_files_below(t.path() / "store" / "objects") == 0);
-        CHECK(regular_files_below(t.path() / "store" / "packs") < objects.size());
-    }
-
-    // The pack index is derived state. A clean restart must reconstruct it from
-    // durable pack records without any cluster metadata or external index.
-    {
-        LocalStore reopened(t.path() / "store", options, keys.storage);
-        for (const auto& [id, data] : objects) {
-            REQUIRE(reopened.get(id).has_value());
-            CHECK(*reopened.get(id) == data);
-            CHECK(reopened.is_packed(id));
-        }
-    }
+    return load_cluster_keys(keyfile).storage;
 }
 
-MACHA_TEST("storage_v18", test_pack_tombstones_and_compaction_preserve_live_objects) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
+LocalStoreOptions packed_options(uint64_t limit, uint64_t target_size) {
     LocalStoreOptions options;
-    options.limit = 96ULL * 1024 * 1024;
+    options.limit = limit;
     options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
+    options.pack_target_size = target_size;
+    return options;
+}
+
+std::filesystem::path only_pack(const std::filesystem::path& store) {
+    std::filesystem::path pack;
+    for (const auto& entry : std::filesystem::directory_iterator(store / "packs")) {
+        if (entry.is_regular_file()) {
+            REQUIRE(pack.empty());
+            pack = entry.path();
+        }
+    }
+    REQUIRE(!pack.empty());
+    return pack;
+}
+
+// One device operation held at its start until released, so a test can act
+// while it is provably in progress.
+class HeldOperation {
+    std::promise<void> entered_;
+    std::future<void> entered_future_ = entered_.get_future();
+    std::promise<void> release_;
+    std::shared_future<void> released_ = release_.get_future().share();
+    std::atomic_uint64_t calls_{};
+    std::atomic_bool released_once_{};
+    InterposedLocalStoreFiles* files_{};
+
+  public:
+    HeldOperation() = default;
+    HeldOperation(const HeldOperation&) = delete;
+    HeldOperation& operator=(const HeldOperation&) = delete;
+    // Releases a holder a failed check left waiting, and detaches from the device.
+    ~HeldOperation() {
+        release();
+        if (files_)
+            files_->before({});
+    }
+
+    // Holds the first call matching `op` (and `path`, if given); counts every
+    // matching call.
+    void hold(InterposedLocalStoreFiles& files, InterposedLocalStoreFiles::Op op,
+              std::filesystem::path path = {}) {
+        files_ = &files;
+        files.before([this, op, path](InterposedLocalStoreFiles::Op seen,
+                                      const std::filesystem::path& at) {
+            if (seen != op || (!path.empty() && at != path))
+                return;
+            if (calls_.fetch_add(1) == 0) {
+                entered_.set_value();
+                released_.wait();
+            }
+        });
+    }
+    bool entered() { return entered_future_.wait_for(2s) == std::future_status::ready; }
+    void release() {
+        if (!released_once_.exchange(true))
+            release_.set_value();
+    }
+    uint64_t calls() const { return calls_.load(); }
+};
+
+template <class T>
+bool ready(std::future<T>& future, std::chrono::milliseconds within = 2s) {
+    return future.wait_for(within) == std::future_status::ready;
+}
+
+} // namespace
+
+// The pack lifecycle on one store: small objects are packed, deletions are
+// tombstones, compaction reclaims dead space a bounded slice at a time (and
+// not at all once shutdown is requested), and a restart rebuilds the pack
+// index from the pack records alone.
+MACHA_FAST_TEST("storage_v18", test_packs_store_compact_and_survive_restart) {
+    TempDir t;
+    const auto key = storage_key(t);
+    const auto options = packed_options(128ULL * 1024 * 1024, 512 * 1024);
 
     std::vector<std::pair<ObjectId, Bytes>> live;
     std::vector<ObjectId> removed;
-    uint64_t before_compaction = 0;
     {
-        LocalStore store(t.path() / "store", options, keys.storage);
-        for (size_t i = 0; i < 48; ++i) {
-            auto data = pattern(64 * 1024 + i);
-            data[0] ^= static_cast<uint8_t>(i * 3);
-            auto id = object_id(data);
+        LocalStore store(t.path() / "store", options, key);
+        std::stop_source shutdown;
+        shutdown.request_stop();
+        CHECK(!store.compact_packs(shutdown.get_token()));
+
+        for (size_t i = 0; i < 40; ++i) {
+            auto data = pattern(96 * 1024 + i, static_cast<uint8_t>(17 + i));
+            const auto id = object_id(data);
             REQUIRE(store.put(id, data));
-            if (i % 2) {
-                live.push_back({id, std::move(data)});
-            } else {
+            CHECK(store.is_packed(id));
+            if (i % 2)
+                live.emplace_back(id, std::move(data));
+            else
                 removed.push_back(id);
-            }
         }
+        CHECK(regular_files_below(t.path() / "store" / "objects") == 0);
+        CHECK(regular_files_below(t.path() / "store" / "packs") < live.size() + removed.size());
+
         for (const auto& id : removed)
             REQUIRE(store.remove(id));
-        before_compaction = store.used();
+        // Dead packs remain after one bounded victim rewrite, so a second slice
+        // makes further progress; no call needs space for the whole corpus.
+        const auto before = store.used();
         REQUIRE(store.compact_packs());
-        CHECK(store.used() < before_compaction);
+        const auto after_one = store.used();
+        CHECK(after_one < before);
+        REQUIRE(store.compact_packs());
+        CHECK(store.used() < after_one);
         for (const auto& id : removed)
             CHECK(!store.has(id));
-        for (const auto& [id, data] : live) {
-            REQUIRE(store.get(id).has_value());
-            CHECK(*store.get(id) == data);
-        }
+        for (const auto& [id, data] : live)
+            CHECK(store.get(id) == std::optional<Bytes>{data});
     }
 
+    LocalStore reopened(t.path() / "store", options, key);
+    for (const auto& id : removed)
+        CHECK(!reopened.has(id));
+    for (const auto& [id, data] : live) {
+        CHECK(reopened.get(id) == std::optional<Bytes>{data});
+        CHECK(reopened.is_packed(id));
+    }
+}
+
+// Admission: the free-space reserve refuses a put before the filesystem is
+// exhausted; a pool falls through to a backend with room; r=1 logical
+// capacity is the sum of the nodes, not the smallest.
+MACHA_FAST_TEST("storage_v18", test_admission_respects_reserve_and_capacity) {
+    TempDir t;
+    const auto key = storage_key(t);
     {
-        LocalStore reopened(t.path() / "store", options, keys.storage);
-        for (const auto& id : removed)
-            CHECK(!reopened.has(id));
-        for (const auto& [id, data] : live) {
-            REQUIRE(reopened.get(id).has_value());
-            CHECK(*reopened.get(id) == data);
-        }
+        LocalStoreOptions options;
+        options.limit = 64ULL * 1024 * 1024;
+        options.reserve_free = std::numeric_limits<uint64_t>::max();
+        options.pack_threshold = 0;
+        options.pack_target_size = 0;
+        LocalStore store(t.path() / "reserved", options, key);
+        auto data = pattern(128 * 1024, 31);
+        const auto id = object_id(data);
+        CHECK(!store.put(id, data));
+        CHECK(!store.has(id));
+        CHECK(store.used() == 0);
     }
-}
-
-MACHA_TEST("storage_v18", test_pack_compaction_reclaims_dead_space_incrementally) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 128ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 512 * 1024;
-
-    LocalStore store(t.path() / "store", options, keys.storage);
-    std::vector<ObjectId> ids;
-    for (size_t i = 0; i < 40; ++i) {
-        auto data = pattern(96 * 1024 + i, static_cast<uint8_t>(17 + i));
-        auto id = object_id(data);
-        REQUIRE(store.put(id, data));
-        ids.push_back(id);
-    }
-    for (size_t i = 0; i < ids.size(); i += 2)
-        REQUIRE(store.remove(ids[i]));
-
-    const auto before = store.used();
-    REQUIRE(store.compact_packs());
-    const auto after_one = store.used();
-    CHECK(after_one < before);
-
-    // Dead packs remain after one bounded victim rewrite, so a second slice
-    // makes further progress; no call needs space for the whole packed corpus.
-    REQUIRE(store.compact_packs());
-    const auto after_two = store.used();
-    CHECK(after_two < after_one);
-
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (i % 2 == 0)
-            CHECK(!store.has(ids[i]));
-        else
-            CHECK(store.valid(ids[i]));
-    }
-}
-
-MACHA_TEST("storage_v18", test_pack_compaction_honours_shutdown_before_accounting_wait) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
-
-    LocalStore store(t.path() / "store", options, keys.storage);
-    std::stop_source shutdown;
-    shutdown.request_stop();
-
-    const auto started = std::chrono::steady_clock::now();
-    CHECK(!store.compact_packs(shutdown.get_token()));
-    CHECK(std::chrono::steady_clock::now() - started < 250ms);
-}
-
-MACHA_TEST("storage_v18", test_local_backend_capacity_falls_through_to_larger_backend) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    auto state = t.path() / "state";
-    auto small = t.path() / "small";
-    auto large = t.path() / "large";
-    std::filesystem::create_directories(small);
-    std::filesystem::create_directories(large);
-
-    auto node = load_or_create_node_id(state);
-    StoragePackingConfig no_packing;
-    no_packing.threshold = 0;
-    no_packing.target_size = 0;
-    StoragePool pool(state, node,
-                     {{small, 512ULL * 1024, 0}, {large, 16ULL * 1024 * 1024, 0}},
-                     keys.storage, 0ms, no_packing);
-
-    std::vector<ObjectId> ids;
-    for (size_t i = 0; i < 40; ++i) {
-        auto data = pattern(192 * 1024 + i);
-        data[0] ^= static_cast<uint8_t>(i);
-        auto id = object_id(data);
-        REQUIRE(pool.put(id, data));
-        ids.push_back(id);
-    }
-
-    CHECK(pool.used() > 512ULL * 1024);
-    CHECK(pool.limit() == 512ULL * 1024 + 16ULL * 1024 * 1024);
-    for (const auto& id : ids)
-        CHECK(pool.valid(id));
-}
-
-MACHA_TEST("storage_v18", test_data_reserve_free_blocks_admission_before_filesystem_exhaustion) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.reserve_free = std::numeric_limits<uint64_t>::max();
-    options.pack_threshold = 0;
-    options.pack_target_size = 0;
-
-    LocalStore store(t.path() / "store", options, keys.storage);
-    auto data = pattern(128 * 1024, 31);
-    const auto id = object_id(data);
-    CHECK(!store.put(id, data));
-    CHECK(!store.has(id));
-    CHECK(store.used() == 0);
-}
-
-MACHA_TEST("storage_v18", test_unrelated_loose_object_read_bypasses_blocked_loader_write) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 0;
-    options.pack_target_size = 0;
-    InterposedLocalStoreFiles files;
-    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
-                     {}, files);
-
-    const auto viewer = pattern(512 * 1024, 0x41);
-    const auto viewer_id = object_id(viewer);
-    REQUIRE(store.put(viewer_id, viewer));
-
-    const auto loader = pattern(4 * 1024 * 1024, 0x82);
-    const auto loader_id = object_id(loader);
-    std::promise<void> loader_entered;
-    auto loader_entered_future = loader_entered.get_future();
-    std::promise<void> release_loader;
-    auto release_loader_future = release_loader.get_future().share();
-    std::atomic_uint64_t loader_hook_calls{};
-    const auto loader_path = store.object_path(loader_id);
-    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path& path) {
-        if (op != InterposedLocalStoreFiles::Op::install || path != loader_path)
-            return;
-        if (loader_hook_calls.fetch_add(1, std::memory_order_relaxed) == 0)
-            loader_entered.set_value();
-        release_loader_future.wait();
-    });
-
-    auto blocked_loader = std::async(std::launch::async, [&] {
-        return store.put(loader_id, loader);
-    });
-    REQUIRE(loader_entered_future.wait_for(2s) == std::future_status::ready);
-
-    // The loader is held after admission, at its disk write; an unrelated
-    // viewer read needs only the short index lock and completes.
-    auto viewer_read = std::async(std::launch::async, [&] { return store.get(viewer_id); });
-    REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
-    REQUIRE(viewer_read.get().has_value());
-    CHECK(*store.get(viewer_id) == viewer);
-
-    // A second operation for the same immutable ID remains single-flight.
-    auto same_object = std::async(std::launch::async, [&] {
-        return store.put(loader_id, loader);
-    });
-    std::this_thread::sleep_for(20ms);
-    CHECK(loader_hook_calls.load(std::memory_order_relaxed) == 1);
-
-    release_loader.set_value();
-    REQUIRE(blocked_loader.wait_for(2s) == std::future_status::ready);
-    CHECK(blocked_loader.get());
-    REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
-    CHECK(same_object.get());
-    CHECK(loader_hook_calls.load(std::memory_order_relaxed) == 1);
-    CHECK(store.get(loader_id) == std::optional<Bytes>{loader});
-}
-
-MACHA_TEST("storage_v18", test_unrelated_object_read_bypasses_blocked_packed_read) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 4 * 1024 * 1024;
-    InterposedLocalStoreFiles files;
-    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
-                     {}, files);
-
-    const auto blocked = pattern(128 * 1024, 0x37);
-    const auto blocked_id = object_id(blocked);
-    const auto viewer = pattern(512 * 1024, 0x91);
-    const auto viewer_id = object_id(viewer);
-    REQUIRE(store.put(blocked_id, blocked));
-    REQUIRE(store.is_packed(blocked_id));
-    REQUIRE(store.put(viewer_id, viewer));
-    CHECK(!store.is_packed(viewer_id));
-
-    std::promise<void> read_entered;
-    auto read_entered_future = read_entered.get_future();
-    std::promise<void> release_read;
-    auto release_read_future = release_read.get_future().share();
-    std::atomic_bool first{true};
-    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
-        if (op == InterposedLocalStoreFiles::Op::read_at && first.exchange(false)) {
-            read_entered.set_value();
-            release_read_future.wait();
-        }
-    });
-
-    auto packed_read = std::async(std::launch::async,
-                                  [&] { return store.get(blocked_id); });
-    REQUIRE(read_entered_future.wait_for(2s) == std::future_status::ready);
-
-    // The packed inode is pinned with its read stalled; an unrelated viewer
-    // read must still take the index lock and complete.
-    auto viewer_read = std::async(std::launch::async,
-                                  [&] { return store.get(viewer_id); });
-    REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
-    CHECK(viewer_read.get() == std::optional<Bytes>{viewer});
-
-    // Same-ID access remains coalesced behind the per-object single-flight.
-    auto same_object = std::async(std::launch::async,
-                                  [&] { return store.get(blocked_id); });
-    CHECK(same_object.wait_for(20ms) == std::future_status::timeout);
-
-    release_read.set_value();
-    REQUIRE(packed_read.wait_for(2s) == std::future_status::ready);
-    CHECK(packed_read.get() == std::optional<Bytes>{blocked});
-    REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
-    CHECK(same_object.get() == std::optional<Bytes>{blocked});
-}
-
-MACHA_TEST("storage_v18", test_unrelated_viewer_read_bypasses_blocked_packed_write) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 4 * 1024 * 1024;
-    InterposedLocalStoreFiles files;
-    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
-                     {}, files);
-
-    const auto viewer = pattern(512 * 1024, 0x22);
-    const auto viewer_id = object_id(viewer);
-    REQUIRE(store.put(viewer_id, viewer));
-
-    const auto loader = pattern(128 * 1024, 0x73);
-    const auto loader_id = object_id(loader);
-    std::promise<void> write_entered;
-    auto write_entered_future = write_entered.get_future();
-    std::promise<void> release_write;
-    auto release_write_future = release_write.get_future().share();
-    // Only the loader's records are appended once the viewer is stored.
-    std::atomic_uint64_t hook_calls{};
-    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
-        if (op == InterposedLocalStoreFiles::Op::append &&
-            hook_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
-            write_entered.set_value();
-            release_write_future.wait();
-        }
-    });
-
-    auto packed_write = std::async(std::launch::async,
-                                   [&] { return store.put(loader_id, loader); });
-    REQUIRE(write_entered_future.wait_for(2s) == std::future_status::ready);
-
-    // The packed append is stalled at its disk write; its reservation and
-    // per-object ownership must not hold the index mutex a viewer read needs.
-    auto viewer_read = std::async(std::launch::async,
-                                  [&] { return store.get(viewer_id); });
-    REQUIRE(viewer_read.wait_for(2s) == std::future_status::ready);
-    CHECK(viewer_read.get() == std::optional<Bytes>{viewer});
-
-    auto same_object = std::async(std::launch::async,
-                                  [&] { return store.put(loader_id, loader); });
-    CHECK(same_object.wait_for(20ms) == std::future_status::timeout);
-    CHECK(hook_calls.load(std::memory_order_relaxed) == 1);
-
-    release_write.set_value();
-    REQUIRE(packed_write.wait_for(2s) == std::future_status::ready);
-    CHECK(packed_write.get());
-    REQUIRE(same_object.wait_for(2s) == std::future_status::ready);
-    CHECK(same_object.get());
-    // The second PUT appends its touch only after the first write completes.
-    CHECK(hook_calls.load(std::memory_order_relaxed) == 2);
-    CHECK(store.get(loader_id) == std::optional<Bytes>{loader});
-}
-
-MACHA_TEST("storage_v18", test_viewer_reads_bypass_blocked_pack_compaction) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 4 * 1024 * 1024;
-    InterposedLocalStoreFiles files;
-    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
-                     {}, files);
-
-    const auto dead = pattern(128 * 1024, 0x19);
-    const auto dead_id = object_id(dead);
-    const auto packed_viewer = pattern(128 * 1024, 0x29);
-    const auto packed_viewer_id = object_id(packed_viewer);
-    const auto loose_viewer = pattern(512 * 1024, 0x39);
-    const auto loose_viewer_id = object_id(loose_viewer);
-    REQUIRE(store.put(dead_id, dead));
-    REQUIRE(store.put(packed_viewer_id, packed_viewer));
-    REQUIRE(store.put(loose_viewer_id, loose_viewer));
-    REQUIRE(store.remove(dead_id));
-
-    std::promise<void> compaction_entered;
-    auto compaction_entered_future = compaction_entered.get_future();
-    std::promise<void> release_compaction;
-    auto release_compaction_future = release_compaction.get_future().share();
-    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
-        if (op == InterposedLocalStoreFiles::Op::list) {
-            compaction_entered.set_value();
-            release_compaction_future.wait();
-        }
-    });
-
-    auto compaction =
-        std::async(std::launch::async, [&] { return store.compact_packs(); });
-    REQUIRE(compaction_entered_future.wait_for(2s) == std::future_status::ready);
-
-    auto packed_read = std::async(std::launch::async,
-                                  [&] { return store.get(packed_viewer_id); });
-    auto loose_read = std::async(std::launch::async,
-                                 [&] { return store.get(loose_viewer_id); });
-    REQUIRE(packed_read.wait_for(2s) == std::future_status::ready);
-    REQUIRE(loose_read.wait_for(2s) == std::future_status::ready);
-    CHECK(packed_read.get() == std::optional<Bytes>{packed_viewer});
-    CHECK(loose_read.get() == std::optional<Bytes>{loose_viewer});
-
-    release_compaction.set_value();
-    REQUIRE(compaction.wait_for(2s) == std::future_status::ready);
-    CHECK(compaction.get());
-    CHECK(store.get(packed_viewer_id) == std::optional<Bytes>{packed_viewer});
-    CHECK(store.get(loose_viewer_id) == std::optional<Bytes>{loose_viewer});
-}
-
-MACHA_TEST("storage_v18", test_pack_compaction_waits_for_preopen_reader_lease) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 4 * 1024 * 1024;
-    InterposedLocalStoreFiles files;
-    LocalStore store(t.path() / "store", options, keys.storage, LocalStoreMode::authoritative,
-                     {}, files);
-
-    const auto live = pattern(128 * 1024, 0x51);
-    const auto live_id = object_id(live);
-    const auto dead = pattern(128 * 1024, 0x61);
-    const auto dead_id = object_id(dead);
-    REQUIRE(store.put(live_id, live));
-    REQUIRE(store.put(dead_id, dead));
-    REQUIRE(store.remove(dead_id));
-
-    std::promise<void> reader_leased;
-    auto reader_leased_future = reader_leased.get_future();
-    std::promise<void> release_reader;
-    auto release_reader_future = release_reader.get_future().share();
-    std::atomic_bool first{true};
-    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
-        if (op == InterposedLocalStoreFiles::Op::read_at && first.exchange(false)) {
-            reader_leased.set_value();
-            release_reader_future.wait();
-        }
-    });
-
-    auto read = std::async(std::launch::async, [&] { return store.get(live_id); });
-    REQUIRE(reader_leased_future.wait_for(2s) == std::future_status::ready);
-    auto compaction =
-        std::async(std::launch::async, [&] { return store.compact_packs(); });
-
-    // The reader holds only a logical lease and has not called open(2). The
-    // compactor may switch to its replacement but cannot unlink the victim
-    // until this reader has opened and finished it.
-    CHECK(compaction.wait_for(20ms) == std::future_status::timeout);
-    release_reader.set_value();
-    REQUIRE(read.wait_for(2s) == std::future_status::ready);
-    CHECK(read.get() == std::optional<Bytes>{live});
-    REQUIRE(compaction.wait_for(2s) == std::future_status::ready);
-    CHECK(compaction.get());
-    CHECK(store.get(live_id) == std::optional<Bytes>{live});
-}
-
-MACHA_TEST("storage_v18", test_presence_index_warms_from_object_names_at_start) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 0; // everything loose
-    std::vector<ObjectId> ids;
     {
-        LocalStore store(t.path() / "store", options, keys.storage);
-        for (int i = 0; i < 12; ++i) {
-            auto data = pattern(64 * 1024, static_cast<uint8_t>(0x30 + i));
-            auto id = object_id(data);
-            REQUIRE(store.put(id, data));
+        const auto state = t.path() / "state";
+        const auto small = t.path() / "small";
+        const auto large = t.path() / "large";
+        std::filesystem::create_directories(small);
+        std::filesystem::create_directories(large);
+        StoragePackingConfig no_packing;
+        no_packing.threshold = 0;
+        no_packing.target_size = 0;
+        StoragePool pool(state, load_or_create_node_id(state),
+                         {{small, 512ULL * 1024, 0}, {large, 16ULL * 1024 * 1024, 0}}, key, 0ms,
+                         no_packing);
+        std::vector<ObjectId> ids;
+        for (size_t i = 0; i < 40; ++i) {
+            auto data = pattern(192 * 1024 + i);
+            data[0] ^= static_cast<uint8_t>(i);
+            const auto id = object_id(data);
+            REQUIRE(pool.put(id, data));
             ids.push_back(id);
         }
+        CHECK(pool.used() > 512ULL * 1024);
+        CHECK(pool.limit() == 512ULL * 1024 + 16ULL * 1024 * 1024);
+        for (const auto& id : ids)
+            CHECK(pool.valid(id));
     }
-    // A fresh process learns what it holds from directory names alone, so the
-    // first claim after a restart does not stat the object.
-    LocalStore reopened(t.path() / "store", options, keys.storage);
-    REQUIRE(wait_until([&] { return reopened.diagnostics().presence_index_entries == ids.size(); }, 5s));
-    for (const auto& id : ids) CHECK(reopened.has(id));
-    CHECK(!reopened.has(ObjectId{}));
+    NodeInfo small;
+    small.id.bytes[0] = 1;
+    small.capacity = 1ULL * 1024 * 1024 * 1024;
+    NodeInfo large;
+    large.id.bytes[0] = 2;
+    large.capacity = 2ULL * 1024 * 1024 * 1024 * 1024;
+    CHECK(placement_logical_capacity({small, large}, 1) == small.capacity + large.capacity);
 }
 
-MACHA_TEST("storage_v18", test_has_is_a_cheap_presence_check_not_a_decrypt) {
+// Damage a power loss or a bad sector leaves in a pack. A torn or
+// undecodable record at the tail is truncated and the pack stays the active
+// one; an unreadable span with live records after it is skipped, reported,
+// and reclaimed by compaction, and the lost object can be written again.
+MACHA_FAST_TEST("storage_v18", test_pack_recovery_settles_each_kind_of_damage) {
     TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
+    const auto key = storage_key(t);
+    const auto options = packed_options(32ULL * 1024 * 1024, 1024 * 1024);
+    // A record is this header plus ciphertext as long as the plaintext.
+    constexpr uint64_t pack_header_size = 93 + 32;
 
-    LocalStoreOptions options;
-    options.limit = 64ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
-    InterposedLocalStoreFiles files;
-    std::optional<LocalStore> store_holder;
-    store_holder.emplace(t.path() / "store", options, keys.storage,
-                         LocalStoreMode::authoritative, nullptr, files);
-    auto& store = *store_holder;
+    struct Tail {
+        const char* what;
+        Bytes garbage;
+        // Shorter than a header: discarded before any header is decoded, so
+        // not counted among undecodable tails.
+        bool short_of_a_header;
+    };
+    std::vector<Tail> tails;
+    tails.push_back({"incomplete record",
+                     Bytes{'M', 'A', 'C', 'H', 'P', 'K', '0', '1', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                           11, 12, 13, 14, 15},
+                     true});
+    tails.push_back({"zero-filled header", Bytes(pack_header_size, 0), false});
+    tails.push_back({"garbage header", pattern(pack_header_size, 0x5a), false});
+    tails.push_back(
+        {"garbage header and partial payload", pattern(pack_header_size + 40000, 0x5a), false});
 
-    // Loose and packed objects take different presence-check paths.
-    auto loose = pattern(512 * 1024, 0x71);
-    auto loose_id = object_id(loose);
-    auto packed = pattern(64 * 1024, 0x72);
-    auto packed_id = object_id(packed);
-    REQUIRE(store.put(loose_id, loose));
-    REQUIRE(store.put(packed_id, packed));
-    REQUIRE(!store.is_packed(loose_id));
-    REQUIRE(store.is_packed(packed_id));
+    size_t index = 0;
+    for (auto& tail : tails) {
+        std::cerr << "row: " << tail.what << "\n";
+        const auto root = t.path() / ("store-" + std::to_string(index++));
+        const auto first = pattern(96 * 1024, 11);
+        const auto second = pattern(96 * 1024, 12);
+        {
+            LocalStore store(root, options, key);
+            REQUIRE(store.put(object_id(first), first));
+            REQUIRE(store.put(object_id(second), second));
+        }
+        const auto pack = only_pack(root);
+        const auto intact_size = std::filesystem::file_size(pack);
+        {
+            std::ofstream out(pack, std::ios::binary | std::ios::app);
+            out.write(reinterpret_cast<const char*>(tail.garbage.data()),
+                      static_cast<std::streamsize>(tail.garbage.size()));
+            REQUIRE(out.good());
+        }
+        REQUIRE(std::filesystem::file_size(pack) == intact_size + tail.garbage.size());
 
-    std::atomic_bool loose_read{false};
-    std::atomic_bool packed_read{false};
-    files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
-        if (op == InterposedLocalStoreFiles::Op::read)
-            loose_read = true;
-        if (op == InterposedLocalStoreFiles::Op::read_at)
-            packed_read = true;
-    });
+        LocalStore reopened(root, options, key);
+        CHECK(reopened.get(object_id(first)) == std::optional<Bytes>{first});
+        CHECK(reopened.get(object_id(second)) == std::optional<Bytes>{second});
+        CHECK(std::filesystem::file_size(pack) == intact_size);
+        const auto diagnostics = reopened.diagnostics();
+        CHECK(diagnostics.pack_recovery_truncated_tails == (tail.short_of_a_header ? 0 : 1));
+        CHECK(diagnostics.pack_recovery_skipped_regions == 0);
+        CHECK(diagnostics.pack_recovery_skipped_bytes == 0);
+        // Appends continue behind the restored boundary.
+        const auto third = pattern(64 * 1024, 13);
+        REQUIRE(reopened.put(object_id(third), third));
+        CHECK(reopened.is_packed(object_id(third)));
+    }
 
-    // has() must not read or decrypt; the recorded device reads prove it, not
-    // just the returned boolean.
-    CHECK(store.has(loose_id));
-    CHECK(store.has(packed_id));
-    CHECK(!loose_read.load());
-    CHECK(!packed_read.load());
+    // A header failing its checksum with intact records after it.
+    const auto root = t.path() / "store-damaged-middle";
+    const std::vector<Bytes> objects{pattern(96 * 1024, 21), pattern(96 * 1024, 22),
+                                     pattern(96 * 1024, 23)};
+    {
+        LocalStore store(root, options, key);
+        for (const auto& object : objects)
+            REQUIRE(store.put(object_id(object), object));
+    }
+    const auto pack = only_pack(root);
+    const auto intact_size = std::filesystem::file_size(pack);
+    const uint64_t second_offset = pack_header_size + objects[0].size();
+    {
+        // Flip one byte inside the second record's header checksum.
+        std::fstream io(pack, std::ios::binary | std::ios::in | std::ios::out);
+        io.seekg(static_cast<std::streamoff>(second_offset + 100));
+        char byte = 0;
+        io.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0x01);
+        io.seekp(static_cast<std::streamoff>(second_offset + 100));
+        io.write(&byte, 1);
+        REQUIRE(io.good());
+    }
+    LocalStore reopened(root, options, key);
+    CHECK(std::filesystem::file_size(pack) == intact_size);
+    CHECK(reopened.get(object_id(objects[0])) == std::optional<Bytes>{objects[0]});
+    CHECK(!reopened.has(object_id(objects[1])));
+    CHECK(reopened.get(object_id(objects[2])) == std::optional<Bytes>{objects[2]});
+    const auto diagnostics = reopened.diagnostics();
+    CHECK(diagnostics.pack_recovery_truncated_tails == 0);
+    CHECK(diagnostics.pack_recovery_skipped_regions == 1);
+    CHECK(diagnostics.pack_recovery_skipped_bytes == pack_header_size + objects[1].size());
+    // What replica repair does: write the lost object again. Compaction then
+    // reclaims the unreadable span without touching live data.
+    REQUIRE(reopened.put(object_id(objects[1]), objects[1]));
+    const auto before_compaction = reopened.used();
+    REQUIRE(reopened.compact_packs());
+    CHECK(reopened.used() < before_compaction);
+    for (const auto& object : objects)
+        CHECK(reopened.get(object_id(object)) == std::optional<Bytes>{object});
+}
 
-    // A real read does reach the device.
-    CHECK(store.get(loose_id).has_value());
-    CHECK(store.get(packed_id).has_value());
-    CHECK(loose_read.load());
-    CHECK(packed_read.load());
+// Device I/O on one object never blocks the index lock an unrelated read
+// needs; operations on the same object stay single-flight behind it; and
+// compaction cannot unlink a pack a reader has leased but not yet opened.
+MACHA_FAST_TEST("storage_v18", test_held_device_io_blocks_only_its_own_object) {
+    TempDir t;
+    const auto key = storage_key(t);
+    LocalStoreOptions loose;
+    loose.limit = 64ULL * 1024 * 1024;
+    loose.pack_threshold = 0;
+    loose.pack_target_size = 0;
+    const auto packed = packed_options(64ULL * 1024 * 1024, 4 * 1024 * 1024);
+    // Over the pack threshold: stored loose even in a packing store.
+    const auto viewer = pattern(512 * 1024, 0x41);
 
-    CHECK(!store.has(ObjectId{}));
+    {
+        // A loose loader write held at its disk write, after admission.
+        InterposedLocalStoreFiles files;
+        LocalStore store(t.path() / "loose-write", loose, key, LocalStoreMode::authoritative, {},
+                         files);
+        REQUIRE(store.put(object_id(viewer), viewer));
+        const auto loader = pattern(4 * 1024 * 1024, 0x82);
+        HeldOperation held;
+        held.hold(files, InterposedLocalStoreFiles::Op::install,
+                  store.object_path(object_id(loader)));
+        auto write = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        REQUIRE(held.entered());
+        auto read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
+        REQUIRE(ready(read));
+        CHECK(read.get() == std::optional<Bytes>{viewer});
+        auto same = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        CHECK(!ready(same, 20ms));
+        held.release();
+        REQUIRE(ready(write));
+        CHECK(write.get());
+        REQUIRE(ready(same));
+        CHECK(same.get());
+        // The second put found the object installed and wrote nothing.
+        CHECK(held.calls() == 1);
+        CHECK(store.get(object_id(loader)) == std::optional<Bytes>{loader});
+    }
+    {
+        // A packed read held at its device read.
+        InterposedLocalStoreFiles files;
+        LocalStore store(t.path() / "packed-read", packed, key, LocalStoreMode::authoritative, {},
+                         files);
+        const auto blocked = pattern(128 * 1024, 0x37);
+        REQUIRE(store.put(object_id(blocked), blocked));
+        REQUIRE(store.is_packed(object_id(blocked)));
+        REQUIRE(store.put(object_id(viewer), viewer));
+        CHECK(!store.is_packed(object_id(viewer)));
+        HeldOperation held;
+        held.hold(files, InterposedLocalStoreFiles::Op::read_at);
+        auto first = std::async(std::launch::async, [&] { return store.get(object_id(blocked)); });
+        REQUIRE(held.entered());
+        auto read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
+        REQUIRE(ready(read));
+        CHECK(read.get() == std::optional<Bytes>{viewer});
+        auto same = std::async(std::launch::async, [&] { return store.get(object_id(blocked)); });
+        CHECK(!ready(same, 20ms));
+        held.release();
+        REQUIRE(ready(first));
+        CHECK(first.get() == std::optional<Bytes>{blocked});
+        REQUIRE(ready(same));
+        CHECK(same.get() == std::optional<Bytes>{blocked});
+    }
+    {
+        // A packed write held at its append; its reservation and ownership
+        // must not hold the index mutex.
+        InterposedLocalStoreFiles files;
+        LocalStore store(t.path() / "packed-write", packed, key, LocalStoreMode::authoritative, {},
+                         files);
+        REQUIRE(store.put(object_id(viewer), viewer));
+        const auto loader = pattern(128 * 1024, 0x73);
+        HeldOperation held;
+        held.hold(files, InterposedLocalStoreFiles::Op::append);
+        auto write = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        REQUIRE(held.entered());
+        auto read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
+        REQUIRE(ready(read));
+        CHECK(read.get() == std::optional<Bytes>{viewer});
+        auto same = std::async(std::launch::async, [&] { return store.put(object_id(loader), loader); });
+        CHECK(!ready(same, 20ms));
+        CHECK(held.calls() == 1);
+        held.release();
+        REQUIRE(ready(write));
+        CHECK(write.get());
+        REQUIRE(ready(same));
+        CHECK(same.get());
+        // The second put appends its touch only after the first write completes.
+        CHECK(held.calls() == 2);
+        CHECK(store.get(object_id(loader)) == std::optional<Bytes>{loader});
+    }
+    {
+        // Compaction held at its pack listing: packed and loose reads proceed.
+        InterposedLocalStoreFiles files;
+        LocalStore store(t.path() / "compaction", packed, key, LocalStoreMode::authoritative, {},
+                         files);
+        const auto dead = pattern(128 * 1024, 0x19);
+        const auto packed_viewer = pattern(128 * 1024, 0x29);
+        REQUIRE(store.put(object_id(dead), dead));
+        REQUIRE(store.put(object_id(packed_viewer), packed_viewer));
+        REQUIRE(store.put(object_id(viewer), viewer));
+        REQUIRE(store.remove(object_id(dead)));
+        HeldOperation held;
+        held.hold(files, InterposedLocalStoreFiles::Op::list);
+        auto compaction = std::async(std::launch::async, [&] { return store.compact_packs(); });
+        REQUIRE(held.entered());
+        auto packed_read =
+            std::async(std::launch::async, [&] { return store.get(object_id(packed_viewer)); });
+        auto loose_read = std::async(std::launch::async, [&] { return store.get(object_id(viewer)); });
+        REQUIRE(ready(packed_read));
+        REQUIRE(ready(loose_read));
+        CHECK(packed_read.get() == std::optional<Bytes>{packed_viewer});
+        CHECK(loose_read.get() == std::optional<Bytes>{viewer});
+        held.release();
+        REQUIRE(ready(compaction));
+        CHECK(compaction.get());
+        CHECK(store.get(object_id(packed_viewer)) == std::optional<Bytes>{packed_viewer});
+        CHECK(store.get(object_id(viewer)) == std::optional<Bytes>{viewer});
+    }
+    {
+        // A reader holds a logical lease on a pack and has not opened it:
+        // compaction may switch to the replacement but cannot unlink the
+        // victim until that reader has finished.
+        InterposedLocalStoreFiles files;
+        LocalStore store(t.path() / "lease", packed, key, LocalStoreMode::authoritative, {}, files);
+        const auto live = pattern(128 * 1024, 0x51);
+        const auto dead = pattern(128 * 1024, 0x61);
+        REQUIRE(store.put(object_id(live), live));
+        REQUIRE(store.put(object_id(dead), dead));
+        REQUIRE(store.remove(object_id(dead)));
+        HeldOperation held;
+        held.hold(files, InterposedLocalStoreFiles::Op::read_at);
+        auto read = std::async(std::launch::async, [&] { return store.get(object_id(live)); });
+        REQUIRE(held.entered());
+        auto compaction = std::async(std::launch::async, [&] { return store.compact_packs(); });
+        CHECK(!ready(compaction, 20ms));
+        held.release();
+        REQUIRE(ready(read));
+        CHECK(read.get() == std::optional<Bytes>{live});
+        REQUIRE(ready(compaction));
+        CHECK(compaction.get());
+        CHECK(store.get(object_id(live)) == std::optional<Bytes>{live});
+    }
+}
 
-    // An empty object file is never an object (writes rename into place and
-    // every object has a header); only a crash or external truncation leaves
-    // one. Presence is not stat'ed, so the empty file is found on read: the
-    // first read prunes it and reports the object absent.
-    auto truncated = pattern(512 * 1024, 0x73);
-    auto truncated_id = object_id(truncated);
-    REQUIRE(store.put(truncated_id, truncated));
-    REQUIRE(store.has(truncated_id));
-    const auto truncated_path = store.object_path(truncated_id);
+// Presence is known without reading or decrypting an object: a restarted
+// store learns what it holds from object names, has() touches no device, and
+// an empty object file (a crash or external truncation) is pruned on read.
+MACHA_FAST_TEST("storage_v18", test_presence_is_known_without_reading_objects) {
+    TempDir t;
+    const auto key = storage_key(t);
+    const auto options = packed_options(64ULL * 1024 * 1024, 1024 * 1024);
+    const auto root = t.path() / "store";
+    const auto loose = pattern(512 * 1024, 0x71);
+    const auto packed = pattern(64 * 1024, 0x72);
+    const auto truncated = pattern(512 * 1024, 0x73);
+    std::vector<ObjectId> more_loose;
+    std::filesystem::path truncated_path;
+    {
+        InterposedLocalStoreFiles files;
+        LocalStore store(root, options, key, LocalStoreMode::authoritative, nullptr, files);
+        REQUIRE(store.put(object_id(loose), loose));
+        REQUIRE(store.put(object_id(packed), packed));
+        REQUIRE(!store.is_packed(object_id(loose)));
+        REQUIRE(store.is_packed(object_id(packed)));
+        for (int i = 0; i < 12; ++i) {
+            auto data = pattern(300 * 1024, static_cast<uint8_t>(0x30 + i));
+            REQUIRE(store.put(object_id(data), data));
+            more_loose.push_back(object_id(data));
+        }
+
+        std::atomic_bool loose_read{false};
+        std::atomic_bool packed_read{false};
+        files.before([&](InterposedLocalStoreFiles::Op op, const std::filesystem::path&) {
+            if (op == InterposedLocalStoreFiles::Op::read)
+                loose_read = true;
+            if (op == InterposedLocalStoreFiles::Op::read_at)
+                packed_read = true;
+        });
+        // The recorded device reads prove has() reads nothing, not just its answer.
+        CHECK(store.has(object_id(loose)));
+        CHECK(store.has(object_id(packed)));
+        CHECK(!store.has(ObjectId{}));
+        CHECK(!loose_read.load());
+        CHECK(!packed_read.load());
+        CHECK(store.get(object_id(loose)).has_value());
+        CHECK(store.get(object_id(packed)).has_value());
+        CHECK(loose_read.load());
+        CHECK(packed_read.load());
+        files.before({});
+
+        REQUIRE(store.put(object_id(truncated), truncated));
+        truncated_path = store.object_path(object_id(truncated));
+    }
     {
         std::ofstream truncate(truncated_path, std::ios::binary | std::ios::trunc);
         REQUIRE(truncate.good());
     }
-    store_holder.reset();
-    LocalStore reopened(t.path() / "store", options, keys.storage);
-    CHECK(!reopened.get(truncated_id).has_value());
+
+    LocalStore reopened(root, options, key);
+    // Every loose object name, including the truncated file's.
+    REQUIRE(wait_until([&] {
+        return reopened.diagnostics().presence_index_entries == more_loose.size() + 2;
+    }));
+    for (const auto& id : more_loose)
+        CHECK(reopened.has(id));
+    CHECK(reopened.has(object_id(loose)));
+    CHECK(reopened.has(object_id(packed)));
+    CHECK(!reopened.has(ObjectId{}));
+    // Presence is not stat'ed, so the empty file is found on read, which
+    // prunes it and reports the object absent.
+    CHECK(!reopened.get(object_id(truncated)).has_value());
     CHECK(!std::filesystem::exists(truncated_path));
-    CHECK(!reopened.has(truncated_id));
-    REQUIRE(reopened.put(truncated_id, truncated));
-    CHECK(reopened.has(truncated_id));
-    CHECK(reopened.has(loose_id));
+    CHECK(!reopened.has(object_id(truncated)));
+    REQUIRE(reopened.put(object_id(truncated), truncated));
+    CHECK(reopened.has(object_id(truncated)));
 }
 
+// Kept integrated: the separate budget is LocalServices' wiring of the
+// control store beside the DATA pool, not a LocalStore property.
 MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quota) {
     TestNode fixture("metadata-priority");
     auto& config = fixture.config();
@@ -648,213 +565,49 @@ MACHA_TEST("storage_v18", test_metadata_control_store_is_independent_of_data_quo
     auto control = pattern(128 * 1024 + 17);
     auto control_id = object_id(control);
     REQUIRE(fixture.node().control_store().put(control_id, control));
-    REQUIRE(fixture.node().control_store().get(control_id).has_value());
-    CHECK(*fixture.node().control_store().get(control_id) == control);
+    CHECK(fixture.node().control_store().get(control_id) == std::optional<Bytes>{control});
 }
 
-MACHA_TEST("storage_v18", test_pack_recovery_discards_incomplete_tail_record) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 32ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
-
-    auto first = pattern(96 * 1024, 11);
-    auto second = pattern(96 * 1024, 12);
-    const auto first_id = object_id(first);
-    const auto second_id = object_id(second);
+// State from before the versioned layout: a non-empty unversioned state
+// namespace refuses to start; a non-empty unversioned DATA backend leaves the
+// node up with that backend offline.
+MACHA_TEST("storage_v18", test_unversioned_state_is_refused) {
+    TestCluster cluster(ConfigProfile::isolated);
     {
-        LocalStore store(t.path() / "store", options, keys.storage);
-        REQUIRE(store.put(first_id, first));
-        REQUIRE(store.put(second_id, second));
-    }
-
-    std::filesystem::path pack;
-    for (const auto& entry : std::filesystem::directory_iterator(t.path() / "store" / "packs")) {
-        if (entry.is_regular_file()) {
-            pack = entry.path();
-            break;
+        auto config = cluster.node_config("old-state", free_port());
+        config.storage_backends = {{cluster.path() / "old-state.data", 8ULL * 1024 * 1024, 0}};
+        config.storage_packing.threshold = 0;
+        config.storage_packing.target_size = 0;
+        config.metadata_store.path = cluster.path() / "old-state.control";
+        std::filesystem::create_directories(config.state_path);
+        std::ofstream(config.state_path / "metadata.bin") << "old namespace";
+        bool refused = false;
+        try {
+            BareNode node(config, cluster.keys());
+        } catch (const std::exception& e) {
+            refused = std::string(e.what()).find("fresh namespace") != std::string::npos;
         }
+        CHECK(refused);
     }
-    REQUIRE(!pack.empty());
-    const auto intact_size = std::filesystem::file_size(pack);
     {
-        std::ofstream out(pack, std::ios::binary | std::ios::app);
-        REQUIRE(out.good());
-        const std::array<uint8_t, 23> torn{'M','A','C','H','P','K','0','1',1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
-        out.write(reinterpret_cast<const char*>(torn.data()), static_cast<std::streamsize>(torn.size()));
-        REQUIRE(out.good());
-    }
-    CHECK(std::filesystem::file_size(pack) > intact_size);
-
-    LocalStore reopened(t.path() / "store", options, keys.storage);
-    REQUIRE(reopened.get(first_id).has_value());
-    REQUIRE(reopened.get(second_id).has_value());
-    CHECK(*reopened.get(first_id) == first);
-    CHECK(*reopened.get(second_id) == second);
-    CHECK(std::filesystem::file_size(pack) == intact_size);
-}
-
-namespace {
-std::filesystem::path only_pack(const std::filesystem::path& store) {
-    std::filesystem::path pack;
-    for (const auto& entry : std::filesystem::directory_iterator(store / "packs")) {
-        if (entry.is_regular_file()) {
-            REQUIRE(pack.empty());
-            pack = entry.path();
-        }
-    }
-    REQUIRE(!pack.empty());
-    return pack;
-}
-} // namespace
-
-// A power loss between the pack write() and syncfs can leave an undecodable
-// header (zeroed or garbage, perhaps with partial payload) at the tail;
-// recovery truncates it as a torn tail rather than taking the backend offline.
-MACHA_TEST("storage_v18", test_pack_recovery_truncates_undecodable_header_at_tail) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 32ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
-
-    constexpr size_t pack_header_size = 93 + 32;
-    struct Shape {
-        const char* name;
-        Bytes garbage;
-    };
-    Bytes partial = pattern(pack_header_size + 40000, 0x5a);
-    std::vector<Shape> shapes;
-    shapes.push_back({"zero-filled header", Bytes(pack_header_size, 0)});
-    shapes.push_back({"garbage header", pattern(pack_header_size, 0x5a)});
-    shapes.push_back({"garbage header and partial payload", std::move(partial)});
-
-    size_t index = 0;
-    for (auto& shape : shapes) {
-        const auto root = t.path() / ("store-" + std::to_string(index++));
-        auto first = pattern(96 * 1024, 11);
-        auto second = pattern(96 * 1024, 12);
-        const auto first_id = object_id(first);
-        const auto second_id = object_id(second);
-        {
-            LocalStore store(root, options, keys.storage);
-            REQUIRE(store.put(first_id, first));
-            REQUIRE(store.put(second_id, second));
-        }
-        const auto pack = only_pack(root);
-        const auto intact_size = std::filesystem::file_size(pack);
-        {
-            std::ofstream out(pack, std::ios::binary | std::ios::app);
-            REQUIRE(out.good());
-            out.write(reinterpret_cast<const char*>(shape.garbage.data()),
-                      static_cast<std::streamsize>(shape.garbage.size()));
-            REQUIRE(out.good());
-        }
-        REQUIRE(std::filesystem::file_size(pack) == intact_size + shape.garbage.size());
-
-        LocalStore reopened(root, options, keys.storage);
-        REQUIRE(reopened.get(first_id).has_value());
-        REQUIRE(reopened.get(second_id).has_value());
-        CHECK(*reopened.get(first_id) == first);
-        CHECK(*reopened.get(second_id) == second);
-        CHECK(std::filesystem::file_size(pack) == intact_size);
-        const auto diagnostics = reopened.diagnostics();
-        CHECK(diagnostics.pack_recovery_truncated_tails == 1);
-        CHECK(diagnostics.pack_recovery_skipped_regions == 0);
-        CHECK(diagnostics.pack_recovery_skipped_bytes == 0);
-
-        // The pack is still the active one: appends continue behind the
-        // restored boundary and survive another reopen.
-        auto third = pattern(64 * 1024, 13);
-        const auto third_id = object_id(third);
-        REQUIRE(reopened.put(third_id, third));
-        CHECK(reopened.is_packed(third_id));
+        auto config = cluster.node_config("fresh-boundary", free_port());
+        config.storage_backends = {{cluster.path() / "old-data", 8ULL * 1024 * 1024, 0}};
+        config.storage_packing.threshold = 0;
+        config.storage_packing.target_size = 0;
+        config.metadata_store.path = cluster.path() / "fresh-boundary.control";
+        std::filesystem::create_directories(config.storage_backends.front().path / "objects");
+        std::ofstream(config.storage_backends.front().path / "objects" / "legacy")
+            << "old namespace";
+        BareNode node(config, cluster.keys());
+        node.start();
+        REQUIRE(node.wait_local_state_ready(10s));
+        CHECK(node.readiness().control_plane_online);
+        CHECK(node.readiness().data_storage_ready);
+        CHECK(node.local_store().online_backends() == 0);
+        CHECK(node.local_store().limit() == 0);
+        node.stop();
     }
 }
-
-// A header failing its checksum with intact records after it is not a torn
-// tail: recovery skips the span, keeps what follows, reports the loss, and
-// leaves the span as dead bytes for compaction.
-MACHA_TEST("storage_v18", test_pack_recovery_skips_unreadable_region_before_live_records) {
-    TempDir t;
-    auto keyfile = t.path() / "key";
-    write_key(keyfile);
-    auto keys = load_cluster_keys(keyfile);
-
-    LocalStoreOptions options;
-    options.limit = 32ULL * 1024 * 1024;
-    options.pack_threshold = 256 * 1024;
-    options.pack_target_size = 1024 * 1024;
-
-    auto first = pattern(96 * 1024, 21);
-    auto second = pattern(96 * 1024, 22);
-    auto third = pattern(96 * 1024, 23);
-    const auto first_id = object_id(first);
-    const auto second_id = object_id(second);
-    const auto third_id = object_id(third);
-    {
-        LocalStore store(t.path() / "store", options, keys.storage);
-        REQUIRE(store.put(first_id, first));
-        REQUIRE(store.put(second_id, second));
-        REQUIRE(store.put(third_id, third));
-    }
-    const auto pack = only_pack(t.path() / "store");
-    const auto intact_size = std::filesystem::file_size(pack);
-    // Records are header (125 bytes) + ciphertext of the same length as the
-    // plaintext; the second record therefore starts at 125 + 96 KiB.
-    constexpr uint64_t pack_header_size = 93 + 32;
-    const uint64_t second_offset = pack_header_size + first.size();
-    {
-        // Flip one byte inside the second record's header checksum.
-        std::fstream io(pack, std::ios::binary | std::ios::in | std::ios::out);
-        REQUIRE(io.good());
-        io.seekg(static_cast<std::streamoff>(second_offset + 100));
-        char byte = 0;
-        io.read(&byte, 1);
-        REQUIRE(io.good());
-        byte = static_cast<char>(byte ^ 0x01);
-        io.seekp(static_cast<std::streamoff>(second_offset + 100));
-        io.write(&byte, 1);
-        REQUIRE(io.good());
-    }
-
-    LocalStore reopened(t.path() / "store", options, keys.storage);
-    // Nothing was truncated: the records after the damage are live.
-    CHECK(std::filesystem::file_size(pack) == intact_size);
-    REQUIRE(reopened.get(first_id).has_value());
-    CHECK(*reopened.get(first_id) == first);
-    CHECK(!reopened.has(second_id));
-    REQUIRE(reopened.get(third_id).has_value());
-    CHECK(*reopened.get(third_id) == third);
-    const auto diagnostics = reopened.diagnostics();
-    CHECK(diagnostics.pack_recovery_truncated_tails == 0);
-    CHECK(diagnostics.pack_recovery_skipped_regions == 1);
-    CHECK(diagnostics.pack_recovery_skipped_bytes == pack_header_size + second.size());
-
-    // The lost object can be written again (this is what replica repair does),
-    // and compaction reclaims the unreadable span without touching live data.
-    REQUIRE(reopened.put(second_id, second));
-    REQUIRE(reopened.get(second_id).has_value());
-    CHECK(*reopened.get(second_id) == second);
-    const auto before_compaction = reopened.used();
-    REQUIRE(reopened.compact_packs());
-    CHECK(reopened.used() < before_compaction);
-    for (const auto* item : {&first, &second, &third}) {
-        const auto id = object_id(*item);
-        REQUIRE(reopened.get(id).has_value());
-        CHECK(*reopened.get(id) == *item);
-    }
-}
-
 namespace {
 class StorageClusterNode {
     Config config_;
@@ -972,90 +725,200 @@ void fill_data_store(StoragePool& store, size_t object_bytes = 96 * 1024) {
 }
 } // namespace
 
-
-MACHA_TEST("storage_v18", test_unversioned_nonempty_state_namespace_is_refused) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("old-state", free_port());
-    config.storage_backends = {{cluster.path() / "old-state.data", 8ULL * 1024 * 1024, 0}};
-    config.storage_packing.threshold = 0;
-    config.storage_packing.target_size = 0;
-    config.metadata_store.path = cluster.path() / "old-state.control";
-    std::filesystem::create_directories(config.state_path);
-    {
-        std::ofstream legacy(config.state_path / "metadata.bin");
-        legacy << "old namespace";
-    }
-
-    bool refused = false;
-    try {
-        BareNode node(config, cluster.keys());
-    } catch (const std::exception& e) {
-        refused = std::string(e.what()).find("fresh namespace") != std::string::npos;
-    }
-    CHECK(refused);
-}
-
-MACHA_TEST("storage_v18", test_unversioned_nonempty_data_backend_is_refused) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("fresh-boundary", free_port());
-    config.storage_backends = {{cluster.path() / "old-data", 8ULL * 1024 * 1024, 0}};
-    config.storage_packing.threshold = 0;
-    config.storage_packing.target_size = 0;
-    config.metadata_store.path = cluster.path() / "fresh-boundary.control";
-    std::filesystem::create_directories(config.storage_backends.front().path / "objects");
-    {
-        std::ofstream old(config.storage_backends.front().path / "objects" / "legacy");
-        old << "old namespace";
-    }
-
-    BareNode node(config, cluster.keys());
-    node.start();
-    REQUIRE(node.wait_local_state_ready(10s));
-    CHECK(node.readiness().control_plane_online);
-    CHECK(node.readiness().data_storage_ready);
-    CHECK(node.local_store().online_backends() == 0);
-    CHECK(node.local_store().limit() == 0);
-    node.stop();
-}
-
-MACHA_TEST("storage_v18", test_r1_logical_capacity_is_aggregate_not_smallest_node) {
-    NodeInfo small;
-    small.id.bytes[0] = 1;
-    small.capacity = 1ULL * 1024 * 1024 * 1024;
-    NodeInfo large;
-    large.id.bytes[0] = 2;
-    large.capacity = 2ULL * 1024 * 1024 * 1024 * 1024;
-    CHECK(placement_logical_capacity({small, large}, 1) == small.capacity + large.capacity);
-}
-
-MACHA_TEST("storage_v18", test_distributed_r1_spills_preferred_full_node_to_next_candidate) {
+// Kept integrated: placement across two real nodes' memberships and the
+// catalogue's split between control and DATA storage on both.
+//
+// A full preferred node: an r=1 DATA put spills to the next candidate, and
+// artwork follows it; the catalogue's control objects ignore the DATA quota
+// and land on both metadata replicas; the small node reads the artwork back.
+MACHA_TEST("storage_v18", test_a_full_preferred_node_spills_data_but_not_control) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto small_port = free_port();
     const auto large_port = free_port();
-    auto small_config = storage_node_config(cluster, "small", small_port, 384ULL * 1024, 1, 1);
-    auto large_config = storage_node_config(
-        cluster, "large", large_port, 16ULL * 1024 * 1024, 1, 1,
-        {{"127.0.0.1", small_port}});
-
-    StorageClusterNode small(std::move(small_config), cluster.keys());
-    StorageClusterNode large(std::move(large_config), cluster.keys());
+    StorageClusterNode small(storage_node_config(cluster, "small", small_port, 384ULL * 1024, 1, 2),
+                             cluster.keys());
+    StorageClusterNode large(storage_node_config(cluster, "large", large_port,
+                                                 16ULL * 1024 * 1024, 1, 2,
+                                                 {{"127.0.0.1", small_port}}),
+                             cluster.keys());
     small.start();
     large.start();
     REQUIRE(wait_until([&] {
         return small.node().membership().active().size() == 2 &&
                large.node().membership().active().size() == 2;
-    }, 5s));
+    }));
+    REQUIRE(wait_until([&] {
+        try {
+            return large.metadata().snapshot().metadata_voters.empty();
+        } catch (...) {
+            return false;
+        }
+    }));
 
     fill_data_store(small.local_state().data());
-    auto data = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 77);
+    const auto data = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 77);
     const auto id = object_id(data);
     REQUIRE(large.store().put(id, data));
     CHECK(!small.local_state().data().has(id));
     CHECK(large.local_state().data().has(id));
-    REQUIRE(large.store().get(id).has_value());
-    CHECK(*large.store().get(id) == data);
+    CHECK(large.store().get(id) == std::optional<Bytes>{data});
+
+    const auto art_bytes = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 123);
+    auto art = large.catalogue().stage_artwork("poster", "image/jpeg", art_bytes);
+    CHECK(!small.node().local_store().has(art.id));
+    CHECK(large.node().local_store().has(art.id));
+
+    CatalogueItem item;
+    item.id = "tmdb:movie:1";
+    item.kind = CatalogueKind::movie;
+    item.title = "Storage Contract";
+    item.artwork.push_back(art);
+    CHECK(large.catalogue().upsert(item).id == item.id);
+
+    const auto metadata = large.metadata().snapshot();
+    REQUIRE(metadata.catalogue_root.has_value());
+    CHECK(small.node().control_store().has(*metadata.catalogue_root));
+    CHECK(large.node().control_store().has(*metadata.catalogue_root));
+    CHECK(!small.node().local_store().has(*metadata.catalogue_root));
+    CHECK(!large.node().local_store().has(*metadata.catalogue_root));
+
+    REQUIRE(small.catalogue().get(item.id).has_value());
+    auto fetched = small.catalogue().artwork(art.id);
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->bytes == art_bytes);
 }
 
+// Repair does no work that cannot complete, and says what it cannot do: an
+// object the survey marks unavailable is passed without a fetch, and a live
+// object no peer can supply is counted and sampled once, never a held one.
+MACHA_TEST("storage_v18", test_repair_passes_unavailable_and_counts_unsourceable_objects) {
+    TestCluster cluster;
+    StorageClusterNode node(storage_node_config(cluster, "lonely", free_port(), 8ULL * 1024 * 1024,
+                                                2, 1),
+                            cluster.keys());
+    node.start();
+
+    const auto present_bytes = pattern(64 * 1024, 7);
+    const auto present = object_id(present_bytes);
+    REQUIRE(node.store().put(present, present_bytes));
+    const auto missing = object_id(pattern(64 * 1024, 9));
+    REQUIRE(!node.local_state().data().has(missing));
+    std::vector<ObjectId> live{missing};
+
+    bool marked = true;
+    std::vector<ObjectId> asked;
+    const auto unavailable = [&](const ObjectId& id) {
+        asked.push_back(id);
+        return marked;
+    };
+    const auto step = [&] {
+        return node.store().repair_step(4ULL * 1024 * 1024, 16, live, {}, 0, unavailable);
+    };
+
+    // A whole pass over the marked object examines it and attempts nothing.
+    const auto passed = step();
+    CHECK(asked == std::vector<ObjectId>{missing});
+    CHECK(passed.pull_examined == 1);
+    CHECK(passed.bytes_transferred == 0);
+    CHECK(node.store().repair_diagnostics().pull_unsourceable == 0);
+
+    // Unmarked, the pass tries to source it and, with no peer, cannot.
+    marked = false;
+    REQUIRE(wait_until([&] {
+        (void)step();
+        return node.store().repair_diagnostics().pull_unsourceable > 0;
+    }));
+    // With a held object beside it in the live set (sorted: repair
+    // binary-searches it), only the missing one is unsourceable.
+    live = {present, missing};
+    std::sort(live.begin(), live.end());
+    node.store().repair_once(4ULL * 1024 * 1024, live);
+    const auto after = node.store().repair_diagnostics();
+    REQUIRE(after.unsourceable_sample.size() == 1);
+    CHECK(after.unsourceable_sample.front() == missing);
+    CHECK(node.local_state().data().has(present));
+
+    // Repeated passes deduplicate the sample while the counter keeps climbing.
+    node.store().repair_once(4ULL * 1024 * 1024, live);
+    const auto repeated = node.store().repair_diagnostics();
+    CHECK(repeated.unsourceable_sample.size() == 1);
+    CHECK(repeated.pull_unsourceable >= after.pull_unsourceable);
+}
+
+// Kept integrated: the barrier's answer across a real peer restart, a new
+// durability epoch and backend incarnation read from the peer's own disk.
+//
+// After a peer restarts, the barrier re-derives its token from the peer's
+// disk and re-stamps the batch without re-sending bytes; while the peer is
+// down the failure is transient, naming nothing; once a restarted peer has
+// lost the object, the barrier names it so the writer can re-put it.
+MACHA_TEST("storage_v18", test_durability_barrier_across_peer_restarts) {
+    TestCluster cluster(ConfigProfile::isolated);
+    const auto a_port = free_port();
+    const auto b_port = free_port();
+    StorageClusterNode a(storage_node_config(cluster, "epoch-a", a_port, 64ULL * 1024 * 1024, 2, 1,
+                                             {}, 2),
+                         cluster.keys());
+    StorageClusterNode b(storage_node_config(cluster, "epoch-b", b_port, 64ULL * 1024 * 1024, 2, 1,
+                                             {{"127.0.0.1", a_port}}, 2),
+                         cluster.keys());
+    a.start();
+    b.start();
+    const auto both_active = [&] {
+        return wait_until([&] {
+            return a.node().membership().active().size() == 2 &&
+                   b.node().membership().active().size() == 2;
+        }, 10s);
+    };
+    REQUIRE(both_active());
+
+    const auto data = pattern(64 * 1024, 91);
+    DistributedStore::DurabilityBatch batch;
+    const auto id = a.store().put_deferred(data, batch);
+    REQUIRE(!batch.empty());
+    REQUIRE(b.node().local_store().has(id));
+    REQUIRE(a.store().durability_barrier(batch));
+
+    // a's dial to b failed while b was down, so early barriers may be refused
+    // as in retry backoff; that is transient, and the contract is to ask again.
+    std::vector<ObjectId> unsatisfiable;
+    bool durable = false;
+    const auto definitive = [&] {
+        return wait_until([&] {
+            unsatisfiable.clear();
+            durable = a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
+            return durable || !unsatisfiable.empty();
+        }, 30s);
+    };
+
+    const auto old_epoch = b.node().durability_epoch();
+    b.restart();
+    REQUIRE(b.node().durability_epoch() != old_epoch);
+    REQUIRE(both_active());
+    REQUIRE(b.node().local_store().has(id));
+    REQUIRE(definitive());
+    CHECK(durable);
+    CHECK(unsatisfiable.empty());
+    bool restamped = false;
+    for (const auto& requirement : batch.requirements)
+        for (const auto& replica : requirement.replicas)
+            if (replica.id == b.node().node_id())
+                restamped = replica.epoch == b.node().durability_epoch();
+    CHECK(restamped);
+    CHECK(a.store().durability_barrier(batch));
+
+    b.stop();
+    unsatisfiable.clear();
+    CHECK(!a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
+    CHECK(unsatisfiable.empty());
+
+    b.start();
+    REQUIRE(both_active());
+    REQUIRE(b.node().local_store().remove(id));
+    REQUIRE(definitive());
+    CHECK(!durable);
+    CHECK(unsatisfiable == std::vector<ObjectId>{id});
+}
 MACHA_TEST("storage_v18", test_min_write_two_uses_fallback_when_preferred_replica_is_full) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto a_port = free_port();
@@ -1174,89 +1037,6 @@ MACHA_TEST("storage_v18", test_nodes_replicating_to_each_other_do_not_hold_their
     CHECK(on_both.load() == total);
 }
 
-MACHA_TEST("storage_v18", test_repair_passes_an_object_marked_unavailable_and_pulls_it_once_unmarked) {
-    // Repair does no work that cannot complete: an object the survey marks
-    // unavailable is passed without a fetch, and fetched once the mark goes.
-    TestCluster cluster;
-    const auto port = free_port();
-    auto config = storage_node_config(cluster, "skipper", port, 8ULL * 1024 * 1024, 2, 1);
-    StorageClusterNode node(std::move(config), cluster.keys());
-    node.start();
-
-    const auto missing = object_id(pattern(64 * 1024, 11));
-    const std::vector<ObjectId> live{missing};
-    bool marked = true;
-    size_t asked = 0;
-    const auto unavailable = [&](const ObjectId& id) {
-        ++asked;
-        CHECK(id == missing);
-        return marked;
-    };
-    const auto step = [&] {
-        return node.store().repair_step(4ULL * 1024 * 1024, 16, live, {}, 0, unavailable);
-    };
-
-    // A whole pass over the marked object examines it and attempts nothing.
-    const auto passed = step();
-    CHECK(asked == 1);
-    CHECK(passed.pull_examined == 1);
-    CHECK(passed.bytes_transferred == 0);
-    CHECK(node.store().repair_diagnostics().pull_unsourceable == 0);
-
-    // Unmarked, the same pass tries to source it (and here finds no peer).
-    marked = false;
-    REQUIRE(wait_until([&] {
-        (void)step();
-        return node.store().repair_diagnostics().pull_unsourceable > 0;
-    }, 5s));
-}
-
-MACHA_TEST("storage_v18", test_repair_counts_an_object_no_peer_can_supply) {
-    // A live object this node should own and no peer can supply is counted
-    // and sampled, not passed over silently.
-    TestCluster cluster;
-    const auto port = free_port();
-    auto config = storage_node_config(cluster, "lonely", port, 8ULL * 1024 * 1024, 2, 1);
-    StorageClusterNode node(std::move(config), cluster.keys());
-    node.start();
-
-    // One object held, and one never stored anywhere; with no peers its pull
-    // exhausts every candidate, as for an extent whose only replica departed.
-    auto present_bytes = pattern(64 * 1024, 7);
-    const auto present = object_id(present_bytes);
-    REQUIRE(node.store().put(present, present_bytes));
-    REQUIRE(node.local_state().data().has(present));
-
-    const auto missing = object_id(pattern(64 * 1024, 9));
-    REQUIRE(!node.local_state().data().has(missing));
-
-    const auto before = node.store().repair_diagnostics();
-    CHECK(before.pull_unsourceable == 0);
-
-    // live must be sorted: repair binary-searches it.
-    std::vector<ObjectId> live{present, missing};
-    std::sort(live.begin(), live.end());
-    REQUIRE(wait_until([&] {
-        node.store().repair_once(4ULL * 1024 * 1024, live);
-        return node.store().repair_diagnostics().pull_unsourceable > 0;
-    }, 5s));
-
-    const auto after = node.store().repair_diagnostics();
-    // A present object is never reported as unsourceable.
-    REQUIRE(after.unsourceable_sample.size() == 1);
-    CHECK(after.unsourceable_sample.front() == missing);
-    CHECK(std::find(after.unsourceable_sample.begin(), after.unsourceable_sample.end(),
-                    present) == after.unsourceable_sample.end());
-    CHECK(node.local_state().data().has(present));
-
-    // Repeated passes deduplicate the sample while the counter keeps climbing.
-    const auto repeated_before = after.pull_unsourceable;
-    node.store().repair_once(4ULL * 1024 * 1024, live);
-    const auto repeated = node.store().repair_diagnostics();
-    CHECK(repeated.unsourceable_sample.size() == 1);
-    CHECK(repeated.pull_unsourceable >= repeated_before);
-}
-
 MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_within_bounded_time) {
     // One publication referencing thousands of extents: retain_data() must
     // batch presence checks rather than make a round trip per extent.
@@ -1301,148 +1081,6 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
     // Batched checks need a handful of round trips; the bound is loose for
     // loaded hardware but still catches one round trip per extent.
     CHECK(elapsed < 10s);
-}
-
-MACHA_TEST("storage_v18", test_durability_barrier_rederives_placement_after_peer_restart) {
-    // After a peer restarts, the barrier re-derives its durability token from
-    // the peer's disk and re-stamps the batch without re-sending any bytes.
-    TestCluster cluster(ConfigProfile::isolated);
-    const auto a_port = free_port();
-    const auto b_port = free_port();
-    auto a_config = storage_node_config(cluster, "epoch-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
-    auto b_config = storage_node_config(cluster, "epoch-b", b_port, 64ULL * 1024 * 1024, 2, 1,
-                                        {{"127.0.0.1", a_port}}, 2);
-    StorageClusterNode a(std::move(a_config), cluster.keys());
-    StorageClusterNode b(std::move(b_config), cluster.keys());
-    a.start();
-    b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
-
-    const auto data = pattern(64 * 1024, 91);
-    DistributedStore::DurabilityBatch batch;
-    const auto id = a.store().put_deferred(data, batch);
-    REQUIRE(!batch.empty());
-    REQUIRE(b.node().local_store().has(id));
-    const auto old_epoch = b.node().durability_epoch();
-    REQUIRE(a.store().durability_barrier(batch));
-
-    b.restart();
-    REQUIRE(b.node().durability_epoch() != old_epoch);
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 10s));
-    REQUIRE(b.node().local_store().has(id));
-
-    // a's dial to b failed while b was down, so early barriers may be refused
-    // as in retry backoff; that is transient, and the contract is to ask again.
-    std::vector<ObjectId> unsatisfiable;
-    REQUIRE(wait_until([&] {
-        unsatisfiable.clear();
-        return a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable) ||
-               !unsatisfiable.empty();
-    }, 30s));
-    CHECK(unsatisfiable.empty());
-    bool restamped = false;
-    for (const auto& requirement : batch.requirements)
-        for (const auto& replica : requirement.replicas)
-            if (replica.id == b.node().node_id()) {
-                CHECK(replica.epoch == b.node().durability_epoch());
-                restamped = replica.epoch == b.node().durability_epoch();
-            }
-    CHECK(restamped);
-    // Subsequent barriers take the ordinary path.
-    CHECK(a.store().durability_barrier(batch));
-}
-
-MACHA_TEST("storage_v18", test_durability_barrier_treats_an_unreachable_peer_as_transient) {
-    // A down peer has not lost the object: the barrier fails without naming it
-    // unsatisfiable, so the writer retries rather than re-sending bytes.
-    TestCluster cluster(ConfigProfile::isolated);
-    const auto a_port = free_port();
-    const auto b_port = free_port();
-    auto a_config = storage_node_config(cluster, "down-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
-    auto b_config = storage_node_config(cluster, "down-b", b_port, 64ULL * 1024 * 1024, 2, 1,
-                                        {{"127.0.0.1", a_port}}, 2);
-    StorageClusterNode a(std::move(a_config), cluster.keys());
-    StorageClusterNode b(std::move(b_config), cluster.keys());
-    a.start();
-    b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
-
-    const auto data = pattern(64 * 1024, 93);
-    DistributedStore::DurabilityBatch batch;
-    (void)a.store().put_deferred(data, batch);
-    REQUIRE(a.store().durability_barrier(batch));
-
-    b.stop();
-    std::vector<ObjectId> unsatisfiable;
-    CHECK(!a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable));
-    CHECK(unsatisfiable.empty());
-
-    // Back with a new incarnation, the same batch is re-derived. The RPC client
-    // re-dials on its own schedule, so early barriers may still be transient.
-    b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 10s));
-    REQUIRE(wait_until([&] {
-        unsatisfiable.clear();
-        return a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
-    }, 30s));
-    CHECK(unsatisfiable.empty());
-}
-
-MACHA_TEST("storage_v18", test_durability_barrier_reports_objects_a_restarted_peer_lost) {
-    // The peer restarted and lost the object: the barrier names the ids so
-    // the writer can re-put them.
-    TestCluster cluster(ConfigProfile::isolated);
-    const auto a_port = free_port();
-    const auto b_port = free_port();
-    auto a_config = storage_node_config(cluster, "lost-a", a_port, 64ULL * 1024 * 1024, 2, 1, {}, 2);
-    auto b_config = storage_node_config(cluster, "lost-b", b_port, 64ULL * 1024 * 1024, 2, 1,
-                                        {{"127.0.0.1", a_port}}, 2);
-    StorageClusterNode a(std::move(a_config), cluster.keys());
-    StorageClusterNode b(std::move(b_config), cluster.keys());
-    a.start();
-    b.start();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 5s));
-
-    const auto data = pattern(64 * 1024, 92);
-    DistributedStore::DurabilityBatch batch;
-    const auto id = a.store().put_deferred(data, batch);
-    REQUIRE(a.store().durability_barrier(batch));
-
-    b.restart();
-    REQUIRE(wait_until([&] {
-        return a.node().membership().active().size() == 2 &&
-               b.node().membership().active().size() == 2;
-    }, 10s));
-    REQUIRE(b.node().local_store().remove(id));
-    REQUIRE(!b.node().local_store().has(id));
-
-    // Ask until definitive: while a's dial backoff lasts the barrier cannot
-    // reach b and names nothing.
-    std::vector<ObjectId> unsatisfiable;
-    bool durable = false;
-    REQUIRE(wait_until([&] {
-        unsatisfiable.clear();
-        durable = a.store().durability_barrier(batch, FrameType::loader, &unsatisfiable);
-        return durable || !unsatisfiable.empty();
-    }, 30s));
-    CHECK(!durable);
-    REQUIRE(unsatisfiable.size() == 1);
-    CHECK(unsatisfiable.front() == id);
 }
 
 MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget_still_publishes) {
@@ -1508,58 +1146,6 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
     CHECK(puts_final == puts_after + 10);
     for (size_t i = 0; i < 10; ++i)
         CHECK(b.node().control_store().has(ids[i]));
-}
-
-MACHA_TEST("storage_v18", test_catalogue_metadata_ignores_full_data_quota_and_artwork_uses_data_fallback) {
-    TestCluster cluster(ConfigProfile::isolated);
-    const auto small_port = free_port();
-    const auto large_port = free_port();
-    auto small_config = storage_node_config(cluster, "small", small_port, 384ULL * 1024, 1, 2);
-    auto large_config = storage_node_config(
-        cluster, "large", large_port, 16ULL * 1024 * 1024, 1, 2,
-        {{"127.0.0.1", small_port}});
-    StorageClusterNode small(std::move(small_config), cluster.keys());
-    StorageClusterNode large(std::move(large_config), cluster.keys());
-    small.start();
-    large.start();
-    REQUIRE(wait_until([&] {
-        return small.node().membership().active().size() == 2 &&
-               large.node().membership().active().size() == 2;
-    }, 5s));
-
-    REQUIRE(wait_until([&] {
-        try {
-            return large.metadata().snapshot().metadata_voters.empty();
-        } catch (...) {
-            return false;
-        }
-    }, 5s));
-
-    fill_data_store(small.node().local_store());
-    auto art_bytes = preferred_for(large.node(), small.node().node_id(), 128 * 1024, 123);
-    auto art = large.catalogue().stage_artwork("poster", "image/jpeg", art_bytes);
-    CHECK(!small.node().local_store().has(art.id));
-    CHECK(large.node().local_store().has(art.id));
-
-    CatalogueItem item;
-    item.id = "tmdb:movie:1";
-    item.kind = CatalogueKind::movie;
-    item.title = "Storage Contract";
-    item.artwork.push_back(art);
-    auto committed = large.catalogue().upsert(item);
-    CHECK(committed.id == item.id);
-
-    auto metadata = large.metadata().snapshot();
-    REQUIRE(metadata.catalogue_root.has_value());
-    CHECK(small.node().control_store().has(*metadata.catalogue_root));
-    CHECK(large.node().control_store().has(*metadata.catalogue_root));
-    CHECK(!small.node().local_store().has(*metadata.catalogue_root));
-    CHECK(!large.node().local_store().has(*metadata.catalogue_root));
-
-    REQUIRE(small.catalogue().get(item.id).has_value());
-    auto fetched = small.catalogue().artwork(art.id);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->bytes == art_bytes);
 }
 
 MACHA_TEST("storage_v18", test_catalogue_control_objects_recover_on_metadata_replica) {
@@ -1746,4 +1332,3 @@ MACHA_TEST("storage_v18", test_node_that_stops_hosting_drains_through_repair) {
     }
 }
 
-} // namespace

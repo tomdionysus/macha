@@ -17,6 +17,93 @@ using namespace macha::test_support;
 
 namespace {
 
+Json body_json(const HttpResponse& response) {
+    return Json::parse(
+        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
+}
+
+HttpRequest request_for(std::string method, std::string path, std::string_view body = {},
+                        std::map<std::string, std::string, std::less<>> query = {}) {
+    HttpRequest request;
+    request.method = std::move(method);
+    request.path = std::move(path);
+    request.body.assign(body.begin(), body.end());
+    for (auto& [name, value] : query)
+        request.query[name] = value;
+    return request;
+}
+
+std::string error_code(const Json& body) {
+    return body.find("error")->find("code")->asString();
+}
+
+// A single node with what ManageApi and CatalogueScanner work on, built
+// directly: no Service, so no maintenance pass, scanner or HTTP server runs
+// beside the test.
+class CatalogueBench {
+    TestNode node_;
+    std::optional<CatalogueManager> catalogue_;
+    std::optional<CatalogueHintQueue> hints_;
+
+  public:
+    explicit CatalogueBench(std::string_view name, size_t metadata_min_write_replicas = 1)
+        : node_(name) {
+        auto& config = node_.config();
+        config.replication = 1;
+        config.metadata_min_write_replicas = metadata_min_write_replicas;
+        config.hydration.enabled = false;
+        config.catalogue.scanner.enabled = false;
+        config.maintenance.interval = std::chrono::hours(1);
+        node_.start();
+        auto& node = node_.node();
+        catalogue_.emplace(node, node.local_state(), node.metadata_server(), node_.store(),
+                           node_.metadata(), node.ledger());
+        hints_.emplace(node.config().state_path);
+    }
+    const std::filesystem::path& path() const { return node_.path(); }
+    BareNode& node() { return node_.node(); }
+    MetadataManager& metadata() { return node_.metadata(); }
+    DistributedStore& store() { return node_.store(); }
+    FileSystem& fs() { return node_.filesystem(); }
+    NodeResources& resources() { return node_.resources(); }
+    const Config& config() { return node_.config(); }
+    CatalogueManager& catalogue() { return *catalogue_; }
+    CatalogueHintQueue& hints() { return *hints_; }
+
+    std::unique_ptr<CatalogueScanner> scanner(CatalogueScannerConfig config = {},
+                                              std::unique_ptr<HttpClient> http = {}) {
+        return std::make_unique<CatalogueScanner>(node(), node().metadata_server(), fs(),
+                                                  catalogue(), hints(), std::move(config),
+                                                  std::move(http));
+    }
+    // A file the scanner found and could not match, as the Unmatched list sees it.
+    std::pair<std::string, std::string> unmatched(const std::string& path, uint8_t seed) {
+        write_file(fs(), path, pattern(4096, seed));
+        const auto media_id = file_media_id(fs().getattr(path));
+        const auto hint_id =
+            hints().submit(path, "scanner", media_id, CatalogueHintPriority::periodic_scan);
+        REQUIRE(hints().claim_next().has_value());
+        hints().mark_no_match(hint_id, "scanner", media_id, "no_provider_match");
+        return {hint_id, media_id};
+    }
+};
+
+CatalogueScannerConfig provider_scanner_config(const std::filesystem::path& token) {
+    CatalogueScannerConfig config;
+    config.movies.roots = {"/Movies"};
+    config.movies.tmdb.token_file = token;
+    config.tv.roots = {"/TV"};
+    config.tv.tmdb.token_file = token;
+    config.music.roots = {"/Music"};
+    return config;
+}
+
+std::filesystem::path write_token(const std::filesystem::path& dir) {
+    const auto token = dir / "tmdb.token";
+    std::ofstream(token) << "test-token\n";
+    return token;
+}
+
 MACHA_TEST("invariants", test_convergence_demand_coalesces_burst_and_keeps_same_generation_event) {
     ConvergenceDemand demand;
     CHECK(!demand.pending());
@@ -58,6 +145,328 @@ MACHA_TEST("invariants", test_convergence_demand_coalesces_burst_and_keeps_same_
     CHECK(!demand.complete(*sibling));
     CHECK(demand.diagnostics().runs_scheduled == 3);
 }
+
+// ManageApi over unmatched files: list, rename (the hint follows the file),
+// identify by hand under existing parents, match to a provider reference
+// (refusals leave the file unmatched), list files bound twice as conflicts,
+// and a scan keeps on a manual item only the files still in the namespace.
+MACHA_TEST("invariants", test_unmatched_files_are_identified_by_hand_or_by_reference) {
+    CatalogueBench bench("manage-unmatched");
+    auto& fs = bench.fs();
+    auto& catalogue = bench.catalogue();
+    auto& hints = bench.hints();
+    for (const auto* root : {"/Movies", "/TV", "/Music", "/Other"})
+        fs.mkdir(root, 0755, getuid(), getgid());
+
+    {
+        // List, rename, identify by hand, browse, delete.
+        auto scanner = bench.scanner();
+        ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
+        const auto [hint_id, media_id] = bench.unmatched("/Movies/unknown.mkv", 91);
+
+        auto listed = manage.handle(request_for("GET", "/api/v1/manage/unmatched"));
+        REQUIRE(listed.status == 200);
+        CHECK(body_json(listed).find("count")->asUInt64() == 1);
+
+        REQUIRE(manage.handle(request_for(
+                                  "POST", "/api/v1/manage/filesystem/rename",
+                                  R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})"))
+                    .status == 200);
+        CHECK(file_media_id(fs.getattr("/Movies/renamed.mkv")) == media_id);
+        auto moved = hints.list();
+        REQUIRE(moved.size() == 1);
+        CHECK(moved.front().path == "/Movies/renamed.mkv");
+        CHECK(moved.front().media_id == media_id);
+
+        auto created = manage.handle(
+            request_for("POST", "/api/v1/manage/unmatched/" + moved.front().id + "/manual",
+                        R"({"kind":"movie","title":"Manually Identified","year":2026})"));
+        REQUIRE(created.status == 201);
+        const auto leaf_id = body_json(created).find("leaf_item_id")->asString();
+        auto item = catalogue.get(leaf_id);
+        REQUIRE(item.has_value());
+        CHECK(item->title == "Manually Identified");
+        CHECK(item->media_ids == std::vector<std::string>{media_id});
+        CHECK(!hints.get(moved.front().id).has_value());
+
+        auto browsed = manage.handle(
+            request_for("GET", "/api/v1/manage/filesystem", {}, {{"path", "/Movies"}}));
+        REQUIRE(browsed.status == 200);
+        const auto browsed_json = body_json(browsed);
+        const auto& entries = browsed_json.find("entries")->asArray();
+        REQUIRE(entries.size() == 1);
+        CHECK(entries.front().find("path")->asString() == "/Movies/renamed.mkv");
+        CHECK(entries.front().find("media_id")->asString() == media_id);
+        REQUIRE(entries.front().find("catalogue_item_ids")->asArray().size() == 1);
+        CHECK(entries.front().find("catalogue_item_ids")->asArray().front().asString() == leaf_id);
+
+        // Files-tab deletion also clears any durable match state for the path.
+        const auto stale = hints.submit("/Movies/renamed.mkv", "scanner", media_id,
+                                        CatalogueHintPriority::periodic_scan);
+        REQUIRE(hints.claim_next().has_value());
+        hints.mark_no_match(stale, "movies", media_id, "synthetic stale exception");
+        REQUIRE(manage.handle(request_for("DELETE", "/api/v1/manage/filesystem", {},
+                                          {{"path", "/Movies/renamed.mkv"}}))
+                    .status == 204);
+        CHECK(hints.list().empty());
+    }
+
+    {
+        // By hand under existing parents, named by id.
+        auto parent = [](CatalogueKind kind, std::string id, std::string title,
+                         std::optional<std::string> parent_id = {}) {
+            CatalogueItem item;
+            item.kind = kind;
+            item.id = std::move(id);
+            item.title = std::move(title);
+            if (parent_id)
+                item.parent_id = *parent_id;
+            return item;
+        };
+        auto season_two =
+            parent(CatalogueKind::season, "tmdb:tv:1:season:2", "Season 2", "tmdb:tv:1");
+        season_two.season_number = 2;
+        catalogue.upsert_many({parent(CatalogueKind::show, "tmdb:tv:1", "Scanner Show"),
+                               season_two,
+                               parent(CatalogueKind::artist, "musicbrainz:artist:a",
+                                      "Scanner Artist")});
+        auto scanner = bench.scanner();
+        ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
+        int file = 0;
+        auto unmatched = [&] {
+            ++file;
+            return bench.unmatched("/TV/hand-" + std::to_string(file) + ".mkv",
+                                   static_cast<uint8_t>(100 + file))
+                .first;
+        };
+        auto post = [&](const std::string& hint_id, std::string_view body) {
+            auto response = manage.handle(
+                request_for("POST", "/api/v1/manage/unmatched/" + hint_id + "/manual", body));
+            return std::pair{response.status, body_json(response)};
+        };
+        auto leaf = [&](const Json& body) {
+            return catalogue.get(body.find("leaf_item_id")->asString());
+        };
+
+        // season_id: the episode joins the scanner's season, locked.
+        auto [status, body] = post(unmatched(), R"({"kind":"episode","season_id":"tmdb:tv:1:season:2","season_number":7,"episode_number":3})");
+        REQUIRE(status == 201);
+        auto episode = leaf(body);
+        REQUIRE(episode.has_value());
+        CHECK(episode->parent_id == "tmdb:tv:1:season:2");
+        CHECK(episode->season_number == 2);
+        CHECK(episode->external_ids.at("macha_metadata_locked") == "1");
+        CHECK(catalogue.get("tmdb:tv:1:season:2")->title == "Season 2");
+
+        // series_id plus an existing season number reuses that season.
+        std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":2,"episode_number":4,"lock":false})");
+        REQUIRE(status == 201);
+        episode = leaf(body);
+        CHECK(episode->parent_id == "tmdb:tv:1:season:2");
+        CHECK(!episode->external_ids.contains("macha_metadata_locked"));
+        CHECK(catalogue.list(CatalogueKind::season, std::string_view("tmdb:tv:1")).size() == 1);
+
+        // A new season number creates one season under the existing show.
+        std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":5,"episode_number":1})");
+        REQUIRE(status == 201);
+        const auto new_season = catalogue.get(*leaf(body)->parent_id);
+        REQUIRE(new_season.has_value());
+        CHECK(new_season->parent_id == "tmdb:tv:1");
+        CHECK(new_season->season_number == 5);
+        CHECK(catalogue.list(CatalogueKind::show).size() == 1);
+
+        // artist_id plus an album title: one album, reused by the second track.
+        std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"One","track_number":1})");
+        REQUIRE(status == 201);
+        const auto album_id = leaf(body)->parent_id;
+        CHECK(catalogue.get(*album_id)->parent_id == "musicbrainz:artist:a");
+        std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"Two","track_number":2})");
+        REQUIRE(status == 201);
+        CHECK(leaf(body)->parent_id == album_id);
+        CHECK(catalogue.list(CatalogueKind::artist).size() == 1);
+
+        // A missing parent is 404 and a wrong kind is 400, both naming the parent.
+        const auto refused = unmatched();
+        std::tie(status, body) = post(refused, R"({"kind":"episode","season_id":"tmdb:tv:missing","episode_number":1})");
+        CHECK(status == 404);
+        CHECK(error_code(body) == "parent_not_found");
+        CHECK(body.find("error")->find("parent_id")->asString() == "tmdb:tv:missing");
+        std::tie(status, body) = post(refused, R"({"kind":"track","album_id":"musicbrainz:artist:a","title":"Three"})");
+        CHECK(status == 400);
+        CHECK(error_code(body) == "bad_parent_kind");
+        CHECK(body.find("error")->find("expected_kind")->asString() == "album");
+        CHECK(body.find("error")->find("parent_kind")->asString() == "artist");
+        CHECK(hints.get(refused).has_value());
+    }
+
+    {
+        // By provider reference, as a scan would match it.
+        const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
+        auto http = std::make_unique<FakeHttpClient>();
+        http->add("/movie/335984", 200, "application/json",
+                  R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","poster_path":"/p.jpg"})");
+        http->add("/movie/77", 500, "text/plain", "down");
+        http->add("/tv/1399/season/1", 200, "application/json",
+                  R"({"id":3624,"name":"Season 1","episodes":[{"id":63057,"episode_number":2,"name":"The Kingsroad"}]})");
+        http->add("/tv/1399", 200, "application/json",
+                  R"({"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17"})");
+        http->add("/release/" + release, 200, "application/json",
+                  R"({"id":")" + release + R"(","title":"Hand Album","date":"1999",
+                      "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
+                      "media":[{"position":1,"tracks":[{"position":1,"title":"One","recording":{"id":"r1","title":"One"}},
+                                                       {"position":2,"title":"Two","recording":{"id":"r2","title":"Two"}}]}]})");
+        http->add("image.tmdb.org", 200, "image/jpeg", "poster-bytes");
+        auto scanner =
+            bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
+        ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
+        auto match = [&](const std::string& hint_id, const std::string& body) {
+            auto response = manage.handle(
+                request_for("POST", "/api/v1/manage/unmatched/" + hint_id + "/match", body));
+            return std::pair{response.status, body_json(response)};
+        };
+
+        // A movie by TMDB id: the record, its poster and the binding.
+        auto [movie_hint, movie_media] = bench.unmatched("/Movies/ref-1.mkv", 1);
+        auto [status, body] = match(movie_hint, R"({"ref":"tmdb:movie:335984"})");
+        REQUIRE(status == 200);
+        CHECK(body.find("status")->asString() == "matched");
+        CHECK(body.find("leaf_item_id")->asString() == "tmdb:movie:335984");
+        auto movie = catalogue.get("tmdb:movie:335984");
+        REQUIRE(movie.has_value());
+        CHECK(movie->title == "Blade Runner 2049");
+        CHECK(movie->media_ids == std::vector<std::string>{movie_media});
+        REQUIRE(movie->artwork.size() == 1);
+        CHECK(movie->artwork.front().role == "poster");
+        CHECK(!hints.get(movie_hint).has_value());
+
+        // A show by id with season and episode numbers builds show, season, episode.
+        auto [episode_hint, episode_media] = bench.unmatched("/TV/ref-2.mkv", 2);
+        std::tie(status, body) = match(episode_hint, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":2})");
+        REQUIRE(status == 200);
+        auto episode = catalogue.get(body.find("leaf_item_id")->asString());
+        REQUIRE(episode.has_value());
+        CHECK(episode->title == "The Kingsroad");
+        CHECK(episode->media_ids == std::vector<std::string>{episode_media});
+        CHECK(catalogue.get(*episode->parent_id)->parent_id == "tmdb:tv:1399");
+
+        // A release by MusicBrainz id with a track number.
+        auto [track_hint, track_media] = bench.unmatched("/Music/ref-3.flac", 3);
+        std::tie(status, body) = match(track_hint, R"({"ref":"musicbrainz:release:)" + release + R"(","track_number":2})");
+        REQUIRE(status == 200);
+        auto track = catalogue.get(body.find("leaf_item_id")->asString());
+        REQUIRE(track.has_value());
+        CHECK(track->title == "Two");
+        CHECK(track->media_ids == std::vector<std::string>{track_media});
+
+        // Refusals leave the file unmatched.
+        const auto refused = bench.unmatched("/Movies/ref-4.mkv", 4).first;
+        struct Refusal {
+            std::string body;
+            int status;
+            const char* code;
+        };
+        for (const auto& refusal : std::vector<Refusal>{
+                 {R"({"ref":"imdb:tt0083658"})", 400, "bad_ref"},
+                 {R"({"ref":"tmdb:tv:1399","season_number":1})", 400, "not_playable_ref"},
+                 {R"({"ref":"tmdb:movie:404404"})", 404, "provider_not_found"},
+                 {R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":9})", 404,
+                  "provider_not_found"},
+                 {R"({"ref":"tmdb:movie:77"})", 503, "provider_unavailable"}}) {
+            std::tie(status, body) = match(refused, refusal.body);
+            CHECK(status == refusal.status);
+            CHECK(error_code(body) == refusal.code);
+        }
+        CHECK(hints.get(refused).has_value());
+
+        // With no TMDB token the movie provider has no source: refused before
+        // any request leaves the node.
+        CatalogueScannerConfig unconfigured;
+        unconfigured.movies.roots = {"/Movies"};
+        auto silent = std::make_unique<FakeHttpClient>();
+        auto* silent_ptr = silent.get();
+        auto bare = bench.scanner(unconfigured, std::move(silent));
+        ManageApi unconfigured_manage(bench.node(), bench.metadata(), fs, catalogue, hints, *bare);
+        auto response = unconfigured_manage.handle(
+            request_for("POST", "/api/v1/manage/unmatched/" + refused + "/match",
+                        R"({"ref":"tmdb:movie:335984"})"));
+        CHECK(response.status == 400);
+        CHECK(error_code(body_json(response)) == "provider_not_configured");
+        CHECK(silent_ptr->requests() == 0);
+    }
+
+    {
+        // A file bound to two items is a conflict; one season's multi-episode
+        // file is not.
+        auto item = [](CatalogueKind kind, std::string id, std::vector<std::string> media,
+                       std::optional<std::string> parent = {}) {
+            CatalogueItem out;
+            out.kind = kind;
+            out.id = std::move(id);
+            out.title = out.id;
+            out.media_ids = std::move(media);
+            if (parent)
+                out.parent_id = *parent;
+            return out;
+        };
+        catalogue.upsert_many({
+            item(CatalogueKind::movie, "tmdb:movie:1", {"macha:twice"}),
+            item(CatalogueKind::movie, "manual:movie:1", {"macha:twice"}),
+            item(CatalogueKind::episode, "tmdb:episode:1", {"macha:double"}, "tmdb:season:9:1"),
+            item(CatalogueKind::episode, "tmdb:episode:2", {"macha:double"}, "tmdb:season:9:1"),
+            item(CatalogueKind::movie, "tmdb:movie:2", {"macha:once"}),
+        });
+        auto scanner = bench.scanner();
+        ManageApi manage(bench.node(), bench.metadata(), fs, catalogue, hints, *scanner);
+        auto response = manage.handle(request_for("GET", "/api/v1/manage/unmatched"));
+        REQUIRE(response.status == 200);
+        const auto json = body_json(response);
+        const auto& conflicts = json.find("conflicts")->asArray();
+        REQUIRE(conflicts.size() == 1);
+        CHECK(conflicts[0].find("media_id")->asString() == "macha:twice");
+        CHECK(conflicts[0].find("item_ids")->asArray().size() == 2);
+    }
+
+    {
+        // A scan keeps on a manual item every file still in the namespace,
+        // inside its roots or not, and drops only the deleted one.
+        fs.mkdir("/Prune", 0755, getuid(), getgid());
+        auto file = [&](const std::string& path, uint8_t seed) {
+            write_file(fs, path, pattern(4096, seed));
+            return file_media_id(fs.getattr(path));
+        };
+        const auto in_root = file("/Prune/a.mkv", 201);
+        const auto outside_roots = file("/Other/b.mkv", 202);
+        const auto deleted = file("/Prune/c.mkv", 203);
+        CatalogueItem manual;
+        manual.kind = CatalogueKind::movie;
+        manual.id = "manual:movie:kept";
+        manual.title = "Kept";
+        manual.media_ids = {in_root, outside_roots, deleted};
+        CatalogueItem only_deleted = manual;
+        only_deleted.id = "manual:movie:emptied";
+        only_deleted.media_ids = {deleted};
+        catalogue.upsert_many({manual, only_deleted});
+        fs.unlink("/Prune/c.mkv");
+
+        CatalogueScannerConfig config;
+        config.enabled = true;
+        config.movies.roots = {"/Prune"};
+        config.tv.enabled = false;
+        config.music.enabled = false;
+        (void)bench.scanner(config, std::make_unique<FakeHttpClient>())->scan_once();
+
+        auto kept = catalogue.get("manual:movie:kept");
+        REQUIRE(kept.has_value());
+        auto expected = std::vector<std::string>{in_root, outside_roots};
+        std::sort(expected.begin(), expected.end());
+        auto actual = kept->media_ids;
+        std::sort(actual.begin(), actual.end());
+        CHECK(actual == expected);
+        auto emptied = catalogue.get("manual:movie:emptied");
+        REQUIRE(emptied.has_value());
+        CHECK(emptied->media_ids.empty());
+    }
+}
 Config config_for(const std::filesystem::path& path, const std::filesystem::path& key,
                   uint16_t port, std::vector<Endpoint> bootstrap = {}) {
     return macha::test_support::config_for(path, key, port, std::move(bootstrap),
@@ -70,471 +479,25 @@ std::atomic_uint64_t fsync_calls{0};
 std::atomic_uint64_t syncfs_calls{0};
 #endif
 
-MACHA_TEST("invariants", test_manage_unmatched_rename_manual_catalogue_and_filesystem_binding) {
-    TestService fixture("manage");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
 
-    auto& fs = service.filesystem();
-    fs.mkdir("/Movies", 0755, getuid(), getgid());
-    write_file(fs, "/Movies/unknown.mkv", pattern(4096, 91));
-    const auto before = fs.getattr("/Movies/unknown.mkv");
-    const auto media_id = file_media_id(before);
-
-    auto& hints = service.catalogue_hints();
-    const auto hint_id = hints.submit("/Movies/unknown.mkv", "scanner", media_id,
-                                      CatalogueHintPriority::periodic_scan);
-    auto claimed = hints.claim_next();
-    REQUIRE(claimed.has_value());
-    REQUIRE(claimed->id == hint_id);
-    hints.mark_no_match(hint_id, "movies", media_id, "no metadata provider match");
-
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
-                             config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
-                     scanner);
-
-    HttpRequest list;
-    list.method = "GET";
-    list.path = "/api/v1/manage/unmatched";
-    auto listed = manage.handle(list);
-    REQUIRE(listed.status == 200);
-    auto listed_json = Json::parse(
-        std::string(reinterpret_cast<const char*>(listed.body.data()), listed.body.size()));
-    REQUIRE(listed_json.find("count") != nullptr);
-    CHECK(listed_json.find("count")->asUInt64() == 1);
-
-    HttpRequest rename;
-    rename.method = "POST";
-    rename.path = "/api/v1/manage/filesystem/rename";
-    const std::string rename_body =
-        R"({"path":"/Movies/unknown.mkv","destination":"/Movies/renamed.mkv"})";
-    rename.body.assign(rename_body.begin(), rename_body.end());
-    REQUIRE(manage.handle(rename).status == 200);
-    CHECK(file_media_id(fs.getattr("/Movies/renamed.mkv")) == media_id);
-
-    auto moved_hints = hints.list();
-    REQUIRE(moved_hints.size() == 1);
-    CHECK(moved_hints.front().path == "/Movies/renamed.mkv");
-    CHECK(moved_hints.front().media_id == media_id);
-    const auto moved_hint_id = moved_hints.front().id;
-
-    HttpRequest manual;
-    manual.method = "POST";
-    manual.path = "/api/v1/manage/unmatched/" + moved_hint_id + "/manual";
-    const std::string manual_body = R"({"kind":"movie","title":"Manually Identified","year":2026})";
-    manual.body.assign(manual_body.begin(), manual_body.end());
-    auto created = manage.handle(manual);
-    REQUIRE(created.status == 201);
-    auto created_json = Json::parse(
-        std::string(reinterpret_cast<const char*>(created.body.data()), created.body.size()));
-    const auto leaf_id = created_json.find("leaf_item_id")->asString();
-    auto item = service.catalogue().get(leaf_id);
-    REQUIRE(item.has_value());
-    CHECK(item->title == "Manually Identified");
-    CHECK(item->media_ids == std::vector<std::string>{media_id});
-    CHECK(!hints.get(moved_hint_id).has_value());
-
-    HttpRequest browse;
-    browse.method = "GET";
-    browse.path = "/api/v1/manage/filesystem";
-    browse.query["path"] = "/Movies";
-    auto browsed = manage.handle(browse);
-    REQUIRE(browsed.status == 200);
-    auto browsed_json = Json::parse(
-        std::string(reinterpret_cast<const char*>(browsed.body.data()), browsed.body.size()));
-    const auto& entries = browsed_json.find("entries")->asArray();
-    REQUIRE(entries.size() == 1);
-    CHECK(entries.front().find("path")->asString() == "/Movies/renamed.mkv");
-    CHECK(entries.front().find("media_id")->asString() == media_id);
-    REQUIRE(entries.front().find("catalogue_item_ids")->asArray().size() == 1);
-    CHECK(entries.front().find("catalogue_item_ids")->asArray().front().asString() == leaf_id);
-
-    // Generic Files-tab deletion also clears any durable match state for the path.
-    const auto delete_hint = hints.submit("/Movies/renamed.mkv", "scanner", media_id,
-                                          CatalogueHintPriority::periodic_scan);
-    REQUIRE(hints.claim_next().has_value());
-    hints.mark_no_match(delete_hint, "movies", media_id, "synthetic stale exception");
-    HttpRequest remove;
-    remove.method = "DELETE";
-    remove.path = "/api/v1/manage/filesystem";
-    remove.query["path"] = "/Movies/renamed.mkv";
-    REQUIRE(manage.handle(remove).status == 204);
-    CHECK(hints.list().empty());
-}
-
-MACHA_TEST("invariants", test_manual_entry_attaches_to_existing_parents_by_id) {
-    TestService fixture("manage-manual-parents");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    auto& fs = service.filesystem();
-    auto& catalogue = service.catalogue();
-    auto& hints = service.catalogue_hints();
-    fs.mkdir("/TV", 0755, getuid(), getgid());
-
-    auto parent = [](CatalogueKind kind, std::string id, std::string title,
-                     std::optional<std::string> parent_id = {}) {
-        CatalogueItem item;
-        item.kind = kind;
-        item.id = std::move(id);
-        item.title = std::move(title);
-        if (parent_id) item.parent_id = *parent_id;
-        return item;
-    };
-    auto season_two = parent(CatalogueKind::season, "tmdb:tv:1:season:2", "Season 2", "tmdb:tv:1");
-    season_two.season_number = 2;
-    catalogue.upsert_many({parent(CatalogueKind::show, "tmdb:tv:1", "Scanner Show"), season_two,
-                           parent(CatalogueKind::artist, "musicbrainz:artist:a", "Scanner Artist")});
-
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, catalogue, hints, config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), fs, catalogue, hints, scanner);
-
-    int file = 0;
-    auto unmatched = [&] {
-        const auto path = "/TV/file-" + std::to_string(++file) + ".mkv";
-        write_file(fs, path, pattern(4096, static_cast<uint8_t>(file)));
-        const auto hint_id = hints.submit(path, "scanner", file_media_id(fs.getattr(path)),
-                                          CatalogueHintPriority::periodic_scan);
-        REQUIRE(hints.claim_next().has_value());
-        hints.mark_no_match(hint_id, "tv", file_media_id(fs.getattr(path)), "no match");
-        return hint_id;
-    };
-    auto post = [&](const std::string& hint_id, const std::string& body) {
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/manage/unmatched/" + hint_id + "/manual";
-        request.body.assign(body.begin(), body.end());
-        auto response = manage.handle(request);
-        return std::pair{response.status,
-                         Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                                 response.body.size()))};
-    };
-    auto leaf = [&](const Json& body) { return catalogue.get(body.find("leaf_item_id")->asString()); };
-
-    // season_id: the episode joins the scanner's season, locked.
-    auto [status, body] = post(unmatched(), R"({"kind":"episode","season_id":"tmdb:tv:1:season:2","season_number":7,"episode_number":3})");
-    REQUIRE(status == 201);
-    auto episode = leaf(body);
-    REQUIRE(episode.has_value());
-    CHECK(episode->parent_id == "tmdb:tv:1:season:2");
-    CHECK(episode->season_number == 2);
-    CHECK(episode->external_ids.at("macha_metadata_locked") == "1");
-    CHECK(catalogue.get("tmdb:tv:1:season:2")->title == "Season 2");
-
-    // series_id plus an existing season number reuses that season.
-    std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":2,"episode_number":4,"lock":false})");
-    REQUIRE(status == 201);
-    episode = leaf(body);
-    CHECK(episode->parent_id == "tmdb:tv:1:season:2");
-    CHECK(!episode->external_ids.contains("macha_metadata_locked"));
-    CHECK(catalogue.list(CatalogueKind::season, std::string_view("tmdb:tv:1")).size() == 1);
-
-    // A new season number creates one season under the existing show.
-    std::tie(status, body) = post(unmatched(), R"({"kind":"episode","series_id":"tmdb:tv:1","season_number":5,"episode_number":1})");
-    REQUIRE(status == 201);
-    const auto new_season = catalogue.get(*leaf(body)->parent_id);
-    REQUIRE(new_season.has_value());
-    CHECK(new_season->parent_id == "tmdb:tv:1");
-    CHECK(new_season->season_number == 5);
-    CHECK(catalogue.list(CatalogueKind::show).size() == 1);
-
-    // artist_id plus an album title: one album, reused by the second track.
-    std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"One","track_number":1})");
-    REQUIRE(status == 201);
-    const auto album_id = leaf(body)->parent_id;
-    CHECK(catalogue.get(*album_id)->parent_id == "musicbrainz:artist:a");
-    std::tie(status, body) = post(unmatched(), R"({"kind":"track","artist_id":"musicbrainz:artist:a","album":"Hand Album","title":"Two","track_number":2})");
-    REQUIRE(status == 201);
-    CHECK(leaf(body)->parent_id == album_id);
-    CHECK(catalogue.list(CatalogueKind::artist).size() == 1);
-
-    // A missing parent is 404 and a wrong kind is 400, both naming the parent.
-    const auto refused = unmatched();
-    std::tie(status, body) = post(refused, R"({"kind":"episode","season_id":"tmdb:tv:missing","episode_number":1})");
-    CHECK(status == 404);
-    CHECK(body.find("error")->find("code")->asString() == "parent_not_found");
-    CHECK(body.find("error")->find("parent_id")->asString() == "tmdb:tv:missing");
-    std::tie(status, body) = post(refused, R"({"kind":"track","album_id":"musicbrainz:artist:a","title":"Three"})");
-    CHECK(status == 400);
-    CHECK(body.find("error")->find("code")->asString() == "bad_parent_kind");
-    CHECK(body.find("error")->find("expected_kind")->asString() == "album");
-    CHECK(body.find("error")->find("parent_kind")->asString() == "artist");
-    CHECK(hints.get(refused).has_value());
-}
-
-MACHA_TEST("invariants", test_unmatched_files_match_to_a_provider_reference) {
-    TestService fixture("manage-provider-ref");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    auto& fs = service.filesystem();
-    auto& catalogue = service.catalogue();
-    auto& hints = service.catalogue_hints();
-    for (const auto* root : {"/Movies", "/TV", "/Music"}) fs.mkdir(root, 0755, getuid(), getgid());
-
-    const auto token = fixture.path() / "tmdb.token";
-    std::ofstream(token) << "test-token\n";
-    const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
-    auto http = std::make_unique<FakeHttpClient>();
-    http->add("/movie/335984", 200, "application/json",
-              R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","poster_path":"/p.jpg"})");
-    http->add("/movie/77", 500, "text/plain", "down");
-    http->add("/tv/1399/season/1", 200, "application/json",
-              R"({"id":3624,"name":"Season 1","episodes":[{"id":63057,"episode_number":2,"name":"The Kingsroad"}]})");
-    http->add("/tv/1399", 200, "application/json",
-              R"({"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17"})");
-    http->add("/release/" + release, 200, "application/json",
-              R"({"id":")" + release + R"(","title":"Hand Album","date":"1999",
-                  "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
-                  "media":[{"position":1,"tracks":[{"position":1,"title":"One","recording":{"id":"r1","title":"One"}},
-                                                   {"position":2,"title":"Two","recording":{"id":"r2","title":"Two"}}]}]})");
-    http->add("image.tmdb.org", 200, "image/jpeg", "poster-bytes");
-
-    CatalogueScannerConfig scanner_config;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.roots = {"/TV"};
-    scanner_config.tv.tmdb.token_file = token;
-    scanner_config.music.roots = {"/Music"};
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, catalogue, hints, scanner_config, std::move(http));
-    ManageApi manage(service.node(), service.metadata_manager(), fs, catalogue, hints, scanner);
-
-    int file = 0;
-    auto unmatched = [&](const std::string& root, const std::string& extension) {
-        const auto path = root + "/file-" + std::to_string(++file) + extension;
-        write_file(fs, path, pattern(4096, static_cast<uint8_t>(file)));
-        const auto media_id = file_media_id(fs.getattr(path));
-        const auto hint_id = hints.submit(path, "scanner", media_id,
-                                          CatalogueHintPriority::periodic_scan);
-        REQUIRE(hints.claim_next().has_value());
-        hints.mark_no_match(hint_id, "scanner", media_id, "no_provider_match");
-        return std::pair{hint_id, media_id};
-    };
-    auto match = [&](const std::string& hint_id, const std::string& body) {
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/manage/unmatched/" + hint_id + "/match";
-        request.body.assign(body.begin(), body.end());
-        auto response = manage.handle(request);
-        return std::pair{response.status,
-                         Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                                 response.body.size()))};
-    };
-    auto code = [](const Json& body) { return body.find("error")->find("code")->asString(); };
-
-    // A movie by TMDB id: the record, its poster and the binding, as a scan would.
-    auto [movie_hint, movie_media] = unmatched("/Movies", ".mkv");
-    auto [status, body] = match(movie_hint, R"({"ref":"tmdb:movie:335984"})");
-    REQUIRE(status == 200);
-    CHECK(body.find("status")->asString() == "matched");
-    CHECK(body.find("leaf_item_id")->asString() == "tmdb:movie:335984");
-    auto movie = catalogue.get("tmdb:movie:335984");
-    REQUIRE(movie.has_value());
-    CHECK(movie->title == "Blade Runner 2049");
-    CHECK(movie->media_ids == std::vector<std::string>{movie_media});
-    REQUIRE(movie->artwork.size() == 1);
-    CHECK(movie->artwork.front().role == "poster");
-    CHECK(!hints.get(movie_hint).has_value());
-
-    // A show by id with season and episode numbers builds show, season, episode.
-    auto [episode_hint, episode_media] = unmatched("/TV", ".mkv");
-    std::tie(status, body) = match(episode_hint, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":2})");
-    REQUIRE(status == 200);
-    auto episode = catalogue.get(body.find("leaf_item_id")->asString());
-    REQUIRE(episode.has_value());
-    CHECK(episode->title == "The Kingsroad");
-    CHECK(episode->media_ids == std::vector<std::string>{episode_media});
-    CHECK(catalogue.get(*episode->parent_id)->parent_id == "tmdb:tv:1399");
-
-    // A release by MusicBrainz id with a track number.
-    auto [track_hint, track_media] = unmatched("/Music", ".flac");
-    std::tie(status, body) = match(track_hint, R"({"ref":"musicbrainz:release:)" + release + R"(","track_number":2})");
-    REQUIRE(status == 200);
-    auto track = catalogue.get(body.find("leaf_item_id")->asString());
-    REQUIRE(track.has_value());
-    CHECK(track->title == "Two");
-    CHECK(track->media_ids == std::vector<std::string>{track_media});
-
-    // Refusals leave the file unmatched.
-    auto [refused, refused_media] = unmatched("/Movies", ".mkv");
-    std::tie(status, body) = match(refused, R"({"ref":"imdb:tt0083658"})");
-    CHECK(status == 400);
-    CHECK(code(body) == "bad_ref");
-    std::tie(status, body) = match(refused, R"({"ref":"tmdb:tv:1399","season_number":1})");
-    CHECK(status == 400);
-    CHECK(code(body) == "not_playable_ref");
-    std::tie(status, body) = match(refused, R"({"ref":"tmdb:movie:404404"})");
-    CHECK(status == 404);
-    CHECK(code(body) == "provider_not_found");
-    std::tie(status, body) = match(refused, R"({"ref":"tmdb:tv:1399","season_number":1,"episode_number":9})");
-    CHECK(status == 404);
-    CHECK(code(body) == "provider_not_found");
-    std::tie(status, body) = match(refused, R"({"ref":"tmdb:movie:77"})");
-    CHECK(status == 503);
-    CHECK(code(body) == "provider_unavailable");
-    CHECK(hints.get(refused).has_value());
-}
-
-MACHA_TEST("invariants", test_a_provider_reference_needs_its_provider_configured) {
-    TestService fixture("manage-provider-ref-unconfigured");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    auto& fs = service.filesystem();
-    auto& hints = service.catalogue_hints();
-    fs.mkdir("/Movies", 0755, getuid(), getgid());
-    write_file(fs, "/Movies/film.mkv", pattern(4096, 7));
-    const auto media_id = file_media_id(fs.getattr("/Movies/film.mkv"));
-    const auto hint_id = hints.submit("/Movies/film.mkv", "scanner", media_id,
-                                      CatalogueHintPriority::periodic_scan);
-    REQUIRE(hints.claim_next().has_value());
-    hints.mark_no_match(hint_id, "movies", media_id, "no_provider_match");
-
-    // No TMDB token: the movie provider has no metadata source.
-    CatalogueScannerConfig scanner_config;
-    scanner_config.movies.roots = {"/Movies"};
-    auto http = std::make_unique<FakeHttpClient>();
-    auto* http_ptr = http.get();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints, scanner_config,
-                             std::move(http));
-    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
-                     scanner);
-    HttpRequest request;
-    request.method = "POST";
-    request.path = "/api/v1/manage/unmatched/" + hint_id + "/match";
-    const std::string body = R"({"ref":"tmdb:movie:335984"})";
-    request.body.assign(body.begin(), body.end());
-    auto response = manage.handle(request);
-    CHECK(response.status == 400);
-    auto json = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                        response.body.size()));
-    CHECK(json.find("error")->find("code")->asString() == "provider_not_configured");
-    CHECK(http_ptr->requests() == 0);
-}
-
-MACHA_TEST("invariants", test_provider_search_finds_records_and_says_which_are_catalogued) {
-    TestService fixture("manage-provider-search");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    CatalogueItem held;
-    held.kind = CatalogueKind::movie;
-    held.id = "tmdb:movie:335984";
-    held.title = "Blade Runner 2049";
-    service.catalogue().upsert_many({held});
-
-    const auto token = fixture.path() / "tmdb.token";
-    std::ofstream(token) << "test-token\n";
-    auto http = std::make_unique<FakeHttpClient>();
-    auto* http_ptr = http.get();
-    http->add("/search/movie", 200, "application/json",
-              R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","overview":"K."},
-                             {"id":78,"title":"Blade Runner","release_date":"1982-06-25"},
-                             {"id":79,"title":"Blade Runner Black Out"}]})");
-    http->add("/search/tv", 500, "text/plain", "down");
-    http->add("/release", 200, "application/json",
-              R"({"releases":[{"id":"0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41","title":"Hand Album","date":"1999-02-01",
-                               "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
-                               "release-group":{"id":"g1"}}]})");
-
-    CatalogueScannerConfig scanner_config;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.roots = {"/TV"};
-    scanner_config.tv.tmdb.token_file = token;
-    scanner_config.music.roots = {"/Music"};
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                             service.catalogue_hints(), scanner_config, std::move(http));
-    ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(),
-                     service.catalogue(), service.catalogue_hints(), scanner);
-
-    auto search = [&](std::map<std::string, std::string, std::less<>> query) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/manage/providers/search";
-        for (auto& [name, value] : query) request.query[name] = value;
-        auto response = manage.handle(request);
-        return std::pair{response.status,
-                         Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                                 response.body.size()))};
-    };
-
-    auto [status, body] = search({{"q", "Blade Runner"}, {"kind", "movie"}, {"year", "2017"}, {"limit", "2"}});
-    REQUIRE(status == 200);
-    CHECK(body.find("status")->asString() == "ok");
-    const auto& results = body.find("results")->asArray();
-    REQUIRE(results.size() == 2);
-    CHECK(results[0].find("ref")->asString() == "tmdb:movie:335984");
-    CHECK(results[0].find("provider")->asString() == "tmdb");
-    CHECK(results[0].find("year")->asInt64() == 2017);
-    CHECK(results[0].find("overview")->asString() == "K.");
-    CHECK(results[0].find("catalogue_item_id")->asString() == "tmdb:movie:335984");
-    CHECK(results[1].find("catalogue_item_id") == nullptr);
-    CHECK(http_ptr->requests_containing("primary_release_year=2017") == 1);
-
-    std::tie(status, body) = search({{"q", "Hand Album"}, {"kind", "album"}, {"artist", "Band"}});
-    REQUIRE(status == 200);
-    const auto& albums = body.find("results")->asArray();
-    REQUIRE(albums.size() == 1);
-    CHECK(albums[0].find("ref")->asString() == "musicbrainz:release:0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41");
-    CHECK(albums[0].find("artist")->asString() == "Band");
-    CHECK(albums[0].find("year")->asInt64() == 1999);
-
-    auto code = [](const Json& json) { return json.find("error")->find("code")->asString(); };
-    std::tie(status, body) = search({{"q", "Thrones"}, {"kind", "show"}});
-    CHECK(status == 503);
-    CHECK(code(body) == "provider_unavailable");
-    std::tie(status, body) = search({{"q", "x"}, {"kind", "episode"}});
-    CHECK(status == 400);
-    CHECK(code(body) == "bad_kind");
-    std::tie(status, body) = search({{"kind", "movie"}});
-    CHECK(status == 400);
-    CHECK(code(body) == "bad_query");
-    std::tie(status, body) = search({{"q", "x"}, {"kind", "movie"}, {"limit", "0"}});
-    CHECK(status == 400);
-    CHECK(code(body) == "bad_limit");
-}
-
-MACHA_TEST("invariants", test_artwork_options_list_and_a_choice_becomes_the_items_artwork) {
-    TestService fixture("manage-artwork-choice");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-    auto& catalogue = service.catalogue();
-
+// ManageApi over provider records: search says which results are already
+// catalogued, artwork options are listed per role, and a choice fetches the
+// full image, replaces the role's artwork and locks the item.
+MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
+    CatalogueBench bench("manage-providers");
+    auto& catalogue = bench.catalogue();
     const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
     auto item = [](CatalogueKind kind, std::string id, std::optional<std::string> parent = {}) {
         CatalogueItem out;
         out.kind = kind;
         out.id = std::move(id);
         out.title = out.id;
-        if (parent) out.parent_id = *parent;
+        if (parent)
+            out.parent_id = *parent;
         return out;
     };
+    auto movie = item(CatalogueKind::movie, "tmdb:movie:335984");
+    movie.title = "Blade Runner 2049";
     auto season = item(CatalogueKind::season, "tmdb:season:1399:1", "tmdb:tv:1399");
     season.season_number = 1;
     auto episode = item(CatalogueKind::episode, "tmdb:episode:63057", season.id);
@@ -542,14 +505,20 @@ MACHA_TEST("invariants", test_artwork_options_list_and_a_choice_becomes_the_item
     episode.episode_number = 2;
     auto album = item(CatalogueKind::album, "musicbrainz:album:g1");
     album.external_ids["musicbrainz_release"] = release;
-    catalogue.upsert_many({item(CatalogueKind::movie, "tmdb:movie:335984"),
-                           item(CatalogueKind::show, "tmdb:tv:1399"), season, episode, album,
-                           item(CatalogueKind::movie, "manual:movie:x")});
+    catalogue.upsert_many({movie, item(CatalogueKind::show, "tmdb:tv:1399"), season, episode,
+                           album, item(CatalogueKind::movie, "manual:movie:x")});
 
-    const auto token = fixture.path() / "tmdb.token";
-    std::ofstream(token) << "test-token\n";
     auto http = std::make_unique<FakeHttpClient>();
     auto* http_ptr = http.get();
+    http->add("/search/movie", 200, "application/json",
+              R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04","overview":"K."},
+                             {"id":78,"title":"Blade Runner","release_date":"1982-06-25"},
+                             {"id":79,"title":"Blade Runner Black Out"}]})");
+    http->add("/search/tv", 500, "text/plain", "down");
+    http->add("musicbrainz.org/ws/2/release?", 200, "application/json",
+              R"({"releases":[{"id":")" + release + R"(","title":"Hand Album","date":"1999-02-01",
+                               "artist-credit":[{"name":"Band","artist":{"id":"a1","name":"Band"}}],
+                               "release-group":{"id":"g1"}}]})");
     http->add("/movie/335984/images", 200, "application/json",
               R"({"posters":[{"file_path":"/a.jpg","width":1000,"height":1500,"iso_639_1":"en"},
                              {"file_path":"/b.jpg","width":2000,"height":3000,"iso_639_1":null}],
@@ -565,619 +534,404 @@ MACHA_TEST("invariants", test_artwork_options_list_and_a_choice_becomes_the_item
                              "thumbnails":{"250":"https://coverartarchive.org/release/)" + release + R"(/36041390393-250.jpg",
                                            "500":"https://coverartarchive.org/release/)" + release + R"(/36041390393-500.jpg"}},
                             {"id":2,"front":false,"types":["Back"],"image":"https://coverartarchive.org/x/2.jpg"}]})");
-
-    CatalogueScannerConfig scanner_config;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.roots = {"/TV"};
-    scanner_config.tv.tmdb.token_file = token;
-    scanner_config.music.roots = {"/Music"};
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), catalogue,
-                             service.catalogue_hints(), scanner_config, std::move(http));
-    ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(), catalogue,
-                     service.catalogue_hints(), scanner);
-
-    auto parse = [](const HttpResponse& response) {
-        return Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                       response.body.size()));
+    auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())), std::move(http));
+    ManageApi manage(bench.node(), bench.metadata(), bench.fs(), catalogue, bench.hints(),
+                     *scanner);
+    const auto get = [&](const char* path, std::map<std::string, std::string, std::less<>> query) {
+        auto response = manage.handle(request_for("GET", path, {}, std::move(query)));
+        return std::pair{response.status, body_json(response)};
     };
-    auto options = [&](std::map<std::string, std::string, std::less<>> query) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/manage/providers/artwork";
-        for (auto& [name, value] : query) request.query[name] = value;
-        auto response = manage.handle(request);
-        return std::pair{response.status, parse(response)};
+    const auto choose = [&](std::string_view body) {
+        auto response =
+            manage.handle(request_for("POST", "/api/v1/manage/providers/artwork/choose", body));
+        return std::pair{response.status, body_json(response)};
     };
-    auto choose = [&](const std::string& body) {
-        HttpRequest request;
-        request.method = "POST";
-        request.path = "/api/v1/manage/providers/artwork/choose";
-        request.body.assign(body.begin(), body.end());
-        auto response = manage.handle(request);
-        return std::pair{response.status, parse(response)};
-    };
-    auto code = [](const Json& json) { return json.find("error")->find("code")->asString(); };
+    constexpr const char* search = "/api/v1/manage/providers/search";
+    constexpr const char* artwork = "/api/v1/manage/providers/artwork";
 
-    auto [status, body] = options({{"ref", "tmdb:movie:335984"}, {"role", "poster"}});
+    auto [status, body] =
+        get(search, {{"q", "Blade Runner"}, {"kind", "movie"}, {"year", "2017"}, {"limit", "2"}});
     REQUIRE(status == 200);
-    const auto& posters = body.find("options")->asArray();
-    REQUIRE(posters.size() == 2);
-    CHECK(posters[0].find("option_id")->asString() == "/a.jpg");
-    CHECK(posters[0].find("width")->asInt64() == 1000);
-    CHECK(posters[0].find("language")->asString() == "en");
-    CHECK(posters[1].find("language")->isNull());
-    CHECK(posters[0].find("preview_url")->asString() == "https://image.tmdb.org/t/p/w185/a.jpg");
-    CHECK(posters[0].find("url") == nullptr);
+    CHECK(body.find("status")->asString() == "ok");
+    {
+        const auto& results = body.find("results")->asArray();
+        REQUIRE(results.size() == 2);
+        CHECK(results[0].find("ref")->asString() == "tmdb:movie:335984");
+        CHECK(results[0].find("provider")->asString() == "tmdb");
+        CHECK(results[0].find("year")->asInt64() == 2017);
+        CHECK(results[0].find("overview")->asString() == "K.");
+        CHECK(results[0].find("catalogue_item_id")->asString() == "tmdb:movie:335984");
+        CHECK(results[1].find("catalogue_item_id") == nullptr);
+        CHECK(http_ptr->requests_containing("primary_release_year=2017") == 1);
+    }
+    std::tie(status, body) = get(search, {{"q", "Hand Album"}, {"kind", "album"}, {"artist", "Band"}});
+    REQUIRE(status == 200);
+    {
+        const auto& albums = body.find("results")->asArray();
+        REQUIRE(albums.size() == 1);
+        CHECK(albums[0].find("ref")->asString() == "musicbrainz:release:" + release);
+        CHECK(albums[0].find("artist")->asString() == "Band");
+        CHECK(albums[0].find("year")->asInt64() == 1999);
+    }
 
-    auto [cover_status, covers] = options({{"ref", "musicbrainz:release:" + release}, {"role", "cover"}});
-    REQUIRE(cover_status == 200);
-    REQUIRE(covers.find("options")->asArray().size() == 1);
-    CHECK(covers.find("options")->asArray()[0].find("option_id")->asString() == "36041390393");
+    std::tie(status, body) = get(artwork, {{"ref", "tmdb:movie:335984"}, {"role", "poster"}});
+    REQUIRE(status == 200);
+    {
+        const auto& posters = body.find("options")->asArray();
+        REQUIRE(posters.size() == 2);
+        CHECK(posters[0].find("option_id")->asString() == "/a.jpg");
+        CHECK(posters[0].find("width")->asInt64() == 1000);
+        CHECK(posters[0].find("language")->asString() == "en");
+        CHECK(posters[1].find("language")->isNull());
+        CHECK(posters[0].find("preview_url")->asString() == "https://image.tmdb.org/t/p/w185/a.jpg");
+        CHECK(posters[0].find("url") == nullptr);
+    }
+    std::tie(status, body) = get(artwork, {{"ref", "musicbrainz:release:" + release}, {"role", "cover"}});
+    REQUIRE(status == 200);
+    REQUIRE(body.find("options")->asArray().size() == 1);
+    CHECK(body.find("options")->asArray()[0].find("option_id")->asString() == "36041390393");
 
     // Choosing fetches the full image, replaces the role and locks the item.
     std::tie(status, body) = choose(R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/b.jpg"})");
     REQUIRE(status == 200);
     CHECK(body.find("status")->asString() == "chosen");
-    auto movie = catalogue.get("tmdb:movie:335984");
-    REQUIRE(movie->artwork.size() == 1);
-    CHECK(movie->artwork.front().role == "poster");
-    CHECK(movie->external_ids.at("macha_metadata_locked") == "1");
+    auto chosen = catalogue.get("tmdb:movie:335984");
+    REQUIRE(chosen->artwork.size() == 1);
+    CHECK(chosen->artwork.front().role == "poster");
+    CHECK(chosen->external_ids.at("macha_metadata_locked") == "1");
     CHECK(http_ptr->requests_containing("/b.jpg") == 1);
-
     // An episode's reference is its show's, with its own numbers.
     std::tie(status, body) = choose(R"({"item_id":"tmdb:episode:63057","role":"still","option_id":"/s.jpg","lock":false})");
     REQUIRE(status == 200);
     auto chosen_episode = catalogue.get("tmdb:episode:63057");
     REQUIRE(chosen_episode->artwork.size() == 1);
     CHECK(!chosen_episode->external_ids.contains("macha_metadata_locked"));
-
     // An album's reference is its release.
     std::tie(status, body) = choose(R"({"item_id":"musicbrainz:album:g1","role":"cover","option_id":"36041390393"})");
     REQUIRE(status == 200);
     CHECK(catalogue.get("musicbrainz:album:g1")->artwork.size() == 1);
     CHECK(http_ptr->requests_containing("36041390393-500.jpg") == 1);
-
-    std::tie(status, body) = options({{"ref", "tmdb:movie:335984"}, {"role", "still"}});
-    CHECK(status == 400);
-    CHECK(code(body) == "bad_role");
-    std::tie(status, body) = options({{"ref", "tmdb:movie:404404"}, {"role", "poster"}});
-    CHECK(status == 404);
-    CHECK(code(body) == "provider_not_found");
-    std::tie(status, body) = choose(R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/elsewhere.jpg"})");
-    CHECK(status == 404);
-    CHECK(code(body) == "option_not_found");
-    std::tie(status, body) = choose(R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg"})");
-    CHECK(status == 400);
-    CHECK(code(body) == "no_provider_ref");
+    // A manual item needs a reference given with the choice.
     std::tie(status, body) = choose(R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg","ref":"tmdb:movie:335984"})");
     CHECK(status == 200);
-}
 
-MACHA_TEST("invariants", test_manual_items_lose_only_files_gone_from_the_namespace) {
-    TestService fixture("manual-prune");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    auto& fs = service.filesystem();
-    auto& catalogue = service.catalogue();
-    fs.mkdir("/Movies", 0755, getuid(), getgid());
-    fs.mkdir("/Other", 0755, getuid(), getgid());
-    auto file = [&](const std::string& path, uint8_t seed) {
-        write_file(fs, path, pattern(4096, seed));
-        return file_media_id(fs.getattr(path));
+    struct Refusal {
+        const char* method;
+        std::map<std::string, std::string, std::less<>> query;
+        std::string body;
+        int status;
+        const char* code;
     };
-    const auto in_root = file("/Movies/a.mkv", 1);
-    const auto outside_roots = file("/Other/b.mkv", 2);
-    const auto deleted = file("/Movies/c.mkv", 3);
-
-    CatalogueItem manual;
-    manual.kind = CatalogueKind::movie;
-    manual.id = "manual:movie:kept";
-    manual.title = "Kept";
-    manual.media_ids = {in_root, outside_roots, deleted};
-    CatalogueItem only_deleted = manual;
-    only_deleted.id = "manual:movie:emptied";
-    only_deleted.media_ids = {deleted};
-    catalogue.upsert_many({manual, only_deleted});
-    fs.unlink("/Movies/c.mkv");
-
-    CatalogueScannerConfig scanner_config;
-    scanner_config.enabled = true;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.tv.enabled = false;
-    scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, catalogue, service.catalogue_hints(),
-                             scanner_config, std::make_unique<FakeHttpClient>());
-    (void)scanner.scan_once();
-
-    auto kept = catalogue.get("manual:movie:kept");
-    REQUIRE(kept.has_value());
-    auto expected = std::vector<std::string>{in_root, outside_roots};
-    std::sort(expected.begin(), expected.end());
-    auto actual = kept->media_ids;
-    std::sort(actual.begin(), actual.end());
-    CHECK(actual == expected);
-    auto emptied = catalogue.get("manual:movie:emptied");
-    REQUIRE(emptied.has_value());
-    CHECK(emptied->media_ids.empty());
-}
-
-MACHA_TEST("invariants", test_a_file_bound_to_two_items_is_listed_as_a_conflict) {
-    TestService fixture("manage-conflicts");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    auto item = [](CatalogueKind kind, std::string id, std::vector<std::string> media,
-                   std::optional<std::string> parent = {}) {
-        CatalogueItem out;
-        out.kind = kind;
-        out.id = std::move(id);
-        out.title = out.id;
-        out.media_ids = std::move(media);
-        if (parent) out.parent_id = *parent;
-        return out;
+    const std::vector<Refusal> refusals{
+        {search, {{"q", "Thrones"}, {"kind", "show"}}, {}, 503, "provider_unavailable"},
+        {search, {{"q", "x"}, {"kind", "episode"}}, {}, 400, "bad_kind"},
+        {search, {{"kind", "movie"}}, {}, 400, "bad_query"},
+        {search, {{"q", "x"}, {"kind", "movie"}, {"limit", "0"}}, {}, 400, "bad_limit"},
+        {artwork, {{"ref", "tmdb:movie:335984"}, {"role", "still"}}, {}, 400, "bad_role"},
+        {artwork, {{"ref", "tmdb:movie:404404"}, {"role", "poster"}}, {}, 404, "provider_not_found"},
+        {nullptr, {}, R"({"item_id":"tmdb:movie:335984","role":"poster","option_id":"/elsewhere.jpg"})",
+         404, "option_not_found"},
+        {nullptr, {}, R"({"item_id":"manual:movie:x","role":"poster","option_id":"/a.jpg"})", 400,
+         "no_provider_ref"},
     };
-    service.catalogue().upsert_many({
-        item(CatalogueKind::movie, "tmdb:movie:1", {"macha:twice"}),
-        item(CatalogueKind::movie, "manual:movie:1", {"macha:twice"}),
-        // A multi-episode file: one season, several episodes.
-        item(CatalogueKind::episode, "tmdb:episode:1", {"macha:double"}, "tmdb:season:9:1"),
-        item(CatalogueKind::episode, "tmdb:episode:2", {"macha:double"}, "tmdb:season:9:1"),
-        item(CatalogueKind::movie, "tmdb:movie:2", {"macha:once"}),
-    });
-
-    auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), hints,
-                             config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), service.filesystem(),
-                     service.catalogue(), hints, scanner);
-    HttpRequest list;
-    list.method = "GET";
-    list.path = "/api/v1/manage/unmatched";
-    auto response = manage.handle(list);
-    REQUIRE(response.status == 200);
-    auto json = Json::parse(std::string(reinterpret_cast<const char*>(response.body.data()),
-                                        response.body.size()));
-    const auto& conflicts = json.find("conflicts")->asArray();
-    REQUIRE(conflicts.size() == 1);
-    CHECK(conflicts[0].find("media_id")->asString() == "macha:twice");
-    CHECK(conflicts[0].find("item_ids")->asArray().size() == 2);
+    for (const auto& refusal : refusals) {
+        std::tie(status, body) = refusal.method ? get(refusal.method, refusal.query)
+                                                : choose(refusal.body);
+        CHECK(status == refusal.status);
+        CHECK(error_code(body) == refusal.code);
+    }
 }
 
-MACHA_TEST("invariants", test_manage_node_identity_association_reset) {
-    TestService fixture("manage-identity-reset");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-    REQUIRE(wait_until([&] {
-        return service.metadata_manager().cluster_status().availability ==
-               MetadataAvailability::writable;
-    }));
+// Resetting an identity association: the stale NodeId leaves membership at
+// once and pre-reset gossip cannot bring it back, while a different NodeId
+// may own the endpoint; a reset by IP covers every port. The reset is
+// admitted on the local tombstone alone: it does not wait for writable
+// metadata or a metadata mutation in progress, and the audit record follows.
+MACHA_TEST("invariants", test_identity_association_reset) {
+    const auto members_without = [](BareNode& node, const NodeId& id) {
+        const auto all = node.membership().all();
+        return std::none_of(all.begin(), all.end(),
+                            [&](const NodeInfo& member) { return member.id == id; });
+    };
+    const auto stale_peer = [](std::string host, uint16_t port) {
+        NodeInfo stale;
+        stale.id = random_node_id();
+        stale.host = std::move(host);
+        stale.port = port;
+        stale.failure_domain = "test";
+        stale.seen_unix_ms = unix_ms();
+        return stale;
+    };
 
-    auto& fs = service.filesystem();
-    auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
-                             config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
-                     scanner);
+    {
+        CatalogueBench bench("identity-reset");
+        auto& node = bench.node();
+        auto& metadata = bench.metadata();
+        // A lone node's replica set, loaded and validated as its maintenance
+        // pass would.
+        (void)metadata.snapshot();
+        metadata.note_replica_validation(true);
+        REQUIRE(metadata.cluster_status().availability == MetadataAvailability::writable);
+        auto scanner = bench.scanner();
+        ManageApi manage(node, metadata, bench.fs(), bench.catalogue(), bench.hints(), *scanner);
 
-    HttpRequest root;
-    root.method = "GET";
-    root.path = "/api/v1/manage";
-    auto root_response = manage.handle(root);
-    REQUIRE(root_response.status == 200);
-    auto root_json = Json::parse(std::string(
-        reinterpret_cast<const char*>(root_response.body.data()), root_response.body.size()));
-    CHECK(root_json.find("api")->asString() == "manage");
-    CHECK(root_json.find("actions")->find("identity_association_reset") != nullptr);
-    CHECK(root_json.find("actions")->find("node_identity_association_reset") != nullptr);
+        auto root = manage.handle(request_for("GET", "/api/v1/manage"));
+        REQUIRE(root.status == 200);
+        const auto root_json = body_json(root);
+        CHECK(root_json.find("api")->asString() == "manage");
+        CHECK(root_json.find("actions")->find("identity_association_reset") != nullptr);
+        CHECK(root_json.find("actions")->find("node_identity_association_reset") != nullptr);
 
-    NodeInfo stale;
-    stale.id = random_node_id();
-    stale.host = "10.44.1.50";
-    stale.port = 57401;
-    stale.failure_domain = "test";
-    stale.seen_unix_ms = unix_ms();
-    service.node().membership().observe(stale, true);
+        auto stale = stale_peer("10.44.1.50", 57401);
+        node.membership().observe(stale, true);
+        PersistedNodeStatus durable;
+        durable.observed_unix_ms = unix_ms();
+        durable.host = stale.host;
+        durable.port = stale.port;
+        durable.failure_domain = stale.failure_domain;
+        metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+            snapshot.node_status[stale.id] = durable;
+            delta.upsert_node_status[stale.id] = durable;
+        });
 
-    PersistedNodeStatus durable;
-    durable.observed_unix_ms = unix_ms();
-    durable.host = stale.host;
-    durable.port = stale.port;
-    durable.failure_domain = stale.failure_domain;
-    service.metadata_manager().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        snapshot.node_status[stale.id] = durable;
-        delta.upsert_node_status[stale.id] = durable;
-    });
+        // Hold a metadata mutation open: admission must not wait for it.
+        TestGate mutation_gate;
+        std::jthread blocker([&] {
+            metadata.mutate_delta(
+                [&](MetadataSnapshot&, MetadataDelta&) { mutation_gate.enter_and_wait(); });
+        });
+        REQUIRE(mutation_gate.wait_for_entries(1));
+        const auto began = Clock::now();
+        auto reset = manage.handle(request_for(
+            "POST", "/api/v1/manage/nodes/" + to_string(stale.id) + "/identity-association/reset",
+            R"({"host":"10.44.1.50","port":57401,"reason":"test endpoint reassignment"})"));
+        CHECK(Clock::now() - began < 500ms);
+        REQUIRE(reset.status == 202);
+        const auto reset_json = body_json(reset);
+        const auto& reset_value = *reset_json.find("reset");
+        CHECK(reset_value.find("stale_node_id")->asString() == to_string(stale.id));
+        CHECK(reset_value.find("epoch")->asUInt64() == 1);
+        CHECK(reset_value.find("scope")->asString() == "[10.44.1.50]:57401");
+        CHECK(reset_json.find("audit_state")->asString() == "queued");
+        CHECK(!reset_json.find("metadata_persisted")->asBool());
+        CHECK(members_without(node, stale.id));
+        mutation_gate.open();
+        blocker.join();
 
-    HttpRequest reset;
-    reset.method = "POST";
-    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) + "/identity-association/reset";
-    const std::string reset_body =
-        R"({"host":"10.44.1.50","port":57401,"reason":"test endpoint reassignment"})";
-    reset.body.assign(reset_body.begin(), reset_body.end());
-    auto reset_response = manage.handle(reset);
-    REQUIRE(reset_response.status == 202);
-    auto reset_json = Json::parse(std::string(
-        reinterpret_cast<const char*>(reset_response.body.data()), reset_response.body.size()));
-    const auto& reset_value = *reset_json.find("reset");
-    CHECK(reset_value.find("stale_node_id")->asString() == to_string(stale.id));
-    CHECK(reset_value.find("epoch")->asUInt64() == 1);
-    CHECK(reset_value.find("scope")->asString() == "[10.44.1.50]:57401");
-    CHECK(reset_json.find("audit_state")->asString() == "queued");
-    CHECK(!reset_json.find("metadata_persisted")->asBool());
+        // Re-gossiping the pre-reset association cannot resurrect it; a
+        // different authenticated NodeId may own the same endpoint at once.
+        node.membership().observe(stale, false);
+        CHECK(members_without(node, stale.id));
+        auto replacement = stale;
+        replacement.id = random_node_id();
+        node.membership().observe(replacement, true);
+        CHECK(!members_without(node, replacement.id));
 
-    const auto membership_after = service.node().membership().all();
-    CHECK(std::none_of(membership_after.begin(), membership_after.end(),
-                       [&](const NodeInfo& node) { return node.id == stale.id; }));
+        const auto key = identity_reset_key(stale.host, stale.port);
+        REQUIRE(wait_until([&] { return metadata.snapshot().identity_resets.contains(key); }));
+        const auto audited = metadata.snapshot();
+        CHECK(audited.node_status.contains(stale.id));
+        CHECK(audited.identity_resets.at(key).stale_node_id == stale.id);
+        CHECK(audited.identity_resets.at(key).reason == "test endpoint reassignment");
 
-    // Re-gossiping the pre-reset stale association cannot resurrect it.
-    service.node().membership().observe(stale, false);
-    const auto membership_regossip = service.node().membership().all();
-    CHECK(std::none_of(membership_regossip.begin(), membership_regossip.end(),
-                       [&](const NodeInfo& node) { return node.id == stale.id; }));
+        // By IP alone: no NodeId, every port on the host.
+        auto second_port = replacement;
+        second_port.id = random_node_id();
+        second_port.port = 57402;
+        node.membership().observe(second_port, true);
+        auto unrelated = replacement;
+        unrelated.id = random_node_id();
+        unrelated.host = "10.44.1.51";
+        node.membership().observe(unrelated, true);
+        auto reset_ip = manage.handle(request_for("POST", "/api/v1/manage/identity-associations/reset",
+                                                  R"({"host":"10.44.1.50","reason":"clear by ip"})"));
+        REQUIRE(reset_ip.status == 202);
+        const auto reset_ip_json = body_json(reset_ip);
+        const auto& reset_ip_value = *reset_ip_json.find("reset");
+        CHECK(reset_ip_value.find("scope")->asString() == "[10.44.1.50]:*");
+        CHECK(reset_ip_value.find("port")->isNull());
+        CHECK(reset_ip_value.find("stale_node_id")->isNull());
+        const auto reset_ip_at = reset_ip_value.find("reset_at_unix_ms")->asUInt64();
+        const auto after_ip = node.membership().all();
+        CHECK(std::none_of(after_ip.begin(), after_ip.end(),
+                           [&](const NodeInfo& member) { return member.host == "10.44.1.50"; }));
+        CHECK(!members_without(node, unrelated.id));
 
-    // A different authenticated NodeId may immediately own the same endpoint.
-    auto replacement = stale;
-    replacement.id = random_node_id();
-    service.node().membership().observe(replacement, true);
-    const auto membership_replacement = service.node().membership().all();
-    CHECK(std::any_of(membership_replacement.begin(), membership_replacement.end(),
-                      [&](const NodeInfo& node) { return node.id == replacement.id; }));
+        // Pre-reset gossip cannot recreate an association for that IP, but
+        // post-reset authentication can establish a replacement identity.
+        replacement.seen_unix_ms = reset_ip_at ? reset_ip_at - 1 : 0;
+        node.membership().observe(replacement, false);
+        CHECK(members_without(node, replacement.id));
+        auto fresh = replacement;
+        fresh.id = random_node_id();
+        fresh.seen_unix_ms = reset_ip_at + 1;
+        node.membership().observe(fresh, true);
+        CHECK(!members_without(node, fresh.id));
 
-    const auto key = identity_reset_key(stale.host, stale.port);
-    REQUIRE(wait_until([&] {
-        return service.metadata_manager().snapshot().identity_resets.contains(key);
-    }));
-    const auto metadata = service.metadata_manager().snapshot();
-    CHECK(metadata.node_status.contains(stale.id));
-    CHECK(metadata.identity_resets.at(key).stale_node_id == stale.id);
-    CHECK(metadata.identity_resets.at(key).reason == "test endpoint reassignment");
+        const auto ip_key = identity_reset_key("10.44.1.50", 0);
+        REQUIRE(wait_until([&] { return metadata.snapshot().identity_resets.contains(ip_key); }));
+        const auto ip_audited = metadata.snapshot();
+        CHECK(ip_audited.identity_resets.at(ip_key).stale_node_id == NodeId{});
+        CHECK(ip_audited.identity_resets.at(ip_key).reason == "clear by ip");
+    }
 
-    // A reset by IP alone needs no NodeId; port 0 covers every endpoint on the
-    // host.
-    auto second_port = replacement;
-    second_port.id = random_node_id();
-    second_port.port = 57402;
-    service.node().membership().observe(second_port, true);
-    auto unrelated = replacement;
-    unrelated.id = random_node_id();
-    unrelated.host = "10.44.1.51";
-    service.node().membership().observe(unrelated, true);
+    {
+        // Metadata needs two writers and has one: the reset still succeeds on
+        // the durable local tombstone, breaking the cycle in which an
+        // unreachable stale identity keeps metadata unavailable.
+        CatalogueBench bench("identity-reset-unavailable", 2);
+        auto& node = bench.node();
+        auto scanner = bench.scanner();
+        ManageApi manage(node, bench.metadata(), bench.fs(), bench.catalogue(), bench.hints(),
+                         *scanner);
+        const auto stale = stale_peer("10.44.1.50", 7437);
+        node.membership().observe(stale, true);
+        REQUIRE(node.membership().all().size() == 2);
 
-    HttpRequest reset_ip;
-    reset_ip.method = "POST";
-    reset_ip.path = "/api/v1/manage/identity-associations/reset";
-    const std::string reset_ip_body = R"({"host":"10.44.1.50","reason":"clear by ip"})";
-    reset_ip.body.assign(reset_ip_body.begin(), reset_ip_body.end());
-    auto reset_ip_response = manage.handle(reset_ip);
-    REQUIRE(reset_ip_response.status == 202);
-    auto reset_ip_json =
-        Json::parse(std::string(reinterpret_cast<const char*>(reset_ip_response.body.data()),
-                                reset_ip_response.body.size()));
-    const auto& reset_ip_value = *reset_ip_json.find("reset");
-    CHECK(reset_ip_value.find("scope")->asString() == "[10.44.1.50]:*");
-    CHECK(reset_ip_value.find("port")->isNull());
-    CHECK(reset_ip_value.find("stale_node_id")->isNull());
-    const auto reset_ip_at = reset_ip_value.find("reset_at_unix_ms")->asUInt64();
-
-    const auto after_ip_reset = service.node().membership().all();
-    CHECK(std::none_of(after_ip_reset.begin(), after_ip_reset.end(),
-                       [&](const NodeInfo& node) { return node.host == "10.44.1.50"; }));
-    CHECK(std::any_of(after_ip_reset.begin(), after_ip_reset.end(),
-                      [&](const NodeInfo& node) { return node.id == unrelated.id; }));
-
-    // Pre-reset gossip cannot recreate an association for that IP, but direct
-    // post-reset authentication can establish a replacement identity.
-    replacement.seen_unix_ms = reset_ip_at ? reset_ip_at - 1 : 0;
-    service.node().membership().observe(replacement, false);
-    const auto after_stale_regossip = service.node().membership().all();
-    CHECK(std::none_of(after_stale_regossip.begin(), after_stale_regossip.end(),
-                       [&](const NodeInfo& node) { return node.id == replacement.id; }));
-    auto fresh = replacement;
-    fresh.id = random_node_id();
-    fresh.seen_unix_ms = reset_ip_at + 1;
-    service.node().membership().observe(fresh, true);
-    const auto after_fresh_auth = service.node().membership().all();
-    CHECK(std::any_of(after_fresh_auth.begin(), after_fresh_auth.end(),
-                      [&](const NodeInfo& node) { return node.id == fresh.id; }));
-
-    const auto ip_key = identity_reset_key("10.44.1.50", 0);
-    REQUIRE(wait_until([&] {
-        return service.metadata_manager().snapshot().identity_resets.contains(ip_key);
-    }));
-    const auto metadata_after_ip = service.metadata_manager().snapshot();
-    REQUIRE(metadata_after_ip.identity_resets.contains(ip_key));
-    CHECK(metadata_after_ip.identity_resets.at(ip_key).stale_node_id == NodeId{});
-    CHECK(metadata_after_ip.identity_resets.at(ip_key).reason == "clear by ip");
+        auto response = manage.handle(request_for(
+            "POST", "/api/v1/manage/nodes/" + to_string(stale.id) + "/identity-association/reset",
+            R"({"reason":"recover unavailable metadata"})"));
+        REQUIRE(response.status == 202);
+        const auto value = body_json(response);
+        CHECK(!value.find("metadata_persisted")->asBool());
+        CHECK(value.find("metadata_generation")->isNull());
+        CHECK(value.find("persistence_error")->isNull());
+        CHECK(value.find("audit_state")->asString() == "queued");
+        CHECK(value.find("reset")->find("stale_node_id")->asString() == to_string(stale.id));
+        CHECK(members_without(node, stale.id));
+        const auto resets = node.identity_resets();
+        REQUIRE(resets.size() == 1);
+        CHECK(resets.front().host == stale.host);
+        CHECK(resets.front().port == stale.port);
+    }
 }
 
-MACHA_TEST("invariants", test_manage_identity_reset_breaks_metadata_unavailable_cycle) {
-    TestService fixture("manage-identity-reset-unavailable");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 2;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    auto& fs = service.filesystem();
-    auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
-                             config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
-                     scanner);
-
-    NodeInfo stale;
-    stale.id = random_node_id();
-    stale.host = "10.44.1.50";
-    stale.port = 7437;
-    stale.failure_domain = "test";
-    stale.seen_unix_ms = unix_ms();
-    service.node().membership().observe(stale, true);
-    REQUIRE(service.node().membership().all().size() == 2);
-
-    HttpRequest reset;
-    reset.method = "POST";
-    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) +
-                 "/identity-association/reset";
-    const std::string body = R"({"reason":"recover unavailable metadata"})";
-    reset.body.assign(body.begin(), body.end());
-    const auto response = manage.handle(reset);
-
-    // 202: the local tombstone is durable; cluster propagation and audit are
-    // asynchronous, so the reset succeeds without writable metadata.
-    REQUIRE(response.status == 202);
-    const auto value = Json::parse(std::string(
-        reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-    CHECK(!value.find("metadata_persisted")->asBool());
-    CHECK(value.find("metadata_generation")->isNull());
-    CHECK(value.find("persistence_error")->isNull());
-    CHECK(value.find("audit_state")->asString() == "queued");
-    CHECK(value.find("reset")->find("stale_node_id")->asString() == to_string(stale.id));
-
-    const auto members = service.node().membership().all();
-    CHECK(std::none_of(members.begin(), members.end(),
-                       [&](const NodeInfo& node) { return node.id == stale.id; }));
-    const auto resets = service.node().identity_resets();
-    REQUIRE(resets.size() == 1);
-    CHECK(resets.front().host == stale.host);
-    CHECK(resets.front().port == stale.port);
-}
-
-MACHA_TEST("invariants", test_manage_identity_reset_does_not_wait_for_metadata_audit) {
-    TestService fixture("manage-identity-reset-async");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-    REQUIRE(wait_until([&] {
-        return service.metadata_manager().cluster_status().availability ==
-               MetadataAvailability::writable;
-    }));
-
-    auto& fs = service.filesystem();
-    auto& hints = service.catalogue_hints();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), fs, service.catalogue(), hints,
-                             config.catalogue.scanner);
-    ManageApi manage(service.node(), service.metadata_manager(), fs, service.catalogue(), hints,
-                     scanner);
-
-    NodeInfo stale;
-    stale.id = random_node_id();
-    stale.host = "10.34.1.50";
-    stale.port = 7437;
-    stale.failure_domain = "remote";
-    stale.seen_unix_ms = unix_ms();
-    service.node().membership().observe(stale, true);
-
-    // Hold a metadata mutation open; reset admission must not wait for it.
-    TestGate mutation_gate;
-    std::jthread blocker([&] {
-        service.metadata_manager().mutate_delta(
-            [&](MetadataSnapshot&, MetadataDelta&) { mutation_gate.enter_and_wait(); });
-    });
-    REQUIRE(mutation_gate.wait_for_entries(1));
-
-    HttpRequest reset;
-    reset.method = "POST";
-    reset.path = "/api/v1/manage/nodes/" + to_string(stale.id) +
-                 "/identity-association/reset";
-    const std::string body = R"({"reason":"latency regression"})";
-    reset.body.assign(body.begin(), body.end());
-    const auto began = Clock::now();
-    const auto response = manage.handle(reset);
-    const auto elapsed = Clock::now() - began;
-
-    REQUIRE(response.status == 202);
-    CHECK(elapsed < 500ms);
-    const auto members = service.node().membership().all();
-    CHECK(std::none_of(members.begin(), members.end(),
-                       [&](const NodeInfo& node) { return node.id == stale.id; }));
-    const auto value = Json::parse(std::string(
-        reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-    CHECK(value.find("audit_state")->asString() == "queued");
-
-    mutation_gate.open();
-    blocker.join();
-    const auto key = identity_reset_key(stale.host, stale.port);
-    REQUIRE(wait_until([&] {
-        return service.metadata_manager().snapshot().identity_resets.contains(key);
-    }));
-}
-
-// A probe can tell "something answered" from "Macha answered", even while the
-// node is starting.
-MACHA_TEST("invariants", test_health_identifies_itself_unauthenticated_in_every_state) {
+// Kept integrated: the order is Service::start's, observed through its own
+// HTTP server and role gate.
+//
+// Health identifies Macha without a token in every state; Status answers
+// before the control plane is up and while storage recovers, when ordinary
+// routes say the node is recovering; Status needs view_status, which every
+// capability implies and which grants no media.
+MACHA_TEST("invariants", test_service_answers_health_and_status_through_startup) {
     TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("health-identity");
+    auto config = cluster.node_config("startup-order");
     config.catalogue.api.enabled = true;
     config.catalogue.api.listen = "127.0.0.1";
     config.catalogue.api.port = free_port();
     const auto port = config.catalogue.api.port;
 
     TestGate control_gate;
+    TestGate recovery_gate;
     Service service(config, cluster.keys(), [&](std::string_view stage) {
         if (stage == "control-plane")
             control_gate.enter_and_wait();
+        if (stage == "data-storage" || stage == "control-storage")
+            recovery_gate.enter_and_wait();
     });
+    struct ReleaseGates {
+        TestGate& control;
+        TestGate& recovery;
+        ~ReleaseGates() {
+            control.open();
+            recovery.open();
+        }
+    } release{control_gate, recovery_gate};
     std::jthread starter([&] { service.start(); });
-    struct ReleaseGate {
-        TestGate& gate;
-        ~ReleaseGate() { gate.open(); }
-    } release{control_gate};
     REQUIRE(control_gate.wait_for_entries(1));
 
-    // Still starting: 503, and the body still identifies Macha.
+    const auto status_json = [&] {
+        const auto response = raw_http_get(port, "/api/v1/status", bearer_header(service));
+        CHECK(response.find("HTTP/1.1 200") != std::string::npos);
+        const auto body_at = response.find("\r\n\r\n");
+        REQUIRE(body_at != std::string::npos);
+        return Json::parse(response.substr(body_at + 4));
+    };
+    const auto available = [](const Json& diagnostics, const char* section) {
+        return diagnostics.find("diagnostics")->find(section)->find("available")->asBool();
+    };
+
+    // Starting: health is 503 and still identifies Macha; Status, both
+    // halves, already answers.
     {
-        const auto response = raw_http_get(port, "/api/v1/health");
-        CHECK(response.find("HTTP/1.1 503") != std::string::npos);
-        CHECK(response.find("Content-Type: application/json") != std::string::npos);
-        CHECK(response.find("\"service\":\"macha\"") != std::string::npos);
-        CHECK(response.find("\"status\":\"starting\"") != std::string::npos);
+        const auto health = raw_http_get(port, "/api/v1/health");
+        CHECK(health.find("HTTP/1.1 503") != std::string::npos);
+        CHECK(health.find("Content-Type: application/json") != std::string::npos);
+        CHECK(health.find("\"service\":\"macha\"") != std::string::npos);
+        CHECK(health.find("\"status\":\"starting\"") != std::string::npos);
+        const auto startup = *status_json().find("startup");
+        CHECK(startup.find("phase")->asString() == "starting");
+        CHECK(startup.find("api")->asString() == "ready");
+        CHECK(startup.find("control_plane")->asString() == "starting");
+        const auto diagnostics = status_diagnostics_response(port, service);
+        CHECK(!available(diagnostics, "data_store"));
+        CHECK(available(diagnostics, "convergence"));
+        CHECK(!available(diagnostics, "filesystem"));
     }
 
+    // Control plane up, storage recovering: Status says so, ordinary routes
+    // refuse with a reason.
     control_gate.open();
     starter.join();
-    REQUIRE(wait_until([&] {
-        return raw_http_get(port, "/api/v1/health").find("HTTP/1.1 200") != std::string::npos;
-    }, 20s));
+    REQUIRE(recovery_gate.wait_for_entries(2));
+    {
+        const auto startup = *status_json().find("startup");
+        CHECK(startup.find("phase")->asString() == "recovering");
+        CHECK(startup.find("api")->asString() == "ready");
+        CHECK(startup.find("control_plane")->asString() == "ready");
+        CHECK(startup.find("data_storage")->asString() == "recovering");
+        CHECK(startup.find("control_storage")->asString() == "recovering");
+        CHECK(!available(status_diagnostics_response(port, service), "data_store"));
+        CHECK(!service.ready());
+        const auto ordinary = raw_http_get(port, "/api/v1/catalogue/status", bearer_header(service));
+        CHECK(ordinary.find("HTTP/1.1 503") != std::string::npos);
+        CHECK(ordinary.find("service_recovering") != std::string::npos);
+    }
 
-    // Serving: 200 and the same marker, still without a bearer token.
-    const auto response = raw_http_get(port, "/api/v1/health");
-    CHECK(response.find("\"service\":\"macha\"") != std::string::npos);
-    CHECK(response.find("\"status\":\"ok\"") != std::string::npos);
-    CHECK(response.find("\"version\":\"") != std::string::npos);
-    // Cluster shape needs a token; only the node's identity is public.
-    CHECK(response.find("capacity") == std::string::npos);
-    // The probe works cross-origin too.
-    CHECK(response.find("Access-Control-Allow-Origin: *") != std::string::npos);
+    recovery_gate.open();
+    REQUIRE(wait_until([&] { return service.ready(); }, 10s));
+    CHECK(status_json().find("startup")->find("phase")->asString() == "ready");
+
+    // Serving: 200 and the same marker, still without a token; the cluster's
+    // shape needs one. The probe works cross-origin too.
+    const auto health = raw_http_get(port, "/api/v1/health");
+    CHECK(health.find("HTTP/1.1 200") != std::string::npos);
+    CHECK(health.find("\"service\":\"macha\"") != std::string::npos);
+    CHECK(health.find("\"status\":\"ok\"") != std::string::npos);
+    CHECK(health.find("\"version\":\"") != std::string::npos);
+    CHECK(health.find("node") == std::string::npos);
+    CHECK(health.find("capacity") == std::string::npos);
+    CHECK(health.find("Access-Control-Allow-Origin: *") != std::string::npos);
+
+    const auto token_for = [&](std::vector<std::string> roles) {
+        auto minted = service.accounts().sessions().create(expand_roles(roles));
+        REQUIRE(minted.has_value());
+        return std::map<std::string, std::string>{
+            {"Authorization", "Bearer " + minted->bearer_token}};
+    };
+    const auto refused = raw_http_get(port, "/api/v1/status", token_for({}));
+    CHECK(refused.find("HTTP/1.1 403") != std::string::npos);
+    CHECK(refused.find("view_status") != std::string::npos);
+    CHECK(raw_http_get(port, "/api/v1/status", token_for({std::string(role_view_status)}))
+              .find("HTTP/1.1 200") != std::string::npos);
+    CHECK(raw_http_get(port, "/api/v1/catalogue/items", token_for({std::string(role_view_status)}))
+              .find("HTTP/1.1 403") != std::string::npos);
+    CHECK(raw_http_get(port, "/api/v1/status", token_for({std::string(role_importer)}))
+              .find("HTTP/1.1 200") != std::string::npos);
 
     service.stop();
 }
 
-MACHA_TEST("invariants", test_status_api_precedes_control_plane_startup) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("status-first");
-    config.catalogue.api.enabled = true;
-    config.catalogue.api.listen = "127.0.0.1";
-    config.catalogue.api.port = free_port();
-
-    TestGate control_gate;
-    Service service(config, cluster.keys(), [&](std::string_view stage) {
-        if (stage == "control-plane")
-            control_gate.enter_and_wait();
-    });
-    std::jthread starter([&] { service.start(); });
-    struct ReleaseGate {
-        TestGate& gate;
-        ~ReleaseGate() {
-            gate.open();
-        }
-    } release{control_gate};
-    REQUIRE(control_gate.wait_for_entries(1));
-
-    const auto response =
-        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
-    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
-    const auto body_at = response.find("\r\n\r\n");
-    REQUIRE(body_at != std::string::npos);
-    auto status = Json::parse(response.substr(body_at + 4));
-    const auto* startup = status.find("startup");
-    REQUIRE(startup != nullptr);
-    CHECK(startup->find("phase")->asString() == "starting");
-    CHECK(startup->find("api")->asString() == "ready");
-    CHECK(startup->find("control_plane")->asString() == "starting");
-    // Both halves must answer this early, so fetch the expensive one too.
-    const auto diagnostics_root =
-        status_diagnostics_response(config.catalogue.api.port, service);
-    const auto* diagnostics = diagnostics_root.find("diagnostics");
-    REQUIRE(diagnostics != nullptr);
-    CHECK(!diagnostics->find("data_store")->find("available")->asBool());
-    CHECK(diagnostics->find("convergence")->find("available")->asBool());
-    CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
-
-    control_gate.open();
-    starter.join();
-    REQUIRE(wait_until([&] { return service.ready(); }, 10s));
-}
-
-MACHA_TEST("invariants", test_control_plane_and_status_api_are_online_while_backends_recover) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto config = cluster.node_config("recovering-service");
-    config.catalogue.api.enabled = true;
-    config.catalogue.api.listen = "127.0.0.1";
-    config.catalogue.api.port = free_port();
-
-    TestGate recovery_gate;
-    Service service(config, cluster.keys(), [&](std::string_view stage) {
-        if (stage == "data-storage" || stage == "control-storage")
-            recovery_gate.enter_and_wait();
-    });
-    struct ReleaseGate {
-        TestGate& gate;
-        ~ReleaseGate() {
-            gate.open();
-        }
-    } release{recovery_gate};
-
-    service.start();
-    REQUIRE(recovery_gate.wait_for_entries(2));
-
-    const auto status_response =
-        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
-    CHECK(status_response.find("HTTP/1.1 200") != std::string::npos);
-    const auto body_at = status_response.find("\r\n\r\n");
-    REQUIRE(body_at != std::string::npos);
-    auto status = Json::parse(status_response.substr(body_at + 4));
-    const auto* startup = status.find("startup");
-    REQUIRE(startup != nullptr);
-    CHECK(startup->find("phase")->asString() == "recovering");
-    CHECK(startup->find("api")->asString() == "ready");
-    CHECK(startup->find("control_plane")->asString() == "ready");
-    CHECK(startup->find("data_storage")->asString() == "recovering");
-    CHECK(startup->find("control_storage")->asString() == "recovering");
-    const auto recovering_diagnostics =
-        status_diagnostics_response(config.catalogue.api.port, service);
-    CHECK(!recovering_diagnostics.find("diagnostics")
-               ->find("data_store")
-               ->find("available")
-               ->asBool());
-    CHECK(!service.ready());
-
-    const auto ordinary = raw_http_get(config.catalogue.api.port, "/api/v1/catalogue/status",
-                                       bearer_header(service));
-    CHECK(ordinary.find("HTTP/1.1 503") != std::string::npos);
-    CHECK(ordinary.find("service_recovering") != std::string::npos);
-
-    recovery_gate.open();
-    REQUIRE(wait_until([&] { return service.ready(); }, 10s));
-    const auto ready_response =
-        raw_http_get(config.catalogue.api.port, "/api/v1/status", bearer_header(service));
-    const auto ready_body_at = ready_response.find("\r\n\r\n");
-    REQUIRE(ready_body_at != std::string::npos);
-    auto ready_status = Json::parse(ready_response.substr(ready_body_at + 4));
-    CHECK(ready_status.find("startup")->find("phase")->asString() == "ready");
-}
-
-MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recovers) {
+// Kept integrated: a peer reaching a node whose local state is still
+// recovering, over real RPC and telemetry gossip.
+//
+// The recovering node's control plane answers ping and membership at once,
+// and the peer's Status shows it online and recovering, with no fabricated
+// zero capacity, as a cluster condition.
+MACHA_TEST("invariants", test_a_recovering_node_answers_peers_and_is_shown_recovering) {
     TestCluster cluster(ConfigProfile::isolated);
     auto recovering_config = cluster.node_config("recovering-node");
-    auto peer_config = cluster.node_config("peer-node");
+    auto peer_config = cluster.node_config("recovering-peer");
 
     TestGate recovery_gate;
     BareNode recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
@@ -1186,9 +940,7 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() {
-            gate.open();
-        }
+        ~ReleaseGate() { gate.open(); }
     } release{recovery_gate};
 
     recovering.start();
@@ -1201,75 +953,31 @@ MACHA_TEST("invariants", test_rpc_membership_is_online_while_local_state_recover
     REQUIRE(peer.wait_local_state_ready(10s));
 
     const Endpoint recovering_endpoint{"127.0.0.1", recovering_config.port};
-    const auto ping = peer.call(recovering_endpoint, MessageType::ping);
-    CHECK(ping.message.type == MessageType::ok);
-    const auto members = peer.call(recovering_endpoint, MessageType::members);
-    CHECK(members.message.type == MessageType::members_reply);
+    CHECK(peer.call(recovering_endpoint, MessageType::ping).message.type == MessageType::ok);
+    CHECK(peer.call(recovering_endpoint, MessageType::members).message.type ==
+          MessageType::members_reply);
     REQUIRE(wait_until([&] {
         const auto all = recovering.membership().all();
         return std::any_of(all.begin(), all.end(),
                            [&](const NodeInfo& node) { return node.id == peer.node_id(); });
     }));
 
-    recovery_gate.open();
-    REQUIRE(recovering.wait_local_state_ready(10s));
-    peer.stop();
-    recovering.stop();
-}
+    // Fresh telemetry on the peer reporting the non-ready phase.
+    REQUIRE(wait_until([&] {
+        const auto views = peer.telemetry().views(std::chrono::milliseconds(60000));
+        return std::any_of(views.begin(), views.end(), [&](const TelemetryView& view) {
+            return view.telemetry.node_id == recovering.node_id() &&
+                   view.telemetry.phase != NodePhase::ready;
+        });
+    }, 10s));
 
-MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabricated_zero_capacity) {
-    TestCluster cluster(ConfigProfile::isolated);
-    auto recovering_config = cluster.node_config("status-recovering-node");
-    auto peer_config = cluster.node_config("status-recovering-peer");
-
-    TestGate recovery_gate;
-    BareNode recovering(recovering_config, cluster.keys(), [&](std::string_view stage) {
-        if (stage == "data-storage" || stage == "control-storage")
-            recovery_gate.enter_and_wait();
-    });
-    struct ReleaseGate {
-        TestGate& gate;
-        ~ReleaseGate() {
-            gate.open();
-        }
-    } release{recovery_gate};
-
-    recovering.start();
-    REQUIRE(recovery_gate.wait_for_entries(2));
-    CHECK(recovering.readiness().control_plane_online);
-    CHECK(!recovering.readiness().local_state_ready);
-
-    BareNode peer(peer_config, cluster.keys());
-    peer.start();
-    REQUIRE(peer.wait_local_state_ready(10s));
-
-    const Endpoint recovering_endpoint{"127.0.0.1", recovering_config.port};
-    const auto ping = peer.call(recovering_endpoint, MessageType::ping);
-    CHECK(ping.message.type == MessageType::ok);
-
-    // Wait until the peer holds fresh telemetry reporting the non-ready phase.
-    REQUIRE(wait_until(
-        [&] {
-            const auto views = peer.telemetry().views(std::chrono::milliseconds(60000));
-            return std::any_of(views.begin(), views.end(), [&](const TelemetryView& view) {
-                return view.telemetry.node_id == recovering.node_id() &&
-                       view.telemetry.phase != NodePhase::ready;
-            });
-        },
-        10s));
-
-    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity, peer.resources.data, peer.resources.memory);
-    HttpRequest request;
-    request.method = "GET";
-    request.path = "/api/v1/status";
-    auto response = status.handle(request);
+    ClusterStatusService status(peer, peer.accounts(), peer.resources.activity,
+                                peer.resources.data, peer.resources.memory);
+    auto response = status.handle(request_for("GET", "/api/v1/status"));
     REQUIRE(response.status == 200);
-    auto root = Json::parse(
-        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-    const auto* nodes = root.find("nodes");
-    REQUIRE(nodes != nullptr);
+    const auto root = body_json(response);
     bool found = false;
-    for (const auto& value : nodes->asArray()) {
+    for (const auto& value : root.find("nodes")->asArray()) {
         if (value.find("id")->asString() != to_string(recovering.node_id()))
             continue;
         found = true;
@@ -1279,7 +987,6 @@ MACHA_TEST("invariants", test_status_shows_recovering_peer_phase_without_fabrica
         CHECK(!value.find("storage")->find("available")->asBool());
     }
     CHECK(found);
-
     const auto* cluster_json = root.find("cluster");
     REQUIRE(cluster_json != nullptr);
     bool saw_condition = false;
@@ -1381,20 +1088,95 @@ MACHA_FAST_TEST("invariants", test_status_is_light_and_diagnostics_have_their_ow
     CHECK(get("/api/v1/status/nodes/not-a-node-id").status == 400);
 }
 
-MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
-    TestNode fixture("status-membership");
-    auto& config = fixture.config();
+
+// Steady time that stands still until the test moves it.
+class SteppedTime {
+    std::atomic<Clock::rep> now_{Clock::now().time_since_epoch().count()};
+
+  public:
+    Clock::time_point now() const { return Clock::time_point(Clock::duration(now_.load())); }
+    std::function<Clock::time_point()> source() const {
+        return [this] { return now(); };
+    }
+    void advance(Clock::duration by) { now_.fetch_add(by.count()); }
+};
+
+const Json* node_entry(const Json& root, const NodeId& id) {
+    for (const auto& value : root.find("nodes")->asArray())
+        if (value.find("id") && value.find("id")->asString() == to_string(id))
+            return &value;
+    return nullptr;
+}
+
+// What Status says of each node from what this node knows of it: a retired
+// identity is audit history, not a failed member; membership alone makes a
+// peer visible and online with its resource figures unknown, never zero;
+// fresh telemetry supplies measured figures, the advertised API endpoint,
+// the playback budgets and the fresher metadata generation; telemetry past
+// the freshness floor is stale, its resource figures withheld and its
+// runtime figures kept with their age.
+MACHA_TEST("invariants", test_status_renders_each_node_from_what_it_knows) {
+    TestCluster cluster(ConfigProfile::isolated);
+    auto config = cluster.node_config("status-render");
     config.replication = 1;
     config.metadata_min_write_replicas = 1;
     config.hydration.enabled = false;
     config.catalogue.scanner.enabled = false;
-    auto& node = fixture.start();
-    auto& metadata = fixture.metadata();
+    // The peer stays membership-online past the telemetry freshness floor.
+    config.dead_after = 60s;
+    SteppedTime clock;
+    BareNode node(config, cluster.keys(), {}, clock.source());
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    REQUIRE(metadata.snapshot().metadata_voters.empty());
 
-    // Establish the local metadata view without a maintenance thread, so the
-    // availability state is deterministic.
-    const auto local_snapshot = metadata.snapshot();
-    REQUIRE(local_snapshot.metadata_voters.empty());
+    ClusterStatusService status(node, node.accounts(), node.resources.activity,
+                                node.resources.data, node.resources.memory);
+    StatusSources sources;
+    sources.local = &node.local_state();
+    sources.metadata = &metadata;
+    const auto get = [&](std::string path) {
+        auto response = status.handle(request_for("GET", std::move(path)), sources);
+        REQUIRE(response.status == 200);
+        return body_json(response);
+    };
+
+    {
+        // A retired identity stays queryable for audit but is not counted.
+        const auto stale_id = random_node_id();
+        PersistedNodeStatus stale;
+        stale.observed_unix_ms = unix_ms() - 1000;
+        stale.host = "10.34.1.50";
+        stale.port = 7437;
+        stale.failure_domain = "remote";
+        stale.storage_capacity = 8ULL * 1024 * 1024 * 1024;
+        stale.storage_used = 1024;
+        metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+            snapshot.node_status[stale_id] = stale;
+            delta.upsert_node_status[stale_id] = stale;
+        });
+        IdentityAssociationReset reset;
+        reset.host = stale.host;
+        reset.port = stale.port;
+        reset.stale_node_id = stale_id;
+        reset.epoch = 1;
+        reset.reset_unix_ms = unix_ms();
+        reset.reset_by = node.node_id();
+        reset.reason = "replaced node identity";
+        REQUIRE(node.apply_identity_reset(reset));
+        metadata.note_replica_validation(true);
+
+        const auto root = get("/api/v1/status");
+        CHECK(root.find("cluster")->find("nodes_known")->asUInt64() == 1);
+        CHECK(root.find("cluster")->find("nodes_online")->asUInt64() == 1);
+        CHECK(root.find("cluster")->find("health")->asString() == "healthy");
+        CHECK(root.find("nodes")->asArray().size() == 1);
+        CHECK(node_entry(root, node.node_id()) != nullptr);
+        const auto detail = get("/api/v1/status/nodes/" + to_string(stale_id));
+        CHECK(detail.find("state")->asString() == "retired");
+        CHECK(detail.find("identity_association_reset")->find("epoch")->asUInt64() == 1);
+    }
 
     NodeInfo peer;
     peer.id = random_node_id();
@@ -1403,621 +1185,280 @@ MACHA_TEST("invariants", test_status_uses_membership_without_telemetry) {
     peer.failure_domain = "test-lab";
     peer.capacity = 4ULL * 1024 * 1024 * 1024;
     peer.used = 1024ULL * 1024 * 1024;
-    peer.metadata_generation = node.metadata_replica().generation();
+    // Unknown to membership; telemetry knows it.
+    peer.metadata_generation = 0;
     peer.seen_unix_ms = unix_ms();
     node.membership().observe(peer, true);
-
-    // No telemetry for the peer: membership alone makes it visible and online.
     // A pending replica-set validation does not demote write capability while
     // the durability floor is reachable.
     metadata.note_replica_validation(false, "test metadata reconciliation pending");
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-    StatusSources sources;
-    sources.local = &node.local_state();
-    sources.metadata = &metadata;
-    HttpRequest request;
-    request.method = "GET";
-    request.path = "/api/v1/status";
-    auto response = status.handle(request, sources);
-    REQUIRE(response.status == 200);
-    auto root = Json::parse(
-        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-    const auto* cluster = root.find("cluster");
-    REQUIRE(cluster != nullptr);
-    CHECK(cluster->find("nodes_known")->asUInt64() == 2);
-    CHECK(cluster->find("nodes_online")->asUInt64() == 2);
-    CHECK(cluster->find("metadata_availability")->asString() == "writable");
-    CHECK(cluster->find("metadata_read_available")->asBool());
-    CHECK(cluster->find("metadata_write_available")->asBool());
-    CHECK(!cluster->find("metadata_replica_set_validated")->asBool());
 
-    const auto* connectivity = root.find("connectivity");
-    REQUIRE(connectivity != nullptr);
-    const auto* upnp = connectivity->find("upnp");
-    REQUIRE(upnp != nullptr);
-    CHECK(!upnp->find("enabled")->asBool());
-    CHECK(!upnp->find("mapping_active")->asBool());
-    const auto* advertised = connectivity->find("advertised");
-    REQUIRE(advertised != nullptr);
-    const auto self = node.membership().self();
-    CHECK(advertised->find("host")->asString() == self.host);
-    CHECK(advertised->find("port")->asUInt64() == self.port);
-    CHECK(advertised->find("source")->asString() == "configured");
+    {
+        // Membership without telemetry.
+        const auto root = get("/api/v1/status");
+        const auto* cluster_json = root.find("cluster");
+        CHECK(cluster_json->find("nodes_known")->asUInt64() == 2);
+        CHECK(cluster_json->find("nodes_online")->asUInt64() == 2);
+        CHECK(cluster_json->find("metadata_availability")->asString() == "writable");
+        CHECK(cluster_json->find("metadata_read_available")->asBool());
+        CHECK(cluster_json->find("metadata_write_available")->asBool());
+        CHECK(!cluster_json->find("metadata_replica_set_validated")->asBool());
+        CHECK(!cluster_json->find("storage_online")->find("available")->asBool());
+        CHECK(cluster_json->find("storage_online")->find("used_bytes")->isNull());
+        CHECK(cluster_json->find("storage_online")->find("free_bytes")->isNull());
 
-    HttpRequest diagnostics_request;
-    diagnostics_request.method = "GET";
-    diagnostics_request.path = "/api/v1/status/diagnostics";
-    auto diagnostics_response = status.handle(diagnostics_request, sources);
-    REQUIRE(diagnostics_response.status == 200);
-    auto diagnostics_root =
-        Json::parse(std::string(reinterpret_cast<const char*>(diagnostics_response.body.data()),
-                                diagnostics_response.body.size()));
-    const auto* diagnostics = diagnostics_root.find("diagnostics");
-    REQUIRE(diagnostics != nullptr);
-    const auto* metadata_diagnostics = diagnostics->find("metadata");
-    REQUIRE(metadata_diagnostics != nullptr);
-    CHECK(metadata_diagnostics->find("available")->asBool());
-    REQUIRE(metadata_diagnostics->find("accepted_head_persistence_writes") != nullptr);
-    REQUIRE(metadata_diagnostics->find("accepted_head_persistence_bytes") != nullptr);
-    CHECK(metadata_diagnostics->find("accepted_head_persistence_failures")->asUInt64() == 0);
-    const auto* rpc_diagnostics = diagnostics->find("rpc_server");
-    REQUIRE(rpc_diagnostics != nullptr);
-    CHECK(rpc_diagnostics->find("metadata_pending_jobs")->asUInt64() == 0);
-    REQUIRE(rpc_diagnostics->find("frame_timings") != nullptr);
-    REQUIRE(rpc_diagnostics->find("message_timings") != nullptr);
-    const auto* transport_diagnostics = diagnostics->find("rpc_transport");
-    REQUIRE(transport_diagnostics != nullptr);
-    REQUIRE(transport_diagnostics->find("canonical_connections") != nullptr);
-    const auto* data_resources = diagnostics->find("data_resources");
-    REQUIRE(data_resources != nullptr);
-    CHECK(data_resources->find("capacity_bytes")->asUInt64() == config.data_inflight_bytes);
-    CHECK(data_resources->find("viewer_reserve_bytes")->asUInt64() ==
-          config.data_viewer_reserve_bytes);
-    CHECK(data_resources->find("used_bytes")->asUInt64() == 0);
-    REQUIRE(data_resources->find("viewer_admissions") != nullptr);
-    REQUIRE(data_resources->find("loader_waits") != nullptr);
-    REQUIRE(data_resources->find("speculative_waits") != nullptr);
-    CHECK(!diagnostics->find("convergence")->find("available")->asBool());
-    CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
+        const auto* connectivity = root.find("connectivity");
+        REQUIRE(connectivity != nullptr);
+        CHECK(!connectivity->find("upnp")->find("enabled")->asBool());
+        CHECK(!connectivity->find("upnp")->find("mapping_active")->asBool());
+        const auto self = node.membership().self();
+        CHECK(connectivity->find("advertised")->find("host")->asString() == self.host);
+        CHECK(connectivity->find("advertised")->find("port")->asUInt64() == self.port);
+        CHECK(connectivity->find("advertised")->find("source")->asString() == "configured");
 
-    const auto* nodes = root.find("nodes");
-    REQUIRE(nodes != nullptr);
-    bool found = false;
-    for (const auto& value : nodes->asArray()) {
-        if (value.find("id")->asString() != to_string(peer.id))
-            continue;
-        found = true;
-        CHECK(value.find("state")->asString() == "online");
-        CHECK(value.find("telemetry_freshness")->asString() == "unavailable");
-        CHECK(value.find("host")->asString() == peer.host);
-        CHECK(value.find("port")->asUInt64() == peer.port);
+        // A node serving no playback omits its budgets rather than reporting
+        // a zero a client might act on.
+        const auto* self_entry = node_entry(root, node.node_id());
+        REQUIRE(self_entry != nullptr);
+        REQUIRE(self_entry->find("playback") != nullptr);
+        CHECK(self_entry->find("playback")->find("startup_timeout_ms") == nullptr);
+        CHECK(self_entry->find("playback")->find("segment_timeout_ms") == nullptr);
+
+        const auto* entry = node_entry(root, peer.id);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->find("state")->asString() == "online");
+        CHECK(entry->find("telemetry_freshness")->asString() == "unavailable");
+        CHECK(entry->find("host")->asString() == peer.host);
+        CHECK(entry->find("port")->asUInt64() == peer.port);
         // Without telemetry the advertised API address is unknown: omitted.
-        CHECK(value.find("api_endpoint") == nullptr);
-        const auto* storage = value.find("storage");
-        REQUIRE(storage != nullptr);
+        CHECK(entry->find("api_endpoint") == nullptr);
+        const auto* storage = entry->find("storage");
         CHECK(!storage->find("available")->asBool());
         CHECK(storage->find("capacity_bytes")->asUInt64() == peer.capacity);
         CHECK(storage->find("used_bytes")->isNull());
         CHECK(storage->find("free_bytes")->isNull());
-        CHECK(value.find("storage_backends_online")->isNull());
-        const auto* cache = value.find("cache");
-        REQUIRE(cache != nullptr);
+        CHECK(entry->find("storage_backends_online")->isNull());
+        const auto* cache = entry->find("cache");
         CHECK(!cache->find("available")->asBool());
         CHECK(cache->find("capacity_bytes")->isNull());
         CHECK(cache->find("used_bytes")->isNull());
         CHECK(cache->find("free_bytes")->isNull());
+
+        const auto diagnostics_root = get("/api/v1/status/diagnostics");
+        const auto* diagnostics = diagnostics_root.find("diagnostics");
+        REQUIRE(diagnostics != nullptr);
+        const auto* metadata_diagnostics = diagnostics->find("metadata");
+        CHECK(metadata_diagnostics->find("available")->asBool());
+        REQUIRE(metadata_diagnostics->find("accepted_head_persistence_writes") != nullptr);
+        REQUIRE(metadata_diagnostics->find("accepted_head_persistence_bytes") != nullptr);
+        CHECK(metadata_diagnostics->find("accepted_head_persistence_failures")->asUInt64() == 0);
+        const auto* rpc_diagnostics = diagnostics->find("rpc_server");
+        CHECK(rpc_diagnostics->find("metadata_pending_jobs")->asUInt64() == 0);
+        REQUIRE(rpc_diagnostics->find("frame_timings") != nullptr);
+        REQUIRE(rpc_diagnostics->find("message_timings") != nullptr);
+        REQUIRE(diagnostics->find("rpc_transport")->find("canonical_connections") != nullptr);
+        const auto* data_resources = diagnostics->find("data_resources");
+        CHECK(data_resources->find("capacity_bytes")->asUInt64() == config.data_inflight_bytes);
+        CHECK(data_resources->find("viewer_reserve_bytes")->asUInt64() ==
+              config.data_viewer_reserve_bytes);
+        CHECK(data_resources->find("used_bytes")->asUInt64() == 0);
+        REQUIRE(data_resources->find("viewer_admissions") != nullptr);
+        REQUIRE(data_resources->find("loader_waits") != nullptr);
+        REQUIRE(data_resources->find("speculative_waits") != nullptr);
+        CHECK(!diagnostics->find("convergence")->find("available")->asBool());
+        CHECK(!diagnostics->find("filesystem")->find("available")->asBool());
     }
-    CHECK(found);
-    CHECK(!cluster->find("storage_online")->find("available")->asBool());
-    CHECK(cluster->find("storage_online")->find("used_bytes")->isNull());
-    CHECK(cluster->find("storage_online")->find("free_bytes")->isNull());
 
-    // A measured zero differs from a missing observation: with telemetry, zero
-    // usage stays numeric and is marked available.
-    NodeTelemetry peer_telemetry;
-    peer_telemetry.node_id = peer.id;
-    peer_telemetry.boot_id = random_node_id();
-    peer_telemetry.sequence = 1;
-    peer_telemetry.observed_unix_ms = unix_ms();
-    peer_telemetry.host = peer.host;
-    peer_telemetry.failure_domain = peer.failure_domain;
-    peer_telemetry.port = peer.port;
-    peer_telemetry.storage_capacity = peer.capacity;
-    peer_telemetry.storage_used = 0;
-    peer_telemetry.cache_capacity = 1024;
-    peer_telemetry.cache_used = 0;
-    peer_telemetry.metadata_generation = peer.metadata_generation;
-    peer_telemetry.storage_backends_online = 1;
-    peer_telemetry.api_endpoint = "http://10.44.1.51:7438";
-    peer_telemetry.node_name = "Corvus Test Peer";
-    peer_telemetry.traffic = {TrafficClass{2, 5000, 100, 2500, 50}};
-    peer_telemetry.traffic_window_ms = 10000;
-    node.telemetry().observe(peer_telemetry, true);
+    NodeTelemetry telemetry;
+    telemetry.node_id = peer.id;
+    telemetry.boot_id = random_node_id();
+    telemetry.sequence = 1;
+    telemetry.observed_unix_ms = unix_ms();
+    telemetry.host = peer.host;
+    telemetry.failure_domain = peer.failure_domain;
+    telemetry.port = peer.port;
+    telemetry.storage_capacity = peer.capacity;
+    // A measured zero differs from a missing observation.
+    telemetry.storage_used = 0;
+    telemetry.cache_capacity = 1024;
+    telemetry.cache_used = 0;
+    telemetry.metadata_generation = 25723;
+    telemetry.storage_backends_online = 1;
+    telemetry.uptime_ms = 60000;
+    telemetry.rss_bytes = 123456;
+    telemetry.api_endpoint = "http://10.44.1.51:7438";
+    telemetry.node_name = "Corvus Test Peer";
+    telemetry.playback_startup_timeout_ms = 9000;
+    telemetry.playback_segment_timeout_ms = 3000;
+    telemetry.traffic = {TrafficClass{2, 5000, 100, 2500, 50}};
+    telemetry.traffic_window_ms = 10000;
+    node.telemetry().observe(telemetry, true);
 
-    response = status.handle(request, sources);
-    REQUIRE(response.status == 200);
-    root = Json::parse(
-        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-    nodes = root.find("nodes");
-    REQUIRE(nodes != nullptr);
-    found = false;
-    for (const auto& value : nodes->asArray()) {
-        if (value.find("id")->asString() != to_string(peer.id))
-            continue;
-        found = true;
-        CHECK(value.find("telemetry_freshness")->asString() == "live");
-        // With telemetry the advertised API address (not the RPC host/port)
-        // is known.
-        CHECK(value.find("api_endpoint")->asString() == "http://10.44.1.51:7438");
+    {
+        // Fresh telemetry.
+        const auto root = get("/api/v1/status");
+        const auto* entry = node_entry(root, peer.id);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->find("telemetry_freshness")->asString() == "live");
+        // The fresher telemetry generation wins over the membership record's.
+        CHECK(entry->find("metadata_generation")->asUInt64() == 25723);
+        // The advertised API address, not the RPC host/port.
+        CHECK(entry->find("api_endpoint")->asString() == "http://10.44.1.51:7438");
         // The operator's display name travels beside host, never in place of it.
-        CHECK(value.find("node_name")->asString() == "Corvus Test Peer");
-        CHECK(value.find("host")->asString() == peer.host);
-        // Per-class cluster traffic, named by class code.
-        const auto* traffic = value.find("traffic");
+        CHECK(entry->find("node_name")->asString() == "Corvus Test Peer");
+        CHECK(entry->find("host")->asString() == peer.host);
+        CHECK(entry->find("playback")->find("startup_timeout_ms")->asInt64() == 9000);
+        CHECK(entry->find("playback")->find("segment_timeout_ms")->asInt64() == 3000);
+        const auto* traffic = entry->find("traffic");
         REQUIRE(traffic != nullptr);
-        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == peer_telemetry.observed_unix_ms);
+        CHECK(traffic->find("as_of_unix_ms")->asUInt64() == telemetry.observed_unix_ms);
         CHECK(traffic->find("window_ms")->asUInt64() == 10000);
-        const auto* classes = traffic->find("classes");
-        REQUIRE(classes != nullptr);
-        REQUIRE(classes->isArray());
-        REQUIRE(classes->asArray().size() == 1);
-        const auto& foreground = classes->asArray().front();
-        CHECK(foreground.find("class")->asString() == "foreground");
-        CHECK(foreground.find("in_bytes")->asUInt64() == 5000);
-        CHECK(foreground.find("out_bytes")->asUInt64() == 100);
-        CHECK(foreground.find("in_bytes_per_s")->asUInt64() == 2500);
-        CHECK(foreground.find("out_bytes_per_s")->asUInt64() == 50);
-        const auto* storage = value.find("storage");
-        REQUIRE(storage != nullptr);
+        const auto& classes = traffic->find("classes")->asArray();
+        REQUIRE(classes.size() == 1);
+        CHECK(classes.front().find("class")->asString() == "foreground");
+        CHECK(classes.front().find("in_bytes")->asUInt64() == 5000);
+        CHECK(classes.front().find("out_bytes")->asUInt64() == 100);
+        CHECK(classes.front().find("in_bytes_per_s")->asUInt64() == 2500);
+        CHECK(classes.front().find("out_bytes_per_s")->asUInt64() == 50);
+        const auto* storage = entry->find("storage");
         CHECK(storage->find("available")->asBool());
         CHECK(storage->find("capacity_bytes")->asUInt64() == peer.capacity);
         CHECK(storage->find("used_bytes")->asUInt64() == 0);
         CHECK(storage->find("free_bytes")->asUInt64() == peer.capacity);
-        CHECK(value.find("storage_backends_online")->asUInt64() == 1);
-        const auto* cache = value.find("cache");
-        REQUIRE(cache != nullptr);
+        CHECK(entry->find("storage_backends_online")->asUInt64() == 1);
+        const auto* cache = entry->find("cache");
         CHECK(cache->find("available")->asBool());
         CHECK(cache->find("capacity_bytes")->asUInt64() == 1024);
         CHECK(cache->find("used_bytes")->asUInt64() == 0);
         CHECK(cache->find("free_bytes")->asUInt64() == 1024);
+        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() == telemetry.rss_bytes);
     }
-    CHECK(found);
+
+    {
+        // Past the fixed 5 s freshness floor.
+        clock.advance(5200ms);
+        const auto root = get("/api/v1/status");
+        const auto* entry = node_entry(root, peer.id);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->find("state")->asString() == "online");
+        CHECK(entry->find("telemetry_freshness")->asString() == "stale");
+        // Stale resource figures are withheld: consumers sum them across nodes.
+        CHECK(!entry->find("storage")->find("available")->asBool());
+        CHECK(entry->find("storage")->find("used_bytes")->isNull());
+        CHECK(!root.find("cluster")->find("storage_online")->find("available")->asBool());
+        // Runtime figures survive: nothing aggregates them and the entry
+        // states their age.
+        CHECK(entry->find("runtime")->find("rss_bytes")->asUInt64() == telemetry.rss_bytes);
+        CHECK(entry->find("runtime")->find("uptime_ms")->asUInt64() == telemetry.uptime_ms);
+        CHECK(entry->find("live_age_ms")->asUInt64() >= 5000);
+    }
 
     metadata.note_replica_validation(true);
-    response = status.handle(request, sources);
-    REQUIRE(response.status == 200);
-    root = Json::parse(
-        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-    cluster = root.find("cluster");
-    REQUIRE(cluster != nullptr);
-    CHECK(cluster->find("metadata_availability")->asString() == "writable");
-    CHECK(cluster->find("metadata_write_available")->asBool());
+    const auto validated = get("/api/v1/status");
+    CHECK(validated.find("cluster")->find("metadata_availability")->asString() == "writable");
+    CHECK(validated.find("cluster")->find("metadata_write_available")->asBool());
+    node.stop();
 }
 
-// Self's advertised API endpoint is computed from config, not gossiped, and is
-// distinct from `connectivity.advertised` (the RPC endpoint).
-MACHA_TEST("invariants", test_status_reports_self_advertised_api_endpoint) {
-    {
-        TestNode fixture("status-api-endpoint-default");
-        auto& config = fixture.config();
-        config.replication = 1;
-        config.metadata_min_write_replicas = 1;
-        config.hydration.enabled = false;
-        config.catalogue.scanner.enabled = false;
-        // A wildcard API bind: the default must use the advertised RPC host,
-        // never the undialable listen address.
-        config.advertise_host = "10.44.1.60";
-        config.catalogue.api.enabled = true;
-        config.catalogue.api.listen = "0.0.0.0";
-        config.catalogue.api.port = 19991;
-        auto& node = fixture.start();
-        REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
-
-        ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/status";
-        auto response = status.handle(request);
-        REQUIRE(response.status == 200);
-        auto root = Json::parse(std::string(
-            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-        const auto* nodes = root.find("nodes");
-        REQUIRE(nodes != nullptr);
-        REQUIRE(nodes->asArray().size() == 1);
-        const auto& self_node = nodes->asArray().front();
-        // No override: the advertise host and the bound port, over http.
-        CHECK(self_node.find("api_endpoint")->asString() == "http://10.44.1.60:19991");
-    }
-    {
-        TestNode fixture("status-api-endpoint-override");
-        auto& config = fixture.config();
-        config.replication = 1;
-        config.metadata_min_write_replicas = 1;
-        config.hydration.enabled = false;
-        config.catalogue.scanner.enabled = false;
-        config.catalogue.api.enabled = true;
-        config.catalogue.api.listen = "127.0.0.1";
-        config.catalogue.api.port = 19992;
-        config.catalogue.api.advertised_endpoint = "https://media-node-2.example.net:443";
-        auto& node = fixture.start();
-        REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
-
-        ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/status";
-        auto response = status.handle(request);
-        REQUIRE(response.status == 200);
-        auto root = Json::parse(std::string(
-            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-        const auto* nodes = root.find("nodes");
-        REQUIRE(nodes != nullptr);
-        REQUIRE(nodes->asArray().size() == 1);
-        const auto& self_node = nodes->asArray().front();
-        // The override wins and carries its own scheme (TLS offload: the node
-        // serves http on 19992, clients are told https on 443).
-        CHECK(self_node.find("api_endpoint")->asString() ==
-              "https://media-node-2.example.net:443");
-    }
-    {
-        TestNode fixture("status-api-endpoint-disabled");
-        auto& config = fixture.config();
-        config.replication = 1;
-        config.metadata_min_write_replicas = 1;
-        config.hydration.enabled = false;
-        config.catalogue.scanner.enabled = false;
-        config.catalogue.api.enabled = false;
-        auto& node = fixture.start();
-        REQUIRE(wait_until([&] { return node.telemetry().local().has_value(); }, 5s));
-
-        ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/status";
-        auto response = status.handle(request);
-        REQUIRE(response.status == 200);
-        auto root = Json::parse(std::string(
-            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-        const auto* nodes = root.find("nodes");
-        REQUIRE(nodes != nullptr);
-        REQUIRE(nodes->asArray().size() == 1);
-        const auto& self_node = nodes->asArray().front();
-        CHECK(self_node.find("api_endpoint") == nullptr);
-    }
-}
-
-MACHA_TEST("invariants", test_status_marks_stale_peer_telemetry_as_unavailable_not_live) {
-    TestNode fixture("status-stale-telemetry");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    // The peer must stay membership-online past the 5 s telemetry freshness
-    // floor, so dead_after is not tuned small here.
-    config.dead_after = 60s;
-    auto& node = fixture.start();
-    auto& metadata = fixture.metadata();
-    metadata.snapshot();
-
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "10.44.1.201";
-    peer.port = 7437;
-    peer.failure_domain = "test-lab";
-    peer.capacity = 4ULL * 1024 * 1024 * 1024;
-    peer.used = 1024ULL * 1024 * 1024;
-    peer.metadata_generation = node.metadata_replica().generation();
-    peer.seen_unix_ms = unix_ms();
-    node.membership().observe(peer, true);
-
-    NodeTelemetry peer_telemetry;
-    peer_telemetry.node_id = peer.id;
-    peer_telemetry.boot_id = random_node_id();
-    peer_telemetry.sequence = 1;
-    peer_telemetry.observed_unix_ms = unix_ms();
-    peer_telemetry.host = peer.host;
-    peer_telemetry.failure_domain = peer.failure_domain;
-    peer_telemetry.port = peer.port;
-    peer_telemetry.storage_capacity = peer.capacity;
-    peer_telemetry.storage_used = 2ULL * 1024 * 1024 * 1024;
-    peer_telemetry.cache_capacity = 1024;
-    peer_telemetry.cache_used = 512;
-    peer_telemetry.metadata_generation = peer.metadata_generation;
-    peer_telemetry.storage_backends_online = 1;
-    peer_telemetry.uptime_ms = 60000;
-    peer_telemetry.rss_bytes = 123456;
-    node.telemetry().observe(peer_telemetry, true);
-
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-    StatusSources sources;
-    sources.local = &node.local_state();
-    sources.metadata = &metadata;
-    HttpRequest request;
-    request.method = "GET";
-    request.path = "/api/v1/status";
-
-    auto find_peer = [&](const Json& root) -> const Json* {
-        const auto* nodes = root.find("nodes");
-        REQUIRE(nodes != nullptr);
-        for (const auto& value : nodes->asArray())
-            if (value.find("id")->asString() == to_string(peer.id))
-                return &value;
-        return nullptr;
+// What a node publishes about itself from its configuration: the client API
+// endpoint it advertises, and the playback budgets it enforces.
+MACHA_FAST_TEST("invariants", test_a_node_advertises_its_api_endpoint_and_playback_budgets) {
+    struct ApiRow {
+        bool enabled;
+        const char* listen;
+        uint16_t port;
+        const char* advertised;
+        const char* host;
+        const char* expected;
     };
+    const std::vector<ApiRow> endpoints{
+        // A wildcard bind is undialable: the advertised RPC host is used.
+        {true, "0.0.0.0", 19991, "", "10.44.1.60", "http://10.44.1.60:19991"},
+        {true, "0.0.0.0", 19991, "", "fd00::1", "http://[fd00::1]:19991"},
+        // An override wins and carries its own scheme (TLS offload).
+        {true, "127.0.0.1", 19992, "https://media-node-2.example.net:443", "10.44.1.60",
+         "https://media-node-2.example.net:443"},
+        {false, "0.0.0.0", 19991, "", "10.44.1.60", ""},
+    };
+    for (const auto& row : endpoints) {
+        CatalogueApiConfig api;
+        api.enabled = row.enabled;
+        api.listen = row.listen;
+        api.port = row.port;
+        api.advertised_endpoint = row.advertised;
+        CHECK(advertised_api_endpoint(api, row.host) == row.expected);
+    }
 
-    auto fresh_response = status.handle(request, sources);
-    REQUIRE(fresh_response.status == 200);
-    auto fresh_root = Json::parse(std::string(
-        reinterpret_cast<const char*>(fresh_response.body.data()), fresh_response.body.size()));
-    const auto* fresh_peer = find_peer(fresh_root);
-    REQUIRE(fresh_peer != nullptr);
-    CHECK(fresh_peer->find("telemetry_freshness")->asString() == "live");
-    CHECK(fresh_peer->find("storage")->find("available")->asBool());
-    CHECK(fresh_peer->find("storage")->find("used_bytes")->asUInt64() == peer_telemetry.storage_used);
-    REQUIRE(fresh_peer->find("runtime")->find("rss_bytes") != nullptr);
-    CHECK(fresh_peer->find("runtime")->find("rss_bytes")->asUInt64() == peer_telemetry.rss_bytes);
-
-    // The freshness floor is a fixed 5 s (status_response's fresh_for) and
-    // TelemetryStore has no injectable clock, so this really waits it out.
-    std::this_thread::sleep_for(5200ms);
-
-    auto stale_response = status.handle(request, sources);
-    REQUIRE(stale_response.status == 200);
-    auto stale_root = Json::parse(std::string(
-        reinterpret_cast<const char*>(stale_response.body.data()), stale_response.body.size()));
-    const auto* stale_peer = find_peer(stale_root);
-    REQUIRE(stale_peer != nullptr);
-    CHECK(stale_peer->find("state")->asString() == "online");
-    CHECK(stale_peer->find("telemetry_freshness")->asString() == "stale");
-    // Stale resource figures are withheld: consumers sum them across nodes.
-    CHECK(!stale_peer->find("storage")->find("available")->asBool());
-    CHECK(stale_peer->find("storage")->find("used_bytes")->isNull());
-    // Runtime figures survive: nothing aggregates them and the entry states
-    // their age.
-    REQUIRE(stale_peer->find("runtime")->find("rss_bytes") != nullptr);
-    CHECK(stale_peer->find("runtime")->find("rss_bytes")->asUInt64() == peer_telemetry.rss_bytes);
-    CHECK(stale_peer->find("runtime")->find("uptime_ms")->asUInt64() == peer_telemetry.uptime_ms);
-    CHECK(stale_peer->find("live_age_ms")->asUInt64() >= 5000);
-
-    // The cluster aggregate does not count the stale figures either.
-    const auto* cluster = stale_root.find("cluster");
-    REQUIRE(cluster != nullptr);
-    CHECK(!cluster->find("storage_online")->find("available")->asBool());
+    StreamingConfig streaming;
+    streaming.enabled = true;
+    streaming.startup_timeout = 9000ms;
+    streaming.segment_timeout = 3000ms;
+    const auto budgets = enforced_playback_budgets(streaming);
+    CHECK(budgets.startup_timeout_ms == 9000);
+    CHECK(budgets.segment_timeout_ms == 3000);
+    CHECK(budgets.max_sessions == streaming.max_sessions);
+    streaming.enabled = false;
+    const auto none = enforced_playback_budgets(streaming);
+    CHECK(none.startup_timeout_ms == 0);
+    CHECK(none.segment_timeout_ms == 0);
+    CHECK(none.max_sessions == 0);
 }
 
-MACHA_TEST("invariants", test_status_reports_peer_metadata_generation_from_fresher_source) {
-    TestNode fixture("status-generation-source");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    config.catalogue.scanner.enabled = false;
-    auto& node = fixture.start();
-    auto& metadata = fixture.metadata();
-    metadata.snapshot();
-
-    // A membership record with no metadata generation yet.
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "10.44.1.202";
-    peer.port = 7437;
-    peer.failure_domain = "test-lab";
-    peer.capacity = 4ULL * 1024 * 1024 * 1024;
-    peer.metadata_generation = 0;
-    peer.seen_unix_ms = unix_ms();
-    node.membership().observe(peer, true);
-
-    // Fresh telemetry from the same peer that does know its generation.
-    NodeTelemetry peer_telemetry;
-    peer_telemetry.node_id = peer.id;
-    peer_telemetry.boot_id = random_node_id();
-    peer_telemetry.sequence = 1;
-    peer_telemetry.observed_unix_ms = unix_ms();
-    peer_telemetry.host = peer.host;
-    peer_telemetry.failure_domain = peer.failure_domain;
-    peer_telemetry.port = peer.port;
-    peer_telemetry.storage_capacity = peer.capacity;
-    peer_telemetry.metadata_generation = 25723;
-    peer_telemetry.storage_backends_online = 1;
-    node.telemetry().observe(peer_telemetry, true);
-
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-    StatusSources sources;
-    sources.local = &node.local_state();
-    sources.metadata = &metadata;
-    HttpRequest request;
-    request.method = "GET";
-    request.path = "/api/v1/status";
-    const auto response = status.handle(request, sources);
-    REQUIRE(response.status == 200);
-    const auto root = Json::parse(
-        std::string(reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-
-    const Json* entry = nullptr;
-    for (const auto& value : root.find("nodes")->asArray())
-        if (value.find("id")->asString() == to_string(peer.id))
-            entry = &value;
-    REQUIRE(entry != nullptr);
-    // The fresher telemetry generation wins over the membership record's.
-    CHECK(entry->find("metadata_generation")->asUInt64() == 25723);
-}
-
-MACHA_TEST("invariants", test_status_excludes_retired_identity_from_live_cluster_health) {
-    TestNode fixture("status-retired-identity");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& node = fixture.start();
-    auto& metadata = fixture.metadata();
-
-    const auto stale_id = random_node_id();
-    PersistedNodeStatus stale;
-    stale.observed_unix_ms = unix_ms() - 1000;
-    stale.host = "10.34.1.50";
-    stale.port = 7437;
-    stale.failure_domain = "remote";
-    stale.storage_capacity = 8ULL * 1024 * 1024 * 1024;
-    stale.storage_used = 1024;
-    metadata.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        snapshot.node_status[stale_id] = stale;
-        delta.upsert_node_status[stale_id] = stale;
-    });
-
-    IdentityAssociationReset reset;
-    reset.host = stale.host;
-    reset.port = stale.port;
-    reset.stale_node_id = stale_id;
-    reset.epoch = 1;
-    reset.reset_unix_ms = unix_ms();
-    reset.reset_by = node.node_id();
-    reset.reason = "replaced node identity";
-    REQUIRE(node.apply_identity_reset(reset));
-    metadata.note_replica_validation(true);
-
-    ClusterStatusService status(node, node.accounts(), node.resources.activity, node.resources.data, node.resources.memory);
-    StatusSources sources;
-    sources.local = &node.local_state();
-    sources.metadata = &metadata;
-    HttpRequest root_request;
-    root_request.method = "GET";
-    root_request.path = "/api/v1/status";
-    const auto root_response = status.handle(root_request, sources);
-    REQUIRE(root_response.status == 200);
-    const auto root = Json::parse(std::string(
-        reinterpret_cast<const char*>(root_response.body.data()), root_response.body.size()));
-    CHECK(root.find("cluster")->find("nodes_known")->asUInt64() == 1);
-    CHECK(root.find("cluster")->find("nodes_online")->asUInt64() == 1);
-    CHECK(root.find("cluster")->find("health")->asString() == "healthy");
-    CHECK(root.find("nodes")->asArray().size() == 1);
-    CHECK(root.find("nodes")->asArray().front().find("id")->asString() ==
-          to_string(node.node_id()));
-
-    // The retired record stays queryable for audit, but is not counted as a
-    // failed cluster member.
-    HttpRequest detail_request;
-    detail_request.method = "GET";
-    detail_request.path = "/api/v1/status/nodes/" + to_string(stale_id);
-    const auto detail_response = status.handle(detail_request, sources);
-    REQUIRE(detail_response.status == 200);
-    const auto detail = Json::parse(std::string(
-        reinterpret_cast<const char*>(detail_response.body.data()), detail_response.body.size()));
-    CHECK(detail.find("state")->asString() == "retired");
-    CHECK(detail.find("identity_association_reset")->find("epoch")->asUInt64() == 1);
-}
-
-MACHA_TEST("invariants", test_status_collects_connected_peer_telemetry_without_client_fanout) {
+// Kept integrated: telemetry gossip between real nodes, and departure
+// detected on dead_after.
+//
+// Status shows a connected peer's collected telemetry, with no fan-out from
+// the client, and marks the peer offline once it stops.
+MACHA_TEST("invariants", test_status_follows_a_peer_through_telemetry_and_departure) {
     TestCluster cluster(ConfigProfile::isolated);
     const auto first_port = free_port();
     const auto second_port = free_port();
-    auto first_config =
-        cluster.node_config("status-aggregate-first", first_port, {{"127.0.0.1", second_port}});
-    auto second_config =
-        cluster.node_config("status-aggregate-second", second_port, {{"127.0.0.1", first_port}});
-    first_config.catalogue.api.enabled = true;
-    first_config.catalogue.api.port = free_port();
-    second_config.catalogue.api.enabled = true;
-    second_config.catalogue.api.port = free_port();
-
-    Service first(first_config, cluster.keys());
-    Service second(second_config, cluster.keys());
+    BareNode first(cluster.node_config("status-first", first_port, {{"127.0.0.1", second_port}}),
+                   cluster.keys());
+    BareNode second(cluster.node_config("status-second", second_port, {{"127.0.0.1", first_port}}),
+                    cluster.keys());
     first.start();
     second.start();
-    (void)first.filesystem();
-    (void)second.filesystem();
+    REQUIRE(first.wait_local_state_ready(10s));
+    REQUIRE(second.wait_local_state_ready(10s));
+    const auto second_id = second.node_id();
+    REQUIRE(wait_until([&] {
+        return first.membership().active().size() == 2 && second.membership().active().size() == 2;
+    }));
+    REQUIRE(wait_until([&] {
+        const auto values = first.telemetry().all();
+        return std::any_of(values.begin(), values.end(), [&](const NodeTelemetry& value) {
+            return value.node_id == second_id && value.storage_capacity > 0 &&
+                   value.storage_backends_online > 0;
+        });
+    }, 10s));
 
-    REQUIRE(wait_until(
-        [&] {
-            return first.node().membership().active().size() == 2 &&
-                   second.node().membership().active().size() == 2;
-        },
-        5s));
-    REQUIRE(wait_until(
-        [&] {
-            const auto peer = second.node().node_id();
-            const auto values = first.node().telemetry().all();
-            return std::any_of(values.begin(), values.end(), [&](const NodeTelemetry& value) {
-                return value.node_id == peer && value.storage_capacity > 0 &&
-                       value.storage_backends_online > 0;
-            });
-        },
-        10s));
-
-    const auto response =
-        raw_http_get(first_config.catalogue.api.port, "/api/v1/status", bearer_header(first));
-    CHECK(response.find("HTTP/1.1 200") != std::string::npos);
-    const auto body_at = response.find("\r\n\r\n");
-    REQUIRE(body_at != std::string::npos);
-    const auto status = Json::parse(response.substr(body_at + 4));
-    const auto* nodes = status.find("nodes");
-    REQUIRE(nodes != nullptr);
-    bool found_peer = false;
-    for (const auto& node : nodes->asArray()) {
-        if (node.find("id")->asString() != to_string(second.node().node_id()))
-            continue;
-        found_peer = true;
-        CHECK(node.find("state")->asString() == "online");
-        CHECK(node.find("telemetry_freshness")->asString() == "live");
-        CHECK(node.find("storage")->find("available")->asBool());
-        CHECK(!node.find("storage")->find("used_bytes")->isNull());
-        CHECK(node.find("cache")->find("available")->asBool());
-        CHECK(!node.find("storage_backends_online")->isNull());
-    }
-    CHECK(found_peer);
-    CHECK(status.find("cluster")->find("storage_online")->find("available")->asBool());
-
-    second.stop();
-    first.stop();
-}
-
-MACHA_TEST("invariants", test_status_marks_stopped_peer_offline_within_dead_after) {
-    TestCluster cluster(ConfigProfile::isolated);
-    const auto first_port = free_port();
-    const auto second_port = free_port();
-    auto first_config =
-        cluster.node_config("status-offline-first", first_port, {{"127.0.0.1", second_port}});
-    auto second_config =
-        cluster.node_config("status-offline-second", second_port, {{"127.0.0.1", first_port}});
-    first_config.catalogue.api.enabled = true;
-    first_config.catalogue.api.port = free_port();
-    second_config.catalogue.api.enabled = true;
-    second_config.catalogue.api.port = free_port();
-
-    Service first(first_config, cluster.keys());
-    Service second(second_config, cluster.keys());
-    first.start();
-    second.start();
-    (void)first.filesystem();
-    (void)second.filesystem();
-    const auto second_id = second.node().node_id();
-
-    REQUIRE(wait_until(
-        [&] {
-            return first.node().membership().active().size() == 2 &&
-                   second.node().membership().active().size() == 2;
-        },
-        5s));
-
-    auto second_state = [&]() -> std::string {
-        const auto response =
-            raw_http_get(first_config.catalogue.api.port, "/api/v1/status", bearer_header(first));
-        const auto body_at = response.find("\r\n\r\n");
-        REQUIRE(body_at != std::string::npos);
-        const auto status = Json::parse(response.substr(body_at + 4));
-        const auto* nodes = status.find("nodes");
-        REQUIRE(nodes != nullptr);
-        for (const auto& node : nodes->asArray())
-            if (node.find("id")->asString() == to_string(second_id))
-                return node.find("state")->asString();
-        return "missing";
+    ClusterStatusService status(first, first.accounts(), first.resources.activity,
+                                first.resources.data, first.resources.memory);
+    const auto root = [&] {
+        auto response = status.handle(request_for("GET", "/api/v1/status"));
+        REQUIRE(response.status == 200);
+        return body_json(response);
     };
-    // Observe online first, so "offline" is a real transition, not a default.
-    REQUIRE(second_state() == "online");
+    {
+        const auto current = root();
+        const auto* entry = node_entry(current, second_id);
+        REQUIRE(entry != nullptr);
+        CHECK(entry->find("state")->asString() == "online");
+        CHECK(entry->find("telemetry_freshness")->asString() == "live");
+        CHECK(entry->find("storage")->find("available")->asBool());
+        CHECK(!entry->find("storage")->find("used_bytes")->isNull());
+        CHECK(entry->find("cache")->find("available")->asBool());
+        CHECK(!entry->find("storage_backends_online")->isNull());
+        CHECK(current.find("cluster")->find("storage_online")->find("available")->asBool());
+    }
 
     second.stop();
-
-    REQUIRE(wait_until([&] { return second_state() == "offline"; }, 5s));
-
+    REQUIRE(wait_until([&] {
+        const auto current = root();
+        const auto* entry = node_entry(current, second_id);
+        return entry && entry->find("state")->asString() == "offline";
+    }));
     first.stop();
 }
 
@@ -2063,68 +1504,48 @@ MACHA_TEST("invariants", test_metadata_availability_logs_only_transitions) {
     CHECK(saw_initial_writable);
 }
 
-MACHA_TEST("invariants", test_fuse_open_inode_identity_survives_external_replace_and_unlink) {
-    TestNode fixture("node");
-    auto& config = fixture.config();
-    fixture.start();
-    auto& fs = fixture.filesystem();
 
-    const auto old_bytes = pattern(4096, 3);
-    const auto new_bytes = pattern(4096, 4);
-    write_file(fs, "/replace.bin", old_bytes);
-    write_file(fs, "/unlink.bin", old_bytes);
-
-    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse,
-                          std::make_unique<ViewerWeightedAdmission>(fs, config.fuse), fs);
-    const auto replaced_handle = frontend.open("/replace.bin", true, false, false, false);
-    const auto unlinked_handle = frontend.open("/unlink.bin", true, false, false, false);
-
-    // Stand in for another node publishing a new namespace generation.
-    fs.rename("/replace.bin", "/old-replace.bin");
-    write_file(fs, "/replace.bin", new_bytes);
-    fs.unlink("/unlink.bin");
-
-    // Force adoption of the already-decoded newer namespace.
-    REQUIRE(frontend.inode_for_path("/replace.bin").has_value());
-    const auto stale_name = frontend.inode_for_path("/unlink.bin");
-
-    // The descriptor opened before replacement still denotes the original file.
-    CHECK(fuse_read(frontend, replaced_handle.inode, old_bytes.size()) == old_bytes);
-    // Unlink removes the pathname at once; the open inode lives on.
-    CHECK(!stale_name.has_value());
-    CHECK(fuse_read(frontend, unlinked_handle.inode, old_bytes.size()) == old_bytes);
-
-    frontend.stop();
-}
-
-MACHA_TEST("invariants", test_dirty_open_inode_never_writes_remote_replacement) {
-    TestNode fixture("node");
-    auto& config = fixture.config();
-    fixture.start();
-    auto& fs = fixture.filesystem();
-
-    const auto original = pattern(4096, 21);
-    const auto replacement = pattern(4096, 22);
+// An open FUSE inode keeps its identity when another node replaces or
+// unlinks its path: it reads the original, and a dirty one never publishes
+// through the name another inode now holds.
+MACHA_TEST("invariants", test_open_fuse_inodes_keep_their_identity) {
+    CatalogueBench bench("fuse-identity");
+    auto& fs = bench.fs();
+    const auto& config = bench.config();
+    const auto original = pattern(4096, 3);
+    const auto replacement = pattern(4096, 4);
     const auto dirty = pattern(2048, 23);
+    write_file(fs, "/replace.bin", original);
+    write_file(fs, "/unlink.bin", original);
     write_file(fs, "/victim.bin", original);
     write_file(fs, "/incoming.bin", replacement);
 
-    FuseFrontend frontend(fs, fixture.resources().memory, config.fuse,
+    FuseFrontend frontend(fs, bench.resources().memory, config.fuse,
                           std::make_unique<ViewerWeightedAdmission>(fs, config.fuse), fs);
-    const auto old = frontend.open("/victim.bin", true, true, false, false);
-    REQUIRE(frontend.write(old.inode, 0, dirty) == dirty.size());
+    const auto replaced = frontend.open("/replace.bin", true, false, false, false);
+    const auto unlinked = frontend.open("/unlink.bin", true, false, false, false);
+    const auto victim = frontend.open("/victim.bin", true, true, false, false);
+    REQUIRE(frontend.write(victim.inode, 0, dirty) == dirty.size());
 
-    // Another node renames a different inode over the dirty path. The open
-    // descriptor stays valid but must never publish through that name.
+    // Stand in for another node publishing a new namespace generation.
+    fs.rename("/replace.bin", "/old-replace.bin");
+    write_file(fs, "/replace.bin", replacement);
+    fs.unlink("/unlink.bin");
     fs.rename("/incoming.bin", "/victim.bin");
+
+    // Force adoption of the already-decoded newer namespace.
+    REQUIRE(frontend.inode_for_path("/replace.bin").has_value());
+    CHECK(fuse_read(frontend, replaced.inode, original.size()) == original);
+    // Unlink removes the pathname at once; the open inode lives on.
+    CHECK(!frontend.inode_for_path("/unlink.bin").has_value());
+    CHECK(fuse_read(frontend, unlinked.inode, original.size()) == original);
+
     const auto current = frontend.inode_for_path("/victim.bin");
     REQUIRE(current.has_value());
-    CHECK(*current != old.inode);
-    CHECK(fuse_read(frontend, old.inode, dirty.size()) == dirty);
-
-    frontend.release(old.inode, true);
+    CHECK(*current != victim.inode);
+    CHECK(fuse_read(frontend, victim.inode, dirty.size()) == dirty);
+    frontend.release(victim.inode, true);
     REQUIRE(frontend.wait_for_idle(5s));
-
     auto reader = fs.open_read("/victim.bin");
     Bytes actual(replacement.size());
     size_t offset = 0;
@@ -2134,193 +1555,280 @@ MACHA_TEST("invariants", test_dirty_open_inode_never_writes_remote_replacement) 
         offset += n;
     }
     CHECK(actual == replacement);
-
     frontend.stop();
 }
 
-MACHA_TEST("invariants", test_failed_catalogue_commit_never_deletes_live_filesystem_object) {
-    TestNode fixture("node");
-    fixture.prepare();
-    auto& node = fixture.start();
-    auto& store = fixture.store();
-    auto& metadata = fixture.metadata();
-    auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
+// The catalogue never loses what the namespace still holds: a failed commit
+// rolls back without erasing a live object; a scan's prune is fenced to the
+// namespace generation it enumerated; artwork staged in a batch is durable
+// only at the batch's barrier; and GC liveness fails closed when the current
+// catalogue root cannot be fetched.
+MACHA_TEST("invariants", test_catalogue_keeps_what_the_namespace_holds) {
+    CatalogueBench bench("catalogue-fences");
+    auto& node = bench.node();
+    auto& fs = bench.fs();
+    auto& catalogue = bench.catalogue();
+    REQUIRE(wait_until([&] { return node.local_store().online_backends() == 1; }));
 
-    const auto live_bytes = pattern(8192, 5);
-    write_file(fs, "/live.bin", live_bytes);
-    const auto live_entry = fs.getattr("/live.bin");
-    REQUIRE(live_entry.extents.size() == 1);
-    const auto live_id = live_entry.extents.front().id;
-    REQUIRE(node.local_store().get(live_id).has_value());
-
-    CatalogueItem item;
-    item.id = "test:movie:failed-stage";
-    item.kind = CatalogueKind::movie;
-    item.title = "Failed stage must not delete live data";
-    item.artwork.push_back({"poster", live_id, "application/octet-stream"});
-    auto missing_bytes = pattern(7777, 6);
-    const auto missing_id = object_id(missing_bytes);
-    REQUIRE(missing_id != live_id);
-    item.artwork.push_back({"backdrop", missing_id, "application/octet-stream"});
-
-    bool failed = false;
-    try {
-        (void)catalogue.upsert(std::move(item));
-    } catch (...) {
-        failed = true;
+    {
+        // Rollback never erases a hash namespace metadata still reaches;
+        // orphan collection belongs to GC.
+        const auto live_bytes = pattern(8192, 5);
+        write_file(fs, "/live.bin", live_bytes);
+        const auto live_entry = fs.getattr("/live.bin");
+        REQUIRE(live_entry.extents.size() == 1);
+        const auto live_id = live_entry.extents.front().id;
+        REQUIRE(node.local_store().get(live_id).has_value());
+        CatalogueItem item;
+        item.id = "test:movie:failed-stage";
+        item.kind = CatalogueKind::movie;
+        item.title = "Failed stage must not delete live data";
+        item.artwork.push_back({"poster", live_id, "application/octet-stream"});
+        const auto missing_id = object_id(pattern(7777, 6));
+        REQUIRE(missing_id != live_id);
+        item.artwork.push_back({"backdrop", missing_id, "application/octet-stream"});
+        bool failed = false;
+        try {
+            (void)catalogue.upsert(std::move(item));
+        } catch (...) {
+            failed = true;
+        }
+        REQUIRE(failed);
+        CHECK(node.local_store().get(live_id) == std::optional<Bytes>{live_bytes});
     }
-    REQUIRE(failed);
 
-    // Catalogue rollback must never directly erase a hash that is still
-    // reachable from namespace metadata; orphan collection belongs to GC.
-    bool live_object_readable = false;
-    try {
-        auto data = node.local_store().get(live_id);
-        live_object_readable = data && *data == live_bytes;
-    } catch (...) {
-        live_object_readable = false;
-    }
-    CHECK(live_object_readable);
-}
+    {
+        // A scan enumerates one immutable snapshot. A move after it leaves the
+        // media id live, so a no-op reconciliation succeeds; a replacement
+        // after it would be pruned by the stale active set, so the old
+        // signature fences that commit.
+        FsEntry dir;
+        dir.type = EntryType::directory;
+        dir.mode = 0755;
+        dir.uid = getuid();
+        dir.gid = getgid();
+        dir.ctime_ns = dir.mtime_ns = wall_time_ns();
+        FsEntry file;
+        file.type = EntryType::file;
+        file.mode = 0644;
+        file.uid = getuid();
+        file.gid = getgid();
+        file.size = 1234;
+        file.ctime_ns = file.mtime_ns = wall_time_ns();
+        file.extents.push_back({0, file.size, object_id(pattern(1234, 7)), false});
+        bench.metadata().mutate([&](MetadataSnapshot& snapshot) {
+            snapshot.entries["/Movies"] = dir;
+            snapshot.entries["/Movies/A"] = dir;
+            snapshot.entries["/Movies/B"] = dir;
+            snapshot.entries["/Movies/A/live.mkv"] = file;
+        });
+        CatalogueItem item;
+        item.id = "test:movie:mixed-generation";
+        item.kind = CatalogueKind::movie;
+        item.title = "Still live";
+        item.external_ids["macha_scanner"] = "1";
+        item.media_ids = {file_media_id(file)};
+        (void)catalogue.upsert(item);
 
-MACHA_TEST("invariants", test_scanner_prune_is_fenced_to_scanned_namespace) {
-    TestNode fixture("node");
-    fixture.prepare();
-    auto& node = fixture.start();
-    auto& store = fixture.store();
-    auto& metadata = fixture.metadata();
-    auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
+        const auto scanned = fs.local_snapshot_view();
+        const auto scanned_signature = metadata_namespace_signature(*scanned.snapshot);
+        auto scan_nodes = fs.namespace_nodes();
+        const auto discovered = catalogue_snapshot_files("/Movies", *scanned.snapshot, &scan_nodes);
+        REQUIRE(discovered.size() == 1);
+        CHECK(discovered.front().first == "/Movies/A/live.mkv");
+        std::set<std::string> active;
+        for (const auto& [_, entry] : discovered)
+            active.insert(file_media_id(entry));
 
-    const auto old_bytes = pattern(4096, 31);
-    const auto new_bytes = pattern(4096, 32);
-    write_file(fs, "/media.bin", old_bytes);
-    const auto old_entry = fs.getattr("/media.bin");
-    const auto scanned = fs.local_snapshot_view();
-    const auto scanned_signature = metadata_namespace_signature(*scanned.snapshot);
-    const std::set<std::string> stale_active{file_media_id(old_entry)};
-
-    fs.unlink("/media.bin");
-    write_file(fs, "/media.bin", new_bytes);
-    const auto new_entry = fs.getattr("/media.bin");
-    const auto new_media_id = file_media_id(new_entry);
-    REQUIRE(new_media_id != file_media_id(old_entry));
-
-    CatalogueItem item;
-    item.id = "test:movie:namespace-fence";
-    item.kind = CatalogueKind::movie;
-    item.title = "Namespace fence";
-    item.external_ids["macha_scanner"] = "1";
-    item.media_ids = {new_media_id};
-    (void)catalogue.upsert(item);
-
-    bool conflicted = false;
-    try {
-        catalogue.reconcile_scanner({}, stale_active, true, scanned_signature);
-    } catch (const CatalogueConflict&) {
-        conflicted = true;
-    }
-    CHECK(conflicted);
-    auto after = catalogue.get(item.id);
-    REQUIRE(after.has_value());
-    CHECK(after->media_ids == std::vector<std::string>{new_media_id});
-}
-
-MACHA_FAST_TEST("invariants", test_scanner_does_not_prune_from_mixed_namespace_generations) {
-    TestNode fixture("node");
-    fixture.prepare();
-    auto& node = fixture.start();
-    auto& store = fixture.store();
-    auto& metadata = fixture.metadata();
-    auto& fs = fixture.filesystem();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
-
-    FsEntry dir;
-    dir.type = EntryType::directory;
-    dir.mode = 0755;
-    dir.uid = getuid();
-    dir.gid = getgid();
-    dir.ctime_ns = dir.mtime_ns = wall_time_ns();
-    FsEntry file;
-    file.type = EntryType::file;
-    file.mode = 0644;
-    file.uid = getuid();
-    file.gid = getgid();
-    file.size = 1234;
-    file.ctime_ns = file.mtime_ns = wall_time_ns();
-    file.extents.push_back({0, file.size, object_id(pattern(1234, 7)), false});
-
-    metadata.mutate([&](MetadataSnapshot& snapshot) {
-        snapshot.entries["/Movies"] = dir;
-        snapshot.entries["/Movies/A"] = dir;
-        snapshot.entries["/Movies/B"] = dir;
-        snapshot.entries["/Movies/A/live.mkv"] = file;
-    });
-
-    CatalogueItem item;
-    item.id = "test:movie:mixed-generation";
-    item.kind = CatalogueKind::movie;
-    item.title = "Still live";
-    item.external_ids["macha_scanner"] = "1";
-    item.media_ids = {file_media_id(file)};
-    (void)catalogue.upsert(item);
-
-    // The scanner enumerates one immutable snapshot with
-    // catalogue_snapshot_files() and takes its reconciliation signature from it.
-    const auto scanned = fs.local_snapshot_view();
-    const auto scanned_signature = metadata_namespace_signature(*scanned.snapshot);
-    REQUIRE(scanned.snapshot->entries.contains("/Movies/A/live.mkv"));
-    CHECK(!scanned.snapshot->entries.contains("/Movies/B/live.mkv"));
-
-    auto scan_nodes = fs.namespace_nodes();
-    const auto discovered = catalogue_snapshot_files("/Movies", *scanned.snapshot, &scan_nodes);
-    REQUIRE(discovered.size() == 1);
-    CHECK(discovered.front().first == "/Movies/A/live.mkv");
-    CHECK(file_media_id(discovered.front().second) == file_media_id(file));
-
-    std::set<std::string> active;
-    for (const auto& [_, entry] : discovered)
-        active.insert(file_media_id(entry));
-
-    // The object moves after the snapshot is captured. The pinned scan still
-    // sees its media id, so reconciliation must not infer absence.
-    fs.rename("/Movies/A/live.mkv", "/Movies/B/live.mkv");
-    const auto moved = fs.local_snapshot_view();
-    CHECK(!moved.snapshot->entries.contains("/Movies/A/live.mkv"));
-    REQUIRE(moved.snapshot->entries.contains("/Movies/B/live.mkv"));
-    CHECK(metadata_namespace_signature(*moved.snapshot) != scanned_signature);
-
-    // A no-op reconciliation succeeds despite the changed signature.
-    catalogue.reconcile_scanner({}, active, true, scanned_signature);
-    auto after_move = catalogue.get(item.id);
-    REQUIRE(after_move.has_value());
-    CHECK(after_move->media_ids == std::vector<std::string>{file_media_id(file)});
-
-    // A new object replaces the file and becomes the binding. The stale scan's
-    // active set would prune it, so the old signature must fence the commit.
-    const Bytes replacement = pattern(1234, 19);
-    fs.unlink("/Movies/B/live.mkv");
-    write_file(fs, "/Movies/B/live.mkv", replacement);
-    const auto replacement_entry = fs.getattr("/Movies/B/live.mkv");
-    const auto replacement_media_id = file_media_id(replacement_entry);
-    REQUIRE(replacement_media_id != file_media_id(file));
-
-    auto current_item = catalogue.get(item.id);
-    REQUIRE(current_item.has_value());
-    current_item->media_ids = {replacement_media_id};
-    (void)catalogue.upsert(*current_item, current_item->revision);
-
-    bool conflicted = false;
-    try {
+        fs.rename("/Movies/A/live.mkv", "/Movies/B/live.mkv");
+        const auto moved = fs.local_snapshot_view();
+        REQUIRE(moved.snapshot->entries.contains("/Movies/B/live.mkv"));
+        CHECK(metadata_namespace_signature(*moved.snapshot) != scanned_signature);
         catalogue.reconcile_scanner({}, active, true, scanned_signature);
-    } catch (const CatalogueConflict&) {
-        conflicted = true;
+        CHECK(catalogue.get(item.id)->media_ids == std::vector<std::string>{file_media_id(file)});
+
+        fs.unlink("/Movies/B/live.mkv");
+        write_file(fs, "/Movies/B/live.mkv", pattern(1234, 19));
+        const auto replacement_media_id = file_media_id(fs.getattr("/Movies/B/live.mkv"));
+        REQUIRE(replacement_media_id != file_media_id(file));
+        auto current = catalogue.get(item.id);
+        REQUIRE(current.has_value());
+        current->media_ids = {replacement_media_id};
+        (void)catalogue.upsert(*current, current->revision);
+        bool conflicted = false;
+        try {
+            catalogue.reconcile_scanner({}, active, true, scanned_signature);
+        } catch (const CatalogueConflict&) {
+            conflicted = true;
+        }
+        CHECK(conflicted);
+        CHECK(catalogue.get(item.id)->media_ids ==
+              std::vector<std::string>{replacement_media_id});
     }
-    CHECK(conflicted);
-    auto after_replace = catalogue.get(item.id);
-    REQUIRE(after_replace.has_value());
-    CHECK(after_replace->media_ids == std::vector<std::string>{replacement_media_id});
+
+    {
+        // A scan of an older namespace generation cannot prune a binding
+        // made since: the file was replaced after the scan was taken.
+        write_file(fs, "/media.bin", pattern(4096, 31));
+        const auto old_entry = fs.getattr("/media.bin");
+        const auto scanned = fs.local_snapshot_view();
+        const auto scanned_signature = metadata_namespace_signature(*scanned.snapshot);
+        const std::set<std::string> stale_active{file_media_id(old_entry)};
+        fs.unlink("/media.bin");
+        write_file(fs, "/media.bin", pattern(4096, 32));
+        const auto new_media_id = file_media_id(fs.getattr("/media.bin"));
+        REQUIRE(new_media_id != file_media_id(old_entry));
+        CatalogueItem item;
+        item.id = "test:movie:namespace-fence";
+        item.kind = CatalogueKind::movie;
+        item.title = "Namespace fence";
+        item.external_ids["macha_scanner"] = "1";
+        item.media_ids = {new_media_id};
+        (void)catalogue.upsert(item);
+        bool conflicted = false;
+        try {
+            catalogue.reconcile_scanner({}, stale_active, true, scanned_signature);
+        } catch (const CatalogueConflict&) {
+            conflicted = true;
+        }
+        CHECK(conflicted);
+        CHECK(catalogue.get(item.id)->media_ids == std::vector<std::string>{new_media_id});
+    }
+
+    {
+        // Two artworks in one durability domain: the later generation covers
+        // the earlier, so the batch keeps a one-entry frontier, durable only
+        // at its barrier.
+        DistributedStore::DurabilityBatch batch;
+        const auto a = catalogue.stage_artwork_deferred("poster", "image/jpeg",
+                                                        pattern(64 * 1024, 201), batch);
+        const auto b = catalogue.stage_artwork_deferred("backdrop", "image/jpeg",
+                                                        pattern(64 * 1024, 202), batch);
+        REQUIRE(batch.requirements.size() == 1);
+        const auto token = [&] {
+            const auto& replica = batch.requirements.front().replicas.front();
+            return StoragePool::DurabilityToken{replica.domain, replica.generation,
+                                                replica.backend_instance};
+        };
+        REQUIRE(batch.requirements.front().replicas.size() == 1);
+        REQUIRE(batch.requirements.front().replicas.front().id == node.node_id());
+        CHECK(!node.local_store().durability_covered(token()));
+        REQUIRE(catalogue.artwork_durability_barrier(batch));
+        CHECK(node.local_store().durability_covered(token()));
+        CHECK(node.local_store().has(a.id));
+        CHECK(node.local_store().has(b.id));
+    }
+
+    {
+        // A catalogue root that cannot be fetched is still live.
+        catalogue.repair_once();
+        const auto missing_root = object_id(pattern(32123, 11));
+        REQUIRE(!node.local_store().has(missing_root));
+        bench.metadata().mutate(
+            [&](MetadataSnapshot& snapshot) { snapshot.catalogue_root = missing_root; });
+        const auto maintenance = maintenance_inventory(catalogue);
+        CHECK(maintenance.control_live.contains(missing_root));
+        CHECK(!maintenance.complete);
+    }
+}
+
+// HttpServer's connection lifecycle: an incomplete request occupies a worker
+// only for the client I/O timeout; an idle keep-alive connection occupies
+// none; a connection is reused until the client asks to close, the request
+// budget is spent, or it idles past its allowance.
+MACHA_TEST("invariants", test_http_connections_are_bounded_and_reused) {
+    const auto serve = [](CatalogueApiConfig& config) {
+        config.enabled = true;
+        config.listen = "127.0.0.1";
+        config.port = free_port();
+        config.max_connections = 4;
+        auto server = std::make_unique<HttpServer>(
+            config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
+        server->start();
+        REQUIRE(wait_until([&] { return server->bound_port() == config.port; }, 2s));
+        return server;
+    };
+    const auto connect = [](uint16_t port) {
+        const int fd = connect_idle(port);
+        timeval timeout{2, 0};
+        REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+        return fd;
+    };
+    const auto closed_by_server = [](int fd) {
+        char probe;
+        return ::recv(fd, &probe, 1, 0) == 0;
+    };
+    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    {
+        // One worker.
+        CatalogueApiConfig config;
+        config.workers = 1;
+        config.client_io_timeout = 100ms;
+        config.keep_alive_idle_timeout = 5s;
+        auto server = serve(config);
+
+        // An incomplete request ahead of a complete one in the sole worker:
+        // the complete one is served once the slow client's I/O times out.
+        const int slow = connect_idle(config.port);
+        const std::string partial = "GET /slow HTTP/1.1\r\nHost: localhost\r\n";
+        REQUIRE(::send(slow, partial.data(), partial.size(), 0) ==
+                static_cast<ssize_t>(partial.size()));
+        const int fast = connect(config.port);
+        CHECK(raw_http_exchange(fast, request).status == 200);
+        ::close(slow);
+        ::close(fast);
+
+        // Sequential requests reuse one never-reconnected socket, and an idle
+        // keep-alive connection holds no worker: a second connection is served
+        // at once, and the first still answers after it.
+        const int first = connect(config.port);
+        auto reply = raw_http_exchange(first, request);
+        CHECK(reply.status == 200);
+        CHECK(reply.headers["connection"] == "keep-alive");
+        const int second = connect(config.port);
+        const auto started = Clock::now();
+        CHECK(raw_http_exchange(second, request).status == 200);
+        CHECK(Clock::now() - started < 1s);
+        reply = raw_http_exchange(first, request);
+        CHECK(reply.status == 200);
+        CHECK(reply.headers["connection"] == "keep-alive");
+
+        // The client asks to close: the server answers, then closes.
+        reply = raw_http_exchange(
+            second, "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        CHECK(reply.status == 200);
+        CHECK(reply.headers["connection"] == "close");
+        CHECK(closed_by_server(second));
+        ::close(first);
+        ::close(second);
+        server->stop();
+    }
+
+    {
+        // A request budget and a short idle allowance.
+        CatalogueApiConfig config;
+        config.workers = 2;
+        config.keep_alive_max_requests = 2;
+        config.keep_alive_idle_timeout = 100ms;
+        auto server = serve(config);
+
+        // The second of two allowed requests closes, though the client would go on.
+        const int budgeted = connect(config.port);
+        CHECK(raw_http_exchange(budgeted, request).headers["connection"] == "keep-alive");
+        CHECK(raw_http_exchange(budgeted, request).headers["connection"] == "close");
+        CHECK(closed_by_server(budgeted));
+        ::close(budgeted);
+
+        // A silent keep-alive connection is closed after the idle allowance.
+        const int idle = connect(config.port);
+        CHECK(raw_http_exchange(idle, request).headers["connection"] == "keep-alive");
+        const auto idle_since = Clock::now();
+        CHECK(closed_by_server(idle));
+        CHECK(Clock::now() - idle_since >= 50ms);
+        ::close(idle);
+        server->stop();
+    }
 }
 
 MACHA_TEST("invariants", test_replica_repair_does_not_count_corrupt_remote_as_healthy) {
@@ -2525,41 +2033,6 @@ MACHA_TEST("invariants", test_authoritative_deferred_generation_batches_stable_s
 #endif
 }
 
-MACHA_TEST("invariants", test_catalogue_artwork_batch_defers_durability_until_barrier) {
-    TestNode fixture("catalogue-artwork-batch");
-    fixture.config().maintenance.interval = std::chrono::hours(1);
-    fixture.start();
-    REQUIRE(wait_until([&] { return fixture.node().local_store().online_backends() == 1; }));
-
-    CatalogueManager catalogue(fixture.node(), fixture.node().local_state(), fixture.node().metadata_server(), fixture.store(), fixture.metadata(), fixture.node().ledger());
-    DistributedStore::DurabilityBatch batch;
-    const auto a = pattern(64 * 1024, 201);
-    const auto b = pattern(64 * 1024, 202);
-    const auto art_a = catalogue.stage_artwork_deferred("poster", "image/jpeg", a, batch);
-    const auto art_b = catalogue.stage_artwork_deferred("backdrop", "image/jpeg", b, batch);
-
-    // Same durability domain: the later generation covers the earlier, so the
-    // batch keeps a one-entry frontier, not one record per object.
-    REQUIRE(batch.requirements.size() == 1);
-    for (const auto& requirement : batch.requirements) {
-        REQUIRE(requirement.replicas.size() == 1);
-        const auto& replica = requirement.replicas.front();
-        REQUIRE(replica.id == fixture.node().node_id());
-        const StoragePool::DurabilityToken token{replica.domain, replica.generation,
-                                                 replica.backend_instance};
-        CHECK(!fixture.node().local_store().durability_covered(token));
-    }
-
-    REQUIRE(catalogue.artwork_durability_barrier(batch));
-    for (const auto& requirement : batch.requirements) {
-        const auto& replica = requirement.replicas.front();
-        const StoragePool::DurabilityToken token{replica.domain, replica.generation,
-                                                 replica.backend_instance};
-        CHECK(fixture.node().local_store().durability_covered(token));
-    }
-    CHECK(fixture.node().local_store().has(art_a.id));
-    CHECK(fixture.node().local_store().has(art_b.id));
-}
 
 MACHA_TEST("invariants", test_durability_batch_retains_exact_nondominated_frontier) {
     DistributedStore::DurabilityBatch batch;
@@ -3370,293 +2843,6 @@ MACHA_TEST("invariants", test_authenticated_receiver_enforces_transport_lane) {
 
     channel.shutdown();
     server.stop();
-}
-
-MACHA_TEST("invariants", test_http_slow_client_cannot_pin_worker_indefinitely) {
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = free_port();
-    config.workers = 1;
-    config.max_connections = 4;
-    config.client_io_timeout = 100ms;
-
-    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
-
-    const int slow = connect_idle(config.port);
-    const std::string partial = "GET /slow HTTP/1.1\r\nHost: localhost\r\n";
-    REQUIRE(::send(slow, partial.data(), partial.size(), 0) ==
-            static_cast<ssize_t>(partial.size()));
-
-    // Queue a complete request behind the sole worker. It must run after the
-    // incomplete client exceeds its bounded socket-I/O occupancy.
-    const int fast = connect_idle(config.port);
-    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    REQUIRE(::send(fast, request.data(), request.size(), 0) ==
-            static_cast<ssize_t>(request.size()));
-    timeval timeout{1, 0};
-    REQUIRE(setsockopt(fast, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    std::string response;
-    char buffer[1024];
-    while (true) {
-        const auto n = ::recv(fast, buffer, sizeof(buffer), 0);
-        if (n <= 0)
-            break;
-        response.append(buffer, static_cast<size_t>(n));
-    }
-    CHECK(response.find("HTTP/1.1 200 OK") != std::string::npos);
-
-    ::close(slow);
-    ::close(fast);
-    server.stop();
-}
-
-MACHA_TEST("invariants", test_http_keep_alive_reuses_connection_for_sequential_requests) {
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = free_port();
-    config.workers = 2;
-    config.max_connections = 4;
-
-    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
-
-    const int fd = connect_idle(config.port);
-    timeval timeout{2, 0};
-    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-    // Two sequential requests over the same, never-reconnected socket.
-    auto first = raw_http_exchange(fd, request);
-    CHECK(first.status == 200);
-    CHECK(first.headers["connection"] == "keep-alive");
-
-    auto second = raw_http_exchange(fd, request);
-    CHECK(second.status == 200);
-    CHECK(second.headers["connection"] == "keep-alive");
-
-    ::close(fd);
-    server.stop();
-}
-
-MACHA_TEST("invariants", test_http_keep_alive_respects_connection_close_request_header) {
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = free_port();
-    config.workers = 2;
-    config.max_connections = 4;
-
-    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
-
-    const int fd = connect_idle(config.port);
-    timeval timeout{2, 0};
-    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-
-    auto response = raw_http_exchange(fd, request);
-    CHECK(response.status == 200);
-    CHECK(response.headers["connection"] == "close");
-
-    char probe;
-    CHECK(::recv(fd, &probe, 1, 0) == 0); // server closed as requested
-
-    ::close(fd);
-    server.stop();
-}
-
-MACHA_TEST("invariants", test_http_keep_alive_idle_timeout_closes_connection) {
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = free_port();
-    config.workers = 2;
-    config.max_connections = 4;
-    config.keep_alive_idle_timeout = 100ms;
-
-    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
-
-    const int fd = connect_idle(config.port);
-    timeval timeout{2, 0};
-    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-    auto response = raw_http_exchange(fd, request);
-    CHECK(response.headers["connection"] == "keep-alive");
-
-    // Send nothing more: a silent keep-alive connection is closed after the
-    // idle allowance.
-    std::this_thread::sleep_for(400ms);
-    char probe;
-    CHECK(::recv(fd, &probe, 1, 0) == 0);
-
-    ::close(fd);
-    server.stop();
-}
-
-MACHA_TEST("invariants", test_http_keep_alive_max_requests_forces_close) {
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = free_port();
-    config.workers = 2;
-    config.max_connections = 4;
-    config.keep_alive_max_requests = 2;
-
-    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
-
-    const int fd = connect_idle(config.port);
-    timeval timeout{2, 0};
-    REQUIRE(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-    auto first = raw_http_exchange(fd, request);
-    CHECK(first.headers["connection"] == "keep-alive");
-    auto second = raw_http_exchange(fd, request);
-    // The 2nd of 2 allowed requests must force close even though the client
-    // is willing to continue.
-    CHECK(second.headers["connection"] == "close");
-
-    char probe;
-    CHECK(::recv(fd, &probe, 1, 0) == 0);
-
-    ::close(fd);
-    server.stop();
-}
-
-MACHA_TEST("invariants", test_http_idle_keep_alive_connection_costs_no_worker) {
-    // An idle connection is only an fd on the reactor: with one worker, a
-    // second connection is served at once and the first keeps its keep-alive.
-    CatalogueApiConfig config;
-    config.enabled = true;
-    config.listen = "127.0.0.1";
-    config.port = free_port();
-    config.workers = 1;
-    config.max_connections = 4;
-    config.keep_alive_idle_timeout = 5s;
-
-    HttpServer server(config, [](const HttpRequest&) { return http_json(200, "{\"ok\":true}"); });
-    server.start();
-    REQUIRE(wait_until([&] { return server.bound_port() == config.port; }, 2s));
-
-    const int first_fd = connect_idle(config.port);
-    timeval timeout{2, 0};
-    REQUIRE(setsockopt(first_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    const std::string request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-    auto first = raw_http_exchange(first_fd, request);
-    CHECK(first.headers["connection"] == "keep-alive");
-
-    const int second_fd = connect_idle(config.port);
-    REQUIRE(setsockopt(second_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
-    const auto started = Clock::now();
-    auto second = raw_http_exchange(second_fd, request);
-    CHECK(second.status == 200);
-    CHECK(Clock::now() - started < 1s);
-
-    auto second_on_first = raw_http_exchange(first_fd, request);
-    CHECK(second_on_first.status == 200);
-    CHECK(second_on_first.headers["connection"] == "keep-alive");
-
-    ::close(first_fd);
-    ::close(second_fd);
-    server.stop();
-}
-
-MACHA_TEST("invariants", test_catalogue_gc_liveness_fails_closed_when_current_root_unavailable) {
-    TestNode fixture("node");
-    fixture.prepare();
-    auto& node = fixture.start();
-    auto& store = fixture.store();
-    auto& metadata = fixture.metadata();
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
-    catalogue.repair_once(); // establish a coherent empty cached catalogue
-
-    const auto missing_root = object_id(pattern(32123, 11));
-    REQUIRE(!node.local_store().has(missing_root));
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.catalogue_root = missing_root; });
-
-    const auto maintenance = maintenance_inventory(catalogue);
-    // A catalogue root that cannot be fetched is still live; GC fails closed.
-    CHECK(maintenance.control_live.contains(missing_root));
-    CHECK(!maintenance.complete);
-}
-
-MACHA_TEST("invariants", test_a_node_reports_the_playback_budgets_it_enforces) {
-    // Each node reports its own playback budgets, as it does load1 and
-    // cpu_cores, so a client can bound attempts against any candidate node.
-    TestCluster cluster;
-
-    auto streaming_config = cluster.node_config("streamer");
-    streaming_config.catalogue.api.enabled = true; // streaming rides the HTTP API
-    streaming_config.streaming.enabled = true;
-    // Not the defaults, so the assertion cannot pass by coincidence.
-    streaming_config.streaming.startup_timeout = 9000ms;
-    streaming_config.streaming.segment_timeout = 3000ms;
-    BareNode streamer(streaming_config, cluster.keys());
-    streamer.start();
-    REQUIRE(streamer.wait_local_state_ready(10s));
-
-    const auto node_entry = [](ClusterStatusService& status, const NodeId& id) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = "/api/v1/status";
-        auto response = status.handle(request);
-        REQUIRE(response.status == 200);
-        auto root = Json::parse(std::string(
-            reinterpret_cast<const char*>(response.body.data()), response.body.size()));
-        const auto* nodes = root.find("nodes");
-        REQUIRE(nodes != nullptr);
-        std::optional<Json> found;
-        for (const auto& value : nodes->asArray())
-            if (value.find("id") && value.find("id")->asString() == to_string(id))
-                found = value;
-        return found;
-    };
-
-    ClusterStatusService streaming_status(streamer, streamer.accounts(), streamer.resources.activity, streamer.resources.data, streamer.resources.memory);
-    std::optional<Json> entry;
-    REQUIRE(wait_until([&] {
-        entry = node_entry(streaming_status, streamer.node_id());
-        return entry && entry->find("playback") &&
-               entry->find("playback")->find("startup_timeout_ms") != nullptr;
-    }, 10s));
-    const auto* playback = entry->find("playback");
-    REQUIRE(playback != nullptr);
-    CHECK(playback->find("startup_timeout_ms")->asInt64() == 9000);
-    CHECK(playback->find("segment_timeout_ms")->asInt64() == 3000);
-
-    // A node serving no playback omits the budget rather than reporting a
-    // zero a client might act on.
-    auto quiet_config = cluster.node_config("quiet");
-    REQUIRE(!quiet_config.streaming.enabled);
-    BareNode quiet(quiet_config, cluster.keys());
-    quiet.start();
-    REQUIRE(quiet.wait_local_state_ready(10s));
-
-    ClusterStatusService quiet_status(quiet, quiet.accounts(), quiet.resources.activity, quiet.resources.data, quiet.resources.memory);
-    std::optional<Json> quiet_entry;
-    REQUIRE(wait_until([&] {
-        quiet_entry = node_entry(quiet_status, quiet.node_id());
-        return quiet_entry.has_value();
-    }, 10s));
-    const auto* quiet_playback = quiet_entry->find("playback");
-    REQUIRE(quiet_playback != nullptr);
-    CHECK(quiet_playback->find("startup_timeout_ms") == nullptr);
-    CHECK(quiet_playback->find("segment_timeout_ms") == nullptr);
-
-    quiet.stop();
-    streamer.stop();
 }
 
 } // namespace
