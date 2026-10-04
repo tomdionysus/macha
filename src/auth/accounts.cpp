@@ -16,7 +16,7 @@ namespace {
 // become a load source, short enough for a rejoining node to converge promptly.
 constexpr auto gossip_retry_floor = std::chrono::seconds(1);
 // Re-announce this often even when nothing changed and every peer is
-// believed told: broadcast_best_effort() counts frames queued, not applied,
+// believed told: broadcast_notify() counts frames queued, not applied,
 // so a peer whose inbound route is not yet usable (as while it restarts) can
 // be marked told without receiving anything. Announcing on change is the
 // optimisation; this is the guarantee.
@@ -116,11 +116,22 @@ void Accounts::propagate_session(const AuthSession& session) {
     // unreachable-but-not-dead peer, exactly when logging in matters. The
     // local merge is done and the gossip tick is the backstop.
     try {
-        (void)node_.broadcast_best_effort(
+        const auto reached = node_.broadcast_notify(
             {MessageType::session_sync, encode_sessions({session})}, FrameType::control);
+        if (reached < active_peers().size())
+            request_gossip();
     } catch (const std::exception& error) {
         Log::debug("session propagation skipped: " + std::string(error.what()));
+        request_gossip();
     }
+}
+
+void Accounts::request_gossip() {
+    gossip_demand_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        Lock lock(events_.wait_mutex);
+    }
+    events_.wait_cv.notify_all();
 }
 
 bool Accounts::apply_user(const UserRecord& user) {
@@ -134,10 +145,13 @@ void Accounts::propagate_users() {
         auto values = users_.all();
         if (values.empty())
             return;
-        (void)node_.broadcast_best_effort({MessageType::user_sync, encode_users(values)},
-                                          FrameType::control);
+        const auto reached = node_.broadcast_notify(
+            {MessageType::user_sync, encode_users(values)}, FrameType::control);
+        if (reached < active_peers().size())
+            request_gossip();
     } catch (const std::exception& error) {
         Log::debug("user propagation skipped: " + std::string(error.what()));
+        request_gossip();
     }
 }
 
@@ -154,13 +168,22 @@ void Accounts::gossip_loop(std::stop_token stop) {
     const auto interval = std::max(cfg_.telemetry_interval, std::chrono::milliseconds(250));
     while (!stop.stop_requested()) {
         const auto topology = events_.count(NodeEvent::topology);
+        const auto demand = gossip_demand_.load(std::memory_order_acquire);
         gossip_sessions();
         // The whole user table, tombstones included, so a node that missed a
         // deletion learns the tombstone rather than resurrecting the account.
         gossip_users_if_changed();
+        // A broadcast that missed a peer is retried at its floor, not a tick
+        // later.
+        auto wait = std::chrono::duration_cast<Clock::duration>(interval);
+        const auto now = Clock::now();
+        for (const auto retry : {gossip_sessions_retry_after_, gossip_users_retry_after_})
+            if (retry > now)
+                wait = std::min(wait, retry - now);
         Lock lock(events_.wait_mutex);
-        events_.wait_cv.wait_for(lock.native(), stop, interval, [&] {
-            return events_.count(NodeEvent::topology) != topology;
+        events_.wait_cv.wait_for(lock.native(), stop, wait, [&] {
+            return events_.count(NodeEvent::topology) != topology ||
+                   gossip_demand_.load(std::memory_order_acquire) != demand;
         });
     }
 }
@@ -183,7 +206,7 @@ void Accounts::gossip_sessions() {
                          now - gossiped_sessions_at_ >= gossip_reannounce_interval;
         if (!due || now < gossip_sessions_retry_after_)
             return;
-        const auto reached = node_.broadcast_best_effort(
+        const auto reached = node_.broadcast_notify(
             {MessageType::session_sync, std::move(payload)}, FrameType::control);
         // Recorded only once it reached everyone: a best-effort notify queues
         // nothing for a busy or not-yet-usable peer (as when a peer rejoins),
@@ -220,7 +243,7 @@ void Accounts::gossip_users_if_changed() {
         auto values = users_.all();
         if (values.empty())
             return;
-        const auto reached = node_.broadcast_best_effort(
+        const auto reached = node_.broadcast_notify(
             {MessageType::user_sync, encode_users(values)}, FrameType::control);
         // Commit only when it reached everyone, so a not-yet-usable peer is
         // retried next tick rather than marked told.
