@@ -93,6 +93,22 @@ inline uint64_t runner_salt() {
     return salt;
 }
 
+// The factor the runner scales case deadlines by (MACHA_TEST_TIMEOUT_SCALE),
+// for a slower build: a bound inside a case scales with it.
+inline unsigned time_scale() {
+    static const unsigned scale = [] {
+        const char* value = std::getenv("MACHA_TEST_TIMEOUT_SCALE");
+        const auto parsed = value ? std::strtoul(value, nullptr, 10) : 1UL;
+        return static_cast<unsigned>(parsed ? parsed : 1UL);
+    }();
+    return scale;
+}
+
+template <class Rep, class Period>
+std::chrono::duration<Rep, Period> scaled(std::chrono::duration<Rep, Period> bound) {
+    return bound * time_scale();
+}
+
 inline uint16_t free_port() {
     // Each case gets its own 64-port block, so no other test can claim a probed
     // port before the server binds it. Candidates are still bind-probed because
@@ -524,7 +540,7 @@ class TestGate {
 template <class Fn>
 bool wait_until(Fn&& fn, std::chrono::milliseconds timeout = 5s,
                 std::chrono::milliseconds poll_interval = 10ms) {
-    const auto end = Clock::now() + timeout;
+    const auto end = Clock::now() + scaled(timeout);
     while (Clock::now() < end) {
         if (fn()) return true;
         std::this_thread::sleep_for(poll_interval);

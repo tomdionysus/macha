@@ -272,7 +272,7 @@ MACHA_FAST_TEST("subsystem_supervisor", test_stop_cancels_a_blocked_factory) {
         throw std::runtime_error("construction cancelled");
     });
     supervisor.start(SubsystemContext{});
-    REQUIRE(entered_future.wait_for(5s) == std::future_status::ready);
+    REQUIRE(entered_future.wait_for(scaled(5s)) == std::future_status::ready);
 
     // Without cancellation stop() joins a thread that never returns, and the
     // case's deadline fails it.

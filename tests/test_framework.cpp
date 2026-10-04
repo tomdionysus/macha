@@ -436,6 +436,10 @@ int run_all(int argc, char** argv) {
     // block namespace and, with the case index, makes each case's cluster
     // key, so a node of the other run cannot join. Set it explicitly to
     // reproduce a run's exact ports and keys.
+    // Cases scale their own bounded waits by the same factor as their
+    // deadlines (test_support::scaled).
+    ::setenv("MACHA_TEST_TIMEOUT_SCALE", std::to_string(options.timeout_scale).c_str(), 1);
+
     if (!std::getenv("MACHA_TEST_PORT_SALT")) {
         const auto salt = static_cast<unsigned>(
             (static_cast<unsigned long>(::getpid()) * 2654435761UL) ^

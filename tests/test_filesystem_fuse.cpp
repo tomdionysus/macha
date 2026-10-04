@@ -1351,12 +1351,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         });
         REQUIRE(wait_until(
             [&] { return frontend->status().spool_throttle_waits > throttled; }, 10s));
-        CHECK(admitted.wait_for(0s) == std::future_status::timeout);
+        CHECK(admitted.wait_for(scaled(0s)) == std::future_status::timeout);
         CHECK(fs.getattr("/closed-small-2.bin").size == 0);
         CHECK(fs.getattr("/closed-large.bin").size == 0);
 
         frontend.loader->release();
-        REQUIRE(admitted.wait_for(10s) == std::future_status::ready);
+        REQUIRE(admitted.wait_for(scaled(10s)) == std::future_status::ready);
         CHECK(admitted.get() == 1);
         // Its size reaches the namespace with the namespace publication that
         // follows the retirement.
@@ -1632,9 +1632,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
             return error_code_of([&] { frontend->fsync(handle.inode); });
         });
         REQUIRE(wait_until([&] { return frontend->status().pending_data == 1; }, 10s));
-        CHECK(synced.wait_for(0s) == std::future_status::timeout);
+        CHECK(synced.wait_for(scaled(0s)) == std::future_status::timeout);
         frontend->interrupt_waits();
-        REQUIRE(synced.wait_for(10s) == std::future_status::ready);
+        REQUIRE(synced.wait_for(scaled(10s)) == std::future_status::ready);
         CHECK(synced.get() == EIO);
         frontend.loader->release();
         frontend->release(handle.inode, true);
@@ -1696,9 +1696,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
             return frontend->write(handle.inode, first.size(), second);
         });
         REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
-        CHECK(second_write.wait_for(0s) == std::future_status::timeout);
+        CHECK(second_write.wait_for(scaled(0s)) == std::future_status::timeout);
         frontend.loader->release();
-        REQUIRE(second_write.wait_for(10s) == std::future_status::ready);
+        REQUIRE(second_write.wait_for(scaled(10s)) == std::future_status::ready);
         CHECK(second_write.get() == 300 * 1024);
 
         const auto pressure = frontend->status();
@@ -1740,9 +1740,9 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
             return frontend->write(follower.inode, 0, next);
         });
         REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
-        CHECK(admitted.wait_for(0s) == std::future_status::timeout);
+        CHECK(admitted.wait_for(scaled(0s)) == std::future_status::timeout);
         frontend.loader->release();
-        REQUIRE(admitted.wait_for(10s) == std::future_status::ready);
+        REQUIRE(admitted.wait_for(scaled(10s)) == std::future_status::ready);
         CHECK(admitted.get() == 1024 * 1024);
         const auto progress = frontend->status();
         CHECK(progress.spool_bytes <= progress.spool_limit_bytes);
@@ -1771,12 +1771,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
             return error_code_of([&] { (void)frontend->write(handle.inode, first.size(), second); });
         });
         REQUIRE(wait_until([&] { return frontend->status().spool_throttle_waits >= 1; }, 10s));
-        CHECK(blocked.wait_for(0s) == std::future_status::timeout);
+        CHECK(blocked.wait_for(scaled(0s)) == std::future_status::timeout);
         const auto pressure = frontend->status();
         CHECK(pressure.spool_bytes <= pressure.spool_limit_bytes);
         CHECK(pressure.spool_pressure_publication_sweeps == 1);
         frontend->stop();
-        REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
+        REQUIRE(blocked.wait_for(scaled(2s)) == std::future_status::ready);
         CHECK(blocked.get() == EINTR);
     }
 
@@ -1849,14 +1849,14 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         // Nothing reports a payload waiting for admission, so this one
         // negative check is bounded by time: in the window the second payload
         // must not be admitted beside the first.
-        CHECK(blocked_before_copy.wait_for(100ms) == std::future_status::timeout);
+        CHECK(blocked_before_copy.wait_for(scaled(100ms)) == std::future_status::timeout);
         const auto bounded = frontend->status();
         CHECK(bounded.pending_write_request_bytes == payload.size());
         CHECK(bounded.peak_pending_write_request_bytes == payload.size());
         CHECK(bounded.pending_write_request_limit_bytes == payload.size());
         frontend->stop();
-        REQUIRE(blocked_in_spool.wait_for(2s) == std::future_status::ready);
-        REQUIRE(blocked_before_copy.wait_for(2s) == std::future_status::ready);
+        REQUIRE(blocked_in_spool.wait_for(scaled(2s)) == std::future_status::ready);
+        REQUIRE(blocked_before_copy.wait_for(scaled(2s)) == std::future_status::ready);
         CHECK(blocked_in_spool.get() == EINTR);
         CHECK(blocked_before_copy.get() == EINTR);
         CHECK(frontend->status().peak_pending_write_request_bytes == payload.size());
@@ -1880,12 +1880,12 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
                 [&] { (void)frontend->write(handle.inode, payload.size() * 3, payload); });
         });
         REQUIRE(wait_until([&] { return frontend->status().operation_metadata_waits >= 1; }, 5s));
-        CHECK(blocked.wait_for(0s) == std::future_status::timeout);
+        CHECK(blocked.wait_for(scaled(0s)) == std::future_status::timeout);
         const auto bounded = frontend->status();
         CHECK(bounded.operation_metadata_bytes <= bounded.operation_metadata_limit_bytes);
         CHECK(bounded.peak_operation_metadata_bytes <= bounded.operation_metadata_limit_bytes);
         frontend->stop();
-        REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
+        REQUIRE(blocked.wait_for(scaled(2s)) == std::future_status::ready);
         CHECK(blocked.get() == EINTR);
     }
 
@@ -1905,7 +1905,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         auto waiting = std::async(std::launch::async, [&] {
             return frontend->write(handle.inode, payload.size(), payload);
         });
-        REQUIRE(waiting.wait_for(10s) == std::future_status::ready);
+        REQUIRE(waiting.wait_for(scaled(10s)) == std::future_status::ready);
         CHECK(waiting.get() == payload.size());
         const auto progressed = frontend->status();
         CHECK(progressed.operation_metadata_waits >= 1);
