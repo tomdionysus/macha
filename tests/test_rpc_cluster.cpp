@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "test_backend_support.hpp"
+#include "fake_cluster_node.hpp"
+#include "acquisition/cluster_jobs.hpp"
+#include "subsystem/subsystem_registry.hpp"
+#include "torrent/torrent_coordinator.hpp"
 #include "metadata/namespace_control_store.hpp"
 #include "cluster/placement.hpp"
 #include "startup_progress.hpp"
@@ -100,7 +104,7 @@ MACHA_FAST_TEST("rpc_cluster", test_rpc_reassembly_is_process_memory_charged_unt
     CHECK(rejected);
 }
 
-MACHA_TEST("rpc_cluster", test_async_rpc_move_ownership) {
+MACHA_FAST_TEST("rpc_cluster", test_async_rpc_move_ownership) {
     std::atomic_int cancelled{};
 
     // Moving an AsyncRpc transfers cancellation ownership; the moved-from
@@ -345,505 +349,471 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
     server.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_loader_put_does_not_signal_viewer_activity) {
-    TestNode fixture("loader-activity-class");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& node = fixture.start();
+// DistributedStore against a FakeClusterNode: placement, puts, fetches and
+// repair as the store decides them, with peers answering in process.
 
-    // Clear startup accounting; a loader write must not refresh the viewer clock.
-    (void)node.resources.activity.take_bytes(FrameType::read_ahead);
-    (void)node.resources.activity.take_bytes(FrameType::foreground);
-    (void)node.resources.activity.take_bytes(FrameType::loader);
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    auto bytes = pattern(256 * 1024, 91);
-    REQUIRE(store.put(bytes) == object_id(bytes));
-    CHECK(node.resources.activity.take_bytes(FrameType::read_ahead) == 0);
-    CHECK(node.resources.activity.take_bytes(FrameType::foreground) == 0);
+// Objects of `size` bytes, stored locally; returns their ids sorted.
+std::vector<ObjectId> local_objects(StoreBench& bench, size_t count, size_t size, uint8_t salt) {
+    std::vector<ObjectId> ids;
+    for (size_t i = 0; i < count; ++i) {
+        const auto bytes = pattern(size, static_cast<uint8_t>(salt + i));
+        const auto id = object_id(bytes);
+        REQUIRE(bench.local.data().put(id, bytes));
+        ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
 }
 
-MACHA_TEST("rpc_cluster", test_a_loader_write_is_visible_to_maintenance_as_its_own_class) {
-    // A loader write is not a viewer, but it must refresh the loader clock:
-    // maintenance ranks below loader work and judges idleness from these clocks.
-    TestNode fixture("loader-activity-clock");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& node = fixture.start();
-
-    (void)node.resources.activity.take_bytes(FrameType::loader);
-    (void)node.resources.activity.take_bytes(FrameType::foreground);
-    (void)node.resources.activity.take_bytes(FrameType::read_ahead);
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    auto bytes = pattern(256 * 1024, 91);
-    REQUIRE(store.put(bytes) == object_id(bytes));
-
-    // Seen, as its own class, with the viewer clocks untouched.
-    CHECK(store.loader_idle_for() < 5s);
-    CHECK(store.take_loader_bytes() >= bytes.size());
-    CHECK(store.take_foreground_bytes() == 0);
-    CHECK(store.take_interactive_bytes() == 0);
-
-    // Not a viewer to the DATA pressure gate or the torrent rate clamp.
-    CHECK(!fixture.resources().activity.viewer_recently_active(30s));
+// A peer put's durability token, as a node answers put_object_deferred.
+RpcMessage deferred_put_reply() {
+    Writer writer;
+    writer.fixed(random_node_id().bytes);
+    writer.u64(1);
+    writer.u64(1);
+    writer.u64(1);
+    return {MessageType::ok, writer.take()};
 }
 
-MACHA_TEST("rpc_cluster", test_concurrent_object_fetch_waiters_share_one_retained_buffer) {
-    TestNode fixture("shared-object-buffer", ConfigProfile::functional);
-    auto& config = fixture.config();
-    config.replication = 2;
-    config.metadata_min_write_replicas = 1;
-    config.heartbeat = 30s;
-    auto& node = fixture.start();
+// A put is loader work: it refreshes the loader clock and leaves the viewer
+// clocks, which pace maintenance and gate DATA pressure, untouched.
+MACHA_FAST_TEST("rpc_cluster", test_store_put_is_loader_activity_not_viewer_activity) {
+    StoreBench bench;
+    auto& activity = bench.resources.activity;
+    for (auto frame : {FrameType::loader, FrameType::foreground, FrameType::read_ahead})
+        (void)activity.take_bytes(frame);
+    auto store = bench.store();
+    const auto bytes = pattern(256 * 1024, 91);
+    REQUIRE(store->put(bytes) == object_id(bytes));
+    CHECK(store->loader_idle_for() < 5s);
+    CHECK(store->take_loader_bytes() >= bytes.size());
+    CHECK(store->take_foreground_bytes() == 0);
+    CHECK(store->take_interactive_bytes() == 0);
+    CHECK(!activity.viewer_recently_active(30s));
+}
 
+// A put publishes at min_write_replicas with the local copy, never waiting
+// for owners beyond the floor; the prompt worker then copies it to one more
+// owner, and never to an owner that gossips no room.
+MACHA_FAST_TEST("rpc_cluster", test_store_put_publishes_at_the_floor_and_copies_promptly) {
+    StoreBench bench([](Config& c) { c.replication = 3; });
+    TestGate owners_answer;
+    std::atomic_bool put_returned{};
+    std::atomic_bool owners_opened{};
+    const auto held_put = [&](MessageType type, const Bytes&, FrameType) {
+        if (type == MessageType::put_object)
+            owners_answer.enter_and_wait();
+        if (type == MessageType::have_object)
+            return RpcMessage{MessageType::bool_reply, Bytes{0}};
+        return RpcMessage{MessageType::ok, {}};
+    };
+    const auto first = StoreBench::peer();
+    const auto second = StoreBench::peer();
+    bench.node.add_peer(first, held_put);
+    bench.node.add_peer(second, held_put);
+    // Opens the owners whatever happens, so a put that waits for them ends.
+    std::jthread release([&] {
+        (void)wait_until([&] { return put_returned.load(); }, 2s);
+        owners_opened = true;
+        owners_answer.open();
+    });
+
+    auto store = bench.store();
+    const auto data = pattern(128 * 1024);
+    const auto id = object_id(data);
+    CHECK(store->put(id, data));
+    CHECK(!owners_opened.load());
+    put_returned = true;
+    CHECK(bench.local.data().has(id));
+    release.join();
+    REQUIRE(wait_until([&] { return store->prompt_replication_stats().copies == 1; }));
+    CHECK(bench.node.calls_of(MessageType::put_object) == 1);
+
+    // An owner gossiping no room is no destination: nothing is sent, and the
+    // object is left to repair.
+    StoreBench full_bench([](Config& c) { c.replication = 2; });
+    auto full = StoreBench::peer(1024ULL * 1024 * 1024);
+    full.used = full.capacity - 81;
+    full_bench.node.add_peer(full, [](MessageType type, const Bytes&, FrameType) {
+        if (type == MessageType::have_object)
+            return RpcMessage{MessageType::bool_reply, Bytes{0}};
+        return RpcMessage{MessageType::ok, {}};
+    });
+    auto full_store = full_bench.store();
+    const auto other = pattern(128 * 1024, 7);
+    CHECK(full_store->put(object_id(other), other));
+    REQUIRE(wait_until([&] { return full_store->repair_diagnostics().prompt_skipped_no_room == 1; }));
+    const auto diagnostics = full_store->repair_diagnostics();
+    CHECK(diagnostics.prompt_dropped == 1);
+    CHECK(diagnostics.prompt_copies == 0);
+    CHECK(diagnostics.prompt_failures == 0);
+    CHECK(full_bench.node.calls_of(MessageType::put_object) == 0);
+}
+
+// A replica whose call cannot be placed counts as failed at once, so the put
+// launches the next owner in its place rather than waiting on it.
+MACHA_FAST_TEST("rpc_cluster", test_store_put_replaces_a_replica_that_cannot_be_launched) {
+    StoreBench bench([](Config& c) {
+        c.replication = 3;
+        c.min_write_replicas = 2;
+    });
+    bench.node.add_peer(StoreBench::peer());
+    bench.node.add_peer(StoreBench::peer());
+
+    // The peer placement tries first after the local copy cannot be reached;
+    // the other stands by.
+    const auto data = pattern(64 * 1024, 5);
+    std::vector<NodeId> remote;
+    for (const auto& node : capacity_placement_nodes(object_id(data).bytes,
+                                                     bench.node.membership().active(), 3))
+        if (node.id != bench.node.node_id())
+            remote.push_back(node.id);
+    REQUIRE(remote.size() == 2);
+    const auto refused = remote[0];
+    const auto standby = remote[1];
+    bench.node.refuse(refused);
+    // Bounds a put that never replaces the refused replica.
+    std::atomic_bool cancelled{};
+    std::jthread watchdog([&](std::stop_token stop) {
+        const auto deadline = Clock::now() + 2s;
+        while (!stop.stop_requested() && Clock::now() < deadline)
+            std::this_thread::sleep_for(5ms);
+        if (!stop.stop_requested())
+            cancelled = true;
+    });
+    auto store = bench.store();
+    CHECK(store->put(object_id(data), data, &cancelled));
+    watchdog.request_stop();
+    CHECK(!cancelled.load());
+    CHECK(bench.node.calls_of(MessageType::put_object, standby) == 1);
+}
+
+// A put whose required replica never answers fails retryably once nothing in
+// its pipeline has moved for the work's no-progress budget, and the same put
+// goes through once the peer answers.
+MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_fails_within_its_no_progress_budget) {
+    StoreBench bench([](Config& c) {
+        c.replication = 2;
+        c.min_write_replicas = 2;
+        c.write_stall = 50ms;
+    });
+    std::atomic_bool silent{true};
+    TestGate held;
+    const auto peer = StoreBench::peer();
+    bench.node.add_peer(peer, [&](MessageType type, const Bytes&, FrameType) {
+        if (type == MessageType::put_object_deferred && silent.load())
+            held.enter_and_wait();
+        return deferred_put_reply();
+    });
+    auto store = bench.store();
+    const auto data = pattern(64 * 1024, 3);
+    std::atomic_uint64_t progress{};
+    const DataWorkContext work(FrameType::loader, bench.config().extent_size, {}, nullptr,
+                               &progress, 200ms);
+    DistributedStore::DurabilityBatch batch;
+    std::string error;
+    const auto started = Clock::now();
+    try {
+        (void)store->put_deferred(data, batch, FrameType::loader, nullptr, &work);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    const auto elapsed = Clock::now() - started;
+    CHECK(error.find("quorum unavailable") != std::string::npos);
+    CHECK(elapsed >= 200ms);
+    CHECK(elapsed < 5s);
+
+    silent = false;
+    held.open();
+    DistributedStore::DurabilityBatch again;
+    CHECK(store->put_deferred(data, again, FrameType::loader, nullptr, &work) == object_id(data));
+    CHECK(!again.empty());
+}
+
+// Readers of one missing object share a single fetch and a single retained
+// buffer; the reply's memory lease lives as long as the last reader's handle.
+MACHA_FAST_TEST("rpc_cluster", test_store_concurrent_readers_share_one_fetch_and_buffer) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
     const auto bytes = pattern(512 * 1024, 73);
     const auto id = object_id(bytes);
-    const auto port = free_port();
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "127.0.0.1";
-    peer.port = port;
-    peer.failure_domain = "remote";
-    peer.capacity = 1024ULL * 1024 * 1024;
-    peer.seen_unix_ms = unix_ms();
-
+    auto& memory = bench.resources.memory;
     TestGate reply_gate;
-    std::atomic_uint fetches{};
-    RpcServer server(
-        "127.0.0.1", port, fixture.keys(), peer,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::get_object) {
-                ++fetches;
-                reply_gate.enter_and_wait();
-                Writer writer;
-                writer.fixed(id.bytes);
-                writer.bytes(bytes);
-                return RpcMessage{MessageType::object_reply, writer.take()};
-            }
+    bench.node.add_peer(StoreBench::peer(), [&](MessageType type, const Bytes&, FrameType) {
+        if (type != MessageType::get_object)
             return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
-    server.start();
-    node.membership().observe(peer, true);
+        reply_gate.enter_and_wait();
+        auto reply = object_reply(bytes);
+        reply.retained_memory = std::make_shared<std::vector<RetainedMemoryLedger::Lease>>();
+        reply.retained_memory->push_back(*memory.try_acquire(
+            MemoryClass::viewer, MemoryOwner::rpc_frame, reply.payload.size()));
+        return reply;
+    });
+    const auto held = [&] {
+        return memory.stats().owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)];
+    };
 
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    auto first = std::async(std::launch::async, [&] {
-        return store.get_shared(id, 0, FrameType::foreground);
-    });
+    auto store = bench.store();
+    auto first = std::async(std::launch::async,
+                            [&] { return store->get_shared(id, 0, FrameType::foreground); });
     REQUIRE(reply_gate.wait_for_entries(1));
-    auto second = std::async(std::launch::async, [&] {
-        return store.get_shared(id, 0, FrameType::foreground);
-    });
+    auto second = std::async(std::launch::async,
+                             [&] { return store->get_shared(id, 0, FrameType::foreground); });
+    // The second reader joins the fetch in flight; it has no signal to wait on.
     std::this_thread::sleep_for(20ms);
     reply_gate.open();
-
     auto a = first.get();
     auto b = second.get();
     REQUIRE(a != nullptr);
     REQUIRE(b != nullptr);
     CHECK(a.get() == b.get());
     CHECK(a->bytes == bytes);
-    CHECK(fetches.load() == 1);
-
-    const auto held = node.resources.memory.stats()
-                          .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)];
-    CHECK(held >= bytes.size());
+    CHECK(bench.node.calls_of(MessageType::get_object) == 1);
+    CHECK(held() >= bytes.size());
     a.reset();
-    CHECK(node.resources.memory.stats()
-              .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] >= bytes.size());
+    CHECK(held() >= bytes.size());
     b.reset();
-    REQUIRE(wait_until([&] {
-        return node.resources.memory.stats()
-                   .owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)] < bytes.size();
-    }));
-
-    server.stop();
+    CHECK(wait_until([&] { return held() == 0; }));
 }
 
-MACHA_TEST("rpc_cluster", test_repair_does_not_push_to_a_peer_with_no_room) {
-    // A peer that advertises no room for an extent is not a push target.
-    TestNode fixture("repair-full-peer", ConfigProfile::functional);
-    auto& config = fixture.config();
-    config.replication = 2;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    config.heartbeat = 30s;
-    auto& node = fixture.start();
-
-    std::atomic_uint probes{};
-    std::atomic_uint puts{};
-    const auto port = free_port();
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "127.0.0.1";
-    peer.port = port;
-    peer.failure_domain = "remote";
-    peer.capacity = 10ULL * 1024 * 1024 * 1024;
-    peer.used = peer.capacity - 81;
-    peer.seen_unix_ms = unix_ms();
-    RpcServer server(
-        "127.0.0.1", port, fixture.keys(), peer,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::have_object) {
-                ++probes;
-                Writer writer;
-                writer.u8(0);
-                return RpcMessage{MessageType::bool_reply, writer.take()};
-            }
-            if (request.type == MessageType::put_object) ++puts;
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
-    server.start();
-    node.membership().observe(peer, true);
-
-    const auto bytes = pattern(256 * 1024, 31);
-    const auto id = object_id(bytes);
-    REQUIRE(node.local_store().put(id, bytes));
-    const std::vector<ObjectId> live{id};
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    for (int pass = 0; pass < 4; ++pass)
-        (void)store.repair_step(8ULL * 1024 * 1024, 16, live);
-    CHECK(probes.load() == 0);
-    CHECK(puts.load() == 0);
-    // Never dropped for want of a second copy.
-    CHECK(node.local_store().has(id));
-
-    // With room, the same peer is pushed to.
-    peer.used = 0;
-    peer.seen_unix_ms = unix_ms();
-    node.membership().observe(peer, true);
-    for (int pass = 0; pass < 4 && puts.load() == 0; ++pass)
-        (void)store.repair_step(8ULL * 1024 * 1024, 16, live);
-    CHECK(puts.load() > 0);
-    server.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_with_it) {
-    // Probing is paid for by the operation budget; credit pays only for a
-    // transfer's bytes.
-    TestNode fixture("repair-credit-gates-transfers", ConfigProfile::functional);
-    auto& config = fixture.config();
-    config.replication = 2;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    config.heartbeat = 30s;
-    auto& node = fixture.start();
-
-    std::atomic_uint probes{};
-    std::atomic_uint puts{};
-    std::atomic_uint fetches{};
-    std::atomic_bool peer_holds_held{};
-    const auto held_bytes = pattern(256 * 1024, 41);
-    const auto held = object_id(held_bytes);
-    const auto wanted_bytes = pattern(256 * 1024, 42);
-    const auto wanted = object_id(wanted_bytes);
-    const auto port = free_port();
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "127.0.0.1";
-    peer.port = port;
-    peer.failure_domain = "remote";
-    peer.capacity = 1024ULL * 1024 * 1024;
-    peer.seen_unix_ms = unix_ms();
-    RpcServer server(
-        "127.0.0.1", port, fixture.keys(), peer,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::have_valid_objects) {
-                Reader reader(request.payload);
-                const auto count = reader.u32();
-                Writer writer;
-                writer.u32(count);
-                for (uint32_t i = 0; i < count; ++i) {
-                    (void)reader.fixed<32>();
-                    ++probes;
-                    writer.u8(peer_holds_held.load() ? 1 : 0);
-                }
-                return RpcMessage{MessageType::have_valid_objects_reply, writer.take()};
-            }
-            if (request.type == MessageType::get_object) {
-                ++fetches;
-                Writer writer;
-                writer.fixed(wanted.bytes);
-                writer.bytes(wanted_bytes);
-                return RpcMessage{MessageType::object_reply, writer.take()};
-            }
-            if (request.type == MessageType::put_object) ++puts;
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
-    server.start();
-    node.membership().observe(peer, true);
-
-    REQUIRE(node.local_store().put(held, held_bytes));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    REQUIRE(store.should_own(wanted));
-    const auto short_of_an_extent = node.config().extent_size - 1;
-
-    // Push: the peer is probed, and the put waits for credit of the object's own size.
-    const std::vector<ObjectId> held_live{held};
-    auto push = store.repair_step(held_bytes.size() - 1, 16, held_live);
-    CHECK(probes.load() > 0);
-    CHECK(puts.load() == 0);
-    CHECK(push.credit_limited);
-    CHECK(!push.complete);
-    push = store.repair_step(held_bytes.size(), 16, held_live);
-    CHECK(puts.load() == 1);
-    CHECK(!push.credit_limited);
-    peer_holds_held = true;
-
-    // Pull: an object held here is passed over by index, the fetch of the
-    // missing one waits for credit, and the cursor stays on it.
-    std::vector<ObjectId> pull_live{held, wanted};
-    std::sort(pull_live.begin(), pull_live.end());
-    DistributedStore puller(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    DistributedStore::RepairResult pull;
-    for (int step = 0; step < 8 && !pull.credit_limited; ++step)
-        pull = puller.repair_step(short_of_an_extent, 16, pull_live);
-    CHECK(pull.credit_limited);
-    CHECK(fetches.load() == 0);
-    CHECK(!node.local_store().has(wanted));
-    for (int step = 0; step < 8 && !node.local_store().has(wanted); ++step)
-        (void)puller.repair_step(node.config().extent_size, 16, pull_live);
-    CHECK(fetches.load() == 1);
-    CHECK(node.local_store().has(wanted));
-    server.stop();
-}
-
-namespace {
-// A peer for repair's push phase: answers presence as configured, counts what
-// it was asked, and accepts puts.
+// A peer for repair: answers presence as set, counts what it was asked, and
+// accepts puts, holding each at `put_gate` while `hold_puts` is set.
 struct RepairPeer {
+    NodeInfo info{StoreBench::peer()};
     std::atomic_bool knows_batch{true};
     std::atomic_bool holds_everything{};
+    std::atomic_bool hold_puts{};
     std::atomic_uint batch_requests{};
     std::atomic_uint single_probes{};
     std::atomic_uint puts{};
     std::atomic_uint puts_in_flight{};
     std::atomic_uint max_puts_in_flight{};
-    std::chrono::milliseconds put_delay{};
-    NodeInfo info;
-    std::unique_ptr<RpcServer> server;
+    std::atomic_uint fetches{};
+    std::optional<Bytes> serves;
+    TestGate put_gate;
 
-    RepairPeer(TestNode& fixture, BareNode& node) {
-        info.id = random_node_id();
-        info.host = "127.0.0.1";
-        info.port = free_port();
-        info.failure_domain = "remote";
-        info.capacity = 64ULL * 1024 * 1024 * 1024;
-        info.seen_unix_ms = unix_ms();
-        server = std::make_unique<RpcServer>(
-            "127.0.0.1", info.port, fixture.keys(), info,
-            [this](const NodeInfo&, FrameType, const RpcMessage& request) {
-                if (request.type == MessageType::have_valid_objects) {
-                    if (!knows_batch.load())
-                        return RpcMessage{MessageType::error, {}};
-                    ++batch_requests;
-                    Reader reader(request.payload);
-                    const auto count = reader.u32();
-                    Writer writer;
-                    writer.u32(count);
-                    for (uint32_t i = 0; i < count; ++i) {
-                        (void)reader.fixed<32>();
-                        writer.u8(holds_everything.load() ? 1 : 0);
-                    }
-                    return RpcMessage{MessageType::have_valid_objects_reply, writer.take()};
-                }
-                if (request.type == MessageType::have_object) {
-                    ++single_probes;
-                    Writer writer;
-                    writer.u8(holds_everything.load() ? 1 : 0);
-                    return RpcMessage{MessageType::bool_reply, writer.take()};
-                }
-                if (request.type == MessageType::put_object) {
-                    const auto now = ++puts_in_flight;
-                    auto seen = max_puts_in_flight.load();
-                    while (now > seen && !max_puts_in_flight.compare_exchange_weak(seen, now)) {
-                    }
-                    std::this_thread::sleep_for(put_delay);
-                    --puts_in_flight;
-                    ++puts;
-                }
-                return RpcMessage{MessageType::ok, {}};
-            },
-            [](const NodeInfo&) {}, 4ULL * 1024 * 1024, RpcServerExecutionLimits{},
-            &node.resources.memory);
-        server->start();
-        node.membership().observe(info, true);
+    explicit RepairPeer(StoreBench& bench) {
+        bench.node.add_peer(info, [this](MessageType type, const Bytes& request, FrameType) {
+            return answer(type, request);
+        });
     }
-    ~RepairPeer() { server->stop(); }
-
-    void report_viewers(NodeRuntime& node, uint64_t sequence, uint32_t foreground_bps) {
-        NodeTelemetry telemetry;
-        telemetry.node_id = info.id;
-        telemetry.boot_id = NodeId{};
-        telemetry.sequence = sequence;
-        telemetry.observed_unix_ms = unix_ms();
-        telemetry.host = info.host;
-        telemetry.port = info.port;
-        telemetry.traffic = {TrafficClass{static_cast<uint8_t>(FrameType::foreground), 0, 0,
-                                          foreground_bps, 0}};
-        node.telemetry().observe(telemetry, true);
+    RpcMessage answer(MessageType type, const Bytes& request) {
+        switch (type) {
+        case MessageType::have_valid_objects:
+            if (!knows_batch.load())
+                return {MessageType::error, {}};
+            ++batch_requests;
+            return presence_reply(request, holds_everything.load());
+        case MessageType::have_object:
+            ++single_probes;
+            return {MessageType::bool_reply, Bytes{static_cast<uint8_t>(holds_everything.load())}};
+        case MessageType::put_object: {
+            const auto now = ++puts_in_flight;
+            for (auto seen = max_puts_in_flight.load();
+                 now > seen && !max_puts_in_flight.compare_exchange_weak(seen, now);) {
+            }
+            if (hold_puts.load())
+                put_gate.enter_and_wait();
+            --puts_in_flight;
+            ++puts;
+            return {MessageType::ok, {}};
+        }
+        case MessageType::get_object:
+            ++fetches;
+            if (serves)
+                return object_reply(*serves);
+            return {MessageType::error, {}};
+        default:
+            return {MessageType::ok, {}};
+        }
     }
 };
 
-TestNode& repair_fixture(std::optional<TestNode>& slot, const char* name) {
-    slot.emplace(name, ConfigProfile::functional);
-    auto& config = slot->config();
-    config.replication = 2;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    config.heartbeat = 30s;
-    return *slot;
-}
-} // namespace
-
-MACHA_TEST("rpc_cluster", test_repair_probes_a_window_per_request_not_per_object) {
-    // A push step asks about its whole window, up to have_valid_objects_max
-    // objects a request, each checked on the peer as have_object checks one.
-    std::optional<TestNode> slot;
-    auto& fixture = repair_fixture(slot, "repair-batched-presence");
-    auto& node = fixture.start();
-    RepairPeer peer(fixture, node);
-    peer.holds_everything = true;
-
-    std::vector<ObjectId> live;
-    for (int i = 0; i < 40; ++i) {
-        const auto bytes = pattern(8 * 1024, 300 + i);
-        const auto id = object_id(bytes);
-        REQUIRE(node.local_store().put(id, bytes));
-        live.push_back(id);
-    }
-    std::sort(live.begin(), live.end());
-
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    const auto step = store.repair_step(8ULL * 1024 * 1024, 16, live);
-    CHECK(step.push_examined == live.size());
-    CHECK(peer.batch_requests.load() == 3); // 16 + 16 + 8
-    CHECK(peer.single_probes.load() == 0);
-    CHECK(peer.puts.load() == 0);
-
-    // A peer without have_valid_objects is asked one object at a time.
-    peer.knows_batch = false;
-    DistributedStore older(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    const auto fallback = older.repair_step(8ULL * 1024 * 1024, 16, live);
-    CHECK(fallback.push_examined == live.size());
-    CHECK(peer.single_probes.load() == live.size());
-    CHECK(peer.puts.load() == 0);
-}
-
-MACHA_TEST("rpc_cluster", test_repair_pushes_several_objects_at_once) {
-    // A step's pushes go out together, not one round trip at a time.
-    std::optional<TestNode> slot;
-    auto& fixture = repair_fixture(slot, "repair-pipelined-pushes");
-    auto& node = fixture.start();
-    RepairPeer peer(fixture, node);
-    peer.put_delay = 300ms;
-
-    std::vector<ObjectId> live;
-    for (int i = 0; i < 8; ++i) {
-        const auto bytes = pattern(24 * 1024, 400 + i);
-        const auto id = object_id(bytes);
-        REQUIRE(node.local_store().put(id, bytes));
-        live.push_back(id);
-    }
-    std::sort(live.begin(), live.end());
-
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    const auto started = Clock::now();
-    const auto step = store.repair_step(64ULL * 1024 * 1024, 16, live);
-    const auto elapsed = Clock::now() - started;
-    CHECK(peer.puts.load() == live.size());
-    CHECK(step.push_examined == live.size());
-    CHECK(step.bytes_transferred == live.size() * 24 * 1024);
-    CHECK(peer.max_puts_in_flight.load() > 1);
-    // Serially this is 8 x 300 ms.
-    CHECK(elapsed < 1500ms);
-}
-
-MACHA_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_generations_and_restarts) {
-    // The push cursor survives a new live-set generation and a restart; each
-    // object passed again would cost a full read on the peer.
-    std::optional<TestNode> slot;
-    auto& fixture = repair_fixture(slot, "repair-pass-position");
-    auto& node = fixture.start();
-    RepairPeer peer(fixture, node);
-    peer.holds_everything = true;
-
-    std::vector<ObjectId> live;
-    for (int i = 0; i < 100; ++i) {
-        const auto bytes = pattern(4 * 1024, 500 + i);
-        const auto id = object_id(bytes);
-        REQUIRE(node.local_store().put(id, bytes));
-        live.push_back(id);
-    }
-    std::sort(live.begin(), live.end());
-    const auto position = fixture.config().state_path / "repair" / "push-position";
-
+// A push step asks about its whole window, have_valid_objects_max ids a
+// request; a peer without have_valid_objects is asked one id at a time. All
+// of a step's pushes are in flight together, and the bytes go at speculative
+// priority.
+MACHA_FAST_TEST("rpc_cluster", test_repair_push_probes_by_window_and_sends_together) {
     {
-        DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data,
-                           node.resources.memory, node.resources.events, DistributedStoreOptions{position, {}});
-        const auto first = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 1);
+        StoreBench bench([](Config& c) { c.replication = 2; });
+        RepairPeer peer(bench);
+        peer.holds_everything = true;
+        const auto live = local_objects(bench, 40, 8 * 1024, 30);
+        auto store = bench.store();
+        const auto step = store->repair_step(8ULL * 1024 * 1024, 16, live);
+        CHECK(step.push_examined == live.size());
+        CHECK(peer.batch_requests.load() == 3); // 16 + 16 + 8
+        CHECK(peer.single_probes.load() == 0);
+        CHECK(peer.puts.load() == 0);
+
+        peer.knows_batch = false;
+        auto older = bench.store();
+        const auto fallback = older->repair_step(8ULL * 1024 * 1024, 16, live);
+        CHECK(fallback.push_examined == live.size());
+        CHECK(peer.single_probes.load() == live.size());
+        CHECK(peer.puts.load() == 0);
+    }
+    {
+        StoreBench bench([](Config& c) { c.replication = 2; });
+        RepairPeer peer(bench);
+        peer.hold_puts = true;
+        const auto live = local_objects(bench, 8, 24 * 1024, 40);
+        // Opens the puts once all eight are held, or after a bound so a
+        // serial repair ends and fails the check below.
+        std::jthread release([&] {
+            (void)peer.put_gate.wait_for_entries(live.size(), 2s);
+            peer.put_gate.open();
+        });
+        auto store = bench.store();
+        const auto step = store->repair_step(64ULL * 1024 * 1024, 16, live);
+        release.join();
+        CHECK(peer.puts.load() == live.size());
+        CHECK(step.push_examined == live.size());
+        CHECK(step.bytes_transferred == live.size() * 24 * 1024);
+        CHECK(peer.max_puts_in_flight.load() == live.size());
+        for (const auto& call : bench.node.calls())
+            if (call.type == MessageType::put_object)
+                CHECK(call.frame_type == FrameType::speculative);
+    }
+}
+
+// A peer whose advertised free space cannot take an extent is neither probed
+// nor sent one; the copy goes to the next node in rank, and the local copy
+// stays. Once the peer has room it is pushed to.
+MACHA_FAST_TEST("rpc_cluster", test_repair_pushes_past_a_peer_with_no_room) {
+    StoreBench bench([](Config& c) { c.replication = 3; });
+    const auto capacity = bench.local.data().limit();
+    auto full = StoreBench::peer(capacity, capacity - 81);
+    const auto fallback = StoreBench::peer(capacity);
+    const auto owner = StoreBench::peer(capacity);
+    std::atomic_uint full_calls{};
+    bench.node.add_peer(full, [&](MessageType, const Bytes&, FrameType) {
+        ++full_calls;
+        return RpcMessage{MessageType::ok, {}};
+    });
+    const auto absent = [](MessageType type, const Bytes& request, FrameType) {
+        if (type == MessageType::have_valid_objects)
+            return presence_reply(request, false);
+        return RpcMessage{MessageType::ok, {}};
+    };
+    bench.node.add_peer(fallback, absent);
+    bench.node.add_peer(owner, absent);
+
+    // An object the full peer would own: among the first three in rank.
+    Bytes bytes;
+    for (uint32_t salt = 0;; ++salt) {
+        REQUIRE(salt < 4096);
+        bytes = pattern(64 * 1024 + salt, 31);
+        const auto ranked = capacity_placement_nodes(object_id(bytes).bytes,
+                                                     bench.node.membership().active(), 3);
+        if (ranked.size() == 4 && ranked[3].id == fallback.id &&
+            std::any_of(ranked.begin(), ranked.begin() + 3,
+                        [&](const NodeInfo& node) { return node.id == full.id; }))
+            break;
+    }
+    const auto id = object_id(bytes);
+    REQUIRE(bench.local.data().put(id, bytes));
+    const std::vector<ObjectId> live{id};
+    auto store = bench.store();
+    for (int pass = 0; pass < 4; ++pass)
+        (void)store->repair_step(8ULL * 1024 * 1024, 16, live);
+    CHECK(full_calls.load() == 0);
+    CHECK(bench.node.calls_of(MessageType::put_object, fallback.id) > 0);
+    CHECK(bench.node.calls_of(MessageType::put_object, owner.id) > 0);
+    CHECK(bench.local.data().has(id));
+
+    full.used = 0;
+    full.seen_unix_ms += 1000;
+    bench.node.membership().observe(full, true);
+    auto again = bench.store();
+    for (int pass = 0; pass < 4 && full_calls.load() == 0; ++pass)
+        (void)again->repair_step(8ULL * 1024 * 1024, 16, live);
+    CHECK(full_calls.load() > 0);
+}
+
+// Probing is paid for by the operation budget; credit pays only for a
+// transfer's bytes. A push waits for credit of its object's size; a pull
+// passes held objects by index, waits for an extent of credit, and the cursor
+// stays on the object it could not afford.
+MACHA_FAST_TEST("rpc_cluster", test_repair_probes_without_credit_and_transfers_only_with_it) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    const auto held_bytes = pattern(256 * 1024, 41);
+    const auto held = object_id(held_bytes);
+    const auto wanted_bytes = pattern(256 * 1024, 42);
+    const auto wanted = object_id(wanted_bytes);
+    peer.serves = wanted_bytes;
+    REQUIRE(bench.local.data().put(held, held_bytes));
+
+    auto store = bench.store();
+    REQUIRE(store->should_own(wanted));
+    const std::vector<ObjectId> held_live{held};
+    auto push = store->repair_step(held_bytes.size() - 1, 16, held_live);
+    CHECK(peer.batch_requests.load() == 1);
+    CHECK(peer.puts.load() == 0);
+    CHECK(push.credit_limited);
+    CHECK(!push.complete);
+    push = store->repair_step(held_bytes.size(), 16, held_live);
+    CHECK(peer.puts.load() == 1);
+    CHECK(!push.credit_limited);
+    peer.holds_everything = true;
+
+    std::vector<ObjectId> pull_live{held, wanted};
+    std::sort(pull_live.begin(), pull_live.end());
+    const auto extent = bench.config().extent_size;
+    auto puller = bench.store();
+    DistributedStore::RepairResult pull;
+    for (int step = 0; step < 8 && !pull.credit_limited; ++step)
+        pull = puller->repair_step(extent - 1, 16, pull_live);
+    CHECK(pull.credit_limited);
+    CHECK(peer.fetches.load() == 0);
+    CHECK(!bench.local.data().has(wanted));
+    for (int step = 0; step < 8 && !bench.local.data().has(wanted); ++step)
+        (void)puller->repair_step(extent, 16, pull_live);
+    CHECK(peer.fetches.load() == 1);
+    CHECK(bench.local.data().has(wanted));
+}
+
+// The push cursor survives a new live-set generation and a restart (each
+// object passed again would cost a full read on the peer). With no
+// generation, a pass a different live set arrived part-way through is not
+// reported settled; the same set again is.
+MACHA_FAST_TEST("rpc_cluster", test_repair_pass_keeps_its_place_across_live_sets_and_restarts) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    peer.holds_everything = true;
+    const auto live = local_objects(bench, 100, 4 * 1024, 50);
+    const auto repair_dir = bench.config().state_path / "repair";
+    {
+        auto store = bench.store(DistributedStoreOptions{repair_dir / "push-position", {}});
+        const auto first = store->repair_step(64ULL * 1024 * 1024, 16, live, {}, 1);
         CHECK(first.push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
-        // A new generation continues from where the pass had reached.
-        const auto second = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 2);
+        const auto second = store->repair_step(64ULL * 1024 * 1024, 16, live, {}, 2);
         CHECK(second.push_examined == 36);
         CHECK(peer.batch_requests.load() == 4 + 3);
-        // The pass spanned a change, so it is not reported settled.
         CHECK(!second.complete);
     }
 
-    // A pass part-way through survives a restart: the stopped store saved
-    // where it was, and a new one skips that far by index without asking.
-    const auto restart_position = fixture.config().state_path / "repair" / "restart-position";
+    const auto restart_position = repair_dir / "restart-position";
     peer.batch_requests = 0;
     {
-        DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data,
-                           node.resources.memory, node.resources.events, DistributedStoreOptions{restart_position, {}});
-        const auto before = store.repair_step(64ULL * 1024 * 1024, 16, live, {}, 3);
-        CHECK(before.push_examined == 64);
+        auto store = bench.store(DistributedStoreOptions{restart_position, {}});
+        CHECK(store->repair_step(64ULL * 1024 * 1024, 16, live, {}, 3).push_examined == 64);
         CHECK(peer.batch_requests.load() == 4);
     }
     peer.batch_requests = 0;
-    DistributedStore restarted(node, node.local_state(), node.resources.activity, node.resources.data,
-                           node.resources.memory, node.resources.events, DistributedStoreOptions{restart_position, {}});
-    const auto resumed = restarted.repair_step(64ULL * 1024 * 1024, 16, live, {}, 3);
-    CHECK(resumed.push_examined == 36);
+    auto restarted = bench.store(DistributedStoreOptions{restart_position, {}});
+    CHECK(restarted->repair_step(64ULL * 1024 * 1024, 16, live, {}, 3).push_examined == 36);
     CHECK(peer.batch_requests.load() == 3);
-}
 
-MACHA_TEST("rpc_cluster", test_repair_without_a_generation_tells_live_sets_apart_by_identity) {
-    // With no generation, a pass that a different live set arrived part-way
-    // through is not reported settled; the same set again is.
-    std::optional<TestNode> slot;
-    auto& fixture = repair_fixture(slot, "repair-live-identity");
-    auto& node = fixture.start();
-    RepairPeer peer(fixture, node);
-    peer.holds_everything = true;
-
-    std::vector<ObjectId> live;
-    for (int i = 0; i < 100; ++i) {
-        const auto bytes = pattern(4 * 1024, 700 + i);
-        const auto id = object_id(bytes);
-        REQUIRE(node.local_store().put(id, bytes));
-        live.push_back(id);
-    }
-    std::sort(live.begin(), live.end());
     const std::vector<ObjectId> another = live;
-
-    // Steps until a pass ends; returns whether that pass was reported
-    // settled. `second` is the live set from the second step on.
     const auto pass_settles = [&](const std::vector<ObjectId>& second) {
-        DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-        REQUIRE(!store.repair_step(64ULL * 1024 * 1024, 16, live).complete);
+        auto store = bench.store();
+        REQUIRE(!store->repair_step(64ULL * 1024 * 1024, 16, live).complete);
         for (int step = 0; step < 20; ++step) {
-            const auto passes = store.repair_diagnostics().passes_completed;
-            const auto result = store.repair_step(64ULL * 1024 * 1024, 16, second);
-            if (store.repair_diagnostics().passes_completed > passes)
+            const auto passes = store->repair_diagnostics().passes_completed;
+            const auto result = store->repair_step(64ULL * 1024 * 1024, 16, second);
+            if (store->repair_diagnostics().passes_completed > passes)
                 return result.complete;
         }
         CHECK(!"no repair pass ended in 20 steps");
@@ -853,43 +823,278 @@ MACHA_TEST("rpc_cluster", test_repair_without_a_generation_tells_live_sets_apart
     CHECK(!pass_settles(another));
 }
 
-MACHA_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers) {
-    // Small-object pushes measure round trips and far-end writes, not
-    // bandwidth, so they must not drag the link estimate down.
-    std::optional<TestNode> slot;
-    auto& fixture = repair_fixture(slot, "repair-estimate-extents");
-    auto& node = fixture.start();
-    RepairPeer peer(fixture, node);
-    peer.put_delay = 50ms;
-
-    const auto small_bytes = pattern(16 * 1024, 71);
-    const auto small = object_id(small_bytes);
-    REQUIRE(node.local_store().put(small, small_bytes));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    const std::vector<ObjectId> small_live{small};
-    (void)store.repair_step(64ULL * 1024 * 1024, 16, small_live);
+// Small-object pushes measure round trips and far-end writes, not bandwidth,
+// so only a transfer of half an extent or more moves the link estimate.
+MACHA_FAST_TEST("rpc_cluster", test_repair_bandwidth_estimate_ignores_small_transfers) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    RepairPeer peer(bench);
+    const auto small = local_objects(bench, 1, 16 * 1024, 71);
+    auto store = bench.store();
+    (void)store->repair_step(64ULL * 1024 * 1024, 16, small);
     REQUIRE(peer.puts.load() == 1);
-    CHECK(store.estimated_network_bps() == 0.0);
+    CHECK(store->estimated_network_bps() == 0.0);
 
-    const auto large_bytes = pattern(node.config().extent_size / 2, 72);
-    const auto large = object_id(large_bytes);
-    REQUIRE(node.local_store().put(large, large_bytes));
-    DistributedStore extents(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    const std::vector<ObjectId> large_live{large};
-    (void)extents.repair_step(64ULL * 1024 * 1024, 16, large_live);
+    const auto large = local_objects(bench, 1, bench.config().extent_size / 2, 72);
+    auto extents = bench.store();
+    (void)extents->repair_step(64ULL * 1024 * 1024, 16, large);
     REQUIRE(peer.puts.load() == 2);
-    CHECK(extents.estimated_network_bps() > 0.0);
-
-    // This node's speculative bytes out carry both objects.
-    const auto totals = node.traffic_totals();
-    CHECK(totals.out_bytes[static_cast<size_t>(FrameType::speculative)] >=
-          small_bytes.size() + large_bytes.size());
+    CHECK(extents->estimated_network_bps() > 0.0);
 }
 
-MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_viewers) {
-    // A peer's viewers pace repair as local ones do: weighted turns, never a
-    // stop. With a peer reporting viewer traffic throughout, the missing copy
-    // still comes back and the pacer takes turns.
+// Pull decides "already held" by index lookup, never by reading the extent
+// (no DATA admission), and the progress shows in the diagnostics.
+MACHA_FAST_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_extent) {
+    StoreBench bench;
+    const auto live = local_objects(bench, 24, 64 * 1024, 200);
+    auto store = bench.store();
+    const auto before = bench.resources.data.stats().speculative_admissions;
+    size_t examined = 0;
+    for (int pass = 0; pass < 8 && examined < live.size(); ++pass)
+        examined += store->repair_step(8ULL * 1024 * 1024, 16, live).pull_examined;
+    CHECK(examined == live.size());
+    CHECK(bench.resources.data.stats().speculative_admissions == before);
+    CHECK(store->repair_diagnostics().pull_examined == examined);
+}
+
+// Repair yields between operations, never inside one: a pull whose turn ends
+// while the peer is answering still lands.
+MACHA_FAST_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_turn_ended) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    const auto bytes = pattern(512 * 1024, 77);
+    const auto id = object_id(bytes);
+    std::atomic_uint fetches{};
+    std::atomic_uint polls_in_flight{};
+    std::atomic_bool fetching{};
+    bench.node.add_peer(StoreBench::peer(), [&](MessageType type, const Bytes&, FrameType) {
+        if (type != MessageType::get_object)
+            return RpcMessage{MessageType::ok, {}};
+        ++fetches;
+        fetching = true;
+        // Holds the reply long enough for a poll of the yield predicate.
+        (void)wait_until([&] { return polls_in_flight.load() > 0; }, 100ms, 1ms);
+        fetching = false;
+        return object_reply(bytes);
+    });
+    auto store = bench.store();
+    REQUIRE(store->should_own(id));
+    const std::vector<ObjectId> live{id};
+    const auto result = store->repair_step(8ULL * 1024 * 1024, 8, live, [&] {
+        if (fetching.load())
+            ++polls_in_flight;
+        return fetches.load() > 0;
+    });
+    CHECK(fetches.load() == 1);
+    CHECK(result.bytes_transferred == bytes.size());
+    REQUIRE(bench.local.data().valid(id));
+    CHECK(*bench.local.data().get(id) == bytes);
+}
+
+// A peer that holds `bytes` and serves them.
+void add_serving_peer(StoreBench& bench, const Bytes& bytes) {
+    bench.node.add_peer(StoreBench::peer(), [bytes](MessageType type, const Bytes& request, FrameType) {
+        if (type == MessageType::get_object)
+            return object_reply(bytes);
+        if (type == MessageType::have_valid_objects)
+            return presence_reply(request, true);
+        return RpcMessage{MessageType::ok, {}};
+    });
+}
+
+// A corrupt local copy (it fails authentication) is never served: the read
+// comes from a peer and the fetched bytes replace it, as they do a copy that
+// is gone. Unread, scrub finds a corrupt copy and discards it, and repair
+// restores it.
+MACHA_FAST_TEST("rpc_cluster", test_store_heals_a_bad_local_copy_from_a_peer) {
+    StoreBench bench([](Config& c) {
+        c.replication = 2;
+        c.storage_packing = StoragePackingConfig{0, 0};
+    });
+    const auto bytes = pattern(256 * 1024, 7);
+    const auto id = object_id(bytes);
+    add_serving_peer(bench, bytes);
+    auto& data = bench.local.data();
+    const auto backend = bench.config().storage_backends.front().path;
+    REQUIRE(data.put(id, bytes));
+    auto store = bench.store();
+
+    corrupt_object(backend, id);
+    REQUIRE(!data.get(id).has_value());
+    const auto fetched = store->get(id);
+    REQUIRE(fetched.has_value());
+    CHECK(*fetched == bytes);
+    store->wait_local_copies_settled();
+    CHECK(data.get(id) == bytes);
+
+    REQUIRE(data.remove(id));
+    CHECK(store->get(id) == bytes);
+    store->wait_local_copies_settled();
+    CHECK(data.get(id) == bytes);
+
+    corrupt_object(backend, id);
+    store->scrub_once(128ULL * 1024 * 1024);
+    CHECK(!data.has(id));
+    const std::vector<ObjectId> live{id};
+    for (int step = 0; step < 4 && !data.has(id); ++step)
+        store->repair_once(128ULL * 1024 * 1024, live);
+    CHECK(data.get(id) == bytes);
+}
+
+// A persistent cache enabled at runtime keeps a playback fetch: the bytes land
+// in the cache rather than the DATA store, and answer a later read.
+MACHA_FAST_TEST("rpc_cluster", test_store_runtime_cache_keeps_a_playback_fetch) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    const auto bytes = pattern(256 * 1024, 11);
+    const auto id = object_id(bytes);
+    add_serving_peer(bench, bytes);
+    auto cached = bench.config();
+    cached.cache.path = bench.config().state_path.parent_path() / "cache";
+    cached.cache.max_blocks = 8;
+    bench.local.reconfigure(cached);
+    REQUIRE(bench.local.cache().enabled());
+
+    auto store = bench.store();
+    const auto fetched = store->get(id, 0, true);
+    REQUIRE(fetched == bytes);
+    store->wait_local_copies_settled();
+    CHECK(bench.local.cache().has(id));
+    CHECK(!bench.local.data().has(id));
+    const auto gets = bench.node.calls_of(MessageType::get_object);
+    CHECK(store->get(id, 0, true) == bytes);
+    CHECK(bench.node.calls_of(MessageType::get_object) == gets);
+}
+
+// The control store is not on the DATA device: finding a local control
+// object never waits for DATA credit. A namespace node put below its
+// metadata floor is transient cluster state, of the type callers retry on.
+MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_and_keep_the_floor) {
+    StoreBench bench([](Config& c) {
+        c.data_inflight_bytes = 2 * c.extent_size;
+        c.data_viewer_reserve_bytes = c.extent_size;
+        c.maintenance.background_concurrency = 1;
+    });
+    const auto extent = bench.config().extent_size;
+    const auto bytes = pattern(18 * 1024, 91);
+    const auto id = object_id(bytes);
+    REQUIRE(bench.local.control().put(id, bytes));
+    auto store = bench.store();
+    auto held = bench.resources.data.acquire(DataWorkContext(FrameType::loader, extent), extent);
+    REQUIRE(held.has_value());
+    auto found = std::async(std::launch::async, [&] { return store->ensure_control_local(id); });
+    const bool prompt = found.wait_for(2s) == std::future_status::ready;
+    held.reset(); // lets a regressed build finish rather than hang the suite
+    CHECK(prompt);
+    CHECK(found.get());
+
+    auto nodes = ControlNamespaceNodeStore::for_commit(bench.local.control(), *store, 2);
+    bool not_ready = false;
+    try {
+        (void)nodes.put(pattern(512, 17));
+    } catch (const MetadataNotReady&) {
+        not_ready = true;
+    }
+    CHECK(not_ready);
+    CHECK(nodes.written().empty());
+}
+
+// The startup gate fires on silence, never on slow progress: a reading that
+// moved restarts the no-progress window; a ceiling bounds the whole startup;
+// zero turns either off. Readings come at a quarter of a short window.
+MACHA_FAST_TEST("rpc_cluster", test_startup_gate_fires_on_silence_not_on_slow_progress) {
+    using Gate = StartupStallGate;
+    const auto t0 = Gate::Clock::time_point{} + 1h;
+    Gate gate(1200ms, 0ms, t0, 7);
+    uint64_t progress = 7;
+    for (auto at = 100ms; at <= 3000ms; at += 100ms)
+        CHECK(!gate.stalled(t0 + at, ++progress));
+    const auto silent_since = t0 + 3000ms;
+    CHECK(!gate.stalled(silent_since + 1199ms, progress));
+    CHECK(gate.stalled(silent_since + 1200ms, progress));
+    CHECK(gate.last_progress_at() == silent_since);
+    CHECK(gate.poll_interval() == 300ms);
+
+    Gate ceiling(0ms, 200ms, t0, 0);
+    CHECK(!ceiling.stalled(t0 + 199ms, 1));
+    CHECK(ceiling.stalled(t0 + 200ms, 2));
+    CHECK(ceiling.poll_interval() == 1000ms);
+
+    Gate neither(0ms, 0ms, t0, 0);
+    CHECK(!neither.stalled(t0 + 1000h, 0));
+    CHECK(Gate(120s, 0ms, t0, 0).poll_interval() == 1000ms);
+}
+
+// A metadata view holding one snapshot that counts every read that would go
+// to the replicas, and so could wait on a silent peer.
+struct SurveyCountingView final : MetadataView {
+    MetadataSnapshotView view;
+    std::atomic_uint surveys{};
+    std::optional<MetadataSnapshotView> current() const override { return view; }
+    MetadataSnapshotView converged() override {
+        ++surveys;
+        return view;
+    }
+    MetadataSnapshotView converged(const WorkContext&) override { return converged(); }
+    uint64_t current_generation() const noexcept override { return view.generation; }
+    uint64_t current_namespace_revision() const noexcept override { return 0; }
+    MetadataRecord record() override {
+        ++surveys;
+        return {};
+    }
+    std::optional<MetadataSnapshotView> release_head() const override { return view; }
+    MetadataClusterStatus status() const noexcept override { return {}; }
+    MetadataRecord mutate(const std::function<void(MetadataSnapshot&)>&, size_t) override {
+        throw std::runtime_error("read-only view");
+    }
+    MetadataRecord mutate_delta(const std::function<void(MetadataSnapshot&, MetadataDelta&)>&,
+                                size_t, std::optional<MetadataMutationIdentity>) override {
+        throw std::runtime_error("read-only view");
+    }
+    bool resolve_conflict(const std::string&, std::string_view) override { return false; }
+    uint64_t conflicts_superseded() const noexcept override { return 0; }
+    uint64_t conflicts_resolved() const noexcept override { return 0; }
+    MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
+    Page<std::pair<std::string, FsEntry>, std::string>
+    entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {
+        return namespace_entries(*v.snapshot, nullptr, std::move(from), budget);
+    }
+};
+
+// The torrent listing (GET /api/v1/torrents/jobs and one job) is served from
+// the snapshot this node holds and never reads through the replicas, so a
+// silent peer cannot hold an HTTP read (law 1).
+MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_never_a_survey) {
+    TestNode fixture("torrent-listing");
+    fixture.start();
+    CatalogueHintQueue hints(fixture.config().state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.staging_path = fixture.path() / "staging";
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    SubsystemRegistry registry;
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+
+    SurveyCountingView metadata;
+    auto snapshot = std::make_shared<MetadataSnapshot>();
+    TorrentRequest listed;
+    listed.id = std::string(32, 'a');
+    listed.info_hash = std::string(40, '3');
+    snapshot->torrent_requests[listed.id] = listed;
+    metadata.view.generation = 7;
+    metadata.view.snapshot = snapshot;
+    TorrentCoordinator coordinator(fixture.node(), metadata, registry, cluster_jobs,
+                                   fixture.config().state_path);
+
+    const auto requests = coordinator.requests();
+    REQUIRE(requests.size() == 1);
+    CHECK(requests.front().id == listed.id);
+    CHECK(coordinator.request(listed.id).has_value());
+    CHECK(!coordinator.request("does-not-exist").has_value());
+    CHECK(metadata.surveys.load() == 0);
+}
+
+// Maintenance paces repair by weight against busier classes and never stops
+// it: with a peer reporting viewer traffic throughout, and then with this
+// node's loader never going quiet, each missing copy still comes back. Under
+// the viewers the pacer is seen turning passes away between repair's turns.
+MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_stay_busy) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -903,6 +1108,7 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_v
         config->maintenance.interval = 50ms;
         config->maintenance.foreground_quiet = 500ms;
         config->maintenance.no_progress_backoff = 500ms;
+        config->maintenance.busy_bandwidth_fraction = 0.0;
     }
 
     Service s1(c1, keys);
@@ -916,133 +1122,69 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_a_peer_serves_v
     REQUIRE(s1.node().wait_local_state_ready(std::chrono::seconds{10}));
     REQUIRE(s2.node().wait_local_state_ready(std::chrono::seconds{10}));
 
+    // An object s1 holds and s2 is claimed for; s2 is told storage changed.
+    const auto lose_a_copy = [&](uint8_t salt) {
+        const auto bytes = pattern(96 * 1024 + 31, salt);
+        const auto id = object_id(bytes);
+        REQUIRE(s1.local_state().data().put(id, bytes));
+        const RetentionDot claim{s1.node().node_id(), 0xfeed00u + salt};
+        s1.local_state().retention().retain(RetentionClass::data, id, claim);
+        s2.local_state().retention().retain(RetentionClass::data, id, claim);
+        REQUIRE(!s2.local_state().data().valid(id));
+        s2.resources().events.notify(NodeEvent::storage);
+        return std::pair{id, bytes};
+    };
+
     // Another node, as s2's telemetry sees it, playing throughout.
-    std::atomic_bool watching{true};
-    std::thread viewer([&] {
-        const auto peer = random_node_id();
-        const auto boot = random_node_id();
-        for (uint64_t sequence = 1; watching.load(); ++sequence) {
-            NodeTelemetry telemetry;
-            telemetry.node_id = peer;
-            telemetry.boot_id = boot;
-            telemetry.sequence = sequence;
-            telemetry.observed_unix_ms = unix_ms();
-            telemetry.host = "127.0.0.9";
-            telemetry.port = 9;
-            telemetry.traffic = {TrafficClass{static_cast<uint8_t>(FrameType::foreground), 0, 0,
-                                              1'300'000, 0}};
-            s2.node().telemetry().observe(telemetry, true);
-            std::this_thread::sleep_for(50ms);
+    {
+        std::atomic_bool watching{true};
+        std::thread viewer([&] {
+            const auto peer = random_node_id();
+            const auto boot = random_node_id();
+            for (uint64_t sequence = 1; watching.load(); ++sequence) {
+                NodeTelemetry telemetry;
+                telemetry.node_id = peer;
+                telemetry.boot_id = boot;
+                telemetry.sequence = sequence;
+                telemetry.observed_unix_ms = unix_ms();
+                telemetry.host = "127.0.0.9";
+                telemetry.port = 9;
+                telemetry.traffic = {TrafficClass{static_cast<uint8_t>(FrameType::foreground), 0,
+                                                  0, 1'300'000, 0}};
+                s2.node().telemetry().observe(telemetry, true);
+                std::this_thread::sleep_for(50ms);
+            }
+        });
+        REQUIRE(wait_until([&] { return s2.node().peer_viewers_active(3000ms); }));
+        const auto share_before = s2.repair_diagnostics().gate_share;
+        const auto [id, bytes] = lose_a_copy(1);
+        const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
+        const auto share_after = s2.repair_diagnostics().gate_share;
+        watching = false;
+        viewer.join();
+        REQUIRE(restored);
+        CHECK(*s2.local_state().data().get(id) == bytes);
+        CHECK(share_after > share_before);
+    }
+
+    // This node's loader, active throughout.
+    std::atomic_bool loading{true};
+    std::thread loader([&] {
+        while (loading.load()) {
+            s2.resources().activity.note(FrameType::loader, 64 * 1024);
+            std::this_thread::sleep_for(5ms);
         }
     });
-    REQUIRE(wait_until([&] { return s2.node().peer_viewers_active(3000ms); }));
-
-    const auto bytes = pattern(96 * 1024 + 31);
-    const auto id = object_id(bytes);
-    REQUIRE(s1.local_state().data().put(id, bytes));
-    const RetentionDot claim{s1.node().node_id(), 0xfeed};
-    s1.local_state().retention().retain(RetentionClass::data, id, claim);
-    s2.local_state().retention().retain(RetentionClass::data, id, claim);
-    REQUIRE(!s2.local_state().data().valid(id));
-    const auto share_before = s2.repair_diagnostics().gate_share;
-    s2.resources().events.notify(NodeEvent::storage);
-
+    REQUIRE(wait_until([&] {
+        return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
+    }, 5s));
+    const auto [id, bytes] = lose_a_copy(2);
     const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
-    const auto share_after = s2.repair_diagnostics().gate_share;
-    watching = false;
-    viewer.join();
+    CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    loading = false;
+    loader.join();
     REQUIRE(restored);
     CHECK(*s2.local_state().data().get(id) == bytes);
-    // Paced: the weighted share turned passes away between repair's turns.
-    CHECK(share_after > share_before);
-}
-
-MACHA_TEST("rpc_cluster", test_repair_decides_already_held_without_reading_the_extent) {
-    // Repair checks presence by index lookup, never by reading the extent;
-    // corruption belongs to scrub and the read path.
-    TestNode fixture("repair-presence-by-index", ConfigProfile::functional);
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& node = fixture.start();
-
-    std::vector<ObjectId> live;
-    for (int i = 0; i < 24; ++i) {
-        const auto bytes = pattern(64 * 1024, 200 + i);
-        const auto id = object_id(bytes);
-        REQUIRE(node.local_store().put(id, bytes));
-        live.push_back(id);
-    }
-    std::sort(live.begin(), live.end());
-
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    const auto before = node.resources.data.stats().speculative_admissions;
-    size_t examined = 0;
-    for (int pass = 0; pass < 8 && examined < live.size(); ++pass) {
-        const auto result = store.repair_step(8ULL * 1024 * 1024, 16, live);
-        examined += result.pull_examined;
-    }
-    CHECK(examined >= live.size());
-    CHECK(node.resources.data.stats().speculative_admissions == before);
-    // The progress shows in the diagnostics.
-    CHECK(store.repair_diagnostics().pull_examined == examined);
-}
-
-MACHA_TEST("rpc_cluster", test_repair_keeps_a_pull_that_was_in_flight_when_its_turn_ended) {
-    // Repair yields between operations, never inside one: the turn ends the
-    // moment the peer receives the request, and the extent still lands.
-    TestNode fixture("repair-in-flight-pull", ConfigProfile::functional);
-    auto& config = fixture.config();
-    config.replication = 2;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    config.heartbeat = 30s;
-    auto& node = fixture.start();
-
-    const auto bytes = pattern(512 * 1024, 77);
-    const auto id = object_id(bytes);
-    const auto port = free_port();
-    NodeInfo peer;
-    peer.id = random_node_id();
-    peer.host = "127.0.0.1";
-    peer.port = port;
-    peer.failure_domain = "remote";
-    peer.capacity = 1024ULL * 1024 * 1024;
-    peer.seen_unix_ms = unix_ms();
-
-    std::atomic_uint fetches{};
-    RpcServer server(
-        "127.0.0.1", port, fixture.keys(), peer,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::get_object) {
-                ++fetches;
-                // Long enough for a poll of the yield predicate to see it.
-                std::this_thread::sleep_for(150ms);
-                Writer writer;
-                writer.fixed(id.bytes);
-                writer.bytes(bytes);
-                return RpcMessage{MessageType::object_reply, writer.take()};
-            }
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {}, 4ULL * 1024 * 1024, {}, &node.resources.memory);
-    server.start();
-    node.membership().observe(peer, true);
-
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    REQUIRE(store.should_own(id));
-    REQUIRE(!node.local_store().has(id));
-    const std::vector<ObjectId> live{id};
-
-    auto result = store.repair_step(8ULL * 1024 * 1024, 8, live,
-                                    [&] { return fetches.load() > 0; });
-    CHECK(fetches.load() == 1);
-    CHECK(result.bytes_transferred == bytes.size());
-    REQUIRE(node.local_store().valid(id));
-    CHECK(*node.local_store().get(id) == bytes);
-
-    server.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
@@ -1554,21 +1696,36 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     server_info.port = port;
     server_info.failure_domain = "server-site";
 
-    RpcServer server(
+    // Liveness probes every heartbeat; a probe round that cannot complete
+    // within dead_after ends the route.
+    constexpr auto heartbeat = 20ms;
+    constexpr auto dead_after = 300ms;
+    std::unique_ptr<RpcServer> server;
+    const auto pings = [&] {
+        const auto stats = server->work_stats();
+        const auto found = stats.message_timings.find(MessageType::ping);
+        return found == stats.message_timings.end() ? uint64_t{} : found->second.requests;
+    };
+    // Each slow handler answers only once the client has run more probe
+    // rounds than fit in dead_after (rounds are at least a heartbeat apart,
+    // up to two pings a round), so both calls outlive the window by
+    // construction, however slowly the host runs.
+    const auto outlive_the_window = [&] {
+        const auto rounds = static_cast<uint64_t>(dead_after / heartbeat) + 2;
+        const auto from = pings();
+        const auto until = Clock::now() + dead_after + heartbeat;
+        (void)wait_until(
+            [&] { return pings() >= from + 2 * rounds && Clock::now() >= until; }, 30s, 1ms);
+    };
+    server = std::make_unique<RpcServer>(
         "127.0.0.1", port, keys, server_info,
-        [](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::put_object) {
-                std::this_thread::sleep_for(120ms);
-                return RpcMessage{MessageType::ok, {}};
-            }
-            if (request.type == MessageType::members) {
-                std::this_thread::sleep_for(120ms);
-                return RpcMessage{MessageType::ok, request.payload};
-            }
-            return RpcMessage{MessageType::ok, {}};
+        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
+            if (request.type == MessageType::put_object || request.type == MessageType::members)
+                outlive_the_window();
+            return RpcMessage{MessageType::ok, request.payload};
         },
         [](const NodeInfo&) {});
-    server.start();
+    server->start();
 
     NodeInfo client_info;
     client_info.id = random_node_id();
@@ -1579,26 +1736,26 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     NetworkLinks links;
     RpcClient client(
         links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 20ms, 80ms);
+        500ms, heartbeat, dead_after);
     Endpoint endpoint{"127.0.0.1", port};
 
-    // 20 ms is not a deadline: both 120 ms RPCs complete, outliving the 80 ms
-    // peer-death window while control pings prove the peer alive.
+    // The 20 ms interval of call() is a stall notice, not a deadline: a slow
+    // control call and a slow DATA call on the other lane both complete, and
+    // neither ends the other's route.
     Bytes object_payload(256 * 1024, 0x5a);
     auto data = client.call_async(endpoint, MessageType::put_object, object_payload);
-    std::this_thread::sleep_for(5ms);
-
-    auto started = Clock::now();
+    const auto started = Clock::now();
     auto control = client.call(endpoint, MessageType::members, Bytes{1}, 20ms);
+    CHECK(Clock::now() - started > dead_after);
     CHECK(control.message.type == MessageType::ok);
-    CHECK(Clock::now() - started >= 100ms);
+    CHECK(control.message.payload == Bytes{1});
 
-    REQUIRE(data.wait_for(2s) == std::future_status::ready);
+    REQUIRE(data.wait_for(30s) == std::future_status::ready);
     CHECK(data.get().message.type == MessageType::ok);
     CHECK(client.stats().connections_created == 2);
 
     client.stop();
-    server.stop();
+    server->stop();
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_completion) {
@@ -1650,212 +1807,91 @@ MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_comp
     server.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_rpc_health_and_control_not_starved_by_data) {
+// The server runs each class of work on its own executor: with every worker
+// of one class held, health and membership (fast control) and a playback read
+// still answer at once. Each case holds `count` calls of `held` on `frame`
+// until `entries` handlers are in, then times the calls that must not wait.
+MACHA_TEST("rpc_cluster", test_rpc_held_executors_do_not_delay_other_classes) {
+    struct Case {
+        const char* name;
+        MessageType held;
+        FrameType frame;
+        size_t count;
+        size_t entries;
+        RpcMessage held_reply;
+        // Calls that must answer promptly: type, frame, expected reply type.
+        std::vector<std::tuple<MessageType, FrameType, MessageType>> prompt;
+    };
+    const std::vector<Case> cases{
+        {"every DATA worker on speculative puts", MessageType::put_object, FrameType::speculative,
+         8, 6, {MessageType::ok, {}},
+         {{MessageType::ping, FrameType::control, MessageType::ok},
+          {MessageType::members, FrameType::control, MessageType::members_reply}}},
+        {"every DATA worker on retention checks", MessageType::have_objects, FrameType::loader, 8,
+         6, {MessageType::have_objects_reply, Bytes{0, 0, 0, 0}},
+         {{MessageType::ping, FrameType::control, MessageType::ok},
+          {MessageType::members, FrameType::control, MessageType::members_reply}}},
+        {"both CONTROL workers on slow handlers", MessageType::have_object, FrameType::control, 2,
+         2, {MessageType::bool_reply, Bytes{1}},
+         {{MessageType::ping, FrameType::control, MessageType::ok},
+          {MessageType::members, FrameType::control, MessageType::members_reply}}},
+        {"loader puts on the DATA workers", MessageType::put_object, FrameType::loader, 8, 6,
+         {MessageType::ok, {}},
+         {{MessageType::get_object, FrameType::foreground, MessageType::ok}}},
+    };
     TestCluster cluster;
     const auto& keys = cluster.keys();
-    auto port = free_port();
-
-    NodeInfo server_info;
-    server_info.id = random_node_id();
-    server_info.host = "127.0.0.1";
-    server_info.port = port;
-    server_info.failure_domain = "server-site";
-
-    TestGate data_workers_gate;
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::put_object) {
-                data_workers_gate.enter_and_wait();
+    for (const auto& c : cases) {
+        const auto port = free_port();
+        NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
+        TestGate gate;
+        RpcServer server(
+            "127.0.0.1", port, keys, server_info,
+            [&](const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
+                if (request.type == c.held && frame_type == c.frame) {
+                    gate.enter_and_wait();
+                    return c.held_reply;
+                }
+                if (request.type == MessageType::members)
+                    return RpcMessage{MessageType::members_reply, {}};
                 return RpcMessage{MessageType::ok, {}};
-            }
-            if (request.type == MessageType::members)
-                return RpcMessage{MessageType::ok, {}};
-            if (request.type == MessageType::ping)
-                return RpcMessage{MessageType::ok, {}};
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {});
-    server.start();
+            },
+            [](const NodeInfo&) {});
+        server.start();
+        NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
+        NetworkLinks links;
+        RpcClient client(
+            links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {},
+            [](uint64_t) {}, 500ms, 100ms, 2s);
+        const Endpoint endpoint{"127.0.0.1", port};
 
-    NodeInfo client_info;
-    client_info.id = random_node_id();
-    client_info.host = "127.0.0.1";
-    client_info.port = free_port();
-    client_info.failure_domain = "client-site";
-
-    NetworkLinks links;
-    RpcClient client(
-        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
-    Endpoint endpoint{"127.0.0.1", port};
-
-    // With every data worker busy, health and membership stay prompt on the control stream.
-    std::vector<AsyncRpc> bulk;
-    for (int i = 0; i < 8; ++i)
-        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x5a},
-                                         FrameType::speculative));
-    REQUIRE(data_workers_gate.wait_for_entries(6));
-
-    auto started = Clock::now();
-    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
-    CHECK(health.message.type == MessageType::ok);
-    CHECK(Clock::now() - started < 150ms);
-
-    started = Clock::now();
-    auto control = client.call(endpoint, MessageType::members, {}, 20ms);
-    CHECK(control.message.type == MessageType::ok);
-    CHECK(Clock::now() - started < 150ms);
-
-    CHECK(client.stats().canonical_connections == 2);
-
-    data_workers_gate.open();
-    for (auto& rpc : bulk) {
-        REQUIRE(rpc.wait_for(1s) == std::future_status::ready);
-        CHECK(rpc.get().message.type == MessageType::ok);
+        std::vector<AsyncRpc> held;
+        for (size_t i = 0; i < c.count; ++i)
+            held.push_back(client.call_async(endpoint, c.held, Bytes{static_cast<uint8_t>(i)},
+                                             c.frame));
+        const auto fail = [&](const char* what) {
+            std::cerr << c.name << ": " << what << '\n';
+            CHECK(false);
+        };
+        if (!gate.wait_for_entries(c.entries)) {
+            fail("the held calls never all reached the handler");
+            gate.open();
+            continue;
+        }
+        for (const auto& [type, frame, reply] : c.prompt) {
+            const auto started = Clock::now();
+            const auto answer = client.call(endpoint, type, {}, frame, 20ms);
+            if (answer.message.type != reply || Clock::now() - started >= 150ms)
+                fail(message_type_name(type));
+        }
+        gate.open();
+        for (auto& rpc : held) {
+            REQUIRE(rpc.wait_for(2s) == std::future_status::ready);
+            CHECK(rpc.get().message.type == c.held_reply.type);
+        }
+        client.stop();
+        server.stop();
     }
-
-    client.stop();
-    server.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_have_objects_flood_does_not_delay_unrelated_control_rpc) {
-    // Retention checks (have_objects) use a data-lane FrameType and so run on
-    // data_workers_; with every data worker blocked on them, control messages
-    // on the control pools are not delayed.
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto port = free_port();
-
-    NodeInfo server_info;
-    server_info.id = random_node_id();
-    server_info.host = "127.0.0.1";
-    server_info.port = port;
-    server_info.failure_domain = "server-site";
-
-    TestGate data_workers_gate;
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::have_objects) {
-                data_workers_gate.enter_and_wait();
-                Writer writer;
-                writer.u32(0);
-                return RpcMessage{MessageType::have_objects_reply, writer.take()};
-            }
-            if (request.type == MessageType::members)
-                return RpcMessage{MessageType::members_reply, {}};
-            if (request.type == MessageType::ping)
-                return RpcMessage{MessageType::ok, {}};
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {});
-    server.start();
-
-    NodeInfo client_info;
-    client_info.id = random_node_id();
-    client_info.host = "127.0.0.1";
-    client_info.port = free_port();
-    client_info.failure_domain = "client-site";
-
-    NetworkLinks links;
-    RpcClient client(
-        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
-    Endpoint endpoint{"127.0.0.1", port};
-
-    // Every data worker busy with have_objects, as a large retain_data() batch makes it.
-    std::vector<AsyncRpc> bulk;
-    for (int i = 0; i < 8; ++i)
-        bulk.push_back(
-            client.call_async(endpoint, MessageType::have_objects, Bytes{}, FrameType::loader));
-    REQUIRE(data_workers_gate.wait_for_entries(6));
-
-    auto started = Clock::now();
-    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
-    CHECK(health.message.type == MessageType::ok);
-    CHECK(Clock::now() - started < 150ms);
-
-    started = Clock::now();
-    auto control = client.call(endpoint, MessageType::members, {}, 20ms);
-    CHECK(control.message.type == MessageType::members_reply);
-    CHECK(Clock::now() - started < 150ms);
-
-    data_workers_gate.open();
-    for (auto& rpc : bulk) {
-        REQUIRE(rpc.wait_for(1s) == std::future_status::ready);
-        CHECK(rpc.get().message.type == MessageType::have_objects_reply);
-    }
-
-    client.stop();
-    server.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_rpc_health_not_starved_by_slow_control_handlers) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto port = free_port();
-
-    NodeInfo server_info;
-    server_info.id = random_node_id();
-    server_info.host = "127.0.0.1";
-    server_info.port = port;
-    server_info.failure_domain = "server-site";
-
-    TestGate slow_control_gate;
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::have_object) {
-                slow_control_gate.enter_and_wait();
-                return RpcMessage{MessageType::bool_reply, Bytes{1}};
-            }
-            if (request.type == MessageType::members)
-                return RpcMessage{MessageType::members_reply, {}};
-            if (request.type == MessageType::ping)
-                return RpcMessage{MessageType::ok, {}};
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {});
-    server.start();
-
-    NodeInfo client_info;
-    client_info.id = random_node_id();
-    client_info.host = "127.0.0.1";
-    client_info.port = free_port();
-    client_info.failure_domain = "client-site";
-
-    NetworkLinks links;
-    RpcClient client(
-        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
-    Endpoint endpoint{"127.0.0.1", port};
-
-    // With both control handlers busy, health and membership use the fast-control executor.
-    auto slow1 =
-        client.call_async(endpoint, MessageType::have_object, Bytes{1}, FrameType::control);
-    auto slow2 =
-        client.call_async(endpoint, MessageType::have_object, Bytes{2}, FrameType::control);
-    REQUIRE(slow_control_gate.wait_for_entries(2));
-
-    auto started = Clock::now();
-    auto health = client.call(endpoint, MessageType::ping, {}, 20ms);
-    CHECK(health.message.type == MessageType::ok);
-    CHECK(Clock::now() - started < 150ms);
-
-    started = Clock::now();
-    auto members = client.call(endpoint, MessageType::members, {}, 20ms);
-    CHECK(members.message.type == MessageType::members_reply);
-    CHECK(Clock::now() - started < 150ms);
-
-    slow_control_gate.open();
-    REQUIRE(slow1.wait_for(1s) == std::future_status::ready);
-    REQUIRE(slow2.wait_for(1s) == std::future_status::ready);
-    CHECK(slow1.get().message.type == MessageType::bool_reply);
-    CHECK(slow2.get().message.type == MessageType::bool_reply);
-
-    client.stop();
-    server.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_call_fails_after_no_progress_deadline) {
@@ -2164,7 +2200,11 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
     server.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect_boundaries) {
+// The metadata executor's boundaries: a queued job is removed by cancellation
+// without entering the handler; a running job is not cancelled by losing its
+// reply route, it finishes and the reply is discarded. A server stopping
+// detaches every reply, finishes the job it owns and drops its queue.
+MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_disconnect_and_shutdown) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto port = free_port();
@@ -2172,22 +2212,35 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect
     NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
     TestGate before_durability;
     TestGate after_durability;
+    TestGate last_job;
     std::atomic_uint32_t handler_calls{};
     std::atomic_uint32_t durable_jobs{};
     RpcServer server(
         "127.0.0.1", port, keys, server_info,
         [&](const NodeInfo&, FrameType, const RpcMessage& request) {
             REQUIRE(request.type == MessageType::put_metadata_commit);
-            ++handler_calls;
-            before_durability.enter_and_wait();
-            ++durable_jobs;
-            after_durability.enter_and_wait();
+            const auto call = ++handler_calls;
+            if (call == 1) {
+                before_durability.enter_and_wait();
+                ++durable_jobs;
+                after_durability.enter_and_wait();
+            } else {
+                last_job.enter_and_wait();
+                ++durable_jobs;
+            }
             return RpcMessage{MessageType::bool_reply, Bytes{1}};
         },
         [](const NodeInfo&) {}, 256 * 1024,
         RpcServerExecutionLimits{
             .metadata_workers = 1, .metadata_pending_jobs = 4, .metadata_pending_bytes = 64});
     server.start();
+    struct GateOpener {
+        std::array<TestGate*, 3> gates;
+        ~GateOpener() {
+            for (auto* gate : gates)
+                gate->open();
+        }
+    } open_on_exit{{&before_durability, &after_durability, &last_job}};
 
     NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
     NetworkLinks links;
@@ -2195,19 +2248,18 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect
         links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
         500ms, 100ms, 2s);
     Endpoint endpoint{"127.0.0.1", port};
+    const auto pending_jobs = [&](size_t jobs) {
+        return wait_until([&] { return server.work_stats().metadata_pending_jobs == jobs; }, 2s);
+    };
 
     auto running = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
     REQUIRE(before_durability.wait_for_entries(1));
     auto queued = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
-    REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 1; }, 2s));
-
-    // A queued job is removed by cancellation without entering the handler.
+    REQUIRE(pending_jobs(1));
     queued.cancel();
-    REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 0; }, 2s));
+    REQUIRE(pending_jobs(0));
     CHECK(handler_calls.load() == 1);
 
-    // A running job is not cancelled by losing its reply route; it finishes
-    // and the reply is discarded.
     before_durability.open();
     REQUIRE(after_durability.wait_for_entries(1));
     CHECK(durable_jobs.load() == 1);
@@ -2217,60 +2269,22 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_and_disconnect
     CHECK(handler_calls.load() == 1);
     CHECK(durable_jobs.load() == 1);
 
-    client.stop();
-    server.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_shutdown_finishes_owner_and_drops_queue) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto port = free_port();
-
-    NodeInfo server_info{random_node_id(), "127.0.0.1", "server-site", port};
-    TestGate running_gate;
-    std::atomic_uint32_t handler_calls{};
-    std::atomic_uint32_t durable_jobs{};
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-            REQUIRE(request.type == MessageType::put_metadata_commit);
-            ++handler_calls;
-            running_gate.enter_and_wait();
-            ++durable_jobs;
-            return RpcMessage{MessageType::bool_reply, Bytes{1}};
-        },
-        [](const NodeInfo&) {}, 256 * 1024,
-        RpcServerExecutionLimits{
-            .metadata_workers = 1, .metadata_pending_jobs = 4, .metadata_pending_bytes = 64});
-    server.start();
-
-    NodeInfo client_info{random_node_id(), "127.0.0.1", "client-site", free_port()};
-    NetworkLinks links;
-    RpcClient client(
-        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
-    Endpoint endpoint{"127.0.0.1", port};
-
-    auto running = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{1});
-    REQUIRE(running_gate.wait_for_entries(1));
-    auto queued = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{2});
-    REQUIRE(wait_until([&] { return server.work_stats().metadata_pending_jobs == 1; }, 2s));
-
+    auto owned = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{3});
+    REQUIRE(last_job.wait_for_entries(1));
+    auto dropped = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{4});
+    REQUIRE(pending_jobs(1));
     auto stopping = std::async(std::launch::async, [&] { server.stop(); });
-    // Closing the session detaches both replies; the queued request never executes.
-    REQUIRE(running.wait_for(2s) == std::future_status::ready);
-    REQUIRE(queued.wait_for(2s) == std::future_status::ready);
-    running_gate.open();
+    REQUIRE(owned.wait_for(2s) == std::future_status::ready);
+    REQUIRE(dropped.wait_for(2s) == std::future_status::ready);
+    last_job.open();
     REQUIRE(stopping.wait_for(2s) == std::future_status::ready);
     stopping.get();
-
-    CHECK(handler_calls.load() == 1);
-    CHECK(durable_jobs.load() == 1);
+    CHECK(handler_calls.load() == 2);
+    CHECK(durable_jobs.load() == 2);
     const auto stats = server.work_stats();
     CHECK(stats.metadata_active_jobs == 0);
     CHECK(stats.metadata_pending_jobs == 0);
     CHECK(stats.metadata_pending_bytes == 0);
-
     client.stop();
 }
 
@@ -2347,62 +2361,6 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     server.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_rpc_foreground_not_starved_by_busy_data_workers) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto port = free_port();
-
-    NodeInfo server_info;
-    server_info.id = random_node_id();
-    server_info.host = "127.0.0.1";
-    server_info.port = port;
-    server_info.failure_domain = "server-site";
-
-    TestGate lower_priority_gate;
-    RpcServer server(
-        "127.0.0.1", port, keys, server_info,
-        [&](const NodeInfo&, FrameType frame_type, const RpcMessage& request) {
-            if (request.type == MessageType::put_object && frame_type != FrameType::foreground)
-                lower_priority_gate.enter_and_wait();
-            return RpcMessage{MessageType::ok, {}};
-        },
-        [](const NodeInfo&) {});
-    server.start();
-
-    NodeInfo client_info;
-    client_info.id = random_node_id();
-    client_info.host = "127.0.0.1";
-    client_info.port = free_port();
-    client_info.failure_domain = "client-site";
-    NetworkLinks links;
-    RpcClient client(
-        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
-        500ms, 100ms, 2s);
-    Endpoint endpoint{"127.0.0.1", port};
-
-    // Loader work leaves DATA execution capacity for a later playback read.
-    std::vector<AsyncRpc> bulk;
-    for (int i = 0; i < 8; ++i)
-        bulk.push_back(client.call_async(endpoint, MessageType::put_object, Bytes{0x42},
-                                         FrameType::loader));
-    REQUIRE(lower_priority_gate.wait_for_entries(6));
-
-    auto started = Clock::now();
-    auto foreground =
-        client.call(endpoint, MessageType::get_object, Bytes{0x46}, FrameType::foreground, 100ms);
-    CHECK(foreground.message.type == MessageType::ok);
-    CHECK(Clock::now() - started < 200ms);
-
-    lower_priority_gate.open();
-    for (auto& rpc : bulk) {
-        REQUIRE(rpc.wait_for(2s) == std::future_status::ready);
-        CHECK(rpc.get().message.type == MessageType::ok);
-    }
-
-    client.stop();
-    server.stop();
-}
-
 MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_gives_up_when_nothing_is_moving) {
     // A DATA credit wait with no deadline gives up only when the arbiter is
     // wholly stalled; any release resets the window, so contention still waits.
@@ -2455,53 +2413,6 @@ MACHA_FAST_TEST("rpc_cluster", test_data_credit_wait_survives_genuine_contention
 
     auto third = arbiter.acquire(context, chunk);
     CHECK(third.has_value());
-}
-
-MACHA_TEST("rpc_cluster", test_a_namespace_node_below_the_floor_is_metadata_not_ready) {
-    // Missing the metadata durability floor is transient cluster state and
-    // must carry the type callers retry on.
-    TestService fixture("namespace-node-below-floor", ConfigProfile::isolated);
-    fixture.config().replication = 1;
-    fixture.config().metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-    auto nodes = ControlNamespaceNodeStore::for_commit(service.local_state().control(), service.filesystem().store(), 2);
-    const auto bytes = pattern(512, 17);
-    bool not_ready = false;
-    try {
-        (void)nodes.put(bytes);
-    } catch (const MetadataNotReady&) {
-        not_ready = true;
-    }
-    CHECK(not_ready);
-    CHECK(nodes.written().empty());
-}
-
-MACHA_TEST("rpc_cluster", test_a_local_control_object_is_found_while_data_credit_is_exhausted) {
-    // The control store is not on the DATA device: validating a local control
-    // object never waits for DATA credit.
-    TestService fixture("control-local-without-data-credit", ConfigProfile::isolated);
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    const auto extent = config.extent_size;
-    // One extent of non-viewer credit in all, held below by a loader.
-    config.data_inflight_bytes = 2 * extent;
-    config.data_viewer_reserve_bytes = extent;
-    config.maintenance.background_concurrency = 1;
-    auto& service = fixture.start();
-
-    const auto bytes = pattern(18 * 1024, 91);
-    const auto id = object_id(bytes);
-    REQUIRE(service.local_state().control().put(id, bytes));
-
-    auto held = service.resources().data.acquire(DataWorkContext(FrameType::loader, extent), extent);
-    REQUIRE(held.has_value());
-    auto found = std::async(std::launch::async,
-                            [&] { return service.filesystem().store().ensure_control_local(id); });
-    const bool prompt = found.wait_for(2s) == std::future_status::ready;
-    held.reset(); // lets a regressed build finish rather than hang the suite
-    CHECK(prompt);
-    CHECK(found.get());
 }
 
 MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_control) {
@@ -2588,256 +2499,6 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     CHECK(stats.peak_used_bytes == config.data_inflight_bytes);
 
     client.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_early_replication_quorum) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto p1 = free_port();
-    auto pf = free_port();
-    auto ps = free_port();
-
-    // Object PUT quorum latency only: metadata consensus is kept out, and the
-    // two peers are injected rather than discovered.
-    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
-    c1.dead_after = 3s;
-    c1.metadata_min_write_replicas = 1;
-    // Keep background membership exchange out of the measurement.
-    c1.heartbeat = 10s;
-    Service s1(c1, keys);
-    s1.start();
-    // start() returns while local storage is still recovering, and put()
-    // refuses until it has.
-    REQUIRE(s1.node().wait_local_state_ready(10s));
-
-    NodeInfo fast_info;
-    fast_info.id = random_node_id();
-    fast_info.host = "127.0.0.1";
-    fast_info.port = pf;
-    fast_info.failure_domain = "fast-site";
-    fast_info.capacity = 1024ULL * 1024 * 1024;
-    fast_info.seen_unix_ms = unix_ms();
-
-    NodeInfo slow_info;
-    slow_info.id = random_node_id();
-    slow_info.host = "127.0.0.1";
-    slow_info.port = ps;
-    slow_info.failure_domain = "slow-site";
-    slow_info.capacity = 1024ULL * 1024 * 1024;
-    slow_info.seen_unix_ms = unix_ms();
-
-    TestGate slow_replica_gate;
-    auto peer_handler = [&](const NodeInfo& self, bool slow) {
-        return [&, self, slow](const NodeInfo&, FrameType, const RpcMessage& request) {
-            if (request.type == MessageType::put_object) {
-                if (slow)
-                    slow_replica_gate.enter_and_wait();
-                return RpcMessage{MessageType::ok, {}};
-            }
-            if (request.type == MessageType::members) {
-                Writer writer;
-                writer.u32(1);
-                encode_node_info(writer, self);
-                return RpcMessage{MessageType::members_reply, writer.take()};
-            }
-            return RpcMessage{MessageType::ok, {}};
-        };
-    };
-
-    RpcServer fast_server("127.0.0.1", pf, keys, fast_info, peer_handler(fast_info, false),
-                          [](const NodeInfo&) {});
-    RpcServer slow_server("127.0.0.1", ps, keys, slow_info, peer_handler(slow_info, true),
-                          [](const NodeInfo&) {});
-    fast_server.start();
-    slow_server.start();
-
-    s1.node().membership().observe(fast_info, true);
-    s1.node().membership().observe(slow_info, true);
-    REQUIRE(s1.node().membership().active().size() == 3);
-
-    DistributedStore store(s1.node(), s1.local_state(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
-    auto data = pattern(256 * 1024);
-    auto started = Clock::now();
-    REQUIRE(store.put(data) == object_id(data));
-    auto elapsed = Clock::now() - started;
-    CHECK(elapsed < 500ms);
-
-    slow_replica_gate.open();
-    slow_server.stop();
-    fast_server.stop();
-    s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_put_commits_at_floor_without_waiting_for_desired_replicas) {
-    TestNode fixture("local-degraded", ConfigProfile::functional);
-    auto& config = fixture.config();
-    const auto& keys = fixture.keys();
-    auto slow1_port = free_port();
-    auto slow2_port = free_port();
-
-    config.replication = 3;
-    config.metadata_min_write_replicas = 1;
-    config.min_write_replicas = 1;
-    config.write_stall = 100ms;
-    config.heartbeat = 10s;
-    config.dead_after = 5s;
-
-    auto& node = fixture.start();
-
-    auto slow_info = [](uint16_t port, const char* domain) {
-        NodeInfo info;
-        info.id = random_node_id();
-        info.host = "127.0.0.1";
-        info.port = port;
-        info.failure_domain = domain;
-        info.capacity = 1024ULL * 1024 * 1024;
-        info.seen_unix_ms = unix_ms();
-        return info;
-    };
-    auto slow1 = slow_info(slow1_port, "slow-site-1");
-    auto slow2 = slow_info(slow2_port, "slow-site-2");
-
-    TestGate stalled_owner_gate;
-    auto delayed_put = [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-        if (request.type == MessageType::put_object)
-            stalled_owner_gate.enter_and_wait();
-        return RpcMessage{MessageType::ok, {}};
-    };
-    RpcServer slow1_server("127.0.0.1", slow1_port, keys, slow1, delayed_put,
-                           [](const NodeInfo&) {});
-    RpcServer slow2_server("127.0.0.1", slow2_port, keys, slow2, delayed_put,
-                           [](const NodeInfo&) {});
-    slow1_server.start();
-    slow2_server.start();
-
-    node.membership().observe(slow1, true);
-    node.membership().observe(slow2, true);
-    REQUIRE(node.membership().active().size() == 3);
-
-    // R=3 is a convergence target, not a foreground quorum: with W=1 the local
-    // copy publishes at once, and slow replicas stay off the critical path.
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    auto data = pattern(128 * 1024);
-    auto id = object_id(data);
-    auto started = Clock::now();
-    CHECK(store.put(id, data));
-    auto elapsed = Clock::now() - started;
-    CHECK(elapsed < 500ms);
-    CHECK(node.local_store().has(id));
-
-    // The prompt-replication worker pushes the second copy to a placement
-    // owner without waiting for repair.
-    stalled_owner_gate.open();
-    REQUIRE(wait_until([&] { return stalled_owner_gate.entered() >= 1; }, 10s));
-    REQUIRE(wait_until([&] { return store.prompt_replication_stats().copies >= 1; }, 10s));
-    slow2_server.stop();
-    slow1_server.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_prompt_replication_sends_nothing_to_a_full_owner) {
-    // An owner that gossips no room is not a destination; the object is left to repair.
-    TestNode fixture("full-owner", ConfigProfile::functional);
-    auto& config = fixture.config();
-    const auto& keys = fixture.keys();
-    config.replication = 2;
-    config.min_write_replicas = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& node = fixture.start();
-
-    const auto full_port = free_port();
-    NodeInfo full;
-    full.id = random_node_id();
-    full.host = "127.0.0.1";
-    full.port = full_port;
-    full.failure_domain = "full-site";
-    full.capacity = 1024ULL * 1024 * 1024;
-    full.used = full.capacity - 81;
-    full.seen_unix_ms = unix_ms();
-    std::atomic<int> puts{0};
-    RpcServer full_server("127.0.0.1", full_port, keys, full,
-                          [&](const NodeInfo&, FrameType, const RpcMessage& request) {
-                              if (request.type == MessageType::put_object) ++puts;
-                              if (request.type == MessageType::have_object) {
-                                  Writer w;
-                                  w.u8(0);
-                                  return RpcMessage{MessageType::bool_reply, w.take()};
-                              }
-                              return RpcMessage{MessageType::ok, {}};
-                          },
-                          [](const NodeInfo&) {});
-    full_server.start();
-    node.membership().observe(full, true);
-    REQUIRE(node.membership().active().size() == 2);
-
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    auto data = pattern(128 * 1024, 7);
-    auto id = object_id(data);
-    CHECK(store.put(id, data));
-    REQUIRE(wait_until([&] { return store.repair_diagnostics().prompt_skipped_no_room >= 1; }, 10s));
-    const auto diagnostics = store.repair_diagnostics();
-    CHECK(diagnostics.prompt_dropped >= 1);
-    CHECK(diagnostics.prompt_copies == 0);
-    CHECK(diagnostics.prompt_failures == 0); // nothing was sent to be refused
-    CHECK(puts.load() == 0);
-    full_server.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_put_falls_back_after_remote_launch_failure) {
-    TestService fixture("local");
-    auto& config = fixture.config();
-    auto dead_port = free_port();
-
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.connect_timeout = 100ms;
-    config.heartbeat = 30s;
-    config.dead_after = 60s;
-
-    auto& service = fixture.start();
-
-    NodeInfo unreachable;
-    unreachable.id = random_node_id();
-    unreachable.host = "127.0.0.1";
-    unreachable.port = dead_port; // free_port() closes the listener: connect must fail.
-    unreachable.failure_domain = "unreachable-site";
-    unreachable.capacity = config.storage_backends.front().limit;
-    unreachable.seen_unix_ms = unix_ms();
-    service.node().membership().observe(unreachable, true);
-    REQUIRE(service.node().membership().active().size() == 2);
-
-    Bytes data;
-    std::vector<NodeInfo> ranked;
-    for (uint32_t salt = 0; salt < 4096; ++salt) {
-        data = pattern(256 * 1024 + salt);
-        auto id = object_id(data);
-        ranked = capacity_placement_nodes(id.bytes, service.node().membership().active(), 1);
-        if (ranked.size() == 2 && ranked[0].id == unreachable.id &&
-            ranked[1].id == service.node().node_id())
-            break;
-        ranked.clear();
-    }
-    REQUIRE(ranked.size() == 2);
-
-    // A synchronous call_async() failure counts as a failed replica, so the
-    // quorum loop tries the fallback owner. The watchdog bounds a hang.
-    std::atomic_bool cancelled{false};
-    std::jthread watchdog([&](std::stop_token stop) {
-        const auto deadline = Clock::now() + 2s;
-        while (!stop.stop_requested() && Clock::now() < deadline)
-            std::this_thread::sleep_for(10ms);
-        if (!stop.stop_requested())
-            cancelled.store(true, std::memory_order_relaxed);
-    });
-
-    DistributedStore store(service.node(), service.local_state(), service.resources().activity, service.resources().data, service.resources().memory, service.resources().events);
-    auto id = object_id(data);
-    const bool stored = store.put(id, data, &cancelled);
-    watchdog.request_stop();
-
-    CHECK(stored);
-    CHECK(!cancelled.load(std::memory_order_relaxed));
-    CHECK(service.local_state().data().has(id));
-    service.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_joiner_cannot_form_genesis) {
@@ -3506,17 +3167,22 @@ MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_re
     n1.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configured_timeout) {
+// Service startup waits on local state while recovery reports progress, and
+// once progress stops for service_startup_no_progress gives up through its
+// stall handler with a readiness diagnostic. The gate's arithmetic is
+// test_startup_gate_fires_on_silence_not_on_slow_progress; this is its wiring.
+MACHA_TEST("rpc_cluster", test_service_startup_gate_spares_progress_and_ends_a_stall) {
     TestCluster cluster;
     auto c1 = config_for(cluster.path() / "stalled-startup", cluster.keyfile(), free_port());
-    c1.service_startup_timeout = 200ms;
+    c1.service_startup_timeout = 0ms;
+    c1.service_startup_no_progress = 400ms;
     c1.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = false;
     c1.ingest.enabled = false;
     c1.torrent.enabled = false;
 
-    // Stall local-state readiness forever; the injected StartupStallHandler
-    // observes the timeout without terminating the process.
+    // Stall local-state readiness; the injected handler observes the stall
+    // without terminating the process.
     TestGate stall_gate;
     std::atomic_bool handler_called{false};
     std::string diagnostic;
@@ -3533,91 +3199,42 @@ MACHA_TEST("rpc_cluster", test_service_startup_stall_terminates_within_configure
         });
     struct ReleaseGate {
         TestGate& gate;
-        ~ReleaseGate() {
-            gate.open();
-        }
+        ~ReleaseGate() { gate.open(); }
     } release{stall_gate};
 
     service.start();
     REQUIRE(stall_gate.wait_for_entries(1, 5s));
 
-    const auto started = Clock::now();
-    bool threw = false;
-    try {
-        (void)service.filesystem();
-    } catch (const std::exception&) {
-        threw = true;
-    }
-    const auto elapsed = Clock::now() - started;
-
-    CHECK(threw);
-    CHECK(handler_called.load(std::memory_order_acquire));
-    // Resolves near the configured bound rather than hanging.
-    CHECK(elapsed >= 150ms);
-    CHECK(elapsed < 5s);
-    CHECK(diagnostic.find("data_storage=recovering") != std::string::npos);
-
-    // Release the stalled initialise_services() thread so shutdown can join it.
-    stall_gate.open();
-    service.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_service_startup_gate_waits_while_recovery_progresses) {
-    // The startup gate spares a slow but progressing recovery and still kills
-    // one that has stopped.
-    TestCluster cluster;
-    auto c1 = config_for(cluster.path() / "progressing-startup", cluster.keyfile(), free_port());
-    c1.service_startup_timeout = 0ms;            // no absolute ceiling
-    c1.service_startup_no_progress = 1200ms;     // gate on silence only
-    c1.catalogue.scanner.enabled = false;
-    c1.catalogue.api.enabled = false;
-    c1.ingest.enabled = false;
-    c1.torrent.enabled = false;
-
-    TestGate stall_gate;
-    std::atomic_bool handler_called{false};
-    Service service(
-        c1, cluster.keys(),
-        [&](std::string_view stage) {
-            if (stage == "data-storage")
-                stall_gate.enter_and_wait();
-        },
-        {},
-        [&](std::string_view) { handler_called.store(true, std::memory_order_release); });
-    struct ReleaseGate {
-        TestGate& gate;
-        ~ReleaseGate() {
-            gate.open();
-        }
-    } release{stall_gate};
-
-    service.start();
-    REQUIRE(stall_gate.wait_for_entries(1, 5s));
-
-    // Keep "recovery" ticking from outside for 3 s: the gate must stay quiet.
+    // Recovery ticks for three gate windows: the gate holds.
     std::atomic_bool ticking{true};
+    std::atomic_uint ticks{};
     std::thread ticker([&] {
         while (ticking.load(std::memory_order_acquire)) {
             note_startup_progress();
-            std::this_thread::sleep_for(100ms);
+            ++ticks;
+            std::this_thread::sleep_for(50ms);
         }
     });
+    std::atomic_bool threw{};
     std::thread waiter([&] {
         try {
             (void)service.filesystem();
         } catch (const std::exception&) {
+            threw = true;
         }
     });
-    std::this_thread::sleep_for(3s);
+    (void)wait_until([&] { return ticks.load() >= 24 || handler_called.load(); }, 30s);
     CHECK(!handler_called.load(std::memory_order_acquire));
 
-    // Silence: the gate fires within roughly the no-progress window.
+    // Silence: the gate fires within a little over the window.
     ticking.store(false, std::memory_order_release);
     ticker.join();
     const auto silent_since = Clock::now();
     REQUIRE(wait_until([&] { return handler_called.load(std::memory_order_acquire); }, 10s));
-    CHECK(Clock::now() - silent_since >= 1000ms);
+    CHECK(Clock::now() - silent_since >= 350ms);
     waiter.join();
+    CHECK(threw.load());
+    CHECK(diagnostic.find("data_storage=recovering") != std::string::npos);
 
     stall_gate.open();
     service.stop();
@@ -3919,7 +3536,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
     s1.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_commit_replicas_ordered_local_then_nearest) {
+MACHA_FAST_TEST("rpc_cluster", test_commit_replicas_ordered_local_then_nearest) {
     NodeInfo local, lan, wan, unknown;
     local.id.bytes.fill(0x50);
     lan.id.bytes.fill(0x70);
@@ -4088,66 +3705,6 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
     s3->stop();
     s2.stop();
     s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_repair_progresses_while_the_loader_never_goes_quiet) {
-    // Repair is paced by weight against busier classes, never stopped: with
-    // the loader active throughout, the missing copy still comes back.
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    for (auto* config : {&c1, &c2}) {
-        config->replication = 1;
-        config->min_write_replicas = 1;
-        config->metadata_min_write_replicas = 1;
-        config->maintenance.interval = 50ms;
-        config->maintenance.foreground_quiet = 500ms;
-        config->maintenance.no_progress_backoff = 500ms;
-        config->maintenance.busy_bandwidth_fraction = 0.0;
-    }
-
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 2 &&
-               s2.node().membership().active().size() == 2;
-    }));
-    REQUIRE(s1.node().wait_local_state_ready(std::chrono::seconds{10}));
-    REQUIRE(s2.node().wait_local_state_ready(std::chrono::seconds{10}));
-
-    std::atomic_bool loading{true};
-    std::thread loader([&] {
-        while (loading.load()) {
-            s2.resources().activity.note(FrameType::loader, 64 * 1024);
-            std::this_thread::sleep_for(5ms);
-        }
-    });
-
-    const auto bytes = pattern(96 * 1024 + 29);
-    const auto id = object_id(bytes);
-    REQUIRE(s1.local_state().data().put(id, bytes));
-    const RetentionDot claim{s1.node().node_id(), 0xbeef};
-    s1.local_state().retention().retain(RetentionClass::data, id, claim);
-    s2.local_state().retention().retain(RetentionClass::data, id, claim);
-    REQUIRE(!s2.local_state().data().valid(id));
-    s2.resources().events.notify(NodeEvent::storage);
-
-    // The loader thread may not have run yet: wait for its first note.
-    REQUIRE(wait_until([&] {
-        return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
-    }, 5s));
-    const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
-    // The loader never paused: this copy came back during a busy period.
-    CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
-    loading = false;
-    loader.join();
-    REQUIRE(restored);
-    CHECK(*s2.local_state().data().get(id) == bytes);
 }
 
 MACHA_TEST("rpc_cluster", test_retained_missing_copy_repairs_without_namespace_reachability) {
@@ -4558,90 +4115,6 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
     }
 }
 
-MACHA_TEST("rpc_cluster", test_full_replica_fallback) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    uint16_t p1 = free_port();
-    uint16_t p2 = free_port();
-    uint16_t p3 = free_port();
-    uint16_t p4 = free_port();
-
-    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1);
-    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3, {{"127.0.0.1", p1}});
-    auto c4 = config_for(cluster.path() / "n4", cluster.keyfile(), p4, {{"127.0.0.1", p1}});
-    // Equal capacities, equal shares; filling node 1 does not change its
-    // weight, and the missing replica spills to the fallback.
-    c1.storage_backends.front().limit = 2ULL * 1024 * 1024;
-    c2.storage_backends.front().limit = 2ULL * 1024 * 1024;
-    c3.storage_backends.front().limit = 2ULL * 1024 * 1024;
-    c4.storage_backends.front().limit = 2ULL * 1024 * 1024;
-
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    Service s3(c3, keys);
-    Service s4(c4, keys);
-    s1.start();
-    s2.start();
-    s3.start();
-    s4.start();
-    REQUIRE(wait_until([&] { return s2.node().membership().active().size() >= 4; }));
-
-    auto filler = pattern(1800 * 1024);
-    filler[0] ^= 0xa5;
-    REQUIRE(s1.local_state().data().put(object_id(filler), filler));
-
-    Bytes data;
-    std::vector<NodeInfo> ranked;
-    for (uint32_t salt = 0; salt < 1000; ++salt) {
-        data = pattern(256 * 1024 + salt);
-        auto id = object_id(data);
-        auto active = s2.node().membership().active();
-        ranked = capacity_placement_nodes(id.bytes, active, c2.replication);
-        if (ranked.size() == 4 &&
-            std::find_if(ranked.begin(), ranked.begin() + 3, [&](const NodeInfo& n) {
-                return n.id == s1.node().node_id();
-            }) != ranked.begin() + 3) {
-            break;
-        }
-        ranked.clear();
-    }
-    REQUIRE(ranked.size() == 4);
-
-    auto id = object_id(data);
-    DistributedStore store(s2.node(), s2.local_state(), s2.resources().activity, s2.resources().data, s2.resources().memory, s2.resources().events);
-    REQUIRE(store.put(id, data));
-    CHECK(!s1.local_state().data().has(id));
-
-    std::array<Service*, 4> services{&s1, &s2, &s3, &s4};
-    auto fallback = std::find_if(services.begin(), services.end(), [&](Service* service) {
-        return service->node().node_id() == ranked[3].id;
-    });
-    REQUIRE(fallback != services.end());
-
-    // put() commits at quorum; repair then spills the missing replica to the fallback.
-    REQUIRE(wait_until([&] {
-        for (auto* service : services) {
-            if (!service->local_state().data().has(id))
-                continue;
-            DistributedStore repair(service->node(), service->local_state(), service->resources().activity,
-                           service->resources().data, service->resources().memory, service->resources().events);
-            repair.repair_once(8ULL * 1024 * 1024);
-        }
-        return (*fallback)->local_state().data().has(id);
-    }));
-
-    size_t copies = 0;
-    for (auto* service : services)
-        copies += service->local_state().data().has(id) ? 1 : 0;
-    CHECK(copies == 3);
-
-    s4.stop();
-    s3.stop();
-    s2.stop();
-    s1.stop();
-}
-
 MACHA_HEAVY_TEST("rpc_cluster", test_replacement_node_recovers_namespace_and_replication) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -4864,9 +4337,12 @@ Bytes read_whole(Service& node, const std::string& path, size_t size) {
     return out;
 }
 
-// Any node may found a virgin namespace (here the highest NodeId), and its root
-// is on every replica when the founding call returns.
-MACHA_HEAVY_TEST("rpc_cluster", test_any_node_founds_the_namespace_on_every_replica) {
+// Any node may found a virgin namespace (here the highest NodeId), and its
+// root is on every replica when the founding call returns. A node whose view
+// is warm sees another node's later commit as soon as it commits. A file
+// written through one node reads back whole through a second and at an
+// arbitrary offset through a third, as soon as the write commits.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_durable_trio_founds_commits_and_reads_through_every_node) {
     DurableTrio trio;
     size_t founder = 0;
     for (size_t i = 1; i < 3; ++i)
@@ -4874,24 +4350,13 @@ MACHA_HEAVY_TEST("rpc_cluster", test_any_node_founds_the_namespace_on_every_repl
             founder = i;
     trio[founder].filesystem().mkdir("/media", 0755, getuid(), getgid());
     for (size_t i = 0; i < 3; ++i)
-        CHECK(is_directory(trio[i], "/media"));
-}
+        CHECK(is_directory(trio[i], "/media")); // and warms every view
 
-// A node whose namespace view is warm sees another node's change as soon as
-// the change commits: its replica's committed generation outranks the view.
-MACHA_HEAVY_TEST("rpc_cluster", test_a_warm_namespace_view_sees_a_commit_from_another_node) {
-    DurableTrio trio;
-    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
-    REQUIRE(is_directory(trio[1], "/media")); // warms node 2's view
-    trio[2].filesystem().mkdir("/media/new", 0755, getuid(), getgid());
-    CHECK(is_directory(trio[1], "/media/new"));
-}
+    const auto writer = (founder + 1) % 3;
+    trio[writer].filesystem().mkdir("/media/new", 0755, getuid(), getgid());
+    for (size_t i = 0; i < 3; ++i)
+        CHECK(is_directory(trio[i], "/media/new"));
 
-// A file written through one node reads back whole through a second and at
-// an arbitrary offset through a third, as soon as the write commits.
-MACHA_HEAVY_TEST("rpc_cluster", test_a_committed_file_reads_back_through_every_node) {
-    DurableTrio trio;
-    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
     const auto input = pattern(3 * 1024 * 1024 + 12345);
     (void)trio.write(0, "/media/movie.mkv", input);
     CHECK(read_whole(trio[1], "/media/movie.mkv", input.size()) == input);
@@ -4919,95 +4384,6 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_commits_down_to_its_floor_and_no_f
     }
     CHECK(refused);
     CHECK(!is_directory(trio[0], "/below-the-floor"));
-}
-
-// A corrupt local copy (it fails authentication) is never served: the read
-// comes from a peer, and the fetched bytes replace the bad copy.
-MACHA_HEAVY_TEST("rpc_cluster", test_a_read_of_a_corrupt_local_copy_comes_from_a_peer_and_heals_it) {
-    DurableTrio trio;
-    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const auto ids = trio.write(0, "/media/file.bin", pattern(256 * 1024, 7));
-    REQUIRE(ids.size() == 1);
-    const auto id = ids.front();
-    auto& node = trio[1].node();
-    auto& local = trio[1].local_state();
-    corrupt_object(trio.configs[1].storage_backends.front().path, id);
-    REQUIRE(!local.data().get(id).has_value());
-
-    DistributedStore store(node, trio[1].local_state(), trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
-    const auto fetched = store.get(id);
-    REQUIRE(fetched.has_value());
-    CHECK(object_id(*fetched) == id);
-    store.wait_local_copies_settled();
-    const auto healed = local.data().get(id);
-    REQUIRE(healed.has_value());
-    CHECK(object_id(*healed) == id);
-}
-
-// Without a read, the scrub finds a corrupt copy and discards it, and repair
-// restores it from a peer within a few bounded steps.
-MACHA_HEAVY_TEST("rpc_cluster", test_scrub_discards_a_corrupt_copy_and_repair_restores_it) {
-    DurableTrio trio;
-    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const auto ids = trio.write(0, "/media/file.bin", pattern(256 * 1024, 8));
-    REQUIRE(ids.size() == 1);
-    const auto id = ids.front();
-    auto& node = trio[1].node();
-    auto& local = trio[1].local_state();
-    corrupt_object(trio.configs[1].storage_backends.front().path, id);
-
-    DistributedStore store(node, trio[1].local_state(), trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
-    store.scrub_once(128ULL * 1024 * 1024);
-    CHECK(!local.data().has(id));
-    // Repair pulls what the node's live inventory says it should hold.
-    const auto live = trio[1].filesystem().maintenance_objects().live;
-    for (int step = 0; step < 4 && !local.data().has(id); ++step)
-        store.repair_once(128ULL * 1024 * 1024, live);
-    const auto restored = local.data().get(id);
-    REQUIRE(restored.has_value());
-    CHECK(object_id(*restored) == id);
-}
-
-// With its local copy gone, a node reads the file from a peer.
-MACHA_HEAVY_TEST("rpc_cluster", test_a_read_falls_back_to_a_peer_when_the_local_copy_is_gone) {
-    DurableTrio trio;
-    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const auto input = pattern(512 * 1024, 9);
-    const auto ids = trio.write(0, "/media/file.bin", input);
-    for (const auto& id : ids)
-        REQUIRE(trio[1].local_state().data().remove(id));
-    CHECK(read_whole(trio[1], "/media/file.bin", input.size()) == input);
-}
-
-// A persistent cache enabled at runtime keeps a playback fetch: the fetched
-// bytes land in the cache, and a later read with the local copy gone is
-// answered from it.
-MACHA_HEAVY_TEST("rpc_cluster", test_a_runtime_cache_keeps_a_playback_fetch) {
-    DurableTrio trio;
-    trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
-    const auto ids = trio.write(0, "/media/file.bin", pattern(256 * 1024, 11));
-    REQUIRE(ids.size() == 1);
-    const auto id = ids.front();
-    auto& node = trio[1].node();
-    auto& local = trio[1].local_state();
-    auto cached = trio.configs[1];
-    cached.cache.path = trio.cluster.path() / "n2-cache";
-    cached.cache.max_blocks = 8;
-    local.reconfigure(cached);
-    node.reconfigure_local(cached);
-    trio[1].store().wait_local_copies_settled();
-    REQUIRE(local.data().remove(id));
-    REQUIRE(!local.cache().has(id));
-
-    DistributedStore store(node, trio[1].local_state(), trio[1].resources().activity, trio[1].resources().data, trio[1].resources().memory, trio[1].resources().events);
-    const auto fetched = store.get(id, 0, true);
-    REQUIRE(fetched.has_value());
-    store.wait_local_copies_settled();
-    CHECK(local.cache().has(id));
-    REQUIRE(!local.data().has(id));
-    const auto again = store.get(id, 0, true);
-    REQUIRE(again.has_value());
-    CHECK(*again == *fetched);
 }
 
 // Unlinking retires the object to garbage. The cached inventory is one shared,
@@ -5404,134 +4780,6 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     s1.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_torrent_listing_is_served_from_memory_while_a_peer_is_silent) {
-    // GET /api/v1/torrents/jobs never waits on a peer, even when a peer has
-    // announced a newer generation.
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "listing-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "listing-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.replication = c2.replication = 1;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
-
-    auto links = std::make_shared<FaultyLinks>();
-    ServiceInstruments instruments;
-    instruments.links = links;
-    Service s1(c1, keys, {}, {}, {}, instruments);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-    // A write before the metadata floor forms is refused; wait for it on both nodes.
-    REQUIRE(wait_metadata_writable(s1));
-    REQUIRE(wait_metadata_writable(s2));
-    s1.filesystem().mkdir("/warm", 0755, getuid(), getgid());
-    REQUIRE(s1.metadata_manager().available_snapshot_view().has_value());
-
-    // A commit on node 2 makes node 1's cached view stale.
-    const auto before = s1.node().remote_metadata_generation();
-    s2.filesystem().mkdir("/elsewhere", 0755, getuid(), getgid());
-    REQUIRE(wait_until([&] { return s1.node().remote_metadata_generation() > before; }, 10s));
-
-    // Node 2 now answers nothing, so a listing that surveyed it would block.
-    // Stalled-call counts are no evidence: background work calls node 2 constantly.
-    const auto peer = s2.node().node_id();
-    links->stall(peer);
-    const auto started = std::chrono::steady_clock::now();
-    (void)s1.torrent_coordinator().requests();
-    (void)s1.torrent_coordinator().request("does-not-exist");
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-    CHECK(elapsed < 1s);
-    links->release(peer);
-
-    s2.stop();
-    s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_extent_put_to_a_silent_peer_fails_within_the_no_progress_budget) {
-    // A put whose stalled replica has no replacement fails retryably within
-    // the pipeline's no-progress budget rather than spinning forever.
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-    auto c1 = config_for(cluster.path() / "silent-put-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "silent-put-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
-    // Both replicas are required, so the silent one cannot be replaced.
-    c1.replication = c2.replication = 2;
-    c1.min_write_replicas = c2.min_write_replicas = 2;
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
-    c1.write_stall = c2.write_stall = 200ms;
-
-    auto links = std::make_shared<FaultyLinks>();
-    ServiceInstruments instruments;
-    instruments.links = links;
-    Service s1(c1, keys, {}, {}, {}, instruments);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-    // Seeing the peer is not a formed metadata replica set; create_file needs
-    // a committed generation past genesis (1).
-    REQUIRE(wait_until([&] {
-        return s1.local_state().replica().committed_generation() > 1;
-    }, 10s));
-    s1.filesystem().create_file("/silent.bin", 0644, getuid(), getgid());
-    const auto contents = pattern(64 * 1024);
-    const auto peer = s2.node().node_id();
-
-    std::atomic_uint64_t progress{0};
-    auto open = [&] {
-        return s1.filesystem().open_write(
-            "/silent.bin", false, false, WriteDurability::publication_generation,
-            16ULL * 1024 * 1024,
-            DataWorkContext(FrameType::loader, c1.extent_size, {}, nullptr, &progress, 500ms));
-    };
-
-    links->stall(peer, MessageType::put_object_deferred);
-    std::string error;
-    const auto started = std::chrono::steady_clock::now();
-    {
-        auto writer = open();
-        try {
-            (void)writer->write(0, contents);
-            writer->commit();
-        } catch (const std::exception& e) {
-            error = e.what();
-        }
-        // The destructor relaunches a failed put; let the peer answer it.
-        links->release(peer);
-    }
-    const auto elapsed = std::chrono::steady_clock::now() - started;
-    CHECK(!error.empty());
-    CHECK(error.find("quorum unavailable") != std::string::npos);
-    CHECK(elapsed < 15s);
-
-    // With the peer answering again the identical write goes through.
-    bool ok = false;
-    try {
-        auto writer = open();
-        (void)writer->write(0, contents);
-        writer->commit();
-        ok = true;
-    } catch (const std::exception&) {
-    }
-    CHECK(ok);
-
-    s2.stop();
-    s1.stop();
-}
-
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -5834,12 +5082,17 @@ MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_n
 }
 #endif // MACHA_TEST_PLUGIN_DIR
 
-MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across_cluster) {
+// History checkpoints across a pair, round by round. A proposer that crashed
+// between every ack and its commit leaves an acked-only proof, which never
+// re-roots history and the next round supersedes. A round compacts the
+// proposer at once and the peer on its own next attempt, to one record at
+// one (floor_hash, epoch), with reads unchanged. Two proposers at once
+// converge on one proof. An unreachable participant aborts the round.
+MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_rounds_across_a_pair) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     auto p1 = free_port();
     auto p2 = free_port();
-
     auto c1 = config_for(cluster.path() / "checkpoint-n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "checkpoint-n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
     Service s1(c1, keys);
@@ -5850,57 +5103,86 @@ MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_round_compacts_across
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-
+    const auto sees = [](Service& service, const std::string& path) {
+        return wait_until([&] {
+            try {
+                return service.filesystem().getattr(path).type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        });
+    };
     REQUIRE(retry_while_not_ready([&] { s1.filesystem().mkdir("/a", 0755, getuid(), getgid()); }));
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/a").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
+    REQUIRE(sees(s2, "/a"));
     s2.filesystem().mkdir("/b", 0755, getuid(), getgid());
-    REQUIRE(wait_until([&] {
-        try {
-            return s1.filesystem().getattr("/b").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
-
-    // The round's gate needs direct reachability, not merely gossip.
+    REQUIRE(sees(s1, "/b"));
+    // A round's gate needs direct reachability, not merely gossip.
     REQUIRE(wait_until([&] {
         return s1.node().membership().all_known_reachable() &&
                s2.node().membership().all_known_reachable();
     }));
+    auto& r1 = s1.local_state().replica();
+    auto& r2 = s2.local_state().replica();
+    CHECK(r1.diagnostics().history_records >= 3);
 
-    CHECK(s1.local_state().replica().diagnostics().history_records >= 3);
+    const auto floor = r1.accepted_heads();
+    REQUIRE(floor.size() == 1);
+    HistoryCheckpointProof stranded;
+    stranded.floor_hash = floor.front().hash;
+    stranded.floor_generation = floor.front().generation;
+    stranded.epoch.bytes[0] = 0x99;
+    stranded.participants = {s1.node().node_id(), s2.node().node_id()};
+    r2.record_checkpoint_ack(stranded);
+    CHECK(r2.checkpoint_proof()->status == HistoryCheckpointProof::Status::acked);
+    CHECK(r2.diagnostics().history_records > 1);
 
-    // s1 proposes, both ack, s1 commits and compacts in this call; s2 holds a
-    // committed proof and re-roots its history.log on its own next attempt.
     s1.metadata_manager().attempt_history_checkpoint(1, 1);
-    CHECK(s1.local_state().replica().diagnostics().history_records == 1);
-    auto proof1 = s1.local_state().replica().checkpoint_proof();
+    CHECK(r1.diagnostics().history_records == 1);
+    const auto proof1 = r1.checkpoint_proof();
     REQUIRE(proof1.has_value());
     CHECK(proof1->status == HistoryCheckpointProof::Status::committed);
-
     REQUIRE(wait_until([&] {
         s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s2.local_state().replica().diagnostics().history_records == 1;
+        return r2.diagnostics().history_records == 1;
     }));
-    auto proof2 = s2.local_state().replica().checkpoint_proof();
+    const auto proof2 = r2.checkpoint_proof();
     REQUIRE(proof2.has_value());
     CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
     CHECK(proof2->floor_hash == proof1->floor_hash);
     CHECK(proof2->epoch == proof1->epoch);
+    CHECK(proof2->epoch != stranded.epoch);
+    for (auto* service : {&s1, &s2})
+        for (const auto* path : {"/a", "/b"})
+            CHECK(service->filesystem().getattr(path).type == EntryType::directory);
 
-    // Compaction must never be observable through ordinary reads.
-    CHECK(s1.filesystem().getattr("/a").type == EntryType::directory);
-    CHECK(s1.filesystem().getattr("/b").type == EntryType::directory);
-    CHECK(s2.filesystem().getattr("/a").type == EntryType::directory);
-    CHECK(s2.filesystem().getattr("/b").type == EntryType::directory);
+    s1.filesystem().mkdir("/c", 0755, getuid(), getgid());
+    REQUIRE(sees(s2, "/c"));
+    REQUIRE(r1.diagnostics().history_records > 1);
+    std::thread t1([&] { s1.metadata_manager().attempt_history_checkpoint(1, 1); });
+    std::thread t2([&] { s2.metadata_manager().attempt_history_checkpoint(1, 1); });
+    t1.join();
+    t2.join();
+    REQUIRE(wait_until([&] {
+        s1.metadata_manager().attempt_history_checkpoint(1, 1);
+        s2.metadata_manager().attempt_history_checkpoint(1, 1);
+        return r1.diagnostics().history_records == 1 && r2.diagnostics().history_records == 1;
+    }));
+    const auto concurrent1 = r1.checkpoint_proof();
+    const auto concurrent2 = r2.checkpoint_proof();
+    REQUIRE(concurrent1.has_value());
+    REQUIRE(concurrent2.has_value());
+    CHECK(concurrent1->floor_hash != proof1->floor_hash);
+    CHECK(concurrent1->floor_hash == concurrent2->floor_hash);
+    CHECK(concurrent1->epoch == concurrent2->epoch);
+    CHECK(r1.committed().hash == concurrent1->floor_hash);
+    CHECK(r2.committed().hash == concurrent2->floor_hash);
 
+    s1.filesystem().mkdir("/d", 0755, getuid(), getgid());
+    REQUIRE(sees(s2, "/d"));
     s2.stop();
+    s1.metadata_manager().attempt_history_checkpoint(1, 1);
+    CHECK(r1.diagnostics().history_records > 1);
+    CHECK(r1.checkpoint_proof()->epoch == concurrent1->epoch);
     s1.stop();
 }
 
@@ -5977,173 +5259,6 @@ MACHA_TEST("rpc_cluster", test_unreconstructable_accepted_head_is_repaired_live_
     CHECK(served.body == MetadataHistoryEntry::Body::full);
 
     s2->stop();
-    s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_concurrent_proposers_converge) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto p1 = free_port();
-    auto p2 = free_port();
-
-    auto c1 = config_for(cluster.path() / "concurrent-checkpoint-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "concurrent-checkpoint-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-    REQUIRE(retry_while_not_ready(
-        [&] { s1.filesystem().mkdir("/concurrent", 0755, getuid(), getgid()); }));
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/concurrent").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().all_known_reachable() &&
-               s2.node().membership().all_known_reachable();
-    }));
-
-    // Both nodes propose at once; the leaderless protocol is idempotent by
-    // (floor_hash, epoch), so both converge on the same committed proof.
-    std::thread t1([&] { s1.metadata_manager().attempt_history_checkpoint(1, 1); });
-    std::thread t2([&] { s2.metadata_manager().attempt_history_checkpoint(1, 1); });
-    t1.join();
-    t2.join();
-
-    // The loser's next attempt converges via the same (floor_hash, epoch).
-    REQUIRE(wait_until([&] {
-        s1.metadata_manager().attempt_history_checkpoint(1, 1);
-        s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s1.local_state().replica().diagnostics().history_records == 1 &&
-               s2.local_state().replica().diagnostics().history_records == 1;
-    }));
-
-    auto proof1 = s1.local_state().replica().checkpoint_proof();
-    auto proof2 = s2.local_state().replica().checkpoint_proof();
-    REQUIRE(proof1.has_value());
-    REQUIRE(proof2.has_value());
-    CHECK(proof1->floor_hash == proof2->floor_hash);
-    CHECK(proof1->epoch == proof2->epoch);
-    CHECK(s1.local_state().replica().committed().hash == proof1->floor_hash);
-    CHECK(s2.local_state().replica().committed().hash == proof2->floor_hash);
-
-    s2.stop();
-    s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_aborts_when_a_participant_is_unreachable) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto p1 = free_port();
-    auto p2 = free_port();
-
-    auto c1 = config_for(cluster.path() / "unreachable-checkpoint-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "unreachable-checkpoint-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-    REQUIRE(retry_while_not_ready(
-        [&] { s1.filesystem().mkdir("/unreachable", 0755, getuid(), getgid()); }));
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/unreachable").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().all_known_reachable() &&
-               s2.node().membership().all_known_reachable();
-    }));
-
-    // An unreachable durably known participant aborts the round
-    // (discover_accepted_heads_required(), independent of all_known_reachable()).
-    s2.stop();
-    s1.metadata_manager().attempt_history_checkpoint(1, 1);
-    CHECK(s1.local_state().replica().diagnostics().history_records > 1);
-    CHECK(!s1.local_state().replica().checkpoint_proof().has_value());
-
-    s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_metadata_history_checkpoint_recovers_after_crash_between_ack_and_commit) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto p1 = free_port();
-    auto p2 = free_port();
-
-    auto c1 = config_for(cluster.path() / "crash-checkpoint-n1", cluster.keyfile(), p1,
-                         {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "crash-checkpoint-n2", cluster.keyfile(), p2,
-                         {{"127.0.0.1", p1}});
-    Service s1(c1, keys);
-    Service s2(c2, keys);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-    REQUIRE(
-        retry_while_not_ready([&] { s1.filesystem().mkdir("/crash", 0755, getuid(), getgid()); }));
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/crash").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().all_known_reachable() &&
-               s2.node().membership().all_known_reachable();
-    }));
-
-    // A proposer that crashed after every ack but before the commit: an
-    // acked-only proof on s2 for the (floor_hash, epoch) a round would produce.
-    const auto floor = s1.local_state().replica().accepted_heads();
-    REQUIRE(floor.size() == 1);
-    HistoryCheckpointProof stranded;
-    stranded.floor_hash = floor.front().hash;
-    stranded.floor_generation = floor.front().generation;
-    stranded.epoch.bytes[0] = 0x99;
-    stranded.participants = {s1.node().node_id(), s2.node().node_id()};
-    s2.local_state().replica().record_checkpoint_ack(stranded);
-    CHECK(s2.local_state().replica().checkpoint_proof()->status ==
-         HistoryCheckpointProof::Status::acked);
-    // A stranded ack alone never re-roots s2's history.
-    CHECK(s2.local_state().replica().diagnostics().history_records > 1);
-
-    // The next maintenance cycle re-proposes and completes, superseding it.
-    REQUIRE(wait_until([&] {
-        s1.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s1.local_state().replica().diagnostics().history_records == 1;
-    }));
-    REQUIRE(wait_until([&] {
-        s2.metadata_manager().attempt_history_checkpoint(1, 1);
-        return s2.local_state().replica().diagnostics().history_records == 1;
-    }));
-    auto proof2 = s2.local_state().replica().checkpoint_proof();
-    REQUIRE(proof2.has_value());
-    CHECK(proof2->status == HistoryCheckpointProof::Status::committed);
-    CHECK(proof2->epoch != stranded.epoch);
-
-    s2.stop();
     s1.stop();
 }
 
