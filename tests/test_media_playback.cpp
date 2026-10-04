@@ -2975,6 +2975,9 @@ MACHA_TEST("media_playback", test_an_async_start_answers_at_once_and_reports_its
         CHECK(error->find("start_stage")->asString() == "encoding");
         auto next = create(f, "transcode");
         CHECK(next.status == 202);
+        // Its start reaches the engine before it is deleted: the starts
+        // counted below include it.
+        REQUIRE(wait_until([&] { return f.engine->starts() == 2; }, 2s));
         CHECK(call(f, "DELETE", session_id_of(next)).status == 204);
         // The failure is readable for its retention and then gone.
         CHECK(stage(f, id) == "failed");
