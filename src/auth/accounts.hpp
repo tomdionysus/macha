@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <atomic>
+
 #include "auth/session.hpp"
 #include "auth/users.hpp"
 #include "cluster/message_routes.hpp"
@@ -45,10 +47,12 @@ class Accounts {
     const SessionManager& sessions() const noexcept { return sessions_; }
 
     bool apply_session(const AuthSession&);
-    // Applies locally, then notifies peers without waiting on them.
+    // Applies locally, then notifies peers without waiting on them. A peer
+    // the notification could not be queued for is told by the gossip loop,
+    // woken for it.
     void propagate_session(const AuthSession&);
     bool apply_user(const UserRecord&);
-    // Sends the whole table, tombstones included, to every peer.
+    // Sends the whole table, tombstones included, to every peer, likewise.
     void propagate_users();
 
   private:
@@ -56,6 +60,7 @@ class Accounts {
     void gossip_loop(std::stop_token);
     void gossip_sessions();
     void gossip_users_if_changed();
+    void request_gossip();
     std::set<NodeId> active_peers() const;
 
     const Config& cfg_;
@@ -77,6 +82,8 @@ class Accounts {
     std::set<NodeId> gossiped_session_peers_;
     Clock::time_point gossip_sessions_retry_after_{};
     Clock::time_point gossiped_sessions_at_{};
+    // Raised by a push that missed a peer; the gossip loop wakes for it.
+    std::atomic_uint64_t gossip_demand_{};
     std::vector<MessageType> bound_;
     std::jthread gossip_;
 };

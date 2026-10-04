@@ -1,5 +1,20 @@
 # Current release
 
+## 0.87.2 — a session or account change is not dropped on a busy moment (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A revoked session could stay valid on other nodes for a gossip
+interval.** Minting or revoking a session, and changing the user table,
+push the change to every peer as a notification. That push took the RPC
+client's route table only if it was free at that instant, and otherwise
+sent nothing; the gossip loop was the only other delivery, on
+`network.telemetry_interval_ms` (10 s by default). The push now waits for
+the route table (a short in-memory lock; it still never dials and never
+waits on a peer), and a push that could not be queued for every peer wakes
+the gossip loop, which retries at its one-second floor instead of a tick
+later.
+
 ## 0.87.1 — a reconciliation says where its time went (experiment)
 
 No wire, protocol, API or on-disk changes.

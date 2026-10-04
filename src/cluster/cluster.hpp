@@ -225,6 +225,10 @@ class NodeRuntime : public ClusterNode {
     size_t broadcast_best_effort(const RpcMessage& message, FrameType frame_type) {
         return client_.broadcast_best_effort(message, frame_type);
     }
+    // The same, never skipped because the route table was momentarily in use.
+    size_t broadcast_notify(const RpcMessage& message, FrameType frame_type) {
+        return client_.broadcast_notify(message, frame_type);
+    }
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const Endpoint&, MessageType, std::span<const uint8_t> payload = {});
     RpcReply call(const NodeInfo&, MessageType, std::span<const uint8_t>, FrameType) override;

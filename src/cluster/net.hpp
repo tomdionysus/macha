@@ -526,10 +526,11 @@ class RpcClient {
                             const std::array<uint8_t, 32>& session_id);
     void reconcile_locked(const NodeId&, TransportLane, std::vector<std::function<void()>>& retire)
         MACHA_REQUIRES(mutex_);
-    // Snapshots the CONTROL routes unless mutex_ is busy; false if it was.
+    // Snapshots the CONTROL routes; `wait` for mutex_, else false if it is busy.
     bool try_control_routes(
         std::vector<std::shared_ptr<PeerConnection>>& outbound,
-        std::vector<std::function<bool(const RpcMessage&, FrameType)>>& inbound);
+        std::vector<std::function<bool(const RpcMessage&, FrameType)>>& inbound, bool wait);
+    size_t notify_control_routes(const RpcMessage&, FrameType, bool wait);
     void reap_retired();
 
   public:
@@ -589,6 +590,10 @@ class RpcClient {
     }
     void broadcast(const RpcMessage&);
     size_t broadcast_best_effort(const RpcMessage&, FrameType);
+    // As broadcast_best_effort, but waits for the route table instead of
+    // sending nothing when it is momentarily in use. Still never dials and
+    // never waits on a peer: one whose route is busy is not queued for.
+    size_t broadcast_notify(const RpcMessage&, FrameType);
     void invalidate_identity_association(const IdentityAssociationReset&);
     void stop();
 };
