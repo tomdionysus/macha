@@ -88,6 +88,8 @@ cluster has forgotten may be claimed by any node.
 - `metadata_unavailable` (ingest, catalogue, torrents, conflicts) is no
   longer answered for a missing peer. It remains for a node with no usable
   namespace yet, and for an ingest whose bytes no node present holds.
+  On the torrent routes its `error.scope` is `node`, where it was `cluster`
+  with `alternative_may_succeed` false: another node may take the request.
 - The media profile routes answer `404 media_engine_unavailable` on a node
   with no media engine, rather than the node crashing.
 

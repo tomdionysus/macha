@@ -56,7 +56,6 @@ class TorrentCoordinator {
         std::string message;
         std::optional<TorrentRequest> request;
         std::optional<NodeId> node; // torrent_already_added: the holder's owner
-        bool cluster_scope{};       // 503 metadata_unavailable: no other node would differ
     };
 
     // `remove_after`: absent means the cluster default; present-and-empty
