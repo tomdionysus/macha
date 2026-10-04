@@ -2279,6 +2279,10 @@ DistributedStore::RepairDiagnostics DistributedStore::repair_diagnostics() const
     out.gate_quiescent = repair_gate_quiescent_.load(std::memory_order_relaxed);
     out.gate_credit = repair_gate_credit_.load(std::memory_order_relaxed);
     out.last_credit_bytes = repair_last_credit_.load(std::memory_order_relaxed);
+    if (const auto last = repair_last_gate_.load(std::memory_order_relaxed); last & 0x100U) {
+        out.last_gate = static_cast<RepairGate>((last >> 4) & 0xFU);
+        out.paced_by = static_cast<uint8_t>(last & 0xFU);
+    }
     const auto prompt = prompt_replication_stats();
     out.prompt_queued = prompt.queued;
     out.prompt_copies = prompt.copies;

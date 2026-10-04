@@ -481,10 +481,16 @@ void Maintenance::run(std::stop_token stop) {
             // probing which objects need a copy costs no bulk bandwidth.
             const bool allow_network_repair = repair_share.can_start(now, repair_busy);
             const bool network_due = allow_network_repair && now >= network_quiescent_until;
-            store_.note_repair_gate(network_due             ? DistributedStore::RepairGate::ran
-                                     : !allow_network_repair ? DistributedStore::RepairGate::share
-                                                             : DistributedStore::RepairGate::quiescent,
-                                     network_credit);
+            store_.note_repair_gate(
+                network_due             ? DistributedStore::RepairGate::ran
+                : !allow_network_repair ? DistributedStore::RepairGate::share
+                                        : DistributedStore::RepairGate::quiescent,
+                network_credit,
+                static_cast<uint8_t>(
+                    (playback_busy ? DistributedStore::paced_by_playback : 0) |
+                    (interactive_busy ? DistributedStore::paced_by_mounted_filesystem : 0) |
+                    (loader_busy ? DistributedStore::paced_by_loader : 0) |
+                    (peer_viewers ? DistributedStore::paced_by_peer_playback : 0)));
             trace_gate("gate.repair", network_due,
                        flag("share", allow_network_repair) + " " +
                            flag("quiescent", now < network_quiescent_until));

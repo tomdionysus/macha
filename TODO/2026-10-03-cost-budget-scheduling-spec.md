@@ -344,6 +344,19 @@ thing. Three repairs bring it under the same principles:
 - per-account viewer bounds;
 - the shedding path, which no caller uses, is removed or used.
 
+### The durability batch window
+
+A commit that asks for durability waits up to a fixed 500 ms so that other
+writes share one physical sync (`DurabilityDomain`, one per mounted
+filesystem). The right wait depends on the device: where a sync costs
+milliseconds the window is nearly all added commit latency; on a slow disk
+under heavy writing a longer one saves more syncs. It is a constructor
+parameter passed from the root, with no configuration key. Here it becomes
+measured: the domain already performs every sync, so it can time them and
+size the window from the device's own cost (a small multiple of the recent
+sync time, bounded), per domain. A commit marked `immediate` still does not
+wait.
+
 ### Playback
 
 Transcode admission is by measured capacity, not `max_video_transcodes`:

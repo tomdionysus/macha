@@ -1334,6 +1334,30 @@ HttpResponse ClusterStatusService::diagnostics_response(const StatusSources& sou
             gates["credit"] = values.gate_credit;
             repair_diagnostics["pass_gates"] = std::move(gates);
             repair_diagnostics["last_credit_bytes"] = values.last_credit_bytes;
+            // What the latest pass did with repair, and when a higher class
+            // held it to its share, which classes were active.
+            const char* pace = "unknown";
+            if (values.last_gate) {
+                switch (*values.last_gate) {
+                case DistributedStore::RepairGate::ran: pace = "running"; break;
+                case DistributedStore::RepairGate::share: pace = "paced"; break;
+                case DistributedStore::RepairGate::quiescent: pace = "settling"; break;
+                case DistributedStore::RepairGate::credit: pace = "awaiting_credit"; break;
+                }
+            }
+            repair_diagnostics["pace"] = pace;
+            Json::Array paced_by;
+            if (values.last_gate == DistributedStore::RepairGate::share) {
+                if (values.paced_by & DistributedStore::paced_by_playback)
+                    paced_by.push_back("playback");
+                if (values.paced_by & DistributedStore::paced_by_mounted_filesystem)
+                    paced_by.push_back("mounted_filesystem");
+                if (values.paced_by & DistributedStore::paced_by_loader)
+                    paced_by.push_back("loader");
+                if (values.paced_by & DistributedStore::paced_by_peer_playback)
+                    paced_by.push_back("peer_playback");
+            }
+            repair_diagnostics["paced_by"] = std::move(paced_by);
             // The quick second copy of each new object.
             Json::Object prompt;
             prompt["queued"] = values.prompt_queued;
