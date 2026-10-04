@@ -1705,6 +1705,9 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     constexpr auto heartbeat = 20ms;
     constexpr auto dead_after = 300ms;
     std::unique_ptr<RpcServer> server;
+    // Handlers outlive a failed assertion: they stop waiting once the case
+    // ends, and never read the server while it is being destroyed.
+    std::atomic_bool ending{false};
     const auto pings = [&] {
         const auto stats = server->work_stats();
         const auto found = stats.message_timings.find(MessageType::ping);
@@ -1719,7 +1722,10 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
         const auto from = pings();
         const auto until = Clock::now() + dead_after + heartbeat;
         (void)wait_until(
-            [&] { return pings() >= from + 2 * rounds && Clock::now() >= until; }, 30s, 1ms);
+            [&] {
+                return ending.load() || (pings() >= from + 2 * rounds && Clock::now() >= until);
+            },
+            30s, 1ms);
     };
     server = std::make_unique<RpcServer>(
         "127.0.0.1", port, keys, server_info,
@@ -1742,6 +1748,17 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
         links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
         500ms, heartbeat, dead_after);
     Endpoint endpoint{"127.0.0.1", port};
+    // Declared last: runs first, with the client and the server still whole.
+    struct End {
+        std::atomic_bool& ending;
+        RpcClient& client;
+        RpcServer& server;
+        ~End() {
+            ending = true;
+            client.stop();
+            server.stop();
+        }
+    } end{ending, client, *server};
 
     // The 20 ms interval of call() is a stall notice, not a deadline: a slow
     // control call and a slow DATA call on the other lane both complete, and
@@ -1757,9 +1774,6 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     REQUIRE(data.wait_for(30s) == std::future_status::ready);
     CHECK(data.get().message.type == MessageType::ok);
     CHECK(client.stats().connections_created == 2);
-
-    client.stop();
-    server->stop();
 }
 
 MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_completion) {
@@ -4571,6 +4585,8 @@ class FaultyLinks final : public RpcLinks {
         });
     }
 
+    std::map<NodeId, std::pair<MessageType, std::chrono::milliseconds>> slow_ MACHA_GUARDED_BY(mutex_);
+    size_t slow_sends_ MACHA_GUARDED_BY(mutex_){};
   public:
     ~FaultyLinks() override {
         Lock lock(mutex_);
@@ -4611,7 +4627,33 @@ class FaultyLinks final : public RpcLinks {
             Lock lock(mutex_);
             sent_after_retirement_ = sent_after_retirement_ || retired;
         }
-        return network_.send(peer, lane, type, payload, frame_type, route);
+        std::optional<std::chrono::milliseconds> hold;
+        {
+            Lock lock(mutex_);
+            if (auto found = slow_.find(peer); found != slow_.end() && found->second.first == type) {
+                hold = found->second.second;
+                slow_.erase(found);
+            }
+        }
+        auto placed = network_.send(peer, lane, type, payload, frame_type, route);
+        if (hold) {
+            std::this_thread::sleep_for(*hold);
+            Lock lock(mutex_);
+            ++slow_sends_;
+        }
+        return placed;
+    }
+
+    // The next `message` sent to `peer` is placed on its route at once, and
+    // its sender held for `hold` before getting the call back: a sender that
+    // runs late while the peer answers on time.
+    void slow_send(const NodeId& peer, MessageType message, std::chrono::milliseconds hold) {
+        Lock lock(mutex_);
+        slow_[peer] = {message, hold};
+    }
+    size_t slow_sends() const {
+        Lock lock(mutex_);
+        return slow_sends_;
     }
 
     void admit(const NodeInfo& peer, TransportLane lane, std::function<void()> install) override {
@@ -4715,6 +4757,58 @@ class FaultyLinks final : public RpcLinks {
         found->second.sockets.clear();
     }
 };
+
+MACHA_TEST("rpc_cluster", test_a_ping_answered_while_the_health_pass_ran_late_keeps_its_route) {
+    // The health pass is held past the peer-death window with its ping
+    // already placed and answered. An answered ping is proof of life however
+    // late it is read: the route stays, and nothing is redialled.
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    const auto port = free_port();
+    NodeInfo server_info;
+    server_info.id = random_node_id();
+    server_info.host = "127.0.0.1";
+    server_info.port = port;
+    server_info.failure_domain = "server-site";
+    RpcServer server(
+        "127.0.0.1", port, keys, server_info,
+        [](const NodeInfo&, FrameType, const RpcMessage& request) {
+            return RpcMessage{MessageType::ok, request.payload};
+        },
+        [](const NodeInfo&) {});
+    server.start();
+    const auto pings = [&] {
+        const auto stats = server.work_stats();
+        const auto found = stats.message_timings.find(MessageType::ping);
+        return found == stats.message_timings.end() ? uint64_t{} : found->second.requests;
+    };
+
+    NodeInfo client_info;
+    client_info.id = random_node_id();
+    client_info.host = "127.0.0.1";
+    client_info.port = free_port();
+    client_info.failure_domain = "client-site";
+    constexpr auto dead_after = 80ms;
+    FaultyLinks links;
+    RpcClient client(
+        links, keys, [client_info] { return client_info; }, [](const NodeInfo&) {}, [](uint64_t) {},
+        500ms, 20ms, dead_after);
+    const Endpoint endpoint{"127.0.0.1", port};
+    CHECK(client.call(endpoint, MessageType::members, Bytes{1}, 1s).message.payload == Bytes{1});
+    REQUIRE(client.stats().connections_created == 1);
+
+    links.slow_send(server_info.id, MessageType::ping, dead_after * 3);
+    REQUIRE(wait_until([&] { return links.slow_sends() == 1; }, 5s));
+    // The pass reads the late ping and goes on to place more.
+    const auto answered = pings();
+    REQUIRE(wait_until([&] { return pings() >= answered + 2; }, 5s));
+    CHECK(client.has_route(server_info.id, TransportLane::control));
+    CHECK(client.call(endpoint, MessageType::members, Bytes{2}, 1s).message.payload == Bytes{2});
+    CHECK(client.stats().connections_created == 1);
+
+    client.stop();
+    server.stop();
+}
 
 // Needs the libmacha-torrent plugin, built only when libtorrent is found.
 #ifdef MACHA_TEST_PLUGIN_DIR
