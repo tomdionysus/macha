@@ -1,5 +1,26 @@
 # Current release
 
+## 0.86.0 — a release's tracks, and what is pacing repair (experiment)
+
+No wire, protocol or on-disk changes. Two additions to what the API sends.
+
+**A MusicBrainz release's tracks.**
+`GET /api/v1/manage/providers/musicbrainz/releases/{mbid}/tracks` (manager
+role) answers `{"status":"ok","tracks":[...]}`, each track with
+`disc_number`, `track_number`, `title` (the track's title on that release),
+`length_ms` and `recording_id`, in the release's own order; every field but
+`title` may be null. It shares the node's one-request-a-second MusicBrainz
+gate, where a request waits its turn. See `docs/management.md`.
+
+**What the latest maintenance pass did with repair.** Each node's status
+gains `diagnostics.repair.pace` (`running`, `paced`, `settling`,
+`awaiting_credit`, `unknown`) and `paced_by` (`playback`,
+`mounted_filesystem`, `loader`, `peer_playback`; empty unless `paced`).
+See `docs/operations.md`.
+
+**The durability batch window is passed from the root** as a constructor
+parameter (500 ms, as before); it has no configuration key.
+
 ## 0.85.0 — reconciliation merges trees by what differs (experiment)
 
 No wire, protocol, API or on-disk changes; a merge commit is the commit
