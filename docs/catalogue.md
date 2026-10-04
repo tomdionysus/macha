@@ -117,6 +117,7 @@ not normally a deferral. The order is:
 | not a `macha:` identity | `400 bad_media_id` |
 | a stored profile exists | `200` |
 | no stored profile | probed there and then at foreground priority, persisted, `200` |
+| no stored profile, and this node has no media engine (streaming off) | `503 media_engine_unavailable`; another node may answer |
 | the probe failed | `422 profile_failed`, with `error.reason` when the engine said why (`source_unreadable`, `source_unsupported`, `source_read_timed_out`) |
 | the media is not resolvable on this node | `202` with `{"status": "pending", "media_id"}`, `Retry-After: 1` and `Location` if background profiling was accepted, otherwise `404 not_found` |
 
