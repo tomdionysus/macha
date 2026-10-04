@@ -1,5 +1,19 @@
 # Current release
 
+## 0.87.0 — a merge commit is published as a delta (experiment)
+
+No wire, protocol, API or on-disk format changes: the delta is the form
+ordinary commits already use, and a replica that cannot apply one is sent
+the full record as before.
+
+**A tree merge is published as what it changed.** A merge commit of a
+tree-backed namespace went to the peer as a full record (2 MB with the
+live library's 34,000 tombstones), which took 3 to 12 seconds over the
+link between the nodes and was nearly all of the time a reconciliation
+held its lock at 0.85.0. The tree merge now applies onto the primary
+parent's tree, and its changes are the commit's delta. The reconcile log
+line says `history_body=delta` and its size.
+
 ## 0.86.0 — a release's tracks, and what is pacing repair (experiment)
 
 No wire, protocol or on-disk changes. Two additions to what the API sends.
