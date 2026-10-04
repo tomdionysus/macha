@@ -1221,13 +1221,9 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
         job.error.clear();
         job.error_code.clear();
         job.updated_unix_ms = now_ms();
-        {
-            Lock lock(mutex_);
-            if (auto it = jobs_.find(id); it != jobs_.end()) {
-                it->second = job;
-                save_state_locked();
-            }
-        }
+        // Paused or cancelled after its last copy: not finished.
+        if (!record_progress(job))
+            return;
         if (job.state == IngestJobState::cataloguing)
             Log::info("ingest copied id=" + id + " files=" + std::to_string(job.files_completed) +
                       " catalogue_pending=" + std::to_string(job.catalogue_pending));
@@ -1880,15 +1876,28 @@ bool IngestManager::import_job(IngestJob& job, std::stop_token stop) {
         }
         if (!copy_file(job, file, stop)) return false;
         job.updated_unix_ms = now_ms();
-        {
-            Lock lock(mutex_);
-            if (auto it = jobs_.find(job.id); it != jobs_.end()) {
-                it->second = job;
-                save_state_locked();
-            }
-        }
+        if (!record_progress(job)) return false;
     }
     return true;
+}
+
+bool IngestManager::record_progress(IngestJob& job) {
+    Lock lock(mutex_);
+    const auto it = jobs_.find(job.id);
+    if (it == jobs_.end())
+        return false;
+    // A pause or cancel accepted since the worker last looked stands: what
+    // the worker finished is kept under that state.
+    const auto held = it->second.state;
+    const bool overridden = held == IngestJobState::paused || held == IngestJobState::cancelled;
+    if (overridden) {
+        job.state = held;
+        job.rate_bytes_per_second = 0;
+        job.eta_seconds.reset();
+    }
+    it->second = job;
+    save_state_locked();
+    return !overridden;
 }
 
 void IngestManager::set_blocked(IngestJob& job, std::string code, std::string message) {

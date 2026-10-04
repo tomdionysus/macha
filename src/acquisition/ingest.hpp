@@ -218,6 +218,9 @@ class IngestManager {
     void process_job(const std::string&, std::stop_token);
     bool plan_job(IngestJob&, std::stop_token);
     bool import_job(IngestJob&, std::stop_token);
+    // Stores the worker's copy of the job. False if the job is gone, or was
+    // paused or cancelled meanwhile: it is then stored under that state.
+    bool record_progress(IngestJob&) MACHA_EXCLUDES(mutex_);
     // Gives every unfinished file of a planned job a destination no other
     // file of the job uses.
     void resolve_duplicate_destinations(IngestJob&);
