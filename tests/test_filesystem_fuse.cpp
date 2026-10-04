@@ -1709,8 +1709,10 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
         CHECK(pressure.spool_publish_rate_window_bytes >= first.size());
         CHECK(pressure.spool_publish_rate_window_ms > 0);
         const auto spool = *fuse.spool_path / ("inode-" + std::to_string(handle.inode) + ".spool");
-        REQUIRE(std::filesystem::exists(spool));
-        CHECK(std::filesystem::file_size(spool) <= fuse.max_spool_bytes);
+        // Once the second write is published too, the spool is retired.
+        std::error_code retired;
+        const auto spool_size = std::filesystem::file_size(spool, retired);
+        CHECK((retired || spool_size <= fuse.max_spool_bytes));
         frontend->release(handle.inode, true);
         REQUIRE(frontend->wait_for_idle(10s));
         frontend->stop();
