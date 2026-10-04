@@ -174,16 +174,17 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
     // /api/v1/status and view_status.
     if (request.path == "/api/v1/health")
         return health_response();
-    // Sessions work while local services recover: the control plane is online
-    // long before storage and metadata.
-    if (request.path == "/api/v1/session")
-        return session_api_.handle(request);
 
     if (const auto role = required_role(request); !role.empty() && request.session &&
                                                   !std::count(request.session->roles.begin(),
                                                               request.session->roles.end(), role))
         return http_error(403, "forbidden",
                           "this action requires the '" + std::string(role) + "' role");
+
+    // Sessions work while local services recover: the control plane is online
+    // long before storage and metadata.
+    if (request.path == "/api/v1/session")
+        return session_api_.handle(request);
 
     // After the gate, so required_role() applies; before the services_ready_
     // check, because a recovering node is exactly when Status is asked.
