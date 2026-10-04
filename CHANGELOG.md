@@ -1,5 +1,13 @@
 # Current release
 
+## 0.87.1 — a reconciliation says where its time went (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+The `metadata histories reconciled` log line gains `materialise_ms`,
+`merge_ms`, `tree_ms`, `encode_ms` and `publish_ms`: the stages of the time
+a reconciliation holds its lock.
+
 ## 0.87.0 — a merge commit is published as a delta (experiment)
 
 No wire, protocol, API or on-disk format changes: the delta is the form
