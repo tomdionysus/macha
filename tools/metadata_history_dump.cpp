@@ -14,7 +14,9 @@
 // every frame. --stats materializes each reconstructible head and attributes
 // its encoded bytes to the snapshot's parts. --entries-check (with --objects,
 // implies --stats) checks that the resumable walk, at several page bounds,
-// visits exactly what the whole-pass walk visits, in order.
+// visits exactly what the whole-pass walk visits, in order. --merge-deltas
+// (with --objects) lists each merge commit stored whole with the size of the
+// delta against its primary parent that would say the same.
 #include "codec.hpp"
 #include "config.hpp"
 #include "crypto.hpp"
@@ -111,13 +113,15 @@ class ReplayNodeStore final : public NamespaceNodeStore {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: macha-metadata-dump <cluster.key> <history.log> [heads.meta] "
-                     "[--all] [--stats] [--tree] [--entries-check] [--objects <path>]\n";
+                     "[--all] [--stats] [--tree] [--entries-check] [--merge-deltas] "
+                     "[--objects <path>]\n";
         return 2;
     }
     bool all = false;
     bool stats = false;
     bool tree = false;
     bool entries_check = false;
+    bool merge_deltas = false;
     std::filesystem::path objects;
     // Replay writes reconstructed nodes into the store, as a replica does. Point
     // it at a COPY: it tests whether the write path accepts nodes already present.
@@ -137,6 +141,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
             objects = argv[i];
+        } else if (std::string(argv[i]) == "--merge-deltas") {
+            merge_deltas = true;
         } else if (std::string(argv[i]) == "--entries-check") {
             entries_check = true;
             stats = true;
@@ -228,6 +234,109 @@ int main(int argc, char** argv) {
         std::cout << " first_gen=" << order.front().generation
                   << " last_gen=" << order.back().generation;
     std::cout << '\n';
+
+    // Each merge commit stored whole, beside the delta against its primary
+    // parent that says the same: what a full body cost over a delta.
+    if (merge_deltas) {
+        if (objects.empty()) {
+            std::cerr << "--merge-deltas needs --objects\n";
+            return 2;
+        }
+        const auto read = [&](const Frame& frame) {
+            std::ifstream in(history_path, std::ios::binary);
+            in.seekg(static_cast<std::streamoff>(frame.offset + 4));
+            Bytes bytes(frame.length);
+            in.read(reinterpret_cast<char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()));
+            Reader envelope(bytes);
+            auto nonce = envelope.fixed<12>();
+            auto tag = envelope.fixed<16>();
+            auto ciphertext = envelope.bytes();
+            envelope.finish();
+            return decode_metadata_history_entry(aes_gcm_open(key, nonce, tag, ciphertext, MH));
+        };
+        LocalStore store(objects,
+                         LocalStoreOptions{std::numeric_limits<uint64_t>::max(), 0,
+                                           StoragePackingConfig{}.threshold,
+                                           StoragePackingConfig{}.target_size},
+                         key);
+        ReplayNodeStore nodes(store);
+        const NamespaceDeltaApplier applier = [&](const ObjectId& root,
+                                                  const MetadataDelta& delta) {
+            return apply_delta_to_namespace_tree(root, nodes, delta);
+        };
+        // The snapshot a frame commits: its own body, or its delta chain
+        // replayed from the nearest full ancestor.
+        const auto materialise = [&](const Frame& frame) -> std::optional<MetadataSnapshot> {
+            std::vector<Frame> chain;
+            Frame cursor = frame;
+            while (cursor.body == MetadataHistoryEntry::Body::delta) {
+                if (!cursor.previous_known || chain.size() > order.size())
+                    return {};
+                chain.push_back(cursor);
+                const auto parent = index.find(cursor.previous);
+                if (parent == index.end())
+                    return {};
+                cursor = parent->second;
+            }
+            auto snapshot = decode_snapshot(read(cursor).payload);
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+                apply_metadata_delta_in_place(snapshot, decode_metadata_delta(read(*it).payload),
+                                              applier);
+            return snapshot;
+        };
+        size_t merges = 0;
+        uint64_t full_total = 0, delta_total = 0;
+        for (const auto& frame : order) {
+            if (frame.body != MetadataHistoryEntry::Body::full || frame.merge_parents.empty() ||
+                !frame.previous_known)
+                continue;
+            const auto parent = index.find(frame.previous);
+            if (parent == index.end())
+                continue;
+            try {
+                const auto body = read(frame);
+                auto merged = decode_snapshot(body.payload);
+                auto before = materialise(parent->second);
+                if (!before || !before->namespace_root || !merged.namespace_root)
+                    continue;
+                const auto changed =
+                    diff_namespace_trees(*before->namespace_root, *merged.namespace_root, nodes);
+                before->namespace_root.reset();
+                merged.namespace_root.reset();
+                auto delta = metadata_delta(*before, merged);
+                std::cout << "merge gen=" << frame.generation << " full_bytes="
+                          << body.payload.size();
+                if (!delta) {
+                    std::cout << " delta=inexpressible\n";
+                    continue;
+                }
+                for (const auto& [path, difference] : changed) {
+                    if (!difference.after)
+                        delta->erase_entries.push_back(path);
+                    else
+                        record_entry_change(*delta, path,
+                                            difference.before ? &*difference.before : nullptr,
+                                            *difference.after);
+                }
+                const auto encoded = encode_metadata_delta(*delta);
+                std::cout << " delta_bytes=" << encoded.size() << " paths=" << changed.size()
+                          << " garbage_upserts=" << delta->upsert_garbage.size()
+                          << " garbage_erases=" << delta->erase_garbage.size()
+                          << " replace_conflicts=" << (delta->replace_conflicts ? 1 : 0)
+                          << " node_status=" << delta->upsert_node_status.size() << '\n';
+                ++merges;
+                full_total += body.payload.size();
+                delta_total += encoded.size();
+            } catch (const std::exception& error) {
+                std::cout << "merge gen=" << frame.generation << " unreadable: " << error.what()
+                          << '\n';
+            }
+        }
+        std::cout << "merges=" << merges << " full_bytes=" << full_total
+                  << " delta_bytes=" << delta_total << '\n';
+        return 0;
+    }
 
     if (heads_path.empty())
         return 0;

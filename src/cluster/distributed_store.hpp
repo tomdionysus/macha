@@ -56,7 +56,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     // held repair to its share; repair is waiting out the quiet period after
     // one; or its transfer credit could not cover the next extent.
     enum class RepairGate : uint8_t { ran, share, quiescent, credit };
-    // The higher classes that can hold repair to its share.
+    // The higher classes whose activity holds repair to its share.
     enum RepairPacedBy : uint8_t {
         paced_by_playback = 1,
         paced_by_mounted_filesystem = 2,
@@ -80,8 +80,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
         uint64_t gate_quiescent{};
         uint64_t gate_credit{};
         uint64_t last_credit_bytes{};
-        // The latest of those gates, none before the first pass, and when it
-        // was `share`, the higher classes active then (RepairPacedBy bits).
+        // The latest of those gates, none before the first pass, and the
+        // higher classes active at that pass (RepairPacedBy bits).
         std::optional<RepairGate> last_gate;
         uint8_t paced_by{};
         // Prompt replication (copy of each new object to a second owner),
