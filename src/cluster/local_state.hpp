@@ -22,7 +22,7 @@ namespace macha {
 class ControlObjectFetch;
 class LocalStore;
 class MetadataReplica;
-class NodeRuntime;
+class ClusterNode;
 class PersistentBlockCache;
 class RetentionStore;
 class StoragePool;
@@ -103,7 +103,7 @@ struct RecoveryCancelled : std::runtime_error {
 class LocalState {
   public:
     using StageHook = std::function<void(std::string_view)>;
-    LocalState(const Config&, const NodeIdentity&, NodeRuntime&, RecoveryProgress&,
+    LocalState(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
                const StageHook&, std::stop_token);
     ~LocalState();
     LocalState(const LocalState&) = delete;
@@ -126,7 +126,7 @@ class LocalState {
   private:
     void recover_data(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
                       std::stop_token);
-    void recover_state(const Config&, const NodeIdentity&, NodeRuntime&, RecoveryProgress&,
+    void recover_state(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
                        const StageHook&, std::stop_token);
 
     // The replica is declared after the cache it reads, so destroyed first.

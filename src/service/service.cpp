@@ -439,28 +439,16 @@ void Service::wait_services_ready() {
     // service_startup_no_progress is a stall. An absolute ceiling applies only
     // when configured.
     const auto& config = node_.config();
-    const auto started = Clock::now();
-    auto last_progress_at = started;
-    auto last_progress = startup_progress();
+    StartupStallGate gate(config.service_startup_no_progress, config.service_startup_timeout,
+                          Clock::now(), startup_progress());
     bool signalled = false;
     Lock lock(startup_mutex_);
     for (;;) {
-        signalled = startup_cv_.wait_for(lock.native(), std::chrono::seconds(1), [this] {
+        signalled = startup_cv_.wait_for(lock.native(), gate.poll_interval(), [this] {
             return services_ready_.load(std::memory_order_acquire) ||
                    startup_failed_.load(std::memory_order_acquire);
         });
-        if (signalled)
-            break;
-        const auto now = Clock::now();
-        if (const auto progress = startup_progress(); progress != last_progress) {
-            last_progress = progress;
-            last_progress_at = now;
-        }
-        if (config.service_startup_no_progress.count() > 0 &&
-            now - last_progress_at >= config.service_startup_no_progress)
-            break;
-        if (config.service_startup_timeout.count() > 0 &&
-            now - started >= config.service_startup_timeout)
+        if (signalled || gate.stalled(Clock::now(), startup_progress()))
             break;
     }
     if (services_ready_.load(std::memory_order_acquire))
@@ -479,11 +467,12 @@ void Service::wait_services_ready() {
     const auto message =
         "service startup stalled: no recovery progress for " +
         std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                           Clock::now() - last_progress_at)
+                           Clock::now() - gate.last_progress_at())
                            .count()) +
         "ms (gate " + std::to_string(config.service_startup_no_progress.count()) +
         "ms, ceiling " + std::to_string(config.service_startup_timeout.count()) + "ms, elapsed " +
-        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started)
+        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                                              gate.started())
                            .count()) +
         "ms); " + diagnostic + "; terminating for restart";
     Log::error(message);
