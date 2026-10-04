@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "torrent/torrent_extent_journal.hpp"
+#include "stepped_time.hpp"
 #include "test_backend_support.hpp"
 #include "api/acquisition_api.hpp"
 #include "subsystem/subsystem_abi.hpp"
@@ -70,7 +71,87 @@ std::map<std::string, std::string, std::less<>> parse_test_query(std::string_vie
     return out;
 }
 
-MACHA_TEST("hydration_catalogue", test_hydration_scheduler_and_prediction) {
+// One node's filesystem, catalogue and catalogue hint queue, built as Service
+// builds them: what CatalogueScanner, CatalogueApi, IngestManager and the
+// catalogue predictors take. `guard` runs before each of the node's metadata
+// commits is published, on the committing thread.
+class CatalogueNode {
+    TestNode node_;
+    std::unique_ptr<CatalogueManager> catalogue_;
+    std::unique_ptr<CatalogueHintQueue> hints_;
+
+  public:
+    explicit CatalogueNode(std::string_view name, const std::function<void(Config&)>& configure = {},
+                           std::function<void(const MetadataPublicationContext&)> guard = {})
+        : node_(name) {
+        if (configure) configure(node_.config());
+        if (guard) node_.set_publication_guard(std::move(guard));
+        node_.start();
+        auto& bare = node_.node();
+        catalogue_ = std::make_unique<CatalogueManager>(bare, bare.local_state(), bare.metadata_server(),
+                                                        node_.store(), node_.metadata(), bare.ledger());
+        hints_ = std::make_unique<CatalogueHintQueue>(node_.config().state_path);
+    }
+
+    BareNode& node() { return node_.node(); }
+    const Config& config() const { return node_.config(); }
+    const std::filesystem::path& path() const { return node_.path(); }
+    FileSystem& filesystem() { return node_.filesystem(); }
+    MetadataManager& metadata() { return node_.metadata(); }
+    DistributedStore& store() { return node_.store(); }
+    CatalogueManager& catalogue() { return *catalogue_; }
+    CatalogueHintQueue& hints() { return *hints_; }
+
+    void mkdir(const std::string& path) { filesystem().mkdir(path, 0755, getuid(), getgid()); }
+
+    // Writes `bytes` at `path`, replacing what is there, and returns its media id.
+    std::string write(const std::string& path, const Bytes& bytes) {
+        try {
+            (void)filesystem().getattr(path);
+        } catch (const FsError&) {
+            filesystem().create_file(path, 0644, getuid(), getgid());
+        }
+        auto writer = filesystem().open_write(path, true);
+        REQUIRE(writer->write(0, bytes) == bytes.size());
+        writer->commit();
+        return file_media_id(filesystem().getattr(path));
+    }
+
+    CatalogueItem upsert(std::string id, CatalogueKind kind, std::string title,
+                         std::optional<std::string> parent = {}) {
+        CatalogueItem item;
+        item.id = std::move(id);
+        item.kind = kind;
+        item.title = std::move(title);
+        item.parent_id = std::move(parent);
+        return catalogue().upsert(item);
+    }
+};
+
+std::filesystem::path write_token(const std::filesystem::path& path, std::string_view token) {
+    std::ofstream out(path);
+    out << token << '\n';
+    return path;
+}
+
+Json api_body(const HttpResponse& response) {
+    return Json::parse(std::string(response.body.begin(), response.body.end()));
+}
+
+HttpRequest api_request(std::string method, std::string path, Bytes body = {},
+                        std::map<std::string, std::string, std::less<>> headers = {}) {
+    return {.method = std::move(method), .path = std::move(path), .query = {},
+            .headers = std::move(headers), .body = std::move(body), .session = {}};
+}
+
+std::filesystem::path write_host_file(const std::filesystem::path& path, const Bytes& bytes) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return path;
+}
+
+MACHA_FAST_TEST("hydration_catalogue", test_hydration_scheduler_orders_runs_and_follows_playback) {
     auto make_id = [](uint8_t value) {
         Bytes bytes(32, value);
         return object_id(bytes);
@@ -151,127 +232,6 @@ MACHA_TEST("hydration_catalogue", test_hydration_scheduler_and_prediction) {
     renamed.gid = 5678;
     renamed.mtime_ns = 999;
     CHECK(file_media_id(synthetic) == file_media_id(renamed));
-
-    // Catalogue prediction is resolved against actual Macha file manifests. It
-    // advances within a season, crosses into the next season, and advances a
-    // movie collection; every predicted run begins at extent zero.
-    TestService fixture("store");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-    service.filesystem().mkdir("/TV", 0755, getuid(), getgid());
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-
-    auto make_file = [&](const std::string& path, uint8_t value) {
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        auto data = Bytes(2 * 1024 * 1024 + 12345, value);
-        auto writer = service.filesystem().open_write(path, true);
-        REQUIRE(writer->write(0, data) == data.size());
-        writer->commit();
-        auto entry = service.filesystem().getattr(path);
-        REQUIRE(entry.extents.size() >= 3);
-        return entry;
-    };
-
-    auto ep1_file = make_file("/TV/s01e01.mkv", 31);
-    auto ep2_file = make_file("/TV/s01e02.mkv", 32);
-    auto ep3_file = make_file("/TV/s02e01.mkv", 33);
-    auto movie1_file = make_file("/Movies/one.mkv", 41);
-    auto movie2_file = make_file("/Movies/two.mkv", 42);
-
-    CatalogueItem show;
-    show.id = "show:test";
-    show.kind = CatalogueKind::show;
-    show.title = "Test Show";
-    show = service.catalogue().upsert(show);
-
-    CatalogueItem season1;
-    season1.id = "season:test:1";
-    season1.kind = CatalogueKind::season;
-    season1.title = "Season 1";
-    season1.parent_id = show.id;
-    season1.season_number = 1;
-    season1 = service.catalogue().upsert(season1);
-
-    CatalogueItem season2;
-    season2.id = "season:test:2";
-    season2.kind = CatalogueKind::season;
-    season2.title = "Season 2";
-    season2.parent_id = show.id;
-    season2.season_number = 2;
-    season2 = service.catalogue().upsert(season2);
-
-    CatalogueItem ep1;
-    ep1.id = "episode:test:1:1";
-    ep1.kind = CatalogueKind::episode;
-    ep1.title = "One";
-    ep1.parent_id = season1.id;
-    ep1.season_number = 1;
-    ep1.episode_number = 1;
-    ep1.media_ids = {file_media_id(ep1_file)};
-    ep1 = service.catalogue().upsert(ep1);
-
-    CatalogueItem ep2;
-    ep2.id = "episode:test:1:2";
-    ep2.kind = CatalogueKind::episode;
-    ep2.title = "Two";
-    ep2.parent_id = season1.id;
-    ep2.season_number = 1;
-    ep2.episode_number = 2;
-    ep2.media_ids = {file_media_id(ep2_file)};
-    ep2 = service.catalogue().upsert(ep2);
-
-    CatalogueItem ep3;
-    ep3.id = "episode:test:2:1";
-    ep3.kind = CatalogueKind::episode;
-    ep3.title = "Three";
-    ep3.parent_id = season2.id;
-    ep3.season_number = 2;
-    ep3.episode_number = 1;
-    ep3.media_ids = {file_media_id(ep3_file)};
-    ep3 = service.catalogue().upsert(ep3);
-
-    CatalogueItem movie1;
-    movie1.id = "movie:test:1";
-    movie1.kind = CatalogueKind::movie;
-    movie1.title = "First Film";
-    movie1.year = 2001;
-    movie1.external_ids["collection"] = "test-films";
-    movie1.media_ids = {"/Movies/one.mkv"};
-    movie1 = service.catalogue().upsert(movie1);
-
-    CatalogueItem movie2;
-    movie2.id = "movie:test:2";
-    movie2.kind = CatalogueKind::movie;
-    movie2.title = "Second Film";
-    movie2.year = 2003;
-    movie2.external_ids["collection"] = "test-films";
-    movie2.media_ids = {"path:/Movies/two.mkv"};
-    movie2 = service.catalogue().upsert(movie2);
-
-    HydrationConfig prediction_config;
-    prediction_config.catalogue_lookahead = 1;
-    PlaybackTracker prediction_tracker;
-    CatalogueSequenceHintProvider predictor(prediction_tracker, service.filesystem(),
-                                            service.catalogue(), prediction_config);
-
-    auto check_prediction = [&](const std::string& path, const FsEntry& current,
-                                const FsEntry& expected, const char* reason) {
-        auto active = prediction_tracker.open(path, current);
-        prediction_tracker.progress(active, 0);
-        auto predicted = predictor.hints();
-        REQUIRE(predicted.size() == 1);
-        CHECK(predicted[0].reason == reason);
-        REQUIRE(!predicted[0].objects.empty());
-        CHECK(predicted[0].objects.front() == expected.extents.front().id);
-        CHECK(predicted[0].objects.size() == expected.extents.size());
-        prediction_tracker.close(active);
-    };
-    check_prediction("/TV/s01e01.mkv", ep1_file, ep2_file, "next_episode");
-    check_prediction("/TV/s01e02.mkv", ep2_file, ep3_file, "next_episode");
-    check_prediction("/Movies/one.mkv", movie1_file, movie2_file, "next_movie");
 }
 
 MACHA_FAST_TEST("hydration_catalogue", test_catalogue_three_way_merge) {
@@ -586,7 +546,7 @@ MACHA_TEST("hydration_catalogue", test_cache_hydrator_fetches_to_persistent_cach
     n1.stop();
 }
 
-MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_scanner) {
+MACHA_FAST_TEST("hydration_catalogue", test_media_probe_and_metadata_providers) {
     CHECK(catalogue_media_profile_frame_type() == FrameType::speculative);
     // External IDs are part of the durable catalogue format. Read fields in
     // deterministic order: function-argument evaluation order must not be
@@ -1192,7 +1152,11 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
                 R"({"images":[{"front":true,"image":"https://images.example/original.jpg","thumbnails":{"500":"https://images.example/500.jpg"}}]})");
     CatalogueMusicBrainzConfig mb_config;
     mb_config.contact = "https://example.test/macha";
-    MusicBrainzProvider mb(mb_http, mb_config);
+    // Requests to MusicBrainz are spaced by their gate's interval, a second
+    // unless the gate is built with another. Each provider here has its own
+    // gate, as the gate also carries the circuit.
+    const auto unpaced = [] { return std::make_shared<MusicBrainzGate>(0ms); };
+    MusicBrainzProvider mb(mb_http, mb_config, std::make_shared<MusicBrainzGate>(25ms));
     MediaProbe music_probe;
     music_probe.kind = MediaProbeKind::track;
     music_probe.artist = "Pink Floyd";
@@ -1200,7 +1164,9 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     music_probe.title = "Speak to Me";
     music_probe.track = 1;
     music_probe.media_id = "macha:test-track";
+    const auto mb_started = Clock::now();
     auto mb_match = mb.lookup(music_probe);
+    CHECK(Clock::now() - mb_started >= 25ms);
     REQUIRE(mb_match.has_value());
     CHECK(mb_match->items.size() == 3);
     CHECK(mb_match->items[0].kind == CatalogueKind::artist);
@@ -1220,7 +1186,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
         R"JSON({"id":"rec-2","title":"The First Time (Raven Remix)","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"releases":[{"id":"rel-2","title":"The First Time"}]})JSON");
     mb_recording_http.add("/ws/2/release/rel-2", 200, "application/json",
         R"JSON({"id":"rel-2","title":"The First Time","date":"1995-05-01","artist-credit":[{"name":"Scooter","artist":{"id":"artist-2","name":"Scooter"}}],"release-group":{"id":"rg-2"},"media":[{"position":1,"tracks":[{"position":1,"title":"The First Time (Raven Remix)","recording":{"id":"rec-2","title":"The First Time (Raven Remix)"}}]}]})JSON");
-    MusicBrainzProvider mb_recording(mb_recording_http, mb_config);
+    MusicBrainzProvider mb_recording(mb_recording_http, mb_config, unpaced());
     MediaProbe recording_probe;
     recording_probe.kind = MediaProbeKind::track;
     recording_probe.artist = "Scooter";
@@ -1239,7 +1205,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
         R"JSON({"id":"rec-3","title":"Teardrop","artist-credit":[{"name":"Massive Attack","artist":{"id":"artist-3","name":"Massive Attack"}}],"releases":[{"id":"rel-other","title":"Mezzanine"},{"id":"rel-collected","title":"Collected"}]})JSON");
     mb_compilation_http.add("/ws/2/release/rel-collected", 200, "application/json",
         R"JSON({"id":"rel-collected","title":"Collected","date":"2006-03-27","artist-credit":[{"name":"Various Artists","artist":{"id":"artist-va","name":"Various Artists"}}],"release-group":{"id":"rg-collected"},"media":[{"position":1,"tracks":[{"position":4,"title":"Teardrop","recording":{"id":"rec-3","title":"Teardrop"}}]}]})JSON");
-    MusicBrainzProvider mb_compilation(mb_compilation_http, mb_config);
+    MusicBrainzProvider mb_compilation(mb_compilation_http, mb_config, unpaced());
     MediaProbe compilation_probe;
     compilation_probe.kind = MediaProbeKind::track;
     compilation_probe.artist = "Massive Attack";
@@ -1259,7 +1225,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     // later tracks/scans; transient failures use the provider circuit instead.
     FakeHttpClient mb_miss_http;
     mb_miss_http.add("/ws/2/release?", 200, "application/json", R"({"releases":[]})");
-    MusicBrainzProvider mb_miss(mb_miss_http, mb_config);
+    MusicBrainzProvider mb_miss(mb_miss_http, mb_config, unpaced());
     MediaProbe missing_track = music_probe;
     missing_track.album = "Definitely Missing Album";
     missing_track.title = "Track One";
@@ -1274,7 +1240,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
 
     FakeHttpClient mb_error_http;
     mb_error_http.add("/ws/2/release?", 503, "application/json", R"({})");
-    MusicBrainzProvider mb_error(mb_error_http, mb_config);
+    MusicBrainzProvider mb_error(mb_error_http, mb_config, unpaced());
     for (int attempt = 0; attempt < 2; ++attempt) {
         bool threw = false;
         try {
@@ -1372,30 +1338,24 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
         CHECK(threw);
     }
     CHECK(tmdb_error_http.requests() == 2);
+}
 
-    // End-to-end scanner: resolve a real MachaDFS entry, fetch
-    // poster/backdrop bytes, commit them with the catalogue, then prove a second
-    // scan is idempotent and deletion removes only the scanner-owned item.
-    TempDir t;
-    auto key = t.path() / "cluster.key";
-    write_key(key);
-    auto config = config_for(t.path() / "disk", key, free_port());
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.metadata_cache = 20ms;
-    auto keys = load_cluster_keys(key);
-    Service service(config, keys);
-    service.start();
+MACHA_TEST("hydration_catalogue", test_catalogue_scanner_matches_binds_and_reconciles_a_library) {
+    // CatalogueScanner end to end over one node's namespace and catalogue,
+    // with providers answered by a fake HTTP client: match and bind, stay
+    // idempotent, respect manual edits, rematch after Clear Metadata, reconcile
+    // deletions, stop mid-request, and budget provider requests fairly.
+    CatalogueNode node("catalogue-scanner-library");
 
     // Music scanning is tag-first and provider-root scoped. Deliberately put a
     // tagged MP3 under misleading collection/grouping directories: embedded
     // metadata must win, while untagged filename fallback must not manufacture
     // an artist/album from those same directories.
-    service.filesystem().mkdir("/Music", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/Music", 0755, getuid(), getgid());
     const std::string collection = "/Music/Scooter Full Discography (Albums & Singles 1994-2011)";
-    service.filesystem().mkdir(collection, 0755, getuid(), getgid());
+    node.filesystem().mkdir(collection, 0755, getuid(), getgid());
     const std::string singles = collection + "/Singles";
-    service.filesystem().mkdir(singles, 0755, getuid(), getgid());
+    node.filesystem().mkdir(singles, 0755, getuid(), getgid());
     auto fixture_bytes = [](const char* name) {
         auto path = std::filesystem::path(MACHA_TEST_SOURCE_DIR) / "tests" / "fixtures" / name;
         std::ifstream input(path, std::ios::binary);
@@ -1404,8 +1364,8 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
         return Bytes(bytes.begin(), bytes.end());
     };
     auto write_fixture = [&](const std::string& path, const Bytes& bytes) {
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        auto writer = service.filesystem().open_write(path, true);
+        node.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto writer = node.filesystem().open_write(path, true);
         REQUIRE(writer->write(0, bytes) == bytes.size());
         writer->commit();
     };
@@ -1420,38 +1380,38 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
 
     const std::string loose_path = singles + "/Scooter - The First Time (Raven Remix).mp3";
     write_fixture(loose_path, untagged_bytes);
-    auto loose_entry = service.filesystem().getattr(loose_path);
-    auto loose_probe = music_source.probe(service.filesystem(), "/Music", loose_path, loose_entry);
+    auto loose_entry = node.filesystem().getattr(loose_path);
+    auto loose_probe = music_source.probe(node.filesystem(), "/Music", loose_path, loose_entry);
     REQUIRE(loose_probe.has_value());
     CHECK(loose_probe->artist == "Scooter");
     CHECK(loose_probe->album.empty());
     CHECK(loose_probe->title == "The First Time (Raven Remix)");
 
     const std::string nested_album = singles + "/13 - [1996] I'm Raving CDM";
-    service.filesystem().mkdir(nested_album, 0755, getuid(), getgid());
+    node.filesystem().mkdir(nested_album, 0755, getuid(), getgid());
     const std::string nested_path = nested_album + "/01 - I'm Raving.mp3";
     write_fixture(nested_path, untagged_bytes);
-    auto nested_entry = service.filesystem().getattr(nested_path);
-    auto nested_probe = music_source.probe(service.filesystem(), "/Music", nested_path, nested_entry);
+    auto nested_entry = node.filesystem().getattr(nested_path);
+    auto nested_probe = music_source.probe(node.filesystem(), "/Music", nested_path, nested_entry);
     REQUIRE(nested_probe.has_value());
     CHECK(nested_probe->artist.empty());
     CHECK(nested_probe->album.empty());
     CHECK(nested_probe->track == 1);
     CHECK(nested_probe->title == "I'm Raving");
 
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-    service.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644,
+    node.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
+    node.filesystem().create_file("/Movies/Blade.Runner.2049.2017.1080p.mkv", 0644,
                                      getuid(), getgid());
     auto bytes = pattern(32768);
-    auto writer = service.filesystem().open_write(
+    auto writer = node.filesystem().open_write(
         "/Movies/Blade.Runner.2049.2017.1080p.mkv", true);
     REQUIRE(writer->write(0, bytes) == bytes.size());
     writer->commit();
-    auto entry = service.filesystem().getattr(
+    auto entry = node.filesystem().getattr(
         "/Movies/Blade.Runner.2049.2017.1080p.mkv");
     auto media_id = file_media_id(entry);
 
-    auto scanner_token = t.path() / "scanner-tmdb.token";
+    auto scanner_token = node.path() / "scanner-tmdb.token";
     {
         std::ofstream out(scanner_token);
         out << "scanner-token\n";
@@ -1474,51 +1434,51 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     scanner_config.tv.enabled = false;
     scanner_config.music.enabled = false;
     auto profile_engine = std::make_shared<FakeMediaEngine>();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
                              scanner_config, std::move(fake_http), 5s, profile_engine);
-    const auto namespace_before_scan = service.filesystem().namespace_signature();
+    const auto namespace_before_scan = node.filesystem().namespace_signature();
     CHECK(scanner.scan_once() == 1);
-    CHECK(service.filesystem().namespace_signature() == namespace_before_scan);
-    auto catalogued = service.catalogue().get("tmdb:movie:335984");
+    CHECK(node.filesystem().namespace_signature() == namespace_before_scan);
+    auto catalogued = node.catalogue().get("tmdb:movie:335984");
     REQUIRE(catalogued.has_value());
     CHECK(catalogued->title == "Blade Runner 2049");
     CHECK(catalogued->external_ids.at("tmdb_collection") == "422837");
     CHECK(catalogued->external_ids.at("macha_scanner") == "1");
     CHECK(catalogued->media_ids == std::vector<std::string>{media_id});
-    REQUIRE(service.catalogue().media_profile(media_id).has_value());
+    REQUIRE(node.catalogue().media_profile(media_id).has_value());
     CHECK(profile_engine->probes() == 1);
     CHECK(catalogued->artwork.size() == 2);
     for (const auto& art : catalogued->artwork)
-        CHECK(service.local_state().data().has(art.id));
+        CHECK(node.node().local_store().has(art.id));
     auto revision = catalogued->revision;
     CHECK(scanner.scan_once() == 0);
-    REQUIRE(service.catalogue().get("tmdb:movie:335984").has_value());
-    CHECK(service.catalogue().get("tmdb:movie:335984")->revision == revision);
+    REQUIRE(node.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(node.catalogue().get("tmdb:movie:335984")->revision == revision);
 
     // Manual metadata editing is authoritative. A later scanner discovery for
     // another local copy may add media bindings, but must not silently overwrite
     // the user's descriptive changes.
-    auto manual = *service.catalogue().get("tmdb:movie:335984");
+    auto manual = *node.catalogue().get("tmdb:movie:335984");
     manual.title = "Blade Runner Custom";
     manual.sort_title = manual.title;
     manual.synopsis = "A manually edited synopsis.";
     manual.external_ids["macha_metadata_locked"] = "1";
-    auto manually_saved = service.catalogue().upsert(std::move(manual), revision);
+    auto manually_saved = node.catalogue().upsert(std::move(manual), revision);
     revision = manually_saved.revision;
 
     // A second file resolving to the same title adds another binding without
     // losing the already-bound media identity.
     const std::string alternate = "/Movies/Blade.Runner.2049.2017.Remux.mkv";
-    service.filesystem().create_file(alternate, 0644, getuid(), getgid());
+    node.filesystem().create_file(alternate, 0644, getuid(), getgid());
     auto alternate_bytes = pattern(32769);
-    auto alternate_writer = service.filesystem().open_write(alternate, true);
+    auto alternate_writer = node.filesystem().open_write(alternate, true);
     REQUIRE(alternate_writer->write(0, alternate_bytes) == alternate_bytes.size());
     alternate_writer->commit();
-    CHECK(service.filesystem().namespace_signature() != namespace_before_scan);
-    auto alternate_id = file_media_id(service.filesystem().getattr(alternate));
+    CHECK(node.filesystem().namespace_signature() != namespace_before_scan);
+    auto alternate_id = file_media_id(node.filesystem().getattr(alternate));
     CHECK(alternate_id != media_id);
     CHECK(scanner.scan_once() == 1);
-    auto twice = service.catalogue().get("tmdb:movie:335984");
+    auto twice = node.catalogue().get("tmdb:movie:335984");
     REQUIRE(twice.has_value());
     CHECK(twice->title == "Blade Runner Custom");
     CHECK(twice->synopsis == "A manually edited synopsis.");
@@ -1533,7 +1493,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     // matched item. It also returns the exact immutable media identities that
     // became unbound, so recovery can enqueue only those files instead of
     // reopening every terminal/no-match hint in the library.
-    auto cleared = service.catalogue().clear_metadata_with_media(
+    auto cleared = node.catalogue().clear_metadata_with_media(
         "tmdb:movie:335984", twice->revision);
     CHECK(cleared.removed_items == 1);
     CHECK(cleared.media_ids.size() == 2);
@@ -1541,18 +1501,18 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
           cleared.media_ids.end());
     CHECK(std::find(cleared.media_ids.begin(), cleared.media_ids.end(), alternate_id) !=
           cleared.media_ids.end());
-    CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(!node.catalogue().get("tmdb:movie:335984").has_value());
     CHECK(scanner.request_media_rescan(cleared.media_ids) == 2);
-    CHECK(service.catalogue_hints().summary().pending == 2);
+    CHECK(node.hints().summary().pending == 2);
     scanner.start();
     REQUIRE(wait_until([&] {
-        auto item = service.catalogue().get("tmdb:movie:335984");
-        return item && service.catalogue_hints().summary().pending == 0;
+        auto item = node.catalogue().get("tmdb:movie:335984");
+        return item && node.hints().summary().pending == 0;
     }, 5s));
     scanner.stop();
-    CHECK(std::filesystem::exists(service.node().config().state_path /
+    CHECK(std::filesystem::exists(node.config().state_path /
                                   "catalogue" / "scanner.state"));
-    auto rematched = service.catalogue().get("tmdb:movie:335984");
+    auto rematched = node.catalogue().get("tmdb:movie:335984");
     REQUIRE(rematched.has_value());
     CHECK(rematched->title == "Blade Runner 2049");
     CHECK(rematched->synopsis == "A blade runner uncovers a long-buried secret.");
@@ -1564,36 +1524,33 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
 
     // Deletion reconciles duplicate bindings one at a time and removes the
     // scanner-owned item only after the final copy goes.
-    service.filesystem().unlink("/Movies/Blade.Runner.2049.2017.1080p.mkv");
-    std::this_thread::sleep_for(config.metadata_cache + 20ms);
+    node.filesystem().unlink("/Movies/Blade.Runner.2049.2017.1080p.mkv");
     CHECK(scanner.scan_once() == 0);
-    auto partial = service.catalogue().get("tmdb:movie:335984");
+    auto partial = node.catalogue().get("tmdb:movie:335984");
     REQUIRE(partial.has_value());
     CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), media_id) != partial->media_ids.end());
     CHECK(std::find(partial->media_ids.begin(), partial->media_ids.end(), alternate_id) != partial->media_ids.end());
 
     // Once the previously unavailable root exists, the scan is complete and
     // destructive reconciliation may safely remove the vanished first binding.
-    service.filesystem().mkdir("/Missing", 0755, getuid(), getgid());
-    std::this_thread::sleep_for(config.metadata_cache + 20ms);
+    node.filesystem().mkdir("/Missing", 0755, getuid(), getgid());
     CHECK(scanner.scan_once() == 0);
-    auto remaining = service.catalogue().get("tmdb:movie:335984");
+    auto remaining = node.catalogue().get("tmdb:movie:335984");
     REQUIRE(remaining.has_value());
     CHECK(remaining->media_ids == std::vector<std::string>{alternate_id});
 
-    service.filesystem().unlink(alternate);
-    std::this_thread::sleep_for(config.metadata_cache + 20ms);
-    CHECK(service.filesystem().readdir("/Movies").empty());
+    node.filesystem().unlink(alternate);
+    CHECK(node.filesystem().readdir("/Movies").empty());
     CHECK(scanner.scan_once() == 0);
-    CHECK(!service.catalogue().get("tmdb:movie:335984").has_value());
+    CHECK(!node.catalogue().get("tmdb:movie:335984").has_value());
 
     // Shutdown must not wait for a complete catalogue scan. request_stop()
     // propagates into the HTTP client so an in-flight provider request is
     // interrupted, and scan_once(stop) abandons the partial pass without a
     // reconciliation commit.
     const std::string shutdown_path = "/Movies/Shutdown.Test.2020.mkv";
-    service.filesystem().create_file(shutdown_path, 0644, getuid(), getgid());
-    auto shutdown_writer = service.filesystem().open_write(shutdown_path, true);
+    node.filesystem().create_file(shutdown_path, 0644, getuid(), getgid());
+    auto shutdown_writer = node.filesystem().open_write(shutdown_path, true);
     auto shutdown_bytes = pattern(32769);
     REQUIRE(shutdown_writer->write(0, shutdown_bytes) == shutdown_bytes.size());
     shutdown_writer->commit();
@@ -1602,7 +1559,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     auto* blocking_http_ptr = blocking_http.get();
     auto cancel_config = scanner_config;
     cancel_config.movies.roots = {"/Movies"};
-    CatalogueScanner cancel_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner cancel_scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
                                     cancel_config, std::move(blocking_http));
     // Scanner startup is idle on an already-operated library, so request the
     // pass whose in-flight provider request this test exercises.
@@ -1617,7 +1574,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     // Online metadata enrichment is bounded by actual provider HTTP requests,
     // not by the number of files. Completed discoveries commit normally and a
     // later pass resumes with already-bound media skipped.
-    service.filesystem().mkdir("/Budget", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/Budget", 0755, getuid(), getgid());
     const std::array<std::pair<const char*, uint8_t>, 3> budget_files{{
         {"/Budget/Budget.One.2020.mkv", 1},
         {"/Budget/Budget.Two.2021.mkv", 2},
@@ -1625,11 +1582,11 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     }};
     std::set<std::string> budget_media_ids;
     for (const auto& [path, marker] : budget_files) {
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        auto w = service.filesystem().open_write(path, true);
+        node.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto w = node.filesystem().open_write(path, true);
         REQUIRE(w->write(0, Bytes{marker, 2, 3, 4}) == 4);
         w->commit();
-        budget_media_ids.insert(file_media_id(service.filesystem().getattr(path)));
+        budget_media_ids.insert(file_media_id(node.filesystem().getattr(path)));
     }
     REQUIRE(budget_media_ids.size() == budget_files.size());
     auto budget_http = std::make_unique<FakeHttpClient>();
@@ -1651,40 +1608,40 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     budget_config.movies.roots = {"/Budget"};
     budget_config.max_provider_requests_per_scan = 4;
     budget_config.provider_batch_delay = 1000ms;
-    CatalogueScanner budget_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner budget_scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
                                     budget_config, std::move(budget_http));
     CHECK(budget_scanner.scan_once() == 2);
     CHECK(budget_http_ptr->requests() == 4);
     size_t first_batch_items = 0;
     for (const auto* id : {"tmdb:movie:2001", "tmdb:movie:2002", "tmdb:movie:2003"})
-        if (service.catalogue().get(id).has_value()) ++first_batch_items;
+        if (node.catalogue().get(id).has_value()) ++first_batch_items;
     CHECK(first_batch_items == 2);
     CHECK(budget_scanner.scan_once() == 1);
     CHECK(budget_http_ptr->requests() == 6);
-    CHECK(service.catalogue().get("tmdb:movie:2001").has_value());
-    CHECK(service.catalogue().get("tmdb:movie:2002").has_value());
-    CHECK(service.catalogue().get("tmdb:movie:2003").has_value());
+    CHECK(node.catalogue().get("tmdb:movie:2001").has_value());
+    CHECK(node.catalogue().get("tmdb:movie:2002").has_value());
+    CHECK(node.catalogue().get("tmdb:movie:2003").has_value());
 
     // Provider request budgeting is fair across media domains. A long run of
     // movie misses must not consume the whole batch before TV and Music get a
     // lookup opportunity.
-    service.filesystem().mkdir("/FairMovies", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/FairMovies", 0755, getuid(), getgid());
     for (int i = 1; i <= 4; ++i) {
         const auto path = "/FairMovies/Fair.Movie." + std::to_string(i) + ".mkv";
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        auto w = service.filesystem().open_write(path, true);
+        node.filesystem().create_file(path, 0644, getuid(), getgid());
+        auto w = node.filesystem().open_write(path, true);
         REQUIRE(w->write(0, Bytes{static_cast<uint8_t>(i), 2, 3, 4}) == 4);
         w->commit();
     }
-    service.filesystem().mkdir("/FairTV", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/FairTV", 0755, getuid(), getgid());
     const std::string fair_tv = "/FairTV/Fair.Show.S01E01.mkv";
-    service.filesystem().create_file(fair_tv, 0644, getuid(), getgid());
-    auto fair_tv_writer = service.filesystem().open_write(fair_tv, true);
+    node.filesystem().create_file(fair_tv, 0644, getuid(), getgid());
+    auto fair_tv_writer = node.filesystem().open_write(fair_tv, true);
     REQUIRE(fair_tv_writer->write(0, Bytes{9, 8, 7, 6}) == 4);
     fair_tv_writer->commit();
-    service.filesystem().mkdir("/FairMusic", 0755, getuid(), getgid());
-    service.filesystem().mkdir("/FairMusic/Fair Artist", 0755, getuid(), getgid());
-    service.filesystem().mkdir("/FairMusic/Fair Artist/Fair Album", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/FairMusic", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/FairMusic/Fair Artist", 0755, getuid(), getgid());
+    node.filesystem().mkdir("/FairMusic/Fair Artist/Fair Album", 0755, getuid(), getgid());
     const std::string fair_music = "/FairMusic/Fair Artist/Fair Album/01 - Fair Track.mp3";
     write_fixture(fair_music, untagged_bytes);
 
@@ -1702,320 +1659,191 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_media_probe_and_online_catalogue_sc
     fair_config.music.roots = {"/FairMusic"};
     fair_config.music.musicbrainz.enabled = true;
     fair_config.max_provider_requests_per_scan = 3;
-    CatalogueScanner fair_scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(), service.catalogue_hints(),
+    CatalogueScanner fair_scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(), node.hints(),
                                   fair_config, std::move(fair_http));
     CHECK(fair_scanner.scan_once() == 0);
     CHECK(fair_http_ptr->requests() == 3);
     CHECK(fair_http_ptr->requests_containing("/search/movie") == 1);
     CHECK(fair_http_ptr->requests_containing("/search/tv") == 1);
     CHECK(fair_http_ptr->requests_containing("/ws/2/release?") == 1);
-
-    service.stop();
 }
 
-MACHA_TEST("hydration_catalogue", test_catalogue_ignores_paths_carrying_an_ignore_term) {
-    // Release samples sit beside the film they sample, in a Sample directory
-    // or with a -sample suffix, and name the same title. The default
-    // ignore_terms keeps them out, so the title binds only the film itself.
-    TestService fixture("catalogue-ignore-terms");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-    auto write = [&](const std::string& path, uint8_t seed) {
-        service.filesystem().create_file(path, 0644, getuid(), getgid());
-        const auto bytes = pattern(32768, seed);
-        auto writer = service.filesystem().open_write(path, true);
-        REQUIRE(writer->write(0, bytes) == bytes.size());
-        writer->commit();
-        return file_media_id(service.filesystem().getattr(path));
+MACHA_TEST("hydration_catalogue", test_catalogue_scanner_admits_only_what_is_ready_to_catalogue) {
+    // CatalogueScanner over one node's namespace, each behaviour under its own
+    // root: a restart does not rescan an unchanged namespace; zero-length files
+    // wait for committed content; a terminal profile job is not requeued; paths
+    // carrying an ignore term are skipped; and a hint newer than its batch's
+    // snapshot is deferred, not failed.
+    CatalogueNode node("catalogue-scanner");
+    const auto token = write_token(node.path() / "tmdb.token", "test-token");
+    const auto scanner_for = [&](const std::string& root) {
+        CatalogueScannerConfig config;
+        config.enabled = true;
+        config.movies.roots = {root};
+        config.movies.tmdb.token_file = token;
+        config.tv.enabled = false;
+        config.music.enabled = false;
+        return config;
     };
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-    service.filesystem().mkdir("/Movies/Sample", 0755, getuid(), getgid());
-    const auto film = write("/Movies/Blade.Runner.2049.2017.1080p.mkv", 1);
-    (void)write("/Movies/Sample/Blade.Runner.2049.2017.1080p.mkv", 2);
-    (void)write("/Movies/Blade.Runner.2049.2017.1080p-sample.mkv", 3);
 
-    const auto token = fixture.path() / "scanner-tmdb.token";
+    // Hint state on disk and no scanner.state: the elected coordinator seeds
+    // scanner.state from the current namespace and waits for its interval,
+    // rather than walking the root at process start.
     {
-        std::ofstream out(token);
-        out << "scanner-token\n";
+        node.mkdir("/Restart");
+        (void)node.write("/Restart/Unbound.2026.mkv", pattern(4096));
+        std::filesystem::create_directories(node.config().state_path / "catalogue");
+        {
+            std::ofstream out(node.config().state_path / "catalogue" / "hints.json");
+            out << R"({"version":2,"hints":[]})";
+        }
+        auto config = scanner_for("/Restart");
+        config.interval = 1h;
+        config.rescan_debounce = 50ms;
+        config.rescan_max_delay = 1s;
+        auto http = std::make_unique<FakeHttpClient>();
+        auto* requests = http.get();
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
+                                 node.hints(), config, std::move(http));
+        scanner.start();
+        REQUIRE(wait_until([&] {
+            return std::filesystem::exists(node.config().state_path / "catalogue" / "scanner.state");
+        }, 2s));
+        // Past the rescan debounce: a walk would have happened by now.
+        std::this_thread::sleep_for(80ms);
+        scanner.stop();
+        CHECK(node.hints().summary().total == 0);
+        CHECK(requests->requests() == 0);
     }
-    auto http = std::make_unique<FakeHttpClient>();
-    http->add("/search/movie", 200, "application/json",
-              R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
-    http->add("/movie/335984", 200, "application/json",
-              R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
 
-    CatalogueScannerConfig scanner_config;
-    scanner_config.enabled = true;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.enabled = false;
-    scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                             service.catalogue_hints(), scanner_config, std::move(http), 5s,
-                             std::make_shared<FakeMediaEngine>());
-    CHECK(scanner.scan_once() == 1);
-    const auto item = service.catalogue().get("tmdb:movie:335984");
-    REQUIRE(item.has_value());
-    CHECK(item->media_ids == std::vector<std::string>{film});
-
-    // With no terms, the same scan binds all three.
-    auto everything_http = std::make_unique<FakeHttpClient>();
-    everything_http->add("/search/movie", 200, "application/json",
-                         R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
-    everything_http->add("/movie/335984", 200, "application/json",
-                         R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
-    auto everything_config = scanner_config;
-    everything_config.ignore_terms.clear();
-    CatalogueScanner everything(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                                service.catalogue_hints(), everything_config,
-                                std::move(everything_http), 5s,
-                                std::make_shared<FakeMediaEngine>());
-    (void)everything.scan_once();
-    const auto all = service.catalogue().get("tmdb:movie:335984");
-    REQUIRE(all.has_value());
-    CHECK(all->media_ids.size() == 3);
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_zero_length_files_wait_for_committed_content) {
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-    const std::string path = "/Movies/Transient.Movie.2026.mkv";
-    service.filesystem().create_file(path, 0644, getuid(), getgid());
-    const auto empty_entry = service.filesystem().getattr(path);
-    REQUIRE(empty_entry.type == EntryType::file);
-    REQUIRE(empty_entry.size == 0);
-    const auto empty_media_id = file_media_id(empty_entry);
-
-    auto token = fixture.path() / "tmdb.token";
+    // Discovery must not manufacture one shared identity for every zero-length
+    // shell, queue provider work, or contact TMDB; a hint racing publication
+    // stays deferred; committed content reopens the path and matches at once.
     {
-        std::ofstream out(token);
-        out << "test-token\n";
+        node.mkdir("/Transient");
+        const std::string path = "/Transient/Transient.Movie.2026.mkv";
+        node.filesystem().create_file(path, 0644, getuid(), getgid());
+        const auto empty_entry = node.filesystem().getattr(path);
+        REQUIRE(empty_entry.size == 0);
+        const auto empty_media_id = file_media_id(empty_entry);
+        auto http = std::make_unique<FakeHttpClient>();
+        auto* requests = http.get();
+        http->add("/search/movie", 200, "application/json",
+                  R"({"results":[{"id":4242,"title":"Transient Movie","release_date":"2026-01-01"}]})");
+        http->add("/movie/4242", 200, "application/json",
+                  R"({"id":4242,"title":"Transient Movie","release_date":"2026-01-01"})");
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
+                                 node.hints(), scanner_for("/Transient"), std::move(http));
+        CHECK(scanner.scan_once() == 0);
+        CHECK(node.hints().summary().total == 0);
+        CHECK(requests->requests() == 0);
+
+        const auto hint_id = node.hints().submit(path, "namespace", empty_media_id,
+                                                 CatalogueHintPriority::namespace_mutation);
+        CHECK(scanner.scan_once() == 0);
+        auto waiting = node.hints().get(hint_id);
+        REQUIRE(waiting.has_value());
+        CHECK(waiting->state == CatalogueHintState::deferred);
+        CHECK(waiting->result.empty());
+        CHECK(waiting->error == "namespace media file has no committed content yet");
+        CHECK(requests->requests() == 0);
+
+        const auto committed_media_id = node.write(path, pattern(32768));
+        CHECK(committed_media_id != empty_media_id);
+        CHECK(scanner.scan_once() == 1);
+        auto item = node.catalogue().get("tmdb:movie:4242");
+        REQUIRE(item.has_value());
+        CHECK(item->media_ids == std::vector<std::string>{committed_media_id});
+        CHECK(requests->requests() == 2);
     }
-    auto fake_http = std::make_unique<FakeHttpClient>();
-    auto* fake_http_ptr = fake_http.get();
-    fake_http->add("/search/movie", 200, "application/json",
-                   R"({"results":[{"id":4242,"title":"Transient Movie","release_date":"2026-01-01"}]})");
-    fake_http->add("/movie/4242", 200, "application/json",
-                   R"({"id":4242,"title":"Transient Movie","release_date":"2026-01-01"})");
 
-    CatalogueScannerConfig scanner_config;
-    scanner_config.enabled = true;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.enabled = false;
-    scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                             service.catalogue_hints(), scanner_config, std::move(fake_http));
-
-    // Discovery must not manufacture one shared immutable identity for every
-    // zero-length namespace shell, queue provider work, or contact TMDB.
-    CHECK(scanner.scan_once() == 0);
-    CHECK(service.catalogue_hints().summary().total == 0);
-    CHECK(fake_http_ptr->requests() == 0);
-
-    // A hint admitted just before the namespace becomes visible can still race
-    // with publication. It must remain pending rather than becoming a durable
-    // semantic no-match for a file whose content has not committed yet.
-    const auto hint_id = service.catalogue_hints().submit(
-        path, "namespace", empty_media_id, CatalogueHintPriority::namespace_mutation);
-    CHECK(scanner.scan_once() == 0);
-    auto waiting = service.catalogue_hints().get(hint_id);
-    REQUIRE(waiting.has_value());
-    CHECK(waiting->state == CatalogueHintState::deferred);
-    CHECK(waiting->result.empty());
-    CHECK(waiting->error == "namespace media file has no committed content yet");
-    CHECK(fake_http_ptr->requests() == 0);
-
-    // Once the real extent manifest commits, the changed media identity reopens
-    // the same path and normal provider matching proceeds immediately.
-    auto writer = service.filesystem().open_write(path, true);
-    auto bytes = pattern(32768);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto committed_entry = service.filesystem().getattr(path);
-    REQUIRE(committed_entry.size == bytes.size());
-    const auto committed_media_id = file_media_id(committed_entry);
-    CHECK(committed_media_id != empty_media_id);
-
-    CHECK(scanner.scan_once() == 1);
-    auto item = service.catalogue().get("tmdb:movie:4242");
-    REQUIRE(item.has_value());
-    CHECK(item->media_ids == std::vector<std::string>{committed_media_id});
-    CHECK(fake_http_ptr->requests() == 2);
-}
-
-MACHA_TEST("hydration_catalogue", test_terminal_media_profile_job_is_not_requeued_forever) {
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    auto& service = fixture.start();
-
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-    const std::string path = "/Movies/Profile.Failure.2026.mp4";
-    service.filesystem().create_file(path, 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write(path, true);
-    auto bytes = pattern(32771);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-    const auto media_id = file_media_id(service.filesystem().getattr(path));
-
-    auto token = fixture.path() / "tmdb.token";
+    // A retry of a failed profile job observes the terminal result instead of
+    // reopening it; playback reads zero as leave to use its bounded fallback.
     {
-        std::ofstream out(token);
-        out << "test-token\n";
+        node.mkdir("/Profiles");
+        const auto media_id = node.write("/Profiles/Profile.Failure.2026.mp4", pattern(32771));
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
+                                 node.hints(), scanner_for("/Profiles"), std::make_unique<FakeHttpClient>(), 5s,
+                                 std::make_shared<FakeMediaEngine>());
+        CHECK(scanner.request_media_profiles({media_id}) == 1);
+        std::string queued_id;
+        for (const auto& hint : node.hints().list())
+            if (hint.state == CatalogueHintState::queued) queued_id = hint.id;
+        REQUIRE(!queued_id.empty());
+        node.hints().fail(queued_id, "synthetic_failure", "synthetic profile failure");
+        CHECK(scanner.request_media_profiles({media_id}) == 0);
+        auto terminal = node.hints().get(queued_id);
+        REQUIRE(terminal.has_value());
+        CHECK(terminal->state == CatalogueHintState::failed);
+        CHECK(!node.catalogue().media_profile(media_id).has_value());
     }
-    CatalogueScannerConfig scanner_config;
-    scanner_config.enabled = true;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.enabled = false;
-    scanner_config.music.enabled = false;
-    auto profile_engine = std::make_shared<FakeMediaEngine>();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                             service.catalogue_hints(), scanner_config,
-                             std::make_unique<FakeHttpClient>(), 5s, profile_engine);
 
-    CHECK(scanner.request_media_profiles({media_id}) == 1);
-    auto hints = service.catalogue_hints().list();
-    REQUIRE(hints.size() == 1);
-    CHECK(hints.front().state == CatalogueHintState::queued);
-    service.catalogue_hints().fail(hints.front().id, "synthetic_failure", "synthetic profile failure");
-
-    // A retry observes the terminal result instead of reopening the same
-    // immutable profile job and reporting an endless pending state. Playback
-    // interprets zero as permission to use its bounded media-engine fallback.
-    CHECK(scanner.request_media_profiles({media_id}) == 0);
-    auto terminal = service.catalogue_hints().get(hints.front().id);
-    REQUIRE(terminal.has_value());
-    CHECK(terminal->state == CatalogueHintState::failed);
-    CHECK(!service.catalogue().media_profile(media_id).has_value());
-
-    service.stop();
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_cache_ignores_unrelated_metadata_generation) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-
-    BareNode node(config, keys);
-    node.start();
-    REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
-
-    CatalogueItem item;
-    item.id = "test:movie:1";
-    item.kind = CatalogueKind::movie;
-    item.title = "Cached Movie";
-    auto committed = catalogue.upsert(item);
-    CHECK(committed.title == "Cached Movie");
-
-    auto status = catalogue.status();
-    REQUIRE(status.root.has_value());
-    REQUIRE(node.control_store().remove(*status.root));
-
-    // Advance ordinary filesystem metadata without changing catalogue_root.
-    // The warm immutable catalogue must remain usable even though its local
-    // CONTROL manifest has deliberately been made unavailable.
-    metadata.mutate([](MetadataSnapshot& snapshot) {
-        auto root = snapshot.entries.find("/");
-        REQUIRE(root != snapshot.entries.end());
-        ++root->second.version;
-        ++root->second.mtime_ns;
-    });
-
-    auto cached = catalogue.get("test:movie:1");
-    REQUIRE(cached.has_value());
-    CHECK(cached->title == "Cached Movie");
-    // The global metadata generation is newer, but the decoded immutable view
-    // proves that catalogue_root did not change. A missing-item mutation can
-    // therefore return 404 without entering quorum repair.
-    CHECK(catalogue.definitely_absent("test:movie:missing"));
-
-    // CONTROL durability is stronger than API-cache availability. Background
-    // convergence must notice that the authoritative manifest is missing and
-    // fail closed, while the already-loaded immutable snapshot remains usable.
-    bool repair_failed = false;
-    try {
-        catalogue.repair_once();
-    } catch (const CatalogueUnavailable&) {
-        repair_failed = true;
-    }
-    CHECK(repair_failed);
-    auto after_repair = catalogue.get("test:movie:1");
-    REQUIRE(after_repair.has_value());
-    CHECK(after_repair->title == "Cached Movie");
-
-    node.stop();
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_scanner_restart_does_not_rescan_unchanged_namespace) {
-    TestService fixture("store");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false; // explicit scanner below
-    auto& service = fixture.start();
-
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-    service.filesystem().create_file("/Movies/Unbound.2026.mkv", 0644, getuid(), getgid());
-    auto writer = service.filesystem().open_write("/Movies/Unbound.2026.mkv", true);
-    auto bytes = pattern(4096);
-    REQUIRE(writer->write(0, bytes) == bytes.size());
-    writer->commit();
-
-    // A durable hint-state file with no hints and no scanner.state. Coordinator
-    // election must seed scanner.state from the current immutable namespace and
-    // wait for the normal safety interval, not walk /Movies at process start.
-    std::filesystem::create_directories(config.state_path / "catalogue");
+    // Release samples sit beside the film they sample and name the same title.
+    // The default ignore_terms keeps them out; with no terms all three bind.
     {
-        std::ofstream out(config.state_path / "catalogue" / "hints.json");
-        out << R"({"version":2,"hints":[]})";
+        node.mkdir("/Samples");
+        node.mkdir("/Samples/Sample");
+        const auto film = node.write("/Samples/Blade.Runner.2049.2017.1080p.mkv", pattern(32768, 1));
+        (void)node.write("/Samples/Sample/Blade.Runner.2049.2017.1080p.mkv", pattern(32768, 2));
+        (void)node.write("/Samples/Blade.Runner.2049.2017.1080p-sample.mkv", pattern(32768, 3));
+        const auto blade_runner = [] {
+            auto http = std::make_unique<FakeHttpClient>();
+            http->add("/search/movie", 200, "application/json",
+                      R"({"results":[{"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"}]})");
+            http->add("/movie/335984", 200, "application/json",
+                      R"({"id":335984,"title":"Blade Runner 2049","release_date":"2017-10-04"})");
+            return http;
+        };
+        const auto config = scanner_for("/Samples");
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
+                                 node.hints(), config, blade_runner(), 5s, std::make_shared<FakeMediaEngine>());
+        CHECK(scanner.scan_once() == 1);
+        const auto item = node.catalogue().get("tmdb:movie:335984");
+        REQUIRE(item.has_value());
+        CHECK(item->media_ids == std::vector<std::string>{film});
+
+        auto everything_config = config;
+        everything_config.ignore_terms.clear();
+        CatalogueScanner everything(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
+                                    node.hints(), everything_config, blade_runner(), 5s,
+                                    std::make_shared<FakeMediaEngine>());
+        (void)everything.scan_once();
+        const auto all = node.catalogue().get("tmdb:movie:335984");
+        REQUIRE(all.has_value());
+        CHECK(all->media_ids.size() == 3);
     }
 
-    auto token = fixture.path() / "tmdb.token";
+    // A hint created after its batch's namespace snapshot is deferred to the
+    // next batch; absent from a snapshot taken after the hint, it is gone.
     {
-        std::ofstream out(token);
-        out << "test-token\n";
-    }
-    CatalogueScannerConfig scanner_config;
-    scanner_config.enabled = true;
-    scanner_config.interval = 1h;
-    scanner_config.rescan_debounce = 50ms;
-    scanner_config.rescan_max_delay = 1s;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.movies.tmdb.token_file = token;
-    scanner_config.tv.enabled = false;
-    scanner_config.music.enabled = false;
+        node.mkdir("/Late");
+        CatalogueScanner scanner(node.node(), node.node().metadata_server(), node.filesystem(), node.catalogue(),
+                                 node.hints(), scanner_for("/Late"), std::make_unique<FakeHttpClient>());
+        const auto claim = [&](const std::string& id) {
+            // Earlier blocks left settled hints; claim until this one comes up.
+            for (auto claimed = node.hints().claim_next(); claimed; claimed = node.hints().claim_next())
+                if (claimed->id == id) return *claimed;
+            throw std::runtime_error("hint was never claimable: " + id);
+        };
+        const auto snapshot = node.metadata().snapshot(); // no such file in it
+        const auto taken = unix_ms();
+        DistributedStore::DurabilityBatch batch;
+        const auto late_id = node.hints().submit("/Late/Late (2026)/Late.mkv", "ingest", "job",
+                                                 CatalogueHintPriority::ingest);
+        const auto late = claim(late_id);
+        REQUIRE(late.created_unix_ms >= taken);
+        CHECK(!scanner.prepare_hint(late, {}, snapshot, taken, batch).has_value());
+        CHECK(node.hints().get(late_id)->state == CatalogueHintState::deferred);
+        CHECK(node.hints().get(late_id)->error_code == "path_not_yet_visible");
 
-    auto fake_http = std::make_unique<FakeHttpClient>();
-    auto* fake_http_ptr = fake_http.get();
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                             service.catalogue_hints(), scanner_config, std::move(fake_http));
-    scanner.start();
-    REQUIRE(wait_until([&] {
-        return std::filesystem::exists(config.state_path / "catalogue" / "scanner.state");
-    }, 1s));
-    std::this_thread::sleep_for(80ms);
-    CHECK(service.catalogue_hints().summary().total == 0);
-    CHECK(fake_http_ptr->requests() == 0);
-    scanner.stop();
+        const auto gone_id = node.hints().submit("/Late/Gone (2026)/Gone.mkv", "ingest", "job",
+                                                 CatalogueHintPriority::ingest);
+        const auto gone = claim(gone_id);
+        const auto later = node.metadata().snapshot();
+        CHECK(!scanner.prepare_hint(gone, {}, later, unix_ms() + 1, batch).has_value());
+        CHECK(node.hints().get(gone_id)->state == CatalogueHintState::failed);
+        CHECK(node.hints().get(gone_id)->error_code == "path_missing");
+    }
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_spin) {
@@ -2083,7 +1911,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     s2.stop();
     s1.stop();
 }
-
 
 MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_follows_machadfs_rename_and_delete) {
     TempDir temp;
@@ -2336,9 +2163,6 @@ MACHA_FAST_TEST("hydration_catalogue", test_catalogue_hint_queue_persistence_coa
     CHECK(*ready_delay == 0ms);
 }
 
-// A node with no torrent plugin loaded -- not built, not installed, or
-// faulted and between restarts -- must answer honestly rather than assuming
-// the engine is there. This needs no plugin at all, which is the point.
 MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_the_wire_and_reaches_the_api) {
     // A downloaded torrent waits while its extents are published into the
     // store; the job says how far that has got, and why it is waiting.
@@ -2372,39 +2196,101 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_jobs_publication_travels_t
     CHECK(none.find("waiting_reason")->isNull());
 }
 
-MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_answers_from_the_cluster_view) {
-    TestNode fixture("torrent-absent");
+namespace {
+
+// The TorrentService a coordinator drives, as a table of jobs: adopt, pause,
+// resume, cancel and clear move a job's state as the plugin's manager does,
+// with no engine behind them.
+class TableTorrentService final : public TorrentService {
+    mutable std::mutex mutex_;
+    std::map<std::string, TorrentJob, std::less<>> jobs_;
+
+    bool set_state(std::string_view id, TorrentJobState state) {
+        std::lock_guard lock(mutex_);
+        const auto found = jobs_.find(id);
+        if (found == jobs_.end()) return false;
+        found->second.state = state;
+        return true;
+    }
+
+  public:
+    void put(TorrentJob job) {
+        std::lock_guard lock(mutex_);
+        jobs_[job.id] = std::move(job);
+    }
+
+    bool enabled() const noexcept override { return true; }
+    void reconfigure(TorrentConfig) override {}
+    std::string add(std::string) override { throw std::runtime_error("adds go through the coordinator"); }
+    std::string add_search_result(std::string) override {
+        throw std::runtime_error("adds go through the coordinator");
+    }
+    std::vector<TorrentJob> jobs() const override {
+        std::lock_guard lock(mutex_);
+        std::vector<TorrentJob> out;
+        for (const auto& [_, job] : jobs_) out.push_back(job);
+        return out;
+    }
+    std::optional<TorrentJob> job(std::string_view id) const override {
+        std::lock_guard lock(mutex_);
+        const auto found = jobs_.find(id);
+        return found == jobs_.end() ? std::nullopt : std::optional<TorrentJob>{found->second};
+    }
+    bool pause(std::string_view id) override { return set_state(id, TorrentJobState::paused); }
+    bool resume(std::string_view id) override { return set_state(id, TorrentJobState::downloading); }
+    bool retry(std::string_view) override { return false; }
+    bool cancel(std::string_view id) override { return set_state(id, TorrentJobState::cancelled); }
+    bool clear(std::string_view id) override {
+        std::lock_guard lock(mutex_);
+        const auto found = jobs_.find(id);
+        if (found == jobs_.end()) return false;
+        jobs_.erase(found);
+        return true;
+    }
+    Placement place(std::string_view, bool) override { return {}; }
+    Offer offer() const override { return {true, {}, 8, 0}; }
+    Resolved resolve(std::string_view uri, bool) override {
+        return {std::string(uri), magnet_info_hash(uri), magnet_display_name(uri)};
+    }
+    std::string adopt(std::string_view id, std::string_view magnet, bool held) override {
+        TorrentJob job;
+        job.id = std::string(id);
+        job.source_uri = std::string(magnet);
+        job.info_hash = magnet_info_hash(magnet);
+        job.name = magnet_display_name(magnet);
+        job.state = held ? TorrentJobState::paused : TorrentJobState::downloading;
+        std::lock_guard lock(mutex_);
+        jobs_.try_emplace(job.id, std::move(job));
+        return std::string(id);
+    }
+};
+
+} // namespace
+
+MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_and_are_driven_by_their_owner) {
+    // TorrentCoordinator and the acquisition API on one node. With nothing
+    // providing torrents the node answers from the cluster view and takes adds
+    // that wait for a capable node. With a torrent service published it claims
+    // requests, drives the job from the operator's intent, removes a completed
+    // one after its delay, takes over a lapsed claim, and lets a superseded one go.
+    TestNode fixture("torrent-coordinator");
     fixture.prepare();
     fixture.start();
+    const auto self = fixture.node().node_id();
 
     CatalogueHintQueue hints(fixture.config().state_path / "catalogue-hints");
     IngestConfig ingest_config;
     ingest_config.enabled = true;
     ingest_config.staging_path = fixture.path() / "staging";
     IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
-
     TorrentConfig torrent_config;
-    torrent_config.enabled = true; // configured on, but nothing provides it.
+    torrent_config.enabled = true; // configured on, but nothing provides it yet.
     TorrentSearchManager search(torrent_config);
     SubsystemRegistry registry;
     ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
     TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
                                    fixture.config().state_path);
     AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
-
-    HttpRequest status_request;
-    status_request.method = "GET";
-    status_request.path = "/api/v1/torrents/status";
-    const auto status = acquisition.handle(status_request);
-    REQUIRE(status.status == 200);
-    const auto status_body =
-        Json::parse(std::string(status.body.begin(), status.body.end()));
-    CHECK(status_body.find("build_available")->asBool() == false);
-    CHECK(status_body.find("enabled")->asBool() == false);
-
-    // The job routes answer on every node from the cluster view: a node
-    // without the plugin lists the cluster's jobs (none here) and refuses only
-    // what it cannot do itself, run a torrent.
     const auto call = [&](std::string method, std::string path, std::string body = {}) {
         HttpRequest request;
         request.method = std::move(method);
@@ -2412,31 +2298,29 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
         request.body = Bytes(body.begin(), body.end());
         return acquisition.handle(request);
     };
-    const auto parse = [](const HttpResponse& response) {
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
+
+    // No plugin: honest answers rather than assuming the engine is there.
     {
+        const auto status = call("GET", "/api/v1/torrents/status");
+        REQUIRE(status.status == 200);
+        CHECK(api_body(status).find("build_available")->asBool() == false);
+        CHECK(api_body(status).find("enabled")->asBool() == false);
         const auto listed = call("GET", "/api/v1/torrents/jobs");
         REQUIRE(listed.status == 200);
-        const auto body = parse(listed);
-        CHECK(body.find("jobs")->asArray().empty());
-        CHECK(body.find("refresh_interval_ms")->asUInt64() == 5000);
-        CHECK(body.find("sources")->asArray().empty()); // no torrents here, no peers
-    }
-    {
+        CHECK(api_body(listed).find("jobs")->asArray().empty());
+        CHECK(api_body(listed).find("refresh_interval_ms")->asUInt64() == 5000);
+        CHECK(api_body(listed).find("sources")->asArray().empty()); // no torrents here, no peers
         const auto nodes = call("GET", "/api/v1/torrents/nodes");
         REQUIRE(nodes.status == 200);
-        const auto body = parse(nodes);
-        CHECK(body.find("nodes")->asArray().empty()); // not torrent-capable
-        CHECK(body.find("default_remove_after_ms")->isNull());
-    }
-    {
+        CHECK(api_body(nodes).find("nodes")->asArray().empty()); // not torrent-capable
+        CHECK(api_body(nodes).find("default_remove_after_ms")->isNull());
+
         // Torrents belong to the cluster: a node that cannot run one still
         // takes the add, and it waits for a node that can.
         const auto added = call("POST", "/api/v1/torrents/jobs",
                                 R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890&dn=Waiting"})");
         REQUIRE(added.status == 202);
-        const auto body = parse(added);
+        const auto body = api_body(added);
         CHECK(body.find("node_id")->isNull());
         CHECK(body.find("info_hash")->asString() == "1234567890123456789012345678901234567890");
         const auto& job = *body.find("job");
@@ -2448,62 +2332,177 @@ MACHA_TEST("hydration_catalogue", test_acquisition_api_without_a_torrent_plugin_
         CHECK(job.find("bytes_total")->isNull()); // no live view of an unclaimed job
         const auto id = body.find("id")->asString();
 
+        // One request holds a torrent: a second add is refused naming it.
         const auto again = call("POST", "/api/v1/torrents/jobs",
                                 R"({"magnet":"magnet:?xt=urn:btih:1234567890123456789012345678901234567890"})");
         CHECK(again.status == 409);
-        CHECK(parse(again).find("id")->asString() == id);
-        CHECK(parse(again).find("node_id")->isNull());
+        const auto refusal = api_body(again);
+        CHECK(refusal.find("status")->asString() == "torrent_already_added");
+        CHECK(refusal.find("error")->find("code")->asString() == "torrent_already_added");
+        CHECK(!refusal.find("error")->find("message")->asString().empty());
+        CHECK(refusal.find("id")->asString() == id);
+        CHECK(refusal.find("node_id")->isNull());
 
-        CHECK(parse(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().size() == 1);
+        CHECK(api_body(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().size() == 1);
         const auto paused = call("POST", "/api/v1/torrents/jobs/" + id + "/pause");
         CHECK(paused.status == 202);
-        CHECK(parse(paused).find("desired")->asString() == "paused");
+        CHECK(api_body(paused).find("desired")->asString() == "paused");
         const auto patched = call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":3600000})");
         CHECK(patched.status == 200);
-        CHECK(parse(patched).find("remove_after_ms")->asUInt64() == 3600000);
+        CHECK(api_body(patched).find("remove_after_ms")->asUInt64() == 3600000);
         CHECK(call("PATCH", "/api/v1/torrents/jobs/" + id, R"({"remove_after_ms":86400001})").status == 400);
         CHECK(call("POST", "/api/v1/torrents/jobs/" + id + "/clear").status == 202);
-        CHECK(parse(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().empty());
-    }
-    {
+        CHECK(api_body(call("GET", "/api/v1/torrents/jobs")).find("jobs")->asArray().empty());
+
         // Added already paused, in the same write: no pause to race.
-        const auto added = call("POST", "/api/v1/torrents/jobs",
-                                R"({"magnet":"magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd&dn=Held","paused":true})");
-        REQUIRE(added.status == 202);
-        const auto body = parse(added);
-        CHECK(body.find("job")->find("desired")->asString() == "paused");
-        const auto id = body.find("id")->asString();
-        const auto resumed = call("POST", "/api/v1/torrents/jobs/" + id + "/resume");
+        const auto held = call("POST", "/api/v1/torrents/jobs",
+                               R"({"magnet":"magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd&dn=Held","paused":true})");
+        REQUIRE(held.status == 202);
+        CHECK(api_body(held).find("job")->find("desired")->asString() == "paused");
+        const auto held_id = api_body(held).find("id")->asString();
+        const auto resumed = call("POST", "/api/v1/torrents/jobs/" + held_id + "/resume");
         CHECK(resumed.status == 202);
-        CHECK(parse(resumed).find("desired")->asString() == "active");
+        CHECK(api_body(resumed).find("desired")->asString() == "active");
         CHECK(call("POST", "/api/v1/torrents/jobs",
                    R"({"magnet":"magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","paused":"yes"})").status == 400);
-        CHECK(call("POST", "/api/v1/torrents/jobs/" + id + "/clear").status == 202);
-    }
-    {
+        CHECK(call("POST", "/api/v1/torrents/jobs/" + held_id + "/clear").status == 202);
+
         // A pin to a node that cannot run torrents is refused.
         const auto pinned = call("POST", "/api/v1/torrents/jobs",
                                  R"({"magnet":"magnet:?xt=urn:btih:2234567890123456789012345678901234567890","node_id":")" +
-                                     to_string(fixture.node().node_id()) + R"("})");
+                                     to_string(self) + R"("})");
         CHECK(pinned.status == 409);
-        CHECK(parse(pinned).find("error")->find("reason")->asString() == "node_not_torrent_capable");
-    }
-    CHECK(call("GET", "/api/v1/torrents/jobs/whatever").status == 404);
-    CHECK(call("POST", "/api/v1/torrents/jobs/whatever/pause").status == 404);
-    {
-        const auto listed = call("GET", "/api/v1/ingest/jobs");
-        REQUIRE(listed.status == 200);
-        const auto sources = parse(listed).find("sources")->asArray();
+        CHECK(api_body(pinned).find("error")->find("reason")->asString() == "node_not_torrent_capable");
+        CHECK(call("GET", "/api/v1/torrents/jobs/whatever").status == 404);
+        CHECK(call("POST", "/api/v1/torrents/jobs/whatever/pause").status == 404);
+        const auto ingests = call("GET", "/api/v1/ingest/jobs");
+        REQUIRE(ingests.status == 200);
+        const auto sources = api_body(ingests).find("sources")->asArray();
         REQUIRE(sources.size() == 1);
         CHECK(sources.front().find("local")->asBool());
         CHECK(sources.front().find("reachable")->asBool());
+        // Search is core's own Torznab client, so it stays available.
+        CHECK(call("GET", "/api/v1/torrents/search").status == 400); // missing q, not 503.
     }
 
-    // Search is core's own Torznab client, so it stays available.
-    HttpRequest search_request;
-    search_request.method = "GET";
-    search_request.path = "/api/v1/torrents/search";
-    CHECK(acquisition.handle(search_request).status == 400); // missing q, not 503.
+    // A torrent service is published: this node is now the one capable node.
+    auto torrents = std::make_shared<TableTorrentService>();
+    registry.publish_torrent(torrents);
+
+    // An add is a request in metadata; the capable node claims it, runs it
+    // under the request's id, applies the operator's intent to it, and lets it
+    // go when it is cleared.
+    {
+        const auto added = coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
+                                           false, std::nullopt, std::nullopt);
+        REQUIRE(added.status == 202);
+        const auto id = added.request->id;
+        CHECK(added.request->phase == TorrentPhase::awaiting_node);
+        CHECK(!added.request->remove_after_ms); // the cluster default is off
+
+        coordinator.pass_now();
+        auto r = coordinator.request(id);
+        REQUIRE(r.has_value());
+        REQUIRE(r->claim.has_value());
+        CHECK(r->claim->node_id == self);
+        CHECK(r->claim->epoch == 1);
+        CHECK(r->phase == TorrentPhase::downloading);
+        REQUIRE(torrents->job(id).has_value()); // run under the request's id
+
+        CHECK(coordinator.act(id, "pause").status == 202);
+        coordinator.pass_now();
+        CHECK(torrents->job(id)->state == TorrentJobState::paused);
+        CHECK(coordinator.desired_applied(*coordinator.request(id), torrents->job(id)));
+        CHECK(coordinator.act(id, "resume").status == 202);
+        coordinator.pass_now();
+        CHECK(torrents->job(id)->state != TorrentJobState::paused);
+
+        CHECK(coordinator.act(id, "clear").status == 409); // still running
+        CHECK(coordinator.act(id, "cancel").status == 202);
+        coordinator.pass_now(); // stops it locally
+        coordinator.pass_now(); // and records it
+        CHECK(coordinator.request(id)->phase == TorrentPhase::cancelled);
+        CHECK(coordinator.act(id, "clear").status == 202);
+        coordinator.pass_now();
+        CHECK(!coordinator.request(id).has_value());
+        CHECK(!torrents->job(id).has_value());
+    }
+
+    // A local job no request holds becomes a request this node has claimed.
+    // Removal after completion is off unless asked; with a delay of 0 the
+    // owner removes the job and the request at its next pass.
+    {
+        TorrentJob done;
+        done.id = "done-job";
+        done.name = "Finished";
+        done.info_hash = std::string(40, '9');
+        done.source_uri = "magnet:?xt=urn:btih:" + done.info_hash;
+        done.state = TorrentJobState::completed;
+        done.created_unix_ms = 1;
+        done.updated_unix_ms = 2;
+        torrents->put(done);
+        coordinator.pass_now();
+        auto r = coordinator.request("done-job");
+        REQUIRE(r.has_value());
+        CHECK(r->phase == TorrentPhase::completed);
+        CHECK(r->claim->node_id == self);
+        coordinator.pass_now();
+        CHECK(coordinator.request("done-job").has_value()); // no delay set: kept
+        REQUIRE(coordinator.patch("done-job", std::optional<uint64_t>{0}, std::nullopt).status == 200);
+        coordinator.pass_now();
+        CHECK(!coordinator.request("done-job").has_value());
+        CHECK(!torrents->job("done-job").has_value());
+    }
+
+    // A claim holds while its node is a member; past the lease another node
+    // takes it at the next epoch. A node that finds its own claim superseded
+    // stops and deletes its copy.
+    {
+        TorrentCoordinator impatient(fixture.node(), fixture.metadata(), registry, cluster_jobs,
+                                     fixture.config().state_path, std::chrono::milliseconds(0));
+        const auto gone = random_node_id(); // never a member
+        TorrentRequest lapsed;
+        lapsed.id = std::string(32, 'e');
+        lapsed.info_hash = std::string(40, 'a');
+        lapsed.source = "magnet:?xt=urn:btih:" + lapsed.info_hash;
+        lapsed.created_unix_ms = 1;
+        lapsed.claim = TorrentClaim{gone, 1, 1};
+        lapsed.phase = TorrentPhase::downloading;
+        lapsed.phase_epoch = 1;
+        fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+            snapshot.torrent_requests[lapsed.id] = lapsed;
+            delta.upsert_torrent_requests[lapsed.id] = lapsed;
+        });
+
+        // The default lease is ten minutes: an absent owner keeps its claim.
+        coordinator.pass_now();
+        coordinator.pass_now();
+        CHECK(coordinator.request(lapsed.id)->claim->node_id == gone);
+        CHECK(!torrents->job(lapsed.id).has_value());
+
+        impatient.pass_now(); // notes the owner absent
+        impatient.pass_now(); // lease (0 ms) elapsed: taken over
+        auto r = impatient.request(lapsed.id);
+        REQUIRE(r.has_value());
+        CHECK(r->claim->node_id == self);
+        CHECK(r->claim->epoch == 2);
+        CHECK(r->phase_epoch == 2);
+        REQUIRE(torrents->job(lapsed.id).has_value());
+
+        // Another node's newer claim wins; this node lets its copy go.
+        auto superseding = *r;
+        superseding.claim = TorrentClaim{gone, 3, unix_ms()};
+        superseding.phase_epoch = 3;
+        superseding.progress_unix_ms = unix_ms() + 1;
+        fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+            snapshot.torrent_requests[lapsed.id] = superseding;
+            delta.upsert_torrent_requests[lapsed.id] = superseding;
+        });
+        coordinator.pass_now(); // no takeover, only the let-go
+        CHECK(!torrents->job(lapsed.id).has_value());
+        CHECK(coordinator.request(lapsed.id)->claim->node_id == gone);
+    }
+    registry.withdraw_torrent(torrents.get());
 }
 
 // Only meaningful in a build that produced the plugin: without libtorrent
@@ -2547,327 +2546,6 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_torrent_job_is_saved_only_when_its
     CHECK(torrent_job_change(job, catalogued) == TorrentJobChange::record);
 }
 
-MACHA_TEST("hydration_catalogue", test_torrent_jobs_carry_their_info_hash_and_search_results_can_be_placed) {
-    // A job saved without an info_hash is backfilled from its magnet on load.
-    // A search result may be a provider's .torrent URL; a plain placement
-    // requires a magnet.
-    TestNode fixture("torrent-identity");
-    fixture.prepare();
-    const auto state_path = fixture.config().state_path;
-    const auto staging_path = fixture.path() / "staging";
-    const auto payload = staging_path / "torrents" / "torrent-done";
-    std::filesystem::create_directories(payload);
-    std::filesystem::create_directories(state_path / "torrent");
-    {
-        Json::Object done;
-        done["id"] = "torrent-done";
-        done["name"] = "Finished Movie";
-        done["source_uri"] = "magnet:?xt=urn:btih:3333333333333333333333333333333333333333";
-        done["save_path"] = payload.string();
-        done["state"] = "completed";
-        done["created_unix_ms"] = static_cast<uint64_t>(1);
-        done["updated_unix_ms"] = static_cast<uint64_t>(2);
-        done["error"] = "";
-        Json::Array jobs;
-        jobs.emplace_back(std::move(done));
-        Json::Object root;
-        root["version"] = static_cast<uint64_t>(1);
-        root["jobs"] = std::move(jobs);
-        std::ofstream out(state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
-        REQUIRE(out.good());
-        out << Json(std::move(root)).dump();
-    }
-    fixture.start();
-
-    CatalogueHintQueue hints(state_path / "catalogue-hints");
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = staging_path;
-    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
-    TorrentConfig torrent_config;
-    torrent_config.enabled = true;
-    torrent_config.dht = false;
-    torrent_config.pex = false;
-    torrent_config.lsd = false;
-    Config plugin_config = fixture.node().config();
-    plugin_config.torrent = torrent_config;
-    plugin_config.state_path = state_path;
-    SubsystemRegistry registry;
-    SubsystemContext context;
-    context.config = &plugin_config;
-    context.node = &fixture.node();
-    context.data_resources = &fixture.node().resources.data;
-    context.retained_memory = &fixture.node().resources.memory;
-    context.routes = &fixture.node().routes;
-    context.local_state = &fixture.node().local_state();
-    context.ingest = &ingest;
-    context.registry = &registry;
-    LoadedTorrentPlugin plugin(context);
-    auto torrents_owner = registry.torrent();
-    REQUIRE(torrents_owner);
-    auto& torrents = *torrents_owner;
-
-    auto done = torrents.job("torrent-done");
-    REQUIRE(done.has_value());
-    CHECK(done->info_hash == "3333333333333333333333333333333333333333");
-
-    plugin.subsystem().start();
-    const std::string url = "https://127.0.0.1:1/result.torrent";
-    auto as_magnet = torrents.place(url, false);
-    CHECK(!as_magnet.placed);
-    CHECK(as_magnet.error.find("requires a magnet") != std::string::npos);
-    auto as_result = torrents.place(url, true);
-    CHECK(!as_result.placed);
-    CHECK(as_result.error.find("requires a magnet") == std::string::npos);
-    plugin.subsystem().stop();
-}
-
-namespace {
-// A failed torrent job linked to a failed ingest, plus a queued one to pause,
-// written as the node would have persisted them. Shared by the retry case and
-// the resume-through-the-ingest case.
-void write_torrent_recovery_state(TestNode& fixture) {
-    const auto state_path = fixture.config().state_path;
-    const auto staging_path = fixture.path() / "staging";
-    const auto retry_payload = staging_path / "torrents" / "torrent-retry";
-    const auto pause_payload = staging_path / "torrents" / "torrent-pause";
-    std::filesystem::create_directories(retry_payload);
-    std::filesystem::create_directories(pause_payload);
-    std::filesystem::create_directories(state_path / "ingest");
-    std::filesystem::create_directories(state_path / "torrent");
-
-    {
-        Json::Object job;
-        job["id"] = "ingest-retry";
-        job["source_type"] = "torrent";
-        job["source_ref"] = "torrent-retry";
-        job["display_name"] = "Retry Movie";
-        job["source_path"] = retry_payload.string();
-        job["source_owned"] = true;
-        job["delete_source_on_clear"] = true;
-        job["state"] = "failed";
-        job["bytes_total"] = static_cast<uint64_t>(1234);
-        job["bytes_completed"] = static_cast<uint64_t>(1234);
-        job["files_total"] = static_cast<uint64_t>(1);
-        job["files_completed"] = static_cast<uint64_t>(1);
-        job["created_unix_ms"] = static_cast<uint64_t>(1);
-        job["updated_unix_ms"] = static_cast<uint64_t>(2);
-        job["error"] = "metadata quorum unavailable";
-        job["files"] = Json::Array{};
-        Json::Array jobs;
-        jobs.emplace_back(std::move(job));
-        Json::Object root;
-        root["version"] = static_cast<uint64_t>(2);
-        root["jobs"] = std::move(jobs);
-        std::ofstream out(state_path / "ingest" / "jobs.json", std::ios::binary | std::ios::trunc);
-        REQUIRE(out.good());
-        out << Json(std::move(root)).dump();
-        REQUIRE(out.good());
-    }
-
-    {
-        Json::Array jobs;
-        Json::Object retry;
-        retry["id"] = "torrent-retry";
-        retry["name"] = "Retry Movie";
-        retry["source_uri"] = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
-        retry["info_hash"] = "1111111111111111111111111111111111111111";
-        retry["save_path"] = retry_payload.string();
-        retry["state"] = "failed";
-        retry["bytes_total"] = static_cast<uint64_t>(1234);
-        retry["bytes_completed"] = static_cast<uint64_t>(1234);
-        retry["ingest_job_id"] = "ingest-retry";
-        retry["created_unix_ms"] = static_cast<uint64_t>(1);
-        retry["updated_unix_ms"] = static_cast<uint64_t>(2);
-        retry["error"] = "ingest failed: metadata quorum unavailable";
-        jobs.emplace_back(std::move(retry));
-
-        Json::Object pause;
-        pause["id"] = "torrent-pause";
-        pause["name"] = "Pause Movie";
-        pause["source_uri"] = "magnet:?xt=urn:btih:2222222222222222222222222222222222222222";
-        pause["info_hash"] = "2222222222222222222222222222222222222222";
-        pause["save_path"] = pause_payload.string();
-        pause["state"] = "queued";
-        pause["created_unix_ms"] = static_cast<uint64_t>(1);
-        pause["updated_unix_ms"] = static_cast<uint64_t>(2);
-        pause["error"] = "";
-        jobs.emplace_back(std::move(pause));
-
-        Json::Object root;
-        root["version"] = static_cast<uint64_t>(1);
-        root["jobs"] = std::move(jobs);
-        std::ofstream out(state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
-        REQUIRE(out.good());
-        out << Json(std::move(root)).dump();
-        REQUIRE(out.good());
-    }
-
-}
-} // namespace
-
-MACHA_TEST("hydration_catalogue", test_torrent_failed_ingest_retry_and_pause_intent) {
-    TestNode fixture("torrent-recovery");
-    fixture.prepare();
-
-    write_torrent_recovery_state(fixture);
-    const auto state_path = fixture.config().state_path;
-    const auto staging_path = fixture.path() / "staging";
-
-    fixture.start();
-
-    CatalogueHintQueue hints(state_path / "catalogue-hints");
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = staging_path;
-    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
-
-    TorrentConfig torrent_config;
-    torrent_config.enabled = true;
-    torrent_config.dht = false;
-    torrent_config.pex = false;
-    torrent_config.lsd = false;
-
-    // Drive the Subsystem directly, not through a SubsystemSupervisor: this
-    // case acts on state restored from jobs.json before the polling worker
-    // starts, and a supervisor starts it immediately.
-    Config plugin_config = fixture.node().config();
-    plugin_config.torrent = torrent_config;
-    plugin_config.state_path = state_path;
-    SubsystemRegistry registry;
-    SubsystemContext context;
-    context.config = &plugin_config;
-    context.node = &fixture.node();
-    context.data_resources = &fixture.node().resources.data;
-    context.retained_memory = &fixture.node().resources.memory;
-    context.routes = &fixture.node().routes;
-    context.local_state = &fixture.node().local_state();
-    context.ingest = &ingest;
-    context.registry = &registry;
-    LoadedTorrentPlugin plugin(context);
-    auto torrents_owner = registry.torrent();
-    REQUIRE(torrents_owner);
-    auto& torrents = *torrents_owner;
-
-    auto failed_ingest = ingest.job("ingest-retry");
-    REQUIRE(failed_ingest.has_value());
-    CHECK(failed_ingest->state == IngestJobState::failed);
-
-    TorrentSearchManager search(torrent_config);
-    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
-    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
-                                   fixture.config().state_path);
-    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
-    // The jobs restored from jobs.json become cluster requests this node has
-    // already claimed, on the coordinator's first pass.
-    coordinator.pass_now();
-    REQUIRE(coordinator.request("torrent-retry").has_value());
-    CHECK(coordinator.request("torrent-retry")->phase == TorrentPhase::failed);
-    CHECK(coordinator.request("torrent-retry")->claim->node_id == fixture.node().node_id());
-    HttpRequest retry_request;
-    retry_request.method = "POST";
-    retry_request.path = "/api/v1/torrents/jobs/torrent-retry/retry";
-    const auto retry_response = acquisition.handle(retry_request);
-    REQUIRE(retry_response.status == 202);
-    const auto retry_body = Json::parse(
-        std::string(retry_response.body.begin(), retry_response.body.end()));
-    CHECK(retry_body.find("state")->asString() == "importing");
-    CHECK(!torrents.retry("torrent-retry"));
-
-    const auto retried_ingest = ingest.job("ingest-retry");
-    const auto retried_torrent = torrents.job("torrent-retry");
-    REQUIRE(retried_ingest.has_value());
-    REQUIRE(retried_torrent.has_value());
-    CHECK(retried_ingest->state == IngestJobState::queued);
-    CHECK(retried_ingest->error.empty());
-    CHECK(retried_torrent->state == TorrentJobState::importing);
-    CHECK(retried_torrent->error.empty());
-    REQUIRE(retried_torrent->ingest_job_id.has_value());
-    CHECK(*retried_torrent->ingest_job_id == "ingest-retry");
-
-    REQUIRE(torrents.pause("torrent-pause"));
-    auto paused = torrents.job("torrent-pause");
-    REQUIRE(paused.has_value());
-    CHECK(paused->state == TorrentJobState::paused);
-
-    // start() restores a live paused handle and the worker immediately
-    // samples it. The explicit Macha pause must remain authoritative even if
-    // libtorrent still reports its pre-pause state.
-    plugin.subsystem().start();
-    std::this_thread::sleep_for(750ms);
-    paused = torrents.job("torrent-pause");
-    REQUIRE(paused.has_value());
-    CHECK(paused->state == TorrentJobState::paused);
-    plugin.subsystem().stop();
-}
-
-MACHA_TEST("hydration_catalogue", test_a_failed_torrent_follows_its_ingest_resumed_directly) {
-    // A failed torrent whose ingest is resumed through the ingest's own route
-    // follows the ingest back, without anybody touching the torrent.
-    TestNode fixture("torrent-follows-ingest");
-    fixture.prepare();
-    write_torrent_recovery_state(fixture);
-    const auto state_path = fixture.config().state_path;
-    const auto staging_path = fixture.path() / "staging";
-    fixture.start();
-
-    CatalogueHintQueue hints(state_path / "catalogue-hints");
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = staging_path;
-    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
-
-    TorrentConfig torrent_config;
-    torrent_config.enabled = true;
-    torrent_config.dht = false;
-    torrent_config.pex = false;
-    torrent_config.lsd = false;
-    Config plugin_config = fixture.node().config();
-    plugin_config.torrent = torrent_config;
-    plugin_config.state_path = state_path;
-    SubsystemRegistry registry;
-    SubsystemContext context;
-    context.config = &plugin_config;
-    context.node = &fixture.node();
-    context.data_resources = &fixture.node().resources.data;
-    context.retained_memory = &fixture.node().resources.memory;
-    context.routes = &fixture.node().routes;
-    context.local_state = &fixture.node().local_state();
-    context.ingest = &ingest;
-    context.registry = &registry;
-    LoadedTorrentPlugin plugin(context);
-    auto torrents_owner = registry.torrent();
-    REQUIRE(torrents_owner);
-    auto& torrents = *torrents_owner;
-    plugin.subsystem().start();
-
-    auto before = torrents.job("torrent-retry");
-    REQUIRE(before.has_value());
-    REQUIRE(before->state == TorrentJobState::failed);
-    // Settled: with its ingest failed too, nothing brings it back by itself.
-    std::this_thread::sleep_for(600ms);
-    CHECK(torrents.job("torrent-retry")->state == TorrentJobState::failed);
-
-    TorrentSearchManager search(torrent_config);
-    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
-    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs,
-                                   fixture.config().state_path);
-    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
-    HttpRequest resume;
-    resume.method = "POST";
-    resume.path = "/api/v1/ingest/jobs/ingest-retry/resume";
-    REQUIRE(acquisition.handle(resume).status == 200);
-
-    // The ingest is queued (its workers are not running here); the torrent
-    // job mirrors it as importing, with its failure cleared.
-    REQUIRE(wait_until([&] {
-        return torrents.job("torrent-retry")->state == TorrentJobState::importing;
-    }, 5s));
-    const auto after = torrents.job("torrent-retry");
-    CHECK(after->error.empty());
-    CHECK(after->error_code.empty());
-    plugin.subsystem().stop();
-}
 namespace {
 uint64_t torrent_thread_faults() {
     for (const auto& status : supervised_thread_statuses())
@@ -2881,481 +2559,287 @@ size_t torrent_thread_running() {
     return 0;
 }
 
-// The plugin loaded against a fixture node, as the tests above set it up.
-struct TorrentPluginFixture {
-    TestNode fixture;
-    std::filesystem::path state_path;
-    std::filesystem::path staging_path;
-    std::unique_ptr<CatalogueHintQueue> hints;
-    std::unique_ptr<IngestManager> ingest;
-    TorrentConfig torrent_config;
-    Config plugin_config;
-    SubsystemRegistry registry;
-    SubsystemContext context;
-    std::unique_ptr<LoadedTorrentPlugin> plugin;
-
-    explicit TorrentPluginFixture(const std::string& name, const std::function<void(TorrentPluginFixture&)>& seed = {})
-        : fixture(name) {
-        fixture.prepare();
-        state_path = fixture.config().state_path;
-        staging_path = fixture.path() / "staging";
-        if (seed) seed(*this);
-        fixture.start();
-        hints = std::make_unique<CatalogueHintQueue>(state_path / "catalogue-hints");
-        IngestConfig ingest_config;
-        ingest_config.enabled = true;
-        ingest_config.staging_path = staging_path;
-        ingest = std::make_unique<IngestManager>(fixture.node(), fixture.filesystem(), *hints, ingest_config);
-        torrent_config.enabled = true;
-        torrent_config.dht = false;
-        torrent_config.pex = false;
-        torrent_config.lsd = false;
-        plugin_config = fixture.node().config();
-        plugin_config.torrent = torrent_config;
-        plugin_config.state_path = state_path;
-        context.config = &plugin_config;
-        context.node = &fixture.node();
-        context.data_resources = &fixture.node().resources.data;
-        context.retained_memory = &fixture.node().resources.memory;
-        context.routes = &fixture.node().routes;
-        context.local_state = &fixture.node().local_state();
-        context.ingest = ingest.get();
-        context.registry = &registry;
-        plugin = std::make_unique<LoadedTorrentPlugin>(context);
-    }
-
-    ~TorrentPluginFixture() {
-        plugin->subsystem().stop();
-        plugin.reset();
-    }
-
-    TorrentService& torrents() {
-        auto owner = registry.torrent();
-        REQUIRE(owner);
-        return *owner;
-    }
-};
-} // namespace
-
-MACHA_TEST("hydration_catalogue", test_a_torrent_is_held_by_one_job_and_a_second_add_names_it) {
-    // libtorrent keys a torrent by its info hash, so one job holds it and a
-    // second add is refused with the holder's id.
-    TorrentPluginFixture f("torrent-one-job-per-hash");
-    auto& torrents = f.torrents();
-    f.plugin->subsystem().start();
-    const auto faults_before = torrent_thread_faults();
-
-    const std::string magnet = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Twice";
-    const auto first = torrents.place(magnet, false);
-    REQUIRE(first.placed);
-    const auto second = torrents.place(magnet, false);
-    CHECK(!second.placed);
-    CHECK(second.reason == "torrent_already_added");
-    CHECK(second.job_id == first.job_id);
-    CHECK(second.node_id == f.fixture.node().node_id());
-
-    TorrentSearchManager search(f.torrent_config);
-    ClusterJobView cluster_jobs(f.fixture.node(), *f.ingest, f.registry);
-    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, cluster_jobs, f.state_path);
-    AcquisitionApi acquisition(*f.ingest, f.registry, search, cluster_jobs, coordinator);
-    // Through the API the duplicate key is the cluster's requests.
-    const std::string api_magnet = "magnet:?xt=urn:btih:7777777777777777777777777777777777777777&dn=Twice";
-    HttpRequest add;
-    add.method = "POST";
-    add.path = "/api/v1/torrents/jobs";
-    const std::string body = "{\"magnet\":\"" + api_magnet + "\"}";
-    add.body = Bytes(body.begin(), body.end());
-    const auto accepted = acquisition.handle(add);
-    REQUIRE(accepted.status == 202);
-    const auto accepted_id =
-        Json::parse(std::string(accepted.body.begin(), accepted.body.end())).find("id")->asString();
-    const auto refused = acquisition.handle(add);
-    CHECK(refused.status == 409);
-    const auto refusal = Json::parse(std::string(refused.body.begin(), refused.body.end()));
-    CHECK(refusal.find("status")->asString() == "torrent_already_added");
-    CHECK(refusal.find("error")->find("code")->asString() == "torrent_already_added");
-    CHECK(!refusal.find("error")->find("message")->asString().empty());
-    CHECK(refusal.find("id")->asString() == accepted_id);
-
-    size_t holding = 0;
-    for (const auto& job : torrents.jobs())
-        if (job.info_hash == "4444444444444444444444444444444444444444") ++holding;
-    CHECK(holding == 1);
-
-    // A job on record holds its torrent until it is cleared, whatever its
-    // state; once cleared, nothing of it is left in the session, so the same
-    // torrent can be added again.
-    REQUIRE(torrents.cancel(first.job_id));
-    CHECK(torrents.place(magnet, false).reason == "torrent_already_added");
-    REQUIRE(torrents.clear(first.job_id));
-    const auto again = torrents.place(magnet, false);
-    CHECK(again.placed);
-    CHECK(again.job_id != first.job_id);
-    CHECK(torrent_thread_faults() == faults_before);
+Json::Object recorded_torrent(const std::filesystem::path& staging, const std::string& id,
+                              const std::string& hash, const std::string& state, uint64_t created = 1) {
+    const auto payload = staging / "torrents" / id;
+    std::filesystem::create_directories(payload);
+    Json::Object job;
+    job["id"] = id;
+    job["name"] = id;
+    job["source_uri"] = "magnet:?xt=urn:btih:" + hash;
+    job["info_hash"] = hash;
+    job["save_path"] = payload.string();
+    job["state"] = state;
+    job["created_unix_ms"] = created;
+    job["updated_unix_ms"] = created + 1;
+    job["error"] = "";
+    return job;
 }
 
-MACHA_TEST("hydration_catalogue", test_two_jobs_recorded_for_one_torrent_restore_as_one) {
-    // Two jobs recorded for one torrent: the later one fails at restore with
-    // duplicate_torrent and holds nothing, and the worker outlives cancelling
-    // the first.
-    const std::string hash = "5555555555555555555555555555555555555555";
-    TorrentPluginFixture f("torrent-duplicate-restore", [&](TorrentPluginFixture& seeded) {
-        std::filesystem::create_directories(seeded.state_path / "torrent");
-        Json::Array jobs;
-        for (const auto& [id, created] : {std::pair<std::string, uint64_t>{"dup-second", 2},
-                                         std::pair<std::string, uint64_t>{"dup-first", 1}}) {
-            const auto payload = seeded.staging_path / "torrents" / id;
-            std::filesystem::create_directories(payload);
-            Json::Object job;
-            job["id"] = id;
-            job["name"] = "Twice Restored";
-            job["source_uri"] = "magnet:?xt=urn:btih:" + hash;
-            job["info_hash"] = hash;
-            job["save_path"] = payload.string();
-            job["state"] = "queued";
-            job["created_unix_ms"] = created;
-            job["updated_unix_ms"] = created;
-            job["error"] = "";
-            jobs.emplace_back(std::move(job));
-        }
-        Json::Object root;
-        root["version"] = static_cast<uint64_t>(1);
-        root["jobs"] = std::move(jobs);
-        std::ofstream out(seeded.state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
-        REQUIRE(out.good());
-        out << Json(std::move(root)).dump();
-    });
-    auto& torrents = f.torrents();
-    const auto faults_before = torrent_thread_faults();
-    f.plugin->subsystem().start();
+// A failed torrent job with the failed ingest it handed its payload to.
+void record_failed_import(Json::Array& torrents, Json::Array& ingests, const std::filesystem::path& staging,
+                          const std::string& torrent_id, const std::string& ingest_id,
+                          const std::string& hash) {
+    auto torrent = recorded_torrent(staging, torrent_id, hash, "failed");
+    torrent["bytes_total"] = static_cast<uint64_t>(1234);
+    torrent["bytes_completed"] = static_cast<uint64_t>(1234);
+    torrent["ingest_job_id"] = ingest_id;
+    torrent["error"] = "ingest failed: metadata quorum unavailable";
+    torrents.emplace_back(std::move(torrent));
 
+    Json::Object ingest;
+    ingest["id"] = ingest_id;
+    ingest["source_type"] = "torrent";
+    ingest["source_ref"] = torrent_id;
+    ingest["display_name"] = torrent_id;
+    ingest["source_path"] = (staging / "torrents" / torrent_id).string();
+    ingest["source_owned"] = true;
+    ingest["delete_source_on_clear"] = true;
+    ingest["state"] = "failed";
+    ingest["bytes_total"] = static_cast<uint64_t>(1234);
+    ingest["bytes_completed"] = static_cast<uint64_t>(1234);
+    ingest["files_total"] = static_cast<uint64_t>(1);
+    ingest["files_completed"] = static_cast<uint64_t>(1);
+    ingest["created_unix_ms"] = static_cast<uint64_t>(1);
+    ingest["updated_unix_ms"] = static_cast<uint64_t>(2);
+    ingest["error"] = "metadata quorum unavailable";
+    ingest["files"] = Json::Array{};
+    ingests.emplace_back(std::move(ingest));
+}
+
+void write_jobs_file(const std::filesystem::path& path, uint64_t version, Json::Array jobs) {
+    std::filesystem::create_directories(path.parent_path());
+    Json::Object root;
+    root["version"] = version;
+    root["jobs"] = std::move(jobs);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.good());
+    out << Json(std::move(root)).dump();
+    REQUIRE(out.good());
+}
+} // namespace
+
+// Integrated: the real libmacha-torrent module, loaded as SubsystemSupervisor
+// loads it, restoring jobs.json into a libtorrent session.
+MACHA_TEST("hydration_catalogue", test_the_torrent_plugin_restores_its_jobs_and_runs_them_through_the_engine) {
+    const std::string duplicated(40, '5');
+    TestNode fixture("torrent-plugin");
+    fixture.prepare();
+    const auto state_path = fixture.config().state_path;
+    const auto staging_path = fixture.path() / "staging";
+    {
+        Json::Array torrents;
+        Json::Array ingests;
+        // Saved without an info_hash: backfilled from its magnet on load.
+        auto done = recorded_torrent(staging_path, "torrent-done", std::string(40, '3'), "completed");
+        done.erase("info_hash");
+        torrents.emplace_back(std::move(done));
+        record_failed_import(torrents, ingests, staging_path, "torrent-retry", "ingest-retry", std::string(40, '1'));
+        record_failed_import(torrents, ingests, staging_path, "torrent-follow", "ingest-follow", std::string(40, 'f'));
+        torrents.emplace_back(recorded_torrent(staging_path, "torrent-pause", std::string(40, '2'), "queued"));
+        // Two jobs recorded for one torrent, the later one listed first.
+        torrents.emplace_back(recorded_torrent(staging_path, "dup-second", duplicated, "queued", 20));
+        torrents.emplace_back(recorded_torrent(staging_path, "dup-first", duplicated, "queued", 10));
+        write_jobs_file(state_path / "torrent" / "jobs.json", 1, std::move(torrents));
+        write_jobs_file(state_path / "ingest" / "jobs.json", 2, std::move(ingests));
+    }
+    fixture.start();
+    const auto self = fixture.node().node_id();
+
+    CatalogueHintQueue hints(state_path / "catalogue-hints");
+    IngestConfig ingest_config;
+    ingest_config.enabled = true;
+    ingest_config.staging_path = staging_path;
+    IngestManager ingest(fixture.node(), fixture.filesystem(), hints, ingest_config);
+    TorrentConfig torrent_config;
+    torrent_config.enabled = true;
+    torrent_config.dht = false;
+    torrent_config.pex = false;
+    torrent_config.lsd = false;
+    // The Subsystem is driven directly, not through a SubsystemSupervisor,
+    // which would start the polling worker at once: the first steps act on
+    // state restored from jobs.json before it runs.
+    Config plugin_config = fixture.node().config();
+    plugin_config.torrent = torrent_config;
+    plugin_config.state_path = state_path;
+    SubsystemRegistry registry;
+    SubsystemContext context;
+    context.config = &plugin_config;
+    context.node = &fixture.node();
+    context.data_resources = &fixture.node().resources.data;
+    context.retained_memory = &fixture.node().resources.memory;
+    context.routes = &fixture.node().routes;
+    context.local_state = &fixture.node().local_state();
+    context.ingest = &ingest;
+    context.registry = &registry;
+    // The manager's periodic passes run on stepped time.
+    SteppedTime time;
+    context.time = &time;
+    LoadedTorrentPlugin plugin(context);
+    struct StopPlugin {
+        LoadedTorrentPlugin& plugin;
+        ~StopPlugin() { plugin.subsystem().stop(); }
+    } stop_plugin{plugin};
+    const auto torrents_owner = registry.torrent();
+    REQUIRE(torrents_owner);
+    auto& torrents = *torrents_owner;
+    TorrentSearchManager search(torrent_config);
+    ClusterJobView cluster_jobs(fixture.node(), ingest, registry);
+    TorrentCoordinator coordinator(fixture.node(), fixture.metadata(), registry, cluster_jobs, state_path);
+    AcquisitionApi acquisition(ingest, registry, search, cluster_jobs, coordinator);
+    const auto post = [&](const std::string& path) {
+        HttpRequest request;
+        request.method = "POST";
+        request.path = path;
+        return acquisition.handle(request);
+    };
+
+    REQUIRE(torrents.job("torrent-done").has_value());
+    CHECK(torrents.job("torrent-done")->info_hash == std::string(40, '3'));
+    REQUIRE(ingest.job("ingest-retry").has_value());
+    CHECK(ingest.job("ingest-retry")->state == IngestJobState::failed);
+
+    // An explicit pause is the operator's intent, recorded before the worker runs.
+    REQUIRE(torrents.pause("torrent-pause"));
+    CHECK(torrents.job("torrent-pause")->state == TorrentJobState::paused);
+
+    // The restored jobs become cluster requests this node has already
+    // claimed, on the coordinator's first pass. Retrying the failed one
+    // through the API requeues its ingest and the torrent mirrors it.
+    coordinator.pass_now();
+    REQUIRE(coordinator.request("torrent-retry").has_value());
+    CHECK(coordinator.request("torrent-retry")->phase == TorrentPhase::failed);
+    CHECK(coordinator.request("torrent-retry")->claim->node_id == self);
+    const auto retried = post("/api/v1/torrents/jobs/torrent-retry/retry");
+    REQUIRE(retried.status == 202);
+    CHECK(api_body(retried).find("state")->asString() == "importing");
+    CHECK(!torrents.retry("torrent-retry"));
+    const auto retried_ingest = ingest.job("ingest-retry");
+    const auto retried_torrent = torrents.job("torrent-retry");
+    REQUIRE(retried_ingest.has_value());
+    REQUIRE(retried_torrent.has_value());
+    CHECK(retried_ingest->state == IngestJobState::queued);
+    CHECK(retried_ingest->error.empty());
+    CHECK(retried_torrent->state == TorrentJobState::importing);
+    CHECK(retried_torrent->error.empty());
+    REQUIRE(retried_torrent->ingest_job_id.has_value());
+    CHECK(*retried_torrent->ingest_job_id == "ingest-retry");
+
+    const auto faults_before = torrent_thread_faults();
+    plugin.subsystem().start();
+
+    // Two jobs recorded for one torrent restore as one: the later fails with
+    // duplicate_torrent and holds nothing.
     const auto second = torrents.job("dup-second");
     REQUIRE(second.has_value());
     CHECK(second->state == TorrentJobState::failed);
     CHECK(second->error_code == "duplicate_torrent");
     CHECK(second->error.find("dup-first") != std::string::npos);
-    const auto first = torrents.job("dup-first");
-    REQUIRE(first.has_value());
-    CHECK(first->state != TorrentJobState::failed);
+    REQUIRE(torrents.job("dup-first").has_value());
+    CHECK(torrents.job("dup-first")->state != TorrentJobState::failed);
 
+    // A request claimed here runs in the engine under the request's id and
+    // follows the operator's intent.
+    {
+        const auto added = coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
+                                           false, std::nullopt, std::nullopt);
+        REQUIRE(added.status == 202);
+        const auto id = added.request->id;
+        coordinator.pass_now();
+        REQUIRE(torrents.job(id).has_value());
+        CHECK(coordinator.request(id)->phase == TorrentPhase::downloading);
+        CHECK(coordinator.act(id, "pause").status == 202);
+        coordinator.pass_now();
+        CHECK(torrents.job(id)->state == TorrentJobState::paused);
+        CHECK(coordinator.desired_applied(*coordinator.request(id), torrents.job(id)));
+        CHECK(coordinator.act(id, "resume").status == 202);
+        coordinator.pass_now();
+        CHECK(torrents.job(id)->state != TorrentJobState::paused);
+        CHECK(coordinator.act(id, "cancel").status == 202);
+        coordinator.pass_now();
+        coordinator.pass_now();
+        CHECK(coordinator.request(id)->phase == TorrentPhase::cancelled);
+        CHECK(coordinator.act(id, "clear").status == 202);
+        coordinator.pass_now();
+        CHECK(!torrents.job(id).has_value());
+    }
+
+    // A search result may be a provider's .torrent URL; a plain placement
+    // requires a magnet.
+    const std::string url = "https://127.0.0.1:1/result.torrent";
+    const auto as_magnet = torrents.place(url, false);
+    CHECK(!as_magnet.placed);
+    CHECK(as_magnet.error.find("requires a magnet") != std::string::npos);
+    const auto as_result = torrents.place(url, true);
+    CHECK(!as_result.placed);
+    CHECK(as_result.error.find("requires a magnet") == std::string::npos);
+
+    // libtorrent keys a torrent by its info hash, so one job holds it: a second
+    // add is refused with the holder's id, whatever the holder's state, until
+    // it is cleared and nothing of it is left in the session.
+    {
+        const std::string magnet = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444&dn=Twice";
+        const auto first = torrents.place(magnet, false);
+        REQUIRE(first.placed);
+        const auto again = torrents.place(magnet, false);
+        CHECK(!again.placed);
+        CHECK(again.reason == "torrent_already_added");
+        CHECK(again.job_id == first.job_id);
+        CHECK(again.node_id == self);
+        size_t holding = 0;
+        for (const auto& job : torrents.jobs())
+            if (job.info_hash == "4444444444444444444444444444444444444444") ++holding;
+        CHECK(holding == 1);
+        REQUIRE(torrents.cancel(first.job_id));
+        CHECK(torrents.place(magnet, false).reason == "torrent_already_added");
+        REQUIRE(torrents.clear(first.job_id));
+        const auto replaced = torrents.place(magnet, false);
+        CHECK(replaced.placed);
+        CHECK(replaced.job_id != first.job_id);
+    }
+
+    // Cancelling the job that holds the duplicated torrent must not fault the
+    // worker's next held-pieces pass, ten seconds on: step past it and let two
+    // more worker iterations begin, so one whole pass has run since the cancel.
     REQUIRE(torrents.cancel("dup-first"));
-    // Past the held-pieces interval (10 s), so that pass runs after the cancel.
-    std::this_thread::sleep_for(11s);
+    const auto reads = time.reads();
+    time.advance(11s);
+    REQUIRE(wait_until([&] { return time.reads() >= reads + 4; }, 10s));
     CHECK(torrent_thread_faults() == faults_before);
+    for (const auto& job : torrents.jobs()) CHECK(job.error_code != "torrent_fault");
     // The worker is still inside its loop, and a new job is still taken.
     CHECK(torrent_thread_running() == 1);
     const auto fresh = torrents.place("magnet:?xt=urn:btih:6666666666666666666666666666666666666666&dn=After", false);
     REQUIRE(fresh.placed);
     CHECK(torrents.job(fresh.job_id).has_value());
-}
+    // The worker has sampled the restored handles by now: the explicit pause
+    // stays authoritative whatever libtorrent reports, and a failed torrent
+    // whose ingest failed too is not brought back by itself.
+    CHECK(torrents.job("torrent-pause")->state == TorrentJobState::paused);
+    CHECK(torrents.job("torrent-follow")->state == TorrentJobState::failed);
 
-MACHA_TEST("hydration_catalogue", test_a_cluster_torrent_is_claimed_and_driven_by_its_owner) {
-    // An add is a request in metadata; the one torrent-capable node
-    // claims it, runs it under the request's id, applies the operator's
-    // intent to it, and lets it go when it is cleared.
-    TorrentPluginFixture f("torrent-coordinator-owner");
-    auto& torrents = f.torrents();
-    f.plugin->subsystem().start();
-    ClusterJobView view(f.fixture.node(), *f.ingest, f.registry);
-    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path);
-    const auto self = f.fixture.node().node_id();
-
-    const auto added = coordinator.add("magnet:?xt=urn:btih:8888888888888888888888888888888888888888&dn=Owned",
-                                       false, std::nullopt, std::nullopt);
-    REQUIRE(added.status == 202);
-    const auto id = added.request->id;
-    CHECK(added.request->phase == TorrentPhase::awaiting_node);
-    CHECK(!added.request->remove_after_ms); // the cluster default is off
-
-    coordinator.pass_now();
-    auto r = coordinator.request(id);
-    REQUIRE(r.has_value());
-    REQUIRE(r->claim.has_value());
-    CHECK(r->claim->node_id == self);
-    CHECK(r->claim->epoch == 1);
-    CHECK(r->phase == TorrentPhase::downloading);
-    REQUIRE(torrents.job(id).has_value()); // run under the request's id
-
-    CHECK(coordinator.act(id, "pause").status == 202);
-    coordinator.pass_now();
-    CHECK(torrents.job(id)->state == TorrentJobState::paused);
-    CHECK(coordinator.desired_applied(*coordinator.request(id), torrents.job(id)));
-    CHECK(coordinator.act(id, "resume").status == 202);
-    coordinator.pass_now();
-    CHECK(torrents.job(id)->state != TorrentJobState::paused);
-
-    CHECK(coordinator.act(id, "clear").status == 409); // still running
-    CHECK(coordinator.act(id, "cancel").status == 202);
-    coordinator.pass_now(); // stops it locally
-    coordinator.pass_now(); // and records it
-    CHECK(coordinator.request(id)->phase == TorrentPhase::cancelled);
-    CHECK(coordinator.act(id, "clear").status == 202);
-    coordinator.pass_now();
-    CHECK(!coordinator.request(id).has_value());
-    CHECK(!torrents.job(id).has_value());
-}
-
-MACHA_TEST("hydration_catalogue", test_a_completed_torrent_is_removed_after_its_delay) {
-    // Removal after completion is off unless asked; with a delay of 0
-    // the owner removes the torrent job and the request at its next pass.
-    const std::string hash(40, '9');
-    TorrentPluginFixture f("torrent-remove-after", [&](TorrentPluginFixture& seeded) {
-        std::filesystem::create_directories(seeded.state_path / "torrent");
-        const auto payload = seeded.staging_path / "torrents" / "done-job";
-        std::filesystem::create_directories(payload);
-        Json::Object job;
-        job["id"] = "done-job";
-        job["name"] = "Finished";
-        job["source_uri"] = "magnet:?xt=urn:btih:" + hash;
-        job["info_hash"] = hash;
-        job["save_path"] = payload.string();
-        job["state"] = "completed";
-        job["created_unix_ms"] = static_cast<uint64_t>(1);
-        job["updated_unix_ms"] = static_cast<uint64_t>(2);
-        job["error"] = "";
-        Json::Array jobs;
-        jobs.emplace_back(std::move(job));
-        Json::Object root;
-        root["version"] = static_cast<uint64_t>(1);
-        root["jobs"] = std::move(jobs);
-        std::ofstream out(seeded.state_path / "torrent" / "jobs.json", std::ios::binary | std::ios::trunc);
-        out << Json(std::move(root)).dump();
-    });
-    auto& torrents = f.torrents();
-    ClusterJobView view(f.fixture.node(), *f.ingest, f.registry);
-    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path);
-
-    coordinator.pass_now(); // migrated: a completed request this node holds
-    auto r = coordinator.request("done-job");
-    REQUIRE(r.has_value());
-    CHECK(r->phase == TorrentPhase::completed);
-    coordinator.pass_now();
-    CHECK(coordinator.request("done-job").has_value()); // no delay set: kept
-
-    REQUIRE(coordinator.patch("done-job", std::optional<uint64_t>{0}, std::nullopt).status == 200);
-    coordinator.pass_now();
-    CHECK(!coordinator.request("done-job").has_value());
-    CHECK(!torrents.job("done-job").has_value());
-}
-
-MACHA_TEST("hydration_catalogue", test_a_lapsed_claim_is_taken_over_and_a_superseded_one_let_go) {
-    // A claim holds while its node is a member; past the lease another node
-    // takes it at the next epoch. A node that finds its own claim superseded
-    // stops and deletes its copy.
-    TorrentPluginFixture f("torrent-lease");
-    auto& torrents = f.torrents();
-    f.plugin->subsystem().start();
-    ClusterJobView view(f.fixture.node(), *f.ingest, f.registry);
-    TorrentCoordinator coordinator(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path,
-                                   std::chrono::milliseconds(0));
-    const auto self = f.fixture.node().node_id();
-    const auto gone = random_node_id(); // never a member
-
-    TorrentRequest lapsed;
-    lapsed.id = std::string(32, 'e');
-    lapsed.info_hash = std::string(40, 'a');
-    lapsed.source = "magnet:?xt=urn:btih:" + lapsed.info_hash;
-    lapsed.created_unix_ms = 1;
-    lapsed.claim = TorrentClaim{gone, 1, 1};
-    lapsed.phase = TorrentPhase::downloading;
-    lapsed.phase_epoch = 1;
-    f.fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        snapshot.torrent_requests[lapsed.id] = lapsed;
-        delta.upsert_torrent_requests[lapsed.id] = lapsed;
-    });
-
-    coordinator.pass_now(); // notes the owner absent
-    coordinator.pass_now(); // lease (0 ms) elapsed: taken over
-    auto r = coordinator.request(lapsed.id);
-    REQUIRE(r.has_value());
-    CHECK(r->claim->node_id == self);
-    CHECK(r->claim->epoch == 2);
-    CHECK(r->phase_epoch == 2);
-    REQUIRE(torrents.job(lapsed.id).has_value());
-
-    // Now another node's newer claim wins; this node lets its copy go.
-    auto superseding = *r;
-    superseding.claim = TorrentClaim{gone, 3, unix_ms()};
-    superseding.phase_epoch = 3;
-    superseding.progress_unix_ms = unix_ms() + 1;
-    f.fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        snapshot.torrent_requests[lapsed.id] = superseding;
-        delta.upsert_torrent_requests[lapsed.id] = superseding;
-    });
-    TorrentCoordinator patient(f.fixture.node(), f.fixture.metadata(), f.registry, view, f.state_path);
-    patient.pass_now(); // lease is 10 min here: no takeover, only the let-go
-    CHECK(!torrents.job(lapsed.id).has_value());
-    CHECK(patient.request(lapsed.id)->claim->node_id == gone);
-}
-
-#endif // MACHA_TEST_TORRENT_PLUGIN
-
-MACHA_TEST("hydration_catalogue", test_ingest_catalogue_feedback_and_external_clear_cleanup) {
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.catalogue.scanner.movies.enabled = true;
-    config.catalogue.scanner.movies.roots = {"/Movies"};
-    config.catalogue.scanner.tv.enabled = false;
-    config.catalogue.scanner.music.enabled = false;
-    config.ingest.enabled = false; // use the explicit manager below
-
-    auto& service = fixture.start();
-
-    const auto source_root = fixture.path() / "external-import";
-    std::filesystem::create_directories(source_root);
-    const auto media = source_root / "Queue Test Movie 2024.mkv";
-    const auto unrelated = source_root / "do-not-delete.txt";
-    {
-        std::ofstream out(media, std::ios::binary);
-        auto bytes = pattern(512 * 1024);
-        out.write(reinterpret_cast<const char*>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-    }
-    {
-        std::ofstream out(unrelated);
-        out << "external source material not selected for ingest\n";
-    }
-
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = {source_root};
-    ingest_config.copy_chunk_bytes = 64 * 1024;
-    ingest_config.checkpoint_bytes = 256 * 1024;
-    ingest_config.delete_external_source_on_clear = true;
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
-                         ingest_config);
-    ingest.start();
-    const auto job_id = ingest.submit_path(source_root);
-
+    // Resumed through the ingest's own route, the ingest is queued (its workers
+    // are not running here) and the torrent follows it back, failure cleared.
+    REQUIRE(post("/api/v1/ingest/jobs/ingest-follow/resume").status == 200);
     REQUIRE(wait_until([&] {
-        auto job = ingest.job(job_id);
-        return job && job->state == IngestJobState::cataloguing;
-    }, 10s));
-    auto summary = service.catalogue_hints().summary("ingest", job_id);
-    REQUIRE(summary.total == 1);
-    REQUIRE(summary.pending == 1);
-    auto hint = service.catalogue_hints().claim_next();
-    REQUIRE(hint.has_value());
-    CHECK(hint->origins.size() == 1);
-    service.catalogue_hints().mark_catalogued(
-        hint->id, "movies", "macha:test-ingest-media", {"test:movie:queue"}, "synthetic match");
-
-    REQUIRE(wait_until([&] {
-        auto job = ingest.job(job_id);
-        return job && job->state == IngestJobState::completed;
+        return torrents.job("torrent-follow")->state == TorrentJobState::importing;
     }, 5s));
-    auto completed = ingest.job(job_id);
-    REQUIRE(completed.has_value());
-    CHECK(completed->catalogue_total == 1);
-    CHECK(completed->catalogue_pending == 0);
-    CHECK(completed->catalogue_catalogued == 1);
-    CHECK(completed->catalogue_no_match == 0);
-    CHECK(completed->catalogue_failed == 0);
-
-    REQUIRE(ingest.clear(job_id));
-    CHECK(!ingest.job(job_id).has_value());
-    CHECK(!std::filesystem::exists(media));
-    CHECK(std::filesystem::exists(unrelated));
-    CHECK(std::filesystem::exists(source_root));
-    CHECK(service.catalogue_hints().summary("ingest", job_id).total == 0);
-
-    ingest.stop();
+    CHECK(torrents.job("torrent-follow")->error.empty());
+    CHECK(torrents.job("torrent-follow")->error_code.empty());
 }
-
-MACHA_TEST("hydration_catalogue", test_cleared_ingest_job_does_not_resurrect_while_worker_finishes) {
-    // A job can be cancelled and cleared while the worker is still mid-copy in
-    // process_job(). The worker's per-iteration control checks must treat an
-    // erased job as cancelled, never re-insert it.
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.ingest.enabled = false;
-
-    auto& service = fixture.start();
-
-    const auto source_root = fixture.path() / "external-import";
-    std::filesystem::create_directories(source_root);
-    const auto media = source_root / "Slow Import Movie 2024.mkv";
-    {
-        std::ofstream out(media, std::ios::binary);
-        auto bytes = pattern(32 * 1024 * 1024);
-        out.write(reinterpret_cast<const char*>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-    }
-
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = {source_root};
-    // Small enough that the copy loop takes many real iterations, giving the
-    // test a wide window to cancel+clear while the worker is still inside
-    // copy_file()'s per-chunk loop.
-    ingest_config.copy_chunk_bytes = 256;
-    ingest_config.checkpoint_bytes = 4096;
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
-                         ingest_config);
-    ingest.start();
-    const auto job_id = ingest.submit_path(source_root);
-
-    std::string partial;
-    REQUIRE(wait_until([&] {
-        auto job = ingest.job(job_id);
-        if (!job || job->state != IngestJobState::importing || job->files.empty() ||
-            job->files.front().temporary_path.empty())
-            return false;
-        partial = job->files.front().temporary_path;
-        return true;
-    }, 10s));
-
-    // cancel() writes the terminal state immediately, so clear() erases the job
-    // while the worker is still running. The partial stays the worker's until
-    // it lets go: clear() must not remove it underneath the copy.
-    REQUIRE(ingest.cancel(job_id));
-    REQUIRE(ingest.clear(job_id));
-    CHECK(!ingest.job(job_id).has_value());
-
-    // Let the in-flight process_job() finish its chunk and reach a control
-    // check; the job must stay gone.
-    std::this_thread::sleep_for(200ms);
-    CHECK(!ingest.job(job_id).has_value());
-    REQUIRE(wait_until([&] { return !ingest.job(job_id).has_value(); }, 2s));
-    CHECK(ingest.jobs().empty());
-
-    // The cleanup clear() owed is done by the worker as it lets go.
-    const auto gone = [&] {
-        try {
-            (void)service.filesystem().getattr(partial);
-            return false;
-        } catch (const FsError& error) {
-            return error.code() == ENOENT;
-        }
-    };
-    CHECK(wait_until(gone, 10s));
-
-    ingest.stop();
-    CHECK(!ingest.job(job_id).has_value());
-}
+#endif // MACHA_TEST_TORRENT_PLUGIN
 
 namespace {
 
-// Builds `count` single-file import roots under `base` and returns them.
+// Builds `count` single-file import roots under `base` and returns them; file
+// `i` is "Concurrent Movie <i> 2024.mkv".
 std::vector<std::filesystem::path> make_import_roots(const std::filesystem::path& base,
                                                      size_t count, size_t file_bytes) {
     std::vector<std::filesystem::path> roots;
     for (size_t i = 0; i < count; ++i) {
         auto root = base / ("concurrent-import-" + std::to_string(i));
-        std::filesystem::create_directories(root);
-        std::ofstream out(root / ("Concurrent Movie " + std::to_string(i) + " 2024.mkv"),
-                          std::ios::binary);
-        auto bytes = pattern(file_bytes);
-        out.write(reinterpret_cast<const char*>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
+        (void)write_host_file(root / ("Concurrent Movie " + std::to_string(i) + " 2024.mkv"),
+                              pattern(file_bytes));
         roots.push_back(root);
     }
     return roots;
@@ -3373,10 +2857,6 @@ bool all_imports_copied(const IngestManager& ingest, const std::vector<std::stri
     return true;
 }
 
-} // namespace
-
-namespace {
-
 // A source root holding one file whose bytes are `bytes`, and an extent
 // journal beside it recording the extents a torrent's disk backend would
 // have published. When `store_them` is false the journal names objects that
@@ -3387,22 +2867,19 @@ struct PublishedSource {
     std::vector<ObjectId> ids;
 };
 
-PublishedSource make_published_source(TestService& fixture, Service& service, const Bytes& bytes,
-                                      bool store_them) {
+PublishedSource make_published_source(const std::filesystem::path& root, uint64_t extent_size, FileSystem& fs,
+                                      const Bytes& bytes, bool store_them) {
     PublishedSource out;
-    out.root = fixture.path() / (store_them ? "published-import" : "unpublished-import");
+    out.root = root;
     out.name = "Published Movie 2024.mkv";
-    std::filesystem::create_directories(out.root);
-    std::ofstream(out.root / out.name, std::ios::binary)
-        .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    const auto extent_size = fixture.config().extent_size;
+    (void)write_host_file(out.root / out.name, bytes);
     TorrentExtentJournal journal(out.root);
     for (uint64_t offset = 0; offset < bytes.size(); offset += extent_size) {
         const auto length = std::min<uint64_t>(extent_size, bytes.size() - offset);
         const std::span<const uint8_t> slice(bytes.data() + offset, static_cast<size_t>(length));
         ObjectId id;
         if (store_them) {
-            id = service.filesystem().store().put(slice, FrameType::loader);
+            id = fs.store().put(slice, FrameType::loader);
         } else {
             // A different object of the same length, never stored.
             Bytes other(slice.begin(), slice.end());
@@ -3428,85 +2905,299 @@ Bytes read_whole(FileSystem& fs, const std::string& path, uint64_t size) {
     return out;
 }
 
+bool absent(FileSystem& fs, const std::string& path) {
+    try {
+        (void)fs.getattr(path);
+        return false;
+    } catch (const FsError& error) {
+        return error.code() == ENOENT;
+    }
+}
+
+// Holds chosen metadata commits before they are published, on the committing
+// thread: a commit naming a path that contains a held name blocks until
+// release_all(), after `skip` earlier such commits have passed. With it a test
+// stops an ingest worker at a known point in a copy.
+class CommitGate {
+    struct Hold {
+        std::string name;
+        size_t skip{};
+    };
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<Hold> holds_;
+    size_t held_{};
+
+  public:
+    void hold(std::string name, size_t skip = 0) {
+        std::lock_guard lock(mutex_);
+        holds_.push_back({std::move(name), skip});
+    }
+
+    void release_all() {
+        std::lock_guard lock(mutex_);
+        holds_.clear();
+        cv_.notify_all();
+    }
+
+    size_t held() {
+        std::lock_guard lock(mutex_);
+        return held_;
+    }
+
+    void operator()(const MetadataPublicationContext& context) {
+        if (!context.delta) return;
+        std::vector<std::string_view> paths;
+        for (const auto& [path, _] : context.delta->upsert_entries) paths.push_back(path);
+        for (const auto& [path, _] : context.delta->append_entries) paths.push_back(path);
+        std::unique_lock lock(mutex_);
+        bool block = false;
+        for (auto& hold : holds_) {
+            const bool named = std::any_of(paths.begin(), paths.end(), [&](std::string_view path) {
+                return path.find(hold.name) != std::string_view::npos;
+            });
+            if (!named) continue;
+            if (hold.skip) --hold.skip;
+            else block = true;
+        }
+        if (!block) return;
+        ++held_;
+        cv_.wait(lock, [&] { return holds_.empty(); });
+        --held_;
+    }
+};
+
 } // namespace
 
-MACHA_TEST("hydration_catalogue", test_two_files_of_one_job_never_share_a_destination) {
-    // Two same-named files in one job, neither yet in the filesystem, must be
-    // planned to distinct destinations.
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.ingest.enabled = false;
-    auto& service = fixture.start();
+MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_files) {
+    // IngestManager against one node's filesystem and hint queue: catalogue
+    // feedback completes a job and clearing it removes only what was imported;
+    // two same-named files of one job get distinct destinations; a torrent's
+    // published extents are committed without copying, exactly as journalled;
+    // destinations fold case onto existing folders.
+    CatalogueNode node("ingest");
+    auto& fs = node.filesystem();
+    node.mkdir("/Movies");
+    node.mkdir("/Movies/The Martian (2015)");
+    fs.create_file("/Movies/The Martian (2015)/The.Martian.2015.EXTENDED.1080p.mkv", 0644, getuid(), getgid());
 
-    const auto root = fixture.path() / "rome";
-    const auto first = pattern(64 * 1024 + 11, 3);
-    const auto second = pattern(96 * 1024 + 7, 4);
-    for (const auto& [dir, bytes] : {std::pair{std::string("Season 1/Extras"), first},
-                                     std::pair{std::string("Season 2/Extras"), second}}) {
-        std::filesystem::create_directories(root / dir);
-        std::ofstream out(root / dir / "Menu Art.mkv", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    const auto external = node.path() / "external-import";
+    const auto media = write_host_file(external / "Queue Test Movie 2024.mkv", pattern(512 * 1024));
+    const auto unrelated = external / "do-not-delete.txt";
+    {
+        std::ofstream out(unrelated);
+        out << "external source material not selected for ingest\n";
     }
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = {root};
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(), ingest_config);
-    const auto id = ingest.submit_path(root);
-    ingest.start();
-    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
+    const auto rome = node.path() / "rome";
+    const auto first_menu = pattern(64 * 1024 + 11, 3);
+    const auto second_menu = pattern(96 * 1024 + 7, 4);
+    (void)write_host_file(rome / "Season 1/Extras" / "Menu Art.mkv", first_menu);
+    (void)write_host_file(rome / "Season 2/Extras" / "Menu Art.mkv", second_menu);
+    const auto published_bytes = pattern(2 * node.config().extent_size + 1000, 5);
+    const auto published = make_published_source(node.path() / "published-import", node.config().extent_size, fs,
+                                                 published_bytes, true);
+    const auto martian = node.path() / "martian";
+    (void)write_host_file(martian / "the.martian.2015.extended.720p.bluray.x264-nezu.mkv", pattern(64 * 1024 + 5, 5));
+    (void)write_host_file(martian / "the.martian.2015.extended.1080p.mkv", pattern(64 * 1024 + 6, 6));
 
-    const auto job = ingest.job(id);
-    REQUIRE(job.has_value());
-    REQUIRE(job->files.size() == 2);
-    CHECK(job->files[0].destination_path != job->files[1].destination_path);
-    for (const auto& file : job->files) {
-        const auto& bytes = file.size == first.size() ? first : second;
-        CHECK(read_whole(service.filesystem(), file.destination_path, bytes.size()) == bytes);
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = {external, rome, published.root, martian};
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 256 * 1024;
+    config.delete_external_source_on_clear = true;
+    IngestManager ingest(node.node(), fs, node.hints(), config);
+    ingest.start();
+
+    // Copied, the job waits on the catalogue; the hint's outcome completes it.
+    {
+        const auto id = ingest.submit_path(external);
+        REQUIRE(wait_until([&] {
+            auto job = ingest.job(id);
+            return job && job->state == IngestJobState::cataloguing;
+        }, 10s));
+        const auto summary = node.hints().summary("ingest", id);
+        REQUIRE(summary.total == 1);
+        REQUIRE(summary.pending == 1);
+        auto hint = node.hints().claim_next();
+        REQUIRE(hint.has_value());
+        CHECK(hint->origins.size() == 1);
+        node.hints().mark_catalogued(hint->id, "movies", "macha:test-ingest-media", {"test:movie:queue"},
+                                     "synthetic match");
+        REQUIRE(wait_until([&] {
+            auto job = ingest.job(id);
+            return job && job->state == IngestJobState::completed;
+        }, 5s));
+        const auto completed = ingest.job(id);
+        REQUIRE(completed.has_value());
+        CHECK(completed->catalogue_total == 1);
+        CHECK(completed->catalogue_pending == 0);
+        CHECK(completed->catalogue_catalogued == 1);
+        CHECK(completed->catalogue_no_match == 0);
+        CHECK(completed->catalogue_failed == 0);
+
+        // Clearing deletes the imported source file and nothing beside it.
+        REQUIRE(ingest.clear(id));
+        CHECK(!ingest.job(id).has_value());
+        CHECK(!std::filesystem::exists(media));
+        CHECK(std::filesystem::exists(unrelated));
+        CHECK(std::filesystem::exists(external));
+        CHECK(node.hints().summary("ingest", id).total == 0);
+    }
+
+    const auto rome_id = ingest.submit_path(rome);
+    const auto published_id = ingest.submit_path(published.root);
+    const auto martian_id = ingest.submit_path(martian);
+    REQUIRE(wait_until([&] {
+        return all_imports_copied(ingest, {rome_id, published_id, martian_id});
+    }, 60s));
+
+    {
+        // Two same-named files, neither yet in the filesystem.
+        const auto job = ingest.job(rome_id);
+        REQUIRE(job.has_value());
+        REQUIRE(job->files.size() == 2);
+        CHECK(job->files[0].destination_path != job->files[1].destination_path);
+        for (const auto& file : job->files) {
+            const auto& bytes = file.size == first_menu.size() ? first_menu : second_menu;
+            CHECK(read_whole(fs, file.destination_path, bytes.size()) == bytes);
+        }
+    }
+    {
+        // The committed manifest is exactly the journal's; the journal itself
+        // is not media and is not imported.
+        const auto job = ingest.job(published_id);
+        REQUIRE(job.has_value());
+        REQUIRE(job->files.size() == 1);
+        const auto destination = job->files.front().destination_path;
+        const auto entry = fs.getattr(destination);
+        CHECK(entry.size == published_bytes.size());
+        REQUIRE(entry.extents.size() == published.ids.size());
+        for (size_t i = 0; i < published.ids.size(); ++i) CHECK(entry.extents[i].id == published.ids[i]);
+        CHECK(read_whole(fs, destination, published_bytes.size()) == published_bytes);
+    }
+    {
+        // An existing folder is reused as spelt, and a file whose name differs
+        // from one already there only by case is a collision.
+        const auto job = ingest.job(martian_id);
+        REQUIRE(job.has_value());
+        REQUIRE(job->files.size() == 2);
+        for (const auto& file : job->files) {
+            CHECK(file.destination_path.starts_with("/Movies/The Martian (2015)/"));
+            if (file.source_path.ends_with("1080p.mkv"))
+                CHECK(file.destination_path != "/Movies/The Martian (2015)/the.martian.2015.extended.1080p.mkv");
+        }
+        size_t martian_folders = 0;
+        for (const auto& [name, entry] : fs.readdir("/Movies"))
+            if (entry.type == EntryType::directory && name.find("artian") != std::string::npos) ++martian_folders;
+        CHECK(martian_folders == 1);
     }
     ingest.stop();
 }
 
-MACHA_TEST("hydration_catalogue", test_ingest_commits_published_torrent_extents_without_copying) {
-    // A torrent publishes each extent as its pieces verify and records it in
-    // the job's extent journal. The ingest commits the file by naming those
-    // extents -- the manifest is exactly the journal's -- without copying.
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.ingest.enabled = false;
-    auto& service = fixture.start();
+MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_mid_copy) {
+    // Six jobs, three workers, every copy held at its first checkpoint commit:
+    // exactly the bound is claimed; pause, cancel and clear then act on jobs a
+    // worker holds; and once released the paused job stays paused without
+    // stalling the rest, the cancelled job's partial goes, the cleared job
+    // never comes back, and resume completes the paused copy.
+    CommitGate gate;
+    CatalogueNode node("ingest-control", {}, [&](const MetadataPublicationContext& context) { gate(context); });
+    constexpr size_t job_count = 6;
+    constexpr size_t bound = 3;
+    constexpr size_t file_bytes = 1024 * 1024;
+    const auto roots = make_import_roots(node.path(), job_count, file_bytes);
+    // The first commit naming a file creates its partial; the second is its
+    // first checkpoint, with three more to come.
+    for (size_t i = 0; i < job_count; ++i) gate.hold("Concurrent Movie " + std::to_string(i) + " 2024.mkv", 1);
 
-    const auto bytes = pattern(2 * fixture.config().extent_size + 1000);
-    const auto source = make_published_source(fixture, service, bytes, true);
-
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = {source.root};
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(), ingest_config);
-    const auto id = ingest.submit_path(source.root);
+    IngestConfig config;
+    config.enabled = true;
+    config.staging_path = node.path() / "staging";
+    config.source_roots = roots;
+    config.copy_chunk_bytes = 64 * 1024;
+    config.checkpoint_bytes = 256 * 1024;
+    config.max_concurrent_jobs = bound;
+    IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+    // Declared after the manager: a failed REQUIRE releases the held workers
+    // before the manager joins them.
+    struct ReleaseGate {
+        CommitGate& gate;
+        ~ReleaseGate() { gate.release_all(); }
+    } release_gate{gate};
+    // Submitted before start(), so every worker wakes to claimable work.
+    std::vector<std::string> ids;
+    for (const auto& root : roots) ids.push_back(ingest.submit_path(root));
+    CHECK(ingest.active_jobs() == 0);
     ingest.start();
-    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
 
-    const auto job = ingest.job(id);
-    REQUIRE(job.has_value());
-    // The journal is not media and is not imported.
-    REQUIRE(job->files.size() == 1);
-    const auto destination = job->files.front().destination_path;
-    const auto entry = service.filesystem().getattr(destination);
-    CHECK(entry.size == bytes.size());
-    REQUIRE(entry.extents.size() == source.ids.size());
-    for (size_t i = 0; i < source.ids.size(); ++i) CHECK(entry.extents[i].id == source.ids[i]);
-    CHECK(read_whole(service.filesystem(), destination, bytes.size()) == bytes);
+    const auto importing = [&] {
+        std::vector<IngestJob> out;
+        for (const auto& id : ids)
+            if (auto job = ingest.job(id); job && job->state == IngestJobState::importing) out.push_back(*job);
+        return out;
+    };
+    REQUIRE(wait_until([&] { return importing().size() >= bound && gate.held() > 0; }, 30s));
+    CHECK(importing().size() == bound);
+    // The bound is the contract: never more claimed at once than configured.
+    CHECK(ingest.active_jobs() == bound);
+    CHECK(ingest.peak_active_jobs() == bound);
+    const auto claimed = importing();
+    const auto& paused = claimed[0];
+    const auto& cancelled = claimed[1];
+    const auto& cleared = claimed[2];
+    std::vector<std::string> untouched;
+    for (const auto& id : ids)
+        if (id != paused.id && id != cancelled.id && id != cleared.id) untouched.push_back(id);
+    REQUIRE(untouched.size() == job_count - bound);
+    for (const auto& id : untouched) CHECK(ingest.job(id)->state == IngestJobState::queued);
+
+    // Each takes effect in the job's record at once, with its worker still inside the copy.
+    REQUIRE(ingest.pause(paused.id));
+    REQUIRE(ingest.cancel(cancelled.id));
+    REQUIRE(ingest.cancel(cleared.id));
+    REQUIRE(ingest.clear(cleared.id));
+    CHECK(ingest.job(paused.id)->state == IngestJobState::paused);
+    CHECK(ingest.job(cancelled.id)->state == IngestJobState::cancelled);
+    CHECK(!ingest.job(cleared.id).has_value());
+
+    gate.release_all();
+    // The workers let go at their next control check and take the queued jobs.
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, untouched); }, 60s));
+    REQUIRE(wait_until([&] { return ingest.active_jobs() == 0; }, 10s));
+    CHECK(ingest.peak_active_jobs() == bound);
+
+    // No worker picked the paused job back up.
+    const auto held = ingest.job(paused.id);
+    REQUIRE(held.has_value());
+    CHECK(held->state == IngestJobState::paused);
+    CHECK(held->files_completed == 0);
+    // A cancel stands, and its worker removed the partial.
+    CHECK(ingest.job(cancelled.id)->state == IngestJobState::cancelled);
+    CHECK(absent(node.filesystem(), cancelled.files.front().temporary_path));
+    // A cleared job is never re-inserted by the worker that held it, which
+    // does the cleanup clear() owed.
+    CHECK(!ingest.job(cleared.id).has_value());
+    CHECK(ingest.jobs().size() == job_count - 1);
+    CHECK(absent(node.filesystem(), cleared.files.front().temporary_path));
+
+    // Resume queues the paused job again and it completes its copy.
+    REQUIRE(ingest.resume(paused.id));
+    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {paused.id}); }, 60s));
+    CHECK(read_whole(node.filesystem(), ingest.job(paused.id)->files.front().destination_path, file_bytes) ==
+          pattern(file_bytes));
+    // clear() is the API's delete: terminal jobs go, and stay gone.
+    REQUIRE(ingest.clear(cancelled.id));
+    CHECK(!ingest.job(cancelled.id).has_value());
+
     ingest.stop();
+    CHECK(ingest.active_jobs() == 0);
+    CHECK(!ingest.job(cleared.id).has_value());
 }
 
+// Integrated: the refusal is Service's claims barrier on the metadata commit,
+// and the ingest's fallback answers it.
 MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_missing) {
     // The journal is a claim, not proof. A manifest naming objects the store
     // does not hold must never be committed: the ingest falls back to copying,
@@ -3520,8 +3211,8 @@ MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_
     auto& service = fixture.start();
 
     const auto bytes = pattern(2 * fixture.config().extent_size + 1000);
-    const auto source = make_published_source(fixture, service, bytes, false);
-
+    const auto source = make_published_source(fixture.path() / "unpublished-import", fixture.config().extent_size,
+                                              service.filesystem(), bytes, false);
     IngestConfig ingest_config;
     ingest_config.enabled = true;
     ingest_config.staging_path = fixture.path() / "staging";
@@ -3540,131 +3231,6 @@ MACHA_TEST("hydration_catalogue", test_ingest_copies_when_published_extents_are_
         for (const auto& bogus : source.ids) CHECK(extent.id != bogus);
     CHECK(read_whole(service.filesystem(), destination, bytes.size()) == bytes);
     ingest.stop();
-}
-
-MACHA_TEST("hydration_catalogue", test_ingest_runs_jobs_concurrently_up_to_the_configured_bound) {
-    // Jobs run concurrently, bounded by ingest.max_concurrent_jobs.
-    // peak_active_jobs() is a monotonic high-water mark recorded at claim time,
-    // so it proves real overlap without a poller having to catch the moment.
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.ingest.enabled = false; // use the explicit manager below
-
-    auto& service = fixture.start();
-
-    constexpr size_t job_count = 6;
-    constexpr size_t bound = 3;
-    const auto roots = make_import_roots(fixture.path(), job_count, 4 * 1024 * 1024);
-
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = roots;
-    // Small chunks widen the window in which jobs overlap; a large checkpoint
-    // avoids a metadata commit per chunk.
-    ingest_config.copy_chunk_bytes = 4096;
-    ingest_config.checkpoint_bytes = 1024 * 1024;
-    ingest_config.max_concurrent_jobs = bound;
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
-                         ingest_config);
-
-    // Submit before start() so the pool wakes to an already-full queue: every
-    // worker finds claimable work immediately instead of racing the submits.
-    std::vector<std::string> ids;
-    for (const auto& root : roots) ids.push_back(ingest.submit_path(root));
-    CHECK(ingest.active_jobs() == 0);
-    ingest.start();
-
-    // Wait for the overlap rather than sampling at the end, where staggered
-    // workers on a loaded machine would decide the result. The high-water mark
-    // only ever reports overlap that happened.
-    REQUIRE(wait_until([&] { return ingest.peak_active_jobs() >= 2; }, 60s));
-
-    REQUIRE(wait_until([&] { return all_imports_copied(ingest, ids); }, 60s));
-
-    // The bound is the contract -- never more claimed at once than configured.
-    CHECK(ingest.peak_active_jobs() <= bound);
-
-    ingest.stop();
-    CHECK(ingest.active_jobs() == 0);
-}
-
-MACHA_TEST("hydration_catalogue", test_ingest_pause_resume_and_cancel_still_work_under_a_worker_pool) {
-    // show/pause/resume/cancel/clear act per job while several jobs are in
-    // flight, and pausing one does not stall the rest.
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.ingest.enabled = false;
-
-    auto& service = fixture.start();
-
-    constexpr size_t job_count = 4;
-    const auto roots = make_import_roots(fixture.path(), job_count, 2 * 1024 * 1024);
-
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = roots;
-    // Many copy iterations per file so there is a wide window to pause one
-    // mid-flight, without a metadata commit per chunk.
-    ingest_config.copy_chunk_bytes = 4096;
-    ingest_config.checkpoint_bytes = 1024 * 1024;
-    ingest_config.max_concurrent_jobs = job_count;
-    IngestManager ingest(service.node(), service.filesystem(), service.catalogue_hints(),
-                         ingest_config);
-
-    std::vector<std::string> ids;
-    for (const auto& root : roots) ids.push_back(ingest.submit_path(root));
-    ingest.start();
-
-    // Wait until the first job is genuinely mid-copy before touching it.
-    const auto& paused_id = ids.front();
-    REQUIRE(wait_until([&] {
-        auto job = ingest.job(paused_id);
-        return job && job->state == IngestJobState::importing;
-    }, 30s));
-
-    REQUIRE(ingest.pause(paused_id));
-    REQUIRE(wait_until([&] {
-        auto job = ingest.job(paused_id);
-        return job && job->state == IngestJobState::paused;
-    }, 10s));
-
-    // A paused job must stay paused -- no worker in the pool may pick it up.
-    std::this_thread::sleep_for(200ms);
-    auto held = ingest.job(paused_id);
-    REQUIRE(held.has_value());
-    CHECK(held->state == IngestJobState::paused);
-
-    // Cancelling a different in-flight job must not disturb the others.
-    const auto& cancelled_id = ids.back();
-    REQUIRE(ingest.cancel(cancelled_id));
-    REQUIRE(wait_until([&] {
-        auto job = ingest.job(cancelled_id);
-        return job && job->state == IngestJobState::cancelled;
-    }, 10s));
-
-    // The remaining untouched jobs still finish while one is paused and one
-    // cancelled -- i.e. neither one is holding the queue.
-    const std::vector<std::string> untouched(ids.begin() + 1, ids.end() - 1);
-    REQUIRE(wait_until([&] { return all_imports_copied(ingest, untouched); }, 60s));
-
-    // Resume puts the paused job back in the queue and it completes its copy.
-    REQUIRE(ingest.resume(paused_id));
-    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {paused_id}); }, 60s));
-
-    // clear() is the API's delete: terminal jobs go, and stay gone.
-    REQUIRE(ingest.clear(cancelled_id));
-    CHECK(!ingest.job(cancelled_id).has_value());
-
-    ingest.stop();
-    CHECK(ingest.active_jobs() == 0);
 }
 
 MACHA_TEST("hydration_catalogue", test_catalogue_warm_read_defers_remote_refresh) {
@@ -3807,7 +3373,6 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
                          {{"127.0.0.1", c1.port}});
     c1.replication = c2.replication = 1;
     c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 1;
-    c1.metadata_cache = c2.metadata_cache = 30ms;
     // Keep ordinary heartbeat propagation outside this test window. We install a
     // valid newer committed metadata head directly to simulate a generation notice
     // that was missed by node two; TTL validation must still discover it from replicas.
@@ -3827,7 +3392,9 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     const auto initial1 = metadata1.snapshot_view();
     n2.start();
     REQUIRE(n2.wait_local_state_ready(10s));
-    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server());
+    // Node two's decoded cache lives by a clock the test steps.
+    SteppedTime time;
+    MetadataManager metadata2(n2, n2.local_state(), n2.metadata_server(), nullptr, {}, time);
 
     std::optional<MetadataSnapshotView> initial2;
     REQUIRE(wait_until([&] {
@@ -3862,7 +3429,9 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     // the configured metadata TTL expires.
     CHECK(n2.known_metadata_generation() < next.generation);
     CHECK(metadata2.snapshot_view().generation == initial2->generation);
-    std::this_thread::sleep_for(c2.metadata_cache + 20ms);
+    time.advance(c2.metadata_cache - 1ms);
+    CHECK(metadata2.snapshot_view().generation == initial2->generation);
+    time.advance(1ms);
     REQUIRE(n2.known_metadata_generation() < next.generation);
 
     // Expiry must force a real metadata read, discover the newer committed head
@@ -3875,7 +3444,7 @@ MACHA_TEST("hydration_catalogue", test_metadata_decoded_cache_ttl_recovers_misse
     n1.stop();
 }
 
-MACHA_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_resolution) {
+MACHA_FAST_TEST("hydration_catalogue", test_catalogue_effective_music_artwork_resolution) {
     auto art = [](std::string_view seed) {
         return CatalogueArtwork{"cover", object_id(Bytes(seed.begin(), seed.end())), "image/jpeg"};
     };
@@ -4021,744 +3590,511 @@ MACHA_FAST_TEST("hydration_catalogue", test_media_indexes_round_trip_and_older_s
     CHECK(read_back.media_indexes.empty());
 }
 
-MACHA_TEST("hydration_catalogue", test_a_media_index_is_stored_live_and_served_immutably) {
-    TestService fixture("catalogue-media-index");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-    auto& catalogue = service.catalogue();
+MACHA_TEST("hydration_catalogue", test_catalogue_on_one_node_predicts_caches_and_protects_its_control_objects) {
+    // CatalogueManager, MachaDFS and the catalogue predictor on one node:
+    // prediction resolves against real file manifests; the media-id index and
+    // the decoded catalogue survive unrelated namespace and metadata churn;
+    // macOS NFC callbacks find NFD-persisted names; a cold load needs no local
+    // artwork; CONTROL GC spares a future root's staging; and a catalogue whose
+    // CONTROL manifest vanished fails repair closed while serving its snapshot.
+    CatalogueNode node("catalogue-node");
 
-    const std::string media_id = "macha:" + std::string(64, 'c');
-    const std::string body = R"({"status":"ok","schema_version":1,"streams":[]})";
-    catalogue.put_media_index(media_id, Bytes(body.begin(), body.end()));
-    auto stored = catalogue.media_index(media_id);
-    REQUIRE(stored.has_value());
-    CHECK(std::string(stored->begin(), stored->end()) == body);
+    // Prediction advances within a season, crosses into the next season, and
+    // advances a movie collection; every predicted run begins at extent zero.
+    {
+        node.mkdir("/TV");
+        node.mkdir("/Movies");
+        const auto make_file = [&](const std::string& path, uint8_t value) {
+            (void)node.write(path, Bytes(2 * 1024 * 1024 + 12345, value));
+            auto entry = node.filesystem().getattr(path);
+            REQUIRE(entry.extents.size() >= 3);
+            return entry;
+        };
+        const auto ep1_file = make_file("/TV/s01e01.mkv", 31);
+        const auto ep2_file = make_file("/TV/s01e02.mkv", 32);
+        const auto ep3_file = make_file("/TV/s02e01.mkv", 33);
+        const auto movie1_file = make_file("/Movies/one.mkv", 41);
+        const auto movie2_file = make_file("/Movies/two.mkv", 42);
 
-    // Referenced DATA, so GC must see it as live.
-    const auto live = maintenance_inventory(catalogue).live;
-    CHECK(live.contains(object_id(Bytes(body.begin(), body.end()))));
+        const auto show = node.upsert("show:test", CatalogueKind::show, "Test Show");
+        const auto add = [&](CatalogueItem item) { return node.catalogue().upsert(item); };
+        CatalogueItem season1;
+        season1.id = "season:test:1";
+        season1.kind = CatalogueKind::season;
+        season1.title = "Season 1";
+        season1.parent_id = show.id;
+        season1.season_number = 1;
+        season1 = add(season1);
+        auto season2 = season1;
+        season2.id = "season:test:2";
+        season2.title = "Season 2";
+        season2.season_number = 2;
+        season2 = add(season2);
+        const auto episode = [&](std::string id, std::string title, const CatalogueItem& season, int number,
+                                 const FsEntry& file) {
+            CatalogueItem item;
+            item.id = std::move(id);
+            item.kind = CatalogueKind::episode;
+            item.title = std::move(title);
+            item.parent_id = season.id;
+            item.season_number = season.season_number;
+            item.episode_number = number;
+            item.media_ids = {file_media_id(file)};
+            return add(item);
+        };
+        (void)episode("episode:test:1:1", "One", season1, 1, ep1_file);
+        (void)episode("episode:test:1:2", "Two", season1, 2, ep2_file);
+        (void)episode("episode:test:2:1", "Three", season2, 1, ep3_file);
+        // Movies bind by plain and by prefixed path as well as by media id.
+        CatalogueItem movie1;
+        movie1.id = "movie:test:1";
+        movie1.kind = CatalogueKind::movie;
+        movie1.title = "First Film";
+        movie1.year = 2001;
+        movie1.external_ids["collection"] = "test-films";
+        movie1.media_ids = {"/Movies/one.mkv"};
+        (void)add(movie1);
+        auto movie2 = movie1;
+        movie2.id = "movie:test:2";
+        movie2.title = "Second Film";
+        movie2.year = 2003;
+        movie2.media_ids = {"path:/Movies/two.mkv"};
+        (void)add(movie2);
 
-    int calls = 0;
-    CatalogueApi api(catalogue, service.catalogue_hints(), {}, {}, {},
-                     std::chrono::hours(24 * 30), {},
-                     [&](const std::string& id) -> std::optional<Bytes> {
-                         ++calls;
-                         if (id == media_id) return catalogue.media_index(id);
-                         if (id == "macha:mpegts") throw KeyframeIndexUnsupported("no byte index");
-                         return std::nullopt;
-                     });
-    auto get = [&](const std::string& id) {
-        return api.handle({.method = "GET",
-                           .path = "/api/v1/catalogue/media/" + id + "/keyframes",
-                           .query = {}, .headers = {}, .body = {}, .session = {}});
-    };
-    auto served = get(media_id);
-    REQUIRE(served.status == 200);
-    CHECK(std::string(served.body.begin(), served.body.end()) == body);
-    CHECK(served.headers.at("Cache-Control").find("immutable") != std::string::npos);
-    CHECK(served.headers.at("ETag") == "\"" + media_id + "\"");
-    CHECK(get("path:/Movies/x.mkv").status == 400);
-    CHECK(get("macha:gone").status == 404);
-    auto unsupported = get("macha:mpegts");
-    CHECK(unsupported.status == 422);
-    CHECK(std::string(unsupported.body.begin(), unsupported.body.end()).find("keyframes_not_supported") !=
-          std::string::npos);
-    CHECK(calls == 3);
-
-    // An index goes with its media's profile when the file is gone.
-    (void)catalogue.prune_media_profiles({});
-    CHECK(!catalogue.media_index(media_id).has_value());
-}
-
-MACHA_TEST("hydration_catalogue", test_item_edits_validate_parents_and_keep_files_unless_named) {
-    // A whole PUT that leaves out media_ids must not unbind the item's files;
-    // PATCH changes only what it names; parents are checked; a bad body is a
-    // 400; and a hand edit is locked against the scanner unless it says
-    // otherwise.
-    TestService fixture("catalogue-item-edits");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-
-    CatalogueItem show;
-    show.id = "show:edit-test";
-    show.kind = CatalogueKind::show;
-    show.title = "Edit Show";
-    show = service.catalogue().upsert(show);
-    CatalogueItem movie;
-    movie.id = "movie:edit-test";
-    movie.kind = CatalogueKind::movie;
-    movie.title = "Edit Movie";
-    movie.media_ids = {"macha:file-a", "macha:file-b"};
-    movie = service.catalogue().upsert(movie);
-
-    CatalogueApi api(service.catalogue(), service.catalogue_hints());
-    auto call = [&](std::string method, std::string id, std::string body) {
-        return api.handle({.method = std::move(method),
-                           .path = "/api/v1/catalogue/items/" + id,
-                           .query = {},
-                           .headers = {},
-                           .body = Bytes(body.begin(), body.end()),
-                           .session = {}});
-    };
-    auto error_of = [](const HttpResponse& response) {
-        return Json::parse(std::string(response.body.begin(), response.body.end()));
-    };
-
-    // A whole PUT without media_ids keeps both files, and locks the edit.
-    auto put = call("PUT", "movie%3Aedit-test", R"({"kind":"movie","title":"Renamed"})");
-    REQUIRE(put.status == 200);
-    auto stored = service.catalogue().get(movie.id);
-    REQUIRE(stored.has_value());
-    CHECK(stored->title == "Renamed");
-    CHECK((stored->media_ids == std::vector<std::string>{"macha:file-a", "macha:file-b"}));
-    CHECK(stored->external_ids.at("macha_metadata_locked") == "1");
-
-    // PATCH changes only what it names; lock false unlocks.
-    auto patch = call("PATCH", "movie%3Aedit-test", R"({"year":1999,"lock":false})");
-    REQUIRE(patch.status == 200);
-    stored = service.catalogue().get(movie.id);
-    CHECK(stored->title == "Renamed");
-    CHECK(stored->year == std::optional<int32_t>{1999});
-    CHECK(stored->media_ids.size() == 2);
-    CHECK(!stored->external_ids.contains("macha_metadata_locked"));
-
-    // PATCH of an item that does not exist, and a body that is not an object.
-    CHECK(call("PATCH", "movie%3Anope", R"({"year":2000})").status == 404);
-    auto malformed = call("PATCH", "movie%3Aedit-test", "[1,2]");
-    CHECK(malformed.status == 400);
-    CHECK(error_of(malformed).find("error")->asString() == "bad_item");
-
-    // Parents: one that does not exist, and one of the wrong kind.
-    auto missing = call("PUT", "season%3Aedit-test",
-                        R"({"kind":"season","title":"S1","parent_id":"show:absent"})");
-    CHECK(missing.status == 400);
-    CHECK(error_of(missing).find("error")->asString() == "parent_not_found");
-    CHECK(error_of(missing).find("parent_id")->asString() == "show:absent");
-    auto wrong = call("PUT", "episode%3Aedit-test",
-                      R"({"kind":"episode","title":"E1","parent_id":"show:edit-test"})");
-    CHECK(wrong.status == 400);
-    CHECK(error_of(wrong).find("error")->asString() == "bad_parent_kind");
-    CHECK(error_of(wrong).find("kind")->asString() == "episode");
-    CHECK(error_of(wrong).find("parent_kind")->asString() == "show");
-    CHECK(!service.catalogue().get("episode:edit-test").has_value());
-
-    CHECK(call("PUT", "season%3Aedit-test",
-               R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})").status == 201);
-}
-
-MACHA_TEST("hydration_catalogue", test_search_filters_by_kind_and_parent_before_its_limit) {
-    // `kind` may repeat, `parent` keeps one item's children, both filter
-    // before `limit`, and an unknown kind is a 400.
-    TestService fixture("catalogue-search-filters");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-    auto add = [&](std::string id, CatalogueKind kind, std::string title,
-                   std::optional<std::string> parent = {}) {
-        CatalogueItem item;
-        item.id = std::move(id);
-        item.kind = kind;
-        item.title = std::move(title);
-        item.parent_id = std::move(parent);
-        return service.catalogue().upsert(item);
-    };
-    for (int i = 0; i < 5; ++i)
-        add("episode:ember-" + std::to_string(i), CatalogueKind::episode, "Ember Episode " + std::to_string(i));
-    add("movie:ember", CatalogueKind::movie, "Ember");
-    add("show:ember", CatalogueKind::show, "Ember Show");
-    add("season:ember-1", CatalogueKind::season, "Ember Season", "show:ember");
-    add("season:other-1", CatalogueKind::season, "Ember Season Elsewhere", "show:other");
-
-    CatalogueApi api(service.catalogue(), service.catalogue_hints());
-    auto search = [&](std::map<std::string, std::vector<std::string>, std::less<>> all) {
-        HttpRequest request{.method = "GET", .path = "/api/v1/catalogue/search", .query = {},
-                            .headers = {}, .body = {}, .session = {}};
-        for (const auto& [key, values] : all) request.query[key] = values.back();
-        request.query_all = std::move(all);
-        return api.handle(request);
-    };
-    auto ids = [](const HttpResponse& response) {
-        std::set<std::string> out;
-        auto body = Json::parse(std::string(response.body.begin(), response.body.end()));
-        for (const auto& item : body.find("items")->asArray()) out.insert(item.find("id")->asString());
-        return out;
-    };
-
-    // Five episodes rank alongside; with limit 2 and kind=movie&kind=show the
-    // two asked-for kinds still both come back.
-    auto kinds = search({{"q", {"ember"}}, {"kind", {"movie", "show"}}, {"limit", {"2"}}});
-    REQUIRE(kinds.status == 200);
-    CHECK((ids(kinds) == std::set<std::string>{"movie:ember", "show:ember"}));
-
-    auto children = search({{"q", {"ember"}}, {"parent", {"show:ember"}}});
-    REQUIRE(children.status == 200);
-    CHECK((ids(children) == std::set<std::string>{"season:ember-1"}));
-
-    auto unknown = search({{"q", {"ember"}}, {"kind", {"film"}}});
-    CHECK(unknown.status == 400);
-    CHECK(std::string(unknown.body.begin(), unknown.body.end()).find("bad_kind") != std::string::npos);
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_api_effective_artwork_is_display_only) {
-    TestService fixture("catalogue-effective-artwork-api");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-
-    CatalogueItem artist;
-    artist.id = "artist:api-test";
-    artist.kind = CatalogueKind::artist;
-    artist.title = "API Artist";
-    artist = service.catalogue().upsert(artist);
-
-    CatalogueItem album;
-    album.id = "album:api-test";
-    album.kind = CatalogueKind::album;
-    album.title = "API Album";
-    album.parent_id = artist.id;
-    album.year = 2024;
-    album = service.catalogue().upsert(album);
-
-    CatalogueItem track;
-    track.id = "track:api-test";
-    track.kind = CatalogueKind::track;
-    track.title = "API Track";
-    track.parent_id = album.id;
-    track = service.catalogue().upsert(track);
-
-    const Bytes cover_bytes{0x10, 0x20, 0x30, 0x40};
-    const auto cover = service.catalogue().put_artwork(album.id, "cover", "image/jpeg",
-                                                       cover_bytes, album.revision);
-
-    CatalogueApi api(service.catalogue(), service.catalogue_hints());
-    const auto track_response = api.handle({.method = "GET",
-                                            .path = "/api/v1/catalogue/items/track%3Aapi-test",
-                                            .query = {},
-                                            .headers = {},
-                                            .body = {}, .session = {}});
-    REQUIRE(track_response.status == 200);
-    const auto track_json =
-        Json::parse(std::string(track_response.body.begin(), track_response.body.end()));
-    const auto* canonical = track_json.find("artwork");
-    const auto* effective = track_json.find("effective_artwork");
-    REQUIRE(canonical && canonical->isArray());
-    REQUIRE(effective && effective->isArray());
-    CHECK(canonical->asArray().empty());
-    REQUIRE(effective->asArray().size() == 1);
-    CHECK(effective->asArray().front().find("id")->asString() == to_string(cover.id));
-
-    const auto artist_response = api.handle({.method = "GET",
-                                             .path = "/api/v1/catalogue/items/artist%3Aapi-test",
-                                             .query = {},
-                                             .headers = {},
-                                             .body = {}, .session = {}});
-    REQUIRE(artist_response.status == 200);
-    const auto artist_json =
-        Json::parse(std::string(artist_response.body.begin(), artist_response.body.end()));
-    const auto* artist_effective = artist_json.find("effective_artwork");
-    REQUIRE(artist_effective && artist_effective->isArray());
-    REQUIRE(artist_effective->asArray().size() == 1);
-    CHECK(artist_effective->asArray().front().find("id")->asString() == to_string(cover.id));
-
-    auto artwork_response = api.handle({.method = "GET",
-                                        .path = "/api/v1/catalogue/artwork/" + to_string(cover.id),
-                                        .query = {},
-                                        .headers = {},
-                                        .body = {}, .session = {}});
-    REQUIRE(artwork_response.status == 200);
-    CHECK(artwork_response.body == cover_bytes);
-
-    // Round-trip the GET representation. `effective_artwork` is intentionally
-    // ignored by the mutation parser and must never become canonical metadata.
-    auto put_response = api.handle({.method = "PUT",
-                                    .path = "/api/v1/catalogue/items/track%3Aapi-test",
-                                    .query = {},
-                                    .headers = {{"if-match", "\"rev-" +
-                                                              std::to_string(track.revision) + "\""}},
-                                    .body = track_response.body, .session = {}});
-    REQUIRE(put_response.status == 200);
-    auto stored = service.catalogue().get(track.id);
-    REQUIRE(stored.has_value());
-    CHECK(stored->artwork.empty());
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_signed_and_capability_exempt) {
-    TestService fixture("catalogue-artwork-signed-url");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-
-    CatalogueItem album;
-    album.id = "album:signed-url-test";
-    album.kind = CatalogueKind::album;
-    album.title = "Signed URL Album";
-    album = service.catalogue().upsert(album);
-    const Bytes cover_bytes{0x01, 0x02, 0x03, 0x04};
-    const auto cover =
-        service.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
-
-    CatalogueApi api(service.catalogue(), service.catalogue_hints());
-    const auto response = api.handle({.method = "GET",
-                                      .path = "/api/v1/catalogue/items/album%3Asigned-url-test",
-                                      .query = {},
-                                      .headers = {},
-                                      .body = {}, .session = {}});
-    REQUIRE(response.status == 200);
-    const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
-    const auto* artwork = json.find("artwork");
-    REQUIRE(artwork && artwork->isArray());
-    REQUIRE(artwork->asArray().size() == 1);
-    const auto& entry = artwork->asArray().front();
-    const auto* url_value = entry.find("url");
-    REQUIRE(url_value);
-    const auto url = url_value->asString();
-
-    // The URL is directly usable: it carries its own path, id and query.
-    const auto question = url.find('?');
-    REQUIRE(question != std::string::npos);
-    HttpRequest signed_request;
-    signed_request.method = "GET";
-    signed_request.path = url.substr(0, question);
-    signed_request.query = parse_test_query(url.substr(question + 1));
-
-    // capability_request() -- what HttpServer consults to decide whether to
-    // skip the ordinary bearer check -- must recognize this exact request.
-    CHECK(api.capability_request(signed_request));
-
-    const auto fetched = api.handle(signed_request);
-    REQUIRE(fetched.status == 200);
-    CHECK(fetched.body == cover_bytes);
-    REQUIRE(fetched.headers.contains("Cache-Control"));
-    CHECK(fetched.headers.at("Cache-Control").find("immutable") != std::string::npos);
-
-    // A bare, unsigned request to the same path must NOT be granted the
-    // exemption -- otherwise artwork would become unconditionally public
-    // regardless of a configured bearer token, defeating the point.
-    HttpRequest unsigned_request;
-    unsigned_request.method = "GET";
-    unsigned_request.path = signed_request.path;
-    CHECK(!api.capability_request(unsigned_request));
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_artwork_url_is_stable_so_it_can_be_cached) {
-    TestService fixture("catalogue-artwork-stable-url");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-
-    CatalogueItem album;
-    album.id = "album:stable-url-test";
-    album.kind = CatalogueKind::album;
-    album.title = "Stable URL Album";
-    album = service.catalogue().upsert(album);
-    const Bytes cover_bytes{0x09, 0x08, 0x07};
-    service.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
-
-    const std::chrono::milliseconds ttl = std::chrono::hours(24);
-    CatalogueApi api(service.catalogue(), service.catalogue_hints(), {}, {}, {}, ttl);
-    auto artwork_url = [&] {
-        const auto response = api.handle({.method = "GET",
-                                          .path = "/api/v1/catalogue/items/album%3Astable-url-test",
-                                          .query = {},
-                                          .headers = {},
-                                          .body = {}, .session = {}});
-        REQUIRE(response.status == 200);
-        const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
-        return json.find("artwork")->asArray().front().find("url")->asString();
-    };
-
-    // A browser keys its cache on the full URL, so two reads of the same
-    // artwork must produce byte-identical URLs or the immutable cache header
-    // on the artwork response is never consulted.
-    const auto first = artwork_url();
-    std::this_thread::sleep_for(5ms);
-    const auto second = artwork_url();
-    CHECK(first == second);
-
-    // Same again through the list route, which signs separately: a client that
-    // renders a grid and then an item page must not fetch the poster twice.
-    const auto listed = api.handle({.method = "GET",
-                                    .path = "/api/v1/catalogue/items",
-                                    .query = {},
-                                    .headers = {},
-                                    .body = {}, .session = {}});
-    REQUIRE(listed.status == 200);
-    const auto listed_json = Json::parse(std::string(listed.body.begin(), listed.body.end()));
-    bool found = false;
-    for (const auto& item : listed_json.find("items")->asArray()) {
-        if (item.find("id")->asString() != album.id) continue;
-        found = true;
-        CHECK(item.find("artwork")->asArray().front().find("url")->asString() == first);
+        HydrationConfig prediction_config;
+        prediction_config.catalogue_lookahead = 1;
+        PlaybackTracker tracker;
+        CatalogueSequenceHintProvider predictor(tracker, node.filesystem(), node.catalogue(), prediction_config);
+        const auto check_prediction = [&](const std::string& path, const FsEntry& current,
+                                          const FsEntry& expected, const char* reason) {
+            auto active = tracker.open(path, current);
+            tracker.progress(active, 0);
+            auto predicted = predictor.hints();
+            REQUIRE(predicted.size() == 1);
+            CHECK(predicted[0].reason == reason);
+            REQUIRE(!predicted[0].objects.empty());
+            CHECK(predicted[0].objects.front() == expected.extents.front().id);
+            CHECK(predicted[0].objects.size() == expected.extents.size());
+            tracker.close(active);
+        };
+        check_prediction("/TV/s01e01.mkv", ep1_file, ep2_file, "next_episode");
+        check_prediction("/TV/s01e02.mkv", ep2_file, ep3_file, "next_episode");
+        check_prediction("/Movies/one.mkv", movie1_file, movie2_file, "next_movie");
     }
-    CHECK(found);
 
-    // Stability must not be bought with a short capability. The expiry is
-    // rounded up to the bucket after next precisely so that a URL minted just
-    // before a boundary still outlives the configured TTL rather than dying
-    // in the client's hand.
-    const auto question = first.find('?');
-    REQUIRE(question != std::string::npos);
-    const auto query = parse_test_query(first.substr(question + 1));
-    REQUIRE(query.contains("exp"));
-    const auto expires = std::stoull(query.at("exp"));
-    const auto ttl_ms = static_cast<uint64_t>(ttl.count());
-    CHECK(expires % ttl_ms == 0);
-    const auto now = unix_ms();
-    CHECK(expires >= now + ttl_ms);
-    CHECK(expires <= now + 2 * ttl_ms);
+    // An already resolved, content-addressed media id survives unrelated
+    // namespace churn; a new id is a miss that rebuilds, after which both resolve.
+    {
+        node.mkdir("/media");
+        const auto a_id = node.write("/media/a.mkv", pattern(32 * 1024 + 17));
+        auto first = node.filesystem().find_media(a_id);
+        REQUIRE(first.has_value());
+        CHECK(first->first == "/media/a.mkv");
+        node.mkdir("/noise");
+        auto cached = node.filesystem().find_media(a_id);
+        REQUIRE(cached.has_value());
+        CHECK(cached->first == "/media/a.mkv");
+        CHECK(file_media_id(cached->second) == a_id);
+        const auto b_id = node.write("/media/b.mkv", pattern(48 * 1024 + 29));
+        CHECK(b_id != a_id);
+        auto second = node.filesystem().find_media(b_id);
+        REQUIRE(second.has_value());
+        CHECK(second->first == "/media/b.mkv");
+        REQUIRE(node.filesystem().find_media(a_id).has_value());
+    }
 
-    // And it is still a working capability, not merely a stable string.
-    HttpRequest signed_request;
-    signed_request.method = "GET";
-    signed_request.path = first.substr(0, question);
-    signed_request.query = query;
-    CHECK(api.capability_request(signed_request));
-    const auto fetched = api.handle(signed_request);
-    REQUIRE(fetched.status == 200);
-    CHECK(fetched.body == cover_bytes);
+#if defined(__APPLE__)
+    // The runtime alias index resolves NFC callbacks to the exact persisted NFD
+    // spelling instead of rewriting the metadata representation, and a new NFC
+    // leaf under an NFD parent keeps the stored parent spelling.
+    {
+        node.mkdir("/Music");
+        const std::string nfd_dir = "/Music/Cafe\xcc\x81 del Mar";
+        const std::string nfd_file = nfd_dir + "/01.Clannad - Na Buachailli\xcc\x81 lainn.mp3";
+        const std::string nfc_dir = "/Music/Caf\xc3\xa9 del Mar";
+        const std::string nfc_file = nfc_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
+        node.metadata().mutate([&](MetadataSnapshot& snapshot) {
+            FsEntry dir;
+            dir.type = EntryType::directory;
+            dir.mode = 0755;
+            dir.uid = getuid();
+            dir.gid = getgid();
+            dir.ctime_ns = dir.mtime_ns = wall_time_ns();
+            snapshot.entries[nfd_dir] = dir;
+            FsEntry file;
+            file.type = EntryType::file;
+            file.mode = 0644;
+            file.uid = getuid();
+            file.gid = getgid();
+            file.ctime_ns = file.mtime_ns = wall_time_ns();
+            snapshot.entries[nfd_file] = file;
+        });
+        CHECK(node.filesystem().getattr(nfc_dir).type == EntryType::directory);
+        CHECK(node.filesystem().getattr(nfc_file).type == EntryType::file);
+        auto listed = node.filesystem().readdir(nfc_dir);
+        REQUIRE(listed.size() == 1);
+        CHECK(listed.front().first == "01.Clannad - Na Buachailli\xcc\x81 lainn.mp3");
+        const std::string new_nfc = nfc_dir + "/Macha Caf\xc3\xa9 Test.mp3";
+        node.filesystem().create_file(new_nfc, 0644, getuid(), getgid());
+        CHECK(node.metadata().snapshot().entries.contains(nfd_dir + "/Macha Caf\xc3\xa9 Test.mp3"));
+        CHECK(node.filesystem().getattr(new_nfc).type == EntryType::file);
+    }
+#endif
 
-    // Artwork is content-addressed, so its id is its entity tag, and the
-    // cache lifetime equals the capability's: a poster is downloaded once per
-    // browser per TTL, and a revalidation of one already held is a 304 with
-    // no body, answered before the artwork is read at all.
-    const auto tag = fetched.headers.find("ETag");
-    REQUIRE(tag != fetched.headers.end());
-    const auto id_text = signed_request.path.substr(signed_request.path.rfind('/') + 1);
-    CHECK(tag->second == "\"" + id_text + "\"");
-    CHECK(fetched.headers.at("Cache-Control") ==
-          "public, max-age=" + std::to_string(ttl_ms / 1000) + ", immutable");
-    // Without it the browser zeroes every cross-origin timing, and a client
-    // cannot measure how long a poster took.
-    CHECK(fetched.headers.at("Timing-Allow-Origin") == "*");
+    // A cold load from the sharded CONTROL representation is ready without the
+    // referenced artwork DATA held locally.
+    {
+        auto item = node.upsert("test:movie:artwork-missing", CatalogueKind::movie, "Catalogue Still Loads");
+        const auto artwork = node.catalogue().put_artwork(item.id, "poster", "image/jpeg",
+                                                          Bytes{0x01, 0x02, 0x03, 0x04}, item.revision);
+        REQUIRE(node.node().local_store().remove(artwork.id));
+        REQUIRE(!node.node().local_store().has(artwork.id));
+        CatalogueManager reloaded(node.node(), node.node().local_state(), node.node().metadata_server(),
+                                  node.store(), node.metadata(), node.node().ledger());
+        reloaded.repair_once();
+        const auto status = reloaded.status();
+        CHECK(status.ready);
+        CHECK(status.artwork_objects == 1);
+        CHECK(status.local_artwork_objects == 0);
+        auto loaded = reloaded.get(item.id);
+        REQUIRE(loaded.has_value());
+        CHECK(loaded->title == item.title);
+    }
 
-    auto revalidation = signed_request;
-    revalidation.headers["if-none-match"] = tag->second;
-    const auto not_modified = api.handle(revalidation);
-    CHECK(not_modified.status == 304);
-    CHECK(not_modified.body.empty());
-    CHECK(not_modified.headers.at("ETag") == tag->second);
+    // CONTROL publication is data-before-metadata: an object written after the
+    // observed catalogue root is kept by GC even with zero grace, and becomes an
+    // ordinary orphan once a successor root is committed and observed.
+    {
+        auto& control = node.node().control_store();
+        REQUIRE(wait_until([&] {
+            try {
+                node.catalogue().repair_once();
+                return node.catalogue().status().ready;
+            } catch (...) {
+                return false;
+            }
+        }));
+        Bytes staged = pattern(4096 + 37);
+        staged[0] ^= 0x6d;
+        const auto staged_id = object_id(staged);
+        REQUIRE(control.put(staged_id, staged));
+        std::this_thread::sleep_for(5ms);
+        const std::vector<ObjectId> no_live;
+        for (int i = 0; i < 4; ++i) (void)node.catalogue().control_gc_step(no_live, 0ms, 64);
+        CHECK(control.has(staged_id));
+        (void)node.upsert("movie:control-publication-fence", CatalogueKind::movie, "Control Publication Fence");
+        std::this_thread::sleep_for(5ms);
+        auto maintenance = maintenance_inventory(node.catalogue());
+        REQUIRE(maintenance.complete);
+        std::vector<ObjectId> live(maintenance.control_live.begin(), maintenance.control_live.end());
+        for (int i = 0; i < 4 && control.has(staged_id); ++i)
+            (void)node.catalogue().control_gc_step(live, 0ms, 64);
+        CHECK(!control.has(staged_id));
+    }
 
-    // A different tag is not a match: the bytes come back.
-    auto stale = signed_request;
-    stale.headers["if-none-match"] = "\"not-this-one\"";
-    const auto refetched = api.handle(stale);
-    CHECK(refetched.status == 200);
-    CHECK(refetched.body == cover_bytes);
+    // A warm immutable catalogue stays usable when ordinary metadata moves on
+    // without changing catalogue_root, even with its CONTROL manifest gone:
+    // definitely_absent answers from the decoded view, and repair fails closed.
+    {
+        auto committed = node.upsert("test:movie:1", CatalogueKind::movie, "Cached Movie");
+        CHECK(committed.title == "Cached Movie");
+        const auto status = node.catalogue().status();
+        REQUIRE(status.root.has_value());
+        REQUIRE(node.node().control_store().remove(*status.root));
+        node.metadata().mutate([](MetadataSnapshot& snapshot) {
+            auto root = snapshot.entries.find("/");
+            REQUIRE(root != snapshot.entries.end());
+            ++root->second.version;
+            ++root->second.mtime_ns;
+        });
+        auto cached = node.catalogue().get("test:movie:1");
+        REQUIRE(cached.has_value());
+        CHECK(cached->title == "Cached Movie");
+        CHECK(node.catalogue().definitely_absent("test:movie:missing"));
+        bool repair_failed = false;
+        try {
+            node.catalogue().repair_once();
+        } catch (const CatalogueUnavailable&) {
+            repair_failed = true;
+        }
+        CHECK(repair_failed);
+        auto after_repair = node.catalogue().get("test:movie:1");
+        REQUIRE(after_repair.has_value());
+        CHECK(after_repair->title == "Cached Movie");
+    }
 }
 
-MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_lasts_thirty_days_by_default) {
-    CHECK(Config{}.catalogue.api.artwork_capability_ttl == std::chrono::hours(24 * 30));
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_artwork_capability_rejects_tampered_or_expired) {
-    TestService fixture("catalogue-artwork-tampered-url");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.hydration.enabled = false;
-    auto& service = fixture.start();
-
-    CatalogueItem album;
-    album.id = "album:tampered-url-test";
-    album.kind = CatalogueKind::album;
-    album.title = "Tampered URL Album";
-    album = service.catalogue().upsert(album);
-    const Bytes cover_bytes{0x05, 0x06, 0x07, 0x08};
-    const auto cover =
-        service.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
-
-    CatalogueApi api(service.catalogue(), service.catalogue_hints());
-    const auto response = api.handle({.method = "GET",
-                                      .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
-                                      .query = {},
-                                      .headers = {},
-                                      .body = {}, .session = {}});
-    REQUIRE(response.status == 200);
-    const auto json = Json::parse(std::string(response.body.begin(), response.body.end()));
-    const auto url = json.find("artwork")->asArray().front().find("url")->asString();
-    const auto question = url.find('?');
-    REQUIRE(question != std::string::npos);
-    const auto path = url.substr(0, question);
-    const auto query = parse_test_query(url.substr(question + 1));
-    REQUIRE(query.contains("exp"));
-    REQUIRE(query.contains("sig"));
-
-    auto request_with = [&](std::map<std::string, std::string, std::less<>> q) {
-        HttpRequest request;
-        request.method = "GET";
-        request.path = path;
-        request.query = std::move(q);
-        return request;
+MACHA_TEST("hydration_catalogue", test_catalogue_api_edits_searches_and_signs_artwork) {
+    // CatalogueApi over one node's catalogue: item edits keep files unless
+    // named and validate parents; search filters before its limit; effective
+    // artwork is display-only; artwork URLs are signed, stable, capability
+    // exempt and refuse tampering or expiry; media indexes are served immutably.
+    CatalogueNode node("catalogue-api");
+    CatalogueApi api(node.catalogue(), node.hints());
+    const auto call = [&](CatalogueApi& on, std::string method, std::string path, std::string body = {},
+                          std::map<std::string, std::string, std::less<>> headers = {}) {
+        return on.handle(api_request(std::move(method), std::move(path), Bytes(body.begin(), body.end()),
+                                     std::move(headers)));
     };
 
-    // Genuinely valid first, so the rest of this test is meaningful.
-    CHECK(api.capability_request(request_with(query)));
+    // A whole PUT that leaves out media_ids keeps the item's files; PATCH
+    // changes only what it names; parents are checked; a bad body is a 400;
+    // and a hand edit is locked against the scanner unless it says otherwise.
+    {
+        (void)node.upsert("show:edit-test", CatalogueKind::show, "Edit Show");
+        CatalogueItem movie;
+        movie.id = "movie:edit-test";
+        movie.kind = CatalogueKind::movie;
+        movie.title = "Edit Movie";
+        movie.media_ids = {"macha:file-a", "macha:file-b"};
+        movie = node.catalogue().upsert(movie);
+        const auto item_call = [&](std::string method, std::string id, std::string body) {
+            return call(api, std::move(method), "/api/v1/catalogue/items/" + id, std::move(body));
+        };
+        REQUIRE(item_call("PUT", "movie%3Aedit-test", R"({"kind":"movie","title":"Renamed"})").status == 200);
+        auto stored = node.catalogue().get(movie.id);
+        REQUIRE(stored.has_value());
+        CHECK(stored->title == "Renamed");
+        CHECK((stored->media_ids == std::vector<std::string>{"macha:file-a", "macha:file-b"}));
+        CHECK(stored->external_ids.at("macha_metadata_locked") == "1");
+        REQUIRE(item_call("PATCH", "movie%3Aedit-test", R"({"year":1999,"lock":false})").status == 200);
+        stored = node.catalogue().get(movie.id);
+        CHECK(stored->title == "Renamed");
+        CHECK(stored->year == std::optional<int32_t>{1999});
+        CHECK(stored->media_ids.size() == 2);
+        CHECK(!stored->external_ids.contains("macha_metadata_locked"));
+        CHECK(item_call("PATCH", "movie%3Anope", R"({"year":2000})").status == 404);
+        auto malformed = item_call("PATCH", "movie%3Aedit-test", "[1,2]");
+        CHECK(malformed.status == 400);
+        CHECK(api_body(malformed).find("error")->asString() == "bad_item");
+        auto missing = item_call("PUT", "season%3Aedit-test",
+                                 R"({"kind":"season","title":"S1","parent_id":"show:absent"})");
+        CHECK(missing.status == 400);
+        CHECK(api_body(missing).find("error")->asString() == "parent_not_found");
+        CHECK(api_body(missing).find("parent_id")->asString() == "show:absent");
+        auto wrong = item_call("PUT", "episode%3Aedit-test",
+                               R"({"kind":"episode","title":"E1","parent_id":"show:edit-test"})");
+        CHECK(wrong.status == 400);
+        CHECK(api_body(wrong).find("error")->asString() == "bad_parent_kind");
+        CHECK(api_body(wrong).find("kind")->asString() == "episode");
+        CHECK(api_body(wrong).find("parent_kind")->asString() == "show");
+        CHECK(!node.catalogue().get("episode:edit-test").has_value());
+        CHECK(item_call("PUT", "season%3Aedit-test",
+                        R"({"kind":"season","title":"S1","parent_id":"show:edit-test"})").status == 201);
+    }
 
-    auto tampered_sig = query;
-    tampered_sig["sig"][0] = (tampered_sig["sig"][0] == '0') ? '1' : '0';
-    CHECK(!api.capability_request(request_with(tampered_sig)));
+    // `kind` may repeat, `parent` keeps one item's children, both filter before
+    // `limit`, and an unknown kind is a 400.
+    {
+        for (int i = 0; i < 5; ++i)
+            (void)node.upsert("episode:ember-" + std::to_string(i), CatalogueKind::episode,
+                              "Ember Episode " + std::to_string(i));
+        (void)node.upsert("movie:ember", CatalogueKind::movie, "Ember");
+        (void)node.upsert("show:ember", CatalogueKind::show, "Ember Show");
+        (void)node.upsert("season:ember-1", CatalogueKind::season, "Ember Season", "show:ember");
+        (void)node.upsert("season:other-1", CatalogueKind::season, "Ember Season Elsewhere", "show:other");
+        const auto search = [&](std::map<std::string, std::vector<std::string>, std::less<>> all) {
+            auto request = api_request("GET", "/api/v1/catalogue/search");
+            for (const auto& [key, values] : all) request.query[key] = values.back();
+            request.query_all = std::move(all);
+            return api.handle(request);
+        };
+        const auto ids = [](const HttpResponse& response) {
+            std::set<std::string> out;
+            const auto body = api_body(response);
+            for (const auto& item : body.find("items")->asArray()) out.insert(item.find("id")->asString());
+            return out;
+        };
+        auto kinds = search({{"q", {"ember"}}, {"kind", {"movie", "show"}}, {"limit", {"2"}}});
+        REQUIRE(kinds.status == 200);
+        CHECK((ids(kinds) == std::set<std::string>{"movie:ember", "show:ember"}));
+        auto children = search({{"q", {"ember"}}, {"parent", {"show:ember"}}});
+        REQUIRE(children.status == 200);
+        CHECK((ids(children) == std::set<std::string>{"season:ember-1"}));
+        auto unknown = search({{"q", {"ember"}}, {"kind", {"film"}}});
+        CHECK(unknown.status == 400);
+        CHECK(std::string(unknown.body.begin(), unknown.body.end()).find("bad_kind") != std::string::npos);
+    }
 
-    auto tampered_exp = query;
-    tampered_exp["exp"] = std::to_string(std::stoull(tampered_exp["exp"]) + 1);
-    CHECK(!api.capability_request(request_with(tampered_exp)));
+    // A track inherits its album's cover as effective_artwork for display; it
+    // is never canonical, so a round-tripped GET does not store it.
+    {
+        const auto artist = node.upsert("artist:api-test", CatalogueKind::artist, "API Artist");
+        CatalogueItem album;
+        album.id = "album:api-test";
+        album.kind = CatalogueKind::album;
+        album.title = "API Album";
+        album.parent_id = artist.id;
+        album.year = 2024;
+        album = node.catalogue().upsert(album);
+        const auto track = node.upsert("track:api-test", CatalogueKind::track, "API Track", album.id);
+        const Bytes cover_bytes{0x10, 0x20, 0x30, 0x40};
+        const auto cover = node.catalogue().put_artwork(album.id, "cover", "image/jpeg", cover_bytes, album.revision);
+        const auto track_response = call(api, "GET", "/api/v1/catalogue/items/track%3Aapi-test");
+        REQUIRE(track_response.status == 200);
+        const auto track_json = api_body(track_response);
+        REQUIRE(track_json.find("artwork")->isArray());
+        CHECK(track_json.find("artwork")->asArray().empty());
+        REQUIRE(track_json.find("effective_artwork")->asArray().size() == 1);
+        CHECK(track_json.find("effective_artwork")->asArray().front().find("id")->asString() == to_string(cover.id));
+        const auto artist_json = api_body(call(api, "GET", "/api/v1/catalogue/items/artist%3Aapi-test"));
+        REQUIRE(artist_json.find("effective_artwork")->asArray().size() == 1);
+        CHECK(artist_json.find("effective_artwork")->asArray().front().find("id")->asString() == to_string(cover.id));
+        auto artwork_response = call(api, "GET", "/api/v1/catalogue/artwork/" + to_string(cover.id));
+        REQUIRE(artwork_response.status == 200);
+        CHECK(artwork_response.body == cover_bytes);
+        auto put = api.handle(api_request("PUT", "/api/v1/catalogue/items/track%3Aapi-test", track_response.body,
+                                          {{"if-match", "\"rev-" + std::to_string(track.revision) + "\""}}));
+        REQUIRE(put.status == 200);
+        auto stored = node.catalogue().get(track.id);
+        REQUIRE(stored.has_value());
+        CHECK(stored->artwork.empty());
+    }
 
-    // A *correctly signed* but expired URL must still be rejected -- expiry
-    // itself is enforced, not just signature validity. Get a genuinely valid
-    // signature for a past expiry by minting one through the real signing
-    // path with a near-zero TTL and letting it lapse, rather than
-    // hand-duplicating the HMAC construction here.
-    CatalogueApi short_lived_api(service.catalogue(), service.catalogue_hints(), {}, {}, {}, 1ms);
-    const auto short_lived_response =
-        short_lived_api.handle({.method = "GET",
-                                .path = "/api/v1/catalogue/items/album%3Atampered-url-test",
-                                .query = {},
-                                .headers = {},
-                                .body = {}, .session = {}});
-    REQUIRE(short_lived_response.status == 200);
-    const auto short_lived_json = Json::parse(
-        std::string(short_lived_response.body.begin(), short_lived_response.body.end()));
-    const auto short_lived_url =
-        short_lived_json.find("artwork")->asArray().front().find("url")->asString();
-    const auto short_lived_question = short_lived_url.find('?');
-    REQUIRE(short_lived_question != std::string::npos);
-    HttpRequest expired_request;
-    expired_request.method = "GET";
-    expired_request.path = short_lived_url.substr(0, short_lived_question);
-    expired_request.query = parse_test_query(short_lived_url.substr(short_lived_question + 1));
-    std::this_thread::sleep_for(20ms);
-    CHECK(!api.capability_request(expired_request));
+    // Artwork URLs: directly usable and signed, recognised by
+    // capability_request() (which HttpServer consults to skip the bearer check)
+    // only when signed, byte-identical across reads and routes so browsers can
+    // cache them, valid for at least the TTL, and refused when tampered with or
+    // expired.
+    {
+        CatalogueItem album;
+        album.id = "album:signed-url-test";
+        album.kind = CatalogueKind::album;
+        album.title = "Signed URL Album";
+        album = node.catalogue().upsert(album);
+        const Bytes cover_bytes{0x01, 0x02, 0x03, 0x04};
+        (void)node.catalogue().put_artwork(album.id, "cover", "image/png", cover_bytes, album.revision);
+        CHECK(Config{}.catalogue.api.artwork_capability_ttl == std::chrono::hours(24 * 30));
+        const std::chrono::milliseconds ttl = std::chrono::hours(24);
+        CatalogueApi signing(node.catalogue(), node.hints(), {}, {}, {}, ttl);
+        const auto artwork_url = [&](CatalogueApi& on) {
+            const auto response = call(on, "GET", "/api/v1/catalogue/items/album%3Asigned-url-test");
+            REQUIRE(response.status == 200);
+            const auto json = api_body(response);
+            REQUIRE(json.find("artwork")->asArray().size() == 1);
+            return json.find("artwork")->asArray().front().find("url")->asString();
+        };
+        const auto signed_request = [](const std::string& url) {
+            const auto question = url.find('?');
+            REQUIRE(question != std::string::npos);
+            HttpRequest request;
+            request.method = "GET";
+            request.path = url.substr(0, question);
+            request.query = parse_test_query(url.substr(question + 1));
+            return request;
+        };
 
-    auto missing_sig = query;
-    missing_sig.erase("sig");
-    CHECK(!api.capability_request(request_with(missing_sig)));
-
-    HttpRequest bare;
-    bare.method = "GET";
-    bare.path = path;
-    CHECK(!api.capability_request(bare));
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_root_ready_without_local_artwork) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-
-    BareNode node(config, keys);
-    node.start();
-    REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    CatalogueManager catalogue(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
-
-    CatalogueItem item;
-    item.id = "test:movie:artwork-missing";
-    item.kind = CatalogueKind::movie;
-    item.title = "Catalogue Still Loads";
-    item = catalogue.upsert(item);
-
-    const Bytes artwork_bytes{0x01, 0x02, 0x03, 0x04};
-    const auto artwork = catalogue.put_artwork(item.id, "poster", "image/jpeg",
-                                               artwork_bytes, item.revision);
-    REQUIRE(node.local_store().remove(artwork.id));
-    REQUIRE(!node.local_store().has(artwork.id));
-
-    // Force a cold catalogue load from the sharded CONTROL representation. The
-    // referenced artwork DATA is deliberately absent locally and must not be a
-    // prerequisite for catalogue readiness.
-    CatalogueManager reloaded(node, node.local_state(), node.metadata_server(), store, metadata, node.ledger());
-    reloaded.repair_once();
-
-    auto status = reloaded.status();
-    CHECK(status.ready);
-    CHECK(status.items == 1);
-    CHECK(status.artwork_objects == 1);
-    CHECK(status.local_artwork_objects == 0);
-    auto loaded = reloaded.get(item.id);
-    REQUIRE(loaded.has_value());
-    CHECK(loaded->title == item.title);
-
-    node.stop();
-}
-
-MACHA_FAST_TEST("hydration_catalogue", test_macos_unicode_namespace_aliases) {
-#if defined(__APPLE__)
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-
-    BareNode node(config, keys);
-    node.start();
-    REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    FileSystem filesystem(node.config(), node.node_id(), node.membership(), node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
-
-    filesystem.mkdir("/Music", 0755, getuid(), getgid());
-
-    // Namespace keys persisted in NFD form.
-    // The runtime alias index must resolve NFC callbacks to the exact persisted
-    // spelling instead of rewriting the metadata representation.
-    const std::string nfd_dir = "/Music/Cafe\xcc\x81 del Mar";
-    const std::string nfd_file =
-        nfd_dir + "/01.Clannad - Na Buachailli\xcc\x81 lainn.mp3";
-    const std::string nfc_dir = "/Music/Caf\xc3\xa9 del Mar";
-    const std::string nfc_file =
-        nfc_dir + "/01.Clannad - Na Buachaill\xc3\xad lainn.mp3";
-
-    metadata.mutate([&](MetadataSnapshot& snapshot) {
-        FsEntry dir;
-        dir.type = EntryType::directory;
-        dir.mode = 0755;
-        dir.uid = getuid();
-        dir.gid = getgid();
-        dir.ctime_ns = dir.mtime_ns = wall_time_ns();
-        snapshot.entries[nfd_dir] = dir;
-
-        FsEntry file;
-        file.type = EntryType::file;
-        file.mode = 0644;
-        file.uid = getuid();
-        file.gid = getgid();
-        file.ctime_ns = file.mtime_ns = wall_time_ns();
-        snapshot.entries[nfd_file] = file;
-    });
-
-    CHECK(filesystem.getattr(nfc_dir).type == EntryType::directory);
-    CHECK(filesystem.getattr(nfc_file).type == EntryType::file);
-    auto listed = filesystem.readdir(nfc_dir);
-    REQUIRE(listed.size() == 1);
-    CHECK(listed.front().first == "01.Clannad - Na Buachailli\xcc\x81 lainn.mp3");
-
-    // A new NFC leaf under an old NFD parent must retain the exact stored parent
-    // spelling so require_parent() sees a real namespace key.
-    const std::string new_nfc = nfc_dir + "/Macha Caf\xc3\xa9 Test.mp3";
-    filesystem.create_file(new_nfc, 0644, getuid(), getgid());
-    const auto persisted = metadata.snapshot();
-    CHECK(persisted.entries.contains(nfd_dir + "/Macha Caf\xc3\xa9 Test.mp3"));
-    CHECK(filesystem.getattr(new_nfc).type == EntryType::file);
-
-    node.stop();
-#endif
-}
-
-MACHA_TEST("hydration_catalogue", test_media_index_cache_survives_namespace_churn) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    auto config = config_for(cluster.path() / "node", cluster.keyfile(), free_port());
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-
-    BareNode node(config, keys);
-    node.start();
-    REQUIRE(node.wait_local_state_ready(10s));
-    DistributedStore store(node, node.local_state(), node.resources.activity, node.resources.data, node.resources.memory, node.resources.events);
-    MetadataManager metadata(node, node.local_state(), node.metadata_server());
-    FileSystem filesystem(node.config(), node.node_id(), node.membership(), node.local_state(), node.metadata_server(), store, metadata, node.resources.memory);
-
-    filesystem.mkdir("/media", 0755, getuid(), getgid());
-    filesystem.create_file("/media/a.mkv", 0644, getuid(), getgid());
-    auto a_bytes = pattern(32 * 1024 + 17);
-    auto a_writer = filesystem.open_write("/media/a.mkv", true);
-    REQUIRE(a_writer->write(0, a_bytes) == a_bytes.size());
-    a_writer->commit();
-    auto a_entry = filesystem.getattr("/media/a.mkv");
-    auto a_id = file_media_id(a_entry);
-
-    auto first = filesystem.find_media(a_id);
-    REQUIRE(first.has_value());
-    CHECK(first->first == "/media/a.mkv");
-
-    // Unrelated namespace churn must not invalidate an already resolved,
-    // content-addressed media id.
-    filesystem.mkdir("/noise", 0755, getuid(), getgid());
-    auto cached = filesystem.find_media(a_id);
-    REQUIRE(cached.has_value());
-    CHECK(cached->first == "/media/a.mkv");
-    CHECK(file_media_id(cached->second) == a_id);
-
-    // A genuinely new id is a cache miss and must rebuild against current
-    // metadata, after which both the new and old ids remain resolvable.
-    filesystem.create_file("/media/b.mkv", 0644, getuid(), getgid());
-    auto b_bytes = pattern(48 * 1024 + 29);
-    auto b_writer = filesystem.open_write("/media/b.mkv", true);
-    REQUIRE(b_writer->write(0, b_bytes) == b_bytes.size());
-    b_writer->commit();
-    auto b_id = file_media_id(filesystem.getattr("/media/b.mkv"));
-    CHECK(b_id != a_id);
-
-    auto second = filesystem.find_media(b_id);
-    REQUIRE(second.has_value());
-    CHECK(second->first == "/media/b.mkv");
-    REQUIRE(filesystem.find_media(a_id).has_value());
-
-    node.stop();
-}
-
-MACHA_TEST("hydration_catalogue", test_catalogue_control_gc_protects_future_root_staging) {
-    TestService fixture("catalogue-control-publication", ConfigProfile::isolated);
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto& service = fixture.start();
-
-    REQUIRE(wait_until([&] {
-        try {
-            service.catalogue().repair_once();
-            return service.catalogue().status().ready;
-        } catch (...) {
-            return false;
+        const auto first = artwork_url(signing);
+        std::this_thread::sleep_for(5ms);
+        CHECK(artwork_url(signing) == first);
+        // The list route signs separately and must produce the same URL.
+        const auto listed = api_body(call(signing, "GET", "/api/v1/catalogue/items"));
+        bool found = false;
+        for (const auto& item : listed.find("items")->asArray()) {
+            if (item.find("id")->asString() != album.id) continue;
+            found = true;
+            CHECK(item.find("artwork")->asArray().front().find("url")->asString() == first);
         }
-    }));
+        CHECK(found);
+        // The expiry is rounded up to the bucket after next, so a URL minted just
+        // before a boundary still outlives the configured TTL.
+        auto request = signed_request(first);
+        REQUIRE(request.query.contains("exp"));
+        const auto expires = std::stoull(request.query.at("exp"));
+        const auto ttl_ms = static_cast<uint64_t>(ttl.count());
+        CHECK(expires % ttl_ms == 0);
+        const auto now = unix_ms();
+        CHECK(expires >= now + ttl_ms);
+        CHECK(expires <= now + 2 * ttl_ms);
+        CHECK(signing.capability_request(request));
+        const auto fetched = signing.handle(request);
+        REQUIRE(fetched.status == 200);
+        CHECK(fetched.body == cover_bytes);
+        // Content-addressed: the id is the entity tag, the cache lifetime is the
+        // capability's, and a revalidation is a bodiless 304.
+        const auto tag = fetched.headers.at("ETag");
+        CHECK(tag == "\"" + request.path.substr(request.path.rfind('/') + 1) + "\"");
+        CHECK(fetched.headers.at("Cache-Control") ==
+              "public, max-age=" + std::to_string(ttl_ms / 1000) + ", immutable");
+        CHECK(fetched.headers.at("Timing-Allow-Origin") == "*");
+        auto revalidation = request;
+        revalidation.headers["if-none-match"] = tag;
+        const auto not_modified = signing.handle(revalidation);
+        CHECK(not_modified.status == 304);
+        CHECK(not_modified.body.empty());
+        CHECK(not_modified.headers.at("ETag") == tag);
+        auto stale = request;
+        stale.headers["if-none-match"] = "\"not-this-one\"";
+        const auto refetched = signing.handle(stale);
+        CHECK(refetched.status == 200);
+        CHECK(refetched.body == cover_bytes);
 
-    // CONTROL publication is data-before-metadata. Simulate a future root/shard
-    // arriving on this replica before the root CAS references it. Even with zero
-    // configured grace, GC must retain anything written after the currently
-    // observed catalogue root.
-    Bytes staged = pattern(4096 + 37);
-    staged[0] ^= 0x6d;
-    const auto staged_id = object_id(staged);
-    REQUIRE(service.local_state().control().put(staged_id, staged));
-    std::this_thread::sleep_for(5ms);
+        // The default-TTL API's URL is a capability too, and only when signed.
+        auto default_request = signed_request(artwork_url(api));
+        REQUIRE(default_request.query.contains("sig"));
+        CHECK(api.capability_request(default_request));
+        const auto default_fetched = api.handle(default_request);
+        REQUIRE(default_fetched.status == 200);
+        CHECK(default_fetched.headers.at("Cache-Control").find("immutable") != std::string::npos);
+        auto with = [&](std::map<std::string, std::string, std::less<>> query) {
+            auto tampered = default_request;
+            tampered.query = std::move(query);
+            return tampered;
+        };
+        auto tampered_sig = default_request.query;
+        tampered_sig["sig"][0] = (tampered_sig["sig"][0] == '0') ? '1' : '0';
+        CHECK(!api.capability_request(with(tampered_sig)));
+        auto tampered_exp = default_request.query;
+        tampered_exp["exp"] = std::to_string(std::stoull(tampered_exp["exp"]) + 1);
+        CHECK(!api.capability_request(with(tampered_exp)));
+        auto missing_sig = default_request.query;
+        missing_sig.erase("sig");
+        CHECK(!api.capability_request(with(missing_sig)));
+        CHECK(!api.capability_request(with({})));
+        // A correctly signed but expired URL is refused: expiry itself is
+        // enforced. Minted through the real signing path with a 1 ms TTL.
+        CatalogueApi short_lived(node.catalogue(), node.hints(), {}, {}, {}, 1ms);
+        const auto expired = signed_request(artwork_url(short_lived));
+        std::this_thread::sleep_for(20ms);
+        CHECK(!api.capability_request(expired));
+    }
 
-    const std::vector<ObjectId> no_live;
-    for (int i = 0; i < 4; ++i)
-        (void)service.catalogue().control_gc_step(no_live, 0ms, 64);
-    CHECK(service.local_state().control().has(staged_id));
-
-    // Once a successor catalogue root is committed/observed, an unreferenced
-    // object from the previous publication epoch becomes an ordinary orphan.
-    CatalogueItem item;
-    item.id = "movie:control-publication-fence";
-    item.kind = CatalogueKind::movie;
-    item.title = "Control Publication Fence";
-    (void)service.catalogue().upsert(item);
-    std::this_thread::sleep_for(5ms);
-
-    auto maintenance = maintenance_inventory(service.catalogue());
-    REQUIRE(maintenance.complete);
-    std::vector<ObjectId> live(maintenance.control_live.begin(),
-                               maintenance.control_live.end());
-    for (int i = 0; i < 4 && service.local_state().control().has(staged_id); ++i)
-        (void)service.catalogue().control_gc_step(live, 0ms, 64);
-    CHECK(!service.local_state().control().has(staged_id));
+    // A media index is referenced DATA (live to GC), served immutably by the
+    // keyframes route with its error codes, and goes with its media's profile.
+    {
+        const std::string media_id = "macha:" + std::string(64, 'c');
+        const std::string body = R"({"status":"ok","schema_version":1,"streams":[]})";
+        node.catalogue().put_media_index(media_id, Bytes(body.begin(), body.end()));
+        auto stored = node.catalogue().media_index(media_id);
+        REQUIRE(stored.has_value());
+        CHECK(std::string(stored->begin(), stored->end()) == body);
+        CHECK(maintenance_inventory(node.catalogue()).live.contains(object_id(Bytes(body.begin(), body.end()))));
+        int calls = 0;
+        CatalogueApi index_api(node.catalogue(), node.hints(), {}, {}, {}, std::chrono::hours(24 * 30), {},
+                               [&](const std::string& id) -> std::optional<Bytes> {
+                                   ++calls;
+                                   if (id == media_id) return node.catalogue().media_index(id);
+                                   if (id == "macha:mpegts") throw KeyframeIndexUnsupported("no byte index");
+                                   return std::nullopt;
+                               });
+        const auto get = [&](const std::string& id) {
+            return call(index_api, "GET", "/api/v1/catalogue/media/" + id + "/keyframes");
+        };
+        auto served = get(media_id);
+        REQUIRE(served.status == 200);
+        CHECK(std::string(served.body.begin(), served.body.end()) == body);
+        CHECK(served.headers.at("Cache-Control").find("immutable") != std::string::npos);
+        CHECK(served.headers.at("ETag") == "\"" + media_id + "\"");
+        CHECK(get("path:/Movies/x.mkv").status == 400);
+        CHECK(get("macha:gone").status == 404);
+        auto unsupported = get("macha:mpegts");
+        CHECK(unsupported.status == 422);
+        CHECK(std::string(unsupported.body.begin(), unsupported.body.end()).find("keyframes_not_supported") !=
+              std::string::npos);
+        CHECK(calls == 3);
+        (void)node.catalogue().prune_media_profiles({});
+        CHECK(!node.catalogue().media_index(media_id).has_value());
+    }
 }
 
 MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_gc) {
@@ -5307,8 +4643,6 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     s1.stop();
 }
 
-} // namespace
-
 MACHA_FAST_TEST("hydration_catalogue", test_a_failed_hint_outlives_the_job_that_raised_it) {
     // A settled outcome goes with its job; a failure stays, as the only record
     // that the file was never catalogued.
@@ -5354,92 +4688,4 @@ MACHA_FAST_TEST("hydration_catalogue", test_a_discarded_payload_leaves_at_once_a
     CHECK(!staging.discard(dir.path() / "outside")); // never outside staging
 }
 
-MACHA_TEST("hydration_catalogue", test_a_hint_newer_than_its_batch_snapshot_is_deferred_not_failed) {
-    // A hint created after its batch's namespace snapshot is deferred to the
-    // next batch rather than failed as missing.
-    TempDir t;
-    auto key = t.path() / "cluster.key";
-    write_key(key);
-    auto config = config_for(t.path() / "disk", key, free_port());
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    auto keys = load_cluster_keys(key);
-    Service service(config, keys);
-    service.start();
-    service.filesystem().mkdir("/Movies", 0755, getuid(), getgid()); // metadata is up
-    CatalogueScannerConfig scanner_config;
-    scanner_config.enabled = true;
-    scanner_config.movies.roots = {"/Movies"};
-    scanner_config.tv.enabled = false;
-    scanner_config.music.enabled = false;
-    CatalogueScanner scanner(service.node(), service.metadata_server(), service.filesystem(), service.catalogue(),
-                             service.catalogue_hints(), scanner_config, std::make_unique<FakeHttpClient>());
-    auto& hints = service.catalogue_hints();
-    const auto snapshot = service.metadata_manager().snapshot(); // no such file in it
-    const auto taken = unix_ms();
-    DistributedStore::DurabilityBatch batch;
-
-    const auto late_id = hints.submit("/Movies/Late (2026)/Late.mkv", "ingest", "job", CatalogueHintPriority::ingest);
-    auto late = hints.claim_next();
-    REQUIRE(late.has_value());
-    REQUIRE(late->created_unix_ms >= taken);
-    CHECK(!scanner.prepare_hint(*late, {}, snapshot, taken, batch).has_value());
-    CHECK(hints.get(late_id)->state == CatalogueHintState::deferred);
-    CHECK(hints.get(late_id)->error_code == "path_not_yet_visible");
-
-    // Absent from a snapshot taken after the hint: genuinely gone.
-    const auto gone_id = hints.submit("/Movies/Gone (2026)/Gone.mkv", "ingest", "job", CatalogueHintPriority::ingest);
-    auto gone = hints.claim_next();
-    REQUIRE(gone.has_value());
-    const auto later = service.metadata_manager().snapshot();
-    CHECK(!scanner.prepare_hint(*gone, {}, later, unix_ms() + 1, batch).has_value());
-    CHECK(hints.get(gone_id)->state == CatalogueHintState::failed);
-    CHECK(hints.get(gone_id)->error_code == "path_missing");
-}
-
-MACHA_TEST("hydration_catalogue", test_an_import_uses_an_existing_folder_whatever_its_case) {
-    // Import destinations fold case: an existing folder is reused as spelt, and
-    // a file whose name differs from one already there only by case is a
-    // collision.
-    TestService fixture("node");
-    auto& config = fixture.config();
-    config.replication = 1;
-    config.metadata_min_write_replicas = 1;
-    config.catalogue.scanner.enabled = false;
-    config.ingest.enabled = false;
-    auto& service = fixture.start();
-    auto& fs = service.filesystem();
-    fs.mkdir("/Movies", 0755, getuid(), getgid());
-    fs.mkdir("/Movies/The Martian (2015)", 0755, getuid(), getgid());
-    fs.create_file("/Movies/The Martian (2015)/The.Martian.2015.EXTENDED.1080p.mkv", 0644, getuid(), getgid());
-
-    const auto root = fixture.path() / "martian";
-    std::filesystem::create_directories(root);
-    for (const auto& [name, seed] : {std::pair{std::string("the.martian.2015.extended.720p.bluray.x264-nezu.mkv"), 5},
-                                     std::pair{std::string("the.martian.2015.extended.1080p.mkv"), 6}}) {
-        std::ofstream out(root / name, std::ios::binary);
-        const auto bytes = pattern(64 * 1024 + seed, static_cast<uint8_t>(seed));
-        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    }
-    IngestConfig ingest_config;
-    ingest_config.enabled = true;
-    ingest_config.staging_path = fixture.path() / "staging";
-    ingest_config.source_roots = {root};
-    IngestManager ingest(service.node(), fs, service.catalogue_hints(), ingest_config);
-    const auto id = ingest.submit_path(root);
-    ingest.start();
-    REQUIRE(wait_until([&] { return all_imports_copied(ingest, {id}); }, 60s));
-    const auto job = ingest.job(id);
-    REQUIRE(job.has_value());
-    REQUIRE(job->files.size() == 2);
-    for (const auto& file : job->files) {
-        CHECK(file.destination_path.starts_with("/Movies/The Martian (2015)/"));
-        if (file.source_path.ends_with("1080p.mkv"))
-            CHECK(file.destination_path != "/Movies/The Martian (2015)/the.martian.2015.extended.1080p.mkv");
-    }
-    size_t martian_folders = 0;
-    for (const auto& [name, entry] : fs.readdir("/Movies"))
-        if (entry.type == EntryType::directory && name.find("artian") != std::string::npos) ++martian_folders;
-    CHECK(martian_folders == 1);
-    ingest.stop();
-}
+} // namespace
