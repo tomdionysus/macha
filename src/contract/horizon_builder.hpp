@@ -22,16 +22,16 @@ class HorizonBuilder {
     virtual ~HorizonBuilder() = default;
     static constexpr ThreadSafety safety = ThreadSafety::single_owner;
 
-    // The namespace's objects and tombstones at the current metadata
-    // generation: the filesystem's cached walk, cheap while the generation
-    // holds. The pass reads its generation to decide whether to build an
-    // inventory from it.
+    // The namespace's objects, tree nodes and tombstones at the current
+    // metadata generation: the filesystem's cached walk, cheap while the
+    // generation holds; throws when a tree node is unreadable. The pass reads
+    // its generation to decide whether to build an inventory from it.
     static constexpr Waits namespace_objects_waits =
         Waits::state_device | Waits::network | Waits::locks;
     virtual std::shared_ptr<const MaintenanceObjects> namespace_objects() = 0;
 
-    // The inventory at that generation: the namespace's objects and the
-    // catalogue's, read against `head` (captured before the catalogue's
+    // The inventory at that generation: the namespace's objects and tree
+    // nodes and the catalogue's, read against `head` (captured before the catalogue's
     // repair ran) and whether that repair succeeded. Fetches missing
     // catalogue objects into the control store; repairs and commits nothing
     // (spec A4).

@@ -886,6 +886,41 @@ void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceN
     walk_namespace_tree(*snapshot.namespace_root, *store, visit);
 }
 
+namespace {
+
+// Names every node read through it. The walk reads each node of the tree, so
+// what it names is the tree.
+class RecordingNodeStore final : public NamespaceNodeStore {
+  public:
+    RecordingNodeStore(const NamespaceNodeStore& inner, std::vector<ObjectId>& read)
+        : inner_(inner), read_(read) {}
+    ObjectId put(std::span<const uint8_t>) override {
+        throw std::logic_error("a namespace walk does not write");
+    }
+    std::optional<Bytes> get(const ObjectId& id) const override {
+        auto node = inner_.get(id);
+        if (node)
+            read_.push_back(id);
+        return node;
+    }
+
+  private:
+    const NamespaceNodeStore& inner_;
+    std::vector<ObjectId>& read_;
+};
+
+} // namespace
+
+void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                              const NamespaceVisitor& visit, std::vector<ObjectId>& nodes) {
+    if (!snapshot.namespace_root || !store) {
+        for_each_namespace_entry(snapshot, store, visit);
+        return;
+    }
+    const RecordingNodeStore recording(*store, nodes);
+    walk_namespace_tree(*snapshot.namespace_root, recording, visit);
+}
+
 std::optional<FsEntry> namespace_tree_lookup(const ObjectId& root, std::string_view path,
                                              const NamespaceNodeStore& store, bool with_extents) {
     ObjectId current = root;

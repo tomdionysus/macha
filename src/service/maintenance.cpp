@@ -759,10 +759,11 @@ void Maintenance::run(std::stop_token stop) {
                     }
                 }
 
-                // The catalogue control live-set comes from the same inventory as DATA
-                // reachability. A foreground catalogue mutation may advance metadata after
-                // it was built; never sweep the control store with such a stale set, or a
-                // short grace could delete a newly published manifest or shard.
+                // The control live set (catalogue objects and namespace tree nodes)
+                // comes from the same inventory as DATA reachability. A foreground
+                // mutation may advance metadata after it was built; never sweep the
+                // control store with such a stale set, or a short grace could delete a
+                // newly published manifest, shard or tree node.
                 const auto current_metadata_view = metadata_.current();
                 const auto release_metadata_view = metadata_.release_head();
 

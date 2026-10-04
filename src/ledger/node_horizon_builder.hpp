@@ -14,7 +14,8 @@ namespace macha {
 class DistributedStore;
 class NodeRuntime;
 
-// Data is both live sets, control the catalogue's, tombstones the namespace's.
+// Data is both live sets, control the catalogue's and the namespace tree's
+// nodes, tombstones the namespace's.
 std::shared_ptr<const InventoryHorizon> build_inventory(const MaintenanceObjects& namespace_objects,
                                                         const CatalogueMaintenance& catalogue);
 
