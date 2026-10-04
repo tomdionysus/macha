@@ -1094,6 +1094,27 @@ supersede earlier ones where they conflict.
   outside its owner, and nothing above the ledger reaching claims except
   through it".
 
+- **2026-10-04. Reconciliation merges trees by what differs** (operator:
+  "tree wise is the most complete solution"). Found under load at 0.84.0: a
+  two-head reconciliation materialised the whole namespace three times,
+  merged it path-wise and rebuilt the tree, under `reconciliation_mutex_`,
+  on whichever thread first read past the cache; a FUSE commit waited 54 s
+  behind two of them and systemd killed the stop. The alternatives (merge
+  outside the lock; no reconciling on the read path) move the wait and do
+  not shorten the work. Decided: a tree diff (`diff_namespace_trees`) gives
+  the paths each branch changed; the existing path-wise merge runs over
+  those paths, their ancestors and the subjects of standing conflicts
+  (`merge_metadata_snapshots_over`), so there is one set of merge rules;
+  the result is applied to one branch's tree with `update_namespace_tree`,
+  whose root is the root a rebuild would give (property 1), so both
+  reconcilers still mint the same merge commit. The path-wise merge of
+  materialised namespaces stays as the test oracle and as the path for a
+  branch still held as a map. `update_namespace_tree` reads branch nodes and
+  only the leaves its changes fall in (it read every leaf, and every leaf
+  between two distant changes). Not done: the commit to the peer stays
+  under the lock; reconciliation can still start on a reader's thread; the
+  merge is not stop-aware, which a merge of milliseconds does not need.
+
 ## Open questions for the operator
 
 1. **The control gate and `rebuilt_inventory`.** **Answered 2026-09-30** (decision log: the control gate gains `!rebuilt_inventory`). Control GC can run against

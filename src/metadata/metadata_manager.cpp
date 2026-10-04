@@ -1200,24 +1200,42 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         auto right_materialized = local_.replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
             throw MetadataNotReady("metadata merge head cannot be materialized");
-        // The three-way merge is path-wise, so tree-backed branches are
-        // materialised for it and the result re-rooted afterwards.
-        auto namespace_nodes =
-            namespace_store_ ? std::optional<ControlNamespaceNodeStore>(
-                                   ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_))
-                             : std::nullopt;
-        const auto materialise = [&](const MetadataSnapshot& snapshot) {
-            if (!snapshot.namespace_root)
-                return snapshot;
-            if (!namespace_nodes)
-                throw MetadataNotReady("no namespace node store is configured");
-            return attach_namespace(snapshot, *namespace_nodes);
-        };
-        const auto tree_backed = left_materialized->snapshot->namespace_root.has_value() ||
-                                 right_materialized->snapshot->namespace_root.has_value();
-        auto merged = merge_metadata_snapshots(
-            materialise(*base_materialized->snapshot), materialise(*left_materialized->snapshot),
-            materialise(*right_materialized->snapshot), left.hash, right.hash);
+        // Three trees merge by what differs between them. A branch still held
+        // as a map is materialised with the others, and the result re-rooted.
+        const auto& base_snapshot = *base_materialized->snapshot;
+        const auto& left_snapshot = *left_materialized->snapshot;
+        const auto& right_snapshot = *right_materialized->snapshot;
+        const auto tree_backed =
+            left_snapshot.namespace_root.has_value() || right_snapshot.namespace_root.has_value();
+        if (tree_backed && !namespace_store_)
+            throw MetadataNotReady("no namespace node store is configured");
+        const bool all_trees = base_snapshot.namespace_root && left_snapshot.namespace_root &&
+                               right_snapshot.namespace_root;
+        MetadataMergeResult merged;
+        std::optional<NamespaceTreeMerge> tree_merge;
+        if (all_trees) {
+            const auto reading =
+                ControlNamespaceNodeStore::for_reading(local_.control(), *namespace_store_);
+            tree_merge = merge_tree_backed_snapshots(base_snapshot, left_snapshot, right_snapshot,
+                                                     left.hash, right.hash, reading);
+            merged = std::move(tree_merge->merged);
+        } else {
+            auto reading = namespace_store_
+                               ? std::optional<ControlNamespaceNodeStore>(
+                                     ControlNamespaceNodeStore::for_reading(local_.control(),
+                                                                            *namespace_store_))
+                               : std::nullopt;
+            const auto materialise = [&](const MetadataSnapshot& snapshot) {
+                if (!snapshot.namespace_root)
+                    return snapshot;
+                if (!reading)
+                    throw MetadataNotReady("no namespace node store is configured");
+                return attach_namespace(snapshot, *reading);
+            };
+            merged = merge_metadata_snapshots(materialise(base_snapshot),
+                                              materialise(left_snapshot),
+                                              materialise(right_snapshot), left.hash, right.hash);
+        }
         if (merged.snapshot.extent_size &&
             merged.snapshot.extent_size != node_.config().extent_size)
             throw std::runtime_error("cluster extent size does not match local configuration");
@@ -1233,13 +1251,17 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         merged.snapshot.metadata_voters.clear();
         merged.snapshot.merge_parents = {right.hash};
 
-        // Back into a tree if the branches were trees; its nodes are written and
-        // replicated before the record naming the root is published.
+        // The merged namespace's tree; its nodes are written and replicated
+        // before the record naming the root is published.
         if (tree_backed) {
-            if (!namespace_store_)
-                throw MetadataNotReady("no namespace node store is configured");
-            auto commit_nodes = ControlNamespaceNodeStore::for_commit(local_.control(), *namespace_store_, merged.snapshot.metadata_write_replicas_required);
-            merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
+            auto commit_nodes = ControlNamespaceNodeStore::for_commit(
+                local_.control(), *namespace_store_,
+                merged.snapshot.metadata_write_replicas_required);
+            if (tree_merge)
+                merged.snapshot.namespace_root =
+                    update_namespace_tree(tree_merge->onto, commit_nodes, tree_merge->changes);
+            else
+                merged.snapshot = detach_namespace(std::move(merged.snapshot), commit_nodes);
         }
 
         MetadataRecord reconciliation;

@@ -1,5 +1,31 @@
 # Current release
 
+## 0.85.0 — reconciliation merges trees by what differs (experiment)
+
+No wire, protocol, API or on-disk changes; a merge commit is the commit
+0.84.1 would make, so nodes on either version reconcile to the same head.
+
+**A two-head reconciliation costs what the branches changed.** It
+materialised the whole namespace three times, merged it path by path and
+rebuilt the tree, all under the reconciliation lock, on whichever thread
+first read past the cache: tens of seconds on a Pi, during which no commit
+on that node could proceed (a shutdown under load waited 54 s behind two
+of them and was killed). It now diffs the two branches' trees against
+their ancestor, runs the same merge rules over the paths that differ, and
+applies the result to one branch's tree. At the live library's size (8,700
+paths, 900,000 extents) the benchmark
+`baseline/test_baseline_reconcile_materialised_against_tree` times the two
+side by side.
+
+**A namespace update reads only where it changes.**
+`update_namespace_tree` read every leaf of the tree to find its place, and
+every leaf between two distant changes. It now reads the branch nodes and
+the leaves its changes fall in, which every commit to a tree-backed
+namespace gains from.
+
+**Rename detection scans only removed sources** in the path-wise merge,
+which was quadratic in the namespace.
+
 ## 0.84.1 — reconciliation is timed (experiment)
 
 No wire, protocol, API or on-disk changes.
