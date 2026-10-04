@@ -33,6 +33,8 @@ class TorrentManager final : public TorrentService {
     LocalState& local_;
     DataResourceArbiter& data_resources_;
     IngestManager& ingest_;
+    // Times the worker's periodic passes.
+    const TimeSource& time_;
     // Held across jobs.json's durable write, libtorrent session and handle
     // calls, the ingest's calls and log lines.
     mutable IoMutex mutex_;
@@ -151,7 +153,7 @@ class TorrentManager final : public TorrentService {
     Bytes handle_jobs_query(std::span<const uint8_t> request_payload) const;
     Bytes handle_job_action(std::span<const uint8_t> request_payload);
     TorrentManager(NodeRuntime&, LocalState&, DataResourceArbiter&, IngestManager&, TorrentConfig,
-                   const std::filesystem::path& state_path);
+                   const std::filesystem::path& state_path, const TimeSource& time);
     ~TorrentManager() override;
 
     // Installed before start().

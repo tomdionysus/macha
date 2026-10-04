@@ -21,10 +21,11 @@ class TorrentSubsystem final : public Subsystem {
   public:
     TorrentSubsystem(SubsystemRegistry& registry, MessageRoutes& routes, NodeRuntime& node,
                      LocalState& local, DataResourceArbiter& data_resources, IngestManager& ingest,
-                     TorrentConfig config, const std::filesystem::path& state_path)
+                     TorrentConfig config, const std::filesystem::path& state_path,
+                     const TimeSource& time)
         : registry_(registry), routes_(routes),
           manager_(std::make_shared<TorrentManager>(node, local, data_resources, ingest,
-                                                    std::move(config), state_path)) {
+                                                    std::move(config), state_path, time)) {
         // Published at construction, which makes the engine usable; start()
         // only runs the worker. A failed start destroys this, withdrawing it.
         registry_.publish_torrent(manager_);
@@ -83,7 +84,8 @@ extern "C" const macha::SubsystemPluginEntry* macha_subsystem_entry() {
                 *context.data_resources,
                 *context.ingest,
                 context.config->torrent,
-                context.config->state_path);
+                context.config->state_path,
+                context.time ? *context.time : macha::steady_time_source());
         }};
     return &entry;
 }

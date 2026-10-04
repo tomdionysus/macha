@@ -722,6 +722,7 @@ struct PlaybackManager::Impl {
     };
 
     struct Session {
+        explicit Session(Clock::time_point created) : touched(created), stream_touched(created) {}
         std::string id;
         std::string token;
         PlaybackPreferences preferences;
@@ -747,8 +748,9 @@ struct PlaybackManager::Impl {
         };
         std::string subtitle_url;
         std::shared_ptr<SubtitleCache> subtitle_cache{std::make_shared<SubtitleCache>()};
-        Clock::time_point touched{Clock::now()};
-        Clock::time_point stream_touched{Clock::now()};
+        // Both on the manager's TimeSource: the idle clocks run from them.
+        Clock::time_point touched;
+        Clock::time_point stream_touched;
         // Whether any stream object (playlist, fragment, subtitle, direct body)
         // was ever served. stream_touched is reset by start_pipeline(), so it
         // cannot say "never". Never cleared: a used session keeps the full
@@ -825,6 +827,9 @@ struct PlaybackManager::Impl {
     };
 
     FileSystem& fs;
+    // Session idle clocks and failed-start retention; elapsed times that are
+    // only reported stay on the real clock.
+    const TimeSource& time;
     TranscodeRateBook& transcode_rates;
     RetainedMemoryLedger& retained_memory;
     CatalogueManager& catalogue;
@@ -977,8 +982,8 @@ struct PlaybackManager::Impl {
          CatalogueManager& cat, CatalogueApiConfig api, StreamingConfig streaming,
          std::shared_ptr<MediaEngine> media_engine,
          std::function<size_t(const std::vector<std::string>&)> request_profiles,
-         MediaInformationService* information)
-        : fs(filesystem), transcode_rates(rates), retained_memory(memory), catalogue(cat), config(std::move(streaming)),
+         MediaInformationService* information, const TimeSource& time_source)
+        : fs(filesystem), time(time_source), transcode_rates(rates), retained_memory(memory), catalogue(cat), config(std::move(streaming)),
           engine(media_engine ? std::move(media_engine) :
                 (config.enabled ? make_libav_media_engine(config) : nullptr)),
           request_media_profiles(std::move(request_profiles)), media_information(information) {
@@ -1067,7 +1072,7 @@ struct PlaybackManager::Impl {
     // readable long enough.
     std::shared_ptr<PendingReplacement> pending_locked(Session& session) MACHA_REQUIRES(mutex) {
         if (session.pending && session.pending->failed_until != Clock::time_point{} &&
-            Clock::now() >= session.pending->failed_until)
+            time.now() >= session.pending->failed_until)
             session.pending.reset();
         return session.pending;
     }
@@ -1128,12 +1133,12 @@ struct PlaybackManager::Impl {
     }
 
     void prune_failed_starts_locked() MACHA_REQUIRES(mutex) {
-        const auto now = Clock::now();
+        const auto now = time.now();
         std::erase_if(failed_starts, [&](const auto& entry) { return entry.second.expires <= now; });
     }
 
     std::shared_ptr<Session> copy_for_start(const Session& admitted) const {
-        auto copy = std::make_shared<Session>();
+        auto copy = std::make_shared<Session>(time.now());
         copy->id = admitted.id;
         copy->token = admitted.token;
         copy->preferences = admitted.preferences;
@@ -1298,7 +1303,7 @@ struct PlaybackManager::Impl {
                         prune_failed_starts_locked();
                         failed_starts[placeholder->id] =
                             FailedStart{placeholder->account, std::move(payload),
-                                        Clock::now() + config.start_failed_retention};
+                                        time.now() + config.start_failed_retention};
                         signal_cleanup_locked();
                     }
                 }
@@ -1393,7 +1398,7 @@ struct PlaybackManager::Impl {
                 {
                     Lock lock(mutex);
                     if (old->pending == pending)
-                        pending->failed_until = Clock::now() + config.start_failed_retention;
+                        pending->failed_until = time.now() + config.start_failed_retention;
                 }
                 std::string message = "unknown";
                 try { std::rethrow_exception(error); } catch (const std::exception& e) { message = e.what(); } catch (...) {}
@@ -2165,7 +2170,7 @@ struct PlaybackManager::Impl {
         MACHA_EXCLUDES(mutex) {
         stop_pipeline(session);
         const auto settings = current_config();
-        session.stream_touched = Clock::now();
+        session.stream_touched = time.now();
         ++session.generation;
         session.generation_dir = *settings.temp_path / session.id / std::to_string(session.generation);
         std::error_code ec;
@@ -2237,7 +2242,7 @@ struct PlaybackManager::Impl {
         Log::info("playback[" + std::string(trace) + "] admission media=" + media_id +
                   " mode=" + playback_mode_name(plan.mode) + " metadata_ms=" + std::to_string(profile_ms));
 
-        auto session = std::make_shared<Session>();
+        auto session = std::make_shared<Session>(time.now());
         session->id = existing_id.empty() ? hex_token(16) : std::move(existing_id);
         session->token = existing_token.empty() ? hex_token() : std::move(existing_token);
         session->preferences = std::move(preferences);
@@ -2245,7 +2250,7 @@ struct PlaybackManager::Impl {
         session->source = media_source(lease);
         session->probe = std::move(probe);
         session->plan = plan;
-        session->touched = Clock::now();
+        session->touched = time.now();
         return session;
     }
 
@@ -2266,7 +2271,7 @@ struct PlaybackManager::Impl {
         auto reseeked = reseek_hls_vod(*old.vod_plan, requested_seek, &reseek_reason);
         if (!reseeked) return declined(reseek_reason);
 
-        auto session = std::make_shared<Session>();
+        auto session = std::make_shared<Session>(time.now());
         session->id = old.id;
         session->token = old.token;
         session->preferences = old.preferences;
@@ -2276,7 +2281,7 @@ struct PlaybackManager::Impl {
         session->plan = reseeked->playback;
         session->vod_plan = std::move(*reseeked);
         session->generation = old.generation;
-        session->touched = Clock::now();
+        session->touched = time.now();
         session->logical_session = old.logical_session;
         session->account = old.account;
         observations().add("playback.seek_fastpath.taken");
@@ -2301,7 +2306,7 @@ struct PlaybackManager::Impl {
 
         // Subtitles are an independent WebVTT resource: only the subtitle
         // selection changes; the active A/V generation is copied intact.
-        auto session = std::make_shared<Session>();
+        auto session = std::make_shared<Session>(time.now());
         session->id = old.id;
         session->token = old.token;
         session->preferences = std::move(preferences);
@@ -2329,7 +2334,7 @@ struct PlaybackManager::Impl {
                                     std::to_string(session->generation) + "/subtitle-" +
                                     std::to_string(session->plan.subtitle_stream) + "/manifest.json";
         }
-        session->touched = Clock::now();
+        session->touched = time.now();
         Log::info("playback[" + std::string(trace) + "] subtitle update media=" +
                   session->source.media_id + " stream=" +
                   std::to_string(session->plan.subtitle_stream) + " generation=" +
@@ -2580,7 +2585,7 @@ struct PlaybackManager::Impl {
                 auto it = sessions.find(id);
                 if (it == sessions.end() || it->second != session)
                     return http_error(404, "not_found", "stream not found");
-                session->touched = Clock::now();
+                session->touched = time.now();
                 // One ranged body can outlive several idle windows, so direct
                 // play counts as use.
                 session->stream_served = true;
@@ -2616,7 +2621,7 @@ struct PlaybackManager::Impl {
                 return generation_gone(generation, it->second->generation);
             if (session->generation != generation)
                 return generation_gone(generation, session->generation);
-            const auto now = Clock::now();
+            const auto now = time.now();
             session->touched = now;
             session->stream_touched = now;
             session->stream_served = true;
@@ -2934,7 +2939,7 @@ struct PlaybackManager::Impl {
                         return http_error(409, "idempotency_expired",
                                           "the prior playback session has expired");
                     existing = active->second;
-                    existing->touched = Clock::now();
+                    existing->touched = time.now();
                     signal_cleanup_locked();
                 }
                 return creation_response(*existing, trace, "replayed");
@@ -3113,7 +3118,7 @@ struct PlaybackManager::Impl {
             if (!caller_owns(*it->second, request))
                 return http_error(404, "not_found", "playback session not found");
             session = it->second;
-            session->touched = Clock::now();
+            session->touched = time.now();
             signal_cleanup_locked();
         }
         std::shared_ptr<PendingReplacement> pending;
@@ -3695,7 +3700,7 @@ struct PlaybackManager::Impl {
             std::filesystem::path temp_path;
             {
                 Lock lock(mutex);
-                const auto now = Clock::now();
+                const auto now = time.now();
                 temp_path = *config.temp_path;
                 idle_timeout = config.pipeline_idle;
                 unused_idle_timeout = config.session_unused_idle;
@@ -3780,7 +3785,7 @@ struct PlaybackManager::Impl {
                         return cleanup_revision != observed_revision;
                     };
                     if (next_expiry)
-                        cleanup_cv.wait_until(lock.native(), stop, *next_expiry, changed);
+                        cleanup_cv.wait_for(lock.native(), stop, *next_expiry - now, changed);
                     else
                         cleanup_cv.wait(lock.native(), stop, changed);
                     continue;
@@ -3827,10 +3832,10 @@ PlaybackManager::PlaybackManager(FileSystem& fs, TranscodeRateBook& transcode_ra
                                  StreamingConfig streaming, std::shared_ptr<MediaEngine> engine,
                                  std::function<size_t(const std::vector<std::string>&)> request_profiles,
                                  MediaInformationService* media_information,
-                                 MediaFacts media_facts)
+                                 MediaFacts media_facts, const TimeSource& time)
     : impl_(std::make_unique<Impl>(fs, transcode_rates, retained_memory, catalogue, std::move(api), std::move(streaming),
                                   std::move(engine), std::move(request_profiles),
-                                  media_information)) {
+                                  media_information, time)) {
     impl_->extra_media_facts = std::move(media_facts);
 }
 

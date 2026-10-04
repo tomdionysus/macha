@@ -137,8 +137,9 @@ struct TorrentManager::Impl {
 TorrentManager::TorrentManager(NodeRuntime& node, LocalState& local,
                                DataResourceArbiter& data_resources,
                                IngestManager& ingest, TorrentConfig config,
-                               const std::filesystem::path& state_path)
-    : node_(node), local_(local), data_resources_(data_resources), ingest_(ingest), config_(std::move(config)),
+                               const std::filesystem::path& state_path, const TimeSource& time)
+    : node_(node), local_(local), data_resources_(data_resources), ingest_(ingest), time_(time),
+      config_(std::move(config)),
       enabled_(config_.enabled), state_file_(state_path / "torrent" / "jobs.json"),
       resume_dir_(state_path / "torrent" / "resume") {
     if (!config_.enabled) return;
@@ -1180,8 +1181,8 @@ void TorrentManager::loop(std::stop_token stop) {
         // pieces bounds a lost alert's delay to this interval. impl_->handles
         // changes only under mutex_ and only via retire_torrent_locked, so
         // each handle names a live torrent; a throw fails that job only.
-        if (impl_ && Clock::now() - last_held_pieces_report_ >= held_pieces_report_interval) {
-            last_held_pieces_report_ = Clock::now();
+        if (const auto now = time_.now(); impl_ && now - last_held_pieces_report_ >= held_pieces_report_interval) {
+            last_held_pieces_report_ = now;
             Lock lock(mutex_);
             std::vector<std::pair<std::string, std::string>> faults;
             for (const auto& [id, handle] : impl_->handles) {
@@ -1195,8 +1196,8 @@ void TorrentManager::loop(std::stop_token stop) {
             }
             for (const auto& [id, what] : faults) isolate_fault_locked(id, what);
         }
-        if (impl_ && Clock::now() - last_resume_save_ >= resume_save_interval) {
-            last_resume_save_ = Clock::now();
+        if (const auto now = time_.now(); impl_ && now - last_resume_save_ >= resume_save_interval) {
+            last_resume_save_ = now;
             Lock lock(mutex_);
             std::vector<std::pair<std::string, std::string>> faults;
             for (const auto& [id, handle] : impl_->handles) {

@@ -3,6 +3,7 @@
 
 #include "catalogue/catalogue.hpp"
 #include "config.hpp"
+#include "contract/time_source.hpp"
 #include "filesystem/filesystem.hpp"
 #include "http/http.hpp"
 #include "json.hpp"
@@ -28,12 +29,15 @@ class PlaybackManager {
     // Adds what else is known of a media file to its entry in the media
     // listing (its availability); reads only, never waits.
     using MediaFacts = std::function<void(Json::Object& entry, std::string_view media_id)>;
+    // `time`: what sessions' idle clocks and a failed start's retention are
+    // measured by.
     PlaybackManager(FileSystem&, TranscodeRateBook&, RetainedMemoryLedger&, CatalogueManager&,
                     CatalogueApiConfig, StreamingConfig,
                     std::shared_ptr<MediaEngine> = {},
                     std::function<size_t(const std::vector<std::string>&)> request_media_profiles = {},
                     MediaInformationService* media_information = nullptr,
-                    MediaFacts media_facts = {});
+                    MediaFacts media_facts = {},
+                    const TimeSource& time = steady_time_source());
     ~PlaybackManager();
     PlaybackManager(const PlaybackManager&) = delete;
     PlaybackManager& operator=(const PlaybackManager&) = delete;

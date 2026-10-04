@@ -58,9 +58,10 @@ bool bool_reply(const RpcReply& reply) {
 MetadataManager::MetadataManager(NodeRuntime& node, LocalState& local,
                                  MetadataServer& metadata_server,
                                  DistributedStore* namespace_store,
-                                 PublicationRetention publication_retention)
+                                 PublicationRetention publication_retention,
+                                 const TimeSource& time)
     : node_(node), local_(local), metadata_server_(metadata_server), namespace_store_(namespace_store),
-      publication_retention_(std::move(publication_retention)) {}
+      time_(time), publication_retention_(std::move(publication_retention)) {}
 
 const char* metadata_availability_name(MetadataAvailability availability) noexcept {
     switch (availability) {
@@ -228,7 +229,7 @@ MetadataRecord MetadataManager::cache_record(
     if (cache_ && newer_than(*cache_, record))
         return *cache_;
     cache_ = record;
-    cache_until_ = Clock::now() + node_.config().metadata_cache;
+    cache_until_ = time_.now() + node_.config().metadata_cache;
     cache_remote_epoch_ = node_.remote_metadata_epoch();
     if (!decoded_cache_ || decoded_generation_ != record.generation || decoded_hash_ != record.hash) {
         // The change witness FUSE and the catalogue wake on. Tree-backed namespaces
@@ -252,7 +253,7 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
         if (cache_ && newer_than(*cache_, record))
             return *cache_;
         cache_ = record;
-        cache_until_ = Clock::now() + node_.config().metadata_cache;
+        cache_until_ = time_.now() + node_.config().metadata_cache;
         cache_remote_epoch_ = node_.remote_metadata_epoch();
         if (decoded_cache_ && decoded_generation_ == record.generation && decoded_hash_ == record.hash)
             return record;
@@ -270,7 +271,7 @@ MetadataRecord MetadataManager::cache_record(const MetadataRecord& record) {
 
 std::optional<MetadataRecord> MetadataManager::cached_record() {
     Lock lock(cache_mutex_);
-    if (!cache_ || Clock::now() >= cache_until_ ||
+    if (!cache_ || time_.now() >= cache_until_ ||
         cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
     if (local_.replica().committed_generation() > cache_->generation ||
@@ -300,7 +301,7 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     // The decoded snapshot is valid for its record but not proof the record is
     // current: honour cached_record()'s TTL so missed generation notices
     // eventually force replica validation.
-    if (!cache_ || !decoded_cache_ || Clock::now() >= cache_until_ ||
+    if (!cache_ || !decoded_cache_ || time_.now() >= cache_until_ ||
         cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
     if (cache_->generation != decoded_generation_ || cache_->hash != decoded_hash_)
