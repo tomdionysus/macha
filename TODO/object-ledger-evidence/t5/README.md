@@ -292,3 +292,32 @@ stack if the stop took over 15 s. Reports and the three-way comparison (T0,
   followed a playback read failing on an unavailable extent within a
   minute, though such failures are common (85 in 80 minutes without a
   crash). Core: `/mnt/diskB/crash/core.macha-maint.726890.1791071766`.
+
+## Reconciliation: three builds under the same hour of load (2026-10-04)
+
+T0's top-up load on both nodes for an hour each (driven playback every
+cycle, a 32 MiB FUSE write per cycle), no restarts. 0.84.1 times the
+existing merge; 0.85.0 merges trees by what differs; 0.87.0 publishes the
+merge as a delta. Reports are in `reconcile/` (gbni-1's 0.85.0 report was
+not collected; its journal figures are below).
+
+| per node, fi-1 / gbni-1 | 0.84.1 | 0.85.0 | 0.87.0 |
+|---|---|---|---|
+| reconciliations | 19 / 19 | 8 / 8 | 17 / 17 |
+| each, median | 25.7 s / 28.2 s | 8.8 s / 6.3 s | 3.1 s / 2.6 s |
+| each, slowest | 38.2 s / 47.5 s | 24.0 s / 23.8 s | 12.0 s / 9.2 s |
+| lock held, total | 521 s / 551 s | 91 s / 87 s | 79 s / 72 s |
+| wait for the lock, longest | 62 s / 65 s | 17 s / - | 7.8 s / 12.0 s |
+| merge record sent | about 2 MB | about 2 MB | 241 to 10,289 bytes, median 712 |
+
+- In-suite, at the library's size (8,700 paths, 900,000 extents) on fi-1:
+  the materialising merge 1,037 ms, the tree merge 1.2 ms and 70 node reads.
+- At 0.85.0 nearly all of a reconciliation was storing the 2 MB record on
+  the peer (3.3 of 4.2 s, 9.5 of 10.9 s, 12.2 of 17.8 s). The record is
+  almost all tombstones: 34,215 of them, deletion being paused.
+- At 0.87.0 one merge of 6.3 s was 1.4 s storing, 0.6 s accepted, and about
+  4 s of local work the log does not yet itemise.
+- The number of reconciliations follows how the two nodes' writes
+  interleave and is not comparable between hours; the time for each is.
+- FUSE publication in the 0.87.0 hour: 11.4 and 13.6 MB/min (T0: 9.8 and
+  11.6).

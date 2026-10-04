@@ -1,0 +1,63 @@
+windows=60 idle=29 loaded=31 span_minutes=60 versions=['0.84.1+unknown']
+
+histograms (microseconds unless named _ns)
+  api DELETE /api/v1/playback/sessions/:id: n=39 p50=24575 p90=425983 p99=2829070 max=2829070 | idle n=16 p50=1663 p99=917503 | loaded n=23 p50=61439 p99=2829070
+  api DELETE /api/v1/session: n=39 p50=55 p90=2303 p99=5322 max=5322 | idle n=5 p50=319 p99=2303 | loaded n=34 p50=55 p99=5322
+  api GET /api/v1/catalogue/items: n=20 p50=245759 p90=294911 p99=302144 max=302144 | idle n=2 p50=229375 p99=245759 | loaded n=18 p50=245759 p99=302144
+  api GET /api/v1/health: n=821 p50=13 p90=25 p99=59 max=91 | idle n=395 p50=13 p99=63 | loaded n=426 p50=13 p99=51 | hourly(2) p50 13/13.5/14 p99 59/61.0/63
+  api GET /api/v1/playback/sessions/:id: n=760 p50=415 p90=1663 p99=4607 max=18216 | idle n=410 p50=447 p99=4607 | loaded n=350 p50=383 p99=5119 | hourly(2) p50 383/415.0/447 p99 4607/5119.0/5631
+  api GET /api/v1/playback/status: n=20 p50=119 p90=767 p99=897 max=897 | idle n=2 p50=103 p99=119 | loaded n=18 p50=119 p99=897
+  api GET /api/v1/status: n=641 p50=639 p90=895 p99=3583 max=8059 | idle n=307 p50=639 p99=4095 | loaded n=334 p50=575 p99=2815 | hourly(2) p50 575/607.0/639 p99 3327/3711.0/4095
+  api PATCH /api/v1/playback/sessions/:id: n=195 p50=10485759 p90=15728639 p99=20971519 max=24049595 | idle n=106 p50=10485759 p99=18874367 | loaded n=89 p50=9437183 p99=24049595 | hourly(2) p50 9437183/9961471.0/10485759 p99 17112082/19041800.5/20971519
+  api POST /api/v1/playback/sessions: n=139 p50=2559 p90=13631487 p99=25165823 max=31433349 | idle n=75 p50=106495 p99=31433349 | loaded n=64 p50=1151 p99=25165823 | hourly(2) p50 2047/5631.0/9215 p99 25165823/28299586.0/31433349
+  api POST /api/v1/session: n=40 p50=106495 p90=114687 p99=151582 max=151582 | idle n=4 p50=98303 p99=114687 | loaded n=36 p50=106495 p99=151582
+  availability.rollup_us: n=12 p50=3145727 p90=4194303 p99=4825858 max=4825858 | idle n=4 p50=1572863 p99=3145727 | loaded n=8 p50=3407871 p99=4825858
+  availability.survey_us: n=258 p50=6291455 p90=12582911 p99=16777215 max=18679039 | idle n=155 p50=6815743 p99=15728639 | loaded n=103 p50=6291455 p99=16777215 | hourly(2) p50 5767167/6291455.0/6815743 p99 14680063/15728639.0/16777215
+  claim.data_barrier_us: n=19 p50=4607 p90=5119 p99=24004 max=24004 | loaded n=19 p50=4607 p99=24004
+  maintenance.claim_walk.examine_us: n=832 p50=1 p90=2 p99=12 max=25 | idle n=160 p50=1 p99=11 | loaded n=672 p50=1 p99=14 | hourly(2) p50 1/1.0/1 p99 12/13.0/14
+  maintenance.gc.per_object_ns: n=11 p50=2047 p90=2303 p99=2559 max=2559 | idle n=6 p50=2047 p99=2559 | loaded n=5 p50=1791 p99=2303
+  maintenance.gc.step_us: n=14 p50=127 p90=159 p99=159 max=159 | idle n=8 p50=127 p99=159 | loaded n=6 p50=119 p99=159
+  maintenance.inventory.build_us: n=32 p50=1310719 p90=1966079 p99=2473841 max=2473841 | idle n=12 p50=1310719 p99=2359295 | loaded n=20 p50=1310719 p99=2473841
+  maintenance.release_horizon.build_us: n=33 p50=786431 p90=1310719 p99=2151863 max=2151863 | idle n=9 p50=786431 p99=2151863 | loaded n=24 p50=786431 p99=1291333
+  maintenance.repair.step_us.idle: n=7 p50=7864319 p90=25549898 p99=25549898 max=25549898 | idle n=2 p50=6815743 p99=7864319 | loaded n=5 p50=10485759 p99=25549898
+  maintenance.repair.step_us.loaded: n=20 p50=11534335 p90=29360127 p99=54862621 max=54862621 | loaded n=20 p50=11534335 p99=54862621
+  metadata.reconcile_us: n=19 p50=27262975 p90=37748735 p99=38209764 max=38209764 | idle n=6 p50=23068671 p99=38209764 | loaded n=13 p50=29360127 p99=37748735
+  metadata.reconcile_wait_us: n=34 p50=18874367 p90=41943039 p99=62043295 max=62043295 | idle n=10 p50=20971519 p99=41943039 | loaded n=24 p50=1 p99=62043295
+  playback.create_us: n=40 p50=9437183 p90=18874367 p99=22583986 max=22583986 | idle n=21 p50=8388607 p99=22583986 | loaded n=19 p50=9437183 p99=22583986
+  playback.first_fragment_us: n=181 p50=5242879 p90=12582911 p99=14680063 max=14685722 | idle n=97 p50=7340031 p99=14685722 | loaded n=84 p50=2097151 p99=14479597 | hourly(2) p50 4718591/5505023.0/6291455 p99 14479597/14582659.5/14685722
+
+counters (total, per minute)
+  claim.data_barrier.ids: 152 (2.53/min)
+  maintenance.claim_walk.examined: 832 (13.87/min)
+  maintenance.gc.examined: 704 (11.73/min)
+  maintenance.inventory.live_objects: 27656208 (460924.89/min)
+  maintenance.repair.bytes.idle: 20971520 (349516.30/min)
+  maintenance.repair.bytes.loaded: 46137344 (768935.87/min)
+  maintenance.repair.push_examined.idle: 6 (0.10/min)
+  maintenance.repair.push_examined.loaded: 16 (0.27/min)
+  playback.seek_fastpath.taken: 196 (3.27/min)
+  retention.released.control: 460 (7.67/min)
+  retention.released.data: 140 (2.33/min)
+
+gauges
+  foreground_idle_ms: min=17 median=1399.5 max=66209
+  fuse_parked_publications: min=0 median=0.0 max=0
+  fuse_publication_bytes_committed: 637534208 (10805383.72/min, 0 reset(s))
+  fuse_publication_bytes_confirmed: 637534208 (10805383.72/min, 0 reset(s))
+  fuse_publications_completed: 19 (0.32/min, 0 reset(s))
+  fuse_spool_bytes: min=0 median=0.0 max=33554432
+  interactive_idle_ms: min=18841 median=86400000.0 max=86400000
+  loader_idle_ms: min=521 median=95337.0 max=86400000
+  maintenance_wakeups: 429 (7.27/min, 0 reset(s))
+  repair_bytes_transferred: 58720256 (995232.71/min, 0 reset(s))
+  repair_gate_credit: 14 (0.24/min, 0 reset(s))
+  repair_gate_ran: 21 (0.36/min, 0 reset(s))
+  repair_gate_share: 408 (6.92/min, 0 reset(s))
+  repair_passes_completed: 0 (0.00/min, 0 reset(s))
+  repair_prompt_copies: 151 (2.56/min, 0 reset(s))
+  repair_pull_examined: 0 (0.00/min, 0 reset(s))
+  repair_pull_unsourceable: 0 (0.00/min, 0 reset(s))
+  repair_push_examined: 16 (0.27/min, 0 reset(s))
+  rss_bytes: min=617086976 median=1382219776.0 max=2003992576
+
+events
