@@ -5,6 +5,7 @@
 #include "contract/object_store.hpp"
 #include "storage/io_pressure.hpp"
 #include "storage/local_store.hpp"
+#include "storage/unreferenced_since.hpp"
 
 #include <atomic>
 #include <span>
@@ -143,13 +144,17 @@ class StoragePool final : public ObjectStore {
                                  const std::function<bool()>& should_yield = {});
     // Mark/sweep one bounded slice. `live` and `protected_ids` must be
     // sorted/unique. An unreferenced object is removed only once older than
-    // orphan_grace, so uncommitted puts cannot race metadata commit.
+    // orphan_grace, so uncommitted puts cannot race metadata commit, and,
+    // given `sightings`, only once this node has seen it unreferenced and
+    // unclaimed for `unreferenced_grace`.
     MaintenanceResult gc_step(std::span<const ObjectId> live,
                               const std::vector<ObjectId>& protected_ids,
                               std::chrono::milliseconds orphan_grace,
                               size_t operation_budget,
                               const std::function<bool()>& should_yield = {},
-                              const std::function<bool(const ObjectId&)>& is_retained = {});
+                              const std::function<bool(const ObjectId&)>& is_retained = {},
+                              UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0,
+                              std::chrono::milliseconds unreferenced_grace = {});
 
     // A complete pass, for tests and explicit callers; maintenance uses
     // rebalance_step().

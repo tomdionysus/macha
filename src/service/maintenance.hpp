@@ -10,6 +10,7 @@
 #include "contract/horizon.hpp"
 #include "contract/horizon_builder.hpp"
 #include "contract/object_ledger.hpp"
+#include "storage/unreferenced_since.hpp"
 #include "service/availability_service.hpp"
 #include "metadata/metadata_manager.hpp"
 #include "service/convergence_demand.hpp"
@@ -68,6 +69,9 @@ struct MaintenanceDependencies {
     CatalogueManager& catalogue;
     HorizonBuilder& builder;
     ObjectLedger& ledger;
+    // When this node first saw each DATA and CONTROL object unreferenced.
+    UnreferencedSince& data_unreferenced;
+    UnreferencedSince& control_unreferenced;
     // Kept current by the pass.
     AvailabilityService& availability;
     // Pruned when metadata changes.
@@ -109,6 +113,7 @@ class Maintenance final {
     // Waits until absorb_events() calls for a pass, `deadline`, or `stop`.
     void wait_for_events(std::stop_token, Clock::time_point deadline);
     std::vector<GarbageRef> collect_garbage(const std::vector<GarbageRef>&);
+    void save_sightings(UnreferencedSince&, Clock::time_point& saved, bool complete = false);
     void maintain_garbage_metadata(const std::vector<GarbageRef>& erase,
                                    const std::vector<GarbageRef>& stamp);
 
@@ -121,6 +126,10 @@ class Maintenance final {
     CatalogueManager& catalogue_;
     HorizonBuilder& builder_;
     ObjectLedger& ledger_;
+    UnreferencedSince& data_unreferenced_;
+    UnreferencedSince& control_unreferenced_;
+    Clock::time_point data_sightings_saved_{};
+    Clock::time_point control_sightings_saved_{};
     AvailabilityService& availability_;
     MediaInformationService& media_information_;
     NodeEvents& events_;

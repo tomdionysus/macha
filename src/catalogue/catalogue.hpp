@@ -6,6 +6,7 @@
 #include "metadata/metadata_server.hpp"
 #include "cluster/distributed_store.hpp"
 #include "media/media_engine.hpp"
+#include "storage/unreferenced_since.hpp"
 #include "metadata/metadata_manager.hpp"
 
 #include <map>
@@ -286,8 +287,11 @@ class CatalogueManager {
     CatalogueMaintenance maintenance_objects(const CatalogueMaintenanceHead&, bool repaired);
     CatalogueRetentionObjects retention_objects(const std::optional<ObjectId>& old_root,
                                                  const std::optional<ObjectId>& new_root);
+    // Given `sightings`, an object goes only once this node has seen it
+    // unreferenced and unclaimed for `grace`.
     size_t control_gc_step(std::span<const ObjectId> live,
-                           std::chrono::milliseconds grace, size_t operation_budget = 32);
+                           std::chrono::milliseconds grace, size_t operation_budget = 32,
+                           UnreferencedSince* sightings = nullptr, uint64_t now_unix_ms = 0);
 };
 
 } // namespace macha

@@ -23,12 +23,8 @@ struct PassFacts {
     bool gc_waiting_for_event{};
     // The inventory was rebuilt in this pass: not yet used destructively.
     bool rebuilt_inventory{};
-    // Every durably-known node reachable, and metadata stable as well.
-    bool reachable{};
-    bool metadata_stable{};
-    // A sole accepted head to release against, and its retention baseline.
+    // A sole accepted head to release against.
     bool release_view{};
-    bool retention_baseline_complete{};
     // The metadata generation this node knows of.
     uint64_t known_generation{};
 };
@@ -41,13 +37,16 @@ struct GateVerdict {
     std::string conditions;
 };
 
+// Every gate reads this node's own state only: no gate waits for another
+// node. What protects an absent node's references is the deletion grace the
+// sweeps apply on this node's clock.
+
 // Tombstone collection: due, the inventory not rebuilt this pass, the
-// cluster stable, the catalogue's inventory complete.
+// catalogue's inventory complete.
 GateVerdict tombstone_gate(const PassFacts&, const InventoryHorizon*);
 
-// Control release and GC: due, not rebuilt, destructive GC enabled (stable,
-// a release view, its baseline complete), the catalogue complete, an
-// inventory, at or past the known generation.
+// Control release and GC: due, not rebuilt, a release view, the catalogue
+// complete, an inventory, at or past the known generation.
 GateVerdict control_gate(const PassFacts&, const InventoryHorizon*);
 
 // DATA release and sweep: the control gate's conditions; the reason is the

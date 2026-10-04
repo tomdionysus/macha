@@ -563,109 +563,6 @@ MACHA_TEST("namespace_migration", test_a_tree_backed_delta_reconstructs_its_reco
     CHECK(encode_snapshot_v14(committed) == encode_snapshot_v14(successor));
 }
 
-// A namespace inherited from before claims existed carries no retention
-// baseline. The first repair gives it one, and before that commit is accepted
-// every object the head can reach is claimed: the namespace's extents, a
-// standing conflict's alternatives and the catalogue.
-MACHA_TEST("namespace_migration", test_an_inherited_namespace_without_a_baseline_is_claimed_whole) {
-    TestCluster cluster;
-    auto config = cluster.node_config("baseline");
-    make_solo(config);
-    const auto film_bytes = pattern(3 * 1024 * 1024, 61);
-    const auto alternative_bytes = pattern(256 * 1024, 62);
-
-    NodeId node_id{};
-    FsEntry alternative;
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        service.filesystem().mkdir("/Movies", 0755, getuid(), getgid());
-        write_file(service, "/Movies/film.mkv", film_bytes);
-        // Bytes the namespace no longer names, kept as one side of a conflict.
-        write_file(service, "/alternative.bin", alternative_bytes);
-        alternative = service.filesystem().getattr("/alternative.bin");
-        service.filesystem().unlink("/alternative.bin");
-        CatalogueItem item;
-        item.id = "movie:film";
-        item.kind = CatalogueKind::movie;
-        item.title = "Film";
-        (void)service.catalogue().upsert(item);
-        service.stop();
-    }
-
-    // The inherited state: the same head with no baseline, a conflict
-    // standing, and not one claim.
-    MetadataConflict conflict;
-    conflict.kind = MetadataConflictKind::namespace_entry;
-    conflict.key = "/disputed.bin";
-    conflict.left_head = sha256(pattern(32, 63));
-    conflict.right_head = sha256(pattern(32, 64));
-    conflict.left_entry = alternative;
-    conflict.right_entry = make_directory(65);
-    {
-        MetadataReplica replica(config.state_path, cluster.keys().storage);
-        const auto head = replica.committed();
-        auto snapshot = decode_snapshot(head.payload);
-        REQUIRE(snapshot.retention_baseline_complete);
-        snapshot.retention_baseline_complete = false;
-        snapshot.conflicts.emplace(metadata_conflict_id(conflict), conflict);
-        MetadataRecord inherited;
-        inherited.generation = head.generation + 1;
-        inherited.previous = head.hash;
-        inherited.payload = encode_snapshot(snapshot);
-        inherited.hash =
-            metadata_hash(inherited.generation, inherited.previous, inherited.payload);
-        REQUIRE(replica.install_migrated_head(inherited, {node_id}, "test: no baseline"));
-    }
-    std::filesystem::remove_all(config.state_path / "retention");
-
-    // The repair that establishes the baseline is held at its start, so the
-    // node is first seen serving without one.
-    TestGate repair;
-    Service service(config, cluster.keys(), test_durability_window, {},
-                    [&](std::string_view stage) {
-                        if (stage == "metadata-repair-begin")
-                            repair.enter_and_wait();
-                    });
-    struct OpenRepair {
-        TestGate& gate;
-        ~OpenRepair() { gate.open(); }
-    } release{repair};
-    service.start();
-    (void)service.filesystem();
-    REQUIRE(repair.wait_for_entries(1, 10s));
-
-    auto& claims = service.local_state().retention();
-    const auto film = service.filesystem().getattr("/Movies/film.mkv");
-    REQUIRE(!film.extents.empty());
-    // Before the baseline: what was inherited has no claim, and a commit
-    // made now still claims what it writes.
-    CHECK(!service.metadata_manager().snapshot().retention_baseline_complete);
-    for (const auto& extent : film.extents)
-        CHECK(!claims.retained(RetentionClass::data, extent.id));
-    write_file(service, "/Movies/second.mkv", pattern(256 * 1024, 66));
-    const auto second = service.filesystem().getattr("/Movies/second.mkv");
-    REQUIRE(!second.extents.empty());
-    for (const auto& extent : second.extents)
-        CHECK(claims.retained(RetentionClass::data, extent.id));
-    CHECK(!service.metadata_manager().snapshot().retention_baseline_complete);
-
-    repair.open();
-    REQUIRE(wait_until(
-        [&] { return service.metadata_manager().snapshot().retention_baseline_complete; }, 30s));
-    const auto snapshot = service.metadata_manager().snapshot();
-    for (const auto& extent : film.extents)
-        CHECK(claims.retained(RetentionClass::data, extent.id));
-    REQUIRE(!alternative.extents.empty());
-    for (const auto& extent : alternative.extents)
-        CHECK(claims.retained(RetentionClass::data, extent.id));
-    REQUIRE(snapshot.catalogue_root.has_value());
-    CHECK(claims.retained(RetentionClass::control, *snapshot.catalogue_root));
-    CHECK(snapshot.conflicts.contains(metadata_conflict_id(conflict)));
-    CHECK(read_file(service, "/Movies/film.mkv", film_bytes.size()) == film_bytes);
-    service.stop();
-}
 
 // On a tree, a commit that changes only the catalogue leaves the tree as it
 // is and claims the catalogue it installs.
@@ -760,12 +657,7 @@ MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_uncl
         Service s2(c2, cluster.keys(), test_durability_window);
         s1.start();
         s2.start();
-        REQUIRE(wait_until(
-            [&] {
-                return s1.metadata_manager().snapshot().retention_baseline_complete &&
-                       s2.metadata_manager().snapshot().retention_baseline_complete;
-            },
-            30s));
+        REQUIRE(wait_metadata_writable(s1));
         REQUIRE(converged(s1, s2));
         s2.stop();
         s1.stop();
@@ -858,9 +750,7 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     {
         Service service(config, cluster.keys(), test_durability_window);
         service.start();
-        REQUIRE(wait_until(
-            [&] { return service.metadata_manager().snapshot().retention_baseline_complete; },
-            30s));
+        REQUIRE(wait_metadata_writable(service));
         service.stop();
     }
     std::filesystem::remove_all(config.state_path / "retention");
@@ -962,53 +852,6 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     service.stop();
 }
 
-// A migration claims nothing, so the head it installs carries no retention
-// baseline. The node's first repair establishes one on the tree, and that
-// commit claims every node and extent the namespace reaches.
-MACHA_TEST("namespace_migration", test_a_migrated_namespace_is_claimed_by_its_baseline) {
-    TestCluster cluster;
-    auto config = cluster.node_config("migrated-baseline");
-    make_solo(config);
-    const auto film = pattern(256 * 1024, 111);
-    NodeId node_id{};
-    {
-        Service service(config, cluster.keys(), test_durability_window);
-        service.start();
-        node_id = service.node().node_id();
-        service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
-        for (int i = 0; i < 60; ++i)
-            service.filesystem().mkdir("/Films/" + std::to_string(i), 0755, getuid(), getgid());
-        write_file(service, "/Films/film.mkv", film);
-        service.stop();
-    }
-    const auto migration = migrate_state(config, cluster.keys(), {node_id});
-    {
-        MetadataReplica replica(config.state_path, cluster.keys().storage);
-        CHECK(!decode_snapshot(replica.committed().payload).retention_baseline_complete);
-    }
-
-    Service service(config, cluster.keys(), test_durability_window);
-    service.start();
-    REQUIRE(wait_until(
-        [&] { return service.metadata_manager().snapshot().retention_baseline_complete; }, 30s));
-    // The baseline is a tree-backed commit over the migrated tree.
-    const auto head = decode_snapshot(service.local_state().replica().committed().payload);
-    CHECK(head.retention_baseline_complete);
-    REQUIRE(head.namespace_root.has_value());
-    CHECK(*head.namespace_root == migration.root);
-
-    auto& claims = service.local_state().retention();
-    const auto tree = reachable_tree_nodes(service);
-    REQUIRE(tree.size() > 1);
-    for (const auto& node : tree)
-        CHECK(claims.retained(RetentionClass::control, node));
-    const auto entry = service.filesystem().getattr("/Films/film.mkv");
-    REQUIRE(!entry.extents.empty());
-    for (const auto& extent : entry.extents)
-        CHECK(claims.retained(RetentionClass::data, extent.id));
-    CHECK(read_file(service, "/Films/film.mkv", film.size()) == film);
-    service.stop();
-}
 
 
 } // namespace

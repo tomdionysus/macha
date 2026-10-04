@@ -39,6 +39,8 @@ class MetadataServer {
     // The newest generation this node knows of: its replica's, or a newer
     // one a peer has announced. Lock-free on the node side.
     uint64_t known_generation() const;
+    // The highest generation a peer advertises that is news to this node.
+    uint64_t remote_generation() const;
 
   private:
     void route(MessageType, MessageRoutes::Handler);

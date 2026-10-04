@@ -82,8 +82,7 @@ MACHA_FAST_TEST("ledger", test_release_horizon_carries_its_head_and_clock) {
 // The reference model's state: an inventory or none, its generation, its
 // catalogue completeness (true before the first inventory).
 struct Reference {
-    bool garbage_due, gc_due, busy, waiting, rebuilt, reachable, metadata_stable, release_view,
-        baseline;
+    bool garbage_due, gc_due, busy, waiting, rebuilt, release_view;
     std::optional<uint64_t> generation;
     bool catalogue_complete;
     uint64_t known;
@@ -104,10 +103,10 @@ std::vector<std::optional<InventoryHorizon>> inventories() {
 }
 
 template <class Check> void over_every_pass(Check&& check) {
-    for (unsigned bits = 0; bits < (1U << 9); ++bits)
+    for (unsigned bits = 0; bits < (1U << 6); ++bits)
         for (const auto& inventory : inventories()) {
             const auto bit = [bits](unsigned n) { return ((bits >> n) & 1U) != 0; };
-            Reference ref{bit(0), bit(1), bit(2), bit(3), bit(4), bit(5), bit(6), bit(7), bit(8),
+            Reference ref{bit(0), bit(1), bit(2), bit(3), bit(4), bit(5),
                           inventory ? std::optional<uint64_t>(inventory->generation())
                                     : std::nullopt,
                           inventory ? inventory->catalogue_complete() : true, 5};
@@ -117,10 +116,7 @@ template <class Check> void over_every_pass(Check&& check) {
             facts.busy = ref.busy;
             facts.gc_waiting_for_event = ref.waiting;
             facts.rebuilt_inventory = ref.rebuilt;
-            facts.reachable = ref.reachable;
-            facts.metadata_stable = ref.metadata_stable;
             facts.release_view = ref.release_view;
-            facts.retention_baseline_complete = ref.baseline;
             facts.known_generation = ref.known;
             check(ref, facts, inventory ? &*inventory : nullptr);
         }
@@ -128,31 +124,27 @@ template <class Check> void over_every_pass(Check&& check) {
 
 MACHA_FAST_TEST("ledger", test_tombstone_gate_is_the_pass_condition_over_every_input) {
     over_every_pass([](const Reference& r, const PassFacts& facts, const InventoryHorizon* inventory) {
-        const bool cluster_gc_stable = r.reachable && r.metadata_stable;
-        const bool expected = r.garbage_due && !r.rebuilt && cluster_gc_stable && r.catalogue_complete;
+        const bool expected = r.garbage_due && !r.rebuilt && r.catalogue_complete;
         const auto verdict = tombstone_gate(facts, inventory);
         CHECK(verdict.permitted == expected);
         CHECK(verdict.reason.empty() == expected);
         CHECK(verdict.conditions ==
               flag("due", r.garbage_due) + " " + flag("rebuilt", r.rebuilt) + " " +
-                  flag("reachable", r.reachable) + " " + flag("stable", cluster_gc_stable) + " " +
                   flag("catalogue_complete", r.catalogue_complete));
     });
 }
 
 MACHA_FAST_TEST("ledger", test_control_gate_is_the_pass_condition_over_every_input) {
     over_every_pass([](const Reference& r, const PassFacts& facts, const InventoryHorizon* inventory) {
-        const bool cluster_gc_stable = r.reachable && r.metadata_stable;
-        const bool destructive = cluster_gc_stable && r.release_view && r.baseline;
         const uint64_t generation = r.generation.value_or(0);
-        const bool expected = r.gc_due && !r.rebuilt && destructive && r.catalogue_complete &&
+        const bool expected = r.gc_due && !r.rebuilt && r.release_view && r.catalogue_complete &&
                               r.generation.has_value() && generation >= r.known;
         const auto verdict = control_gate(facts, inventory);
         CHECK(verdict.permitted == expected);
         CHECK(verdict.reason.empty() == expected);
         CHECK(verdict.conditions ==
               flag("due", r.gc_due) + " " + flag("rebuilt", r.rebuilt) + " " +
-                  flag("destructive", destructive) + " " +
+                  flag("release_view", r.release_view) + " " +
                   flag("catalogue_complete", r.catalogue_complete) + " " +
                   flag("control_live", r.generation.has_value()) + " " +
                   flag("generation_current", generation >= r.known));
@@ -161,11 +153,8 @@ MACHA_FAST_TEST("ledger", test_control_gate_is_the_pass_condition_over_every_inp
 
 MACHA_FAST_TEST("ledger", test_data_gate_is_the_pass_condition_and_reason_over_every_input) {
     over_every_pass([](const Reference& r, const PassFacts& facts, const InventoryHorizon* inventory) {
-        const bool cluster_gc_healthy = r.reachable;
-        const bool cluster_gc_stable = r.reachable && r.metadata_stable;
-        const bool destructive = cluster_gc_stable && r.release_view && r.baseline;
         const uint64_t generation = r.generation.value_or(0);
-        const bool expected = r.gc_due && !r.rebuilt && destructive && r.catalogue_complete &&
+        const bool expected = r.gc_due && !r.rebuilt && r.release_view && r.catalogue_complete &&
                               r.generation.has_value() && generation >= r.known;
         std::string reason;
         if (!r.gc_due)
@@ -174,12 +163,8 @@ MACHA_FAST_TEST("ledger", test_data_gate_is_the_pass_condition_and_reason_over_e
                                  : "quiet window";
         else if (r.rebuilt)
             reason = "inventory rebuilt this pass";
-        else if (!cluster_gc_stable)
-            reason = cluster_gc_healthy ? "metadata not stable" : "not every known node reachable";
         else if (!r.release_view)
             reason = "no sole accepted head for retention release";
-        else if (!r.baseline)
-            reason = "retention baseline incomplete";
         else if (!r.catalogue_complete)
             reason = "catalogue inventory incomplete";
         else if (!r.generation)
@@ -192,9 +177,7 @@ MACHA_FAST_TEST("ledger", test_data_gate_is_the_pass_condition_and_reason_over_e
         CHECK(verdict.reason == reason);
         CHECK(verdict.conditions ==
               flag("due", r.gc_due) + " " + flag("rebuilt", r.rebuilt) + " " +
-                  flag("reachable", cluster_gc_healthy) + " " + flag("stable", cluster_gc_stable) +
-                  " " + flag("release_view", r.release_view) + " " +
-                  flag("baseline", r.release_view && r.baseline) + " " +
+                  flag("release_view", r.release_view) + " " +
                   flag("catalogue_complete", r.catalogue_complete) + " " +
                   flag("live", r.generation.has_value()) + " " +
                   flag("generation_current", generation >= r.known));
@@ -204,8 +187,7 @@ MACHA_FAST_TEST("ledger", test_data_gate_is_the_pass_condition_and_reason_over_e
 MACHA_FAST_TEST("ledger", test_each_shut_gate_names_the_first_condition_that_failed) {
     PassFacts open;
     open.garbage_due = open.gc_due = true;
-    open.reachable = open.metadata_stable = true;
-    open.release_view = open.retention_baseline_complete = true;
+    open.release_view = true;
     open.known_generation = 5;
     const InventoryHorizon current(5, true, {}, {}, {});
     CHECK(tombstone_gate(open, &current).permitted);
@@ -220,12 +202,9 @@ MACHA_FAST_TEST("ledger", test_each_shut_gate_names_the_first_condition_that_fai
     CHECK(tombstone_gate(shut, &current).reason == "inventory rebuilt this pass");
     CHECK(control_gate(shut, &current).reason == "inventory rebuilt this pass");
     shut = open;
-    shut.reachable = false;
-    CHECK(tombstone_gate(shut, &current).reason == "not every known node reachable");
-    CHECK(control_gate(shut, &current).reason == "destructive GC not enabled");
-    shut = open;
-    shut.metadata_stable = false;
-    CHECK(tombstone_gate(shut, &current).reason == "metadata not stable");
+    shut.release_view = false;
+    CHECK(tombstone_gate(shut, &current).permitted);
+    CHECK(control_gate(shut, &current).reason == "no sole accepted head for retention release");
     const InventoryHorizon incomplete(5, false, {}, {}, {});
     CHECK(tombstone_gate(open, &incomplete).reason == "catalogue inventory incomplete");
     CHECK(control_gate(open, &incomplete).reason == "catalogue inventory incomplete");

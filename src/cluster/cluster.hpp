@@ -119,6 +119,8 @@ class NodeRuntime : public ClusterNode {
     std::map<NodeId, Clock::time_point> dial_back_last_ MACHA_GUARDED_BY(dial_back_mutex_);
 
     std::atomic_uint64_t remote_metadata_generation_{};
+    // Owned by the loop thread.
+    std::optional<Clock::time_point> remote_generation_unbacked_since_;
     std::atomic_uint64_t remote_metadata_epoch_{};
     std::atomic_uint64_t metadata_announcements_{};
     // The latest local-state figures their owners advertised; zero until
@@ -153,6 +155,7 @@ class NodeRuntime : public ClusterNode {
     void route(MessageType, MessageRoutes::Handler);
     void unbind_routes();
     void loop(std::stop_token);
+    void settle_remote_generation();
     // Public-endpoint discovery, then (for `inbound_capable: auto`) the
     // dial-back resolution state machine, for the node's life.
     void connectivity_loop(std::stop_token);

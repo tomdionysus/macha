@@ -3031,6 +3031,74 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     s1.stop();
 }
 
+// A second accepted head with no ancestor in common with this node's own
+// cannot be merged. It is set aside: the node goes on reading, writing and
+// releasing on its own head, and neither head is dropped.
+MACHA_TEST("rpc_cluster", test_a_head_that_cannot_be_merged_is_set_aside) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "set-aside", cluster.keyfile(), free_port(), {});
+    config.metadata_cache = std::chrono::milliseconds(0);
+    BareNode node(config, keys);
+    node.start();
+    REQUIRE(node.wait_local_state_ready(10s));
+
+    MetadataManager metadata(node, node.local_state(), node.metadata_server());
+    const auto directory = [] {
+        FsEntry entry;
+        entry.type = EntryType::directory;
+        entry.mode = 0755;
+        entry.uid = getuid();
+        entry.gid = getgid();
+        return entry;
+    };
+    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/mine"] = directory(); });
+    const auto mine = node.metadata_replica().committed();
+    REQUIRE(mine.generation > 1);
+
+    // A head from a history this node has never seen.
+    auto foreign_snapshot = decode_snapshot(mine.payload);
+    foreign_snapshot.entries.erase("/mine");
+    foreign_snapshot.entries["/theirs"] = directory();
+    foreign_snapshot.mutation_sequences.clear();
+    foreign_snapshot.mutation_sequences[random_node_id()] = 9;
+    MetadataRecord foreign;
+    foreign.generation = mine.generation + 7;
+    foreign.previous = sha256(pattern(64, 201));
+    foreign.payload = encode_snapshot(foreign_snapshot);
+    foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
+    REQUIRE(node.metadata_replica().store_commit(foreign));
+    MetadataAcceptance acceptance;
+    acceptance.generation = foreign.generation;
+    acceptance.hash = foreign.hash;
+    acceptance.required = 1;
+    acceptance.replicas = {random_node_id()};
+    REQUIRE(node.metadata_server().accept_commit(acceptance));
+    REQUIRE(node.metadata_replica().accepted_heads().size() == 2);
+
+    // Reads serve this node's own head.
+    const auto read = metadata.read_record();
+    CHECK(read.hash == mine.hash);
+    CHECK(metadata.snapshot().entries.contains("/mine"));
+    CHECK(!metadata.snapshot().entries.contains("/theirs"));
+
+    // Writes extend it.
+    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/more"] = directory(); });
+    const auto after = metadata.read_record();
+    CHECK(after.previous == mine.hash);
+    CHECK(metadata.snapshot().entries.contains("/more"));
+
+    // Release has a head to follow, and the other head is still held.
+    const auto release = metadata.retention_release_view();
+    REQUIRE(release.has_value());
+    CHECK(release->hash == after.hash);
+    const auto heads = node.metadata_replica().accepted_heads();
+    CHECK(heads.size() == 2);
+    CHECK(std::any_of(heads.begin(), heads.end(),
+                      [&](const MetadataRecord& head) { return head.hash == foreign.hash; }));
+    node.stop();
+}
+
 MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_reconciliation) {
     // Several readers on one node observe the same two-head divergence, and
     // reconciliation_mutex_ makes exactly one mint the merge commit. Bare
@@ -3516,7 +3584,9 @@ MACHA_FAST_TEST("rpc_cluster", test_commit_replicas_ordered_local_then_nearest) 
     CHECK(cold[2].host == "lan");
 }
 
-MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_cluster_healthy) {
+// A delete made while a node is away is reclaimed by the nodes present
+// without waiting for it, and by the absent node once it is back.
+MACHA_TEST("rpc_cluster", test_a_delete_is_reclaimed_while_a_node_is_away) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -3579,61 +3649,27 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         }
     }));
 
-    // Record the claims and copies on the cohort that stays online: none may be
-    // removed while a durably known node is unreachable.
-    const bool n1_claim_before = s1.local_state().retention().retained(RetentionClass::data, extent);
-    const bool n2_claim_before = s2.local_state().retention().retained(RetentionClass::data, extent);
-    const bool n1_copy_before = s1.local_state().data().valid(extent);
-    const bool n2_copy_before = s2.local_state().data().valid(extent);
-    REQUIRE(n1_claim_before || n2_claim_before);
-    REQUIRE(n1_copy_before || n2_copy_before);
-
-    // The W=2 cohort keeps accepting metadata with node 3 offline, but the
-    // persisted roster fences claim release and reclamation.
+    // With node 3 away the others delete the file, release their claims and
+    // reclaim their copies on their own clocks.
     s3->stop();
     s3.reset();
     REQUIRE(wait_until([&] {
         return s1.node().membership().active().size() == 2 &&
-               s2.node().membership().active().size() == 2 &&
-               !s1.node().membership().all_known_reachable() &&
-               !s2.node().membership().all_known_reachable();
+               s2.node().membership().active().size() == 2;
     }));
-
     s1.filesystem().unlink("/partition-retain.bin");
-    REQUIRE(wait_until([&] {
-        try {
-            (void)s2.filesystem().getattr("/partition-retain.bin");
-            return false;
-        } catch (...) {
-            return true;
-        }
-    }));
-
-    // Several zero-grace passes: neither the claim nor the bytes may go.
-    std::this_thread::sleep_for(800ms);
-    if (n1_claim_before)
-        CHECK(s1.local_state().retention().retained(RetentionClass::data, extent));
-    if (n2_claim_before)
-        CHECK(s2.local_state().retention().retained(RetentionClass::data, extent));
-    if (n1_copy_before)
-        CHECK(s1.local_state().data().valid(extent));
-    if (n2_copy_before)
-        CHECK(s2.local_state().data().valid(extent));
-
-    // The third node returns from its persistent state; metadata must converge
-    // before GC may reclaim the delete.
-    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
-    s3->start();
     REQUIRE(wait_until(
         [&] {
-            return s1.node().membership().all_known_reachable() &&
-                   s2.node().membership().all_known_reachable() &&
-                   s3->node().membership().all_known_reachable() &&
-                   s1.metadata_manager().cluster_status().stable &&
-                   s2.metadata_manager().cluster_status().stable &&
-                   s3->metadata_manager().cluster_status().stable;
+            return !s1.local_state().retention().retained(RetentionClass::data, extent) &&
+                   !s2.local_state().retention().retained(RetentionClass::data, extent) &&
+                   !s1.local_state().data().valid(extent) && !s2.local_state().data().valid(extent);
         },
-        10s));
+        20s));
+
+    // Node 3 returns still holding what it held, learns of the delete from
+    // the head and reclaims its own copy.
+    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
+    s3->start();
     REQUIRE(wait_until(
         [&] {
             try {
@@ -3646,11 +3682,10 @@ MACHA_TEST("rpc_cluster", test_partition_delete_defers_destructive_gc_until_clus
         10s));
     REQUIRE(wait_until(
         [&] {
-            return !s1.local_state().retention().retained(RetentionClass::data, extent) &&
-                   !s2.local_state().retention().retained(RetentionClass::data, extent) &&
-                   !s1.local_state().data().valid(extent) && !s2.local_state().data().valid(extent);
+            return !s3->local_state().retention().retained(RetentionClass::data, extent) &&
+                   !s3->local_state().data().valid(extent);
         },
-        10s));
+        20s));
 
     s3->stop();
     s2.stop();

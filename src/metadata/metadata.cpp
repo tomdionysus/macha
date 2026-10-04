@@ -1898,23 +1898,23 @@ MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
     auto& out = result.snapshot;
     out.metadata_voters.clear();
 
-    auto scalar_merge = [](auto base_value, auto left_value, auto right_value,
-                           std::string_view name) {
+    // A one-sided change wins; where both branches changed a value, the
+    // greater does, so every reconciler computes the same record.
+    auto scalar_merge = [](auto base_value, auto left_value, auto right_value) {
         if (left_value == right_value)
             return left_value;
         if (left_value == base_value)
             return right_value;
         if (right_value == base_value)
             return left_value;
-        throw std::runtime_error("metadata cluster policy diverged: " + std::string(name));
+        return std::max(left_value, right_value);
     };
-    out.data_replication = scalar_merge(base.data_replication, left.data_replication,
-                                        right.data_replication, "data_replication");
-    out.extent_size =
-        scalar_merge(base.extent_size, left.extent_size, right.extent_size, "extent_size");
+    out.data_replication =
+        scalar_merge(base.data_replication, left.data_replication, right.data_replication);
+    out.extent_size = scalar_merge(base.extent_size, left.extent_size, right.extent_size);
     out.metadata_write_replicas_required =
         scalar_merge(base.metadata_write_replicas_required, left.metadata_write_replicas_required,
-                     right.metadata_write_replicas_required, "metadata_write_replicas_required");
+                     right.metadata_write_replicas_required);
     // Participation is monotonic: a merge preserves every branch-capable node.
     // The roster is migration bookkeeping, never branch authority.
     out.metadata_participants = base.metadata_participants;
@@ -1963,8 +1963,12 @@ MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
             merged = r;
         else if (r == b)
             merged = l;
+        // Both branches changed the record: a branch that settled it wins,
+        // otherwise the lesser, so every reconciler computes the same record.
+        else if (!l || !r)
+            merged = std::nullopt;
         else
-            throw std::runtime_error("metadata conflict state diverged for id " + id);
+            merged = std::min(*l, *r);
         if (merged)
             out.conflicts.emplace(id, std::move(*merged));
     }
@@ -3295,8 +3299,16 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     std::erase_if(unreconstructable_head_retry_at_, [&](const auto& item) MACHA_REQUIRES(m_) {
         return !accepted_heads_.contains(item.first);
     });
+    std::erase_if(set_aside_, [&](const auto& item) MACHA_REQUIRES(m_) {
+        return !accepted_heads_.contains(item.first);
+    });
+    if (set_aside_.size() >= accepted_heads_.size())
+        set_aside_.clear();
+    note_set_aside_locked();
     std::optional<MetadataRecord> selected;
     for (const auto& [hash, _] : accepted_heads_) {
+        if (set_aside_.contains(hash))
+            continue;
         if (auto found = unreconstructable_head_retry_at_.find(hash);
             found != unreconstructable_head_retry_at_.end() && now < found->second)
             continue;
@@ -3321,6 +3333,40 @@ bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
     pending_history_.reset();
     pending_recovered_ = false;
     return true;
+}
+
+void MetadataReplica::note_set_aside_locked() {
+    uint64_t highest = 0;
+    for (const auto& [_, generation] : set_aside_)
+        highest = std::max(highest, generation);
+    set_aside_generation_.store(highest, std::memory_order_release);
+}
+
+bool MetadataReplica::set_aside(const Hash256& hash) {
+    Lock lock(m_);
+    const auto found = accepted_heads_.find(hash);
+    if (found == accepted_heads_.end() || set_aside_.size() + 1 >= accepted_heads_.size())
+        return false;
+    set_aside_.emplace(hash, found->second.generation);
+    refresh_materialized_head_locked();
+    return true;
+}
+
+void MetadataReplica::clear_set_aside() {
+    Lock lock(m_);
+    if (set_aside_.empty())
+        return;
+    set_aside_.clear();
+    refresh_materialized_head_locked();
+}
+
+std::vector<MetadataRecord> MetadataReplica::usable_heads() const {
+    auto heads = accepted_heads();
+    Lock lock(m_);
+    std::erase_if(heads, [&](const MetadataRecord& head) MACHA_REQUIRES(m_) {
+        return set_aside_.contains(head.hash);
+    });
+    return heads;
 }
 
 void MetadataReplica::refresh_materialized_head_locked() {

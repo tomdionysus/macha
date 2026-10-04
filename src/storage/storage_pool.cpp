@@ -974,7 +974,9 @@ StoragePool::gc_step(std::span<const ObjectId> live,
                      const std::vector<ObjectId>& protected_ids,
                      std::chrono::milliseconds orphan_grace, size_t operation_budget,
                      const std::function<bool()>& should_yield,
-                     const std::function<bool(const ObjectId&)>& is_retained) {
+                     const std::function<bool(const ObjectId&)>& is_retained,
+                     UnreferencedSince* sightings, uint64_t now_unix_ms,
+                     std::chrono::milliseconds unreferenced_grace) {
     MaintenanceResult result;
     while (!operation_budget || result.objects < operation_budget) {
         if (should_yield && should_yield()) {
@@ -985,14 +987,23 @@ StoragePool::gc_step(std::span<const ObjectId> live,
         auto item = next_physical(gc_cursor_, pass_complete);
         if (!item) {
             result.complete = pass_complete;
+            if (pass_complete && sightings)
+                sightings->pass_complete();
             return result;
         }
         ++result.objects;
         const auto& id = item->id;
         if (std::binary_search(live.begin(), live.end(), id) ||
             std::binary_search(protected_ids.begin(), protected_ids.end(), id) ||
-            (is_retained && is_retained(id)))
+            (is_retained && is_retained(id))) {
+            if (sightings)
+                sightings->forget(id);
             continue;
+        }
+        if (sightings && !sightings->matured(id, now_unix_ms, unreferenced_grace)) {
+            result.deferred = true;
+            continue;
+        }
 
         try {
             // Re-check immediately before irreversible deletion. A foreground
@@ -1005,10 +1016,13 @@ StoragePool::gc_step(std::span<const ObjectId> live,
             // timestamp when an existing content hash is reaffirmed, preventing
             // a new write from racing an ancient orphan with identical bytes.
             const auto bytes = item->store->stored_size(id);
-            if (item->store->remove_if_older_than(id, orphan_grace))
+            if (item->store->remove_if_older_than(id, orphan_grace)) {
                 result.bytes += bytes;
-            else
+                if (sightings)
+                    sightings->forget(id);
+            } else {
                 result.deferred = true;
+            }
         } catch (const std::exception& error) {
             Log::debug("garbage collection skipped local object " + to_string(id) +
                        " on " + item->path.string() + ": " + error.what());

@@ -1785,7 +1785,8 @@ CatalogueMaintenance CatalogueManager::maintenance_objects(const CatalogueMainte
 
 size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
                                          std::chrono::milliseconds grace,
-                                         size_t operation_budget) {
+                                         size_t operation_budget,
+                                         UnreferencedSince* sightings, uint64_t now_unix_ms) {
     if (!operation_budget) return 0;
 
     // Publication is data-before-metadata, so a future root's CONTROL objects
@@ -1812,10 +1813,17 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
         if (!id) continue;
 
         if (std::binary_search(live.begin(), live.end(), *id)) {
+            if (sightings)
+                sightings->forget(*id);
             Lock lock(mutex_);
             control_gc_unreferenced_epoch_.erase(*id);
             continue;
         }
+        if (sightings && ledger_.retained(RetentionClass::control, *id)) {
+            sightings->forget(*id);
+            continue;
+        }
+        const bool waited = !sightings || sightings->matured(*id, now_unix_ms, grace);
 
         // A content-addressed object may be reused by the current publication;
         // put() touches it, so keep any object touched since this root was seen.
@@ -1838,14 +1846,18 @@ size_t CatalogueManager::control_gc_step(std::span<const ObjectId> live,
 
             // cache() takes this mutex to publish a new root, so GC never races
             // a root transition and deletes its staging.
-            if (ledger_.retained(RetentionClass::control, *id))
+            if (!waited || ledger_.retained(RetentionClass::control, *id))
                 continue;
             if (local_.control().remove_if_older_than(*id, grace)) {
                 control_gc_unreferenced_epoch_.erase(seen);
+                if (sightings)
+                    sightings->forget(*id);
                 ++removed;
             }
         }
     }
+    if (exhausted && sightings)
+        sightings->pass_complete();
     if (exhausted && removed)
         (void)local_.control().compact_packs();
     return removed;

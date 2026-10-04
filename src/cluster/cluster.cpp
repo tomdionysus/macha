@@ -207,7 +207,8 @@ NodeRuntime::NodeRuntime(Config config, const NodeIdentity& identity, RecoveryPr
       inbound_(initial_inbound_resolution(cfg_)),
       members_(self_info(cfg_, identity_.id, 0, 0, 0,
                          node_flags_for(inbound_.inbound_capable, inbound_.hosts_extents)),
-               cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin"),
+               cfg_.dead_after, cfg_.state_path / "membership" / "known-nodes.bin",
+               cfg_.maintenance.garbage_grace),
       public_connectivity_(cfg_, identity_.id, Endpoint{members_.self().host, members_.self().port}),
       telemetry_(identity_.id, cfg_.state_path / "telemetry" / "last-known.bin",
                  std::move(telemetry_now)),
@@ -1044,11 +1045,45 @@ void NodeRuntime::exchange(const NodeInfo& node) {
     merge(reply.message.payload);
 }
 
+// The highest generation heard of is only worth chasing while some node
+// present advertises it. One that no active node has backed for dead_after
+// belonged to a node that has gone, and is dropped to what the nodes present
+// advertise.
+void NodeRuntime::settle_remote_generation() {
+    uint64_t backed = 0;
+    for (const auto& peer : members_.active())
+        if (peer.id != identity_.id)
+            backed = std::max(backed, peer.metadata_generation);
+    const auto heard = remote_metadata_generation_.load();
+    const auto now = Clock::now();
+    if (backed >= heard) {
+        remote_generation_unbacked_since_.reset();
+        return;
+    }
+    if (!remote_generation_unbacked_since_) {
+        remote_generation_unbacked_since_ = now;
+        return;
+    }
+    if (now - *remote_generation_unbacked_since_ < cfg_.dead_after)
+        return;
+    auto expected = heard;
+    if (remote_metadata_generation_.compare_exchange_strong(expected, backed))
+        events_.notify(NodeEvent::metadata);
+    remote_generation_unbacked_since_.reset();
+}
+
 void NodeRuntime::loop(std::stop_token stop) {
     ThreadCpuReporter cpu_reporter("macha-node", std::chrono::seconds(5), true);
     while (!stop.stop_requested()) {
         // Readiness is orthogonal to membership: refresh available local
         // planes, then exchange regardless.
+
+        if (const auto forgotten = members_.forget_unseen()) {
+            Log::info("membership: forgot " + std::to_string(forgotten) +
+                      " node(s) not heard of for the absence horizon");
+            events_.notify(NodeEvent::topology);
+        }
+        settle_remote_generation();
 
         std::set<std::pair<std::string, uint16_t>> exchanged;
         const auto known_nodes = members_.all();
