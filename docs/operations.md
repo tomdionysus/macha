@@ -4,7 +4,7 @@
 
 Create the configured state, DATA backend, cache and FUSE spool parent directories on the intended filesystems. Do not point Macha at a populated unversioned state/backend: the storage contract deliberately refuses it.
 
-Copy the same cluster key to every node. Configure reachable advertised addresses and consistent DHT policy. Start at least `dht.metadata_min_write_replicas` nodes before expecting namespace/catalogue mutations to commit.
+Copy the same cluster key to every node. Configure reachable advertised addresses and consistent DHT policy. The founding node commits namespace/catalogue mutations as soon as it is up; a joining node does so once it has the namespace from a peer.
 
 ## Capacity
 
@@ -25,11 +25,17 @@ A full backend stops admitting new DATA. Local `StoragePool` tries another ranke
 
 Do not increase metadata/control quota merely to work around a full DATA disk; those are intentionally different resources.
 
-## Metadata write-floor loss
+## A node on its own
 
-With fewer than `metadata_min_write_replicas` active nodes, namespace/catalogue mutations cannot publish. Nodes may continue serving a persisted/readable snapshot where the operation supports it.
+A node whose peers are all absent, for a minute or for good, keeps reading and writing. Namespace commits, merges, catalogue edits, ingest and deletion are accepted on the node itself; `dht.metadata_write_copies` and `dht.write_copies` are copies sought, and with no peer present a write returns on the one copy it has. `cluster.metadata_availability` stays `writable`. What the node writes alone exists on that node only until a peer is present, when repair delivers it: `diagnostics.metadata.head_holders` counts the nodes present that held the current head at the last repair pass (`head_holders_present` is how many were present), and `diagnostics.prompt_replication.queued` the objects still waiting for their second copy.
 
-Catalogue scanner infrastructure failures are deferred rather than counted as semantic provider failures. An ingest job that meets unwritable metadata (no write floor, or a DATA or CONTROL retention floor not met) goes to `blocked` with `error_code` `metadata_unavailable` and is retried every `ingest.blocked_retry_ms` rather than failing. Once the write floor is available, work resumes.
+Media is readable where a node present holds its extents; the availability survey reports the rest (see [Files and availability](files.md)). A rename, a chmod or an append to a file whose older extents live on an absent node commits. The one refusal is a commit that brings new bytes into the namespace when no node present holds those bytes (`DATA object is held by no node present before metadata publication`); the writer still has them and puts them again.
+
+If the absent nodes wrote too, there are two accepted heads when they return, and they are merged. A second head that cannot be merged with the node's own (no common ancestor is known, or its content cannot be fetched from any node present) is set aside until the membership changes: reads serve the node's own head and writes extend it. `diagnostics.metadata.heads_set_aside` counts them, and each is logged once as `metadata head set aside until membership changes`.
+
+A node not heard of for `maintenance.garbage_grace_ms` (never sooner than twice `network.dead_after_ms`) is dropped from each node's known-node roster and logged as `membership: forgot N node(s) not heard of for the absence horizon`. Gossip that old does not teach it back; if it returns, its own connection does, and its namespace is merged like any other. An identity reset (see [Management](management.md)) removes a node sooner.
+
+`metadata_unavailable` remains for a node with no usable namespace yet, for example one still waiting for its bootstrap peer. Catalogue scanner work meeting it is deferred rather than counted as a semantic provider failure, and an ingest job goes to `blocked` with `error_code` `metadata_unavailable` and is retried every `ingest.blocked_retry_ms` rather than failing.
 
 ## Maintenance
 
@@ -45,16 +51,19 @@ A complete no-progress pass backs off instead of repeatedly scanning a settled s
 
 ## Garbage collection
 
-Reachability from committed metadata is authority. Unreferenced objects are not immediately deleted: they must age past `maintenance.garbage_grace_ms`. This protects failed publications and convergence lag.
+Reachability from committed metadata is authority. The three destructive gates (tombstones, CONTROL, DATA) read this node's own state only: collection is due, the inventory was not rebuilt in this pass, the catalogue's inventory is complete and, for CONTROL and DATA, the node has a sole usable accepted head and an inventory at or past the metadata generation it knows of. No gate waits for another node.
+
+What protects another node's references is time. An object's bytes go only once this node has itself seen the object unreferenced and unclaimed for `maintenance.garbage_grace_ms` (the absence horizon, 30 days by default), measured on its own clock from its own first sighting. The sightings are kept in `<state_path>/retention/unreferenced-data.bin` and `unreferenced-control.bin`, so a restart does not restart the wait, and a node back from a long absence removes nothing before its own grace has run. The same wait protects failed publications and convergence lag.
+
+The cost is stated: if an object is deleted on one side of a separation and still used on the other, and the separation outlasts the horizon, the merged file may have extents nobody holds. The availability survey reports it incomplete.
 
 Namespace deletion and physical reclamation are deliberately separate. Once a
 namespace batch is durably accepted and its operation journal is confirmed, the
 FUSE operation can complete without waiting for DATA objects to be unlinked.
 Physical GC later walks a persistent local-store cursor in slices of at most 64
 objects. A slice yields as soon as playback, mounted-filesystem or loader
-activity appears; destructive work is also fenced on complete cluster reachability,
-stable metadata, catalogue liveness, retention claims, and the configured grace
-period. A completed no-progress sweep parks until a real event or an exact grace
+activity appears; destructive work is also fenced on a sole usable accepted
+head, catalogue liveness, retention claims, and the configured grace period. A completed no-progress sweep parks until a real event or an exact grace
 deadline rather than polling the settled object store.
 
 DATA and CONTROL live sets are separate. Packed dead records become reclaimable bytes and are removed by pack compaction.
@@ -167,15 +176,19 @@ Repeated recovery/catalogue mutation should not produce monotonic namespace-size
 
 ## Diagnostics
 
-`DEBUG` logs show placement, metadata write-floor, catalogue and maintenance state without the per-object volume of `ALL`. `ALL` is intended for targeted tracing and can be expensive on active systems.
+`DEBUG` logs show placement, metadata commit, catalogue and maintenance state without the per-object volume of `ALL`. `ALL` is intended for targeted tracing and can be expensive on active systems.
 
-A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as metadata/control write-floor durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
+A DATA failure should be diagnosed as placement/admission/durability; a metadata failure as metadata/control durability. Keeping those failure domains distinct is intentional and should be preserved in logs and tooling.
 
 `GET /api/v1/status` includes local, process-lifetime aggregate diagnostics
 under `diagnostics`:
 
 - `metadata` reports historical reconstruction/cache totals and accepted-head
-  persistence writes, encoded bytes, and failures;
+  persistence writes, encoded bytes, and failures; `head_holders` (how many of
+  the nodes present held the current head at the last repair pass),
+  `head_holders_present` (how many nodes were present at it) and
+  `heads_set_aside` (accepted heads waiting, unmergeable, for the membership
+  to change);
 - `rpc_server` reports current metadata queue jobs/bytes, active and rejected
   jobs, plus request count, total/max queue wait, and total/max handler time in
   microseconds, grouped by wire message and frame class;
@@ -348,7 +361,7 @@ in its most load-bearing form: the durability contract treats "present after a
 restart" as durable, justified by the store's pack validation on open plus an
 explicit flush inside the probe.
 
-A publication proves that its extents reached the write floor with placement
+A publication proves that its extents are durably held with placement
 tokens: `(node, durability epoch, domain, generation, backend instance)`. The
 epoch is fresh for every process and the backend instance for every reopen,
 so a token can only be *checked* by the incarnation that issued it. A token
@@ -390,9 +403,8 @@ The shape rules:
   is a legitimate cluster) with a warning: those extents are reachable from
   inbound-capable peers only.
 - Two nodes that both accept no inbound connections never need a path to
-  each other. Metadata reaches both through the capable replicas, and the
-  destructive-GC fence (`all_known_reachable`) excludes such pairs rather than
-  counting them as a fault.
+  each other. Metadata reaches both through the capable replicas, and such a
+  pair is not counted as a fault.
 - Nodes exchange traffic only over direct connections, so a cluster needs
   an inbound-capable storage node. One without is refused: a founding node
   with `inbound_capable: false`, or a joining node whose every bootstrap peer
@@ -474,11 +486,11 @@ membership plus the telemetry already disseminated over authenticated cluster
 connections; the HTTP request never calls peers, and clients do not need to
 fan out. Per-node status reports authoritative membership endpoint/storage
 fields and enriches them with telemetry when available. Metadata availability
-is owned and published by `MetadataManager` as exactly `unavailable`,
-`read-only`, or `writable`; Status consumes that state and may demote a
-previously writable view immediately if fewer than
-`metadata_min_write_replicas` active replicas remain, but never promotes to
-writable merely from peer connectivity.
+(`cluster.metadata_availability`) is `writable` whenever the node has a head,
+whatever peers are present; `read-only` while a committed snapshot can be read
+but the node has no usable head to write on; and `unavailable` otherwise.
+`cluster.metadata_min_write_replicas` and `cluster.metadata_quorum_required`
+carry the configured `dht.metadata_write_copies`.
 
 A telemetry sample only feeds `storage`/`cache`/`runtime` figures once it is
 both fresh (within the freshness window) and self-reported `ready`; a stale
@@ -494,7 +506,7 @@ storage is ready — from briefly looking like real data loss in the cluster
 aggregate; `cluster.conditions` reports "one or more online nodes are still
 recovering" for that window instead.
 
-Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=read-only reason="metadata write durability floor available"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
+Metadata availability logging is transition-only and canonical, for example `metadata availability changed state=writable previous=unavailable reason="local metadata state ready"`. Routine negative checkpoint acknowledgements are silent because they are normal convergence decisions; transport/checkpoint exceptions remain diagnostic.
 
 `POST /api/v1/status/connectivity/check` and the node-specific equivalent perform diagnostic connectivity checks without changing cluster configuration. State-changing administrative operations belong under `/api/v1/manage`.
 
@@ -573,7 +585,7 @@ It is offline and deliberate. Stop every node, let them converge on one head
 first, then run it on each node: the new record is a pure function of the
 converged namespace, so every node computes the same one independently.
 `--expect-hash` makes a node refuse any record other than the one the first
-node produced, `--witness NODE_ID` (once per node, at least the write floor)
+node produced, `--witness NODE_ID` (once per node)
 names the nodes being re-rooted, `--adopt FILE` installs a record written by
 `--export-record` on the node migrated first (for a node that stopped a few
 commits behind it, after proving this node's namespace produces the same tree
@@ -581,10 +593,5 @@ root), and `--dry-run` installs nothing. The previous checkpoint, journal, histo
 acceptance proof are kept beside the originals with a `.pre-migration.<ns>`
 suffix rather than deleted; no extent is touched.
 
-The installed head carries no retention baseline. Once the nodes are started
-and every node the namespace knows (each that has a status or a mutation in
-it, and each active peer) holds that head, metadata repair commits the
-baseline, claiming every tree node and extent the namespace reaches. A
-baseline whose claims cannot be placed at the retention floors is refused and
-retried. The namespace is served and written meanwhile; destructive GC stays
-off until the baseline is committed.
+Once the nodes are started the namespace is served and written from the
+installed head.

@@ -132,8 +132,8 @@ The metadata store has an independent limit and never consumes DATA quota.
 ```yaml
 dht:
   replicas: 1
-  metadata_min_write_replicas: 2
-  min_write_replicas: 1
+  metadata_write_copies: 2
+  write_copies: 1
   write_stall_ms: 2500
   extent_size: 4M
   data_inflight_bytes: 128M
@@ -147,9 +147,9 @@ dht:
 ```
 
 - `replicas`: desired converged authoritative DATA copies.
-- `min_write_replicas`: durable DATA copies required before foreground publication; must be `<= replicas`.
-- `metadata_min_write_replicas`: minimum distinct active nodes that must durably accept a namespace/control mutation before publication. Every node is metadata-capable; this is a write durability floor, not a convergence target. `metadata_replicas` is accepted as an alias and translated to the majority of the count it gives; the two keys are mutually exclusive.
-- `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted.
+- `write_copies`: durable DATA copies sought before a write returns (default 1); must be `<= replicas`. With that many nodes present and answering, the write is on that many when it returns; with fewer, or once no further node can take a copy promptly, it returns on the copies it has and repair delivers the rest.
+- `metadata_write_copies`: copies of a namespace/control mutation sought before the write returns (default 2), on the same terms. Every node is metadata-capable and any node accepts a write on its own: nothing is refused for lack of peers, and a single node keeps reading and writing. It is not a convergence target; repair delivers every commit to every node. Changing it requires a restart.
+- `write_stall_ms`: how long a stalled preferred DATA placement may block before deterministic fallback is attempted. A peer that stalls past it is not waited for once one copy has landed.
 - `extent_size`: maximum ordinary file extent size, `1M`..`64M`, default `16M` (the examples here use `4M`). It is fixed once a namespace exists; live reload refuses a change. It is unrelated to small-object pack allocation.
 - `data_inflight_bytes`: node-wide byte budget for blocking DATA object reads, writes, and transfers.
 - `data_viewer_reserve_bytes`: non-borrowable headroom inside that budget for foreground playback and read-ahead. Loader and speculative work remain work-conserving within the rest of the budget, but cannot consume this reserve. It must be smaller than `data_inflight_bytes`, and the difference must fit at least one `extent_size` object.
@@ -188,7 +188,7 @@ viewer is present, meaning a viewer read within
 percentage must be below the slowdown percentage, the two expectation budgets
 cannot both be zero, and `io_pressure_min_background` must be at least 1.
 
-Replica policy should be identical across the cluster and changed as a coordinated cluster operation. `metadata_min_write_replicas: 2` means any two active nodes, not two preselected nodes.
+`metadata_write_copies: 2` means any two nodes present, not two preselected nodes. Nodes configured with different `write_copies` or `metadata_write_copies` share one namespace.
 
 ## Network
 
@@ -437,8 +437,10 @@ window to catch; `0` disables it), it is **parked**: its
 bytes stay in the spool and journal, it leaves the loader queue, the daemon
 logs one `WARN` line, `diagnostics.filesystem.parked_publications` counts it,
 and `GET /api/v1/manage/filesystem/parked-publications` lists it with the
-last error, attempt count and how long it has been failing. An operator
-resolves it with `POST .../parked-publications/<inode>/retry` (fresh budget)
+last error, attempt count and how long it has been failing. A parked file is
+tried again, with a fresh budget, whenever cluster membership changes or a
+storage backend comes or goes. An operator can also resolve it with
+`POST .../parked-publications/<inode>/retry` (fresh budget)
 or `POST .../parked-publications/<inode>/abandon` (drops the unpublished
 generation, exactly as a corrupt spool record would be dropped). Parking is
 never applied to definitive failures — those are handled at once — nor to the
@@ -612,7 +614,7 @@ maintenance:
   scrub_fraction: 0.02
   scrub_interval_ms: 2592000000
   no_progress_backoff_ms: 300000
-  garbage_grace_ms: 86400000
+  garbage_grace_ms: 2592000000
 ```
 
 `background_concurrency` is the node's background effort ceiling: how many loader or speculative DATA operations (publication and repair, one extent each) may hold an admission lease at once. `0` means half the hardware threads, minimum 1. It counts work on this node's own disk: sending an extent to a peer or fetching one from it holds no slot here, and the peer admits it against its own ceiling. Viewer work is never counted, so playback and read-ahead are unaffected; what it bounds is how much CPU (hashing, encryption) and I/O the node spends on its own import and repair traffic at once. The status API reports the ceiling and its use as `data_resources.background_limit` / `background_active` / `peak_background_active`.
@@ -620,7 +622,9 @@ maintenance:
 
 Maintenance performs DATA repair/rebalance/GC/scrub and catalogue control convergence/GC. Foreground media and mounted MachaDFS activity take priority.
 
-**A new object's second copy is sent at once, but only where there is room.** Each object written to a single node is pushed straight to another placement owner by prompt replication, ahead of repair. It skips an owner whose gossiped storage has less than an extent free, and gives up on an object after five refused sends (30 s doubling to 4 min), leaving it to repair. `diagnostics.prompt_replication` in `GET /api/v1/status/diagnostics` counts `copies`, `failures`, `skipped_no_room`, `dropped` and `queued`.
+`garbage_grace_ms` is the absence horizon (30 days by default). A node removes an object's bytes only once it has itself seen the object unreferenced and unclaimed for this long, on its own clock, so a node may be away this long and still find what its branch refers to. A node not heard of for this long (and never sooner than twice `network.dead_after_ms`) is dropped from the known-node roster. Retirement tombstones are pruned after it.
+
+**A new object's second copy is sent at once, but only where there is room.** Each object written to a single node is pushed straight to another placement owner by prompt replication, ahead of repair. It skips an owner whose gossiped storage has less than an extent free, and gives up on an object after five refused sends (30 s doubling to 4 min), leaving it to repair. `diagnostics.prompt_replication` in `GET /api/v1/status/diagnostics` counts `copies`, `failures`, `skipped_no_room` and `dropped`; `queued` is the number of objects still waiting for their second copy.
 
 **Replica repair is paced, never stopped.** While any higher class is busy -- a viewer, mounted reads, or the loader (ingest, torrents, FUSE publication) -- repair runs in bounded turns followed by a proportional cooldown, receiving `repair_weight` time for every `foreground_weight` of theirs (95:5 by default, the same duty-cycle form as `fuse.viewer_weight`/`loader_weight`). When nothing else is busy it runs unrestricted within `idle_bandwidth_fraction`. Its turns end between operations: an extent already in flight completes and is kept. Both weights must be 1..10000; zero is refused, because a repair that stops while the node is busy never restores a copy on a node that is always busy, and a lost copy is lost data (law 4).
 

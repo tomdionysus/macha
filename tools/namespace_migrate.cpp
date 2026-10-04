@@ -11,8 +11,7 @@
 // Destructive and offline. It quarantines the checkpoint, journal, history,
 // heads and acceptance proof under a timestamped suffix and installs a head
 // with no ancestry. No extent is touched: paths, stat fields and ObjectIds are
-// copied unchanged. The head carries no retention baseline, so the cluster's
-// first repair claims the tree before destructive GC resumes.
+// copied unchanged.
 //
 // Run it on every node, all stopped and converged. The tree's shape depends on
 // the entry set alone, so every node computes the same root independently;
@@ -56,7 +55,7 @@ struct Options {
               << "  --expect-hash <hex>  refuse to install any other record\n"
               << "  --witness <node-id>  a node being re-rooted onto this record; repeat\n"
               << "                       once per node. Defaults to the nodes this one\n"
-              << "                       has seen. At least as many as the write floor.\n"
+              << "                       has seen.\n"
               << "  --export-record <p>  write the computed record to a file\n"
               << "  --adopt <p>           install THAT record instead of this node's own,\n"
               << "                       after proving this node's namespace produces the\n"

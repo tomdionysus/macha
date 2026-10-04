@@ -2102,6 +2102,10 @@ size_t DistributedStore::replicate_control(const ObjectId& id,
     return success;
 }
 
+uint64_t DistributedStore::reachability_epoch() const noexcept {
+    return (events_.count(NodeEvent::topology) << 8) + local_.data().online_backends();
+}
+
 bool DistributedStore::locally_available(const ObjectId& id) const {
     return local_.data().has(id) || local_.cache().has(id);
 }

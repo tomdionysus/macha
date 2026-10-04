@@ -96,17 +96,19 @@ Three explicit storage classes, with separate durability rules:
   Placed by the DHT across eligible node/backend capacity; a full preferred
   owner falls through to the next deterministic candidate.
 - **CONTROL/METADATA** — namespace metadata and catalogue manifests/shards.
-  Dedicated priority storage and an any-node write durability floor, so
+  Dedicated priority storage, and any node accepts a write on its own, so
   ordinary DATA quota can never block them.
 - **CACHE** — opportunistic, non-authoritative copies. Cache contents never
   satisfy DATA or metadata durability.
 
-Every known node is metadata-capable and counts equally towards the metadata
-write floor.
-`dht.min_write_replicas` is the foreground DATA publication floor,
-`dht.replicas` the desired converged replica count, and
-`dht.metadata_min_write_replicas` the independent floor for publishing a
-namespace or control mutation. Divergent metadata heads are reconciled
+Every known node is metadata-capable and any node accepts a write on its own:
+a single node, or the survivor of any number of losses, keeps reading and
+writing. `dht.replicas` is the DATA copy count repair converges to.
+`dht.write_copies` and `dht.metadata_write_copies` are the copies sought
+before a write returns, of a DATA object and of a namespace or control
+mutation: with that many nodes present and answering, the write is on that
+many when it returns; with fewer, it returns on the copies it has and repair
+delivers the rest. Divergent metadata heads are reconciled
 automatically, non-conflicting namespace changes are merged, and incompatible
 alternatives are preserved as durable conflicts rather than silently picking a
 winner.
