@@ -566,7 +566,9 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 try {
                     profile = resolve_media_profile_(media_id);
                 } catch (const MediaEngineUnavailable& e) {
-                    return error(503, "media_engine_unavailable", e.what());
+                    // Not here, as for media this node has no file of: another
+                    // node may have an engine or the profile.
+                    return error(404, "media_engine_unavailable", e.what());
                 } catch (const MediaError& e) {
                     // Report the failure kind: an unreadable source may be fine elsewhere; an
                     // unparseable one is unparseable everywhere.
