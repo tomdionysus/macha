@@ -1157,20 +1157,17 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
         });
         REQUIRE(wait_until([&] { return s2.node().peer_viewers_active(3000ms); }));
         const auto share_before = s2.repair_diagnostics().gate_share;
-        // The latest pass says repair was held to its share, and by whom.
-        REQUIRE(wait_until([&] {
-            const auto repair = s2.repair_diagnostics();
-            return repair.last_gate == DistributedStore::RepairGate::share &&
-                   repair.paced_by == DistributedStore::paced_by_peer_playback;
-        }, 5s));
         const auto [id, bytes] = lose_a_copy(1);
         const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
         const auto share_after = s2.repair_diagnostics().gate_share;
+        // The passes that restored it ran with the peer's viewer active.
+        const auto paced_by = s2.repair_diagnostics().paced_by;
         watching = false;
         viewer.join();
         REQUIRE(restored);
         CHECK(*s2.local_state().data().get(id) == bytes);
         CHECK(share_after > share_before);
+        CHECK((paced_by & DistributedStore::paced_by_peer_playback));
     }
 
     // This node's loader, active throughout.
@@ -1184,14 +1181,10 @@ MACHA_TEST("rpc_cluster", test_repair_is_paced_not_stopped_while_higher_classes_
     REQUIRE(wait_until([&] {
         return s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet;
     }, 5s));
-    REQUIRE(wait_until([&] {
-        const auto repair = s2.repair_diagnostics();
-        return repair.last_gate == DistributedStore::RepairGate::share &&
-               (repair.paced_by & DistributedStore::paced_by_loader);
-    }, 5s));
     const auto [id, bytes] = lose_a_copy(2);
     const bool restored = wait_until([&] { return s2.local_state().data().valid(id); }, 10s);
     CHECK(s2.resources().activity.idle_for(FrameType::loader) < c2.maintenance.foreground_quiet);
+    CHECK((s2.repair_diagnostics().paced_by & DistributedStore::paced_by_loader));
     loading = false;
     loader.join();
     REQUIRE(restored);

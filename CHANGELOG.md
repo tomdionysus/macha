@@ -12,11 +12,11 @@ role) answers `{"status":"ok","tracks":[...]}`, each track with
 `title` may be null. It shares the node's one-request-a-second MusicBrainz
 gate, where a request waits its turn. See `docs/management.md`.
 
-**What the latest maintenance pass did with repair.** Each node's status
-gains `diagnostics.repair.pace` (`running`, `paced`, `settling`,
-`awaiting_credit`, `unknown`) and `paced_by` (`playback`,
-`mounted_filesystem`, `loader`, `peer_playback`; empty unless `paced`).
-See `docs/operations.md`.
+**Whether repair is being paced.** Each node's status gains
+`diagnostics.repair.paced_by`, the higher classes active at the latest
+maintenance pass (`playback`, `mounted_filesystem`, `loader`,
+`peer_playback`), and `pace`: `paced` while any is, otherwise `running`,
+`settling`, `awaiting_credit` or `unknown`. See `docs/operations.md`.
 
 **The durability batch window is passed from the root** as a constructor
 parameter (500 ms, as before); it has no configuration key.

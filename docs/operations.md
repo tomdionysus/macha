@@ -189,15 +189,14 @@ under `diagnostics`:
   speculative), the background lease ceiling and its use, and the disk
   pressure monitor (below);
 - `repair` reports objects repair could not source from any peer and local
-  copies that could not be read, and what the latest maintenance pass did
-  with repair: `pace` is `running`, `paced` (a higher class was active, so
-  repair took only its share), `settling` (the quiet period after such
-  activity), `awaiting_credit` (its transfer credit does not yet cover an
-  extent) or `unknown` (no pass yet). When `paced`, `paced_by` lists the
-  active classes: `playback`, `mounted_filesystem`, `loader`,
-  `peer_playback` (a viewer on another node, whose links repair shares);
-  otherwise it is empty. These are this node's own; each node answers for
-  itself; and
+  copies that could not be read, and how repair stood at the latest
+  maintenance pass. `paced_by` lists the higher classes active then:
+  `playback`, `mounted_filesystem`, `loader`, `peer_playback` (a viewer on
+  another node, whose links repair shares). While any is, repair takes
+  turns on its share and `pace` is `paced`. With none, `pace` is `running`,
+  `settling` (the quiet period after such activity), `awaiting_credit` (its
+  transfer credit does not yet cover an extent) or `unknown` (no pass yet).
+  These are this node's own; each node answers for itself; and
 - `data_store` reports local store presence-index and pack-recovery counters.
 
 `rpc_transport`, `retained_memory`, `http` and `auth` sit beside them.
