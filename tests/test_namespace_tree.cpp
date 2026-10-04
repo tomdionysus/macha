@@ -1113,6 +1113,7 @@ MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
     base.metadata_write_replicas_required = 1;
     base.entries = library(10, 8);
     size_t conflicts = 0, clean = 0;
+    uint64_t delta_bytes = 0, full_bytes = 0;
     for (int round = 0; round < 40; ++round) {
         auto left = base;
         auto right = base;
@@ -1146,6 +1147,23 @@ MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
         if (root != expected_root)
             break;
 
+        // The same commit as a delta: applied to the primary parent, as a
+        // replica would, it gives the merge's snapshot byte for byte.
+        const auto& primary_map = left_head < right_head ? left : right;
+        const auto primary = detach_namespace(primary_map, store);
+        CHECK(merge.onto == *primary.namespace_root);
+        merged_tree.merge_parents = {left_head < right_head ? right_head : left_head};
+        const auto delta = tree_merge_delta(primary, merged_tree, merge.changes);
+        REQUIRE(delta.has_value());
+        const auto replayed = apply_metadata_delta(
+            primary, decode_metadata_delta(encode_metadata_delta(*delta)),
+            [&](const ObjectId& tree, const MetadataDelta& applied) {
+                return apply_delta_to_namespace_tree(tree, store, applied);
+            });
+        CHECK(encode_snapshot_v14(replayed) == encode_snapshot_v14(merged_tree));
+        delta_bytes += encode_metadata_delta(*delta).size();
+        full_bytes += encode_snapshot_v14(merged_tree).size();
+
         (expected.snapshot.conflicts.empty() ? clean : conflicts) += 1;
         base = expected.snapshot;
         base.merge_parents.clear();
@@ -1153,6 +1171,7 @@ MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
     // The rounds reached both outcomes.
     CHECK(conflicts > 5);
     CHECK(clean > 0);
+    CHECK(delta_bytes < full_bytes);
 
     // One head twice is that head.
     MemoryNamespaceNodeStore store;
