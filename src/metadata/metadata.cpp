@@ -4560,18 +4560,15 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
     load_checkpoint_proof();
 
     // The record must be an accepted head or the node refuses to serve. The
-    // certificate carries the record's write floor (a required=0 certificate
-    // would be refused by acceptance_matches_record_policy_locked), witnessed
-    // by the operator-named nodes being re-rooted onto this record: the record
-    // is a pure function of the converged head, and `--expect-hash` proves
-    // each node computed the same one. Fewer witnesses than the floor is
-    // refused: the cluster could never accept that record.
+    // certificate names the operator-named nodes being re-rooted onto this
+    // record: the record is a pure function of the converged head, and
+    // `--expect-hash` proves each node computed the same one. It needs at
+    // least one witness (a required=0 certificate would be refused by
+    // acceptance_matches_record_policy_locked).
     accepted_heads_.clear();
-    const auto migrated_snapshot = decode_snapshot(record.payload);
     MetadataAcceptance accepted;
     accepted.generation = record.generation;
     accepted.hash = record.hash;
-    accepted.required = migrated_snapshot.metadata_write_replicas_required;
     accepted.replicas = witnesses;
     std::sort(accepted.replicas.begin(), accepted.replicas.end());
     accepted.replicas.erase(std::unique(accepted.replicas.begin(), accepted.replicas.end()),
@@ -4581,13 +4578,11 @@ bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
         Log::error("metadata migration refused: a witness is the empty node id");
         return false;
     }
-    if (accepted.replicas.size() < accepted.required) {
-        Log::error("metadata migration refused: " + std::to_string(accepted.replicas.size()) +
-                   " witnesses named against a write floor of " +
-                   std::to_string(accepted.required) +
-                   "; this record could never be accepted by the cluster it describes");
+    if (accepted.replicas.empty()) {
+        Log::error("metadata migration refused: no witness named");
         return false;
     }
+    accepted.required = static_cast<uint32_t>(accepted.replicas.size());
     accepted_heads_.emplace(accepted.hash, accepted);
     persist_heads_locked();
 

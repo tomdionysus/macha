@@ -108,7 +108,9 @@ A FUSE write whose publication keeps failing transiently is retried with
 exponential backoff and, once it exhausts its retry budget (see
 `fuse.publication_retry_*` in the configuration guide), is parked: its bytes
 stay in the spool and journal and it leaves the loader queue so the rest of
-the cluster keeps publishing.
+the cluster keeps publishing. It is tried again by itself whenever cluster
+membership changes or a storage backend comes or goes; the routes below act
+on it sooner.
 
 - `GET /api/v1/manage/filesystem/parked-publications` → `{"parked": [{inode, path, error_code, error_message, attempts, failing_for_ms, parked_for_ms, pending_bytes}]}`
 - `POST /api/v1/manage/filesystem/parked-publications/{inode}/retry` — reset the retry budget and re-queue the publication (`204`; `409 not_parked` if that inode is not parked).

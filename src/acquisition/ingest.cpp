@@ -1240,9 +1240,9 @@ void IngestManager::process_job(const std::string& id, std::stop_token stop) {
             }
             return;
         }
-        // Unwritable metadata (no quorum, retention floor unmet) is a cluster
-        // condition: the job blocks as metadata_unavailable and retries after
-        // blocked_retry.
+        // Metadata that cannot be written now (no namespace yet, or the bytes
+        // a commit brings in are held by no node present): the job blocks as
+        // metadata_unavailable and retries after blocked_retry.
         if (dynamic_cast<const MetadataNotReady*>(&e)) {
             // Said once when the job blocks, not on every retry.
             const auto line = "ingest blocked id=" + id + ": " + e.what() + "; retrying";

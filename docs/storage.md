@@ -6,11 +6,11 @@ Macha has three storage classes with different correctness rules.
 
 ### DATA
 
-DATA contains immutable payload objects: media extents, catalogue artwork, subtitles and similar blobs. A DATA object is addressed by SHA-256 of its plaintext. DATA is distributed by capacity-aware deterministic placement and governed by `dht.replicas` / `dht.min_write_replicas`.
+DATA contains immutable payload objects: media extents, catalogue artwork, subtitles and similar blobs. A DATA object is addressed by SHA-256 of its plaintext. DATA is distributed by capacity-aware deterministic placement and governed by `dht.replicas` / `dht.write_copies`.
 
 ### CONTROL / metadata
 
-Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards must satisfy `dht.metadata_min_write_replicas` distinct active durable copies before publication, and every active node counts equally towards that floor.
+Namespace metadata and content-addressed catalogue control objects are control-plane authority. On a namespace re-rooted onto the Merkle tree, the tree's branch, leaf and extent-spine nodes are control objects too, and the metadata record carries only the root (see [Metadata](metadata.md)). Every node stores metadata/control authority. Namespace mutations and catalogue manifests/shards are valid once the committing node durably holds them; `dht.metadata_write_copies` is the number of copies sought before the write returns, and every active node is equally eligible to take one.
 
 CONTROL storage does not consume DATA quota.
 
@@ -69,26 +69,28 @@ For example:
 node A DATA limit:   1 GiB
 node B DATA limit:   2 TiB
 replicas:            1
-min_write_replicas:  1
+write_copies:        1
 ```
 
 The logical DATA capacity is approximately the aggregate eligible capacity, subject to reserves/overhead. Once A cannot admit an object, placement can fall through to B. No rule requires every object to fit on A.
 
-## Publication floor and convergence target
+## Write copies and convergence target
 
 Two settings intentionally mean different things:
 
 ```yaml
 dht:
   replicas: 3
-  min_write_replicas: 1
+  write_copies: 1
 ```
 
-These are the defaults. `min_write_replicas` is the number of durable authoritative DATA copies required before foreground publication, and the number of nodes that must hold a retention claim on each DATA object before metadata may reference it. `replicas` is the desired converged replica count.
+These are the defaults. `write_copies` is the number of durable authoritative DATA copies sought before a write returns. `replicas` is the desired converged replica count.
 
-Thus an R=3/W=1 write may publish after one durable copy during a degraded topology. That object is under-replicated, not falsely considered converged. Maintenance repair creates the missing preferred replicas when eligible nodes/capacity return.
+Thus a write with `replicas: 3` and `write_copies: 1` returns after one durable copy. That object is under-replicated, not falsely considered converged. Prompt replication sends its second copy at once and maintenance repair creates the remaining preferred replicas when eligible nodes/capacity are present.
 
-If `min_write_replicas: 2`, publication requires two durable placements; a two-copy policy can legitimately reduce writable capacity when only two suitable stores exist. That is explicit policy rather than an accidental consequence of cluster size.
+With `write_copies: 2`, a write is on two nodes when it returns, provided two nodes are present and answering. With fewer, or once no further node can take a copy promptly, it returns on the copies that landed and repair delivers the rest; a peer that stalls past `dht.write_stall_ms` is not waited for once one copy has landed. A write is never refused for lack of peers.
+
+Metadata may reference a new DATA object once a node present holds it, and its retention claim is placed on the holders present. A commit that brings in new bytes no node present holds is refused; the writer still has them and puts them again.
 
 ## Local backend selection
 
@@ -155,7 +157,7 @@ The control-store `limit` is a safety ceiling, not a DATA budget. Operators shou
 
 Catalogue structure consists of 64 content-addressed shards plus a small manifest root. Those objects are CONTROL. Artwork bytes are DATA.
 
-A catalogue commit cannot reference a new manifest/shard until that control object is durable on `metadata_min_write_replicas` active nodes. After commit, maintenance converges current control objects onto every active node. Missing extra copies are convergence debt, not grounds for copying artwork everywhere.
+A catalogue commit cannot reference a new manifest/shard until that control object is durable on the committing node; copies on `metadata_write_copies` nodes are sought from those present. After commit, maintenance converges current control objects onto every active node. Missing extra copies are convergence debt, not grounds for copying artwork everywhere.
 
 ## Reads
 
@@ -167,7 +169,9 @@ The cache may retain a useful fetched copy independently, but that cache copy do
 
 Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards, and every namespace tree node reachable from a tree-backed root, contribute to a separate CONTROL live set, both in the maintenance inventory the collector sweeps against and in the release horizon claims are released against. A tree node that cannot be read leaves the inventory unbuilt and the release horizon incomplete, so nothing is collected or released against a partial set.
 
-Objects that become unreachable are protected for `maintenance.garbage_grace_ms` before physical reclamation. This protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
+Collection reads this node's own state only: it waits for no other node. What protects another node's references is time. An object's bytes go only once this node has itself seen the object unreferenced and unclaimed for `maintenance.garbage_grace_ms` (the absence horizon, 30 days by default), measured on its own clock from its own first sighting. The sightings are kept in `<state_path>/retention/unreferenced-data.bin` and `unreferenced-control.bin`, so a restart does not restart the wait, and a node back from a long absence removes nothing before its own grace has run. This also protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
+
+The cost is stated: if an object is deleted on one side of a separation and still used on the other, and the separation outlasts the horizon, the merged file may have extents nobody holds. The availability survey reports such a file as incomplete (see [Files and availability](files.md)).
 
 Packed logical deletion does not rewrite neighboring live objects immediately; dead bytes are reclaimed later by pack compaction.
 

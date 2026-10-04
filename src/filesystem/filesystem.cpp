@@ -2115,6 +2115,10 @@ std::shared_ptr<ReadHandle> FileSystem::open_read(const FsEntry& entry, const st
     return std::make_shared<ReadHandle>(s_, entry, track_playback ? playback_ : nullptr,
                                         normalize_path(logical_path), frame_type);
 }
+uint64_t FileSystem::reachability_epoch() const noexcept {
+    return s_.reachability_epoch();
+}
+
 std::shared_ptr<PublicationWriter> FileSystem::open_publication(const std::string& path,
                                                                bool cache_puts,
                                                                uint64_t pipeline_bytes,

@@ -9,8 +9,8 @@ For a straightforward highly available setup, use this policy on every node:
 ```yaml
 dht:
   replicas: 2
-  min_write_replicas: 2
-  metadata_min_write_replicas: 2
+  write_copies: 2
+  metadata_write_copies: 2
 
 network:
   advertise: 10.0.0.11       # this node's reachable address
@@ -28,10 +28,11 @@ and cluster key the same everywhere.
 
 - `replicas: 2` asks Macha to keep two authoritative copies of each DATA
   object. It does not copy the whole library onto every node.
-- `min_write_replicas: 2` means new file data is not published until both
-  copies are durable.
-- `metadata_min_write_replicas: 2` protects namespace and catalogue changes on
-  two active nodes. With three nodes, any available pair can continue writing.
+- `write_copies: 2` means new file data is on two nodes when the write
+  returns, whenever two nodes are present to take it.
+- `metadata_write_copies: 2` does the same for namespace and catalogue
+  changes. With fewer nodes present, a write returns on the copies it has and
+  repair delivers the rest; nothing is refused for lack of peers.
 - `failure_domain` tells Macha which nodes share a likely outage. Nodes on the
   same power supply, disk shelf, host, or site should normally use the same
   value. Placement prefers copies in different domains.
@@ -59,9 +60,9 @@ uses the same cluster key.
 - A cache is convenient but is not an authoritative replica.
 - Enough free capacity must remain in at least two suitable domains for repair
   and continued writes.
-- If fewer than two nodes remain, persisted media may still be readable where
-  a copy is reachable, but new DATA or metadata publication will wait for the
-  configured durability floor.
+- If only one node remains, it keeps reading and writing. Media is readable
+  where a copy is reachable, and what the node writes alone exists on that
+  node only until a peer is present to take a copy.
 - After adding or returning a node, leave the cluster online long enough for
   placement repair to settle before deliberately removing another node.
 

@@ -150,8 +150,12 @@ class InterposedTarget final : public PublicationTarget {
     // Given the bytes the writer has taken, after each write.
     std::function<void(uint64_t written)> after_write;
     std::function<void(const std::string& path)> after_commit;
+    // What reachability_epoch() answers; a test advances it.
+    std::atomic_uint64_t reachability{};
 
     explicit InterposedTarget(PublicationTarget& real) : real_(real) {}
+
+    uint64_t reachability_epoch() const noexcept override { return reachability.load(); }
 
     std::shared_ptr<PublicationWriter> open_publication(const std::string& path, bool cache_puts,
                                                         uint64_t pipeline_bytes,
@@ -1925,16 +1929,16 @@ MACHA_TEST("filesystem_fuse", test_fuse_admission_backpressure) {
     }
 }
 
-// Publication failures over one node, whose target fails every attempt as an
-// unreachable write floor does: a long failure run is reported, then the file
-// is parked for the operator, who may retry or abandon it; a recovered write
+// Publication failures over one node, whose target fails every attempt: a
+// long failure run is reported, then the file is parked until membership or
+// storage changes or the operator retries or abandons it; a recovered write
 // whose path has left the namespace fails once and is not readmitted.
 MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) {
     FilesystemNode node("fuse-publication-failures");
     auto& fs = node.fs();
     InterposedTarget failing(fs);
     failing.before_open = [](const std::string&) {
-        throw FsError(EIO, "metadata write durability floor unavailable");
+        throw FsError(EIO, "no storage backend is online");
     };
 
     // Crossing the escalation threshold (10 failures) is counted once for the
@@ -1965,6 +1969,7 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) 
         auto fuse = node.fuse("park");
         fuse.commit_workers = 1;
         fuse.publication_retry = RetryPolicy{3, 60s, 5ms, 20ms};
+        fuse.parked_recheck = 10ms;
         auto frontend = node.frontend(fuse, failing);
         auto handle = frontend->create("/parked.bin", 0644, getuid(), getgid(), true, true, false);
         const auto payload = pattern(64 * 1024 + 3, 44);
@@ -1993,6 +1998,19 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_failures_back_off_and_park) 
         CHECK(frontend->diagnostics().parked_publications == 0);
         REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
         CHECK(frontend->status().backend_failures > failures_at_park);
+
+        // A membership or storage change tries it again with a fresh budget,
+        // with nobody asking; with no change it stays parked.
+        const auto failures_at_second_park = frontend->status().backend_failures;
+        REQUIRE(frontend->wait_for_idle(5s));
+        ++failing.reachability;
+        REQUIRE(wait_until(
+            [&] { return frontend->status().backend_failures >= failures_at_second_park + 4; },
+            10s));
+        REQUIRE(wait_until([&] { return frontend->diagnostics().parked_publications == 1; }, 10s));
+        const auto failures_at_third_park = frontend->status().backend_failures;
+        std::this_thread::sleep_for(100ms);
+        CHECK(frontend->status().backend_failures == failures_at_third_park);
 
         CHECK(!frontend->retry_parked_publication(handle.inode + 1000));
         REQUIRE(frontend->abandon_parked_publication(handle.inode));
@@ -3516,7 +3534,7 @@ MACHA_TEST("filesystem_fuse", test_management_api_reports_and_acts_on_fuse_state
 
         InterposedTarget failing(service.filesystem());
         failing.before_open = [](const std::string&) {
-            throw FsError(EIO, "metadata write durability floor unavailable");
+            throw FsError(EIO, "no storage backend is online");
         };
         auto fuse = fuse_config("parked");
         fuse.commit_workers = 1;

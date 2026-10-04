@@ -402,6 +402,8 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     uint64_t take_foreground_bytes() { return activity_.take_bytes(FrameType::foreground); }
     uint64_t take_interactive_bytes() { return activity_.take_bytes(FrameType::read_ahead); }
     uint64_t take_loader_bytes() { return activity_.take_bytes(FrameType::loader); }
+    // Advances when membership changes or a storage backend comes or goes.
+    uint64_t reachability_epoch() const noexcept;
     std::chrono::milliseconds foreground_idle_for() const;
     std::chrono::milliseconds interactive_idle_for() const {
         return activity_.idle_for(FrameType::read_ahead);

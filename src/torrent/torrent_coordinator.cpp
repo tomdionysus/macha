@@ -220,7 +220,8 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
     const auto self = node_.node_id();
     if (pin && *pin == NodeId{}) pin.reset();
     if (pin) {
-        const bool member = std::any_of(node_.membership().active().begin(), node_.membership().active().end(),
+        const auto active = node_.membership().active();
+        const bool member = std::any_of(active.begin(), active.end(),
                                         [&](const NodeInfo& n) { return n.id == *pin; }) ||
                             *pin == self;
         if (!member) {
@@ -855,6 +856,14 @@ void TorrentCoordinator::pass() {
     const auto is_active = [&](const NodeId& id) {
         return id == self || std::any_of(active.begin(), active.end(), [&](const NodeInfo& n) { return n.id == id; });
     };
+    // A pin holds only while the node it names is still known: once the node
+    // is forgotten, any node may take the request.
+    const auto known = node_.membership().all();
+    const auto pinned_elsewhere = [&](const TorrentRequest& r) {
+        return r.pinned_node_id && *r.pinned_node_id != self &&
+               std::any_of(known.begin(), known.end(),
+                           [&](const NodeInfo& n) { return n.id == *r.pinned_node_id; });
+    };
     {
         Lock lock(mutex_);
         std::set<NodeId> claimants;
@@ -938,7 +947,7 @@ void TorrentCoordinator::pass() {
             }
             if (local && r.desired == TorrentDesired::active &&
                 (r.phase == TorrentPhase::awaiting_node || (!torrent_phase_terminal(r.phase) && lapsed(r))) &&
-                (!r.pinned_node_id || *r.pinned_node_id == self))
+                !pinned_elsewhere(r))
                 claimable.push_back(&r);
             else {
                 Lock lock(mutex_);
@@ -1023,10 +1032,13 @@ void TorrentCoordinator::pass() {
         });
         for (const auto* r : claimable) {
             if (!offer.accepting) break;
+            // Claimable means unpinned, pinned here, or pinned to a node now
+            // forgotten, whose pin no longer restricts anything.
+            const bool pinned_here = r->pinned_node_id && *r->pinned_node_id == self;
             std::vector<std::pair<uint64_t, NodeId>> ranked;
             for (const auto& node : nodes)
                 if (node.reachable && node.offer.accepting &&
-                    (!r->pinned_node_id || *r->pinned_node_id == node.node_id))
+                    (!pinned_here || node.node_id == self))
                     ranked.emplace_back(rendezvous(r->id, node.node_id), node.node_id);
             std::sort(ranked.rbegin(), ranked.rend());
             size_t rank = 0;
