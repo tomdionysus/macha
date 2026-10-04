@@ -433,6 +433,9 @@ struct FuseFrontend::State {
             int error_code{};
             std::string error_message;
             Clock::time_point since{};
+            // The target's reachability when parked: publication is tried
+            // again once it differs.
+            uint64_t reachability_epoch{};
         };
         std::optional<Parked> parked MACHA_GUARDED_BY(mutex);
         uint64_t journal_epoch MACHA_GUARDED_BY(mutex){};
@@ -2839,6 +2842,37 @@ struct FuseFrontend::State {
         data_cv.notify_all();
     }
 
+    // A parked publication is tried again once the nodes or storage it
+    // depends on have changed since it was parked.
+    void readmit_parked_on_change() {
+        if (!parked_publications.load(std::memory_order_relaxed))
+            return;
+        const auto epoch = publication_target.reachability_epoch();
+        std::vector<std::shared_ptr<Inode>> candidates;
+        {
+            Lock lock(namespace_mutex);
+            candidates.reserve(inodes.size());
+            for (const auto& [_, inode] : inodes)
+                candidates.push_back(inode);
+        }
+        size_t readmitted = 0;
+        for (const auto& inode : candidates) {
+            Lock inode_lock(inode->mutex);
+            if (!inode->parked || inode->parked->reachability_epoch == epoch)
+                continue;
+            inode->parked.reset();
+            inode->publication_retry.reset();
+            inode->data_deferred = true;
+            ++readmitted;
+        }
+        if (!readmitted)
+            return;
+        parked_publications.fetch_sub(readmitted, std::memory_order_relaxed);
+        Log::info("FUSE data publication retry after a membership or storage change parked=" +
+                  std::to_string(readmitted));
+        admit_deferred();
+    }
+
     void admit_deferred() {
         std::vector<std::shared_ptr<Inode>> candidates;
         {
@@ -3806,10 +3840,18 @@ struct FuseFrontend::State {
                             return stopping.load() || !data_queue.empty() ||
                                    deferred_retry_due_ns.load(std::memory_order_acquire) != due_ns;
                         };
-                        if (due)
+                        if (due) {
                             data_cv.wait_until(lock.native(), stop, *due, arrived);
-                        else
+                        } else if (parked_publications.load(std::memory_order_relaxed)) {
+                            // Nothing notifies a membership or storage change.
+                            data_cv.wait_for(lock.native(), stop, config.parked_recheck,
+                                             arrived);
+                            lock.unlock();
+                            readmit_parked_on_change();
+                            lock.lock();
+                        } else {
                             data_cv.wait(lock.native(), stop, arrived);
+                        }
                         continue;
                     }
                     if (runnable_data_available_locked())
@@ -3997,7 +4039,8 @@ struct FuseFrontend::State {
                             now - inode->publication_retry.failing_since());
                         path = inode->current_path;
                         if (!delay) {
-                            inode->parked = Inode::Parked{code, e.what(), now};
+                            inode->parked = Inode::Parked{
+                                code, e.what(), now, publication_target.reachability_epoch()};
                             set_data_publication_locked(*inode, nullptr);
                         }
                     }
@@ -4031,7 +4074,8 @@ struct FuseFrontend::State {
                                   " attempts=" + std::to_string(attempts) +
                                   " failing_for_ms=" + std::to_string(failing_for.count()) +
                                   " error=" + e.what() +
-                                  "; retry or abandon via manage/filesystem/parked-publications");
+                                  "; retried when membership or storage changes, or via "
+                                  "manage/filesystem/parked-publications");
                     }
                 } else {
                     // Terminal: poisons the inode until an operator acts.

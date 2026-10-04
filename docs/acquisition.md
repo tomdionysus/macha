@@ -281,7 +281,7 @@ A `blocked` job is retried every `ingest.blocked_retry_ms` until it succeeds or 
 
 | `error_code` (blocked) | cause |
 |---|---|
-| `metadata_unavailable` | cluster metadata is not writable (no metadata quorum, or a DATA or CONTROL retention floor not met) |
+| `metadata_unavailable` | this node has no usable namespace yet (for example it is still waiting for its bootstrap peer), or the import brought in bytes that no node present holds. An absent peer does not block an import |
 | `source_unavailable` | the source path does not exist |
 | `source_not_regular` | the source is neither a regular file nor a directory |
 | `source_scan_interrupted` | the scan could not finish; the source may be unavailable |
@@ -435,7 +435,7 @@ The response is `202`, sent only once the request is accepted into metadata, so 
 | 409 | `placement_failed` | `node_not_torrent_capable` | `node_id` does not run the torrent subsystem |
 | 409 | `placement_failed` | `add_failed` | the URI is not an acceptable magnet or names no info hash, or no torrent-capable node could read the `.torrent` |
 | 409 | `torrent_already_added` | | a job for this torrent (the same info hash) exists anywhere in the cluster, in any phase until it is cleared |
-| 503 | `metadata_unavailable` | | cluster metadata cannot be written; `error.scope` is `cluster` and `error.alternative_may_succeed` false, since every node would answer the same. On a cluster whose write floor is its whole membership, one node down stops adds |
+| 503 | `metadata_unavailable` | | cluster metadata cannot be written; `error.scope` is `cluster` and `error.alternative_may_succeed` false. It is answered only by a node with no usable namespace yet (for example one still waiting for its bootstrap peer); an absent peer does not stop adds |
 
 The refusal of a duplicate names the job that holds the torrent, in the fields a `202` uses; `node_id` is the node running it, or null while it awaits one:
 
@@ -449,7 +449,7 @@ To download it again, clear that job first.
 
 ### Who downloads it
 
-Every torrent-capable node runs a scheduler. It claims a waiting job when the job is not paused, is not pinned elsewhere, and the node has a free slot (`torrent.max_active`) and staging room. Nodes rank each job the same way, and a node that is not the preferred one waits 30 s per place in that ranking before claiming, so healthy nodes do not race for it. The claiming node downloads under the job's `id` and writes its progress back: `downloading`, `importing`, `completed` or `failed`.
+Every torrent-capable node runs a scheduler. It claims a waiting job when the job is not paused, is not pinned to another node the cluster still knows, and the node has a free slot (`torrent.max_active`) and staging room. Nodes rank each job the same way, and a node that is not the preferred one waits 30 s per place in that ranking before claiming, so healthy nodes do not race for it. The claiming node downloads under the job's `id` and writes its progress back: `downloading`, `importing`, `completed` or `failed`.
 
 A claim holds while its node is a cluster member. **A node absent for 10 minutes loses it**, and another capable node claims the job and starts it again from nothing (staging and resume data are the node's own). A node that returns to find its claim taken over deletes its copy.
 

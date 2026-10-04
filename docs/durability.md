@@ -4,7 +4,7 @@
 
 Macha may publish a logical reference only after the storage class responsible for that reference has satisfied its durability contract.
 
-For DATA, the foreground contract is `dht.min_write_replicas` durable authoritative copies. For namespace/control metadata, the contract is `dht.metadata_min_write_replicas` distinct durable metadata copies on active nodes.
+For DATA, the contract is a durable authoritative copy on a node present. For namespace/control metadata, it is a durable copy on the committing node. `dht.write_copies` and `dht.metadata_write_copies` are the copies sought before a write returns: with that many nodes present and answering, the write is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest. Nothing is refused for lack of peers.
 
 Cache never counts.
 
@@ -44,34 +44,38 @@ Immediate versus batchable urgency changes scheduling, not correctness. Both use
 
 ## Distributed DATA publication
 
-The writer ranks preferred owners and deterministic fallbacks, trying its own store first when it is an eligible candidate. It obtains placements until at least `min_write_replicas` have accepted and become durably covered. Only then may MachaDFS namespace metadata reference the new extents.
+The writer ranks preferred owners and deterministic fallbacks, trying its own store first when it is an eligible candidate. It obtains placements until `write_copies` have accepted and become durably covered, or until no further node can take a copy promptly: a peer that stalls past `dht.write_stall_ms` is not waited for once one copy has landed. The write returns on the copies that landed, and only then may MachaDFS namespace metadata reference the new extents.
 
-`min_write_replicas` is also the DATA retention floor. Before a metadata commit is published, a reconciliation's merge commit included, every DATA object named by the entries it changes must carry a durable retention claim on that many nodes holding it, and every CONTROL object it introduces (catalogue shards, namespace tree nodes) a claim on `metadata_min_write_replicas` nodes. A merge also claims the extents and catalogue roots of the conflict alternatives it records. Its claims carry a fresh sequence of the reconciling node that the merge's clock does not include, so every reconciler still mints the same commit; they become releasable once a head carrying that node's next mutation no longer references the object. A commit that cannot meet either floor is refused (`DATA retention floor unavailable before metadata publication` / `CONTROL retention floor unavailable before metadata publication`) rather than published over missing copies.
+Before a metadata commit is published, a reconciliation's merge commit included, every DATA object named by the entries it changes is given a durable retention claim on the holders present, and every CONTROL object it introduces (catalogue shards, namespace tree nodes) a claim that must be recorded on the committing node. A merge also claims the extents and catalogue roots of the conflict alternatives it records. Its claims carry a fresh sequence of the reconciling node that the merge's clock does not include, so every reconciler still mints the same commit; they become releasable once a head carrying that node's next mutation no longer references the object.
 
-`replicas` can be larger than the publication floor. Missing desired copies remain repair debt and are converged by maintenance.
+One refusal remains. A commit that brings new bytes into the namespace is refused if no node present holds those bytes (`DATA object is held by no node present before metadata publication`); the writer still has them and puts them again. Bytes the parent head already named are not checked, so a rename, a chmod or an append to a file whose older extents live on an absent node commits.
 
-A full or offline preferred owner does not weaken the floor; it changes which eligible candidate supplies the required durable copy.
+`replicas` can be larger than the copies a write returned on. Missing desired copies remain repair debt and are converged by maintenance.
+
+A full or offline preferred owner changes which eligible candidate supplies a copy.
 
 ## Namespace metadata
 
-Every node is metadata-capable. A metadata commit is publishable after the exact immutable commit has been durably stored on at least `dht.metadata_min_write_replicas` distinct active nodes and its acceptance certificate has been durably retained. A receiver stores the commit independently of its current head; disconnected cohorts may therefore preserve different accepted successors of the same ancestor. Ordinary linear commits may use compact deterministic deltas in the history store, while full records remain valid recovery material.
+Every node is metadata-capable. A metadata commit is accepted once the exact immutable commit and its acceptance certificate are durably held by the committing node; copies on up to `dht.metadata_write_copies` nodes are sought from those present before the write returns, and repair delivers it to the rest. A receiver stores the commit independently of its current head; separated nodes may therefore preserve different accepted successors of the same ancestor. Ordinary linear commits may use compact deterministic deltas in the history store, while full records remain valid recovery material.
 
-This is a durability floor rather than majority consensus. It deliberately allows arbitrary surviving cohorts of the configured floor size to continue, so disconnected cohorts can produce divergent valid histories. Those histories are preserved and destructive convergence is refused: two divergent heads are reconciled through a multi-parent commit, non-conflicting namespace changes are merged, and incompatible alternatives are retained as durable conflict records instead of one being silently chosen. Status reports them as `metadata.conflicts`, `conflicts_resolved` and `conflicts_superseded`; see [Metadata replication and reconciliation](metadata.md).
+This is not majority consensus. It deliberately allows any surviving node to continue alone, so separated nodes can produce divergent valid histories. Those histories are preserved and destructive convergence is refused: two divergent heads are reconciled through a multi-parent commit, non-conflicting namespace changes are merged, and incompatible alternatives are retained as durable conflict records instead of one being silently chosen. Status reports them as `metadata.conflicts`, `conflicts_resolved` and `conflicts_superseded`; see [Metadata replication and reconciliation](metadata.md).
 
-Metadata durability is independent of DATA `dht.replicas` and `dht.min_write_replicas`.
+A write accepted by one node alone exists on that node until a peer is present to take a copy. In `GET /api/v1/status`, `diagnostics.metadata.head_holders` is how many of the nodes present held the current head at the last repair pass, and `head_holders_present` how many nodes were present at it.
+
+Metadata copies are independent of DATA `dht.replicas` and `dht.write_copies`.
 
 ## Catalogue control durability
 
-Catalogue manifest/shard objects are CONTROL, as are the nodes of a tree-backed namespace: a new namespace root may be referenced only once every tree node it introduces has durably reached `metadata_min_write_replicas`, exactly as a manifest may not name a shard that has not. Before namespace metadata can point at a new catalogue manifest:
+Catalogue manifest/shard objects are CONTROL, as are the nodes of a tree-backed namespace: a new namespace root may be referenced only once the committing node durably holds every tree node it introduces, exactly as a manifest may not name a shard the node does not hold. Before namespace metadata can point at a new catalogue manifest:
 
 1. newly referenced artwork DATA must be readable through the normal DATA store;
-2. changed catalogue shards must be durable on at least `metadata_min_write_replicas` active nodes;
-3. the successor manifest must be durable on at least `metadata_min_write_replicas` active nodes;
+2. changed catalogue shards must be durable on the committing node, with copies sought on `metadata_write_copies` nodes;
+3. the successor manifest must be durable on the committing node, with copies sought likewise;
 4. namespace metadata acceptance publishes the new manifest root.
 
 After publication, maintenance converges the current manifest/shards to all active metadata replicas. A joining or returning node with missing control objects fetches them from another replica. This convergence does not make artwork universal.
 
-Transient metadata/control unavailability causes catalogue scanner work to defer. It does not consume the hint's provider/content failure attempts.
+Transient metadata/control unavailability (a node with no usable namespace yet) causes catalogue scanner work to defer. It does not consume the hint's provider/content failure attempts.
 
 ## FUSE durability
 
@@ -90,7 +94,7 @@ return local success to kernel
       |
 asynchronous publication builds DATA extents
       |
-wait for DATA durability floor
+wait for DATA copies to be durable
       |
 commit namespace metadata
       |

@@ -138,6 +138,9 @@ struct FuseConfig {
     // `parked_publications`, manage `parked-publications`).
     RetryPolicy publication_retry{100, std::chrono::minutes(30), std::chrono::milliseconds(250),
                                   std::chrono::seconds(30)};
+    // How often a parked file checks whether membership or storage changed,
+    // which is when it is tried again. Not read from YAML.
+    std::chrono::milliseconds parked_recheck{std::chrono::seconds(5)};
     // Retry for a retryably failing namespace operation. Past the budget it is
     // reported blocked (manage `blocked-namespace-operation`) and keeps trying
     // at the ceiling.

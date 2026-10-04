@@ -2566,6 +2566,36 @@ MACHA_TEST("hydration_catalogue", test_torrent_requests_belong_to_the_cluster_an
         CHECK(r->phase_epoch == 2);
         REQUIRE(torrents->job(lapsed.id).has_value());
 
+        // A pin holds while the node it names is known, and no longer once
+        // that node is forgotten: then any node may take the request.
+        NodeInfo known_peer;
+        known_peer.id = random_node_id();
+        known_peer.host = "127.0.0.9";
+        known_peer.port = 57499;
+        known_peer.seen_unix_ms = unix_ms();
+        fixture.node().membership().observe(known_peer, true);
+        const auto pinned_to = [&](char tag, const NodeId& node) {
+            TorrentRequest pinned;
+            pinned.id = std::string(32, tag);
+            pinned.info_hash = std::string(40, tag);
+            pinned.source = "magnet:?xt=urn:btih:" + pinned.info_hash;
+            pinned.created_unix_ms = 2;
+            pinned.phase = TorrentPhase::awaiting_node;
+            pinned.pinned_node_id = node;
+            fixture.metadata().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                snapshot.torrent_requests[pinned.id] = pinned;
+                delta.upsert_torrent_requests[pinned.id] = pinned;
+            });
+            return pinned.id;
+        };
+        const auto held = pinned_to('b', known_peer.id);
+        const auto freed = pinned_to('c', gone);
+        impatient.pass_now();
+        impatient.pass_now();
+        CHECK(!impatient.request(held)->claim.has_value());
+        REQUIRE(impatient.request(freed)->claim.has_value());
+        CHECK(impatient.request(freed)->claim->node_id == self);
+
         // Another node's newer claim wins; this node lets its copy go.
         auto superseding = *r;
         superseding.claim = TorrentClaim{gone, 3, unix_ms()};

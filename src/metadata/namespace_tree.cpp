@@ -1163,9 +1163,7 @@ NamespaceMigration plan_namespace_migration(const MetadataRecord& head,
 
     const auto source = snapshot.entries;
     auto migrated = detach_namespace(std::move(snapshot), nodes);
-    // The tree's nodes are new and nothing claims them, so the head carries no
-    // retention baseline: the first repair with every participant at it
-    // claims all it reaches, and destructive GC waits for that.
+    // Part of the record, which every migrating node must compute alike.
     migrated.retention_baseline_complete = false;
     migration.root = *migrated.namespace_root;
     migration.stats = namespace_tree_stats(migration.root, nodes);

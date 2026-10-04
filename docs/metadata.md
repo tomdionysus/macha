@@ -4,24 +4,24 @@
 
 Every Macha node is a metadata replica, and every replica has the same standing.
 
-`dht.metadata_min_write_replicas` is the minimum number of **distinct active nodes** which must durably store an immutable metadata commit before that commit may be accepted. It is a durability floor, not a target replica count and not a majority derived from cluster membership.
+A metadata commit is accepted once the committing node durably holds it. `dht.metadata_write_copies` is the number of copies sought before the write returns, not a condition of acceptance and not a majority derived from cluster membership: with that many nodes present and answering, the commit is on that many when it returns; with fewer, it returns on the copies it has and repair delivers the rest.
 
 For example, with twelve known nodes and:
 
 ```yaml
 dht:
-  metadata_min_write_replicas: 2
+  metadata_write_copies: 2
 ```
 
-any mutually connected pair may continue publishing metadata while the other ten are unavailable.
+any node may continue publishing metadata while the other eleven are unavailable, and any connected pair holds each commit on two nodes. Nodes configured with different values share one namespace.
 
 ## Commit, acceptance and heads are separate concepts
 
-A live metadata write is two steps over immutable objects: store the commit on enough replicas, then record its acceptance.
+A live metadata write is two steps over immutable objects: store the commit on this node and on the replicas present, then record its acceptance.
 
 A `MetadataCommit` is an immutable DAG node: it contains a complete state or deterministic delta, its primary parent, and any additional merge parents. A replica may durably store a valid commit regardless of which accepted head it currently exposes. Storing a commit therefore never means "replace your current head".
 
-A commit becomes accepted only after the writer has durably stored that exact immutable commit on at least `metadata_min_write_replicas` distinct nodes. The writer then persists an acceptance certificate naming those durable store witnesses. The certificate records historical publication durability; acceptance does **not** disappear merely because some witness later goes offline.
+A commit becomes accepted once the writer has durably stored that exact immutable commit itself. It offers the commit to the nearest nodes present until `metadata_write_copies` hold it or none is left to ask, then persists an acceptance certificate naming the nodes that stored it, on itself first and then on each of them, so a peer never holds an accepted commit its author lacks. The certificate records where the commit was held when it was accepted; acceptance does **not** disappear merely because one of those nodes later goes offline.
 
 Each replica persists a set of maximal accepted heads. Normally the set contains one commit. A partition may leave several accepted heads. Learning another accepted head adds it to the set rather than replacing an unrelated branch. Once a reconciliation commit descends from those heads, the ancestors cease to be maximal and the head set collapses naturally.
 
@@ -29,11 +29,13 @@ Macha currently assumes authenticated, non-Byzantine cluster peers. Acceptance c
 
 ## Consequence: history may branch
 
-A node cannot distinguish a failed remote cohort from a network partition. Therefore a fixed write floor smaller than a membership majority cannot guarantee one globally linear history. Macha treats this as an availability property rather than corruption.
+A node cannot distinguish a failed remote node from a network partition, and it accepts writes on its own either way. There is therefore no guarantee of one globally linear history. Macha treats this as an availability property rather than corruption.
 
 When disconnected branches meet, replicas exchange accepted heads and ancestry, locate a common ancestor and perform semantic reconciliation. Non-conflicting namespace changes merge automatically. Identical changes are idempotent. Incompatible changes become durable first-class conflicts; neither alternative is destroyed until resolution. Resolving a conflict creates another metadata commit. The rest of the namespace remains usable while conflicts exist.
 
-Reconciliation itself is an ordinary immutable commit with multiple parents and must satisfy the same metadata write floor before it is accepted.
+Reconciliation itself is an ordinary immutable commit with multiple parents, accepted like any other. Values changed on both branches that are not namespace entries (policy scalars, conflict records) join deterministically, so they never fail a merge.
+
+A second accepted head that cannot be merged with the node's own (no common ancestor is known, or its content cannot be fetched from any node present) is set aside until the membership changes. Meanwhile reads serve the node's own head, writes extend it and claim release follows it. `diagnostics.metadata.heads_set_aside` in `GET /api/v1/status` counts the heads set aside.
 
 ## Implementation
 
@@ -42,7 +44,7 @@ The commit-store/acceptance model is implemented directly:
 - every active node is eligible to store metadata commits and acceptance evidence;
 - live publication uses `put_metadata_commit` followed by `accept_metadata_commit`;
 - a receiver validates and stores an immutable commit without comparing it with its current head;
-- an accepted commit carries durable evidence of the distinct replicas which stored it at publication time;
+- an accepted commit carries durable evidence of the replicas which stored it at publication time;
 - each replica persists encrypted accepted-head certificates separately from its materialised checkpoint;
 - each replica retains encrypted compact ancestry/history across checkpoint compaction;
 - accepted heads exchange ancestry, collapse stale ancestor heads and locate common ancestors;
@@ -52,7 +54,7 @@ The commit-store/acceptance model is implemented directly:
 - virgin founders construct the same deterministic generation-2 root and publish it through the ordinary immutable-commit path, so any founder may publish it;
 - non-destructive DATA repair can continue from an accepted local branch while reconciliation is pending;
 - accepted metadata references install durable causal retention claims on the physical DATA/CONTROL copies before publication; retention claims themselves drive bounded repair if a claimed copy is missing or corrupt;
-- GC remains active during partitions. Each node releases only locally-held claims for objects absent from its sole accepted head, and only claim dots dominated by that head's causal mutation clock. An unseen/concurrent branch which touched the object carries a newer/incomparable claim dot and therefore remains protected without any global branch survey.
+- GC remains active during partitions. Each node releases only locally-held claims for objects absent from its sole accepted head, and only claim dots dominated by that head's causal mutation clock. An unseen/concurrent branch which touched the object carries a newer/incomparable claim dot and therefore remains protected without any global branch survey. An object's bytes go only once this node has itself seen it unreferenced and unclaimed for `maintenance.garbage_grace_ms`.
 
 Validated historical materializations are shared and bounded. An uncached
 delta chain is reconstructed once outside the replica-state critical section,
@@ -109,16 +111,15 @@ Merkle tree keyed by path, and never both. A cluster founds in the inline
 form; a tree-backed node stays tree-backed.
 
 - Tree nodes live in the control object store and follow the CONTROL rules:
-  a commit may reference a new root only once every node it wrote has
-  reached `metadata_min_write_replicas`, and only the nodes a commit wrote
-  are replicated, sending each peer just the objects it reports missing.
+  a commit may reference a new root once this node holds every tree node it
+  wrote, and only the nodes a commit wrote are replicated, sending each peer
+  present just the objects it reports missing.
 - Node boundaries depend on keys only, so the same entry set yields the same
   root however it was reached, and a value change rewrites one leaf and the
   branches above it. Large extent lists live in their own spine, so a stat
   reads at most the tree's depth and fetches no extent node.
 - "Has the namespace changed" is a root comparison.
-- History replay rebuilds a tree-backed head locally without asking a peer:
-  the commit already reached the floor when it was made.
+- History replay rebuilds a tree-backed head locally without asking a peer.
 - Reconciliation materialises the base and both branches, merges them
   path-wise as before, and re-roots the result, so a merge costs what it
   costs for an inline namespace.
@@ -130,9 +131,3 @@ A snapshot also carries `torrent_requests`: the torrents the cluster has been as
 Reconciliation joins the collection per request instead of recording conflicts: every field has a deterministic merge (cancel is final; a later claim epoch wins; within one epoch a request never moves backwards; removal wins), so the merge is commutative, associative and idempotent and never needs an operator. Removed requests stay as tombstones for seven days so a branch that has not seen the removal cannot bring one back.
 
 SM15, SM16 and DLT9 belong to cluster protocol 22, which every node in the cluster must run.
-
-## Configuration alias
-
-`dht.metadata_replicas` is accepted as an alias and translated to the majority
-of the count it gives, so `metadata_replicas: 3` means
-`metadata_min_write_replicas: 2`. The two keys are mutually exclusive.

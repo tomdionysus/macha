@@ -201,6 +201,11 @@ class PublicationTarget {
                                                                 bool cache_puts,
                                                                 uint64_t pipeline_bytes,
                                                                 DataWorkContext) = 0;
+
+    // Advances whenever the nodes or the storage a publication depends on
+    // change: a publication that kept failing is worth another attempt. An
+    // atomic read.
+    virtual uint64_t reachability_epoch() const noexcept { return 0; }
 };
 
 class WriteHandle final : public PublicationWriter {
@@ -464,6 +469,7 @@ class FileSystem final : public PublicationTarget {
                                             uint64_t publication_pipeline_bytes = 0,
                                             DataWorkContext work_context = DataWorkContext{});
     // open_write() for a publication generation, never truncating.
+    uint64_t reachability_epoch() const noexcept override;
     std::shared_ptr<PublicationWriter> open_publication(const std::string& path, bool cache_puts,
                                                         uint64_t pipeline_bytes,
                                                         DataWorkContext work_context) override;

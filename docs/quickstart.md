@@ -84,8 +84,8 @@ network:
 
 dht:
   replicas: 1
-  metadata_min_write_replicas: 2
-  min_write_replicas: 1
+  metadata_write_copies: 2
+  write_copies: 1
   extent_size: 4M
 
 fuse:
@@ -137,8 +137,8 @@ network:
 
 dht:
   replicas: 1
-  metadata_min_write_replicas: 2
-  min_write_replicas: 1
+  metadata_write_copies: 2
+  write_copies: 1
   extent_size: 4M
 
 bootstrap:
@@ -181,6 +181,6 @@ curl http://127.0.0.1:7440/api/v1/health
 
 Node 1 has no bootstrap peers, so it founds the cluster and creates the `root` and `anonymous` accounts on first start. Root's generated password is written to `demo/node1/state/initial-root-password` (mode 0600, owned by the user that started the node). Read it, sign in, change the password and delete the file. Node 2 joins and receives the accounts by replication. See [Management](management.md#bootstrapping-and-recovery).
 
-With `replicas: 1`, the 2 GiB node does not cap the 8 GiB node. DATA objects have one desired authoritative owner and may fall through to the other node when their preferred owner cannot admit them. With `metadata_min_write_replicas: 2`, both nodes are required for metadata publication in this two-node demonstration; in a larger cluster any two active replicas can satisfy the same floor.
+With `replicas: 1`, the 2 GiB node does not cap the 8 GiB node. DATA objects have one desired authoritative owner and may fall through to the other node when their preferred owner cannot admit them. With `metadata_write_copies: 2`, a metadata commit is on both nodes when the write returns while both are running; with one stopped, the other keeps reading and writing and repair delivers what the stopped node missed when it returns.
 
 For a production cluster, choose replica/failure-domain policy according to the failures you intend to survive; do not infer production durability from this R=1 example.
