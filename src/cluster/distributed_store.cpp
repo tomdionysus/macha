@@ -235,12 +235,11 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         std::rotate(nodes.begin(), self, self + 1);
     }
     const size_t target = std::min(n_.config().replication, nodes.size());
-    const size_t floor = n_.config().min_write_replicas;
-    // min_write_replicas is the publication contract; further replication is
-    // repair's convergence work, not a quorum rule tied to membership.
+    // Copies sought before the write returns. One copy is a write; the rest
+    // are sought from the nodes present and otherwise left to repair.
+    const size_t floor =
+        std::max<size_t>(1, std::min(n_.config().min_write_replicas, nodes.size()));
     const size_t need = floor;
-    if (nodes.size() < floor)
-        return false;
 
     Writer writer;
     writer.fixed(id.bytes);
@@ -395,8 +394,8 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
                 Log::debug("object write made no progress within budget id=" + to_string(id) +
                            " budget_ms=" + std::to_string(budget.count()) +
                            " success=" + std::to_string(success) +
-                           " required=" + std::to_string(need));
-                return finish(false, need);
+                           " sought=" + std::to_string(need));
+                return finish(success > 0 && !work->cancelled(), success);
             }
         }
         if (cancelled && cancelled->load(std::memory_order_relaxed)) {
@@ -476,17 +475,28 @@ bool DistributedStore::put_impl(const ObjectId& id, std::span<const uint8_t> dat
         }
 
         size_t unfinished = 0;
-        for (const auto& item : pending)
-            if (!item.done) ++unfinished;
+        size_t stalled = 0;
+        for (const auto& item : pending) {
+            if (item.done)
+                continue;
+            ++unfinished;
+            if (item.spilled)
+                ++stalled;
+        }
 
-        if (success + unfinished + (nodes.size() - next_fallback) < floor)
+        // No further copy can be had promptly: what landed is the write. A
+        // stalled peer is waited for only while nothing has landed.
+        const size_t untried = nodes.size() - next_fallback;
+        if (success > 0 && success + (unfinished - stalled) + untried < floor)
+            break;
+        if (!success && !unfinished && !untried)
             break;
 
         if (!progressed)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    return finish(success >= floor, floor);
+    return finish(success > 0, success);
 }
 
 namespace {
@@ -842,22 +852,23 @@ bool DistributedStore::retain_on(const NodeInfo& target, RetentionClass object_c
     }
 }
 
-bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
-                                   const RetentionDot& dot) {
+std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>& input,
+                                                    const RetentionDot& dot) {
     auto ids = input;
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    std::vector<ObjectId> unheld;
     if (ids.empty())
-        return true;
+        return unheld;
 
-    const size_t floor = n_.config().min_write_replicas;
-    if (!floor)
-        return false;
+    // Claims sought per object. A holder that is away is not claimed on: its
+    // own head and the deletion grace protect its copy until it returns.
+    const size_t floor = std::max<size_t>(1, n_.config().min_write_replicas);
 
     // Plan claims first, then persist one RetainBatch per selected node, so a
-    // multi-extent file is not one fsync/RPC per object; the per-object DATA
-    // floor still holds. Single-object fallback claims below cover a node
-    // vanishing between planning and persistence.
+    // multi-extent file is not one fsync/RPC per object. Single-object
+    // fallback claims below cover a node vanishing between planning and
+    // persistence.
     const auto started = Clock::now();
     std::map<NodeId, NodeInfo> node_info;
     std::map<NodeId, std::vector<ObjectId>> batches;
@@ -865,8 +876,8 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     for (const auto& id : ids)
         candidates_by_object.emplace(id, ranked(id));
 
-    // Batched, concurrent candidate-presence scan; same preference order and
-    // per-object floor as a serial has_on() walk.
+    // Batched, concurrent candidate-presence scan; same preference order as a
+    // serial has_on() walk.
     auto selected_by_object = select_present_batched(candidates_by_object, floor);
     const auto scan_ms = since_ms(started);
 
@@ -878,14 +889,14 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     size_t fallback_claims = 0;
     // Where a slow retention barrier spends its time: presence scan,
     // re-replication of short objects, per-node claims, per-object fallbacks.
-    const auto report = [&](bool ok) {
+    size_t under_claimed = 0;
+    const auto report = [&] {
         static auto& barrier = observations().histogram("claim.data_barrier_us");
         static auto& barrier_ids = observations().counter("claim.data_barrier.ids");
-        static auto& barrier_failed = observations().counter("claim.data_barrier.failed");
+        static auto& barrier_short = observations().counter("claim.data_barrier.under_claimed");
         barrier.record(elapsed_us(started));
         barrier_ids.fetch_add(ids.size(), std::memory_order_relaxed);
-        if (!ok)
-            barrier_failed.fetch_add(1, std::memory_order_relaxed);
+        barrier_short.fetch_add(under_claimed, std::memory_order_relaxed);
         const auto total = since_ms(started);
         if (total >= 250 && Log::enabled(LogLevel::debug))
             Log::debug("DATA retention barrier ids=" + std::to_string(ids.size()) +
@@ -893,21 +904,19 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
                        std::to_string(total) + " scan_ms=" + std::to_string(scan_ms) +
                        " short=" + std::to_string(short_count) +
                        " fallback_claims=" + std::to_string(fallback_claims) +
-                       " ok=" + (ok ? "yes" : "no"));
+                       " under_claimed=" + std::to_string(under_claimed));
     };
 
     if (!short_ids.empty()) {
         // A metadata-only mutation may be the first touch after an object's
-        // old placement disappeared: re-establish the DATA durability floor
-        // before the new claim. Only objects the scan found short take this
-        // rare serial path.
+        // old placement disappeared: re-place it where possible before the
+        // new claim. Only objects the scan found short take this rare serial
+        // path; one that cannot be read now is left to repair.
         std::map<ObjectId, std::vector<NodeInfo>> rescan_candidates;
         for (const auto& id : short_ids) {
             auto data = get(id, 0, FrameType::speculative);
-            if (!data || !put(id, *data)) {
-                report(false);
-                return false;
-            }
+            if (!data || !put(id, *data))
+                continue;
             auto candidates = ranked(id);
             candidates_by_object[id] = candidates;
             rescan_candidates.emplace(id, std::move(candidates));
@@ -918,15 +927,7 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
     }
 
     for (const auto& id : ids) {
-        auto& selected = selected_by_object[id];
-        if (selected.size() < floor) {
-            Log::debug("DATA retention placement unavailable id=" + to_string(id) +
-                       " required=" + std::to_string(floor) +
-                       " present=" + std::to_string(selected.size()));
-            report(false);
-            return false;
-        }
-        for (const auto& candidate : selected) {
+        for (const auto& candidate : selected_by_object[id]) {
             node_info[candidate.id] = candidate;
             batches[candidate.id].push_back(id);
         }
@@ -969,8 +970,9 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
             continue;
         const auto candidates = candidates_by_object.find(id);
         if (candidates == candidates_by_object.end()) {
-            report(false);
-            return false;
+            ++under_claimed;
+            unheld.push_back(id);
+            continue;
         }
         for (const auto& candidate : candidates->second) {
             if (successful.size() >= floor)
@@ -987,46 +989,38 @@ bool DistributedStore::retain_data(const std::vector<ObjectId>& input,
             if (present && retain_on(candidate, RetentionClass::data, {id}, dot))
                 successful.insert(candidate.id);
         }
-        if (successful.size() < floor) {
-            Log::debug("DATA retention floor unavailable id=" + to_string(id) +
-                       " required=" + std::to_string(floor) +
-                       " retained=" + std::to_string(successful.size()));
-            report(false);
-            return false;
-        }
+        if (successful.size() < floor)
+            ++under_claimed;
+        if (successful.empty())
+            unheld.push_back(id);
     }
-    report(true);
-    return true;
+    report();
+    return unheld;
 }
 
 bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
-                                      const RetentionDot& dot, size_t required) {
+                                      const RetentionDot& dot) {
     auto ids = input;
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (ids.empty())
         return true;
-    if (!required)
-        return false;
 
+    const size_t sought = std::max<size_t>(1, n_.config().metadata_min_write_replicas);
     const auto started = Clock::now();
     auto active = n_.membership().active();
-    active.erase(std::remove_if(active.begin(), active.end(), [&](const NodeInfo& peer) {
-        return peer.metadata_write_replicas_required != required;
-    }), active.end());
-    if (active.size() < required)
-        return false;
     // Local first, then the nearest measured peer: this runs inside the
     // writer's metadata mutation.
     active = order_commit_replicas(active, n_.node_id(), [&](const NodeId& peer) {
         return n_.peer_latency(peer);
     });
 
-    // A retention claim asserts this node holds every object and peer copies
-    // derive from ours, so local presence is a precondition.
-    for (const auto& id : ids)
-        if (!ensure_control_local(id))
-            return false;
+    // A retention claim asserts this node holds the object and peer copies
+    // derive from ours. An object that cannot be made local now is not
+    // claimed here; its holder's own head protects it.
+    std::erase_if(ids, [&](const ObjectId& id) { return !ensure_control_local(id); });
+    if (ids.empty())
+        return true;
 
     // Ask the peer what it is missing before sending anything, so a commit's
     // cost scales with what changed, not with the namespace's size. A peer
@@ -1140,32 +1134,30 @@ bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
         return ok;
     };
 
-    // Critical-path CONTROL publication scales with the metadata write floor,
-    // not membership; background control repair may fan out later.
+    // Critical-path CONTROL publication claims on a few nodes, not on
+    // membership; background control repair fans out later. The local claim
+    // is the one that must hold.
     size_t retained_count = 0;
     size_t tried = 0;
+    bool local_retained = false;
     for (const auto& candidate : active) {
         ++tried;
         if (!put_graph_on(candidate))
             continue;
-        if (retain_on(candidate, RetentionClass::control, ids, dot))
+        if (retain_on(candidate, RetentionClass::control, ids, dot)) {
             ++retained_count;
-        if (retained_count >= required)
+            local_retained = local_retained || candidate.id == n_.node_id();
+        }
+        if (retained_count >= sought)
             break;
     }
     const auto total_ms = since_ms(started);
     if (total_ms >= 250 && Log::enabled(LogLevel::debug))
         Log::debug("CONTROL retention claim objects=" + std::to_string(ids.size()) +
-                   " required=" + std::to_string(required) + " tried=" + std::to_string(tried) +
+                   " sought=" + std::to_string(sought) + " tried=" + std::to_string(tried) +
                    " retained=" + std::to_string(retained_count) +
                    " total_ms=" + std::to_string(total_ms));
-    if (retained_count < required) {
-        Log::debug("CONTROL retention floor unavailable objects=" + std::to_string(ids.size()) +
-                   " required=" + std::to_string(required) +
-                   " retained=" + std::to_string(retained_count));
-        return false;
-    }
-    return true;
+    return local_retained;
 }
 
 DistributedStore::DistributedStore(ClusterNode& n, LocalState& local, ActivityClocks& activity,

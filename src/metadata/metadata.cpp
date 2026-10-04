@@ -3242,14 +3242,6 @@ void MetadataReplica::migrate_legacy_head_locked() {
 
 bool MetadataReplica::acceptance_matches_record_policy_locked(
     const MetadataAcceptance& acceptance, const MetadataMaterialization& materialized) const {
-    const auto policy_floor = [](const MetadataSnapshot& snapshot) -> uint32_t {
-        if (snapshot.metadata_write_replicas_required)
-            return snapshot.metadata_write_replicas_required;
-        if (!snapshot.metadata_voters.empty())
-            return static_cast<uint32_t>(snapshot.metadata_voters.size() / 2 + 1);
-        return 0;
-    };
-
     const auto& record = materialized.record;
     const auto& snapshot = *materialized.snapshot;
     if (!snapshot.metadata_write_replicas_required) {
@@ -3266,25 +3258,14 @@ bool MetadataReplica::acceptance_matches_record_policy_locked(
         return true;
     }
 
-    const auto current = policy_floor(snapshot);
+    // `required` records how many nodes held the commit at acceptance; one,
+    // the author, suffices.
     if (!acceptance.required)
         return false;
     for (const auto& witness : acceptance.replicas)
         if (witness == NodeId{})
             return false;
-
-    uint32_t required = current;
-    for (const auto& parent_hash : metadata_record_parents(record)) {
-        auto parent = materialized_locked(parent_hash);
-        if (!parent) {
-            // Parent not yet imported: only a same-policy certificate validates.
-            if (acceptance.required != current)
-                return false;
-            continue;
-        }
-        required = std::max(required, policy_floor(*parent->snapshot));
-    }
-    return acceptance.required == required;
+    return true;
 }
 
 bool MetadataReplica::legacy_write_api_allowed_locked() const {

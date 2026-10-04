@@ -603,10 +603,11 @@ MACHA_TEST("service_root", test_standing_conflicts_are_listed_and_resolved_over_
     service.stop();
 }
 
-// A node that cannot reach its metadata write floor says so on both routes
-// rather than failing or answering from nothing.
+// A node still waiting for its bootstrap peer has no namespace: both routes
+// say so rather than failing or answering from nothing.
 MACHA_TEST("service_root", test_conflict_routes_say_when_metadata_is_unavailable) {
     TestService fixture("conflicts-unavailable", ConfigProfile::functional);
+    fixture.config().bootstrap = {{"127.0.0.1", free_port()}};
     const auto port = enable_api(fixture.config());
     auto& service = fixture.start();
     const auto admin = bearer_header(service);
