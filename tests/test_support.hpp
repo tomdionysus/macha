@@ -280,11 +280,12 @@ struct BareNodeResources {
 // tests' convenience; each waits, bounded, for local state to recover.
 class BareNode : public BareNodeResources, public NodeRuntime {
   public:
-    BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {})
+    BareNode(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook hook = {},
+             TelemetryStore::Now telemetry_now = {})
         : BareNodeResources(config, keys, hook),
           NodeRuntime(std::move(config), identity, progress, resources.memory,
                       resources.transcode_rates, routes,
-                      resources.events, links, std::move(hook)) {}
+                      resources.events, links, std::move(hook), std::move(telemetry_now)) {}
     ~BareNode() { stop(); }
     BareNode(const BareNode&) = delete;
     BareNode& operator=(const BareNode&) = delete;

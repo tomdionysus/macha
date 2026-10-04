@@ -62,6 +62,16 @@ struct NodeReadiness {
     std::string error;
 };
 
+// The client API URL a node advertises: the configured endpoint as given (it
+// may sit behind a TLS proxy), else http on the advertised RPC host and the
+// API port, never the usually undialable listen address; empty with no API.
+std::string advertised_api_endpoint(const CatalogueApiConfig&, std::string advertise_host);
+
+// The playback budgets a node with this streaming configuration enforces;
+// zeros ("cannot say") when it serves no playback. Transcode rates are not
+// configuration and are left empty.
+PlaybackBudgets enforced_playback_budgets(const StreamingConfig&);
+
 class NodeRuntime : public ClusterNode {
   public:
     using StartupStageHook = std::function<void(std::string_view)>;
@@ -160,9 +170,10 @@ class NodeRuntime : public ClusterNode {
 
   public:
     // The caller holds state_path's StorageLock for this node's life.
+    // `telemetry_now` is the steady time telemetry ages are measured by.
     NodeRuntime(Config, const NodeIdentity&, RecoveryProgress&, RetainedMemoryLedger&,
                 TranscodeRateBook&, MessageRoutes&, NodeEvents&, RpcLinks&,
-                StartupStageHook startup_stage_hook = {});
+                StartupStageHook startup_stage_hook, TelemetryStore::Now telemetry_now);
     ~NodeRuntime() override;
     void start();
     void request_stop();

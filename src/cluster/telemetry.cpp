@@ -480,8 +480,9 @@ std::vector<NodeTelemetry> decode_telemetry_set(std::span<const uint8_t> bytes) 
     return values;
 }
 
-TelemetryStore::TelemetryStore(NodeId self, std::filesystem::path persisted_path)
-    : self_(self), boot_id_(random_node_id()), persisted_path_(std::move(persisted_path)) {
+TelemetryStore::TelemetryStore(NodeId self, std::filesystem::path persisted_path, Now now)
+    : now_(now ? std::move(now) : Now([] { return Clock::now(); })), self_(self),
+      boot_id_(random_node_id()), persisted_path_(std::move(persisted_path)) {
     if (persisted_path_.empty() || !std::filesystem::exists(persisted_path_))
         return;
     try {
@@ -628,7 +629,7 @@ void TelemetryStore::observe(NodeTelemetry telemetry, bool direct) {
             current.observed_unix_ms > telemetry.observed_unix_ms + 60000)
             return;
     }
-    records_[telemetry.node_id] = Record{std::move(telemetry), Clock::now()};
+    records_[telemetry.node_id] = Record{std::move(telemetry), now_()};
 }
 
 
@@ -668,7 +669,7 @@ std::vector<NodeTelemetry> TelemetryStore::all() const {
 std::vector<NodeTelemetry> TelemetryStore::recent(std::chrono::milliseconds max_age,
                                                      size_t max_records) const {
     Lock lock(mutex_);
-    const auto now = Clock::now();
+    const auto now = now_();
     std::vector<NodeTelemetry> out;
     out.reserve(std::min(records_.size(), max_records));
     for (const auto& [_, record] : records_) {
@@ -732,7 +733,7 @@ void TelemetryStore::persist() {
 
 std::vector<TelemetryView> TelemetryStore::views(std::chrono::milliseconds fresh_for) const {
     Lock lock(mutex_);
-    const auto now = Clock::now();
+    const auto now = now_();
     std::vector<TelemetryView> out;
     out.reserve(records_.size());
     for (const auto& [_, record] : records_) {

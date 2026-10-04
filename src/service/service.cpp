@@ -37,7 +37,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       identity_(config.state_path, keys), recovery_stage_hook_(startup_stage_hook),
       node_(std::move(config), identity_, progress_, resources_.memory,
             resources_.transcode_rates, routes_, resources_.events, *links_,
-            std::move(startup_stage_hook)),
+            std::move(startup_stage_hook), [] { return Clock::now(); }),
       accounts_(node_.config(), identity_, node_, resources_.events, routes_),
       cluster_status_(node_, accounts_, resources_.activity, resources_.data, resources_.memory),
       session_api_(node_, accounts_), users_api_(node_, accounts_),
