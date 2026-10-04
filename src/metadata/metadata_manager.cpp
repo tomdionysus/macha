@@ -1279,10 +1279,12 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
             left_materialized->record.hash == reconciliation.previous
                 ? left_materialized->snapshot.get()
                 : right_materialized->snapshot.get();
-        // metadata_delta diffs entry maps; a tree-backed merge has none, so it is
-        // published as a full record.
-        if (auto delta = tree_backed ? std::nullopt
-                                     : metadata_delta(*primary_snapshot, merged.snapshot)) {
+        // A tree merge knows its namespace changes against the primary parent.
+        // A merge of materialised trees does not, and is published whole.
+        if (auto delta = tree_merge ? tree_merge_delta(*primary_snapshot, merged.snapshot,
+                                                       tree_merge->changes)
+                         : tree_backed ? std::nullopt
+                                       : metadata_delta(*primary_snapshot, merged.snapshot)) {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < reconciliation.payload.size())
                 reconciliation_delta = std::move(encoded);

@@ -1425,8 +1425,11 @@ NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
                                                const NamespaceNodeStore& store) {
     if (!base.namespace_root || !left.namespace_root || !right.namespace_root)
         throw std::logic_error("a tree merge requires three tree-backed namespaces");
+    // The lower head is the merge commit's primary parent: the changes are
+    // against its tree, so they are also the commit's delta.
+    const bool left_primary = !(right_head < left_head);
     NamespaceTreeMerge out;
-    out.onto = *left.namespace_root;
+    out.onto = left_primary ? *left.namespace_root : *right.namespace_root;
     if (left_head == right_head) {
         out.merged.snapshot = left;
         out.merged.snapshot.namespace_root.reset();
@@ -1473,16 +1476,33 @@ NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
 
     out.merged = merge_metadata_snapshots_over(base, left, right, base_entries, left_entries,
                                                right_entries, left_head, right_head);
+    const auto& primary_entries = left_primary ? left_entries : right_entries;
     for (const auto& path : paths) {
         const auto merged = out.merged.snapshot.entries.find(path);
-        const auto was = left_entries.find(path);
+        const auto was = primary_entries.find(path);
         const bool present = merged != out.merged.snapshot.entries.end();
-        if (present != (was != left_entries.end()) || (present && merged->second != was->second))
+        if (present != (was != primary_entries.end()) ||
+            (present && merged->second != was->second))
             out.changes[path] =
                 present ? std::optional<FsEntry>(merged->second) : std::optional<FsEntry>();
     }
     out.merged.snapshot.entries.clear();
     return out;
+}
+
+std::optional<MetadataDelta> tree_merge_delta(const MetadataSnapshot& primary,
+                                              const MetadataSnapshot& merged,
+                                              const NamespaceChanges& changes) {
+    auto delta = metadata_delta(primary, merged);
+    if (!delta)
+        return {};
+    for (const auto& [path, entry] : changes) {
+        if (entry)
+            delta->upsert_entries.insert_or_assign(path, *entry);
+        else
+            delta->erase_entries.push_back(path);
+    }
+    return delta;
 }
 
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store) {

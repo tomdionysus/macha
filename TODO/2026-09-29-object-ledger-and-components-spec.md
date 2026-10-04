@@ -1114,6 +1114,14 @@ supersede earlier ones where they conflict.
   between two distant changes). Not done: the commit to the peer stays
   under the lock; reconciliation can still start on a reader's thread; the
   merge is not stop-aware, which a merge of milliseconds does not need.
+  Measured at 0.85.0 over an hour of T0's top-up load: lock time per node
+  fell from about 520-550 s to about 90 s and reconciliations from 19 to
+  8, but each still took 4 to 24 s, nearly all of it storing the merge
+  record on the peer: a tree-backed merge was published whole (2 MB,
+  almost all tombstones, deletion being paused). Decided (operator, "yes,
+  do it, we'll see"): the tree merge applies onto the primary parent's
+  tree, so its changes are the commit's delta (`tree_merge_delta`), in the
+  form ordinary commits use; the full record remains the fallback.
 
 ## Open questions for the operator
 

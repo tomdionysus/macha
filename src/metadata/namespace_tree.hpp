@@ -208,7 +208,8 @@ NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId
 // `merge_metadata_snapshots` over the paths that differ from `base` on either
 // branch. `merged.snapshot` carries neither entries nor a root; its namespace
 // is `changes` applied to the tree `onto` (update_namespace_tree), the same
-// root a merge of the materialised namespaces would build.
+// root a merge of the materialised namespaces would build. `onto` is the tree
+// of the lower head, the merge commit's primary parent.
 struct NamespaceTreeMerge {
     MetadataMergeResult merged;
     ObjectId onto{};
@@ -219,6 +220,13 @@ NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
                                                const MetadataSnapshot& right,
                                                const Hash256& left_head, const Hash256& right_head,
                                                const NamespaceNodeStore& store);
+
+// The merge commit as a delta against its primary parent: what differs outside
+// the namespace, and `changes` as the namespace's. `merged` is the merge's
+// final snapshot. None when a delta cannot say it (metadata_delta).
+std::optional<MetadataDelta> tree_merge_delta(const MetadataSnapshot& primary,
+                                              const MetadataSnapshot& merged,
+                                              const NamespaceChanges& changes);
 
 // Applies a commit's delta to the tree: erases, upserts, then appends, in the
 // order `apply_metadata_delta_in_place` uses. An append whose base extent count
