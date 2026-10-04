@@ -5,7 +5,9 @@
 #include "crypto.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 namespace macha {
@@ -378,8 +380,9 @@ ObjectId build_namespace_tree(const std::map<std::string, FsEntry>& entries, Nam
 
 namespace {
 
-// The tree's leaf sequence in order, without decoding entries. Reads the
-// branch nodes plus each leaf's header and first key.
+// The tree's leaf sequence in order. Reads the branch nodes alone: a branch
+// directly above leaves names each one's first key and entry count. A root
+// that is itself a leaf is read for them.
 void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
                     std::vector<Child>& out) {
     auto encoded = store.get(id);
@@ -397,18 +400,24 @@ void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
     }
     if (magic != branch_magic)
         throw DecodeError("not a namespace tree node");
-    (void)reader.u8(); // level
+    const auto level = reader.u8();
     const auto count = reader.u32();
-    std::vector<ObjectId> children;
+    std::vector<Child> children;
     children.reserve(std::min<size_t>(count, reader.remaining() / 44));
     for (uint32_t i = 0; i < count; ++i) {
-        (void)reader.string(8192);
-        children.push_back(ObjectId{reader.fixed<32>()});
-        (void)reader.u64();
+        Child child;
+        child.first_key = reader.string(8192);
+        child.id = ObjectId{reader.fixed<32>()};
+        child.items = reader.u64();
+        children.push_back(std::move(child));
     }
     reader.finish();
+    if (level == 1) {
+        std::move(children.begin(), children.end(), std::back_inserter(out));
+        return;
+    }
     for (const auto& child : children)
-        collect_leaves(child, store, out);
+        collect_leaves(child.id, store, out);
 }
 
 void read_leaf(const ObjectId& id, const NamespaceNodeStore& store,
@@ -662,83 +671,87 @@ ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
     // The owning leaf: the last whose first key is <= key, else the first leaf
     // (where a full build would put it).
     const auto owner_of = [&](const std::string& key) -> size_t {
-        size_t index = 0;
-        for (size_t i = 0; i < leaves.size(); ++i) {
-            if (leaves[i].first_key <= key)
-                index = i;
-            else
-                break;
-        }
-        return index;
+        const auto after = std::upper_bound(
+            leaves.begin(), leaves.end(), key,
+            [](const std::string& k, const Child& leaf) { return k < leaf.first_key; });
+        return after == leaves.begin() ? 0 : static_cast<size_t>(after - leaves.begin()) - 1;
     };
 
-    size_t first = leaves.size(), last = 0;
-    for (const auto& [key, _] : changes) {
-        if (leaves.empty())
-            break;
-        const auto owner = owner_of(key);
-        first = std::min(first, owner);
-        last = std::max(last, owner);
-    }
+    // One window per run of changes whose owning leaves touch, so leaves
+    // between distant changes are never read.
+    struct Window {
+        size_t first{};
+        size_t last{};
+    };
+    std::vector<Window> windows;
     if (leaves.empty()) {
-        first = 0;
-        last = 0;
-    }
-
-    // Read the window, apply the changes, re-chunk. While the last run is open
-    // (did not end on a boundary key) the window grows right by one leaf until
-    // it re-synchronises with the full-build partition.
-    std::vector<std::pair<std::string, FsEntry>> window;
-    std::vector<Child> replacement;
-    size_t end = last;
-    for (;;) {
-        window.clear();
-        for (size_t i = first; i <= end && i < leaves.size(); ++i)
-            read_leaf(leaves[i].id, store, window);
-
-        // Apply only the changes whose keys fall in the window's key range.
-        std::map<std::string, FsEntry> merged;
-        for (auto& [path, entry] : window)
-            merged.insert_or_assign(std::move(path), std::move(entry));
-        const std::string low = leaves.empty() ? std::string() : leaves[first].first_key;
-        const bool last_window = end + 1 >= leaves.size();
-        const std::string high = last_window ? std::string() : leaves[end + 1].first_key;
-        for (const auto& [key, value] : changes) {
-            if (!leaves.empty() && key < low && first != 0)
-                continue;
-            if (!last_window && key >= high)
-                continue;
-            if (value)
-                merged.insert_or_assign(key, *value);
+        windows.push_back({});
+    } else {
+        for (const auto& [key, _] : changes) {
+            const auto owner = owner_of(key);
+            if (windows.empty() || owner > windows.back().last + 1)
+                windows.push_back({owner, owner});
             else
-                merged.erase(key);
+                windows.back().last = std::max(windows.back().last, owner);
         }
-
-        std::vector<EntryRef> ordered;
-        ordered.reserve(merged.size());
-        for (const auto& [path, entry] : merged)
-            ordered.emplace_back(&path, &entry);
-        bool open = false;
-        replacement = chunk_leaves(ordered, store, limits, &open);
-        // An open tail with nothing left to absorb is the sequence end, where a
-        // full build flushes too.
-        if (!open || end + 1 >= leaves.size())
-            break;
-        ++end;
     }
 
-    std::vector<Child> updated;
-    updated.reserve(leaves.size() + replacement.size());
-    for (size_t i = 0; i < first && i < leaves.size(); ++i)
-        updated.push_back(leaves[i]);
-    for (auto& leaf : replacement)
-        updated.push_back(std::move(leaf));
-    for (size_t i = end + 1; i < leaves.size(); ++i)
-        updated.push_back(leaves[i]);
+    // Rightmost first, so the indices of the windows still to do stay valid.
+    // A window that grows into leaves a later one already replaced applies
+    // those changes again, to the same effect.
+    for (auto window = windows.rbegin(); window != windows.rend(); ++window) {
+        const size_t first = window->first;
+        // Read the window, apply the changes, re-chunk. While the last run is
+        // open (did not end on a boundary key) the window grows right by one
+        // leaf until it re-synchronises with the full-build partition.
+        std::vector<std::pair<std::string, FsEntry>> entries;
+        std::vector<Child> replacement;
+        size_t end = window->last;
+        for (;;) {
+            entries.clear();
+            for (size_t i = first; i <= end && i < leaves.size(); ++i)
+                read_leaf(leaves[i].id, store, entries);
 
-    if (updated.empty())
+            // Apply only the changes whose keys fall in the window's key range.
+            std::map<std::string, FsEntry> merged;
+            for (auto& [path, entry] : entries)
+                merged.insert_or_assign(std::move(path), std::move(entry));
+            const std::string low = leaves.empty() ? std::string() : leaves[first].first_key;
+            const bool last_window = end + 1 >= leaves.size();
+            const std::string high = last_window ? std::string() : leaves[end + 1].first_key;
+            for (const auto& [key, value] : changes) {
+                if (!leaves.empty() && key < low && first != 0)
+                    continue;
+                if (!last_window && key >= high)
+                    continue;
+                if (value)
+                    merged.insert_or_assign(key, *value);
+                else
+                    merged.erase(key);
+            }
+
+            std::vector<EntryRef> ordered;
+            ordered.reserve(merged.size());
+            for (const auto& [path, entry] : merged)
+                ordered.emplace_back(&path, &entry);
+            bool open = false;
+            replacement = chunk_leaves(ordered, store, limits, &open);
+            // An open tail with nothing left to absorb is the sequence end,
+            // where a full build flushes too.
+            if (!open || end + 1 >= leaves.size())
+                break;
+            ++end;
+        }
+        const auto from = leaves.begin() + static_cast<std::ptrdiff_t>(std::min(first, leaves.size()));
+        const auto to = leaves.begin() + static_cast<std::ptrdiff_t>(std::min(end + 1, leaves.size()));
+        const auto at = leaves.erase(from, to);
+        leaves.insert(at, std::make_move_iterator(replacement.begin()),
+                      std::make_move_iterator(replacement.end()));
+    }
+
+    if (leaves.empty())
         return empty_leaf(store);
-    return build_spine(std::move(updated), store, true, limits.branch_target_fanout,
+    return build_spine(std::move(leaves), store, true, limits.branch_target_fanout,
                        limits.branch_max_fanout);
 }
 
@@ -1329,6 +1342,147 @@ void collect_namespace_tree_nodes(const ObjectId& root, const NamespaceNodeStore
 void collect_namespace_tree_changes(const std::optional<ObjectId>& before, const ObjectId& after,
                                     const NamespaceNodeStore& store, std::vector<ObjectId>& out) {
     collect_changed(after, before, store, out);
+}
+
+namespace {
+
+// A leaf's entries as encoded. Equal bytes are equal entries, extents
+// included: an extent sequence's root is a function of its extents.
+void read_leaf_records(const ObjectId& id, const NamespaceNodeStore& store,
+                       std::map<std::string, Bytes>& out) {
+    const auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    if (reader.fixed<4>() != leaf_magic)
+        throw DecodeError("not a namespace tree leaf");
+    const auto count = reader.u32();
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto from = encoded->size() - reader.remaining();
+        auto item = decode_leaf_entry(reader, store, false);
+        const auto to = encoded->size() - reader.remaining();
+        out.emplace(std::move(item.first),
+                    Bytes(encoded->begin() + static_cast<std::ptrdiff_t>(from),
+                          encoded->begin() + static_cast<std::ptrdiff_t>(to)));
+    }
+    reader.finish();
+}
+
+FsEntry decode_record(const Bytes& record, const NamespaceNodeStore& store) {
+    Reader reader(record);
+    auto item = decode_leaf_entry(reader, store, true);
+    reader.finish();
+    return std::move(item.second);
+}
+
+} // namespace
+
+NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId& after,
+                                          const NamespaceNodeStore& store) {
+    NamespaceDifferences out;
+    if (before == after)
+        return out;
+    std::vector<Child> leaves_before, leaves_after;
+    collect_leaves(before, store, leaves_before);
+    collect_leaves(after, store, leaves_after);
+    std::set<ObjectId> ids_before, ids_after;
+    for (const auto& leaf : leaves_before)
+        ids_before.insert(leaf.id);
+    for (const auto& leaf : leaves_after)
+        ids_after.insert(leaf.id);
+
+    // A leaf both trees hold has the same entries in both; a path in a leaf
+    // only one holds is in no leaf they share, keys being unique in a tree.
+    std::map<std::string, Bytes> records_before, records_after;
+    for (const auto& leaf : leaves_before)
+        if (!ids_after.contains(leaf.id))
+            read_leaf_records(leaf.id, store, records_before);
+    for (const auto& leaf : leaves_after)
+        if (!ids_before.contains(leaf.id))
+            read_leaf_records(leaf.id, store, records_after);
+
+    for (const auto& [path, record] : records_before) {
+        const auto other = records_after.find(path);
+        if (other != records_after.end() && other->second == record)
+            continue;
+        NamespaceDifference difference;
+        difference.before = decode_record(record, store);
+        if (other != records_after.end())
+            difference.after = decode_record(other->second, store);
+        if (difference.before != difference.after)
+            out.emplace(path, std::move(difference));
+    }
+    for (const auto& [path, record] : records_after)
+        if (!records_before.contains(path))
+            out[path].after = decode_record(record, store);
+    return out;
+}
+
+NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
+                                               const MetadataSnapshot& left,
+                                               const MetadataSnapshot& right,
+                                               const Hash256& left_head, const Hash256& right_head,
+                                               const NamespaceNodeStore& store) {
+    if (!base.namespace_root || !left.namespace_root || !right.namespace_root)
+        throw std::logic_error("a tree merge requires three tree-backed namespaces");
+    NamespaceTreeMerge out;
+    out.onto = *left.namespace_root;
+    if (left_head == right_head) {
+        out.merged.snapshot = left;
+        out.merged.snapshot.namespace_root.reset();
+        return out;
+    }
+    const auto from_left = diff_namespace_trees(*base.namespace_root, *left.namespace_root, store);
+    const auto from_right =
+        diff_namespace_trees(*base.namespace_root, *right.namespace_root, store);
+
+    // What the path-wise merge must see: each changed path, each standing
+    // conflict's subject, and the directories above them.
+    std::set<std::string> paths{"/"};
+    for (const auto* changed : {&from_left, &from_right})
+        for (const auto& [path, _] : *changed)
+            paths.insert(path);
+    for (const auto* conflicts : {&base.conflicts, &left.conflicts, &right.conflicts})
+        for (const auto& [_, conflict] : *conflicts)
+            if (conflict.kind == MetadataConflictKind::namespace_entry)
+                paths.insert(conflict.key);
+    for (const auto& path : std::vector<std::string>(paths.begin(), paths.end()))
+        for (auto above = path; above != "/" && !above.empty();) {
+            above = parent_path(above);
+            paths.insert(above);
+        }
+
+    NamespaceEntries base_entries, left_entries, right_entries;
+    for (const auto& path : paths) {
+        const auto l = from_left.find(path);
+        const auto r = from_right.find(path);
+        // Not in a difference: the branch has the ancestor's entry.
+        const auto b = l != from_left.end()    ? l->second.before
+                       : r != from_right.end() ? r->second.before
+                                               : namespace_tree_lookup(*base.namespace_root,
+                                                                       path, store, true);
+        const auto& left_entry = l != from_left.end() ? l->second.after : b;
+        const auto& right_entry = r != from_right.end() ? r->second.after : b;
+        if (b)
+            base_entries.emplace(path, *b);
+        if (left_entry)
+            left_entries.emplace(path, *left_entry);
+        if (right_entry)
+            right_entries.emplace(path, *right_entry);
+    }
+
+    out.merged = merge_metadata_snapshots_over(base, left, right, base_entries, left_entries,
+                                               right_entries, left_head, right_head);
+    for (const auto& path : paths) {
+        const auto merged = out.merged.snapshot.entries.find(path);
+        const auto was = left_entries.find(path);
+        const bool present = merged != out.merged.snapshot.entries.end();
+        if (present != (was != left_entries.end()) || (present && merged->second != was->second))
+            out.changes[path] =
+                present ? std::optional<FsEntry>(merged->second) : std::optional<FsEntry>();
+    }
+    out.merged.snapshot.entries.clear();
+    return out;
 }
 
 NamespaceTreeStats namespace_tree_stats(const ObjectId& root, const NamespaceNodeStore& store) {

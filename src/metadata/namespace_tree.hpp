@@ -186,10 +186,39 @@ using NamespaceChanges = std::map<std::string, std::optional<FsEntry>>;
 // The spine above changed leaves is recomputed over the whole leaf sequence
 // rather than spliced: unchanged branches re-encode to the same address, so
 // written nodes are only the changed leaves and their paths; the local cost is
-// O(branch nodes) reads and encodes.
+// O(branch nodes) reads and encodes, plus the leaves the changes fall in:
+// leaves between distant changes are not read.
 ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
                                const NamespaceChanges& changes,
                                const NamespaceTreeLimits& limits = {});
+
+// A path whose entry differs between two trees; absent on a side is none.
+struct NamespaceDifference {
+    std::optional<FsEntry> before;
+    std::optional<FsEntry> after;
+};
+using NamespaceDifferences = std::map<std::string, NamespaceDifference>;
+// Every path whose entry differs, extents included. Reads both trees' branch
+// nodes and the leaves only one of them has: the cost follows what differs.
+// Throws DecodeError if a node cannot be read.
+NamespaceDifferences diff_namespace_trees(const ObjectId& before, const ObjectId& after,
+                                          const NamespaceNodeStore& store);
+
+// The three-way merge of tree-backed snapshots, without materialising them:
+// `merge_metadata_snapshots` over the paths that differ from `base` on either
+// branch. `merged.snapshot` carries neither entries nor a root; its namespace
+// is `changes` applied to the tree `onto` (update_namespace_tree), the same
+// root a merge of the materialised namespaces would build.
+struct NamespaceTreeMerge {
+    MetadataMergeResult merged;
+    ObjectId onto{};
+    NamespaceChanges changes;
+};
+NamespaceTreeMerge merge_tree_backed_snapshots(const MetadataSnapshot& base,
+                                               const MetadataSnapshot& left,
+                                               const MetadataSnapshot& right,
+                                               const Hash256& left_head, const Hash256& right_head,
+                                               const NamespaceNodeStore& store);
 
 // Applies a commit's delta to the tree: erases, upserts, then appends, in the
 // order `apply_metadata_delta_in_place` uses. An append whose base extent count
