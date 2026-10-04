@@ -4587,6 +4587,7 @@ class FaultyLinks final : public RpcLinks {
 
     std::map<NodeId, std::pair<MessageType, std::chrono::milliseconds>> slow_ MACHA_GUARDED_BY(mutex_);
     size_t slow_sends_ MACHA_GUARDED_BY(mutex_){};
+    std::map<std::pair<NodeId, TransportLane>, size_t> admitted_ MACHA_GUARDED_BY(mutex_);
   public:
     ~FaultyLinks() override {
         Lock lock(mutex_);
@@ -4660,11 +4661,24 @@ class FaultyLinks final : public RpcLinks {
         {
             Lock lock(mutex_);
             if (held_.contains(peer.id)) {
-                held_installs_.emplace_back(peer.id, std::move(install));
+                held_installs_.emplace_back(peer.id, [this, id = peer.id, lane,
+                                                      install = std::move(install)] {
+                    install();
+                    Lock counted(mutex_);
+                    ++admitted_[{id, lane}];
+                });
                 return;
             }
         }
         network_.admit(peer, lane, std::move(install));
+        Lock lock(mutex_);
+        ++admitted_[{peer.id, lane}];
+    }
+    // Sessions `peer` opened on `lane` that are installed as routes here.
+    size_t admitted(const NodeId& peer, TransportLane lane) const {
+        Lock lock(mutex_);
+        const auto found = admitted_.find({peer, lane});
+        return found == admitted_.end() ? 0 : found->second;
     }
 
     // Calls to `peer` (every one, or only `message`, or only on `lane`) are
@@ -5463,6 +5477,7 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
 
     NetworkLinks network;
     FaultyLinks site_links;
+    FaultyLinks hub_links;
 
     // A peer that knows the node cannot be dialled does not try, and says
     // so at once rather than after a connect timeout.
@@ -5483,7 +5498,7 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
         CHECK(hub.client.stats().connections_created == 0);
     }
 
-    FlagNode hub(network, keys, capable_info(), 2s);
+    FlagNode hub(hub_links, keys, capable_info(), 2s);
     FlagNode site(site_links, keys, incapable_info(), 300ms);
 
     // Control flows both ways over the one session the site opened.
@@ -5513,11 +5528,15 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
     site.client.set_maintained_peers([&] { return std::vector<NodeInfo>{hub.info}; });
     const Endpoint hub_endpoint{hub.info.host, hub.info.port};
     const auto data_dials = site_links.dials(hub_endpoint, TransportLane::data);
+    const auto data_sessions = hub_links.admitted(site.info.id, TransportLane::data);
     site_links.sever(hub_endpoint, TransportLane::data);
+    // Redialled by the site, and installed by the hub: until the hub lists
+    // the new session it has no DATA route and would ask for one.
     REQUIRE(wait_until(
         [&] {
             return site_links.dials(hub_endpoint, TransportLane::data) > data_dials &&
-                   site.client.has_route(hub.info.id, TransportLane::data);
+                   site.client.has_route(hub.info.id, TransportLane::data) &&
+                   hub_links.admitted(site.info.id, TransportLane::data) > data_sessions;
         },
         5s));
     CHECK(hub.client.dial_requests_sent() == 1);
