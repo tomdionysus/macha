@@ -11,7 +11,8 @@
 // Destructive and offline. It quarantines the checkpoint, journal, history,
 // heads and acceptance proof under a timestamped suffix and installs a head
 // with no ancestry. No extent is touched: paths, stat fields and ObjectIds are
-// copied unchanged.
+// copied unchanged. The head carries no retention baseline, so the cluster's
+// first repair claims the tree before destructive GC resumes.
 //
 // Run it on every node, all stopped and converged. The tree's shape depends on
 // the entry set alone, so every node computes the same root independently;

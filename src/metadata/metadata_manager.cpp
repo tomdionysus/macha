@@ -1414,7 +1414,8 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
     MetadataRecord proposed;
     proposed.generation = initial.generation + 1;
     proposed.previous = initial.hash;
-    proposed.payload = encode_snapshot(snapshot);
+    proposed.payload =
+        snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
     proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
     (void)publish_commit(compatible, proposed, {}, FrameType::control);
     Log::info("metadata policy/migration transition committed generation=" +
@@ -2060,10 +2061,11 @@ void MetadataManager::repair_once() {
         }
     }
 
-    // A migrated SM12 cluster has no retention baseline. Establish it only once
-    // every durable participant is at this head; the publication guard
-    // claims every reachable object before the baseline commit is accepted.
-    // Until then destructive mark/sweep is fenced in Service.
+    // A namespace migrated from SM12 or re-rooted onto the tree has no
+    // retention baseline. Establish it only once every durable participant
+    // is at this head; the publication guard claims every reachable object
+    // before the baseline commit is accepted. Until then destructive
+    // mark/sweep is fenced in Service.
     if (all_participants_at_head && !snapshot.retention_baseline_complete) {
         const auto origin = node_.node_id();
         const auto found = snapshot.mutation_sequences.find(origin);
@@ -2081,7 +2083,8 @@ void MetadataManager::repair_once() {
         MetadataRecord baseline_record;
         baseline_record.generation = record.generation + 1;
         baseline_record.previous = record.hash;
-        baseline_record.payload = encode_snapshot(baseline);
+        baseline_record.payload = baseline.namespace_root ? encode_snapshot_v14(baseline)
+                                                          : encode_snapshot(baseline);
         baseline_record.hash = metadata_hash(baseline_record.generation,
                                              baseline_record.previous,
                                              baseline_record.payload);

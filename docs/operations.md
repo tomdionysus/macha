@@ -580,3 +580,11 @@ commits behind it, after proving this node's namespace produces the same tree
 root), and `--dry-run` installs nothing. The previous checkpoint, journal, history, heads and
 acceptance proof are kept beside the originals with a `.pre-migration.<ns>`
 suffix rather than deleted; no extent is touched.
+
+The installed head carries no retention baseline. Once the nodes are started
+and every node the namespace knows (each that has a status or a mutation in
+it, and each active peer) holds that head, metadata repair commits the
+baseline, claiming every tree node and extent the namespace reaches. A
+baseline whose claims cannot be placed at the retention floors is refused and
+retried. The namespace is served and written meanwhile; destructive GC stays
+off until the baseline is committed.
