@@ -1,5 +1,108 @@
 # Current release
 
+## 0.88.0 — a node carries on when another never returns (experiment)
+
+Any node may disappear at any time and may never come back. Writes and
+deletes now proceed with the nodes that are present, reclamation and merging
+wait for no absent node, and a node that is gone for good is forgotten. The
+design and the audits behind it are in
+`TODO/2026-10-05-absent-node-tolerance-design.md` and `TODO/absent-node-audit/`.
+
+**Configuration (breaking).** `dht.min_write_replicas` is now
+`dht.write_copies` and `dht.metadata_min_write_replicas` is
+`dht.metadata_write_copies`; the old names, the legacy `dht.metadata_replicas`
+and their command-line flags are refused as unknown. They are the copies
+*sought* before a write returns, never a condition of it. Nodes configured
+differently share one namespace. `maintenance.garbage_grace_ms` defaults to
+30 days and is the absence horizon described below.
+
+**Mixed versions.** An acceptance certificate now records how many nodes
+held the commit when it was accepted. A 0.87 node refuses a certificate
+whose count differs from its configured floor, so upgrade every node; do not
+run 0.87 and 0.88 together for longer than the upgrade takes.
+
+**On disk.** The known-node roster is written as v4 (each entry gains when
+this node last heard of it); an older build cannot read it. Two new files,
+`<state_path>/retention/unreferenced-data.bin` and
+`unreferenced-control.bin`, record when this node first saw each object it
+holds unreferenced.
+
+**Writes are accepted on the nodes present.** A metadata commit, a merge
+commit, a namespace tree node, a catalogue shard or manifest and a retention
+claim are valid once the committing node holds them. Further copies go to
+the nodes present and are owed to the rest. A lone node, or the survivor of
+any number of losses, keeps reading and writing; what it writes alone exists
+on it alone until a peer is present. A DATA write returns on the copies that
+landed once no further node can take one promptly. One refusal remains: a
+commit that brings new bytes into the namespace is refused when no node
+present holds them (`DATA object is held by no node present before metadata
+publication`), since the writer still has them and puts them again. A
+rename, chmod or append to a file whose older extents live on an absent
+node commits.
+
+**A stalled peer costs one commit, once.** A peer that makes no progress on
+a commit call for `dht.write_stall_ms` is not waited for and is not asked
+again for `network.dead_after_ms`. The acceptance certificate is sent to
+peers only after the committing node has accepted the commit itself.
+
+**Reclamation waits on this node's clock, not on other nodes.** The three
+destructive gates read only this node's own head. The requirements that
+every known node be reachable and that metadata be stable are gone, and so
+are the retention baseline and its participant roster. An object's bytes go
+only once this node has itself seen the object unreferenced and unclaimed
+for `maintenance.garbage_grace_ms`, counted from its own first sighting and
+kept across restarts, so a node back from a long absence removes nothing
+before its own grace has run. The cost, stated plainly: if an object is
+deleted on one side of a separation and still used on the other, and the
+separation outlasts the horizon, the merged file may have extents nobody
+holds; the availability survey reports it incomplete.
+
+**A node unheard of for the horizon is forgotten**, on each node
+independently and never sooner than twice `network.dead_after_ms`. Gossip
+that old does not teach it back; its own connection does. A metadata
+generation advertised only by a node that has gone stops holding caches and
+gates open. Metadata repair no longer waits on a node known only through
+gossip.
+
+**A merge that cannot be made never stops a node.** A second accepted head
+with no known ancestor in common with this node's own, or whose content no
+node present can supply, is set aside until the membership changes. Reads
+serve the node's own head, writes extend it and release follows it. Policy
+values and conflict records changed on both branches join to one answer
+instead of failing the merge.
+
+**Parked work retries by itself.** A FUSE publication parked after its retry
+budget is tried again, with a fresh budget, whenever membership changes or a
+storage backend comes or goes. A torrent request pinned to a node the
+cluster has forgotten may be claimed by any node.
+
+**API.**
+- `cluster.metadata_availability` is `writable` whenever the node has a
+  head; it is never `read-only` for lack of peers.
+  `cluster.metadata_min_write_replicas` and `metadata_quorum_required` keep
+  their names and carry `dht.metadata_write_copies`.
+- New `diagnostics.metadata` fields: `head_holders` and
+  `head_holders_present` (how many of the nodes present held the current
+  head at the last repair pass, and how many were present), and
+  `heads_set_aside`.
+- `metadata_unavailable` (ingest, catalogue, torrents, conflicts) is no
+  longer answered for a missing peer. It remains for a node with no usable
+  namespace yet, and for an ingest whose bytes no node present holds.
+- The media profile routes answer `404 media_engine_unavailable` on a node
+  with no media engine, rather than the node crashing.
+
+**Fixed along the way.** The control collector keeps every node of the
+accepted namespace tree whether or not anything claims it. A reconciliation's
+merge commit claims the tree nodes and conflict alternatives it introduces.
+A pin check in the torrent coordinator iterated two temporary membership
+lists.
+
+**Not in this release.** A node returning after more than the absence
+horizon holds a head with no known ancestor here, which is set aside rather
+than merged; merging it exactly needs the namespace format change planned
+next. History truncation still requires every known node to agree, which now
+resolves itself once an absent node is forgotten.
+
 ## 0.87.3 — a peer that answered is not declared dead by a late reader (experiment)
 
 No wire, protocol, API or on-disk changes.
