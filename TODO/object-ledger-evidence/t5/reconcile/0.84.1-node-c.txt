@@ -1,0 +1,70 @@
+windows=60 idle=21 loaded=39 span_minutes=60 versions=['0.84.1+unknown']
+
+histograms (microseconds unless named _ns)
+  api DELETE /api/v1/playback/sessions/:id: n=51 p50=49151 p90=163839 p99=210794 max=210794 | idle n=17 p50=5119 p99=210024 | loaded n=34 p50=61439 p99=210794 | hourly(2) p50 49151/49151.0/49151 p99 161547/186170.5/210794
+  api DELETE /api/v1/session: n=45 p50=79 p90=95 p99=307 max=307 | idle n=10 p50=79 p99=307 | loaded n=35 p50=79 p99=287 | hourly(2) p50 79/79.0/79 p99 88/197.5/307
+  api GET /api/:other: n=1 p50=21 p90=21 p99=21 max=21 | loaded n=1 p50=21 p99=21
+  api GET /api/v1/catalogue/items: n=23 p50=589823 p90=1572863 p99=27513933 max=27513933 | idle n=4 p50=589823 p99=655359 | loaded n=19 p50=589823 p99=27513933
+  api GET /api/v1/catalogue/items/:id: n=4 p50=55 p90=72 p99=72 max=72 | idle n=4 p50=55 p99=72
+  api GET /api/v1/health: n=836 p50=19 p90=35 p99=103 max=561 | idle n=303 p50=21 p99=111 | loaded n=533 p50=19 p99=87 | hourly(2) p50 19/20.0/21 p99 79/95.0/111
+  api GET /api/v1/playback/sessions/:id: n=1031 p50=447 p90=2303 p99=7167 max=11911 | idle n=327 p50=511 p99=7679 | loaded n=704 p50=415 p99=7167 | hourly(2) p50 383/431.0/479 p99 6655/6911.0/7167
+  api GET /api/v1/playback/status: n=23 p50=159 p90=223 p99=329 max=329 | idle n=5 p50=159 p99=207 | loaded n=18 p50=159 p99=329
+  api GET /api/v1/session: n=2 p50=71 p90=182 p99=182 max=182 | idle n=2 p50=71 p99=182
+  api GET /api/v1/status: n=4 p50=1151 p90=1948 p99=1948 max=1948 | idle n=4 p50=1151 p99=1948
+  api GET web: n=50 p50=111 p90=207 p99=50464 max=50464 | idle n=7 p50=351 p99=50464 | loaded n=43 p50=111 p99=479
+  api PATCH /api/v1/playback/sessions/:id: n=226 p50=3407871 p90=14680063 p99=15361663 max=15361663 | idle n=77 p50=9437183 p99=15361663 | loaded n=149 p50=458751 p99=15361663 | hourly(2) p50 458751/2326527.0/4194303 p99 15361663/15361663.0/15361663
+  api POST /api/v1/playback/sessions: n=162 p50=1791 p90=3145727 p99=15728639 max=23456144 | idle n=37 p50=1663 p99=23456144 | loaded n=125 p50=2303 p99=9437183 | hourly(2) p50 1663/2367.0/3071 p99 15042780/19249462.0/23456144
+  api POST /api/v1/session: n=46 p50=158921 p90=158921 p99=158921 max=158921 | idle n=10 p50=158921 p99=158921 | loaded n=36 p50=158921 p99=158921 | hourly(2) p50 157470/158195.5/158921 p99 157470/158195.5/158921
+  api POST web: n=7 p50=39 p90=47 p99=47 max=47 | loaded n=7 p50=39 p99=47
+  availability.rollup_us: n=8 p50=5242879 p90=11385625 p99=11385625 max=11385625 | idle n=4 p50=7340031 p99=11385625 | loaded n=4 p50=4718591 p99=6851520
+  availability.survey_us: n=181 p50=7340031 p90=13631487 p99=20971519 max=22792935 | idle n=54 p50=7864319 p99=22792935 | loaded n=127 p50=6815743 p99=18874367 | hourly(2) p50 6815743/7077887.0/7340031 p99 20971519/21882227.0/22792935
+  claim.data_barrier_us: n=22 p50=425983 p90=1179647 p99=1232349 max=1232349 | loaded n=22 p50=425983 p99=1232349
+  maintenance.claim_walk.examine_us: n=1088 p50=1 p90=15 p99=959 max=117258 | idle n=32 p50=1 p99=19 | loaded n=1056 p50=1 p99=959 | hourly(2) p50 1/1.0/1 p99 239/10359.0/20479
+  maintenance.gc.per_object_ns: n=12 p50=3839 p90=4607 p99=9156 max=9156 | idle n=2 p50=3583 p99=3839 | loaded n=10 p50=3839 p99=9156
+  maintenance.gc.step_us: n=13 p50=239 p90=319 p99=586 max=586 | idle n=2 p50=223 p99=239 | loaded n=11 p50=239 p99=586
+  maintenance.inventory.build_us: n=31 p50=1703935 p90=3145727 p99=4096222 max=4096222 | idle n=4 p50=1572863 p99=3670015 | loaded n=27 p50=1703935 p99=4096222
+  maintenance.release_horizon.build_us: n=30 p50=1441791 p90=3145727 p99=4265090 max=4265090 | idle n=3 p50=1441791 p99=1441791 | loaded n=27 p50=1572863 p99=4265090
+  maintenance.repair.step_us.idle: n=5 p50=2621439 p90=4267680 p99=4267680 max=4267680 | loaded n=5 p50=2621439 p99=4267680
+  maintenance.repair.step_us.loaded: n=28 p50=589823 p90=27262975 p99=119836392 max=119836392 | loaded n=28 p50=589823 p99=119836392
+  metadata.reconcile_us: n=19 p50=29360127 p90=41943039 p99=47457211 max=47457211 | idle n=4 p50=37748735 p99=37748735 | loaded n=15 p50=27262975 p99=47457211
+  metadata.reconcile_wait_us: n=43 p50=23068671 p90=50331647 p99=64956819 max=64956819 | idle n=8 p50=1 p99=37748735 | loaded n=35 p50=23068671 p99=64956819
+  playback.create_us: n=46 p50=524287 p90=3407871 p99=4476718 max=4476718 | idle n=13 p50=2359295 p99=3670015 | loaded n=33 p50=393215 p99=4476718 | hourly(2) p50 294911/409599.0/524287 p99 4212451/4344584.5/4476718
+  playback.first_fragment_us: n=247 p50=458751 p90=11534335 p99=14861355 max=14861355 | idle n=78 p50=3145727 p99=14803121 | loaded n=169 p50=294911 p99=14680063 | hourly(2) p50 327679/425983.0/524287 p99 14030955/14446155.0/14861355
+
+counters (total, per minute)
+  claim.data_barrier.ids: 176 (2.93/min)
+  maintenance.claim_walk.examined: 1088 (18.13/min)
+  maintenance.gc.examined: 768 (12.80/min)
+  maintenance.inventory.live_objects: 26791945 (446513.44/min)
+  maintenance.repair.bytes.idle: 12582912 (209706.29/min)
+  maintenance.repair.bytes.loaded: 33554432 (559216.77/min)
+  maintenance.repair.push_examined.idle: 3 (0.05/min)
+  maintenance.repair.push_examined.loaded: 82 (1.37/min)
+  playback.seek_fastpath.taken: 227 (3.78/min)
+  retention.released.control: 832 (13.87/min)
+  retention.released.data: 133 (2.22/min)
+
+gauges
+  foreground_idle_ms: min=6 median=1002.0 max=93283
+  fuse_parked_publications: min=0 median=0.0 max=0
+  fuse_publication_bytes_committed: 738197504 (12511281.36/min, 0 reset(s))
+  fuse_publication_bytes_confirmed: 738197504 (12511281.36/min, 0 reset(s))
+  fuse_publications_completed: 22 (0.37/min, 0 reset(s))
+  fuse_spool_bytes: min=0 median=0.0 max=33554432
+  interactive_idle_ms: min=91 median=7135.5 max=86400000
+  loader_idle_ms: min=614 median=79717.5 max=86400000
+  maintenance_wakeups: 655 (11.10/min, 0 reset(s))
+  repair_bytes_transferred: 46137344 (781955.08/min, 0 reset(s))
+  repair_gate_credit: 16 (0.27/min, 0 reset(s))
+  repair_gate_ran: 34 (0.58/min, 0 reset(s))
+  repair_gate_share: 622 (10.54/min, 0 reset(s))
+  repair_passes_completed: 0 (0.00/min, 0 reset(s))
+  repair_prompt_copies: 168 (2.85/min, 0 reset(s))
+  repair_pull_examined: 0 (0.00/min, 0 reset(s))
+  repair_pull_unsourceable: 0 (0.00/min, 0 reset(s))
+  repair_push_examined: 85 (1.44/min, 0 reset(s))
+  rss_bytes: min=615776256 median=1284521984.0 max=1693925376
+
+events
+  1791099186737 services_ready {"elapsed_ms": 55154}
+  1791099221929 cluster_stable {"elapsed_ms": 90347}
