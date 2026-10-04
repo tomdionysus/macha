@@ -823,4 +823,142 @@ MACHA_HEAVY_TEST("namespace_migration", test_the_control_collector_keeps_an_uncl
     s1.stop();
 }
 
+// A reconciliation's merge commit claims what it introduces before it is
+// published: the tree nodes it adds to its primary parent and the extents of
+// the conflict alternatives it records, under a dot of its own that its
+// clock does not carry and a later head of this node's covers.
+MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
+    TestCluster cluster;
+    auto config = cluster.node_config("merge-claims");
+    make_solo(config);
+    NodeId node_id{};
+    FsEntry first;
+    FsEntry second;
+    {
+        Service service(config, cluster.keys(), test_durability_window);
+        service.start();
+        node_id = service.node().node_id();
+        service.filesystem().mkdir("/Films", 0755, getuid(), getgid());
+        for (int i = 0; i < 60; ++i)
+            service.filesystem().mkdir("/Films/" + std::to_string(i), 0755, getuid(), getgid());
+        write_file(service, "/first.bin", pattern(256 * 1024, 101));
+        write_file(service, "/second.bin", pattern(256 * 1024, 102));
+        first = service.filesystem().getattr("/first.bin");
+        second = service.filesystem().getattr("/second.bin");
+        service.filesystem().unlink("/first.bin");
+        service.filesystem().unlink("/second.bin");
+        service.stop();
+    }
+    REQUIRE(!first.extents.empty());
+    REQUIRE(!second.extents.empty());
+    (void)migrate_state(config, cluster.keys(), {node_id});
+    // Started once so whatever a migrated namespace is due is done, then
+    // every claim is lost.
+    {
+        Service service(config, cluster.keys(), test_durability_window);
+        service.start();
+        REQUIRE(wait_until(
+            [&] { return service.metadata_manager().snapshot().retention_baseline_complete; },
+            30s));
+        service.stop();
+    }
+    std::filesystem::remove_all(config.state_path / "retention");
+
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    auto& claims = service.local_state().retention();
+    for (const auto* entry : {&first, &second})
+        for (const auto& extent : entry->extents)
+            REQUIRE(!claims.retained(RetentionClass::data, extent.id));
+
+    // Two branches from one head, each adding a directory of its own and a
+    // different file at the same path. Each claims the tree nodes it wrote,
+    // as its commit would.
+    auto& replica = service.local_state().replica();
+    const auto base = replica.committed();
+    const auto base_snapshot = decode_snapshot(base.payload);
+    REQUIRE(base_snapshot.namespace_root.has_value());
+    auto nodes = ControlNamespaceNodeStore::for_commit(service.local_state().control(),
+                                                       service.filesystem().store(), 1);
+    const auto make_branch = [&](const std::string& directory, const FsEntry& disputed) {
+        MetadataDelta delta;
+        delta.upsert_entries[directory] = make_directory(7);
+        delta.upsert_entries["/disputed.bin"] = disputed;
+        auto snapshot = base_snapshot;
+        snapshot.namespace_root =
+            apply_delta_to_namespace_tree(*base_snapshot.namespace_root, nodes, delta);
+        const auto sequence = ++snapshot.mutation_sequences[node_id];
+        std::vector<ObjectId> written;
+        collect_namespace_tree_changes(base_snapshot.namespace_root, *snapshot.namespace_root,
+                                       nodes, written);
+        claims.retain_batch(RetentionClass::control, written, RetentionDot{node_id, sequence});
+
+        MetadataRecord branch;
+        branch.generation = base.generation + 1;
+        branch.previous = base.hash;
+        branch.payload = encode_snapshot_v14(snapshot);
+        branch.hash = metadata_hash(branch.generation, branch.previous, branch.payload);
+        REQUIRE(replica.store_commit(branch));
+        MetadataAcceptance acceptance;
+        acceptance.generation = branch.generation;
+        acceptance.hash = branch.hash;
+        acceptance.required = 1;
+        acceptance.replicas = {node_id};
+        REQUIRE(service.metadata_server().accept_commit(acceptance));
+        return std::pair{branch, snapshot};
+    };
+    const auto left_branch = make_branch("/Films/left", first);
+    const auto right_branch = make_branch("/Films/right", second);
+    const auto& [left, left_snapshot] = left_branch;
+    const auto& right_snapshot = right_branch.second;
+    const auto left_generation = left.generation;
+
+    REQUIRE(wait_until(
+        [&] {
+            try {
+                (void)service.metadata_manager().read_record();
+                const auto heads = replica.accepted_heads();
+                return heads.size() == 1 && heads.front().generation > left_generation;
+            } catch (const std::exception&) {
+                return false;
+            }
+        },
+        10s));
+    const auto head = replica.accepted_heads().front();
+    const auto merged = decode_snapshot(head.payload);
+    REQUIRE(merged.merge_parents.size() == 1);
+    REQUIRE(merged.namespace_root.has_value());
+    // A pure join: the clock is the branches', so any reconciler mints it.
+    CHECK(merged.mutation_sequences == left_snapshot.mutation_sequences);
+    const auto merged_sequence = merged.mutation_sequences.at(node_id);
+
+    const auto& primary = head.previous == left.hash ? left_snapshot : right_snapshot;
+    std::vector<ObjectId> introduced;
+    collect_namespace_tree_changes(primary.namespace_root, *merged.namespace_root,
+                                   service.filesystem().namespace_nodes(), introduced);
+    REQUIRE(!introduced.empty());
+    for (const auto& node : introduced) {
+        const auto held = claims.claims(RetentionClass::control, node);
+        const auto add = held.adds.find(node_id);
+        REQUIRE(add != held.adds.end());
+        // Beyond this head's clock: a release at this head keeps it.
+        CHECK(add->second > merged_sequence);
+    }
+    REQUIRE(!merged.conflicts.empty());
+    for (const auto* entry : {&first, &second})
+        for (const auto& extent : entry->extents)
+            CHECK(claims.retained(RetentionClass::data, extent.id));
+
+    // This node's next mutation is a head whose clock covers the merge's dot.
+    service.filesystem().mkdir("/after-merge", 0755, getuid(), getgid());
+    const auto after = service.metadata_manager().snapshot();
+    for (const auto& node : introduced)
+        CHECK(after.mutation_sequences.at(node_id) >=
+              claims.claims(RetentionClass::control, node).adds.at(node_id));
+    CHECK(service.filesystem().getattr("/Films/left").type == EntryType::directory);
+    CHECK(service.filesystem().getattr("/Films/right").type == EntryType::directory);
+    service.stop();
+}
+
 } // namespace
