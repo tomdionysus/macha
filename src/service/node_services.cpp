@@ -368,10 +368,11 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
             data.insert(data.end(), objects.data.begin(), objects.data.end());
             control.insert(control.end(), objects.control.begin(), objects.control.end());
         }
-        // A reconciliation may preserve catalogue conflict alternatives which
-        // are not the effective root. New alternatives must be retained before
-        // the merge commit can become accepted.
-        if (!context.delta) {
+        // A merge (and a commit without a delta) may introduce conflict
+        // alternatives: catalogue roots that are not the effective root, and
+        // namespace entries whose extents no path names. New ones must be
+        // retained before the commit can become accepted.
+        if (!context.delta || !context.proposed.merge_parents.empty()) {
             auto before_roots = metadata_catalogue_root_set(before);
             auto after_roots = metadata_catalogue_root_set(context.proposed);
             for (const auto& root : after_roots) {
@@ -381,6 +382,10 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
                 data.insert(data.end(), objects.data.begin(), objects.data.end());
                 control.insert(control.end(), objects.control.begin(), objects.control.end());
             }
+            const auto before_extents = metadata_conflict_extent_roots(before);
+            for (const auto& extent : metadata_conflict_extent_roots(context.proposed))
+                if (!before_extents.contains(extent))
+                    data.push_back(extent);
         }
     }
 
