@@ -2922,6 +2922,8 @@ class CommitGate {
     struct Hold {
         std::string name;
         size_t skip{};
+        // Only a path ending in the name: a file's final name, not its partial.
+        bool ending{};
     };
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -2932,6 +2934,11 @@ class CommitGate {
     void hold(std::string name, size_t skip = 0) {
         std::lock_guard lock(mutex_);
         holds_.push_back({std::move(name), skip});
+    }
+
+    void hold_ending(std::string name) {
+        std::lock_guard lock(mutex_);
+        holds_.push_back({std::move(name), 0, true});
     }
 
     void release_all() {
@@ -2954,7 +2961,8 @@ class CommitGate {
         bool block = false;
         for (auto& hold : holds_) {
             const bool named = std::any_of(paths.begin(), paths.end(), [&](std::string_view path) {
-                return path.find(hold.name) != std::string_view::npos;
+                return hold.ending ? path.ends_with(hold.name)
+                                   : path.find(hold.name) != std::string_view::npos;
             });
             if (!named) continue;
             if (hold.skip) --hold.skip;
@@ -3094,6 +3102,56 @@ MACHA_TEST("hydration_catalogue", test_ingest_plans_destinations_and_imports_fil
         CHECK(martian_folders == 1);
     }
     ingest.stop();
+}
+
+MACHA_TEST("hydration_catalogue", test_a_pause_or_cancel_accepted_during_the_final_rename_stands) {
+    // The worker is past its last control check, inside the commit that
+    // renames its finished copy into place, when the job is paused or
+    // cancelled: the answer given must hold once the worker comes out.
+    for (const bool cancel : {true, false}) {
+        CommitGate gate;
+        CatalogueNode node(cancel ? "ingest-late-cancel" : "ingest-late-pause", {},
+                           [&](const MetadataPublicationContext& context) { gate(context); });
+        const auto roots = make_import_roots(node.path(), 1, 256 * 1024);
+        gate.hold_ending("Concurrent Movie 0 2024.mkv");
+
+        IngestConfig config;
+        config.enabled = true;
+        config.staging_path = node.path() / "staging";
+        config.source_roots = roots;
+        config.max_concurrent_jobs = 1;
+        IngestManager ingest(node.node(), node.filesystem(), node.hints(), config);
+        struct ReleaseGate {
+            CommitGate& gate;
+            ~ReleaseGate() { gate.release_all(); }
+        } release_gate{gate};
+        const auto id = ingest.submit_path(roots.front());
+        ingest.start();
+        REQUIRE(wait_until([&] { return gate.held() == 1; }, 30s));
+        REQUIRE(ingest.job(id)->state == IngestJobState::importing);
+
+        REQUIRE(cancel ? ingest.cancel(id) : ingest.pause(id));
+        const auto asked = cancel ? IngestJobState::cancelled : IngestJobState::paused;
+        CHECK(ingest.job(id)->state == asked);
+        gate.release_all();
+        REQUIRE(wait_until([&] { return ingest.active_jobs() == 0; }, 30s));
+
+        const auto job = ingest.job(id);
+        REQUIRE(job.has_value());
+        CHECK(job->state == asked);
+        // The copy that finished is on record under that state.
+        CHECK(job->files_completed == 1);
+        if (!cancel) {
+            REQUIRE(ingest.resume(id));
+            REQUIRE(wait_until(
+                [&] {
+                    const auto resumed = ingest.job(id);
+                    return resumed && (resumed->state == IngestJobState::cataloguing ||
+                                       resumed->state == IngestJobState::completed);
+                },
+                30s));
+        }
+    }
 }
 
 MACHA_TEST("hydration_catalogue", test_ingest_job_control_acts_on_workers_held_mid_copy) {
