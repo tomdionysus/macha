@@ -305,6 +305,24 @@ bool has_fuse_gauges(const std::map<std::string, uint64_t>& gauges) {
 
 // What an observation window samples of the services: how long each class
 // has been idle, repair's figures, and the mount's while one is published.
+MACHA_TEST("node_services", test_a_node_without_streaming_says_it_cannot_profile) {
+    // Streaming off: no engine. A profile for a file this node holds cannot be
+    // made here, and the node says so instead of failing the file.
+    ServicesBench bench([](Config& config) {
+        with_media(config);
+        config.streaming.enabled = false;
+    });
+    auto& services = *bench.services;
+    auto& fs = services.filesystem();
+    write_file(fs, "/film.mkv", pattern(64 * 1024, 7));
+    const auto media_id = file_media_id(fs.getattr("/film.mkv"));
+    const auto answered = services.catalogue_api().handle(
+        request("GET", "/api/v1/catalogue/media/" + media_id + "/profile"));
+    CHECK(answered.status == 503);
+    CHECK(text_of(answered).find("media_engine_unavailable") != std::string::npos);
+    CHECK(!services.catalogue().media_profile(media_id).has_value());
+}
+
 MACHA_TEST("node_services", test_observation_gauges_follow_activity_repair_and_the_mount) {
     ServicesBench bench([](Config& config) { config.fuse.publication_quiet = 0ms; });
     auto& services = *bench.services;

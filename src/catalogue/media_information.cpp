@@ -207,6 +207,7 @@ MediaProbeResult MediaInformationService::resolve(
     std::string media_id, std::string path, FsEntry entry, bool foreground,
     Clock::time_point deadline) {
     if (auto stored = catalogue_.media_profile(media_id)) return *stored;
+    if (!engine_ || !engine_->status().available) throw MediaEngineUnavailable();
 
     std::shared_ptr<Flight> flight;
     {

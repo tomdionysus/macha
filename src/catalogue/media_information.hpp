@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <stdexcept>
+
 #include "catalogue/catalogue.hpp"
 #include "contract/thread_safety.hpp"
 #include "catalogue/catalogue_hints.hpp"
@@ -16,6 +18,13 @@
 #include <thread>
 
 namespace macha {
+
+// This node has no media engine (streaming is off), so it cannot probe.
+class MediaEngineUnavailable : public std::runtime_error {
+  public:
+    MediaEngineUnavailable() : std::runtime_error("this node has no media engine") {}
+};
+
 
 // The container keeps no byte index (only MP4 and Matroska do).
 class KeyframeIndexUnsupported : public std::runtime_error {
