@@ -83,6 +83,16 @@ class TempDir {
     const std::filesystem::path& path() const { return path_; }
 };
 
+// The runner's per-run salt, inherited by every case it runs; set
+// MACHA_TEST_PORT_SALT to reproduce a run's exact ports and keys.
+inline uint64_t runner_salt() {
+    static const uint64_t salt = [] {
+        const char* value = std::getenv("MACHA_TEST_PORT_SALT");
+        return value ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    return salt;
+}
+
 inline uint16_t free_port() {
     // Each case gets its own 64-port block, so no other test can claim a probed
     // port before the server binds it. Candidates are still bind-probed because
@@ -91,14 +101,11 @@ inline uint16_t free_port() {
     constexpr uint16_t first = 20000;
     constexpr uint16_t block = 64;
     constexpr uint16_t blocks = 600; // 20000..58399
-    // The runner's per-run salt keeps two runners on one machine out of each
-    // other's blocks; otherwise they would share ports and cluster key, and merge.
-    static const uint64_t runner_salt = [] {
-        const char* value = std::getenv("MACHA_TEST_PORT_SALT");
-        return value ? std::strtoull(value, nullptr, 10) : 0ULL;
-    }();
+    // The salt shifts which cases of two runners on one machine land on the
+    // same block; it cannot keep them apart, there being more cases than
+    // blocks. What keeps their nodes apart is the key (write_key).
     const auto case_block =
-        static_cast<uint16_t>((macha::test::case_index() + runner_salt) % blocks);
+        static_cast<uint16_t>((macha::test::case_index() + runner_salt()) % blocks);
 
     int last_bind_error = 0;
     for (uint16_t attempt = 0; attempt < block; ++attempt) {
@@ -129,7 +136,10 @@ inline uint16_t free_port() {
 inline void write_key(const std::filesystem::path& path) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     REQUIRE(out.good());
-    out << "macha deterministic test cluster key\n";
+    // One key per runner and case: a node of another run on this machine
+    // that reaches one of this case's ports fails the handshake instead of
+    // joining its cluster.
+    out << "macha test cluster key " << runner_salt() << ' ' << macha::test::case_index() << '\n';
     REQUIRE(out.good());
 }
 

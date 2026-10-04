@@ -1,5 +1,21 @@
 # Current release
 
+## 0.87.3 — a peer that answered is not declared dead by a late reader (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The liveness check aborted a route whose ping had been answered.** The
+health pass tested a probe's deadline before it looked at whether the
+reply had arrived, so a pass that ran late (a slow dial for another peer,
+a starved thread) closed a healthy route and failed every call pending on
+it with `peer channel closed`. An answered ping is now read however late;
+the deadline is for a peer that has not answered. An attempt's budget
+starts when its ping is placed, not when the pass began.
+
+**Tests.** Each test case's cluster key is derived from the runner's salt
+and the case index, so two test runs on one machine, which can share a
+port block, can no longer join each other's clusters.
+
 ## 0.87.2 — a session or account change is not dropped on a busy moment (experiment)
 
 No wire, protocol, API or on-disk changes.
