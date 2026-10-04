@@ -165,7 +165,7 @@ The cache may retain a useful fetched copy independently, but that cache copy do
 
 ## Garbage collection
 
-Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards, and every namespace tree node reachable from a tree-backed root, contribute to a separate CONTROL live set; a tree node that cannot be read marks that set incomplete and nothing is released against it.
+Committed metadata is reachability authority. MachaDFS file extents and catalogue artwork contribute to the DATA live set. Catalogue manifests/shards, and every namespace tree node reachable from a tree-backed root, contribute to a separate CONTROL live set, both in the maintenance inventory the collector sweeps against and in the release horizon claims are released against. A tree node that cannot be read leaves the inventory unbuilt and the release horizon incomplete, so nothing is collected or released against a partial set.
 
 Objects that become unreachable are protected for `maintenance.garbage_grace_ms` before physical reclamation. This protects failed publications, convergence lag and recently retired references. DATA and CONTROL are swept separately.
 
