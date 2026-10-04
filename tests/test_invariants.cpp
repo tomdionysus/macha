@@ -892,6 +892,19 @@ MACHA_TEST("invariants", test_service_answers_health_and_status_through_startup)
     REQUIRE(wait_until([&] { return service.ready(); }, 10s));
     CHECK(status_json().find("startup")->find("phase")->asString() == "ready");
 
+    // Once a maintenance pass has run, Status says what it did with repair.
+    {
+        const auto repair = [&] {
+            return *status_diagnostics_response(port, service).find("diagnostics")->find("repair");
+        };
+        REQUIRE(wait_until([&] { return repair().find("pace")->asString() != "unknown"; }, 10s));
+        const auto now = repair();
+        const auto pace = now.find("pace")->asString();
+        CHECK((pace == "running" || pace == "paced" || pace == "settling" ||
+               pace == "awaiting_credit"));
+        CHECK((pace == "paced") == !now.find("paced_by")->asArray().empty());
+    }
+
     // Serving: 200 and the same marker, still without a token; the cluster's
     // shape needs one. The probe works cross-origin too.
     const auto health = raw_http_get(port, "/api/v1/health");

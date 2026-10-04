@@ -52,6 +52,17 @@ class DistributedStore final : public Placement, public ControlObjectSource {
 
     // A cumulative count plus a bounded sample of ids, so Status can show
     // whether anything is unreachable.
+    // Why a pass's repair step did or did not run: it ran; a higher class
+    // held repair to its share; repair is waiting out the quiet period after
+    // one; or its transfer credit could not cover the next extent.
+    enum class RepairGate : uint8_t { ran, share, quiescent, credit };
+    // The higher classes that can hold repair to its share.
+    enum RepairPacedBy : uint8_t {
+        paced_by_playback = 1,
+        paced_by_mounted_filesystem = 2,
+        paced_by_loader = 4,
+        paced_by_peer_playback = 8,
+    };
     struct RepairDiagnostics {
         uint64_t pull_unsourceable{};
         uint64_t local_unreadable{};
@@ -69,6 +80,10 @@ class DistributedStore final : public Placement, public ControlObjectSource {
         uint64_t gate_quiescent{};
         uint64_t gate_credit{};
         uint64_t last_credit_bytes{};
+        // The latest of those gates, none before the first pass, and when it
+        // was `share`, the higher classes active then (RepairPacedBy bits).
+        std::optional<RepairGate> last_gate;
+        uint8_t paced_by{};
         // Prompt replication (copy of each new object to a second owner),
         // cumulative since start.
         uint64_t prompt_queued{};
@@ -206,6 +221,7 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     std::atomic_uint64_t repair_gate_quiescent_{};
     std::atomic_uint64_t repair_gate_credit_{};
     std::atomic_uint64_t repair_last_credit_{};
+    std::atomic_uint16_t repair_last_gate_{};
     // Decision trace for repair: each copy pushed, pull and local drop, in
     // decision order (verifications are not decisions). Set once before
     // maintenance starts.
@@ -216,10 +232,13 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     }
 
   public:
-    enum class RepairGate { ran, share, quiescent, credit };
-    void note_repair_gate(RepairGate gate, double credit) noexcept {
+    void note_repair_gate(RepairGate gate, double credit, uint8_t paced_by = 0) noexcept {
         repair_last_credit_.store(static_cast<uint64_t>(std::max(0.0, credit)),
                                   std::memory_order_relaxed);
+        // One word, so a reader never pairs a gate with another pass's classes.
+        repair_last_gate_.store(static_cast<uint16_t>(0x100U | (static_cast<unsigned>(gate) << 4) |
+                                                      (paced_by & 0xFU)),
+                                std::memory_order_relaxed);
         switch (gate) {
         case RepairGate::ran: repair_gate_ran_.fetch_add(1, std::memory_order_relaxed); break;
         case RepairGate::share: repair_gate_share_.fetch_add(1, std::memory_order_relaxed); break;
