@@ -1287,21 +1287,36 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                                             reconciliation.payload);
 
         Bytes reconciliation_delta;
-        const auto* primary_snapshot =
-            left_materialized->record.hash == reconciliation.previous
-                ? left_materialized->snapshot.get()
-                : right_materialized->snapshot.get();
+        const auto& primary =
+            left_materialized->record.hash == reconciliation.previous ? *left_materialized
+                                                                      : *right_materialized;
         // A tree merge knows its namespace changes against the primary parent.
         // A merge of materialised trees does not, and is published whole.
-        if (auto delta = tree_merge ? tree_merge_delta(*primary_snapshot, merged.snapshot,
-                                                       tree_merge->changes)
-                         : tree_backed ? std::nullopt
-                                       : metadata_delta(*primary_snapshot, merged.snapshot)) {
+        const auto delta =
+            tree_merge ? tree_merge_delta(*primary.snapshot, merged.snapshot, tree_merge->changes)
+            : tree_backed ? std::nullopt
+                          : metadata_delta(*primary.snapshot, merged.snapshot);
+        if (delta) {
             auto encoded = encode_metadata_delta(*delta);
             if (encoded.size() < reconciliation.payload.size())
                 reconciliation_delta = std::move(encoded);
         }
         const auto encode_ms = stage_ms();
+
+        // The merge claims what it introduces before it is published, as a
+        // mutation does. Its dot is a fresh local sequence the merged clock
+        // does not carry, so every reconciler still mints the same commit and
+        // no earlier release here can void the claim; the head that carries
+        // this node's next mutation covers it.
+        if (publication_retention_) {
+            const auto origin = node_.node_id();
+            const auto seen = merged.snapshot.mutation_sequences.find(origin);
+            const auto sequence = local_.replica().reserve_mutation_sequence(
+                seen == merged.snapshot.mutation_sequences.end() ? 0 : seen->second);
+            publication_retention_(MetadataPublicationContext{
+                origin, sequence, primary.record, merged.snapshot, delta ? &*delta : nullptr});
+        }
+        const auto retention_ms = stage_ms();
         (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
         const auto publish_ms = stage_ms();
         if (merged.conflicts_superseded)
@@ -1315,6 +1330,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                   " merge_ms=" + std::to_string(merge_ms) +
                   " tree_ms=" + std::to_string(tree_ms) +
                   " encode_ms=" + std::to_string(encode_ms) +
+                  " retention_ms=" + std::to_string(retention_ms) +
                   " publish_ms=" + std::to_string(publish_ms) +
                   " history_body=" +
                   std::string(reconciliation_delta.empty() ? "full" : "delta") +
