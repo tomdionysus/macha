@@ -642,6 +642,139 @@ MACHA_TEST("invariants", test_provider_search_and_artwork_choice) {
     }
 }
 
+// ManageApi over a MusicBrainz release's tracks: the release's own order, the
+// track's title, a null length where MusicBrainz gives none, and the provider
+// routes' codes for each refusal.
+MACHA_TEST("invariants", test_provider_release_tracks) {
+    CatalogueBench bench("manage-release-tracks");
+    const std::string release = "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d41";
+    const std::string other = "11111111-2222-4333-8444-555555555555";
+    const auto tracks_path = [](std::string_view id) {
+        return "/api/v1/manage/providers/musicbrainz/releases/" + std::string(id) + "/tracks";
+    };
+    const auto get = [&](ManageApi& manage, const std::string& path) {
+        auto response = manage.handle(request_for("GET", path));
+        return std::pair{response.status, body_json(response)};
+    };
+
+    {
+        auto http = std::make_unique<FakeHttpClient>();
+        auto* http_ptr = http.get();
+        http->add("musicbrainz.org/ws/2/release/" + release, 200, "application/json",
+                  R"JSON({"id":")JSON" + release + R"JSON(","title":"Two Discs","media":[
+                      {"position":1,"tracks":[
+                          {"position":1,"title":"Opening","length":215000,
+                           "recording":{"id":"aaaaaaaa-0000-4000-8000-000000000001",
+                                        "title":"Opening (album version)","length":216000}},
+                          {"position":2,"title":"Untimed","length":null,
+                           "recording":{"id":"aaaaaaaa-0000-4000-8000-000000000002",
+                                        "title":"Untimed","length":null}}]},
+                      {"position":2,"tracks":[
+                          {"position":1,"title":"Second Disc","length":90500,
+                           "recording":{"id":"aaaaaaaa-0000-4000-8000-000000000003",
+                                        "title":"Second Disc"}}]}]})JSON");
+        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
+                                     std::move(http));
+        ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
+                         bench.hints(), *scanner);
+
+        auto [status, body] = get(manage, tracks_path(release));
+        REQUIRE(status == 200);
+        CHECK(body.find("status")->asString() == "ok");
+        CHECK(body.asObject().size() == 2);
+        const auto& tracks = body.find("tracks")->asArray();
+        REQUIRE(tracks.size() == 3);
+        struct Expected {
+            int64_t disc;
+            int64_t track;
+            const char* title;
+            std::optional<int64_t> length_ms;
+            const char* recording_id;
+        };
+        const std::vector<Expected> expected{
+            {1, 1, "Opening", 215000, "aaaaaaaa-0000-4000-8000-000000000001"},
+            {1, 2, "Untimed", std::nullopt, "aaaaaaaa-0000-4000-8000-000000000002"},
+            {2, 1, "Second Disc", 90500, "aaaaaaaa-0000-4000-8000-000000000003"},
+        };
+        for (size_t i = 0; i < expected.size(); ++i) {
+            std::cerr << "row: " << expected[i].title << "\n";
+            CHECK(tracks[i].asObject().size() == 5);
+            CHECK(tracks[i].find("disc_number")->asInt64() == expected[i].disc);
+            CHECK(tracks[i].find("track_number")->asInt64() == expected[i].track);
+            CHECK(tracks[i].find("title")->asString() == expected[i].title);
+            if (expected[i].length_ms)
+                CHECK(tracks[i].find("length_ms")->asInt64() == *expected[i].length_ms);
+            else
+                CHECK(tracks[i].find("length_ms")->isNull());
+            CHECK(tracks[i].find("recording_id")->asString() == expected[i].recording_id);
+        }
+        CHECK(http_ptr->requests() == 1);
+
+        // A malformed id is refused before any request to MusicBrainz.
+        for (const char* malformed : {"not-an-mbid", "0f9a7b22-3c3e-4f5e-9d1a-2b8e6f7c5d4",
+                                      "0f9a7b22_3c3e_4f5e_9d1a_2b8e6f7c5d41"}) {
+            std::tie(status, body) = get(manage, tracks_path(malformed));
+            CHECK(status == 400);
+            CHECK(error_code(body) == "bad_ref");
+        }
+        CHECK(http_ptr->requests() == 1);
+
+        // Only MusicBrainz releases are a resource here, and only to read.
+        std::tie(status, body) =
+            get(manage, "/api/v1/manage/providers/tmdb/releases/" + release + "/tracks");
+        CHECK(status == 404);
+        CHECK(error_code(body) == "not_found");
+        CHECK(manage.handle(request_for("POST", tracks_path(release), "{}")).status == 404);
+
+        // Reading it makes the node call MusicBrainz: a manager's request.
+        HttpRequest request;
+        request.method = "GET";
+        request.path = tracks_path(release);
+        CHECK(Service::required_role(request) == role_manager);
+    }
+    {
+        // MusicBrainz has no such release.
+        auto http = std::make_unique<FakeHttpClient>();
+        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
+                                     std::move(http));
+        ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
+                         bench.hints(), *scanner);
+        auto [status, body] = get(manage, tracks_path(release));
+        CHECK(status == 404);
+        CHECK(error_code(body) == "provider_not_found");
+    }
+    {
+        // MusicBrainz failing opens the gate's circuit: the next release is
+        // refused without a request.
+        auto http = std::make_unique<FakeHttpClient>();
+        auto* http_ptr = http.get();
+        http->add("musicbrainz.org/ws/2/release/", 503, "text/plain", "down");
+        auto scanner = bench.scanner(provider_scanner_config(write_token(bench.path())),
+                                     std::move(http));
+        ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
+                         bench.hints(), *scanner);
+        for (const auto& id : {release, other}) {
+            auto [status, body] = get(manage, tracks_path(id));
+            CHECK(status == 503);
+            CHECK(error_code(body) == "provider_unavailable");
+        }
+        CHECK(http_ptr->requests() == 1);
+    }
+    {
+        auto config = provider_scanner_config(write_token(bench.path()));
+        config.music.musicbrainz.enabled = false;
+        auto http = std::make_unique<FakeHttpClient>();
+        auto* http_ptr = http.get();
+        auto scanner = bench.scanner(std::move(config), std::move(http));
+        ManageApi manage(bench.node(), bench.metadata(), bench.fs(), bench.catalogue(),
+                         bench.hints(), *scanner);
+        auto [status, body] = get(manage, tracks_path(release));
+        CHECK(status == 400);
+        CHECK(error_code(body) == "provider_not_configured");
+        CHECK(http_ptr->requests() == 0);
+    }
+}
+
 // Resetting an identity association: the stale NodeId leaves membership at
 // once and pre-reset gossip cannot bring it back, while a different NodeId
 // may own the endpoint; a reset by IP covers every port. The reset is

@@ -847,6 +847,29 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
             return http_json(200, Json(std::move(out)).dump());
         }
 
+        if (auto id = route_id(request.path, "/api/v1/manage/providers/musicbrainz/releases/",
+                               "/tracks");
+            !id.empty() && request.method == "GET") {
+            const auto number = [](const auto& value) {
+                return value ? Json(static_cast<int64_t>(*value)) : Json(nullptr);
+            };
+            Json::Array tracks;
+            for (const auto& track : scanner_.release_tracks("musicbrainz", id)) {
+                Json::Object item;
+                item["disc_number"] = number(track.disc_number);
+                item["track_number"] = number(track.track_number);
+                item["title"] = track.title;
+                item["length_ms"] = number(track.length_ms);
+                item["recording_id"] =
+                    track.recording_id.empty() ? Json(nullptr) : Json(track.recording_id);
+                tracks.push_back(Json(std::move(item)));
+            }
+            Json::Object out;
+            out["status"] = "ok";
+            out["tracks"] = std::move(tracks);
+            return http_json(200, Json(std::move(out)).dump());
+        }
+
         if (request.method == "POST" && request.path == "/api/v1/manage/providers/artwork/choose") {
             const auto body = parse_body(request);
             std::optional<std::string> ref;
