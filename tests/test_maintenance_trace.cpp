@@ -316,21 +316,10 @@ void check_against_fixture(std::string_view name, const std::vector<std::string>
     CHECK(trace == expected);
 }
 
-MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_only_when_advanced) {
-    ManualMaintenanceClock clock;
-    const auto steady = clock.now();
-    const auto wall = clock.wall_ns();
-    CHECK(wall > 0);
-    std::this_thread::sleep_for(5ms);
-    CHECK(clock.now() == steady);
-    CHECK(clock.wall_ns() == wall);
-    clock.advance(1500ms);
-    CHECK(clock.now() == steady + 1500ms);
-    CHECK(clock.wall_ns() == wall + 1'500'000'000);
-    CHECK(clock.wall_ms() == static_cast<uint64_t>(wall + 1'500'000'000) / 1'000'000);
-}
-
-MACHA_FAST_TEST("maintenance_trace", test_wall_ms_of_a_clock_before_the_epoch_is_zero) {
+// The fixtures' clock: time moves only when advanced, steady and wall time
+// together, and a wait ends on its predicate, stop, or a deadline reached by
+// an advance, never by real time. A clock before the epoch reads wall_ms 0.
+MACHA_FAST_TEST("maintenance_trace", test_manual_clock_moves_and_wakes_only_when_told) {
     struct BeforeEpoch final : MaintenanceClock {
         Clock::time_point now() const override {
             return {};
@@ -341,12 +330,21 @@ MACHA_FAST_TEST("maintenance_trace", test_wall_ms_of_a_clock_before_the_epoch_is
         void wait_until(std::condition_variable_any&, std::unique_lock<std::mutex>&,
                         std::stop_token, Clock::time_point, const std::function<bool()>&) override {
         }
-    } clock;
-    CHECK(clock.wall_ms() == 0);
-}
+    } before_epoch;
+    CHECK(before_epoch.wall_ms() == 0);
 
-MACHA_FAST_TEST("maintenance_trace", test_manual_clock_wait_returns_on_ready_stop_or_deadline) {
     ManualMaintenanceClock clock(1ms);
+    const auto steady = clock.now();
+    const auto wall = clock.wall_ns();
+    CHECK(wall > 0);
+    std::this_thread::sleep_for(5ms);
+    CHECK(clock.now() == steady);
+    CHECK(clock.wall_ns() == wall);
+    clock.advance(1500ms);
+    CHECK(clock.now() == steady + 1500ms);
+    CHECK(clock.wall_ns() == wall + 1'500'000'000);
+    CHECK(clock.wall_ms() == static_cast<uint64_t>(wall + 1'500'000'000) / 1'000'000);
+
     std::condition_variable_any cv;
     std::mutex mutex;
     std::stop_source stop;
