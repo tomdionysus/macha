@@ -319,7 +319,8 @@ struct NamespaceMigration {
 };
 
 // Builds the tree for `head`'s namespace into `nodes`, verifies it entry by
-// entry, and returns the record that would replace the head. Installs nothing.
+// entry, and returns the record that would replace the head, without a
+// retention baseline so the cluster claims the tree. Installs nothing.
 // A pure function of the head, so every node computes the same root and record
 // hash without coordination (what makes `--expect-hash` meaningful). Throws if
 // the tree does not read back as the namespace it was built from.
