@@ -63,9 +63,16 @@ void MetadataServer::refresh_loop(std::stop_token stop) {
     }
 }
 
+uint64_t MetadataServer::remote_generation() const {
+    // A generation no higher than a head set aside is that head again, not
+    // news.
+    const auto remote = node_.remote_metadata_generation();
+    return remote > replica_.set_aside_generation() ? remote : 0;
+}
+
 uint64_t MetadataServer::known_generation() const {
     const auto local = replica_.generation();
-    const auto remote = node_.remote_metadata_generation();
+    const auto remote = remote_generation();
     return local > remote ? local : remote;
 }
 

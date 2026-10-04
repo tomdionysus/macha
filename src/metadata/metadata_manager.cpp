@@ -225,7 +225,7 @@ std::optional<MetadataRecord> MetadataManager::cached_record() {
         cache_remote_epoch_ != node_.remote_metadata_epoch())
         return {};
     if (local_.replica().committed_generation() > cache_->generation ||
-        node_.remote_metadata_generation() > cache_->generation)
+        metadata_server_.remote_generation() > cache_->generation)
         return {};
     return cache_;
 }
@@ -257,7 +257,7 @@ std::optional<MetadataSnapshotView> MetadataManager::cached_snapshot_view() {
     if (cache_->generation != decoded_generation_ || cache_->hash != decoded_hash_)
         return {};
     if (local_.replica().committed_generation() > decoded_generation_ ||
-        node_.remote_metadata_generation() > decoded_generation_)
+        metadata_server_.remote_generation() > decoded_generation_)
         return {};
     return coherent(MetadataSnapshotView{decoded_generation_, decoded_namespace_revision_,
                                              decoded_hash_, decoded_cache_});
@@ -973,6 +973,61 @@ void MetadataManager::attempt_history_checkpoint(size_t record_threshold,
                   " participants=" + std::to_string(participants.size()));
 }
 
+namespace {
+// A merge that cannot be made with what this node can reach now.
+struct MergeUnavailable : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+} // namespace
+
+uint64_t MetadataManager::membership_stamp() const {
+    auto active = node_.membership().active();
+    std::sort(active.begin(), active.end(),
+              [](const NodeInfo& a, const NodeInfo& b) { return a.id < b.id; });
+    uint64_t stamp = 1469598103934665603ULL;
+    for (const auto& peer : active)
+        for (const auto byte : peer.id.bytes)
+            stamp = (stamp ^ byte) * 1099511628211ULL;
+    return stamp;
+}
+
+std::vector<MetadataRecord> MetadataManager::usable_heads() const {
+    if (local_.replica().set_aside_generation() &&
+        set_aside_stamp_.load(std::memory_order_acquire) != membership_stamp())
+        local_.replica().clear_set_aside();
+    return local_.replica().usable_heads();
+}
+
+MetadataRecord MetadataManager::own_head(const std::vector<MetadataRecord>& heads) const {
+    const auto self = node_.node_id();
+    const MetadataRecord* best = nullptr;
+    uint64_t best_sequence = 0;
+    for (const auto& head : heads) {
+        uint64_t sequence = 0;
+        try {
+            const auto snapshot = decode_snapshot(head.payload);
+            if (const auto found = snapshot.mutation_sequences.find(self);
+                found != snapshot.mutation_sequences.end())
+                sequence = found->second;
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (!best || sequence > best_sequence ||
+            (sequence == best_sequence && head.hash < best->hash)) {
+            best = &head;
+            best_sequence = sequence;
+        }
+    }
+    return best ? *best : heads.front();
+}
+
+void MetadataManager::set_aside(const MetadataRecord& head, std::string_view reason) const {
+    set_aside_stamp_.store(membership_stamp(), std::memory_order_release);
+    if (local_.replica().set_aside(head.hash))
+        Log::warn("metadata head set aside until membership changes generation=" +
+                  std::to_string(head.generation) + " reason=\"" + std::string(reason) + "\"");
+}
+
 MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                                            FrameType frame_type) {
     auto nodes = replica_nodes(replicas);
@@ -1061,7 +1116,7 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
     // Guards no state, so the analysis need not see it held.
     std::optional<Lock> reconciliation_lock;
     for (;;) {
-        auto heads = local_.replica().accepted_heads();
+        auto heads = usable_heads();
         if (heads.empty())
             throw MetadataNotReady("metadata accepted-head set is empty");
         std::sort(heads.begin(), heads.end(), [](const MetadataRecord& a,
@@ -1105,19 +1160,27 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         // Fold the maximal head set deterministically, two branches at a time.
         // Each merge names both parents and applies three-way conflict-presence
         // semantics so explicit resolutions survive.
+        // A merge that cannot be made now never holds reads or writes: the
+        // head that is not this node's own is set aside and the loop goes on
+        // with the rest.
+        const auto aside = [&](std::string_view reason) {
+            const auto own = own_head({heads[0], heads[1]});
+            set_aside(own.hash == heads[0].hash ? heads[1] : heads[0], reason);
+        };
+        try {
         auto left = heads[0];
         auto right = heads[1];
         const auto common =
             local_.replica().history_common_ancestor(left.hash, right.hash);
         if (!common)
-            throw MetadataNotReady("divergent metadata heads have no known common ancestor");
+            throw MergeUnavailable("divergent metadata heads have no known common ancestor");
         auto base_materialized = local_.replica().materialized(*common);
         if (!base_materialized)
-            throw MetadataNotReady("metadata common ancestor cannot be reconstructed");
+            throw MergeUnavailable("metadata common ancestor cannot be reconstructed");
         auto left_materialized = local_.replica().materialized(left.hash);
         auto right_materialized = local_.replica().materialized(right.hash);
         if (!left_materialized || !right_materialized)
-            throw MetadataNotReady("metadata merge head cannot be materialized");
+            throw MergeUnavailable("metadata merge head cannot be materialized");
         const auto materialise_ms = stage_ms();
         // Three trees merge by what differs between them. A branch still held
         // as a map is materialised with the others, and the result re-rooted.
@@ -1251,6 +1314,12 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
                   " remaining_heads=" + std::to_string(heads.size() - 1));
         // accept_commit() drops accepted ancestors from the head set, so the loop
         // folds any remaining heads into this commit.
+        } catch (const MergeUnavailable& error) {
+            aside(error.what());
+        } catch (const DecodeError& error) {
+            // A tree node of one branch that no node present can supply.
+            aside(error.what());
+        }
     }
 }
 
@@ -1266,39 +1335,12 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
 
     const auto active = node_.membership().active();
 
-    // `metadata_participants` is a migration roster, not authority. Kept only
-    // until the one-time legacy retention baseline is established, then
-    // cleared.
-    auto participants = snapshot.metadata_participants;
-    bool migration_roster_change = false;
-    if (!snapshot.retention_baseline_complete && participants.empty()) {
-        for (const auto& legacy : snapshot.metadata_voters)
-            if (legacy != NodeId{})
-                participants.insert(legacy);
-        for (const auto& [id, _] : snapshot.node_status)
-            if (id != NodeId{})
-                participants.insert(id);
-        for (const auto& [id, _] : snapshot.mutation_sequences)
-            if (id != NodeId{})
-                participants.insert(id);
-        for (const auto& peer : active)
-            if (peer.id != NodeId{})
-                participants.insert(peer.id);
-        migration_roster_change = participants != snapshot.metadata_participants;
-    }
-
-    const bool clear_migration_roster =
-        snapshot.retention_baseline_complete && !snapshot.metadata_participants.empty();
-    if (!policy_transition && !clear_legacy_metadata_voters && !data_policy_change &&
-        !migration_roster_change && !clear_migration_roster)
+    if (!policy_transition && !clear_legacy_metadata_voters && !data_policy_change)
         return initial;
 
     snapshot.metadata_voters.clear();
     if (policy_transition)
         snapshot.metadata_write_replicas_required = 1;
-    snapshot.metadata_participants = snapshot.retention_baseline_complete
-                                         ? std::set<NodeId>{}
-                                         : std::move(participants);
     snapshot.merge_parents.clear();
     snapshot.data_replication = static_cast<uint32_t>(node_.config().replication);
     MetadataRecord proposed;
@@ -1308,9 +1350,8 @@ MetadataRecord MetadataManager::maybe_reconfigure(const MetadataRecord& initial)
         snapshot.namespace_root ? encode_snapshot_v14(snapshot) : encode_snapshot(snapshot);
     proposed.hash = metadata_hash(proposed.generation, proposed.previous, proposed.payload);
     (void)publish_commit(active, proposed, {}, FrameType::control);
-    Log::info("metadata policy/migration transition committed generation=" +
-              std::to_string(proposed.generation) +
-              " participants=" + std::to_string(snapshot.metadata_participants.size()));
+    Log::info("metadata policy transition committed generation=" +
+              std::to_string(proposed.generation));
     return cache_record(proposed,
                         std::make_shared<MetadataSnapshot>(std::move(snapshot)));
 }
@@ -1469,12 +1510,15 @@ MetadataRecord MetadataManager::read_record() {
     } catch (const std::exception& error) {
         // Reads may use the last persisted local snapshot while the write floor is
         // unavailable; mutations never treat it as durable.
-        auto local = local_.replica().committed();
-        const auto heads = local_.replica().accepted_heads();
-        if (!local_.replica().recovery_required() && heads.size() == 1 &&
-            heads.front().hash == local.hash && local.generation > 1) {
-            (void)error;
-            return cache_record(local);
+        // Reads never wait for peers or for a merge: this node's own head
+        // serves.
+        const auto heads = usable_heads();
+        if (!local_.replica().recovery_required() && !heads.empty()) {
+            const auto local = own_head(heads);
+            if (local.generation > 1) {
+                (void)error;
+                return cache_record(local);
+            }
         }
         throw;
     }
@@ -1531,7 +1575,7 @@ MetadataSnapshot MetadataManager::snapshot() {
 std::optional<MetadataSnapshotView> MetadataManager::retention_release_view() const {
     if (local_.replica().recovery_required())
         return {};
-    const auto heads = local_.replica().accepted_heads();
+    const auto heads = usable_heads();
     if (heads.size() != 1)
         return {};
 
@@ -1569,7 +1613,7 @@ MetadataRecord MetadataManager::mutate_impl(
         const auto& active = all_active;
 
         MetadataRecord current;
-        auto local_heads = local_.replica().accepted_heads();
+        auto local_heads = usable_heads();
         const bool recovering = local_.replica().recovery_required();
         if (recovering || local_heads.empty() ||
             (local_heads.size() == 1 && local_heads.front().generation <= 1)) {
@@ -1577,7 +1621,7 @@ MetadataRecord MetadataManager::mutate_impl(
             if (recovering)
                 local_.replica().mark_recovered();
         } else if (local_heads.size() > 1 ||
-                   node_.remote_metadata_generation() >
+                   metadata_server_.remote_generation() >
                        local_.replica().committed_generation()) {
             // Reconciliation is not a prerequisite for a mutation: if the survey
             // cannot complete, use the local accepted head.
@@ -1588,12 +1632,15 @@ MetadataRecord MetadataManager::mutate_impl(
                     ids.push_back(peer.id);
                 current = maybe_reconfigure(read_group(ids, FrameType::read_ahead));
             } catch (const MetadataNotReady&) {
-                if (local_heads.size() > 1)
+                // With several heads and no merge to be had, the mutation
+                // extends the head carrying this node's own latest one.
+                const auto heads = usable_heads();
+                if (heads.empty())
                     throw;
-                current = maybe_reconfigure(local_.replica().committed());
+                current = maybe_reconfigure(own_head(heads));
             }
         } else {
-            current = maybe_reconfigure(local_.replica().committed());
+            current = maybe_reconfigure(local_heads.front());
         }
 
         auto snapshot = decode_snapshot(current.payload);
@@ -1751,7 +1798,7 @@ MetadataRecord MetadataManager::mutate_impl(
             // acceptance notice has invalidated the cache, so do not install this
             // branch's snapshot. With W>=2 the later writer sees both heads; reconcile
             // synchronously so both mutations are visible once the writers return.
-            auto post_publish_heads = local_.replica().accepted_heads();
+            auto post_publish_heads = usable_heads();
             if (post_publish_heads.size() > 1) {
                 std::vector<NodeId> ids;
                 ids.reserve(all_active.size());
@@ -1887,14 +1934,17 @@ void MetadataManager::repair_once() {
     // offered the head and proof; a node on another branch keeps it as a
     // second head for read_group() to reconcile. Runs without the mutation
     // lock.
+    // A node known only through gossip cannot be offered anything from here
+    // and does not hold convergence back.
     const auto selected_generation = record.generation;
-    size_t converged = 0;
+    bool incomplete = false;
     for (const auto& owner : active) {
-        if (replicate_accepted_head(owner, record, *acceptance, FrameType::speculative))
-            ++converged;
+        if (!replicate_accepted_head(owner, record, *acceptance, FrameType::speculative) &&
+            node_.membership().directly_reachable(owner.id))
+            incomplete = true;
     }
     Lock mutation_lock(mutation_mutex_);
-    if (converged < active.size())
+    if (incomplete)
         throw MetadataNotReady("metadata accepted-head replication incomplete");
     if (local_.replica().committed_generation() > selected_generation)
         return;
@@ -1903,81 +1953,6 @@ void MetadataManager::repair_once() {
     if (!materialized)
         throw MetadataNotReady("metadata repair head cannot be materialized");
     auto snapshot = *materialized->snapshot;
-    std::vector<NodeInfo> participants;
-    participants.reserve(snapshot.metadata_participants.size());
-    bool all_participants_online = !snapshot.metadata_participants.empty();
-    for (const auto& participant : snapshot.metadata_participants) {
-        auto found = std::find_if(active.begin(), active.end(), [&](const NodeInfo& peer) {
-            return peer.id == participant;
-        });
-        if (found == active.end()) {
-            all_participants_online = false;
-            break;
-        }
-        participants.push_back(*found);
-    }
-
-    bool all_participants_at_head = all_participants_online;
-    if (all_participants_at_head) {
-        for (const auto& participant : participants) {
-            if (!replicate_accepted_head(participant, record, *acceptance,
-                                         FrameType::speculative)) {
-                all_participants_at_head = false;
-                break;
-            }
-        }
-    }
-
-    // A namespace migrated from SM12 or re-rooted onto the tree has no
-    // retention baseline. Establish it only once every durable participant
-    // is at this head; the publication guard claims every reachable object
-    // before the baseline commit is accepted. Until then destructive
-    // mark/sweep is fenced in Service.
-    if (all_participants_at_head && !snapshot.retention_baseline_complete) {
-        const auto origin = node_.node_id();
-        const auto found = snapshot.mutation_sequences.find(origin);
-        const uint64_t previous_sequence =
-            found == snapshot.mutation_sequences.end() ? 0 : found->second;
-        const auto sequence = local_.replica().reserve_mutation_sequence(previous_sequence);
-
-        auto baseline = snapshot;
-        baseline.retention_baseline_complete = true;
-        baseline.metadata_participants.clear();
-        baseline.metadata_branch_floor = {};
-        baseline.merge_parents.clear();
-        baseline.mutation_sequences[origin] = sequence;
-
-        MetadataRecord baseline_record;
-        baseline_record.generation = record.generation + 1;
-        baseline_record.previous = record.hash;
-        baseline_record.payload = baseline.namespace_root ? encode_snapshot_v14(baseline)
-                                                          : encode_snapshot(baseline);
-        baseline_record.hash = metadata_hash(baseline_record.generation,
-                                             baseline_record.previous,
-                                             baseline_record.payload);
-        if (publication_retention_) {
-            publication_retention_(MetadataPublicationContext{
-                origin, sequence, record, baseline, nullptr});
-        }
-        auto published = publish_commit(active, baseline_record, {}, FrameType::speculative);
-        record = baseline_record;
-        acceptance = published.acceptance;
-        snapshot = std::move(baseline);
-
-        all_participants_at_head = true;
-        for (const auto& participant : participants) {
-            if (!replicate_accepted_head(participant, record, *acceptance,
-                                         FrameType::speculative)) {
-                all_participants_at_head = false;
-                break;
-            }
-        }
-        if (all_participants_at_head)
-            Log::info("metadata retention baseline established generation=" +
-                      std::to_string(record.generation) +
-                      " migration_participants=" + std::to_string(participants.size()));
-    }
-
     // Retention release follows each node's sole accepted head and causal
     // clock; unknown concurrent claim dots survive.
 

@@ -299,6 +299,7 @@ set(MACHA_CORE_SOURCES
     src/storage/local_store.cpp
     src/storage/storage_pool.cpp
     src/storage/retention.cpp
+    src/storage/unreferenced_since.cpp
     src/ledger/retention_ledger.cpp
     src/storage/persistent_cache.cpp
     src/cluster/telemetry.cpp
@@ -605,6 +606,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_maintenance_trace.cpp
         tests/test_presence.cpp
         tests/test_contract.cpp
+        tests/test_absent_nodes.cpp
         tests/test_ledger_gates.cpp
         tests/test_horizon_builder.cpp
         tests/test_availability.cpp

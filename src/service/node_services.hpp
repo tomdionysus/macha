@@ -141,6 +141,8 @@ class NodeServices {
     DistributedStore store_;
     MetadataManager metadata_;
     RetentionLedger ledger_;
+    UnreferencedSince data_unreferenced_;
+    UnreferencedSince control_unreferenced_;
     AvailabilityService availability_;
     CatalogueManager catalogue_;
     FileSystem filesystem_;
