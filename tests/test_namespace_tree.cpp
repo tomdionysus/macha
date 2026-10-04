@@ -5,6 +5,7 @@
 #include "metadata/namespace_tree.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <set>
 #include <vector>
 #include <string>
@@ -961,3 +962,272 @@ MACHA_TEST("namespace_tree", test_a_commit_claims_the_nodes_it_introduced_and_pr
 }
 
 } // namespace
+
+namespace {
+
+struct Random {
+    uint64_t seed;
+    uint64_t next() {
+        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return seed >> 33;
+    }
+};
+
+Hash256 head_of(uint8_t first) {
+    Hash256 head{};
+    head.bytes[0] = first;
+    return head;
+}
+
+// One branch's edits to `entries`. Targets come from a small pool as often as
+// not, so two branches edit the same paths; a removed directory takes what is
+// beneath it, so the other branch can leave orphans there.
+void edit_branch(std::map<std::string, FsEntry>& entries, Random& random, size_t edits) {
+    const auto pick = [&](size_t pool) {
+        auto it = entries.begin();
+        std::advance(it, static_cast<ptrdiff_t>(random.next() % std::min(pool, entries.size())));
+        return it;
+    };
+    for (size_t i = 0; i < edits; ++i) {
+        const size_t pool = random.next() % 2 ? 12 : entries.size();
+        auto target = pick(pool);
+        const auto path = target->first;
+        if (path == "/")
+            continue;
+        switch (random.next() % 6) {
+        case 0: // change in place
+            target->second.mtime_ns += 1 + static_cast<int64_t>(random.next() % 3);
+            target->second.size += random.next() % 2 ? 4096 : 0;
+            break;
+        case 1: // the same content, another time: compatible on both branches
+            target->second.ctime_ns += 7;
+            break;
+        case 2: { // remove, with everything beneath a directory
+            for (auto it = entries.begin(); it != entries.end();)
+                it = it->first == path || it->first.starts_with(path + "/") ? entries.erase(it)
+                                                                            : std::next(it);
+            break;
+        }
+        case 3: { // move a file
+            if (target->second.type != EntryType::file)
+                break;
+            auto moved = target->second;
+            entries.erase(target);
+            entries["/TV/moved " + std::to_string(random.next() % 5) + ".mkv"] = moved;
+            break;
+        }
+        case 4: { // a new file beside the target, or beneath it
+            const auto parent =
+                target->second.type == EntryType::directory ? path : parent_path(path);
+            entries[(parent == "/" ? "" : parent) + "/new " + std::to_string(random.next() % 4) +
+                    ".mkv"] = make_file(random.next(), random.next() % 5 == 0 ? 700 : 2);
+            break;
+        }
+        default: // a new directory at a name both branches may choose
+            entries["/TV/made " + std::to_string(random.next() % 3)] =
+                make_directory(random.next() % 2);
+            break;
+        }
+    }
+}
+
+} // namespace
+
+MACHA_FAST_TEST("namespace_tree", test_a_diff_is_the_paths_that_differ_and_reads_only_their_leaves) {
+    MemoryNamespaceNodeStore store;
+    auto before = library(200, 20);
+    const auto root_before = build_namespace_tree(before, store);
+    CHECK(diff_namespace_trees(root_before, root_before, store).empty());
+
+    auto after = before;
+    after.erase("/TV/Show 3/Season 1/Episode 0.mkv");
+    after["/TV/Show 3/Season 1/Episode 4.mkv"].mtime_ns += 1;
+    after["/TV/Show 40/Season 2/added.mkv"] = make_file(77, 700);
+    // An external extent list one extent longer.
+    auto& grown = after.at("/TV/Show 0/Season 1/Episode 0.mkv");
+    grown.extents.push_back(make_file(5, 1).extents.front());
+    const auto root_after = build_namespace_tree(after, store);
+
+    store.forget_reads();
+    const auto differences = diff_namespace_trees(root_before, root_after, store);
+    const auto reads = store.reads();
+    REQUIRE(differences.size() == 4);
+    for (const auto& [path, difference] : differences) {
+        const auto was = before.find(path);
+        const auto is = after.find(path);
+        CHECK(difference.before ==
+              (was == before.end() ? std::optional<FsEntry>() : std::optional(was->second)));
+        CHECK(difference.after ==
+              (is == after.end() ? std::optional<FsEntry>() : std::optional(is->second)));
+    }
+    // Both ways round, and against the empty tree.
+    const auto reversed = diff_namespace_trees(root_after, root_before, store);
+    REQUIRE(reversed.size() == 4);
+    CHECK(reversed.at("/TV/Show 40/Season 2/added.mkv").after == std::nullopt);
+    const auto empty = build_namespace_tree({}, store);
+    CHECK(diff_namespace_trees(empty, root_before, store).size() == before.size());
+
+    // Four changes in a library of over a hundred leaves: both trees' few
+    // branch nodes, the leaves that differ, and the changed files' extents.
+    const auto stats = namespace_tree_stats(root_before, store);
+    CHECK(stats.leaves > 100);
+    CHECK(reads < stats.leaves / 2);
+}
+
+MACHA_FAST_TEST("namespace_tree", test_distant_changes_read_no_leaf_between_them) {
+    MemoryNamespaceNodeStore store;
+    auto entries = library(200, 20);
+    const auto root = build_namespace_tree(entries, store);
+    const auto stats = namespace_tree_stats(root, store);
+
+    NamespaceChanges changes;
+    auto first = entries.at("/TV/Show 0/Season 1/Episode 0.mkv");
+    first.mtime_ns += 1;
+    changes["/TV/Show 0/Season 1/Episode 0.mkv"] = first;
+    changes["/TV/Show 50/Season 4/Episode 19.mkv"] = std::nullopt;
+    changes["/zz-last.mkv"] = make_file(3, 2);
+    for (const auto& [path, value] : changes)
+        if (value)
+            entries[path] = *value;
+        else
+            entries.erase(path);
+
+    store.forget_reads();
+    const auto updated = update_namespace_tree(root, store, changes);
+    const auto reads = store.reads();
+    MemoryNamespaceNodeStore fresh;
+    CHECK(updated == build_namespace_tree(entries, fresh));
+    // The branch nodes, the three windows' leaves and those leaves' extent
+    // nodes; no leaf between the windows.
+    CHECK(reads < stats.leaves);
+}
+
+MACHA_FAST_TEST("namespace_tree", test_a_tree_merge_is_the_path_wise_merge) {
+    // The path-wise merge of materialised namespaces is the oracle: the tree
+    // merge must reach the same root, the same conflicts and the same snapshot
+    // from random divergent branches. Each round's result, standing conflicts
+    // included, is the next round's ancestor.
+    Random random{2026};
+    MetadataSnapshot base;
+    base.extent_size = 4 * 1024 * 1024;
+    base.metadata_write_replicas_required = 1;
+    base.entries = library(10, 8);
+    size_t conflicts = 0, clean = 0;
+    for (int round = 0; round < 40; ++round) {
+        auto left = base;
+        auto right = base;
+        edit_branch(left.entries, random, 1 + random.next() % 6);
+        edit_branch(right.entries, random, 1 + random.next() % 6);
+        left.mutation_sequences[NodeId{}] = static_cast<uint64_t>(round) + 1;
+        const auto left_head = head_of(round % 2 ? 1 : 2);
+        const auto right_head = head_of(round % 2 ? 2 : 1);
+
+        const auto expected = merge_metadata_snapshots(base, left, right, left_head, right_head);
+        MemoryNamespaceNodeStore fresh;
+        const auto expected_root = build_namespace_tree(expected.snapshot.entries, fresh);
+
+        MemoryNamespaceNodeStore store;
+        const auto merge = merge_tree_backed_snapshots(
+            detach_namespace(base, store), detach_namespace(left, store),
+            detach_namespace(right, store), left_head, right_head, store);
+        const auto root = update_namespace_tree(merge.onto, store, merge.changes);
+        CHECK(root == expected_root);
+        CHECK(merge.merged.conflicts_created == expected.conflicts_created);
+        CHECK(merge.merged.conflicts_superseded == expected.conflicts_superseded);
+        CHECK(merge.merged.snapshot.conflicts == expected.snapshot.conflicts);
+        CHECK(merge.merged.snapshot.entries.empty());
+
+        auto expected_tree = expected.snapshot;
+        expected_tree.entries.clear();
+        expected_tree.namespace_root = expected_root;
+        auto merged_tree = merge.merged.snapshot;
+        merged_tree.namespace_root = root;
+        CHECK(encode_snapshot_v14(merged_tree) == encode_snapshot_v14(expected_tree));
+        if (root != expected_root)
+            break;
+
+        (expected.snapshot.conflicts.empty() ? clean : conflicts) += 1;
+        base = expected.snapshot;
+        base.merge_parents.clear();
+    }
+    // The rounds reached both outcomes.
+    CHECK(conflicts > 5);
+    CHECK(clean > 0);
+
+    // One head twice is that head.
+    MemoryNamespaceNodeStore store;
+    const auto tree = detach_namespace(base, store);
+    const auto same = merge_tree_backed_snapshots(tree, tree, tree, head_of(1), head_of(1), store);
+    CHECK(same.changes.empty());
+    CHECK(same.onto == *tree.namespace_root);
+
+    // A map-backed branch is not a tree.
+    bool refused = false;
+    try {
+        (void)merge_tree_backed_snapshots(tree, base, tree, head_of(1), head_of(2), store);
+    } catch (const std::logic_error&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
+// A two-head reconciliation at the live library's size (8,700 paths, 900,000
+// extents), each branch one cycle of a loader: the materialising merge
+// against the tree merge. Prints "BENCH name=<name> ns_per_op=<n> ops=1";
+// run with `--filter baseline --verbose`.
+MACHA_TEST("baseline", test_baseline_reconcile_materialised_against_tree) {
+    MemoryNamespaceNodeStore store;
+    MetadataSnapshot base;
+    base.extent_size = 4 * 1024 * 1024;
+    base.metadata_write_replicas_required = 1;
+    {
+        std::map<std::string, FsEntry> entries;
+        entries["/"] = make_directory(0);
+        entries["/Library"] = make_directory(1);
+        for (size_t d = 0; d < 700; ++d) {
+            const auto directory = "/Library/Title " + std::to_string(d);
+            entries[directory] = make_directory(10 + d);
+            for (size_t f = 0; f < 11; ++f)
+                entries[directory + "/part " + std::to_string(f) + ".mkv"] =
+                    make_file(d * 100 + f, f == 0 ? 600 : 60);
+        }
+        base.namespace_root = build_namespace_tree(entries, store);
+    }
+    const auto branch = [&](const std::string& name, uint64_t seed) {
+        NamespaceChanges changes;
+        changes["/load-" + name] = make_directory(seed);
+        changes["/load-" + name + "/load.bin"] = make_file(seed, 8);
+        auto next = base;
+        next.namespace_root = update_namespace_tree(*base.namespace_root, store, changes);
+        return next;
+    };
+    const auto left = branch("a", 7001);
+    const auto right = branch("b", 7002);
+    const auto left_head = head_of(1);
+    const auto right_head = head_of(2);
+    const auto report = [](std::string_view name, Clock::duration elapsed) {
+        std::cout << "BENCH name=" << name << " ns_per_op="
+                  << std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
+                  << " ops=1\n";
+    };
+
+    auto started = Clock::now();
+    auto materialised = merge_metadata_snapshots(attach_namespace(base, store),
+                                                 attach_namespace(left, store),
+                                                 attach_namespace(right, store), left_head,
+                                                 right_head);
+    const auto rebuilt = detach_namespace(std::move(materialised.snapshot), store);
+    report("reconcile.materialised", Clock::now() - started);
+
+    store.forget_reads();
+    started = Clock::now();
+    const auto merge =
+        merge_tree_backed_snapshots(base, left, right, left_head, right_head, store);
+    const auto root = update_namespace_tree(merge.onto, store, merge.changes);
+    report("reconcile.tree", Clock::now() - started);
+    std::cout << "BENCH name=reconcile.tree.node_reads ns_per_op=0 ops=" << store.reads() << '\n';
+
+    CHECK(root == *rebuilt.namespace_root);
+    CHECK(namespace_tree_lookup(root, "/load-a/load.bin", store).has_value());
+    CHECK(namespace_tree_lookup(root, "/load-b/load.bin", store).has_value());
+}

@@ -350,6 +350,22 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
                                              const MetadataSnapshot& left,
                                              const MetadataSnapshot& right,
                                              const Hash256& left_head, const Hash256& right_head);
+
+// The same merge over namespaces given apart from the snapshots, whose own
+// entry maps and roots are not read. The maps may hold a part of each
+// namespace: every path that differs between any two of the three, every
+// ancestor of a path they hold, "/", and the key of every namespace conflict
+// any of the three carries. A path in none of them is the same on all three
+// and merges to itself. The result's entries cover the paths given.
+using NamespaceEntries = std::map<std::string, FsEntry>;
+MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
+                                                  const MetadataSnapshot& left,
+                                                  const MetadataSnapshot& right,
+                                                  const NamespaceEntries& base_entries,
+                                                  const NamespaceEntries& left_entries,
+                                                  const NamespaceEntries& right_entries,
+                                                  const Hash256& left_head,
+                                                  const Hash256& right_head);
 // Reachability roots held by unresolved conflicts, which GC must protect.
 std::set<ObjectId> metadata_conflict_extent_roots(const MetadataSnapshot&);
 std::set<ObjectId> metadata_catalogue_root_set(const MetadataSnapshot&);

@@ -1867,18 +1867,32 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
                                              const MetadataSnapshot& left,
                                              const MetadataSnapshot& right,
                                              const Hash256& left_head, const Hash256& right_head) {
-    if (left_head == right_head)
-        return {left, 0};
-    if (right_head < left_head)
-        return merge_metadata_snapshots(base, right, left, right_head, left_head);
-
-    // Path-wise three-way merge over materialised namespaces. A tree-backed
-    // snapshot's empty map would merge to an empty namespace, so it is refused.
-    // TODO: merge tree-native, descending only where subtree roots differ.
+    // A tree-backed snapshot's empty map would merge to an empty namespace.
     for (const auto* branch : {&base, &left, &right})
         if (branch->namespace_root)
             throw std::logic_error("metadata merge requires materialised namespaces; a branch is "
                                    "still a tree");
+    return merge_metadata_snapshots_over(base, left, right, base.entries, left.entries,
+                                         right.entries, left_head, right_head);
+}
+
+MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
+                                                  const MetadataSnapshot& left,
+                                                  const MetadataSnapshot& right,
+                                                  const NamespaceEntries& base_entries,
+                                                  const NamespaceEntries& left_entries,
+                                                  const NamespaceEntries& right_entries,
+                                                  const Hash256& left_head,
+                                                  const Hash256& right_head) {
+    if (left_head == right_head) {
+        MetadataMergeResult same{left, 0};
+        same.snapshot.namespace_root.reset();
+        same.snapshot.entries = left_entries;
+        return same;
+    }
+    if (right_head < left_head)
+        return merge_metadata_snapshots_over(base, right, left, base_entries, right_entries,
+                                             left_entries, right_head, left_head);
 
     MetadataMergeResult result;
     auto& out = result.snapshot;
@@ -1985,7 +1999,7 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     };
 
     std::set<std::string> paths;
-    for (const auto* entries : {&base.entries, &left.entries, &right.entries})
+    for (const auto* entries : {&base_entries, &left_entries, &right_entries})
         for (const auto& [path, _] : *entries)
             paths.insert(path);
 
@@ -1993,27 +2007,30 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     // path-wise like independent creates. Detect exact-entry moves and force
     // the source and destinations into conflict when the intents diverge.
     std::set<std::string> forced_conflict_paths;
-    auto moved_destinations = [&](const MetadataSnapshot& branch, const std::string& source,
+    auto moved_destinations = [&](const NamespaceEntries& branch, const std::string& source,
                                   const FsEntry& entry) {
         std::set<std::string> destinations;
-        for (const auto& [path, candidate] : branch.entries) {
+        for (const auto& [path, candidate] : branch) {
             if (path == source || candidate != entry)
                 continue;
-            auto base_candidate = base.entries.find(path);
-            if (base_candidate == base.entries.end() || base_candidate->second != entry)
+            auto base_candidate = base_entries.find(path);
+            if (base_candidate == base_entries.end() || base_candidate->second != entry)
                 destinations.insert(path);
         }
         return destinations;
     };
-    for (const auto& [source, base_entry] : base.entries) {
+    for (const auto& [source, base_entry] : base_entries) {
         if (source == "/")
             continue;
-        const auto l = find_entry(left.entries, source);
-        const auto r = find_entry(right.entries, source);
-        const auto ld = moved_destinations(left, source, base_entry);
-        const auto rd = moved_destinations(right, source, base_entry);
+        const auto l = find_entry(left_entries, source);
+        const auto r = find_entry(right_entries, source);
         const bool left_removed = !l;
         const bool right_removed = !r;
+        // Only a removed source can collide; the scan is per source.
+        if (!left_removed && !right_removed)
+            continue;
+        const auto ld = moved_destinations(left_entries, source, base_entry);
+        const auto rd = moved_destinations(right_entries, source, base_entry);
         bool semantic_collision = false;
         if (left_removed && right_removed) {
             semantic_collision = ld != rd && (!ld.empty() || !rd.empty());
@@ -2030,9 +2047,9 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
     }
 
     for (const auto& path : paths) {
-        const auto b = find_entry(base.entries, path);
-        const auto l = find_entry(left.entries, path);
-        const auto r = find_entry(right.entries, path);
+        const auto b = find_entry(base_entries, path);
+        const auto l = find_entry(left_entries, path);
+        const auto r = find_entry(right_entries, path);
         if (forced_conflict_paths.contains(path)) {
             install_entry(path, b);
             add_namespace_conflict(path, b, l, r);
@@ -2075,9 +2092,9 @@ MetadataMergeResult merge_metadata_snapshots(const MetadataSnapshot& base,
         auto parent_it = out.entries.find(parent);
         if (parent_it != out.entries.end() && parent_it->second.type == EntryType::directory)
             continue;
-        const auto b = find_entry(base.entries, path);
-        const auto l = find_entry(left.entries, path);
-        const auto r = find_entry(right.entries, path);
+        const auto b = find_entry(base_entries, path);
+        const auto l = find_entry(left_entries, path);
+        const auto r = find_entry(right_entries, path);
         install_entry(path, b);
         if (l != r || l != b)
             add_namespace_conflict(path, b, l, r);
