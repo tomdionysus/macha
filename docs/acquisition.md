@@ -435,7 +435,7 @@ The response is `202`, sent only once the request is accepted into metadata, so 
 | 409 | `placement_failed` | `node_not_torrent_capable` | `node_id` does not run the torrent subsystem |
 | 409 | `placement_failed` | `add_failed` | the URI is not an acceptable magnet or names no info hash, or no torrent-capable node could read the `.torrent` |
 | 409 | `torrent_already_added` | | a job for this torrent (the same info hash) exists anywhere in the cluster, in any phase until it is cleared |
-| 503 | `metadata_unavailable` | | cluster metadata cannot be written; `error.scope` is `cluster` and `error.alternative_may_succeed` false. It is answered only by a node with no usable namespace yet (for example one still waiting for its bootstrap peer); an absent peer does not stop adds |
+| 503 | `metadata_unavailable` | | this node has no usable namespace yet (for example it is still waiting for its bootstrap peer); `error.scope` is `node`, since another node may take the add. An absent peer does not stop adds |
 
 The refusal of a duplicate names the job that holds the torrent, in the fields a `202` uses; `node_id` is the node running it, or null while it awaits one:
 
@@ -477,7 +477,7 @@ Metadata writes merge, so two nodes can change one job at once; every field merg
 
 `404 not_found` for an unknown action or job, `409 invalid_state` for one the job does not allow, `503 node_unreachable` for a `retry` whose owner cannot be reached.
 
-**With metadata unwritable**, `pause`, `resume` and `cancel` on a job some node holds still work: the answering node forwards them to the owner, which applies them at once and publishes them when metadata is writable again. Everything else answers `503 metadata_unavailable` (scope `cluster`).
+**With metadata unwritable**, `pause`, `resume` and `cancel` on a job some node holds still work: the answering node forwards them to the owner, which applies them at once and publishes them when metadata is writable again. Everything else answers `503 metadata_unavailable` (scope `node`).
 
 `PATCH /api/v1/torrents/jobs/{id}` with `{"remove_after_ms": null | 0..86400000}` changes removal on an existing job; with `{"node_id": "..." | null}` it re-pins or unpins a job that still awaits a node (otherwise `409 invalid_state`). It answers `200` with the job.
 

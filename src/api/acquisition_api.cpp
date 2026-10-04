@@ -81,10 +81,10 @@ bool parse_remove_after(const Json& body, std::optional<std::optional<uint64_t>>
 }
 
 HttpResponse outcome_error(const TorrentCoordinator::Outcome& outcome) {
-    if (outcome.cluster_scope) {
+    // This node has no namespace it can write yet; another node may.
+    if (outcome.code == "metadata_unavailable") {
         FailureAxes axes;
-        axes.scope = FailureScope::cluster;
-        axes.alternative_may_succeed = false;
+        axes.scope = FailureScope::node;
         return http_error(outcome.status, outcome.code, outcome.message, outcome.reason, axes);
     }
     if (!outcome.reason.empty()) return http_error(outcome.status, outcome.code, outcome.message, outcome.reason);

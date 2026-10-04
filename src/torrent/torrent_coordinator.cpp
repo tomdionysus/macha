@@ -292,7 +292,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
         out.status = 503;
         out.code = "metadata_unavailable";
         out.message = "cluster metadata is not writable, so no torrent can be added until it is";
-        out.cluster_scope = true;
         return out;
     }
 
@@ -328,7 +327,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::add(std::string_view uri, bool s
         out.status = 503;
         out.code = "metadata_unavailable";
         out.message = std::string("the request could not be recorded: ") + e.what();
-        out.cluster_scope = true;
         return out;
     }
     if (holder) {
@@ -461,7 +459,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::act(std::string_view id, std::st
             out.status = 503;
             out.code = "metadata_unavailable";
             out.message = "cluster metadata is not writable, so the job cannot be cleared until it is";
-            out.cluster_scope = true;
             return out;
         }
         std::optional<TorrentRequest> cleared;
@@ -479,7 +476,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::act(std::string_view id, std::st
             out.status = 503;
             out.code = "metadata_unavailable";
             out.message = std::string("the job could not be cleared: ") + e.what();
-            out.cluster_scope = true;
             return out;
         }
         Log::info("torrent cleared id=" + std::string(id));
@@ -518,7 +514,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::write_desired(const TorrentReque
             out.status = 503;
             out.code = "metadata_unavailable";
             out.message = "cluster metadata is not writable and no node holds this job";
-            out.cluster_scope = true;
             return out;
         }
         if (r.claim->node_id == node_.node_id()) return apply_intent_locally(r.id, desired, now);
@@ -577,7 +572,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::write_desired(const TorrentReque
         out.status = 503;
         out.code = "metadata_unavailable";
         out.message = std::string("the request could not be updated: ") + e.what();
-        out.cluster_scope = true;
         return out;
     }
     wake_.notify_all();
@@ -619,7 +613,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::patch(std::string_view id,
         out.status = 503;
         out.code = "metadata_unavailable";
         out.message = "cluster metadata is not writable";
-        out.cluster_scope = true;
         return out;
     }
     std::optional<TorrentRequest> written;
@@ -643,7 +636,6 @@ TorrentCoordinator::Outcome TorrentCoordinator::patch(std::string_view id,
         out.status = 503;
         out.code = "metadata_unavailable";
         out.message = std::string("the request could not be updated: ") + e.what();
-        out.cluster_scope = true;
         return out;
     }
     wake_.notify_all();
