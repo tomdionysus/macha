@@ -27,7 +27,7 @@ void stage(const LocalState::StageHook& hook, std::string_view name, std::stop_t
 
 } // namespace
 
-LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, NodeRuntime& node,
+LocalState::LocalState(const Config& cfg, const NodeIdentity& identity, ClusterNode& node,
                        RecoveryProgress& progress, const StageHook& hook, std::stop_token stop) {
     // The DATA pool and the control-side chain are independent; recover them
     // side by side, as a large pool can take a while.
@@ -101,7 +101,7 @@ void LocalState::recover_data(const Config& cfg, const NodeIdentity& identity,
 }
 
 void LocalState::recover_state(const Config& cfg, const NodeIdentity& identity,
-                               NodeRuntime& node, RecoveryProgress& progress,
+                               ClusterNode& node, RecoveryProgress& progress,
                                const StageHook& hook, std::stop_token stop) {
     try {
         stage(hook, "control-storage", stop);

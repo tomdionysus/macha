@@ -8,7 +8,7 @@
 namespace macha {
 
 class LocalStore;
-class NodeRuntime;
+class ClusterNode;
 
 // Brings a control object this node lacks into its control store.
 class ControlObjectSource {
@@ -28,14 +28,14 @@ class ControlObjectFetch final : public ControlObjectSource {
     // Called with the bytes and duration of each object received.
     using Observer = std::function<void(uint64_t bytes, Clock::duration)>;
 
-    ControlObjectFetch(NodeRuntime&, LocalStore& control);
+    ControlObjectFetch(ClusterNode&, LocalStore& control);
     bool ensure_control_local(const ObjectId& id) override {
         return pull(id, {});
     }
     bool pull(const ObjectId&, const Observer&);
 
   private:
-    NodeRuntime& node_;
+    ClusterNode& node_;
     LocalStore& control_;
 };
 
