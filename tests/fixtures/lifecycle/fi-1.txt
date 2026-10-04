@@ -3,6 +3,7 @@ start status
 start catalogue-http
 start node
 start startup
+local state recovered
 services constructed
 start media-information
 start scanner

@@ -503,6 +503,7 @@ void Service::initialise_services(std::stop_token stop) {
         // Publish the phase now rather than up to a sampling interval later, so
         // peers do not keep seeing "recovering" after the node is ready.
         node_.signal_telemetry_refresh();
+        note_lifecycle("local state recovered");
         if (stop.stop_requested())
             return;
 
@@ -631,35 +632,9 @@ void Service::stop() {
 std::map<std::string, uint64_t> Service::observation_gauges() {
     std::map<std::string, uint64_t> gauges{{"rss_bytes", process_resident_bytes()},
                                            {"maintenance_wakeups", maintenance_wakeups()}};
-    if (!services_ready_.load(std::memory_order_acquire) ||
-        observation_stopping_.load(std::memory_order_acquire))
-        return gauges;
-    const auto idle_ms = [](std::chrono::milliseconds idle) {
-        return static_cast<uint64_t>(std::max<int64_t>(0, idle.count()));
-    };
-    gauges["foreground_idle_ms"] = idle_ms(services_->store().foreground_idle_for());
-    gauges["interactive_idle_ms"] = idle_ms(services_->store().interactive_idle_for());
-    gauges["loader_idle_ms"] = idle_ms(services_->store().loader_idle_for());
-    // Cumulative since start, as Status reports them; a window's rate is the
-    // difference between consecutive windows.
-    const auto repair = services_->store().repair_diagnostics();
-    gauges["repair_push_examined"] = repair.push_examined;
-    gauges["repair_pull_examined"] = repair.pull_examined;
-    gauges["repair_bytes_transferred"] = repair.bytes_transferred;
-    gauges["repair_passes_completed"] = repair.passes_completed;
-    gauges["repair_pull_unsourceable"] = repair.pull_unsourceable;
-    gauges["repair_gate_ran"] = repair.gate_ran;
-    gauges["repair_gate_share"] = repair.gate_share;
-    gauges["repair_gate_credit"] = repair.gate_credit;
-    gauges["repair_prompt_copies"] = repair.prompt_copies;
-    if (auto frontend = registry_.fuse()) {
-        const auto fuse = frontend->diagnostics();
-        gauges["fuse_publications_completed"] = fuse.data_publications_completed;
-        gauges["fuse_publication_bytes_committed"] = fuse.data_publication_bytes_committed;
-        gauges["fuse_publication_bytes_confirmed"] = fuse.data_publication_bytes_confirmed;
-        gauges["fuse_spool_bytes"] = fuse.spool_bytes;
-        gauges["fuse_parked_publications"] = fuse.parked_publications;
-    }
+    if (services_ready_.load(std::memory_order_acquire) &&
+        !observation_stopping_.load(std::memory_order_acquire))
+        gauges.merge(services_->observation_gauges());
     return gauges;
 }
 
