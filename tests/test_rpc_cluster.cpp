@@ -319,14 +319,16 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_frame_priority_and_variable_length) {
         client.call_async(endpoint, MessageType::put_object, speculative, FrameType::speculative);
     auto foreground =
         client.call_async(endpoint, MessageType::put_object, Bytes{0x46}, FrameType::foreground);
-    REQUIRE(foreground.wait_for(2s) == std::future_status::ready);
+    REQUIRE(foreground.wait_for(scaled(2s)) == std::future_status::ready);
     CHECK(foreground.get().message.type == MessageType::ok);
     {
         std::lock_guard lock(order_mutex);
         REQUIRE(!order.empty());
         CHECK(order.front() == 0x46);
     }
-    REQUIRE(background.wait_for(10s) == std::future_status::ready);
+    // Completion, not speed: 32 MiB takes from 5 s to tens of seconds by build
+    // and load, so the bound is just inside the case's 60 s deadline.
+    REQUIRE(background.wait_for(scaled(50s)) == std::future_status::ready);
     CHECK(background.get().message.type == MessageType::ok);
     CHECK(client.stats().canonical_connections == 2);
     const auto work = server.work_stats();
@@ -521,7 +523,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_fails_within_i
     const auto elapsed = Clock::now() - started;
     CHECK(error.find("quorum unavailable") != std::string::npos);
     CHECK(elapsed >= 200ms);
-    CHECK(elapsed < 5s);
+    CHECK(elapsed < scaled(5s));
 
     silent = false;
     held.open();
@@ -980,7 +982,7 @@ MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_an
     auto held = bench.resources.data.acquire(DataWorkContext(FrameType::loader, extent), extent);
     REQUIRE(held.has_value());
     auto found = std::async(std::launch::async, [&] { return store->ensure_control_local(id); });
-    const bool prompt = found.wait_for(2s) == std::future_status::ready;
+    const bool prompt = found.wait_for(scaled(2s)) == std::future_status::ready;
     held.reset(); // lets a regressed build finish rather than hang the suite
     CHECK(prompt);
     CHECK(found.get());
@@ -1236,12 +1238,12 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_persistence_and_multiplexing) {
     REQUIRE(first_slow_gate.wait_for_entries(1));
     auto fast = client.call_async(endpoint, MessageType::ping, fast_payload);
 
-    REQUIRE(fast.wait_for(150ms) == std::future_status::ready);
+    REQUIRE(fast.wait_for(scaled(150ms)) == std::future_status::ready);
     auto fast_reply = fast.get();
     CHECK(fast_reply.message.type == MessageType::ok);
     CHECK(fast_reply.message.payload == fast_payload);
     first_slow_gate.open();
-    REQUIRE(slow.wait_for(500ms) == std::future_status::ready);
+    REQUIRE(slow.wait_for(scaled(500ms)) == std::future_status::ready);
     CHECK(slow.get().message.payload == slow_payload);
 
     // An empty request straight after prior frames on the same channel stays in sync.
@@ -1554,7 +1556,7 @@ MACHA_TEST("rpc_cluster", test_rpc_v15_bidirectional_and_deduplication) {
         CHECK(lower.client.call(higher.info, MessageType::members, Bytes{43}, 1s).message.payload ==
               Bytes{43});
         retired_connection_gate.open();
-        REQUIRE(slow.wait_for(1s) == std::future_status::ready);
+        REQUIRE(slow.wait_for(scaled(1s)) == std::future_status::ready);
         CHECK(slow.get().message.payload == Bytes{42});
         REQUIRE(wait_until([&] {
             return lower.client.stats().canonical_connections == 1 &&
@@ -1771,7 +1773,7 @@ MACHA_TEST("rpc_cluster", test_rpc_slow_control_does_not_abort_data) {
     CHECK(control.message.type == MessageType::ok);
     CHECK(control.message.payload == Bytes{1});
 
-    REQUIRE(data.wait_for(30s) == std::future_status::ready);
+    REQUIRE(data.wait_for(scaled(30s)) == std::future_status::ready);
     CHECK(data.get().message.type == MessageType::ok);
     CHECK(client.stats().connections_created == 2);
 }
@@ -1818,7 +1820,7 @@ MACHA_TEST("rpc_cluster", test_rpc_request_payload_is_charged_until_handler_comp
           active.owner_bytes[static_cast<size_t>(MemoryOwner::rpc_frame)]);
 
     handler_gate.open();
-    REQUIRE(request.wait_for(2s) == std::future_status::ready);
+    REQUIRE(request.wait_for(scaled(2s)) == std::future_status::ready);
     CHECK(request.get().message.type == MessageType::ok);
     REQUIRE(wait_until([&] { return memory.stats().used_bytes == 0; }));
     client.stop();
@@ -1904,7 +1906,7 @@ MACHA_TEST("rpc_cluster", test_rpc_held_executors_do_not_delay_other_classes) {
         }
         gate.open();
         for (auto& rpc : held) {
-            REQUIRE(rpc.wait_for(2s) == std::future_status::ready);
+            REQUIRE(rpc.wait_for(scaled(2s)) == std::future_status::ready);
             CHECK(rpc.get().message.type == c.held_reply.type);
         }
         client.stop();
@@ -2054,7 +2056,7 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
 
     // A full queue answers with an ordinary RPC error; the session stays open.
     auto queue_full = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{0x07});
-    REQUIRE(queue_full.wait_for(1s) == std::future_status::ready);
+    REQUIRE(queue_full.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(queue_full.get().message.type == MessageType::error);
 
     // Other classes of work complete while the metadata worker and queue are blocked.
@@ -2068,7 +2070,7 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
 
     metadata_gate.open();
     for (auto* rpc : {&history, &commit, &acceptance}) {
-        REQUIRE(rpc->wait_for(2s) == std::future_status::ready);
+        REQUIRE(rpc->wait_for(scaled(2s)) == std::future_status::ready);
         CHECK(rpc->get().message.type == MessageType::bool_reply);
     }
     REQUIRE(wait_until(
@@ -2083,7 +2085,7 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
     // rejected job never reaches the handler.
     auto too_large =
         client.call_async(endpoint, MessageType::accept_metadata_commit, Bytes(9, 0x0a));
-    REQUIRE(too_large.wait_for(1s) == std::future_status::ready);
+    REQUIRE(too_large.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(too_large.get().message.type == MessageType::error);
     CHECK(metadata_calls.load() == 3);
     // Every executor class has its own byte limit; a rejected payload never
@@ -2094,7 +2096,7 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_mutations_use_bounded_isolated_execu
     auto data_too_large = client.call_async(endpoint, MessageType::get_object, Bytes(2, 0x13),
                                             FrameType::foreground);
     for (auto* rejected : {&fast_too_large, &validation_too_large, &data_too_large}) {
-        REQUIRE(rejected->wait_for(1s) == std::future_status::ready);
+        REQUIRE(rejected->wait_for(scaled(1s)) == std::future_status::ready);
         CHECK(rejected->get().message.type == MessageType::error);
     }
     const auto final_stats = server.work_stats();
@@ -2204,7 +2206,7 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_orders_each_peer_and_parall
 
     first_job_gate.open();
     for (auto* rpc : {&first, &same_peer_next, &other_peer}) {
-        REQUIRE(rpc->wait_for(2s) == std::future_status::ready);
+        REQUIRE(rpc->wait_for(scaled(2s)) == std::future_status::ready);
         CHECK(rpc->get().message.type == MessageType::bool_reply);
     }
     CHECK(first_peer_second_started.load());
@@ -2292,10 +2294,10 @@ MACHA_TEST("rpc_cluster", test_rpc_metadata_executor_cancellation_disconnect_and
     auto dropped = client.call_async(endpoint, MessageType::put_metadata_commit, Bytes{4});
     REQUIRE(pending_jobs(1));
     auto stopping = std::async(std::launch::async, [&] { server.stop(); });
-    REQUIRE(owned.wait_for(2s) == std::future_status::ready);
-    REQUIRE(dropped.wait_for(2s) == std::future_status::ready);
+    REQUIRE(owned.wait_for(scaled(2s)) == std::future_status::ready);
+    REQUIRE(dropped.wait_for(scaled(2s)) == std::future_status::ready);
     last_job.open();
-    REQUIRE(stopping.wait_for(2s) == std::future_status::ready);
+    REQUIRE(stopping.wait_for(scaled(2s)) == std::future_status::ready);
     stopping.get();
     CHECK(handler_calls.load() == 2);
     CHECK(durable_jobs.load() == 2);
@@ -2358,10 +2360,10 @@ MACHA_TEST("rpc_cluster", test_service_shutdown_cancels_pending_outbound_rpc_bef
     // fails without waiting for its stall deadline.
     const auto started = Clock::now();
     auto stopping = std::async(std::launch::async, [&] { service.stop(); });
-    REQUIRE(stopping.wait_for(2s) == std::future_status::ready);
+    REQUIRE(stopping.wait_for(scaled(2s)) == std::future_status::ready);
     stopping.get();
     CHECK(Clock::now() - started < 2s);
-    REQUIRE(pending.wait_for(1s) == std::future_status::ready);
+    REQUIRE(pending.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(pending.get());
 
     // Cancellation persists: no new route or synchronous RPC after the close.
@@ -2499,14 +2501,14 @@ MACHA_TEST("rpc_cluster", test_storage_data_credit_reserves_viewer_headroom_and_
     // speculative DATA admission, not a CONTROL worker.
     auto blocked_validation =
         client.call_async(endpoint, MessageType::have_object, request.data());
-    REQUIRE(blocked_validation.wait_for(1s) == std::future_status::ready);
+    REQUIRE(blocked_validation.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(blocked_validation.get().message.type == MessageType::error);
     auto second_control = client.call(endpoint, MessageType::ping, {}, 500ms);
     CHECK(second_control.message.type == MessageType::ok);
-    CHECK(blocked_loader.wait_for(20ms) == std::future_status::timeout);
+    CHECK(blocked_loader.wait_for(scaled(20ms)) == std::future_status::timeout);
 
     first.reset();
-    REQUIRE(blocked_loader.wait_for(1s) == std::future_status::ready);
+    REQUIRE(blocked_loader.wait_for(scaled(1s)) == std::future_status::ready);
     CHECK(blocked_loader.get().message.type == MessageType::object_reply);
     CHECK(client.call(endpoint, MessageType::have_object, request.data(), 500ms).message.type ==
           MessageType::bool_reply);
@@ -4875,7 +4877,7 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     s1.filesystem().mkdir("/during-stall", 0755, getuid(), getgid());
     const auto elapsed = std::chrono::steady_clock::now() - started;
     // Well inside the 30 s control no-progress deadline.
-    CHECK(elapsed < 3s);
+    CHECK(elapsed < scaled(3s));
     CHECK(!repair_done.load());
 
     links->release(peer);

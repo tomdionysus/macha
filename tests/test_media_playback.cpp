@@ -1189,7 +1189,7 @@ MACHA_TEST("media_playback", test_http_server_serves_streams_concurrently) {
     auto elapsed = Clock::now() - started;
     CHECK(fast.find("200 OK") != std::string::npos);
     CHECK(fast.ends_with("ok"));
-    CHECK(elapsed < 300ms);
+    CHECK(elapsed < scaled(300ms));
     slow_body_gate.open();
     slow.join();
     CHECK(slow_response.find("200 OK") != std::string::npos);
