@@ -5409,7 +5409,10 @@ MACHA_TEST("rpc_cluster", test_inbound_incapable_node_is_reached_only_over_its_o
     CHECK(hub.client.stats().connections_created == 0);
     CHECK(site.client.stats().connections_created == 2);
     CHECK(hub.client.has_route(site.info.id, TransportLane::data));
-    CHECK(site.client.has_route(hub.info.id, TransportLane::data));
+    // The site lists the route once its dial is installed; the hub can use
+    // the session, as it just has, a moment before that.
+    REQUIRE(wait_until([&] { return site.client.has_route(hub.info.id, TransportLane::data); },
+                       5s));
 
     // A DATA lane that dies underneath (a NAT mapping expiring) is redialled
     // by the site on its own initiative, without being asked.
