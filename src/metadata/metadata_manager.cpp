@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "metadata/metadata_manager.hpp"
+
+#include "observation.hpp"
 #include "diagnostics.hpp"
 #include "cluster/placement.hpp"
 #include "metadata/namespace_control_store.hpp"
@@ -1171,9 +1173,12 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         }
 
         if (!reconciliation_lock) {
+            const auto waited = Clock::now();
             reconciliation_lock.emplace(reconciliation_mutex_);
+            observations().record("metadata.reconcile_wait_us", elapsed_us(waited));
             continue; // re-read heads now that we hold the lock; may already be resolved
         }
+        const auto reconcile_started = Clock::now();
 
         if (compatible_replicas(nodes).size() < need)
             throw MetadataNotReady(
@@ -1262,8 +1267,11 @@ MetadataRecord MetadataManager::read_group(const std::vector<NodeId>& replicas,
         (void)publish_commit(nodes, reconciliation, reconciliation_delta, frame_type);
         if (merged.conflicts_superseded)
             conflicts_superseded_.fetch_add(merged.conflicts_superseded, std::memory_order_relaxed);
+        const auto reconcile_us = elapsed_us(reconcile_started);
+        observations().record("metadata.reconcile_us", reconcile_us);
         Log::info("metadata histories reconciled generation=" +
                   std::to_string(reconciliation.generation) +
+                  " ms=" + std::to_string(reconcile_us / 1000) +
                   " history_body=" +
                   std::string(reconciliation_delta.empty() ? "full" : "delta") +
                   " history_bytes=" +
