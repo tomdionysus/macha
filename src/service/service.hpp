@@ -80,6 +80,7 @@ class Service {
     MessageRoutes routes_;
     // Local recovery's stages, reported as the node's are.
     LocalState::StageHook recovery_stage_hook_;
+    std::chrono::milliseconds durability_batch_window_;
     NodeRuntime node_;
     // After the node, whose transport carries its gossip; started after the
     // node and stopped before it.
@@ -132,7 +133,9 @@ class Service {
   public:
     // The role a request needs, or empty when a valid session is enough.
     static std::string_view required_role(const HttpRequest&);
-    Service(Config, ClusterKeys, NodeRuntime::StartupStageHook startup_stage_hook = {},
+    // `durability_batch_window`: see LocalState.
+    Service(Config, ClusterKeys, std::chrono::milliseconds durability_batch_window,
+            NodeRuntime::StartupStageHook startup_stage_hook = {},
             MaintenanceStageHook maintenance_stage_hook = {},
             StartupStallHandler startup_stall_handler = {},
             ServiceInstruments instruments = {});

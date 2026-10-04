@@ -103,8 +103,12 @@ struct RecoveryCancelled : std::runtime_error {
 class LocalState {
   public:
     using StageHook = std::function<void(std::string_view)>;
+    // `durability_batch_window` is how long a DATA commit that asks for
+    // durability waits so that others share its physical sync: latency for
+    // fewer syncs.
     LocalState(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
-               const StageHook&, std::stop_token);
+               const StageHook&, std::stop_token,
+               std::chrono::milliseconds durability_batch_window);
     ~LocalState();
     LocalState(const LocalState&) = delete;
     LocalState& operator=(const LocalState&) = delete;
@@ -125,7 +129,7 @@ class LocalState {
 
   private:
     void recover_data(const Config&, const NodeIdentity&, RecoveryProgress&, const StageHook&,
-                      std::stop_token);
+                      std::stop_token, std::chrono::milliseconds durability_batch_window);
     void recover_state(const Config&, const NodeIdentity&, ClusterNode&, RecoveryProgress&,
                        const StageHook&, std::stop_token);
 

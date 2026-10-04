@@ -7,6 +7,7 @@
 #include "cluster/storage_server.hpp"
 #include "metadata/metadata_server.hpp"
 
+#include <chrono>
 #include <stop_token>
 
 namespace macha {
@@ -25,7 +26,7 @@ class LocalServices {
   public:
     LocalServices(const Config&, const NodeIdentity&, RecoveryProgress&,
                   const LocalState::StageHook&, std::stop_token, NodeRuntime&, NodeResources&,
-                  MessageRoutes&);
+                  MessageRoutes&, std::chrono::milliseconds durability_batch_window);
     // Detaches the DATA pool's monitor from the arbiter before the pool goes.
     ~LocalServices();
     LocalServices(const LocalServices&) = delete;

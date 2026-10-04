@@ -164,7 +164,8 @@ class StoreBench {
         : config_(configure(cluster_, tune)), resources(config_),
           identity_(config_.state_path, cluster_.keys()),
           node(config_, self_info(config_, identity_.id), identity_.durability_epoch),
-          local(config_, identity_, node, progress_, {}, std::stop_token{}) {
+          local(config_, identity_, node, progress_, {}, std::stop_token{},
+                test_durability_window) {
         node.advertise_storage(local.data().used(), local.data().limit());
     }
     ~StoreBench() { resources.stop(); }

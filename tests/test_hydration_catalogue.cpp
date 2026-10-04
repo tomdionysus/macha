@@ -1937,8 +1937,8 @@ MACHA_TEST("hydration_catalogue", test_catalogue_non_coordinator_idle_does_not_s
     c1.catalogue.scanner.enabled = c2.catalogue.scanner.enabled = false;
     c1.catalogue.api.enabled = c2.catalogue.api.enabled = false;
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
@@ -4256,7 +4256,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     c3.maintenance.no_progress_backoff = 1000ms;
     CHECK(maintenance_background_interval(c1.maintenance) == 5000ms);
 
-    Service s1(c1, keys);
+    Service s1(c1, keys, test_durability_window);
     s1.start();
     REQUIRE(wait_until([&] {
         try {
@@ -4294,7 +4294,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     // browse/search capable without provider access. Artwork is ordinary DATA:
     // with R=1 it is not copied to every joining node, but every node must still
     // be able to read it from the elected/fallback owner.
-    Service s2(c2, keys);
+    Service s2(c2, keys, test_durability_window);
     s2.start();
     REQUIRE(wait_until([&] {
         auto status = s2.catalogue().status();
@@ -4313,7 +4313,7 @@ MACHA_HEAVY_TEST("hydration_catalogue", test_catalogue_sync_search_and_artwork_g
     REQUIRE(s2_first_art.has_value());
     CHECK(s2_first_art->bytes == first_art_bytes);
 
-    Service s3(c3, keys);
+    Service s3(c3, keys, test_durability_window);
     s3.start();
     REQUIRE(wait_until([&] {
         auto status = s3.catalogue().status();
@@ -4481,7 +4481,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
     std::atomic<Service*> observed{nullptr};
     std::mutex run_begins_mutex;
     std::vector<ConvergenceDemandDiagnostics> run_begins;
-    Service s1(c1, keys, {}, [&](std::string_view stage) {
+    Service s1(c1, keys, test_durability_window, {}, [&](std::string_view stage) {
         if (stage == "metadata-repair-begin" && gate_metadata.load(std::memory_order_acquire)) {
             if (auto* service = observed.load(std::memory_order_acquire)) {
                 std::lock_guard lock(run_begins_mutex);
@@ -4497,7 +4497,7 @@ MACHA_TEST("hydration_catalogue", test_catalogue_uses_final_state_after_coalesce
         }
     });
     observed.store(&s1, std::memory_order_release);
-    Service s2(c2, keys);
+    Service s2(c2, keys, test_durability_window);
     struct GateOpener {
         TestGate& gate;
         ~GateOpener() { gate.open(); }

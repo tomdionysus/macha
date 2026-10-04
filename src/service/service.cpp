@@ -24,7 +24,9 @@
 namespace macha {
 
 
-Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook startup_stage_hook,
+Service::Service(Config config, ClusterKeys keys,
+                 std::chrono::milliseconds durability_batch_window,
+                 NodeRuntime::StartupStageHook startup_stage_hook,
                  MaintenanceStageHook maintenance_stage_hook,
                  StartupStallHandler startup_stall_handler, ServiceInstruments instruments)
     : clock_(instruments.clock ? std::move(instruments.clock)
@@ -35,6 +37,7 @@ Service::Service(Config config, ClusterKeys keys, NodeRuntime::StartupStageHook 
       lifecycle_(std::move(instruments.lifecycle)),
       resources_(config, [clock = clock_] { return clock->now(); }),
       identity_(config.state_path, keys), recovery_stage_hook_(startup_stage_hook),
+      durability_batch_window_(durability_batch_window),
       node_(std::move(config), identity_, progress_, resources_.memory,
             resources_.transcode_rates, routes_, resources_.events, *links_,
             std::move(startup_stage_hook), [] { return Clock::now(); }),
@@ -491,7 +494,8 @@ void Service::initialise_services(std::stop_token stop) {
         try {
             local_ = std::make_unique<LocalServices>(node_.config(), identity_, progress_,
                                                      recovery_stage_hook_, stop, node_,
-                                                     resources_, routes_);
+                                                     resources_, routes_,
+                                                     durability_batch_window_);
         } catch (const RecoveryCancelled&) {
             return;
         }

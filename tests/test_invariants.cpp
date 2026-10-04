@@ -956,7 +956,7 @@ MACHA_TEST("invariants", test_service_answers_health_and_status_through_startup)
 
     TestGate control_gate;
     TestGate recovery_gate;
-    Service service(config, cluster.keys(), [&](std::string_view stage) {
+    Service service(config, cluster.keys(), test_durability_window, [&](std::string_view stage) {
         if (stage == "control-plane")
             control_gate.enter_and_wait();
         if (stage == "data-storage" || stage == "control-storage")
@@ -2784,7 +2784,8 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_group_commits_independent_p
     auto client_config = cluster.node_config("durability-group-rpc-client");
     server_config.replication = client_config.replication = 1;
     server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
-    BareNode server(server_config, cluster.keys());
+    // A window the three barriers below, 75 ms apart, all fall inside.
+    BareNode server(server_config, cluster.keys(), {}, {}, 500ms);
     BareNode client(client_config, cluster.keys());
     server.start();
     client.start();
@@ -2862,7 +2863,7 @@ MACHA_TEST("invariants", test_rpc_durability_barrier_reuses_already_covered_gene
     auto client_config = cluster.node_config("durability-generation-rpc-client");
     server_config.replication = client_config.replication = 1;
     server_config.metadata_min_write_replicas = client_config.metadata_min_write_replicas = 1;
-    BareNode server(server_config, cluster.keys());
+    BareNode server(server_config, cluster.keys(), {}, {}, 500ms);
     BareNode client(client_config, cluster.keys());
     server.start();
     client.start();

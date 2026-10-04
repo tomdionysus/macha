@@ -3972,8 +3972,8 @@ MACHA_TEST("storage_metadata", test_repair_step_is_bounded_and_yields) {
     c1.maintenance.idle_bandwidth_fraction = 0.0;
     c2.maintenance.idle_bandwidth_fraction = 0.0;
 
-    Service s1(c1, keys);
-    Service s2(c2, keys);
+    Service s1(c1, keys, test_durability_window);
+    Service s2(c2, keys, test_durability_window);
     s1.start();
     s2.start();
     REQUIRE(wait_until([&] {
