@@ -565,6 +565,8 @@ HttpResponse CatalogueApi::handle(const HttpRequest& request) {
                 // session create uses; background profiling yields to it.
                 try {
                     profile = resolve_media_profile_(media_id);
+                } catch (const MediaEngineUnavailable& e) {
+                    return error(503, "media_engine_unavailable", e.what());
                 } catch (const MediaError& e) {
                     // Report the failure kind: an unreadable source may be fine elsewhere; an
                     // unparseable one is unparseable everywhere.
