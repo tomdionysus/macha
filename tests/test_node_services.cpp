@@ -409,8 +409,8 @@ MACHA_TEST("node_services", test_a_commit_is_published_only_once_its_objects_are
     CHECK(data == 1);
     CHECK(claims.claim_objects(RetentionClass::data) == 1);
 
-    // An entry naming an object nobody holds cannot be claimed: refused,
-    // unpublished, and the barrier names the floor.
+    // An entry bringing in an object nobody holds is refused and unpublished,
+    // and the barrier says why.
     FsEntry phantom;
     phantom.type = EntryType::file;
     phantom.size = 4096;
@@ -422,14 +422,14 @@ MACHA_TEST("node_services", test_a_commit_is_published_only_once_its_objects_are
     } catch (const MetadataNotReady& error) {
         refusal = error.what();
     }
-    CHECK(refusal == "DATA retention floor unavailable before metadata publication");
+    CHECK(refusal == "DATA object is held by no node present before metadata publication");
     CHECK(!services.metadata().snapshot().entries.contains("/phantom.bin"));
     CHECK(claims.claim_objects(RetentionClass::data) == 1);
     bool named = false;
     for (const auto& [level, line] : log->records())
         named = named || (line.find("metadata retention barrier") != std::string::npos &&
                           line.find("data_objects=1") != std::string::npos &&
-                          line.find("outcome=data-floor-unavailable") != std::string::npos);
+                          line.find("outcome=data-unheld") != std::string::npos);
     CHECK(named);
     Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }

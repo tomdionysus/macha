@@ -576,10 +576,6 @@ std::set<ObjectId> CatalogueManager::data_object_ids(const CatalogueSnapshot& sn
     return ids;
 }
 
-size_t CatalogueManager::durability_required() const {
-    return node_.config().metadata_min_write_replicas;
-}
-
 CatalogueSnapshot CatalogueManager::load_root(const std::optional<ObjectId>& root) {
     if (!root)
         return {};
@@ -1118,7 +1114,6 @@ void CatalogueManager::commit(
         metadata_namespace_signature(metadata_snapshot) != *expected_namespace)
         throw CatalogueConflict("namespace changed during catalogue reconciliation");
 
-    const auto required = durability_required();
     const auto new_artwork = data_object_ids(next);
 
     // Artwork is ordinary immutable DATA. Only new references are validated;
@@ -1161,14 +1156,14 @@ void CatalogueManager::commit(
         return;
     }
 
-    // A commit may reference a control object only once the metadata write
-    // floor holds it. Every active node is eligible, whatever its DATA capacity.
+    // A commit may reference a control object once some node holds it; every
+    // active node is offered it, whatever its DATA capacity.
     for (const auto& [id, encoded] : changed_control) {
-        if (store_.replicate_control(id, encoded) < required)
-            throw CatalogueUnavailable("catalogue shard could not reach metadata durability floor");
+        if (!store_.replicate_control(id, encoded))
+            throw CatalogueUnavailable("catalogue shard could not be stored");
     }
-    if (store_.replicate_control(root, encoded_manifest) < required)
-        throw CatalogueUnavailable("catalogue manifest could not reach metadata durability floor");
+    if (!store_.replicate_control(root, encoded_manifest))
+        throw CatalogueUnavailable("catalogue manifest could not be stored");
 
     try {
         if (resolved_conflict) {

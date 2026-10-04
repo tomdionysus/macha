@@ -211,7 +211,6 @@ class CatalogueManager {
 
     // Every DATA object the catalogue references: artwork and media indexes.
     static std::set<ObjectId> data_object_ids(const CatalogueSnapshot&);
-    size_t durability_required() const;
     CatalogueSnapshot load_root(const std::optional<ObjectId>&);
     bool converge_control_replicas(const MetadataSnapshot&);
     bool reconcile_catalogue_conflict(const MetadataSnapshotView&);

@@ -490,15 +490,18 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_replaces_a_replica_that_cannot_be_
     CHECK(bench.node.calls_of(MessageType::put_object, standby) == 1);
 }
 
-// A put whose required replica never answers fails retryably once nothing in
-// its pipeline has moved for the work's no-progress budget, and the same put
-// goes through once the peer answers.
-MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_fails_within_its_no_progress_budget) {
+// A put whose second replica never answers returns on the local copy once
+// the peer has stalled, well inside the work's no-progress budget, and the
+// same put reaches the peer once it answers.
+MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_returns_on_the_local_copy) {
     StoreBench bench([](Config& c) {
         c.replication = 2;
         c.min_write_replicas = 2;
         c.write_stall = 50ms;
     });
+    const auto peer_puts = [&] {
+        return bench.node.calls_of(MessageType::put_object_deferred);
+    };
     std::atomic_bool silent{true};
     TestGate held;
     const auto peer = StoreBench::peer();
@@ -511,25 +514,23 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_to_a_silent_replica_fails_within_i
     const auto data = pattern(64 * 1024, 3);
     std::atomic_uint64_t progress{};
     const DataWorkContext work(FrameType::loader, bench.config().extent_size, {}, nullptr,
-                               &progress, 200ms);
+                               &progress, scaled(30s));
     DistributedStore::DurabilityBatch batch;
-    std::string error;
     const auto started = Clock::now();
-    try {
-        (void)store->put_deferred(data, batch, FrameType::loader, nullptr, &work);
-    } catch (const std::exception& e) {
-        error = e.what();
-    }
+    CHECK(store->put_deferred(data, batch, FrameType::loader, nullptr, &work) == object_id(data));
     const auto elapsed = Clock::now() - started;
-    CHECK(error.find("quorum unavailable") != std::string::npos);
-    CHECK(elapsed >= 200ms);
+    CHECK(elapsed >= 50ms);
     CHECK(elapsed < scaled(5s));
+    CHECK(bench.local.data().has(object_id(data)));
+    CHECK(!batch.empty());
 
     silent = false;
     held.open();
+    const auto before = peer_puts();
+    const auto more = pattern(64 * 1024, 4);
     DistributedStore::DurabilityBatch again;
-    CHECK(store->put_deferred(data, again, FrameType::loader, nullptr, &work) == object_id(data));
-    CHECK(!again.empty());
+    CHECK(store->put_deferred(more, again, FrameType::loader, nullptr, &work) == object_id(more));
+    CHECK(peer_puts() == before + 1);
 }
 
 // Readers of one missing object share a single fetch and a single retained
@@ -966,9 +967,9 @@ MACHA_FAST_TEST("rpc_cluster", test_store_runtime_cache_keeps_a_playback_fetch) 
 }
 
 // The control store is not on the DATA device: finding a local control
-// object never waits for DATA credit. A namespace node put below its
-// metadata floor is transient cluster state, of the type callers retry on.
-MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_and_keep_the_floor) {
+// object never waits for DATA credit. A namespace node is written by a node
+// on its own.
+MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_and_commit_alone) {
     StoreBench bench([](Config& c) {
         c.data_inflight_bytes = 2 * c.extent_size;
         c.data_viewer_reserve_bytes = c.extent_size;
@@ -987,15 +988,10 @@ MACHA_FAST_TEST("rpc_cluster", test_store_control_objects_take_no_data_credit_an
     CHECK(prompt);
     CHECK(found.get());
 
-    auto nodes = ControlNamespaceNodeStore::for_commit(bench.local.control(), *store, 2);
-    bool not_ready = false;
-    try {
-        (void)nodes.put(pattern(512, 17));
-    } catch (const MetadataNotReady&) {
-        not_ready = true;
-    }
-    CHECK(not_ready);
-    CHECK(nodes.written().empty());
+    auto nodes = ControlNamespaceNodeStore::for_commit(bench.local.control(), *store);
+    const auto node = nodes.put(pattern(512, 17));
+    CHECK(bench.local.control().has(node));
+    CHECK(nodes.written() == std::vector<ObjectId>{node});
 }
 
 // The startup gate fires on silence, never on slow progress: a reading that
@@ -2600,11 +2596,14 @@ MACHA_TEST("rpc_cluster", test_bootstrap_joiner_requires_complete_checkpoint_sur
     node.stop();
 }
 
-MACHA_TEST("rpc_cluster", test_metadata_write_floor_policy_mismatch_fails_closed) {
+// Nodes configured to seek different numbers of copies form one namespace,
+// and a third joins it: each writes and the others read it.
+MACHA_TEST("rpc_cluster", test_nodes_seeking_different_copy_counts_share_one_namespace) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
-    auto p1 = free_port();
-    auto p2 = free_port();
+    const auto p1 = free_port();
+    const auto p2 = free_port();
+    const auto p3 = free_port();
 
     auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
     auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
@@ -2619,94 +2618,39 @@ MACHA_TEST("rpc_cluster", test_metadata_write_floor_policy_mismatch_fails_closed
         return s1.node().membership().active().size() >= 2 &&
                s2.node().membership().active().size() >= 2;
     }));
-
-    auto rejected_for_policy = [](Service& service) {
-        try {
-            service.filesystem().mkdir("/must-not-form", 0755, getuid(), getgid());
-        } catch (const std::exception& error) {
-            return std::string(error.what()).find("write-floor policy mismatch") !=
-                   std::string::npos;
-        }
-        return false;
+    const auto sees = [](Service& service, const std::string& path) {
+        return wait_until([&] {
+            try {
+                return service.filesystem().getattr(path).type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        });
     };
-    CHECK(rejected_for_policy(s1));
-    CHECK(rejected_for_policy(s2));
-    CHECK(s1.local_state().replica().committed().generation <= 1);
-    CHECK(s2.local_state().replica().committed().generation <= 1);
-
-    s2.stop();
-    s1.stop();
-}
-
-MACHA_TEST("rpc_cluster", test_established_metadata_floor_ignores_misconfigured_peer) {
-    TestCluster cluster;
-    const auto& keys = cluster.keys();
-    const auto p1 = free_port();
-    const auto p2 = free_port();
-    const auto p3 = free_port();
-
-    auto c1 = config_for(cluster.path() / "n1", cluster.keyfile(), p1, {{"127.0.0.1", p2}});
-    auto c2 = config_for(cluster.path() / "n2", cluster.keyfile(), p2, {{"127.0.0.1", p1}});
-    c1.metadata_min_write_replicas = c2.metadata_min_write_replicas = 2;
-    Service s1(c1, keys, test_durability_window);
-    Service s2(c2, keys, test_durability_window);
-    s1.start();
-    s2.start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() >= 2 &&
-               s2.node().membership().active().size() >= 2;
-    }));
-    // Reachability precedes metadata recovery; make both metadata planes
-    // ready before establishing history.
-    (void)s1.filesystem();
-    (void)s2.filesystem();
-    REQUIRE(wait_metadata_writable(s1));
-    REQUIRE(wait_metadata_writable(s2));
-    s1.filesystem().mkdir("/established", 0755, getuid(), getgid());
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/established").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
+    REQUIRE(retry_while_not_ready(
+        [&] { s1.filesystem().mkdir("/from-one", 0755, getuid(), getgid()); }));
+    REQUIRE(retry_while_not_ready(
+        [&] { s2.filesystem().mkdir("/from-two", 0755, getuid(), getgid()); }));
+    CHECK(sees(s2, "/from-one"));
+    CHECK(sees(s1, "/from-two"));
 
     auto c3 = config_for(cluster.path() / "n3", cluster.keyfile(), p3,
                          {{"127.0.0.1", p1}, {"127.0.0.1", p2}});
-    c3.metadata_min_write_replicas = 1; // deliberately wrong
+    c3.metadata_min_write_replicas = 3;
     Service s3(c3, keys, test_durability_window);
     s3.start();
     REQUIRE(wait_until([&] { return s1.node().membership().active().size() >= 3; }));
-
-    // The quarantined peer cannot block the two compatible replicas that satisfy W=2.
+    CHECK(sees(s3, "/from-one"));
     REQUIRE(retry_while_not_ready(
-        [&] { s1.filesystem().mkdir("/still-writable", 0755, getuid(), getgid()); }));
-    REQUIRE(wait_until([&] {
-        try {
-            return s2.filesystem().getattr("/still-writable").type == EntryType::directory;
-        } catch (...) {
-            return false;
-        }
-    }));
-    auto& m1 = s1.metadata_manager();
-    m1.note_replica_validation(false, "policy mismatch test");
-    const auto status = m1.cluster_status();
-    CHECK(status.availability == MetadataAvailability::writable);
-    CHECK(status.replicas_online == 2);
-    CHECK(!status.stable);
-
-    bool bad_peer_rejected = false;
-    try {
-        s3.filesystem().mkdir("/must-not-weaken-policy", 0755, getuid(), getgid());
-    } catch (...) {
-        bad_peer_rejected = true;
-    }
-    CHECK(bad_peer_rejected);
+        [&] { s3.filesystem().mkdir("/from-three", 0755, getuid(), getgid()); }));
+    CHECK(sees(s1, "/from-three"));
+    CHECK(sees(s2, "/from-three"));
 
     s3.stop();
     s2.stop();
     s1.stop();
 }
+
 
 MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     TestCluster cluster;
@@ -3441,7 +3385,8 @@ MACHA_HEAVY_TEST("rpc_cluster", test_an_ingest_blocked_on_unwritable_metadata_re
     s1.stop();
 }
 
-MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_before_acceptance) {
+// A metadata-only change to a file commits while one of its holders is away.
+MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -3511,45 +3456,30 @@ MACHA_HEAVY_TEST("rpc_cluster", test_metadata_file_touch_requires_retention_befo
                s2.node().membership().active().size() == 2;
     }));
 
-    // Metadata W=2 holds, but the file touch needs a fresh retention dot on
-    // DATA W=3; when that barrier fails the metadata head must not advance.
-    bool refused = false;
-    try {
-        s1.filesystem().chmod("/retained.bin", 0600);
-    } catch (const MetadataNotReady&) {
-        refused = true;
-    } catch (...) {
-        refused = true;
-    }
-    CHECK(refused);
-    CHECK(s1.local_state().replica().committed().hash == before.hash);
-    CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0644U);
-
-    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
-    s3->start();
-    REQUIRE(wait_until([&] {
-        return s1.node().membership().active().size() == 3 &&
-               s2.node().membership().active().size() == 3 &&
-               s3->node().membership().active().size() == 3;
-    }));
-    // Membership can precede the control worker that serves retention queries,
-    // so prove that path before the W=3 mutation; each attempt is deadline-bounded.
-    REQUIRE(wait_until([&] {
-        try {
-            const auto returning_id = s3->node().node_id();
-            const auto active = s1.node().membership().active();
-            const auto returning = std::find_if(active.begin(), active.end(), [&](const auto& n) {
-                return n.id == returning_id;
-            });
-            return returning != active.end() &&
-                   s1.filesystem().store().has_on(*returning, extent);
-        } catch (...) {
-            return false;
-        }
-    }, 10s));
+    // A holder is away: the touch still commits, with a fresh claim on the
+    // holders present.
     s1.filesystem().chmod("/retained.bin", 0600);
     CHECK((s1.filesystem().getattr("/retained.bin").mode & 0777U) == 0600U);
     CHECK(s1.local_state().replica().committed().hash != before.hash);
+    const auto dot = [&](Service& service) {
+        const auto claims = service.local_state().retention().claims(RetentionClass::data, extent);
+        const auto found = claims.adds.find(s1.node().node_id());
+        return found == claims.adds.end() ? uint64_t{0} : found->second;
+    };
+    const auto touched = dot(s1);
+    CHECK(touched > 0);
+    CHECK(dot(s2) == touched);
+
+    // The returning holder learns the change from the head.
+    s3 = std::make_unique<Service>(c3, keys, test_durability_window);
+    s3->start();
+    REQUIRE(wait_until([&] {
+        try {
+            return (s3->filesystem().getattr("/retained.bin").mode & 0777U) == 0600U;
+        } catch (...) {
+            return false;
+        }
+    }, 30s));
 
     s3->stop();
     s2.stop();
@@ -4082,14 +4012,12 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
                    s2.node().membership().active().size() >= 2;
         }));
 
-        // The write floor must be re-established at the new policy first.
         REQUIRE(wait_metadata_writable(s1));
         s1.filesystem().mkdir("/after-grow", 0755, getuid(), getgid());
         MetadataManager m1(s1.node(), s1.local_state(), s1.metadata_server());
         auto snapshot = m1.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
-        CHECK(snapshot.metadata_write_replicas_required == 2);
         CHECK(s2.filesystem().getattr("/after-grow").type == EntryType::directory);
 
         DistributedStore r1(s1.node(), s1.local_state(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
@@ -4387,24 +4315,18 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_durable_trio_founds_commits_and_reads_thr
     CHECK(std::equal(slice.begin(), slice.end(), input.begin() + 987654));
 }
 
-// With the metadata floor at two of three: losing one replica leaves the
-// other two committing, and the change is on both when the call returns; a
-// lone survivor refuses to commit.
-MACHA_HEAVY_TEST("rpc_cluster", test_metadata_commits_down_to_its_floor_and_no_further) {
+// Three nodes seeking two copies: losing one leaves the other two
+// committing, with the change on both when the call returns; a lone survivor
+// goes on committing.
+MACHA_HEAVY_TEST("rpc_cluster", test_metadata_commits_with_whichever_nodes_remain) {
     DurableTrio trio(2, 1);
     trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
     trio.stop(2);
     trio[1].filesystem().mkdir("/after-one-loss", 0755, getuid(), getgid());
     CHECK(is_directory(trio[0], "/after-one-loss"));
     trio.stop(1);
-    bool refused = false;
-    try {
-        trio[0].filesystem().mkdir("/below-the-floor", 0755, getuid(), getgid());
-    } catch (const std::exception&) {
-        refused = true;
-    }
-    CHECK(refused);
-    CHECK(!is_directory(trio[0], "/below-the-floor"));
+    trio[0].filesystem().mkdir("/alone", 0755, getuid(), getgid());
+    CHECK(is_directory(trio[0], "/alone"));
 }
 
 // Unlinking retires the object to garbage. The cached inventory is one shared,
@@ -4896,14 +4818,11 @@ MACHA_TEST("rpc_cluster", test_metadata_repair_stalled_on_a_silent_peer_does_not
     s1.stop();
 }
 
-// The claims barrier before a commit, across a write floor of two: the
-// commit's control objects must be claimed on both replicas. A replica that
-// holds them and never answers the claim leaves the floor unreached, so the
-// commit is refused and nothing is published; once it answers, the same
-// commit goes through and both replicas hold the claim.
-MACHA_TEST("rpc_cluster", test_a_commit_is_refused_until_its_control_claims_reach_the_write_floor) {
-    auto log = std::make_shared<ConcurrentCapturingLogger>(LogLevel::debug);
-    Log::set_logger(log);
+// The claims barrier before a commit: the commit's control objects are
+// claimed on this node and on the peer when it answers. A peer that never
+// answers the claim does not hold the commit back; once it answers, a later
+// commit's claim lands on both.
+MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answers_the_claim) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
     const auto p1 = free_port();
@@ -4933,32 +4852,24 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_refused_until_its_control_claims_reac
 
     const auto peer = s2.node().node_id();
     links->stall(peer, MessageType::retain_objects);
-    std::string refusal;
-    try {
-        (void)s1.catalogue().upsert(item);
-    } catch (const std::exception& error) {
-        refusal = error.what();
-    }
-    CHECK(refusal.find("CONTROL retention floor unavailable before metadata publication") !=
-          std::string::npos);
+    (void)s1.catalogue().upsert(item);
     CHECK(links->stalled_calls() >= 1);
-    CHECK(!s1.metadata_manager().snapshot().catalogue_root.has_value());
-    bool named = false;
-    for (const auto& [level, line] : log->records())
-        named = named || (line.find("metadata retention barrier") != std::string::npos &&
-                          line.find("outcome=control-floor-unavailable") != std::string::npos);
-    CHECK(named);
+    const auto alone = s1.metadata_manager().snapshot().catalogue_root;
+    REQUIRE(alone.has_value());
+    CHECK(s1.local_state().retention().retained(RetentionClass::control, *alone));
+    CHECK(!s2.local_state().retention().retained(RetentionClass::control, *alone));
 
     links->release(peer);
-    REQUIRE(retry_while_not_ready([&] { (void)s1.catalogue().upsert(item); }));
+    item.title = "Claimed twice";
+    (void)s1.catalogue().upsert(item);
     const auto root = s1.metadata_manager().snapshot().catalogue_root;
     REQUIRE(root.has_value());
+    CHECK(*root != *alone);
     CHECK(s1.local_state().retention().retained(RetentionClass::control, *root));
     CHECK(s2.local_state().retention().retained(RetentionClass::control, *root));
 
     s2.stop();
     s1.stop();
-    Log::set_logger(std::make_shared<ConsoleLogger>(LogLevel::info));
 }
 
 MACHA_TEST("rpc_cluster", test_ingest_torrent_jobs_visible_and_actionable_from_non_owning_node) {

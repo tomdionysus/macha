@@ -551,10 +551,6 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_commit_store_acceptance_heads_
         MetadataReplica replica(path, keys.storage);
         REQUIRE(replica.store_commit(left));
         const auto before_acceptance = replica.diagnostics();
-        MetadataAcceptance understrength{left.generation, left.hash, 1, {a}};
-        CHECK(!replica.accept_commit(understrength));
-        CHECK(replica.diagnostics().accepted_head_persistence_writes ==
-              before_acceptance.accepted_head_persistence_writes);
         REQUIRE(replica.accept_commit(left_accept));
         const auto after_left = replica.diagnostics();
         CHECK(after_left.accepted_head_persistence_writes ==

@@ -1076,7 +1076,7 @@ MACHA_HEAVY_TEST("storage_v18", test_retain_data_batches_a_large_publication_wit
 
     const RetentionDot dot{a.node().node_id(), 1};
     const auto started = std::chrono::steady_clock::now();
-    CHECK(a.store().retain_data(ids, dot));
+    a.store().retain_data(ids, dot);
     const auto elapsed = std::chrono::steady_clock::now() - started;
     // Batched checks need a handful of round trips; the bound is loose for
     // loaded hardware but still catches one round trip per extent.
@@ -1116,9 +1116,9 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
     }
 
     const RetentionDot dot{a.node().node_id(), 1};
-    REQUIRE(a.store().retain_control(ids, dot, 2));
+    REQUIRE(a.store().retain_control(ids, dot));
 
-    // The peer holds every object: the floor was met by a real second replica.
+    // The peer holds every object: a present peer is given the graph.
     size_t on_peer = 0;
     for (const auto& id : ids)
         if (b.node().control_store().has(id))
@@ -1131,7 +1131,7 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
         b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
     REQUIRE(puts_before > 0);
     const RetentionDot again{a.node().node_id(), 2};
-    REQUIRE(a.store().retain_control(ids, again, 2));
+    REQUIRE(a.store().retain_control(ids, again));
     const auto puts_after =
         b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
     CHECK(puts_after == puts_before);
@@ -1140,7 +1140,7 @@ MACHA_TEST("storage_v18", test_a_control_graph_larger_than_the_connection_budget
     for (size_t i = 0; i < 10; ++i)
         REQUIRE(b.node().control_store().remove(ids[i]));
     const RetentionDot third{a.node().node_id(), 3};
-    REQUIRE(a.store().retain_control(ids, third, 2));
+    REQUIRE(a.store().retain_control(ids, third));
     const auto puts_final =
         b.node().rpc_server_work_stats().message_timings[MessageType::put_control_object].requests;
     CHECK(puts_final == puts_after + 10);

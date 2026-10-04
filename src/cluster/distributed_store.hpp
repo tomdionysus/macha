@@ -347,10 +347,12 @@ class DistributedStore final : public Placement, public ControlObjectSource {
     bool durability_barrier(DurabilityBatch&, FrameType = FrameType::loader,
                             std::vector<ObjectId>* unsatisfiable = nullptr);
     // Publication liveness barrier: every object a metadata mutation
-    // references gets a causal retention claim before the commit is accepted.
-    // DATA needs dht.min_write_replicas; CONTROL the given metadata floor.
-    bool retain_data(const std::vector<ObjectId>&, const RetentionDot&);
-    bool retain_control(const std::vector<ObjectId>&, const RetentionDot&, size_t required);
+    // references gets a causal retention claim on the holders present before
+    // the commit is accepted. A CONTROL claim must hold on this node, and is
+    // false only when it does not. A DATA claim is placed wherever a holder
+    // answers; the ids no node present holds come back, sorted.
+    std::vector<ObjectId> retain_data(const std::vector<ObjectId>&, const RetentionDot&);
+    bool retain_control(const std::vector<ObjectId>&, const RetentionDot&);
     std::optional<Bytes> get(const ObjectId&, size_t stripe = 0, bool foreground = true,
                              Clock::time_point deadline = {}, std::atomic_bool* cancelled = nullptr);
     std::optional<Bytes> get(const ObjectId&, size_t stripe, FrameType,

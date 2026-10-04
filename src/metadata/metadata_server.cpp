@@ -23,10 +23,9 @@ RpcMessage metadata_identity_reply(const MetadataIdentity& identity) {
 
 MetadataServer::MetadataServer(NodeRuntime& node, MetadataReplica& replica,
                                PersistentBlockCache& cache, MessageRoutes& routes,
-                               size_t min_write_replicas,
                                std::chrono::milliseconds refresh_interval)
     : node_(node), replica_(replica), cache_(cache), routes_(routes),
-      min_write_replicas_(min_write_replicas), refresh_interval_(refresh_interval) {
+      refresh_interval_(refresh_interval) {
     // Identity-reset tombstones must be active before metadata exchange.
     try {
         const auto committed_snapshot = decode_snapshot(replica_.committed().payload);
@@ -76,17 +75,6 @@ void MetadataServer::route(MessageType type, MessageRoutes::Handler handler) {
 }
 
 bool MetadataServer::accept_commit(const MetadataAcceptance& acceptance) {
-    // Accept only branches whose resulting cluster policy matches the
-    // configured one. The certificate's own `required` may be stronger during
-    // a safe transition (e.g. W=3 -> W=2), so it is not compared directly;
-    // MetadataReplica validates it against the commit and parent policies.
-    if (acceptance.required) {
-        auto materialized = replica_.materialized(acceptance.hash);
-        if (!materialized)
-            return false;
-        if (materialized->snapshot->metadata_write_replicas_required != min_write_replicas_)
-            return false;
-    }
     const auto before = replica_.committed();
     bool heads_changed = false;
     if (!replica_.accept_commit(acceptance, &heads_changed))

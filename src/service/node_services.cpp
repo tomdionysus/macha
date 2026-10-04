@@ -297,6 +297,23 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
             if (!extent.hole)
                 data.push_back(extent.id);
     };
+    // Objects this commit brings into the namespace: some node present must
+    // hold each, or the commit would publish bytes nobody here has. Objects
+    // the parent already named are not checked: their holder may be away.
+    std::set<ObjectId> carried;
+    std::vector<ObjectId> introduced;
+    auto carry = [&](const std::optional<FsEntry>& entry) {
+        if (!entry || entry->type != EntryType::file)
+            return;
+        for (const auto& extent : entry->extents)
+            if (!extent.hole)
+                carried.insert(extent.id);
+    };
+    auto introduce = [&](const std::vector<ExtentRef>& extents) {
+        for (const auto& extent : extents)
+            if (!extent.hole)
+                introduced.push_back(extent.id);
+    };
 
     const auto decode_started = Clock::now();
     auto before = decode_snapshot(context.parent.payload);
@@ -328,15 +345,26 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
             collect_namespace_tree_nodes(*context.proposed.namespace_root, namespace_nodes,
                                          control);
     } else {
+        const bool merge = !context.proposed.merge_parents.empty();
         if (context.delta) {
-            for (const auto& [_, entry] : context.delta->upsert_entries)
+            if (!merge)
+                for (const auto& path : context.delta->erase_entries)
+                    carry(namespace_entry(before, &namespace_nodes, path));
+            for (const auto& [path, entry] : context.delta->upsert_entries) {
                 add_entry(entry);
+                if (!merge && entry.type == EntryType::file) {
+                    carry(namespace_entry(before, &namespace_nodes, path));
+                    introduce(entry.extents);
+                }
+            }
             // An append carries only new extents but changes the whole file: every
             // extent it now holds needs a fresh dot (a touch with no extents too), or a
             // concurrent delete could release the inherited claim.
-            for (const auto& [path, _] : context.delta->append_entries) {
+            for (const auto& [path, append] : context.delta->append_entries) {
                 if (auto found = namespace_entry(context.proposed, &namespace_nodes, path))
                     add_entry(*found);
+                if (!merge)
+                    introduce(append.extents);
             }
         } else {
             // Fallback without a delta: compare the namespaces entry by entry (under
@@ -345,9 +373,17 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
                 context.proposed, &namespace_nodes,
                 [&](const std::string& path, const FsEntry& entry) {
                     const auto found = namespace_entry(before, &namespace_nodes, path);
-                    if (!found || *found != entry)
+                    if (!found || *found != entry) {
                         add_entry(entry);
+                        if (!merge && entry.type == EntryType::file)
+                            introduce(entry.extents);
+                    }
                 });
+            if (!merge && !introduced.empty())
+                for_each_namespace_entry(before, &namespace_nodes,
+                                         [&](const std::string&, const FsEntry& entry) {
+                                             carry(entry);
+                                         });
         }
 
         // Tree nodes this commit introduced need claims, as changed catalogue shards
@@ -396,20 +432,20 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     collect_ms = since_ms(collect_started) - catalogue_ms;
 
     const auto data_started = Clock::now();
-    const bool data_ok = data.empty() || store_.retain_data(data, dot);
+    const auto unheld = store_.retain_data(data, dot);
     data_ms = since_ms(data_started);
-    if (!data_ok) {
-        report("data-floor-unavailable");
-        throw MetadataNotReady("DATA retention floor unavailable before metadata publication");
+    for (const auto& id : introduced) {
+        if (carried.contains(id) || !std::binary_search(unheld.begin(), unheld.end(), id))
+            continue;
+        report("data-unheld");
+        throw MetadataNotReady("DATA object is held by no node present before metadata publication");
     }
     const auto control_started = Clock::now();
-    const bool control_ok =
-        control.empty() ||
-        store_.retain_control(control, dot, context.proposed.metadata_write_replicas_required);
+    const bool control_ok = control.empty() || store_.retain_control(control, dot);
     control_ms = since_ms(control_started);
     if (!control_ok) {
-        report("control-floor-unavailable");
-        throw MetadataNotReady("CONTROL retention floor unavailable before metadata publication");
+        report("control-claim-failed");
+        throw std::runtime_error("CONTROL retention claim could not be recorded on this node");
     }
     report("ok");
     resources_.events.notify(NodeEvent::storage);
