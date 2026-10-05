@@ -25,6 +25,7 @@ struct FakeMetadataView final : MetadataView {
         return *view;
     }
     MetadataSnapshotView converged(const WorkContext&) override { return converged(); }
+    MetadataSnapshotView local() override { return converged(); }
     uint64_t current_generation() const noexcept override { return view ? view->generation : 0; }
     uint64_t current_namespace_revision() const noexcept override { return 0; }
     // When set, a committed read brings the view up to date; otherwise it

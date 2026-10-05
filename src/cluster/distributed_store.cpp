@@ -1011,17 +1011,36 @@ std::vector<ObjectId> DistributedStore::retain_data(const std::vector<ObjectId>&
     return unheld;
 }
 
+std::vector<ObjectId> DistributedStore::retain_data_here(const std::vector<ObjectId>& input,
+                                                         const RetentionDot& dot) {
+    auto ids = input;
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    std::vector<ObjectId> held;
+    std::vector<ObjectId> elsewhere;
+    held.reserve(ids.size());
+    for (const auto& id : ids)
+        (local_.data().has(id) ? held : elsewhere).push_back(id);
+    if (!held.empty())
+        local_.retention().retain_batch(RetentionClass::data, held, dot);
+    return elsewhere;
+}
+
 bool DistributedStore::retain_control(const std::vector<ObjectId>& input,
-                                      const RetentionDot& dot) {
+                                      const RetentionDot& dot, ClaimScope scope) {
     auto ids = input;
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
     if (ids.empty())
         return true;
 
-    const size_t sought = std::max<size_t>(1, n_.config().metadata_write_copies);
+    const size_t sought = scope == ClaimScope::here
+                              ? 1
+                              : std::max<size_t>(1, n_.config().metadata_write_copies);
     const auto started = Clock::now();
     auto active = n_.membership().active();
+    if (scope == ClaimScope::here)
+        std::erase_if(active, [&](const NodeInfo& node) { return node.id != n_.node_id(); });
     // Local first, then the nearest measured peer: this runs inside the
     // writer's metadata mutation.
     active = order_commit_replicas(active, n_.node_id(), [&](const NodeId& peer) {

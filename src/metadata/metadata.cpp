@@ -2913,6 +2913,7 @@ void MetadataReplica::load_history() {
 }
 
 void MetadataReplica::load_heads() {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     accepted_heads_.clear();
     if (!std::filesystem::exists(heads_p_))
         return;
@@ -2988,6 +2989,7 @@ void MetadataReplica::persist_heads_locked() {
 }
 
 bool MetadataReplica::prune_accepted_heads_locked() {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     bool changed = false;
     for (auto it = accepted_heads_.begin(); it != accepted_heads_.end();) {
         bool ancestor = false;
@@ -3042,6 +3044,7 @@ bool MetadataReplica::accepted_head_is_ancestor_locked(const Hash256& ancestor,
 }
 
 void MetadataReplica::migrate_legacy_head_locked() {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     ensure_history_root(committed_);
     const auto genesis = genesis_metadata();
     if (!accept_pristine_genesis_authority_ && committed_.hash == genesis.hash) {
@@ -3127,6 +3130,7 @@ bool MetadataReplica::legacy_write_api_allowed_locked() const {
 }
 
 void MetadataReplica::set_legacy_committed_head_locked(const MetadataRecord& record) {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     MetadataAcceptance legacy;
     legacy.generation = record.generation;
     legacy.hash = record.hash;
@@ -3137,6 +3141,7 @@ void MetadataReplica::set_legacy_committed_head_locked(const MetadataRecord& rec
 }
 
 bool MetadataReplica::refresh_materialized_head_in_memory_locked() {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     if (accepted_heads_.empty())
         return false;
     // Cooldown bounds how often a broken head re-throws; this runs on every
@@ -3224,6 +3229,7 @@ void MetadataReplica::persist_set_aside_since_locked() {
 }
 
 bool MetadataReplica::set_aside(const Hash256& hash, uint64_t now_unix_ms) {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     Lock lock(m_);
     const auto found = accepted_heads_.find(hash);
     if (found == accepted_heads_.end() || set_aside_.size() + 1 >= accepted_heads_.size())
@@ -3237,6 +3243,7 @@ bool MetadataReplica::set_aside(const Hash256& hash, uint64_t now_unix_ms) {
 }
 
 size_t MetadataReplica::expire_set_aside(uint64_t now_unix_ms, std::chrono::milliseconds horizon) {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     Lock durable(durable_mutation_m_);
     Lock lock(m_);
     load_set_aside_since_locked();
@@ -3271,6 +3278,7 @@ size_t MetadataReplica::expire_set_aside(uint64_t now_unix_ms, std::chrono::mill
 }
 
 void MetadataReplica::clear_set_aside() {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     Lock lock(m_);
     if (set_aside_.empty())
         return;
@@ -3285,6 +3293,16 @@ std::vector<MetadataRecord> MetadataReplica::usable_heads() const {
         return set_aside_.contains(head.hash);
     });
     return heads;
+}
+
+std::vector<MetadataIdentity> MetadataReplica::usable_head_identities() const {
+    Lock lock(m_);
+    std::vector<MetadataIdentity> out;
+    out.reserve(accepted_heads_.size());
+    for (const auto& [hash, head] : accepted_heads_)
+        if (!set_aside_.contains(hash))
+            out.push_back({head.generation, hash});
+    return out;
 }
 
 void MetadataReplica::refresh_materialized_head_locked() {
@@ -3660,6 +3678,7 @@ std::vector<Hash256> MetadataReplica::unreconstructable_heads() const {
 std::string MetadataReplica::flag_unreconstructable_locked(const Hash256& hash,
                                                             Clock::time_point now,
                                                             std::string_view context) const {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     const bool first_failure = !unreconstructable_head_retry_at_.contains(hash);
     unreconstructable_head_retry_at_[hash] = now + unreconstructable_retry_cooldown;
     const auto reason = diagnose_unreconstructable_locked(hash);
@@ -3723,6 +3742,7 @@ std::string MetadataReplica::diagnose_unreconstructable_locked(const Hash256& ta
 }
 
 bool MetadataReplica::reanchor_history(const MetadataHistoryEntry& entry_value) {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     if (entry_value.body != MetadataHistoryEntry::Body::full || !entry_value.generation ||
         entry_value.hash == Hash256{} || entry_value.merge_parents.size() > 64)
         return false;
@@ -3973,6 +3993,7 @@ bool MetadataReplica::store_commit(const MetadataRecord& record,
 }
 
 bool MetadataReplica::accept_commit(const MetadataAcceptance& input, bool* heads_changed) {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     if (heads_changed)
         *heads_changed = false;
     MetadataAcceptance value = input;
@@ -4456,6 +4477,7 @@ bool MetadataReplica::install_committed_delta(uint64_t generation, const Hash256
 bool MetadataReplica::install_migrated_head(const MetadataRecord& record,
                                             const std::vector<NodeId>& witnesses,
                                             const std::string& reason) {
+    const HeadsRevisionBump heads_bump(heads_revision_);
     if (!valid_metadata_record(record))
         return false;
     Lock durable(durable_mutation_m_);

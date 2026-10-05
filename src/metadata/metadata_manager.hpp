@@ -9,12 +9,15 @@
 #include "cluster/cluster.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 namespace macha {
 
@@ -44,6 +47,10 @@ struct MetadataPublicationContext {
     const MetadataRecord& parent;
     const MetadataSnapshot& proposed;
     const MetadataDelta* delta{};
+    // False before the commit is accepted here: this node's own claims, which
+    // must hold. True afterwards, from the replicator: the peers' share,
+    // which may fail and is then owed.
+    bool peers{};
 };
 
 
@@ -61,7 +68,8 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     DistributedStore* namespace_store_{};
     const TimeSource& time_;
     // Guards no state: serialises mutations, repair and history truncation.
-    // Held across replica RPCs and metadata commits.
+    // A mutation holds it across its local commit only; repair holds it
+    // across replica RPCs.
     IoMutex mutation_mutex_;
     // Guards no state: serialises the multi-head merge-and-publish branch of
     // read_group(), held across its history imports and commit fan-out.
@@ -98,6 +106,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     uint64_t decoded_namespace_revision_ MACHA_GUARDED_BY(cache_mutex_){};
     std::atomic_uint64_t available_namespace_revision_{};
     Hash256 decoded_hash_ MACHA_GUARDED_BY(cache_mutex_){};
+    // local()'s answer, and the replica head-set revision it was taken at.
+    std::optional<MetadataSnapshotView> local_view_ MACHA_GUARDED_BY(cache_mutex_);
+    uint64_t local_view_revision_ MACHA_GUARDED_BY(cache_mutex_){};
     std::function<void(const MetadataPublicationContext&)> publication_retention_;
 
     // Observational replica state: lock-free reads, no I/O. Refreshed by the
@@ -172,12 +183,38 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
         const std::vector<NodeInfo>&, FrameType);
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
                                  const MetadataAcceptance&, FrameType);
-    // Offers a head this node already holds to the nodes present.
-    void offer_accepted_head(const std::vector<NodeInfo>&, const MetadataRecord&, FrameType);
 
     MetadataRecord mutate_impl(
         const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
         size_t retries, std::optional<MetadataMutationIdentity> identity);
+
+    // A commit accepted here and owed to the peers: its claims on them and
+    // the head itself. The replicator delivers these in order, off every
+    // caller's path. What it cannot deliver, repair_once() does later.
+    struct OwedCommit {
+        MetadataRecord record;
+        // Absent when only the head is owed (a commit found already made).
+        struct Claims {
+            NodeId origin{};
+            uint64_t sequence{};
+            MetadataRecord parent;
+            std::shared_ptr<const MetadataSnapshot> proposed;
+            std::optional<MetadataDelta> delta;
+        };
+        std::optional<Claims> claims;
+    };
+    // Claims kept for a peer that is not taking them; past this the oldest
+    // are dropped and the peer's own head protects what it holds.
+    static constexpr size_t owed_claims_max = 1024;
+    mutable Mutex owed_mutex_;
+    std::condition_variable_any owed_changed_;
+    std::deque<OwedCommit> owed_ MACHA_GUARDED_BY(owed_mutex_);
+    bool replicating_ MACHA_GUARDED_BY(owed_mutex_){};
+    std::atomic_uint64_t owed_dropped_{};
+    void owe(OwedCommit);
+    void replication_loop(std::stop_token);
+    // Accepts a commit on this node alone.
+    void accept_locally(const MetadataRecord&, std::span<const uint8_t> delta, FrameType);
     void publish_replica_state(bool validated, std::string_view reason = {});
 
   public:
@@ -193,6 +230,17 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
                     DistributedStore* namespace_store = nullptr,
                     PublicationRetention publication_retention = {},
                     const TimeSource& time = steady_time_source());
+    ~MetadataManager();
+
+    // Ends the replicator. What is still owed stays owed: the commits are
+    // accepted here and repair delivers them after a restart. Called before
+    // anything the retention callback uses is stopped.
+    void request_replication_stop();
+    void stop_replication();
+    // Commits accepted here that the replicator has not yet offered.
+    size_t replication_pending() const;
+    // Waits until nothing is pending; false on timeout.
+    bool wait_replicated(std::chrono::milliseconds timeout);
 
     MetadataRecord read_record();
     MetadataRecord record() override { return read_record(); }
@@ -276,6 +324,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     std::optional<MetadataSnapshotView> current() const override {
         return available_snapshot_view();
     }
+    MetadataSnapshotView local() override;
     MetadataSnapshotView converged() override { return snapshot_view(); }
     MetadataSnapshotView converged(const WorkContext& context) override {
         return snapshot_view(context);
@@ -287,5 +336,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     void repair_step() override { repair_once(); }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& view, Cursor<std::string> from, Budget& budget) override;
+
+  private:
+    // Last, so it starts after and ends before everything it uses.
+    std::jthread replicator_;
 };
 } // namespace macha

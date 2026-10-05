@@ -1527,73 +1527,90 @@ MetadataSnapshot FileSystem::snap() {
     return *m_.converged().snapshot;
 }
 
-std::shared_ptr<const FileSystem::NamespaceIndex> FileSystem::namespace_index() {
-    auto view = m_.converged();
-    {
-        Lock lock(namespace_index_mutex_);
-        if (namespace_index_ && namespace_index_->generation == view.generation &&
-            namespace_index_->hash == view.hash)
-            return namespace_index_;
-    }
+namespace {
+// A name every byte of which is ASCII has no other canonically-equivalent
+// spelling, so a miss on it is final.
+bool ascii_only(std::string_view text) {
+    return std::all_of(text.begin(), text.end(),
+                       [](char c) { return static_cast<unsigned char>(c) < 0x80; });
+}
+} // namespace
 
-    auto built = std::make_shared<NamespaceIndex>();
-    built->generation = view.generation;
-    built->hash = view.hash;
-    built->snapshot = std::move(view.snapshot);
-    auto index_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-    for_each_namespace_entry(*built->snapshot, &index_nodes,
-                             [&](const std::string& path, const FsEntry&) {
-        const auto canonical = macos_fuse_composed_name(path);
-        auto [canonical_it, inserted] = built->canonical_paths.emplace(canonical, path);
-        if (!inserted && canonical_it->second != path) {
-            built->ambiguous_canonical_paths.insert(canonical);
-            if (Log::enabled(LogLevel::debug))
-                Log::debug("namespace contains canonically-equivalent duplicate paths canonical=" +
-                           canonical + " first=" + canonical_it->second + " second=" + path);
+FileSystem::ResolvedPath FileSystem::resolve_in(const MetadataSnapshot& snapshot,
+                                                const NamespaceNodeStore& nodes,
+                                                const std::string& q) {
+    // Existence only, no copy or extent fetch: every lookup passes here.
+    if (namespace_contains(snapshot, &nodes, q))
+        return {q, false};
+    if (q == "/" || ascii_only(q))
+        return {};
+
+    // macOS may present a canonically-equivalent UTF-8 spelling of a stored
+    // name. Stored keys stay byte-exact; the path is matched one component at
+    // a time against the directory that would hold it.
+    std::string resolved = "/";
+    size_t begin = 1;
+    while (begin <= q.size()) {
+        const auto end = std::min(q.find('/', begin), q.size());
+        const auto component = q.substr(begin, end - begin);
+        begin = end + 1;
+        if (component.empty())
+            continue;
+        const auto exact = resolved == "/" ? "/" + component : resolved + "/" + component;
+        if (namespace_contains(snapshot, &nodes, exact)) {
+            resolved = exact;
+            continue;
         }
-        if (path == "/")
-            return;
-        built->children[parent_path(path)].push_back({base_name(path), path});
-    });
-
-    Lock lock(namespace_index_mutex_);
-    if (!namespace_index_ || namespace_index_->generation < built->generation ||
-        (namespace_index_->generation == built->generation && namespace_index_->hash != built->hash))
-        namespace_index_ = built;
-    return namespace_index_;
+        if (ascii_only(component))
+            return {};
+        const auto wanted = macos_fuse_composed_name(component);
+        std::optional<std::string> match;
+        bool ambiguous = false;
+        for_each_namespace_child(snapshot, &nodes, resolved,
+                                 [&](const std::string& name, const std::string& path,
+                                     const FsEntry&) {
+                                     if (macos_fuse_composed_name(name) != wanted)
+                                         return;
+                                     if (match)
+                                         ambiguous = true;
+                                     match = path;
+                                 });
+        if (ambiguous) {
+            if (Log::enabled(LogLevel::debug))
+                Log::debug("namespace contains canonically-equivalent duplicate names under " +
+                           resolved);
+            return {{}, true};
+        }
+        if (!match)
+            return {};
+        resolved = *match;
+    }
+    return {resolved, false};
 }
 
 std::optional<std::string> FileSystem::resolve_existing_path(const std::string& p) {
-    const auto q = normalize_path(p);
-    auto index = namespace_index();
+    const auto view = m_.local();
     auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-    // Existence only, no copy or extent fetch: every FUSE lookup passes here.
-    if (namespace_contains(*index->snapshot, &nodes, q))
-        return q;
-
-    const auto canonical = macos_fuse_composed_name(q);
-    if (index->ambiguous_canonical_paths.contains(canonical))
-        return {};
-    auto alias = index->canonical_paths.find(canonical);
-    if (alias == index->canonical_paths.end())
-        return {};
-    return alias->second;
+    return resolve_in(*view.snapshot, nodes, normalize_path(p)).path;
 }
 
 std::string FileSystem::resolve_new_path(const std::string& p) {
     const auto q = normalize_path(p);
-    if (auto existing = resolve_existing_path(q))
-        return *existing;
+    const auto view = m_.local();
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    const auto existing = resolve_in(*view.snapshot, nodes, q);
+    if (existing.path)
+        return *existing.path;
+    if (existing.ambiguous)
+        fail(EEXIST, "canonically equivalent name is ambiguous");
     if (q == "/")
         return q;
 
-    auto index = namespace_index();
-    const auto canonical = macos_fuse_composed_name(q);
-    if (index->ambiguous_canonical_paths.contains(canonical))
-        fail(EEXIST, "canonically equivalent name is ambiguous");
-
     const auto requested_parent = parent_path(q);
-    const auto actual_parent = resolve_existing_path(requested_parent).value_or(requested_parent);
+    const auto parent = resolve_in(*view.snapshot, nodes, requested_parent);
+    if (parent.ambiguous)
+        fail(EEXIST, "canonically equivalent name is ambiguous");
+    const auto actual_parent = parent.path.value_or(requested_parent);
     const auto leaf = macos_fuse_composed_name(base_name(q));
     return actual_parent == "/" ? "/" + leaf : actual_parent + "/" + leaf;
 }
@@ -1607,41 +1624,41 @@ void FileSystem::require_parent(const NamespaceWorkingSet& working, const std::s
         fail(ENOTDIR, "parent not directory");
 }
 FsEntry FileSystem::getattr(const std::string& p) {
-    auto index = namespace_index();
-    auto resolved = resolve_existing_path(p);
+    const auto view = m_.local();
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    const auto resolved = resolve_in(*view.snapshot, nodes, normalize_path(p)).path;
     if (!resolved)
         fail(ENOENT, "not found");
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     // With extents: a caller reading `extents` off a stat-only entry would
     // silently see an empty list.
-    auto found = namespace_entry(*index->snapshot, &nodes, *resolved);
+    auto found = namespace_entry(*view.snapshot, &nodes, *resolved);
     if (!found)
         fail(ENOENT, "not found");
     return *found;
 }
 std::vector<std::pair<std::string, FsEntry>> FileSystem::readdir(const std::string& p) {
-    auto resolved = resolve_existing_path(p);
+    const auto view = m_.local();
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    const auto resolved = resolve_in(*view.snapshot, nodes, normalize_path(p)).path;
     if (!resolved)
         fail(ENOENT, "not found");
-    auto q = *resolved;
-    auto index = namespace_index();
-    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
     // Stat-only: only the type matters.
-    auto entry = namespace_entry(*index->snapshot, &nodes, q, false);
+    auto entry = namespace_entry(*view.snapshot, &nodes, *resolved, false);
     if (!entry)
         fail(ENOENT, "not found");
     if (entry->type != EntryType::directory)
         fail(ENOTDIR, "not directory");
-    auto children = index->children.find(q);
-    if (children == index->children.end())
-        return {};
+    std::vector<std::pair<std::string, std::string>> children;
+    for_each_namespace_child(*view.snapshot, &nodes, *resolved,
+                             [&](const std::string& name, const std::string& path,
+                                 const FsEntry&) { children.emplace_back(name, path); });
     std::vector<std::pair<std::string, FsEntry>> result;
-    result.reserve(children->second.size());
+    result.reserve(children.size());
     // Children carry their extents: the manage API computes file_media_id()
     // over readdir results, and a stat-only entry would silently hash an empty
     // extent list into a wrong but valid-looking id.
-    for (const auto& [name, child_path] : children->second) {
-        if (auto child = namespace_entry(*index->snapshot, &nodes, child_path))
+    for (const auto& [name, child_path] : children) {
+        if (auto child = namespace_entry(*view.snapshot, &nodes, child_path))
             result.emplace_back(name, *child);
     }
     return result;
@@ -1904,6 +1921,7 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
                                     batch->error = std::current_exception();
                                     snapshot = std::move(snapshot_before);
                                     delta = std::move(delta_before);
+                                    working.reload();
                                 }
                             }
                             // Nothing held: no commit, and each caller has its error.

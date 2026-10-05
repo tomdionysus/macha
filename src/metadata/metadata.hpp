@@ -512,6 +512,14 @@ class MetadataReplica {
     void load_set_aside_since_locked() MACHA_REQUIRES(m_);
     void persist_set_aside_since_locked() MACHA_REQUIRES(m_);
     std::atomic_uint64_t set_aside_generation_{};
+    mutable std::atomic_uint64_t heads_revision_{1};
+    // Declared first in a function that may change the head set, so the
+    // revision moves once the change is in place and any lock released.
+    struct HeadsRevisionBump {
+        std::atomic_uint64_t& revision;
+        explicit HeadsRevisionBump(std::atomic_uint64_t& r) : revision(r) {}
+        ~HeadsRevisionBump() { revision.fetch_add(1, std::memory_order_release); }
+    };
     void note_set_aside_locked() MACHA_REQUIRES(m_);
     // Per-hash retry cooldown for an accepted head that fails to reconstruct,
     // so callers that catch and retry cannot spin. Between attempts the head
@@ -680,6 +688,13 @@ class MetadataReplica {
     }
     // accepted_heads() without those set aside.
     std::vector<MetadataRecord> usable_heads() const;
+    // The same heads by generation and hash, copying no payload.
+    std::vector<MetadataIdentity> usable_head_identities() const;
+    // Moves whenever the head set or what is set aside may have changed. An
+    // atomic read: a reader that sees it unchanged holds a current answer.
+    uint64_t heads_revision() const noexcept {
+        return heads_revision_.load(std::memory_order_acquire);
+    }
     bool import_history(const MetadataHistoryEntry&);
     bool history_contains(const Hash256&) const;
     bool store_commit(const MetadataRecord&, std::span<const uint8_t> delta = {});

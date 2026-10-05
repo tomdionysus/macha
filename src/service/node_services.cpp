@@ -248,8 +248,12 @@ void NodeServices::stop() {
     torrent_coordinator_.stop();
     note("stop cluster-jobs");
     cluster_jobs_.stop();
+    note("request_stop metadata-replicator");
+    metadata_.request_replication_stop();
     note("cancel-io outbound-rpc");
     node_.cancel_outbound_calls();
+    note("stop metadata-replicator");
+    metadata_.stop_replication();
     note("stop maintenance");
     maintenance_.stop();
     note("stop streaming");
@@ -413,17 +417,42 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
     control.erase(std::unique(control.begin(), control.end()), control.end());
     collect_ms = since_ms(collect_started) - catalogue_ms;
 
-    const auto data_started = Clock::now();
-    const auto unheld = store_.retain_data(data, dot);
-    data_ms = since_ms(data_started);
-    for (const auto& id : introduced) {
-        if (carried.contains(id) || !std::binary_search(unheld.begin(), unheld.end(), id))
-            continue;
-        report("data-unheld");
-        throw MetadataNotReady("DATA object is held by no node present before metadata publication");
+    if (context.peers) {
+        // The peers' share of a commit already accepted here. An object no
+        // node present holds is repair's to find, not a reason to stop.
+        const auto data_started = Clock::now();
+        (void)store_.retain_data(data, dot);
+        data_ms = since_ms(data_started);
+        const auto control_started = Clock::now();
+        if (!control.empty())
+            (void)store_.retain_control(control, dot);
+        control_ms = since_ms(control_started);
+        report("ok");
+        return;
     }
+
+    // This node's own claims, asking no peer. Only an object this commit
+    // brings in that is not held here is looked for on the nodes present.
+    const auto data_started = Clock::now();
+    const auto elsewhere = store_.retain_data_here(data, dot);
+    std::vector<ObjectId> sought;
+    for (const auto& id : introduced)
+        if (!carried.contains(id) && std::binary_search(elsewhere.begin(), elsewhere.end(), id))
+            sought.push_back(id);
+    if (!sought.empty()) {
+        const auto unheld = store_.retain_data(sought, dot);
+        if (!unheld.empty()) {
+            data_ms = since_ms(data_started);
+            report("data-unheld");
+            throw MetadataNotReady(
+                "DATA object is held by no node present before metadata publication");
+        }
+    }
+    data_ms = since_ms(data_started);
     const auto control_started = Clock::now();
-    const bool control_ok = control.empty() || store_.retain_control(control, dot);
+    const bool control_ok =
+        control.empty() ||
+        store_.retain_control(control, dot, DistributedStore::ClaimScope::here);
     control_ms = since_ms(control_started);
     if (!control_ok) {
         report("control-claim-failed");

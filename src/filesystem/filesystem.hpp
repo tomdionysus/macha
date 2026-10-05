@@ -403,21 +403,14 @@ class FileSystem final : public PublicationTarget {
     void extent_worker(std::stop_token);
     std::future<WriteHandle::StagedExtentResult> submit_extent_task(
         std::function<WriteHandle::StagedExtentResult()>);
-    // Namespace lookup cached per metadata generation.
-    struct NamespaceIndex {
-        uint64_t generation{};
-        Hash256 hash{};
-        std::shared_ptr<const MetadataSnapshot> snapshot;
-        // Names/paths only; FsEntry manifests stay owned by the snapshot.
-        std::map<std::string, std::vector<std::pair<std::string, std::string>>, std::less<>> children;
-        // macOS may present canonically-equivalent UTF-8 spellings; stored keys
-        // stay byte-exact and only the runtime alias resolves to them.
-        std::map<std::string, std::string, std::less<>> canonical_paths;
-        std::set<std::string, std::less<>> ambiguous_canonical_paths;
+    // A path as the namespace stores it. `ambiguous` when two stored names
+    // are canonically equivalent to the one asked for.
+    struct ResolvedPath {
+        std::optional<std::string> path;
+        bool ambiguous{};
     };
-    Mutex namespace_index_mutex_;
-    std::shared_ptr<const NamespaceIndex> namespace_index_ MACHA_GUARDED_BY(namespace_index_mutex_);
-    std::shared_ptr<const NamespaceIndex> namespace_index();
+    static ResolvedPath resolve_in(const MetadataSnapshot&, const NamespaceNodeStore&,
+                                   const std::string& normalized);
     std::optional<std::string> resolve_existing_path(const std::string&);
     std::string resolve_new_path(const std::string&);
 

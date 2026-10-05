@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -137,6 +138,39 @@ using NamespaceItem = std::pair<std::string, FsEntry>;
 Page<NamespaceItem, std::string> namespace_entries(const MetadataSnapshot& snapshot,
                                                    const NamespaceNodeStore* store,
                                                    Cursor<std::string> from, Budget& budget);
+
+// What a scan does after an entry: go on, end, or jump to the first entry at
+// or after a later key.
+struct NamespaceScanStep {
+    enum class Kind { next, stop, seek } kind{Kind::next};
+    std::string to;
+    static NamespaceScanStep next() { return {}; }
+    static NamespaceScanStep stop() { return {Kind::stop, {}}; }
+    static NamespaceScanStep seek(std::string key) { return {Kind::seek, std::move(key)}; }
+};
+using NamespaceScanVisitor =
+    std::function<NamespaceScanStep(const std::string& path, const FsEntry& stat)>;
+// Visits entries at or after `from` in path order, stat-only, until the
+// visitor ends it. On a tree each leaf reached costs one descent, a seek
+// costs one more, and nothing between is read: the cost follows what is
+// visited, not the namespace.
+void scan_namespace(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                    std::string_view from, const NamespaceScanVisitor& visit);
+
+// The entries directly inside `directory`, in name order, stat-only. A child
+// directory's contents are stepped over in one descent, so the cost is the
+// directory's own size times the tree's depth.
+using NamespaceChildVisitor = std::function<void(const std::string& name, const std::string& path,
+                                                 const FsEntry& stat)>;
+void for_each_namespace_child(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                              std::string_view directory, const NamespaceChildVisitor& visit);
+
+// The first path beneath `directory` that `skip` does not pass over, if any:
+// the emptiness test. Stops at the first.
+std::optional<std::string>
+first_namespace_path_under(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                           std::string_view directory,
+                           const std::function<bool(const std::string&)>& skip = {});
 
 // The namespace of a snapshot in either form: the inline map, or the tree when
 // the snapshot carries a root. Throws if the snapshot is detached and no store
@@ -280,7 +314,13 @@ class NamespaceWorkingSet {
     NamespaceWorkingSet(MetadataSnapshot& snapshot, MetadataDelta& delta,
                         const NamespaceNodeStore* nodes)
         : snapshot_(snapshot), delta_(delta), nodes_(nodes),
-          tree_backed_(snapshot.namespace_root.has_value()) {}
+          tree_backed_(snapshot.namespace_root.has_value()) {
+        reload();
+    }
+
+    // Takes the delta's erasures again, after the delta was replaced from
+    // outside (a batch undone).
+    void reload();
 
     bool tree_backed() const noexcept {
         return tree_backed_;
@@ -306,6 +346,8 @@ class NamespaceWorkingSet {
     MetadataDelta& delta_;
     const NamespaceNodeStore* nodes_;
     bool tree_backed_;
+    // delta_.erase_entries as a set, for lookups.
+    std::set<std::string, std::less<>> erased_;
 };
 
 // What a migration would do to one node, built and verified but not installed.
