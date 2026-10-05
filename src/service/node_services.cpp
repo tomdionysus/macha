@@ -459,7 +459,7 @@ void NodeServices::retain_metadata_publication(const MetadataPublicationContext&
         throw std::runtime_error("CONTROL retention claim could not be recorded on this node");
     }
     report("ok");
-    resources_.events.notify(NodeEvent::storage);
+    resources_.events.notify(NodeEvent::claims);
 }
 
 

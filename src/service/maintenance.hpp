@@ -144,6 +144,7 @@ class Maintenance final {
     uint64_t absorbed_storage_{};
     uint64_t absorbed_metadata_{};
     uint64_t absorbed_topology_{};
+    uint64_t absorbed_claims_{};
     uint64_t absorbed_total_{};
 
     std::jthread thread_;
