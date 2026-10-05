@@ -1007,17 +1007,34 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
             }
         },
         10s));
-    const auto head = replica.accepted_heads().front();
-    const auto merged = decode_snapshot(head.payload);
+    // Reintroducing tombstoned extents makes maintenance erase the stale
+    // tombstones in a commit of its own, on a branch before the merge or on
+    // the merge itself, so the merge is found in the head's ancestry and
+    // checked against the parents it actually joined.
+    auto merge = replica.materialized(replica.accepted_heads().front().hash);
+    REQUIRE(merge != nullptr);
+    while (merge->snapshot->merge_parents.empty()) {
+        REQUIRE(merge->record.generation > left_generation);
+        merge = replica.materialized(merge->record.previous);
+        REQUIRE(merge != nullptr);
+    }
+    const auto& merged = *merge->snapshot;
     REQUIRE(merged.merge_parents.size() == 1);
     REQUIRE(merged.namespace_root.has_value());
-    // A pure join: the clock is the branches', so any reconciler mints it.
-    auto joined = left_snapshot.mutation_sequences;
-    for (const auto& [author, sequence] : right_snapshot.mutation_sequences)
+    const auto primary_parent = replica.materialized(merge->record.previous);
+    const auto other_parent = replica.materialized(merged.merge_parents.front());
+    REQUIRE(primary_parent != nullptr);
+    REQUIRE(other_parent != nullptr);
+    // A pure join: the clock is the parents', so any reconciler mints it.
+    auto joined = primary_parent->snapshot->mutation_sequences;
+    for (const auto& [author, sequence] : other_parent->snapshot->mutation_sequences)
         joined[author] = std::max(joined[author], sequence);
     CHECK(merged.mutation_sequences == joined);
+    for (const auto* branch : {&left_snapshot, &right_snapshot})
+        for (const auto& [author, sequence] : branch->mutation_sequences)
+            CHECK(clock_covers(merged.mutation_sequences, MetadataDot{author, sequence}));
 
-    const auto& primary = head.previous == left.hash ? left_snapshot : right_snapshot;
+    const auto& primary = *primary_parent->snapshot;
     std::vector<ObjectId> introduced;
     collect_namespace_tree_changes(primary.namespace_root, *merged.namespace_root,
                                    service.filesystem().namespace_nodes(), introduced);
