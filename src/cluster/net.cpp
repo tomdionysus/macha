@@ -22,7 +22,7 @@ namespace macha {
 namespace {
 // 22: the metadata snapshot carries torrent requests (SM15/SM16, DLT9),
 // which a protocol-21 node rejects, so the two cannot share a cluster.
-constexpr uint16_t protocol_version = 22;
+constexpr uint16_t protocol_version = 23;
 constexpr uint32_t frame_magic = 0x4d433133; // "MC13"
 constexpr size_t protocol_min_frame_size = 4 * 1024;
 constexpr size_t protocol_max_frame_size = 4 * 1024 * 1024;
