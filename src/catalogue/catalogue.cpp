@@ -1136,6 +1136,9 @@ void CatalogueManager::commit(
     // unchanged ones were proven by the committed catalogue.
     for (const auto& id : new_artwork) {
         if (old_artwork.contains(id)) continue;
+        // Held here is enough; only one that is not is fetched to prove it
+        // exists somewhere.
+        if (local_.data().has(id)) continue;
         if (!store_.get(id, 0, FrameType::speculative))
             throw CatalogueUnavailable("referenced artwork object is unavailable: " + to_string(id));
     }
