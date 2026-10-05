@@ -229,7 +229,9 @@ void Maintenance::run(std::stop_token stop) {
     absorbed_storage_ = events_.count(NodeEvent::storage);
     absorbed_metadata_ = events_.count(NodeEvent::metadata);
     absorbed_topology_ = events_.count(NodeEvent::topology);
-    absorbed_total_ = absorbed_storage_ + absorbed_metadata_ + absorbed_topology_;
+    absorbed_claims_ = events_.count(NodeEvent::claims);
+    absorbed_total_ =
+        absorbed_storage_ + absorbed_metadata_ + absorbed_topology_ + absorbed_claims_;
     port_.metadata_convergence.request(metadata_server_.known_generation());
     uint64_t observed_event = absorbed_total_;
     auto network_quiescent_until = Clock::time_point{};
@@ -1226,7 +1228,8 @@ bool Maintenance::absorb_events() {
     const auto storage = events_.count(NodeEvent::storage);
     const auto metadata = events_.count(NodeEvent::metadata);
     const auto topology = events_.count(NodeEvent::topology);
-    bool wake = storage != absorbed_storage_;
+    const auto claims = events_.count(NodeEvent::claims);
+    bool wake = storage != absorbed_storage_ || claims != absorbed_claims_;
     if (metadata != absorbed_metadata_)
         media_information_.request_prune();
     if (metadata != absorbed_metadata_ || topology != absorbed_topology_)
@@ -1234,7 +1237,8 @@ bool Maintenance::absorb_events() {
     absorbed_storage_ = storage;
     absorbed_metadata_ = metadata;
     absorbed_topology_ = topology;
-    absorbed_total_ = storage + metadata + topology;
+    absorbed_claims_ = claims;
+    absorbed_total_ = storage + metadata + topology + claims;
     return wake;
 }
 
