@@ -1,5 +1,27 @@
 # Current release
 
+## 0.90.6 — availability and media information stop re-reading the namespace (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The availability roll-up is carried to the next tree.** After each commit
+the count of what this node holds beneath every tree node was made again from
+the root, reading every node and asking about every extent. When nothing has
+been gained or lost on the node since the last roll-up, only the tree has
+moved: the subtrees the two trees share keep their counts and are not read.
+A roll-up is still made afresh after a storage change, and every 64 carries.
+
+**A tree is surveyed once.** A commit that arrived while a roll-up was still
+due left the head marked as changed, and every maintenance wake then repeated
+the survey of the peers for the tree already surveyed. The peers are asked
+again when a new roll-up exists to ask about.
+
+**Media information finds files through the media index.** Its lookup of a
+file by media id, the request a match makes for a new file's profile, and the
+prune that follows every metadata change each walked the whole namespace,
+hashing every file's extent list. They ask the filesystem's index, which
+follows the tree.
+
 ## 0.90.5 — maintenance follows the tree from one head to the next (experiment)
 
 No wire, protocol, API or on-disk changes.
