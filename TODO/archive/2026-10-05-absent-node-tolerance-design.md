@@ -34,7 +34,7 @@ refused, nothing waits, and nothing grows forever.**
 
 ## Where the code stands against the rule
 
-Two audits read the whole dependency (`TODO/absent-node-audit/`). The short form:
+Two audits read the whole dependency (`TODO/archive/absent-node-audit/`). The short form:
 
 - **Authoring** has no voters and no quorum, but it has floors that refuse. With the metadata floor
   at 2 (the default, and the live value) one node down stops every namespace change, and the floor

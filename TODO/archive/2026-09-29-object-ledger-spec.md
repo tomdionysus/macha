@@ -1,7 +1,7 @@
 # The object ledger: one record per object, on disk, diffable
 
 **Historical only.** The canonical spec is the most recent version of
-[the object ledger and the component model](../2026-09-29-object-ledger-and-components-spec.md).
+[the object ledger and the component model](2026-09-29-object-ledger-and-components-spec.md).
 This document records how the design began and is not read as requirements.
 
 Status: EXPERIMENTAL. A specification and roadmap, not a commitment to a

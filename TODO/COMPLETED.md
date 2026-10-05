@@ -1,6 +1,45 @@
 # Completed and tested
 
-Last updated: 2026-09-29
+Last updated: 2026-10-06
+
+## 2026-09-29 to 2026-10-06 -- 0.74.0 to 0.90.16
+
+All deployed on gbni-1 and fi-1, merged to `develop` and `main` (`0c5492f`).
+Detail in `CHANGELOG.md` under each version; the plans and evidence are in
+`archive/`.
+
+- **The object ledger experiment** (0.74.0 to 0.87.1): observation (T0); one
+  ledger answering what maintenance asks of an object (T1 to T3); components
+  with declared waits and thread safety, a hand-written composition root
+  (T4, T5); every `*_for_tests` hook retired. Closed by the operator on
+  2026-10-06 and merged. Spec and plan:
+  `archive/2026-09-29-object-ledger-and-components-spec.md`,
+  `archive/2026-09-29-object-ledger-implementation-plan.md`; evidence:
+  `archive/object-ledger-evidence/`.
+- **Absent nodes never block** (0.88.0 to 0.89.1): writes on the nodes
+  present, deletion on the node's own clock, membership that forgets, entry
+  provenance and the two-head merge (protocol 23), group commit of namespace
+  batches. Design: `archive/2026-10-05-absent-node-tolerance-design.md`.
+- **One local-first path for every read and write** (0.90.0 to 0.90.13): the
+  commit is local and a replicator delivers it; lookups, the mount, the media
+  index, the maintenance census and the availability roll-up follow the tree
+  diff; catalogue writes are local and touch only their shards; no global
+  management lock. Twelve deletes went from 39-45 s to 0.2 s each, a commit
+  from 2-3 s to about 100 ms, the unmatched list from 1.9-5.6 s to 0.06 s.
+  Plan and measurements: `archive/2026-10-05-local-first-filesystem-plan.md`;
+  audit: `archive/2026-10-05-whole-library-work-audit.md`.
+- **Matching** (0.90.10 to 0.90.16): a match waits for no other node,
+  downloads its artwork in parallel, reuses a cover already stored from the
+  same URL, and takes the provider set that has the record cached; artwork
+  options are kept ten minutes; a provider failure is reported as "Provider
+  unavailable".
+- **A title's files** (0.90.15): unmatch, delete by path and delete by
+  content, each one call, with empty titles and parents removed
+  (`2026-10-05-title-files-and-paging.md`).
+- **Operator housekeeping, 2026-10-05**: 103 empty directories under
+  `/Movies`, `/Music` and `/TV` on gbni-1 removed; fi-1's old backend copy
+  `/var/lib/macha/data.moved-20260929` deleted; repair weight 20 against 80
+  set in both nodes' config.
 
 ## 2026-09-28/29 -- 0.65.0 to 0.73.2
 

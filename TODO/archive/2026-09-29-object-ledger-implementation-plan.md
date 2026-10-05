@@ -42,7 +42,7 @@ That sets the standard of evidence for every step:
   used that way they waste time and produce false positives. Their silence
   is not evidence.
 - **Evidence is committed.** Each accepted step commits its proof beside
-  its code, under `TODO/object-ledger-evidence/<step>/`: the coverage report
+  its code, under `TODO/archive/object-ledger-evidence/<step>/`: the coverage report
   for what it built, the mutation record (each mutation and the test that
   failed), the trace comparison, and the suite timings. The history then
   carries the evidence, not only the claim.
@@ -74,7 +74,7 @@ step, without exception:
 - **Records its decisions** in the spec's decision log, dated, with the
   reasoning.
 - **Commits its evidence** (coverage, mutation record, trace comparison,
-  timings) under `TODO/object-ledger-evidence/<step>/`.
+  timings) under `TODO/archive/object-ledger-evidence/<step>/`.
 - **Is pushed when accepted**, stage and substage alike.
 - **States the laws it touches** and how each holds.
 - **Changes nothing the API sends**, or announces the change to Core and
