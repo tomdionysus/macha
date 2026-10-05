@@ -1805,6 +1805,32 @@ std::optional<FsEntry> FileSystem::apply_namespace_mutation(
     throw std::logic_error("unknown filesystem namespace mutation");
 }
 
+// Applies one batch's operations through the working set, as the largest
+// valid prefix unless `atomic`. Throws FsError when nothing of it can apply.
+void FileSystem::apply_namespace_batch_to(QueuedNamespaceBatch& batch, NamespaceWorkingSet& working,
+                                          MetadataSnapshot& snapshot, MetadataDelta& delta) {
+    auto& result = batch.result;
+    result.entries.assign(batch.operations.size(), std::nullopt);
+    result.applied = 0;
+    result.failure_code.reset();
+    result.failure_message.clear();
+    for (size_t i = 0; i < batch.operations.size(); ++i) {
+        try {
+            result.entries[i] =
+                apply_namespace_mutation(working, snapshot, delta, batch.operations[i]);
+            ++result.applied;
+        } catch (const FsError& error) {
+            // No valid prefix, or all-or-nothing: throw. Otherwise commit
+            // the largest valid prefix and report the failing operation.
+            if (!result.applied || batch.atomic)
+                throw;
+            result.failure_code = error.code();
+            result.failure_message = error.what();
+            break;
+        }
+    }
+}
+
 FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
     std::span<const FilesystemNamespaceMutation> operations,
     std::optional<MetadataMutationIdentity> identity, bool atomic) {
@@ -1815,41 +1841,96 @@ FilesystemNamespaceBatchResult FileSystem::apply_namespace_batch(
     // re-points open handles beneath it under the registry lock, which is not
     // held across the mutation.
     FilesystemNamespaceBatchResult result;
-    result.entries.resize(operations.size());
-    result.record = m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
-        auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-        NamespaceWorkingSet working(snapshot, delta, &nodes);
-        result.applied = 0;
-        result.failure_code.reset();
-        result.failure_message.clear();
-        std::fill(result.entries.begin(), result.entries.end(), std::nullopt);
-        for (size_t i = 0; i < operations.size(); ++i) {
-            try {
-                result.entries[i] =
-                    apply_namespace_mutation(working, snapshot, delta, operations[i]);
-                ++result.applied;
-            } catch (const FsError& error) {
-                // No valid prefix, or all-or-nothing: throw. Otherwise commit
-                // the largest valid prefix and report the failing operation.
-                if (!result.applied || atomic)
-                    throw;
-                result.failure_code = error.code();
-                result.failure_message = error.what();
-                break;
+    if (identity) {
+        // A batch with an identity is one journalled unit of its own.
+        QueuedNamespaceBatch alone{operations, atomic, {}, {}, false};
+        alone.result.record =
+            m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+                NamespaceWorkingSet working(snapshot, delta, &nodes);
+                apply_namespace_batch_to(alone, working, snapshot, delta);
+                std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
+                delta.erase_entries.erase(
+                    std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
+                    delta.erase_entries.end());
+            }, 8, identity);
+        result = std::move(alone.result);
+        if (!result.applied) {
+            // The identity clock was already past this batch: an earlier attempt
+            // committed it whole. Report fully applied; entries are left to the
+            // caller to resolve.
+            result.applied = operations.size();
+        }
+    } else {
+        QueuedNamespaceBatch mine{operations, atomic, {}, {}, false};
+        {
+            Lock queue(namespace_batch_queue_mutex_);
+            namespace_batch_queue_.push_back(&mine);
+        }
+        {
+            Lock commit(namespace_batch_commit_mutex_);
+            std::vector<QueuedNamespaceBatch*> group;
+            {
+                Lock queue(namespace_batch_queue_mutex_);
+                // Committed by an earlier holder of the commit lock, or still
+                // queued and so this thread's to commit with the rest.
+                if (!mine.done)
+                    group.swap(namespace_batch_queue_);
+            }
+            if (!group.empty()) {
+                const auto finish = [&](const std::function<void(QueuedNamespaceBatch&)>& each) {
+                    Lock queue(namespace_batch_queue_mutex_);
+                    for (auto* batch : group) {
+                        each(*batch);
+                        batch->done = true;
+                    }
+                };
+                try {
+                    const auto record =
+                        m_.mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+                            auto nodes =
+                                ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+                            NamespaceWorkingSet working(snapshot, delta, &nodes);
+                            size_t committed = 0;
+                            for (auto* batch : group) {
+                                // A batch that fails is undone and fails alone.
+                                auto snapshot_before = snapshot;
+                                auto delta_before = delta;
+                                batch->error = nullptr;
+                                try {
+                                    apply_namespace_batch_to(*batch, working, snapshot, delta);
+                                    ++committed;
+                                } catch (const FsError&) {
+                                    batch->error = std::current_exception();
+                                    snapshot = std::move(snapshot_before);
+                                    delta = std::move(delta_before);
+                                }
+                            }
+                            // Nothing held: no commit, and each caller has its error.
+                            if (!committed)
+                                std::rethrow_exception(group.front()->error);
+                            std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
+                            delta.erase_entries.erase(std::unique(delta.erase_entries.begin(),
+                                                                  delta.erase_entries.end()),
+                                                      delta.erase_entries.end());
+                        });
+                    finish([&](QueuedNamespaceBatch& batch) {
+                        if (!batch.error)
+                            batch.result.record = record;
+                    });
+                } catch (...) {
+                    // The commit itself failed: every batch that had held fails with it.
+                    const auto failure = std::current_exception();
+                    finish([&](QueuedNamespaceBatch& batch) {
+                        if (!batch.error)
+                            batch.error = failure;
+                    });
+                }
             }
         }
-        // A batch accumulates erases in syscall order; the delta wire format
-        // requires sorted, unique paths.
-        std::sort(delta.erase_entries.begin(), delta.erase_entries.end());
-        delta.erase_entries.erase(
-            std::unique(delta.erase_entries.begin(), delta.erase_entries.end()),
-            delta.erase_entries.end());
-    }, 8, identity);
-    if (identity && !result.applied) {
-        // The identity clock was already past this batch: an earlier attempt
-        // committed it whole. Report fully applied; entries are left to the
-        // caller to resolve.
-        result.applied = operations.size();
+        if (mine.error)
+            std::rethrow_exception(mine.error);
+        result = std::move(mine.result);
     }
 
     Lock handles(open_writes_mutex_);
