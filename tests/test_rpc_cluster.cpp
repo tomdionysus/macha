@@ -5048,6 +5048,46 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answ
     s1.stop();
 }
 
+// A catalogue conflict whose alternatives merge to the root already in place
+// is decided by one pass: the conflict goes, though the root does not change.
+MACHA_TEST("rpc_cluster", test_a_catalogue_conflict_decided_for_the_root_in_place_is_removed) {
+    TestService fixture("catalogue-conflict");
+    fixture.config().replication = 1;
+    fixture.config().metadata_write_copies = 1;
+    auto& service = fixture.start();
+    CatalogueItem item;
+    item.id = "movie:standing";
+    item.kind = CatalogueKind::movie;
+    item.title = "Standing";
+    (void)service.catalogue().upsert(item);
+    const auto root = service.metadata_manager().snapshot().catalogue_root;
+    REQUIRE(root.has_value());
+
+    MetadataConflict conflict;
+    conflict.kind = MetadataConflictKind::catalogue_root;
+    conflict.key = "catalogue_root";
+    conflict.base_catalogue_root = root;
+    conflict.left_catalogue_root = root;
+    conflict.right_catalogue_root = root;
+    const auto id = metadata_conflict_id(conflict);
+    service.metadata_manager().mutate_delta([&](MetadataSnapshot& snapshot, MetadataDelta& delta) {
+        snapshot.conflicts[id] = conflict;
+        delta.replace_conflicts = snapshot.conflicts;
+    });
+    REQUIRE(service.metadata_manager().snapshot().conflicts.contains(id));
+    const auto before = service.local_state().replica().committed_generation();
+
+    service.catalogue().repair_once();
+    const auto after = service.metadata_manager().snapshot();
+    CHECK(!after.conflicts.contains(id));
+    CHECK(after.catalogue_root == root);
+    CHECK(service.local_state().replica().committed_generation() > before);
+    // With nothing left to decide, a further pass commits nothing.
+    const auto settled = service.local_state().replica().committed_generation();
+    service.catalogue().repair_once();
+    CHECK(service.local_state().replica().committed_generation() == settled);
+}
+
 // A peer that stops answering commit calls costs a caller nothing: the commit
 // is answered from this node. The replicator waits for the peer once, for the
 // stall time, and does not ask it again until it has had time to be dropped
