@@ -27,7 +27,9 @@ request_stop media-information
 stop subsystems
 stop torrent-coordinator
 stop cluster-jobs
+request_stop metadata-replicator
 cancel-io outbound-rpc
+stop metadata-replicator
 stop maintenance
 stop streaming
 stop manage-api
