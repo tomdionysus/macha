@@ -1,5 +1,21 @@
 # Current release
 
+## 0.90.5 — maintenance follows the tree from one head to the next (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The maintenance inventory no longer walks the namespace after every
+commit.** To know what is live, maintenance walked every entry of the
+namespace, every extent list included, and sorted what it found; the release
+horizon then walked every entry again and every tree node. All of it ran
+after each commit, on every node. The filesystem now keeps a census of what
+the namespace refers to, one item per reference, at the tree it was counted
+at, and brings it to the next tree from what differs between the two: the
+branch and leaf nodes only one tree holds, and the extents and extent spines
+of the entries that changed. The release horizon is handed the census in
+place of its own walks. The whole namespace is walked the first time, and
+again if the census and the trees ever disagree, which is logged.
+
 ## 0.90.4 — the mount and the media index follow a commit's changes (experiment)
 
 No wire, protocol, API or on-disk changes.
