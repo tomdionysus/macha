@@ -5,6 +5,7 @@
 #include "crypto.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <iterator>
 #include <limits>
 #include <set>
@@ -73,9 +74,82 @@ struct Child {
     uint64_t items{};
 };
 
-// Groups children into spine nodes until one remains. Grouping hashes each
-// child's key (its content address on the keyless extent spine), so the shape
-// is a function of the child sequence alone.
+bool branch_boundary(const Child& child, uint8_t level, bool keyed, size_t target) {
+    const auto hash = keyed ? boundary_hash("macha/namespace-tree/branch/v1", level,
+                                            key_span(child.first_key))
+                            : boundary_hash("macha/namespace-tree/extent-branch/v1", level,
+                                            child.id.bytes);
+    return is_boundary(hash, target);
+}
+
+Child put_spine_node(const std::vector<Child>& run, uint8_t level, bool keyed,
+                     NamespaceNodeStore& store) {
+    Writer writer;
+    writer.raw(keyed ? branch_magic : extent_branch_magic);
+    writer.u8(level);
+    writer.u32(static_cast<uint32_t>(run.size()));
+    uint64_t items = 0;
+    for (const auto& child : run) {
+        if (keyed)
+            writer.string(child.first_key);
+        writer.fixed(child.id.bytes);
+        writer.u64(child.items);
+        items += child.items;
+    }
+    const auto encoded = writer.take();
+    return Child{run.front().first_key, store.put(encoded), items};
+}
+
+// One spine level: groups `children` into the nodes above them. Grouping
+// hashes each child's key (its content address on the keyless extent spine),
+// so the shape is a function of the child sequence alone.
+std::vector<Child> build_spine_level(const std::vector<Child>& children, uint8_t level,
+                                     NamespaceNodeStore& store, bool keyed, size_t target,
+                                     size_t maximum) {
+    std::vector<Child> parents;
+    std::vector<Child> run;
+    const auto flush = [&] {
+        if (run.empty())
+            return;
+        parents.push_back(put_spine_node(run, level, keyed, store));
+        run.clear();
+    };
+
+    // `packed` ignores the boundary test and groups by the count cap alone:
+    // the fallback for a level where every child hashed as a boundary and
+    // nothing reduced (e.g. two extent chunks both hitting a 1-in-256
+    // boundary). It makes progress unconditional: at maximum >= 2, n >= 2
+    // children become at most ceil(n/maximum) < n parents. History
+    // independence holds: the trigger and the packing are both functions
+    // of this level's child sequence.
+    const auto build_level = [&](bool packed) {
+        parents.clear();
+        run.clear();
+        for (const auto& child : children) {
+            run.push_back(child);
+            if ((!packed && branch_boundary(child, level, keyed, target)) || run.size() >= maximum)
+                flush();
+        }
+        flush();
+    };
+
+    build_level(false);
+    if (parents.size() >= children.size() && children.size() > 1)
+        build_level(true);
+    if (parents.size() >= children.size() && children.size() > 1)
+        throw std::logic_error("namespace tree spine made no progress even packed: level=" +
+                               std::to_string(level) + " keyed=" + (keyed ? "1" : "0") +
+                               " children=" + std::to_string(children.size()) +
+                               " parents=" + std::to_string(parents.size()) +
+                               " max=" + std::to_string(maximum));
+    return parents;
+}
+
+uint8_t next_spine_level(uint8_t level) {
+    return level < std::numeric_limits<uint8_t>::max() ? static_cast<uint8_t>(level + 1) : level;
+}
+
+// Groups children into spine nodes until one remains.
 ObjectId build_spine(std::vector<Child> children, NamespaceNodeStore& store, bool keyed,
                      size_t target, size_t maximum) {
     if (children.empty())
@@ -83,62 +157,8 @@ ObjectId build_spine(std::vector<Child> children, NamespaceNodeStore& store, boo
 
     uint8_t level = 1;
     while (children.size() > 1) {
-        std::vector<Child> parents;
-        std::vector<Child> run;
-        const auto flush = [&] {
-            if (run.empty())
-                return;
-            Writer writer;
-            writer.raw(keyed ? branch_magic : extent_branch_magic);
-            writer.u8(level);
-            writer.u32(static_cast<uint32_t>(run.size()));
-            uint64_t items = 0;
-            for (const auto& child : run) {
-                if (keyed)
-                    writer.string(child.first_key);
-                writer.fixed(child.id.bytes);
-                writer.u64(child.items);
-                items += child.items;
-            }
-            const auto encoded = writer.take();
-            parents.push_back(Child{run.front().first_key, store.put(encoded), items});
-            run.clear();
-        };
-
-        // `packed` ignores the boundary test and groups by the count cap alone:
-        // the fallback for a level where every child hashed as a boundary and
-        // nothing reduced (e.g. two extent chunks both hitting a 1-in-256
-        // boundary). It makes progress unconditional: at maximum >= 2, n >= 2
-        // children become at most ceil(n/maximum) < n parents. History
-        // independence holds: the trigger and the packing are both functions
-        // of this level's child sequence.
-        const auto build_level = [&](bool packed) {
-            parents.clear();
-            run.clear();
-            for (auto& child : children) {
-                const auto hash = keyed ? boundary_hash("macha/namespace-tree/branch/v1", level,
-                                                        key_span(child.first_key))
-                                        : boundary_hash("macha/namespace-tree/extent-branch/v1",
-                                                        level, child.id.bytes);
-                run.push_back(child);
-                if ((!packed && is_boundary(hash, target)) || run.size() >= maximum)
-                    flush();
-            }
-            flush();
-        };
-
-        build_level(false);
-        if (parents.size() >= children.size() && children.size() > 1)
-            build_level(true);
-        if (parents.size() >= children.size() && children.size() > 1)
-            throw std::logic_error("namespace tree spine made no progress even packed: level=" +
-                                   std::to_string(level) + " keyed=" + (keyed ? "1" : "0") +
-                                   " children=" + std::to_string(children.size()) +
-                                   " parents=" + std::to_string(parents.size()) +
-                                   " max=" + std::to_string(maximum));
-        children = std::move(parents);
-        if (level < std::numeric_limits<uint8_t>::max())
-            ++level;
+        children = build_spine_level(children, level, store, keyed, target, maximum);
+        level = next_spine_level(level);
     }
     return children.front().id;
 }
@@ -452,20 +472,6 @@ void collect_leaves(const ObjectId& id, const NamespaceNodeStore& store,
         collect_leaves(child.id, store, out);
 }
 
-void read_leaf(const ObjectId& id, const NamespaceNodeStore& store,
-               std::vector<std::pair<std::string, FsEntry>>& out) {
-    auto encoded = store.get(id);
-    if (!encoded)
-        throw DecodeError("namespace tree node unavailable: " + to_string(id));
-    Reader reader(*encoded);
-    if (reader.fixed<4>() != leaf_magic)
-        throw DecodeError("not a namespace tree leaf");
-    const auto count = reader.u32();
-    for (uint32_t i = 0; i < count; ++i)
-        out.push_back(decode_leaf_entry(reader, store, true));
-    reader.finish();
-}
-
 // Exclusive upper bound of keys starting with `prefix`: the prefix with its
 // last non-0xFF byte incremented and trailing 0xFF bytes dropped. Empty means
 // unbounded.
@@ -690,102 +696,334 @@ bool namespace_contains(const MetadataSnapshot& snapshot, const NamespaceNodeSto
     return namespace_tree_lookup(*snapshot.namespace_root, path, *store, false).has_value();
 }
 
+namespace {
+
+// A node standing in a spine sequence. One whose level is above the level
+// being built stands for everything beneath it, unread.
+struct SpineItem {
+    Child child;
+    uint8_t level{};
+    // Written by this update, not carried over from the tree it started from.
+    bool fresh{};
+};
+
+// A node's own level (0 for a leaf) and, for a branch, its children.
+struct SpineNode {
+    uint8_t level{};
+    std::vector<Child> children;
+};
+
+SpineNode read_spine_node(const ObjectId& id, const NamespaceNodeStore& store) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    Reader reader(*encoded);
+    const auto magic = reader.fixed<4>();
+    SpineNode node;
+    if (magic == leaf_magic)
+        return node;
+    if (magic != branch_magic)
+        throw DecodeError("not a namespace tree node");
+    node.level = reader.u8();
+    const auto count = reader.u32();
+    if (!node.level || !count)
+        throw DecodeError("malformed namespace tree branch");
+    node.children.reserve(std::min<size_t>(count, reader.remaining() / 44));
+    for (uint32_t i = 0; i < count; ++i) {
+        Child child;
+        child.first_key = reader.string(8192);
+        child.id = ObjectId{reader.fixed<32>()};
+        child.items = reader.u64();
+        node.children.push_back(std::move(child));
+    }
+    reader.finish();
+    return node;
+}
+
+// Replaces the item at `at` with its children, one level down.
+void expand_spine_item(std::vector<SpineItem>& items, size_t at, const NamespaceNodeStore& store) {
+    const auto level = items[at].level;
+    auto node = read_spine_node(items[at].child.id, store);
+    if (node.level != level)
+        throw DecodeError("namespace tree node at an unexpected level");
+    std::vector<SpineItem> children;
+    children.reserve(node.children.size());
+    for (auto& child : node.children)
+        children.push_back({std::move(child), static_cast<uint8_t>(level - 1), false});
+    items.erase(items.begin() + static_cast<std::ptrdiff_t>(at));
+    items.insert(items.begin() + static_cast<std::ptrdiff_t>(at),
+                 std::make_move_iterator(children.begin()),
+                 std::make_move_iterator(children.end()));
+}
+
+// A leaf record as it lies in its leaf, or an entry to encode in its place.
+struct LeafRecord {
+    std::string key;
+    std::span<const uint8_t> raw;
+    const FsEntry* entry{};
+};
+
+// A leaf's records by key, each with its encoded bytes: nothing an entry
+// refers to is read. `backing` keeps the leaf's bytes alive.
+void read_leaf_records(const ObjectId& id, const NamespaceNodeStore& store,
+                       std::deque<Bytes>& backing, std::vector<LeafRecord>& out) {
+    auto encoded = store.get(id);
+    if (!encoded)
+        throw DecodeError("namespace tree node unavailable: " + to_string(id));
+    backing.push_back(std::move(*encoded));
+    const Bytes& bytes = backing.back();
+    Reader reader(bytes);
+    if (reader.fixed<4>() != leaf_magic)
+        throw DecodeError("not a namespace tree leaf");
+    const auto count = reader.u32();
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto start = bytes.size() - reader.remaining();
+        auto key = reader.string(8192);
+        skip_leaf_entry_stat(reader);
+        switch (static_cast<ExtentForm>(reader.u8())) {
+        case ExtentForm::none:
+            break;
+        case ExtentForm::inlined: {
+            const auto extents = reader.u32();
+            (void)reader.view(static_cast<size_t>(extents) * encoded_extent_bytes);
+            break;
+        }
+        case ExtentForm::external:
+            (void)reader.u64();
+            (void)reader.fixed<32>();
+            break;
+        default:
+            throw DecodeError("bad namespace tree extent form");
+        }
+        const auto end = bytes.size() - reader.remaining();
+        out.push_back({std::move(key), std::span<const uint8_t>(bytes).subspan(start, end - start),
+                       nullptr});
+    }
+    reader.finish();
+}
+
+// chunk_leaves over records: one that lies in a leaf already is copied as it
+// stands, so an untouched neighbour's extents are neither read nor rebuilt.
+std::vector<Child> chunk_records(const std::vector<LeafRecord>& records, NamespaceNodeStore& store,
+                                 const NamespaceTreeLimits& limits, bool& open) {
+    std::vector<Child> leaves;
+    size_t run_begin = 0;
+    bool ended_on_boundary = true;
+    const auto flush = [&](size_t run_end) {
+        if (run_end == run_begin)
+            return;
+        Writer writer;
+        writer.raw(leaf_magic);
+        writer.u32(static_cast<uint32_t>(run_end - run_begin));
+        for (size_t i = run_begin; i < run_end; ++i) {
+            if (records[i].entry)
+                encode_leaf_entry(writer, records[i].key, *records[i].entry, store, limits);
+            else
+                writer.raw(records[i].raw);
+        }
+        const auto encoded = writer.take();
+        leaves.push_back(Child{records[run_begin].key, store.put(encoded),
+                               static_cast<uint64_t>(run_end - run_begin)});
+        run_begin = run_end;
+    };
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (ends_a_leaf(records[i].key, limits) || i + 1 - run_begin >= limits.entry_max_fanout) {
+            ended_on_boundary = true;
+            flush(i + 1);
+        } else {
+            ended_on_boundary = false;
+        }
+    }
+    flush(records.size());
+    open = !ended_on_boundary;
+    return leaves;
+}
+
+// Every item brought down to `level`, reading whatever stands above it.
+void expand_spine_to(std::vector<SpineItem>& items, uint8_t level,
+                     const NamespaceNodeStore& store) {
+    for (size_t i = 0; i < items.size();) {
+        if (items[i].level > level)
+            expand_spine_item(items, i, store);
+        else
+            ++i;
+    }
+}
+
+// The level above `items`, which stand at `level`. A node above the level
+// being built is kept unread wherever the grouping reaches it at a group
+// boundary: it was built from the same children by the same rule. One the
+// grouping reaches mid-group is opened and its children regrouped, until the
+// groups fall on an old boundary again.
+std::vector<SpineItem> splice_spine_level(std::vector<SpineItem> items, uint8_t level,
+                                          NamespaceNodeStore& store,
+                                          const NamespaceTreeLimits& limits) {
+    const auto above = next_spine_level(level);
+    const auto target = limits.branch_target_fanout;
+    const auto maximum = limits.branch_max_fanout;
+    // The whole level, as a full build makes it.
+    const auto exact = [&] {
+        expand_spine_to(items, level, store);
+        std::vector<Child> children;
+        children.reserve(items.size());
+        for (auto& item : items)
+            children.push_back(std::move(item.child));
+        std::vector<SpineItem> parents;
+        for (auto& parent : build_spine_level(children, above, store, true, target, maximum))
+            parents.push_back({std::move(parent), above, true});
+        return parents;
+    };
+    if (std::all_of(items.begin(), items.end(),
+                    [&](const SpineItem& item) { return item.level == level; }))
+        return exact();
+
+    std::vector<SpineItem> parents;
+    std::vector<Child> run;
+    // Whether some group made here holds more than one child.
+    bool several = false;
+    bool deeper = false;
+    const auto flush = [&] {
+        if (run.empty())
+            return;
+        several = several || run.size() > 1;
+        parents.push_back({put_spine_node(run, above, true, store), above, true});
+        run.clear();
+    };
+    for (size_t i = 0; i < items.size();) {
+        if (items[i].level == level) {
+            run.push_back(items[i].child);
+            if (branch_boundary(items[i].child, above, true, target) || run.size() >= maximum)
+                flush();
+            ++i;
+        } else if (run.empty()) {
+            deeper = deeper || items[i].level > above;
+            parents.push_back(items[i]);
+            ++i;
+        } else {
+            expand_spine_item(items, i, store);
+        }
+    }
+    flush();
+
+    // A full build regroups a whole level by count alone when grouping by
+    // key reduces nothing: when every group is a single child. A level of a
+    // few nodes is settled as a full build settles it. A larger one needs
+    // only a group of several, made here or found among those kept.
+    constexpr size_t few = 8;
+    if (!deeper && parents.size() <= few)
+        return exact();
+    if (several)
+        return parents;
+    for (const auto& parent : parents) {
+        if (parent.fresh)
+            continue;
+        ObjectId id = parent.child.id;
+        auto node = read_spine_node(id, store);
+        while (node.level > above) {
+            id = node.children.front().id;
+            node = read_spine_node(id, store);
+        }
+        if (node.level != above)
+            throw DecodeError("namespace tree node at an unexpected level");
+        // A child ending a group short of its node's end means the node was
+        // grouped by count: the level it came from reduced nothing by key.
+        for (size_t i = 0; i + 1 < node.children.size(); ++i)
+            if (branch_boundary(node.children[i], above, true, target))
+                return exact();
+        if (node.children.size() > 1)
+            return parents;
+    }
+    return exact();
+}
+
+} // namespace
+
 ObjectId update_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,
                                const NamespaceChanges& changes, const NamespaceTreeLimits& limits) {
     if (changes.empty())
         return root;
 
-    std::vector<Child> leaves;
-    collect_leaves(root, store, leaves);
-    // Treat the empty tree's single empty leaf as no leaves.
-    if (leaves.size() == 1 && leaves.front().items == 0)
-        leaves.clear();
-
-    // The owning leaf: the last whose first key is <= key, else the first leaf
-    // (where a full build would put it).
-    const auto owner_of = [&](const std::string& key) -> size_t {
-        const auto after = std::upper_bound(
-            leaves.begin(), leaves.end(), key,
-            [](const std::string& k, const Child& leaf) { return k < leaf.first_key; });
-        return after == leaves.begin() ? 0 : static_cast<size_t>(after - leaves.begin()) - 1;
-    };
-
-    // One window per run of changes whose owning leaves touch, so leaves
-    // between distant changes are never read.
-    struct Window {
-        size_t first{};
-        size_t last{};
-    };
-    std::vector<Window> windows;
-    if (leaves.empty()) {
-        windows.push_back({});
-    } else {
-        for (const auto& [key, _] : changes) {
-            const auto owner = owner_of(key);
-            if (windows.empty() || owner > windows.back().last + 1)
-                windows.push_back({owner, owner});
-            else
-                windows.back().last = std::max(windows.back().last, owner);
+    // The leaf sequence, with every subtree no change falls in left unread.
+    // A change belongs to the last leaf whose first key is at or before its
+    // key, else to the first leaf (where a full build would put it).
+    std::vector<SpineItem> sequence;
+    sequence.push_back({Child{{}, root, 0}, read_spine_node(root, store).level, false});
+    std::vector<SpineItem> leaves;
+    std::deque<Bytes> backing;
+    size_t at = 0;
+    auto change = changes.begin();
+    while (change != changes.end()) {
+        while (at + 1 < sequence.size() && sequence[at + 1].child.first_key <= change->first)
+            leaves.push_back(std::move(sequence[at++]));
+        if (at < sequence.size() && sequence[at].level > 0) {
+            expand_spine_item(sequence, at, store);
+            continue;
         }
-    }
 
-    // Rightmost first, so the indices of the windows still to do stay valid.
-    // A window that grows into leaves a later one already replaced applies
-    // those changes again, to the same effect.
-    for (auto window = windows.rbegin(); window != windows.rend(); ++window) {
-        const size_t first = window->first;
-        // Read the window, apply the changes, re-chunk. While the last run is
-        // open (did not end on a boundary key) the window grows right by one
-        // leaf until it re-synchronises with the full-build partition.
-        std::vector<std::pair<std::string, FsEntry>> entries;
-        std::vector<Child> replacement;
-        size_t end = window->last;
+        // A window of leaves: read, changed, cut into leaves again. While the
+        // last leaf cut is open (did not end on a boundary key) the window
+        // takes the next leaf, until its cuts fall where a full build's do.
+        std::vector<LeafRecord> window;
+        backing.clear();
+        if (at < sequence.size())
+            read_leaf_records(sequence[at++].child.id, store, backing, window);
+        const auto first_change = change;
+        std::vector<Child> cut;
         for (;;) {
-            entries.clear();
-            for (size_t i = first; i <= end && i < leaves.size(); ++i)
-                read_leaf(leaves[i].id, store, entries);
-
-            // Apply only the changes whose keys fall in the window's key range.
-            std::map<std::string, FsEntry> merged;
-            for (auto& [path, entry] : entries)
-                merged.insert_or_assign(std::move(path), std::move(entry));
-            const std::string low = leaves.empty() ? std::string() : leaves[first].first_key;
-            const bool last_window = end + 1 >= leaves.size();
-            const std::string high = last_window ? std::string() : leaves[end + 1].first_key;
-            for (const auto& [key, value] : changes) {
-                if (!leaves.empty() && key < low && first != 0)
+            const std::string* beyond =
+                at < sequence.size() ? &sequence[at].child.first_key : nullptr;
+            while (change != changes.end() && (!beyond || change->first < *beyond))
+                ++change;
+            std::vector<LeafRecord> merged;
+            merged.reserve(window.size() + 8);
+            auto record = window.begin();
+            for (auto applied = first_change; record != window.end() || applied != change;) {
+                if (applied == change || (record != window.end() && record->key < applied->first)) {
+                    merged.push_back(*record++);
                     continue;
-                if (!last_window && key >= high)
-                    continue;
-                if (value)
-                    merged.insert_or_assign(key, *value);
-                else
-                    merged.erase(key);
+                }
+                if (record != window.end() && record->key == applied->first)
+                    ++record;
+                if (applied->second)
+                    merged.push_back({applied->first, {}, &*applied->second});
+                ++applied;
             }
-
-            std::vector<EntryRef> ordered;
-            ordered.reserve(merged.size());
-            for (const auto& [path, entry] : merged)
-                ordered.emplace_back(&path, &entry);
             bool open = false;
-            replacement = chunk_leaves(ordered, store, limits, &open);
-            // An open tail with nothing left to absorb is the sequence end,
+            cut = chunk_records(merged, store, limits, open);
+            // An open tail with nothing left to take is the sequence end,
             // where a full build flushes too.
-            if (!open || end + 1 >= leaves.size())
+            if (!open || at >= sequence.size())
                 break;
-            ++end;
+            while (sequence[at].level > 0)
+                expand_spine_item(sequence, at, store);
+            read_leaf_records(sequence[at++].child.id, store, backing, window);
         }
-        const auto from = leaves.begin() + static_cast<std::ptrdiff_t>(std::min(first, leaves.size()));
-        const auto to = leaves.begin() + static_cast<std::ptrdiff_t>(std::min(end + 1, leaves.size()));
-        const auto at = leaves.erase(from, to);
-        leaves.insert(at, std::make_move_iterator(replacement.begin()),
-                      std::make_move_iterator(replacement.end()));
+        for (auto& leaf : cut)
+            leaves.push_back({std::move(leaf), 0, true});
     }
+    for (; at < sequence.size(); ++at)
+        leaves.push_back(std::move(sequence[at]));
 
-    if (leaves.empty())
-        return empty_leaf(store);
-    return build_spine(std::move(leaves), store, true, limits.branch_target_fanout,
-                       limits.branch_max_fanout);
+    uint8_t level = 0;
+    for (;;) {
+        if (leaves.empty())
+            return empty_leaf(store);
+        if (leaves.size() == 1) {
+            // A full build stops at the first level that is one node. A
+            // subtree kept unread may stand over a chain of single children,
+            // left when its neighbours went: the root is the foot of it.
+            auto id = leaves.front().child.id;
+            for (auto above = leaves.front().level; above > level; --above) {
+                auto node = read_spine_node(id, store);
+                if (node.children.size() != 1)
+                    break;
+                id = node.children.front().id;
+            }
+            return id;
+        }
+        leaves = splice_spine_level(std::move(leaves), level, store, limits);
+        level = next_spine_level(level);
+    }
 }
 
 ObjectId apply_delta_to_namespace_tree(const ObjectId& root, NamespaceNodeStore& store,

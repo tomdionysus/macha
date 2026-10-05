@@ -1043,6 +1043,117 @@ MACHA_TEST("namespace_tree", test_a_scan_seeks_and_stops_where_it_is_told) {
     }
 }
 
+// An update reaches the root a full build of the same namespace reaches,
+// whatever is changed and however the tree is shaped: single entries, runs,
+// the first and last keys, whole subtrees removed, everything removed. Small
+// fanouts make deep trees and the levels a full build regroups by count.
+MACHA_TEST("namespace_tree", test_an_update_reaches_the_root_a_full_build_reaches) {
+    uint64_t state = 0x9e3779b97f4a7c15ULL;
+    const auto next = [&] {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+    const auto key_of = [](uint64_t n) {
+        return "/k/" + std::to_string(n % 97) + "/" + std::to_string(n % 100003);
+    };
+    for (const auto& limits : {NamespaceTreeLimits{}, NamespaceTreeLimits{4, 8, 4, 8, 2, 4, 8},
+                               NamespaceTreeLimits{2, 3, 2, 3, 1, 2, 3}}) {
+        for (const size_t size :
+             {size_t{0}, size_t{1}, size_t{3}, size_t{40}, size_t{900}, size_t{5000}}) {
+            std::map<std::string, FsEntry> entries;
+            while (entries.size() < size)
+                entries[key_of(next())] = make_file(next() % 1000, next() % 5);
+            MemoryNamespaceNodeStore store;
+            auto root = build_namespace_tree(entries, store, limits);
+            // Fewer rounds on the largest tree: each is checked against a full build.
+            const int rounds = size > 1000 ? 12 : 40;
+            for (int round = 0; round < rounds; ++round) {
+                NamespaceChanges changes;
+                const auto kind = next() % 6;
+                const auto count = kind == 0 ? 1 : 1 + next() % 12;
+                for (uint64_t i = 0; i < count; ++i) {
+                    if (kind <= 2 || entries.empty()) {
+                        changes[key_of(next())] = make_file(next() % 1000, next() % 20);
+                    } else {
+                        // An existing key: changed, removed, or with its
+                        // neighbours removed in a run.
+                        auto it = entries.begin();
+                        std::advance(it, static_cast<std::ptrdiff_t>(next() % entries.size()));
+                        if (kind == 3) {
+                            changes[it->first] = make_file(next() % 1000, next() % 3);
+                        } else if (kind == 4) {
+                            changes[it->first] = std::nullopt;
+                        } else {
+                            for (int run = 0; run < 30 && it != entries.end(); ++run, ++it)
+                                changes[it->first] = std::nullopt;
+                        }
+                    }
+                }
+                if (round == 7 && !entries.empty()) {
+                    changes[entries.begin()->first] = std::nullopt;
+                    changes[std::prev(entries.end())->first] = make_file(7, 9);
+                    changes["/"] = make_directory(1);
+                    changes["/zzzz"] = make_directory(2);
+                }
+                if (round == rounds - 1)
+                    for (const auto& [path, _] : entries)
+                        changes[path] = std::nullopt;
+                for (const auto& [path, value] : changes) {
+                    if (value)
+                        entries[path] = *value;
+                    else
+                        entries.erase(path);
+                }
+                root = update_namespace_tree(root, store, changes, limits);
+                MemoryNamespaceNodeStore fresh;
+                REQUIRE(root == build_namespace_tree(entries, fresh, limits));
+            }
+        }
+    }
+}
+
+// The cost of an update follows the change: it reads the path to the leaves
+// it touches and writes them and the nodes above, whatever the size of the
+// tree, and reads no extent list of an entry it does not change.
+MACHA_TEST("namespace_tree", test_an_update_reads_the_path_it_changes_not_the_tree) {
+    auto entries = library(60, 200);
+    MemoryNamespaceNodeStore store;
+    auto root = build_namespace_tree(entries, store);
+    const auto stats = namespace_tree_stats(root, store);
+    REQUIRE(stats.leaves > 300);
+    REQUIRE(stats.depth >= 3);
+
+    const std::string path = "/TV/Show 31/Season 2/Episode 77.mkv";
+    REQUIRE(entries.contains(path));
+    auto changed = entries.at(path);
+    changed.mode = 0600;
+    entries[path] = changed;
+    store.forget_reads();
+    store.forget_written();
+    root = update_namespace_tree(root, store, {{path, changed}});
+    // The path down, the leaf, and at most a neighbour or two taken in.
+    CHECK(store.reads() <= 4 * stats.depth);
+    CHECK(store.written().size() <= 2 * stats.depth);
+    MemoryNamespaceNodeStore fresh;
+    CHECK(root == build_namespace_tree(entries, fresh));
+
+    // Removing a show reads its leaves and the path, not the library.
+    NamespaceChanges removal;
+    for (const auto& [key, _] : entries)
+        if (key == "/TV/Show 9" || key.starts_with("/TV/Show 9/"))
+            removal[key] = std::nullopt;
+    REQUIRE(removal.size() > 200);
+    for (const auto& [key, _] : removal)
+        entries.erase(key);
+    store.forget_reads();
+    root = update_namespace_tree(root, store, removal);
+    CHECK(store.reads() * 4 < stats.leaves);
+    MemoryNamespaceNodeStore again;
+    CHECK(root == build_namespace_tree(entries, again));
+}
+
 MACHA_TEST("namespace_tree", test_every_tree_node_is_reachable_for_the_collector) {
     // The collector's set is exactly the nodes the build wrote: branches,
     // leaves and every extent spine node.
