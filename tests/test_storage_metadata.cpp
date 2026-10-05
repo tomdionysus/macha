@@ -3077,6 +3077,179 @@ MACHA_FAST_TEST("storage_metadata", test_metadata_delta_tombstone_edits_are_line
     }
 }
 
+// An entry's provenance survives the snapshot and delta encodings, an entry
+// without any encodes as it always has, and a flagged entry with no
+// provenance behind the flag is refused.
+MACHA_FAST_TEST("storage_metadata", test_an_entrys_provenance_survives_snapshot_and_delta) {
+    const auto genesis = genesis_metadata();
+    auto plain = decode_snapshot(genesis.payload);
+    FsEntry file;
+    file.type = EntryType::file;
+    file.size = 123;
+    plain.entries["/a"] = file;
+    plain.entries["/b"] = file;
+    const auto plain_bytes = encode_snapshot(plain);
+
+    auto stamped = plain;
+    NodeId author{};
+    author.bytes[3] = 9;
+    auto& entry = stamped.entries["/a"];
+    entry.provenance.file_id = legacy_file_id("/a");
+    entry.provenance.content = {author, 4};
+    entry.provenance.name = {author, 2};
+    const auto bytes = encode_snapshot(stamped);
+    CHECK(bytes.size() == plain_bytes.size() + 16 + 24 + 24);
+    const auto decoded = decode_snapshot(bytes);
+    CHECK(decoded.entries.at("/a") == entry);
+    CHECK(decoded.entries.at("/b").provenance.empty());
+    CHECK(decode_snapshot(plain_bytes).entries.at("/a").provenance.empty());
+
+    const auto delta = metadata_delta(plain, stamped);
+    REQUIRE(delta.has_value());
+    CHECK(delta->upsert_entries.at("/a") == entry);
+    const auto carried = decode_metadata_delta(encode_metadata_delta(*delta));
+    CHECK(carried.upsert_entries.at("/a").provenance == entry.provenance);
+
+    CHECK(legacy_file_id("/a") == legacy_file_id("/a"));
+    CHECK(legacy_file_id("/a") != legacy_file_id("/b"));
+    CHECK(legacy_file_id("/a") != NodeId{});
+}
+
+// The rules by which a mutation stamps what it writes.
+MACHA_FAST_TEST("storage_metadata", test_a_written_entry_is_stamped_against_what_was_there) {
+    NodeId author{};
+    author.bytes[0] = 1;
+    const MetadataDot dot{author, 7};
+    FsEntry file;
+    file.type = EntryType::file;
+    file.size = 10;
+
+    // Nothing at the path: a new file, with an identity of its own.
+    auto created = file;
+    stamp_entry_provenance(created, "/new", nullptr, dot);
+    CHECK(created.provenance.file_id != NodeId{});
+    CHECK(created.provenance.file_id != legacy_file_id("/new"));
+    CHECK(created.provenance.content == dot);
+    CHECK(created.provenance.name == dot);
+
+    // Changed in place: same identity and name, new content dot.
+    const MetadataDot later{author, 9};
+    auto changed = created;
+    changed.size = 11;
+    changed.provenance = {};
+    stamp_entry_provenance(changed, "/new", &created, later);
+    CHECK(changed.provenance.file_id == created.provenance.file_id);
+    CHECK(changed.provenance.name == dot);
+    CHECK(changed.provenance.content == later);
+
+    // Rewritten unchanged: exactly what it was.
+    auto same = created;
+    same.provenance = {};
+    stamp_entry_provenance(same, "/new", &created, later);
+    CHECK(same == created);
+
+    // Arriving from another path with its identity: a rename. The content
+    // dot comes with it and the name dot is this mutation's.
+    auto renamed = created;
+    stamp_entry_provenance(renamed, "/elsewhere", nullptr, later);
+    CHECK(renamed.provenance.file_id == created.provenance.file_id);
+    CHECK(renamed.provenance.content == dot);
+    CHECK(renamed.provenance.name == later);
+
+    // A rename onto another file's path is new at that path.
+    FsEntry other = file;
+    stamp_entry_provenance(other, "/other", nullptr, dot);
+    auto replacing = created;
+    stamp_entry_provenance(replacing, "/other", &other, later);
+    CHECK(replacing.provenance.file_id == created.provenance.file_id);
+    CHECK(replacing.provenance.name == later);
+    CHECK(replacing.provenance.content == dot);
+
+    // An entry from before provenance: untouched while unchanged, and on its
+    // first change it takes the identity of its path, a content dot and no
+    // name dot.
+    const FsEntry legacy = file;
+    auto untouched = legacy;
+    stamp_entry_provenance(untouched, "/old", &legacy, dot);
+    CHECK(untouched.provenance.empty());
+    auto touched = legacy;
+    touched.mode = 0600;
+    stamp_entry_provenance(touched, "/old", &legacy, dot);
+    CHECK(touched.provenance.file_id == legacy_file_id("/old"));
+    CHECK(touched.provenance.content == dot);
+    CHECK(!static_cast<bool>(touched.provenance.name));
+
+    // An append gives the entry its dot, and a legacy entry its identity.
+    MetadataDelta::EntryAppend append;
+    append.base_extents = 0;
+    append.extents.push_back({0, 5, object_id(pattern(5, 1)), false});
+    append.size = 5;
+    append.content = later;
+    auto appended = legacy;
+    appended.extents.clear();
+    apply_entry_append(appended, "/old", append);
+    CHECK(appended.provenance.content == later);
+    CHECK(appended.provenance.file_id == legacy_file_id("/old"));
+    CHECK(appended.extents.size() == 1);
+    bool refused = false;
+    try {
+        apply_entry_append(appended, "/old", append);
+    } catch (const DecodeError&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
+// The legacy clock and an append's dot travel in a delta and in both
+// snapshot forms.
+MACHA_FAST_TEST("storage_metadata", test_the_legacy_clock_survives_snapshot_and_delta) {
+    const auto genesis = genesis_metadata();
+    auto before = decode_snapshot(genesis.payload);
+    NodeId author{};
+    author.bytes[0] = 2;
+    before.mutation_sequences[author] = 3;
+    FsEntry file;
+    file.type = EntryType::file;
+    file.extents.push_back({0, 4, object_id(pattern(4, 1)), false});
+    file.size = 4;
+    before.entries["/f"] = file;
+    CHECK(!decode_snapshot(encode_snapshot(before)).legacy_clock.has_value());
+
+    auto after = before;
+    after.legacy_clock = before.mutation_sequences;
+    after.mutation_sequences[author] = 4;
+    auto& grown = after.entries["/f"];
+    grown.extents.push_back({4, 4, object_id(pattern(4, 2)), false});
+    grown.size = 8;
+    grown.provenance.content = {author, 4};
+    grown.provenance.file_id = legacy_file_id("/f");
+
+    const auto decoded = decode_snapshot(encode_snapshot(after));
+    REQUIRE(decoded.legacy_clock.has_value());
+    CHECK(*decoded.legacy_clock == before.mutation_sequences);
+    // Set but empty is not unset.
+    auto empty_clock = before;
+    empty_clock.legacy_clock.emplace();
+    const auto empty_decoded = decode_snapshot(encode_snapshot(empty_clock));
+    REQUIRE(empty_decoded.legacy_clock.has_value());
+    CHECK(empty_decoded.legacy_clock->empty());
+
+    const auto delta = metadata_delta(before, after);
+    REQUIRE(delta.has_value());
+    REQUIRE(delta->set_legacy_clock.has_value());
+    REQUIRE(delta->append_entries.contains("/f"));
+    CHECK((delta->append_entries.at("/f").content == MetadataDot{author, 4}));
+    const auto carried = decode_metadata_delta(encode_metadata_delta(*delta));
+    CHECK(carried.set_legacy_clock == delta->set_legacy_clock);
+    CHECK(carried.append_entries.at("/f").content == delta->append_entries.at("/f").content);
+    CHECK(encode_snapshot(apply_metadata_delta(before, carried)) == encode_snapshot(after));
+
+    // The clock is set once: a delta cannot change it.
+    auto moved = after;
+    (*moved.legacy_clock)[author] = 99;
+    CHECK(!metadata_delta(after, moved).has_value());
+}
+
 // A merge is total: values both branches changed join to one answer that
 // does not depend on which reconciler computes it.
 MACHA_FAST_TEST("storage_metadata", test_a_merge_of_values_changed_on_both_branches_never_refuses) {

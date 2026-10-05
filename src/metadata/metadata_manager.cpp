@@ -1747,6 +1747,63 @@ MetadataRecord MetadataManager::mutate_impl(
             snapshot.metadata_branch_floor != metadata_branch_floor ||
             snapshot.retention_baseline_complete != retention_baseline_complete)
             throw std::runtime_error("filesystem mutation attempted to change cluster policy");
+        // Provenance: every entry this mutation writes says which mutation
+        // wrote it, against what the parent head held at its path.
+        {
+            const MetadataDot mutation{origin, *sequence};
+            if (!snapshot.legacy_clock) {
+                // Still the parent's clock here.
+                snapshot.legacy_clock = snapshot.mutation_sequences;
+                if (exact_delta)
+                    supplied_delta.set_legacy_clock = snapshot.legacy_clock;
+            }
+            if (!exact_delta) {
+                for (auto& [path, entry] : snapshot.entries) {
+                    const auto prior = before->entries.find(path);
+                    if (prior == before->entries.end())
+                        stamp_entry_provenance(entry, path, nullptr, mutation);
+                    else if (prior->second != entry)
+                        stamp_entry_provenance(entry, path, &prior->second, mutation);
+                }
+            } else if (!supplied_delta.upsert_entries.empty() ||
+                       !supplied_delta.append_entries.empty()) {
+                const bool tree = snapshot.namespace_root.has_value();
+                if (tree && !namespace_store_)
+                    throw MetadataNotReady("no namespace node store is configured");
+                // The parent's namespace: the tree is not yet rewritten; the
+                // map already is, so the parent is decoded again.
+                std::optional<ControlNamespaceNodeStore> reader;
+                std::optional<MetadataSnapshot> parent;
+                if (tree)
+                    reader.emplace(ControlNamespaceNodeStore::for_reading(local_.control(),
+                                                                          *namespace_store_));
+                else
+                    parent = decode_snapshot(current.payload);
+                const auto prior_of = [&](const std::string& path) -> std::optional<FsEntry> {
+                    if (tree)
+                        return namespace_entry(snapshot, &*reader, path);
+                    const auto found = parent->entries.find(path);
+                    if (found == parent->entries.end())
+                        return {};
+                    return found->second;
+                };
+                for (auto& [path, entry] : supplied_delta.upsert_entries) {
+                    const auto prior = prior_of(path);
+                    stamp_entry_provenance(entry, path, prior ? &*prior : nullptr, mutation);
+                    if (!tree)
+                        snapshot.entries[path] = entry;
+                }
+                for (auto& [path, append] : supplied_delta.append_entries) {
+                    append.content = mutation;
+                    if (tree)
+                        continue;
+                    auto& entry = snapshot.entries.at(path);
+                    entry.provenance.content = mutation;
+                    if (entry.provenance.file_id == NodeId{})
+                        entry.provenance.file_id = legacy_file_id(path);
+                }
+            }
+        }
         snapshot.mutation_sequences[origin] = *sequence;
         if (exact_delta)
             supplied_delta.mutation_sequences[origin] = *sequence;

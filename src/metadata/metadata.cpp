@@ -26,6 +26,8 @@ constexpr std::array<uint8_t, 8> SM5{'D', 'H', 'T', 'M', 'E', 'T', 'A', '5'},
     // SM15 is SM13 with every section, then torrent requests; SM16 is SM14
     // then torrent requests. Written only while the collection is non-empty.
     SM15{'D', 'H', 'T', 'M', 'E', 'T', 'B', '5'}, SM16{'D', 'H', 'T', 'M', 'E', 'T', 'B', '6'},
+    // SM17 is SM16 and SM18 is SM15, each followed by the legacy clock.
+    SM17{'D', 'H', 'T', 'M', 'E', 'T', 'B', '7'}, SM18{'D', 'H', 'T', 'M', 'E', 'T', 'B', '8'},
     DM{'D', 'H', 'T', 'M', 'D', 'B', '0', '1'}, MJ{'D', 'H', 'T', 'M', 'J', 'N', 'L', '1'},
     MH{'D', 'H', 'T', 'M', 'H', 'S', 'T', '1'}, MA{'D', 'H', 'T', 'M', 'A', 'C', 'C', '1'},
     MS{'D', 'H', 'T', 'M', 'S', 'E', 'Q', '1'}, CP{'D', 'H', 'T', 'M', 'C', 'K', 'P', '1'},
@@ -56,8 +58,114 @@ void account_entry_allocations(uint64_t& total, const FsEntry& entry) {
 }
 } // namespace
 
+NodeId legacy_file_id(std::string_view path) {
+    Bytes seed;
+    static constexpr std::string_view domain = "macha-legacy-file-id\0";
+    seed.insert(seed.end(), domain.begin(), domain.end());
+    seed.insert(seed.end(), path.begin(), path.end());
+    const auto digest = sha256(seed);
+    NodeId id;
+    std::copy_n(digest.bytes.begin(), id.bytes.size(), id.bytes.begin());
+    return id;
+}
+
+void encode_entry_provenance(Writer& w, const EntryProvenance& p) {
+    w.fixed(p.file_id.bytes);
+    w.fixed(p.content.author.bytes);
+    w.u64(p.content.sequence);
+    w.fixed(p.name.author.bytes);
+    w.u64(p.name.sequence);
+}
+
+EntryProvenance decode_entry_provenance(Reader& r) {
+    EntryProvenance p;
+    p.file_id.bytes = r.fixed<16>();
+    p.content.author.bytes = r.fixed<16>();
+    p.content.sequence = r.u64();
+    p.name.author.bytes = r.fixed<16>();
+    p.name.sequence = r.u64();
+    // The flag promised provenance; an empty one would not round-trip.
+    if (p.empty())
+        throw DecodeError("entry provenance is empty");
+    return p;
+}
+
+namespace {
+void encode_clock(Writer& w, const std::map<NodeId, uint64_t>& clock) {
+    w.u32(static_cast<uint32_t>(clock.size()));
+    for (const auto& [node, sequence] : clock) {
+        w.fixed(node.bytes);
+        w.u64(sequence);
+    }
+}
+
+std::map<NodeId, uint64_t> decode_clock(Reader& r) {
+    std::map<NodeId, uint64_t> clock;
+    const auto count = r.u32();
+    if (count > 65536)
+        throw DecodeError("too many clock origins");
+    for (uint32_t i = 0; i < count; ++i) {
+        NodeId node{r.fixed<16>()};
+        const auto sequence = r.u64();
+        if (!sequence || !clock.emplace(node, sequence).second)
+            throw DecodeError("bad clock entry");
+    }
+    return clock;
+}
+} // namespace
+
+void apply_entry_append(FsEntry& entry, std::string_view path,
+                        const MetadataDelta::EntryAppend& append) {
+    if (entry.type != EntryType::file || entry.extents.size() != append.base_extents)
+        throw DecodeError("metadata delta append base mismatch");
+    entry.extents.insert(entry.extents.end(), append.extents.begin(), append.extents.end());
+    entry.size = append.size;
+    entry.mtime_ns = append.mtime_ns;
+    entry.ctime_ns = append.ctime_ns;
+    entry.version = append.version;
+    if (append.content) {
+        entry.provenance.content = append.content;
+        if (entry.provenance.file_id == NodeId{})
+            entry.provenance.file_id = legacy_file_id(path);
+    }
+}
+
+void stamp_entry_provenance(FsEntry& entry, std::string_view path, const FsEntry* prior,
+                            const MetadataDot& dot) {
+    auto& now = entry.provenance;
+    const auto prior_id = [&] {
+        return prior->provenance.file_id != NodeId{} ? prior->provenance.file_id
+                                                     : legacy_file_id(path);
+    };
+    // An entry built without an identity is the file already at the path,
+    // changed; with nothing at the path it is a new file.
+    if (now.file_id == NodeId{})
+        now.file_id = prior ? prior_id() : random_node_id();
+    const bool same_file = prior && now.file_id == prior_id();
+    if (!same_file) {
+        // New at this path: created here, or renamed to here.
+        now.name = dot;
+        if (!now.content)
+            now.content = dot;
+        return;
+    }
+    auto before = *prior;
+    auto after = entry;
+    before.provenance = {};
+    after.provenance = {};
+    if (before == after) {
+        // Rewritten unchanged: it stays exactly what it was.
+        now = prior->provenance;
+        return;
+    }
+    now.name = prior->provenance.name;
+    now.content = dot;
+}
+
 uint64_t snapshot_resident_bytes(const MetadataSnapshot& snapshot) {
     uint64_t total = sizeof(MetadataSnapshot);
+    if (snapshot.legacy_clock)
+        account_map_nodes(total, *snapshot.legacy_clock);
     saturated_add(total, snapshot.metadata_voters.capacity() * sizeof(NodeId));
     account_map_nodes(total, snapshot.mutation_sequences);
     account_map_nodes(total, snapshot.metadata_participants);
@@ -115,7 +223,8 @@ make_materialization(MetadataRecord record, std::shared_ptr<const MetadataSnapsh
         MetadataMaterialization{std::move(record), std::move(snapshot), bytes});
 }
 void entry(Writer& w, const FsEntry& e) {
-    w.u8((uint8_t)e.type);
+    const bool provenance = !e.provenance.empty();
+    w.u8(static_cast<uint8_t>(e.type) | (provenance ? entry_type_with_provenance : 0));
     w.u32(e.mode);
     w.u32(e.uid);
     w.u32(e.gid);
@@ -123,6 +232,8 @@ void entry(Writer& w, const FsEntry& e) {
     w.i64(e.ctime_ns);
     w.i64(e.mtime_ns);
     w.u64(e.version);
+    if (provenance)
+        encode_entry_provenance(w, e.provenance);
     w.u32(e.extents.size());
     for (auto& x : e.extents) {
         w.u64(x.offset);
@@ -134,6 +245,8 @@ void entry(Writer& w, const FsEntry& e) {
 FsEntry entry(Reader& r) {
     FsEntry e;
     auto t = r.u8();
+    const bool provenance = (t & entry_type_with_provenance) != 0;
+    t &= static_cast<uint8_t>(~entry_type_with_provenance);
     if (t < 1 || t > 2)
         throw DecodeError("bad entry type");
     e.type = (EntryType)t;
@@ -144,6 +257,8 @@ FsEntry entry(Reader& r) {
     e.ctime_ns = r.i64();
     e.mtime_ns = r.i64();
     e.version = r.u64();
+    if (provenance)
+        e.provenance = decode_entry_provenance(r);
     auto n = r.u32();
     if (n > 10000000)
         throw DecodeError("too many extents");
@@ -355,6 +470,9 @@ int metadata_delta_version(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 7> prefix{'D', 'H', 'T', 'M', 'D', 'L', 'T'};
     if (data.size() < 8 || !std::equal(prefix.begin(), prefix.end(), data.begin()))
         return 0;
+    // DLT10 is written 'A'.
+    if (data[7] == 'A')
+        return 10;
     if (data[7] < '1' || data[7] > '9')
         return 0;
     return static_cast<int>(data[7] - '0');
@@ -378,6 +496,7 @@ Bytes encode_snapshot_for_delta(std::span<const uint8_t> delta, const MetadataSn
     case 7:
     case 8:
     case 9:
+    case 10:
         // A tree-backed successor is SM14; encode_snapshot refuses a namespace
         // root, which would force every commit to a full record.
         return snapshot.namespace_root ? encode_snapshot_v14(snapshot)
@@ -493,8 +612,20 @@ bool extents_appended(const FsEntry& before, const FsEntry& after) {
 
 void record_entry_change(MetadataDelta& delta, const std::string& path, const FsEntry* before,
                          const FsEntry& after) {
-    if (before && extents_appended(*before, after)) {
+    // An append carries the content dot and nothing else of the provenance:
+    // the identity and name must be what applying it gives.
+    const auto appends_provenance = [&] {
+        auto expected = before->provenance;
+        if (after.provenance.content) {
+            expected.content = after.provenance.content;
+            if (expected.file_id == NodeId{})
+                expected.file_id = legacy_file_id(path);
+        }
+        return expected == after.provenance;
+    };
+    if (before && extents_appended(*before, after) && appends_provenance()) {
         MetadataDelta::EntryAppend append;
+        append.content = after.provenance.content;
         append.size = after.size;
         append.mtime_ns = after.mtime_ns;
         append.ctime_ns = after.ctime_ns;
@@ -590,7 +721,8 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     // The smallest format that holds the state: SM11 adds branch topology and
     // conflicts, SM12 the metadata write floor, SM13 the participant roster
     // and branch floor.
-    const bool torrent_state = !s.torrent_requests.empty();
+    const bool legacy_clock_state = s.legacy_clock.has_value();
+    const bool torrent_state = legacy_clock_state || !s.torrent_requests.empty();
     const bool branch_state = torrent_state || !s.merge_parents.empty() || !s.conflicts.empty();
     const bool policy_state = torrent_state || s.metadata_write_replicas_required != 0;
     const bool governance_state = torrent_state || !s.metadata_participants.empty() ||
@@ -598,7 +730,9 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
                                   s.retention_baseline_complete;
     const bool include_node_status =
         policy_state || branch_state || !s.node_status.empty() || !s.identity_resets.empty();
-    if (torrent_state)
+    if (legacy_clock_state)
+        w.raw(SM18);
+    else if (torrent_state)
         w.raw(SM15);
     else if (governance_state)
         w.raw(SM13);
@@ -675,6 +809,8 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     }
     if (torrent_state)
         encode_torrent_requests(w, s);
+    if (legacy_clock_state)
+        encode_clock(w, *s.legacy_clock);
     return w.take();
 }
 Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
@@ -698,7 +834,7 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
         throw std::runtime_error("too many metadata participants");
 
     Writer w;
-    w.raw(s.torrent_requests.empty() ? SM14 : SM16);
+    w.raw(s.legacy_clock ? SM17 : s.torrent_requests.empty() ? SM14 : SM16);
     w.u32(s.metadata_voters.size());
     for (const auto& v : s.metadata_voters)
         w.fixed(v.bytes);
@@ -743,15 +879,17 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
         w.fixed(participant.bytes);
     w.fixed(s.metadata_branch_floor.bytes);
     w.u8(s.retention_baseline_complete ? 1 : 0);
-    if (!s.torrent_requests.empty())
+    if (s.legacy_clock || !s.torrent_requests.empty())
         encode_torrent_requests(w, s);
+    if (s.legacy_clock)
+        encode_clock(w, *s.legacy_clock);
     return w.take();
 }
 
 namespace {
 // Leaves `entries` empty: decoding has no node store. Callers needing the map
 // use `attach_namespace`; others read paths via `namespace_tree_lookup`.
-MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests) {
+MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests, bool legacy_clock) {
     MetadataSnapshot s;
     const auto voters = r.u32();
     if (voters > 1024)
@@ -848,6 +986,8 @@ MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests) {
     s.retention_baseline_complete = baseline != 0;
     if (torrent_requests)
         decode_torrent_requests(r, s);
+    if (legacy_clock)
+        s.legacy_clock = decode_clock(r);
     r.finish();
     // No "/" check here: that needs a tree read, which belongs to the store's owner.
     return s;
@@ -859,11 +999,15 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     Reader r(d);
     auto m = r.raw(8);
     if (std::equal(m.begin(), m.end(), SM14.begin()))
-        return decode_snapshot_v14(r, false);
+        return decode_snapshot_v14(r, false, false);
     if (std::equal(m.begin(), m.end(), SM16.begin()))
-        return decode_snapshot_v14(r, true);
-    // SM15 is SM13 with every section present, then the torrent requests.
-    const bool v15 = std::equal(m.begin(), m.end(), SM15.begin());
+        return decode_snapshot_v14(r, true, false);
+    if (std::equal(m.begin(), m.end(), SM17.begin()))
+        return decode_snapshot_v14(r, true, true);
+    // SM15 is SM13 with every section present, then the torrent requests;
+    // SM18 is SM15 and then the legacy clock.
+    const bool v18 = std::equal(m.begin(), m.end(), SM18.begin());
+    const bool v15 = v18 || std::equal(m.begin(), m.end(), SM15.begin());
     const bool v5 = std::equal(m.begin(), m.end(), SM5.begin());
     const bool v6 = std::equal(m.begin(), m.end(), SM6.begin());
     const bool v7 = std::equal(m.begin(), m.end(), SM7.begin());
@@ -990,6 +1134,8 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     }
     if (v15)
         decode_torrent_requests(r, s);
+    if (v18)
+        s.legacy_clock = decode_clock(r);
     r.finish();
     auto x = s.entries.find("/");
     if (x == s.entries.end() || x->second.type != EntryType::directory)
@@ -1006,11 +1152,18 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
     static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
     static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
+    static constexpr std::array<uint8_t, 8> magic_v10{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'A'};
+    // DLT10 is DLT9 with a content dot on every append and a trailing legacy
+    // clock, written when a mutation carries either.
+    const bool v10 = delta.set_legacy_clock.has_value() ||
+                     std::any_of(delta.append_entries.begin(), delta.append_entries.end(),
+                                 [](const auto& item) { return bool(item.second.content); });
     const bool topology =
         delta.replace_merge_parents.has_value() || delta.replace_conflicts.has_value();
     // DLT9 is DLT8 plus a trailing torrent-requests section, written only when
     // a mutation touches a torrent request.
-    const bool v9 = !delta.upsert_torrent_requests.empty() || !delta.erase_torrent_requests.empty();
+    const bool v9 =
+        v10 || !delta.upsert_torrent_requests.empty() || !delta.erase_torrent_requests.empty();
     const bool v8 = v9 || !delta.append_entries.empty();
     // DLT7 when DLT5/6 cannot express it: one topology set without the other,
     // or canonical garbage order. Both sets together still encode as DLT6; a
@@ -1019,7 +1172,8 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
                     (delta.replace_merge_parents.has_value() != delta.replace_conflicts.has_value());
     const bool v6 = !v7 && topology;
     Writer w;
-    w.raw(v9 ? magic_v9 : v8 ? magic_v8 : v7 ? magic_v7 : v6 ? magic_v6 : magic_v5);
+    w.raw(v10 ? magic_v10 : v9 ? magic_v9 : v8 ? magic_v8 : v7 ? magic_v7 : v6 ? magic_v6
+                                                                                 : magic_v5);
     w.u32(delta.mutation_sequences.size());
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         w.fixed(node.bytes);
@@ -1107,6 +1261,10 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
                 w.u8(x.hole);
                 w.fixed(x.id.bytes);
             }
+            if (v10) {
+                w.fixed(append.content.author.bytes);
+                w.u64(append.content.sequence);
+            }
         }
     }
     if (v9) {
@@ -1117,6 +1275,11 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
         }
         w.u32(static_cast<uint32_t>(delta.erase_torrent_requests.size()));
         for (const auto& id : delta.erase_torrent_requests) w.string(id);
+    }
+    if (v10) {
+        w.u8(delta.set_legacy_clock.has_value());
+        if (delta.set_legacy_clock)
+            encode_clock(w, *delta.set_legacy_clock);
     }
     return w.take();
 }
@@ -1131,6 +1294,7 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     static constexpr std::array<uint8_t, 8> magic_v7{'D', 'H', 'T', 'M', 'D', 'L', 'T', '7'};
     static constexpr std::array<uint8_t, 8> magic_v8{'D', 'H', 'T', 'M', 'D', 'L', 'T', '8'};
     static constexpr std::array<uint8_t, 8> magic_v9{'D', 'H', 'T', 'M', 'D', 'L', 'T', '9'};
+    static constexpr std::array<uint8_t, 8> magic_v10{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'A'};
     Reader r(data);
     auto got = r.raw(magic_v1.size());
     const bool v1 = std::equal(got.begin(), got.end(), magic_v1.begin());
@@ -1138,8 +1302,11 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
     const bool v3 = std::equal(got.begin(), got.end(), magic_v3.begin());
     const bool v4 = std::equal(got.begin(), got.end(), magic_v4.begin());
     const bool v5 = std::equal(got.begin(), got.end(), magic_v5.begin());
+    // DLT10 is DLT9 with a content dot on every append and a trailing legacy
+    // clock.
+    const bool v10 = std::equal(got.begin(), got.end(), magic_v10.begin());
     // DLT9 is DLT8 plus a trailing torrent-requests section.
-    const bool v9 = std::equal(got.begin(), got.end(), magic_v9.begin());
+    const bool v9 = v10 || std::equal(got.begin(), got.end(), magic_v9.begin());
     const bool v8 = v9 || std::equal(got.begin(), got.end(), magic_v8.begin());
     // DLT8 is DLT7 plus a trailing append-entries section.
     const bool v7 = v8 || std::equal(got.begin(), got.end(), magic_v7.begin());
@@ -1304,6 +1471,10 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
                 x.id = ObjectId{r.fixed<32>()};
                 append.extents.push_back(x);
             }
+            if (v10) {
+                append.content.author.bytes = r.fixed<16>();
+                append.content.sequence = r.u64();
+            }
             if (delta.upsert_entries.contains(path) ||
                 !delta.append_entries.emplace(std::move(path), std::move(append)).second)
                 throw DecodeError("duplicate metadata delta append path");
@@ -1328,6 +1499,13 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
                 throw DecodeError("torrent request both written and erased");
             delta.erase_torrent_requests.push_back(std::move(id));
         }
+    }
+    if (v10) {
+        const auto set = r.u8();
+        if (set > 1)
+            throw DecodeError("bad metadata delta legacy clock flag");
+        if (set)
+            delta.set_legacy_clock = decode_clock(r);
     }
     r.finish();
     return delta;
@@ -1360,6 +1538,14 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
         auto it = before.mutation_sequences.find(node);
         if (it == before.mutation_sequences.end() || it->second != sequence)
             delta.mutation_sequences.emplace(node, sequence);
+    }
+
+    if (before.legacy_clock != after.legacy_clock) {
+        // Set once and never changed by a mutation; a merge's join is not a
+        // delta.
+        if (before.legacy_clock || !after.legacy_clock)
+            return {};
+        delta.set_legacy_clock = after.legacy_clock;
     }
 
     for (const auto& [path, value] : before.entries) {
@@ -1506,6 +1692,11 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
                               "namespace node store");
         out.namespace_root = namespace_applier(*out.namespace_root, delta);
     }
+    if (delta.set_legacy_clock) {
+        if (out.legacy_clock)
+            throw DecodeError("metadata delta sets a legacy clock already set");
+        out.legacy_clock = delta.set_legacy_clock;
+    }
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         auto it = out.mutation_sequences.find(node);
         if (it != out.mutation_sequences.end() && sequence < it->second)
@@ -1525,17 +1716,11 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
         for (const auto& [path, value] : delta.upsert_entries)
             out.entries[normalize_path(path)] = value;
         for (const auto& [path, append] : delta.append_entries) {
-            auto found = out.entries.find(normalize_path(path));
-            if (found == out.entries.end() || found->second.type != EntryType::file ||
-                found->second.extents.size() != append.base_extents)
+            const auto normalized = normalize_path(path);
+            auto found = out.entries.find(normalized);
+            if (found == out.entries.end())
                 throw DecodeError("metadata delta append base mismatch");
-            auto& entry = found->second;
-            entry.extents.insert(entry.extents.end(), append.extents.begin(),
-                                 append.extents.end());
-            entry.size = append.size;
-            entry.mtime_ns = append.mtime_ns;
-            entry.ctime_ns = append.ctime_ns;
-            entry.version = append.version;
+            apply_entry_append(found->second, normalized, append);
         }
     }
     switch (delta.catalogue) {
@@ -1938,6 +2123,18 @@ MetadataMergeResult merge_metadata_snapshots_over(const MetadataSnapshot& base,
             auto& current = out.mutation_sequences[node];
             current = std::max(current, sequence);
         }
+    }
+
+    // A branch never written with provenance may hold entries without any
+    // from anywhere in its history, so its whole clock stands for it.
+    if (left.legacy_clock || right.legacy_clock) {
+        auto joined = left.legacy_clock ? *left.legacy_clock : left.mutation_sequences;
+        for (const auto& [node, sequence] :
+             right.legacy_clock ? *right.legacy_clock : right.mutation_sequences) {
+            auto& current = joined[node];
+            current = std::max(current, sequence);
+        }
+        out.legacy_clock = std::move(joined);
     }
 
     // Conflict presence merges three-way, so a resolution on one branch is

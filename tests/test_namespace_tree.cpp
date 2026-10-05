@@ -94,6 +94,45 @@ MACHA_TEST("namespace_tree", test_the_tree_round_trips_every_namespace_it_is_giv
     CHECK(read_back.at("/TV/Show 0/Season 1/Episode 0.mkv").extents == original.extents);
 }
 
+// An entry's provenance is part of the tree: it comes back whole through a
+// read, a lookup, the stats walk and the node collection, and an entry that
+// has none leaves the tree exactly as it was.
+MACHA_TEST("namespace_tree", test_the_tree_carries_each_entrys_provenance) {
+    MemoryNamespaceNodeStore store;
+    auto entries = library(6, 5);
+    const auto plain_root = build_namespace_tree(entries, store);
+
+    NodeId author{};
+    author.bytes[0] = 7;
+    uint64_t sequence = 0;
+    for (auto& [path, entry] : entries) {
+        // Every third entry stays as it was written before provenance.
+        if (++sequence % 3 == 0)
+            continue;
+        entry.provenance.file_id = legacy_file_id(path);
+        entry.provenance.content = {author, sequence};
+        entry.provenance.name = {author, sequence / 2 + 1};
+    }
+    const auto root = build_namespace_tree(entries, store);
+    CHECK(root != plain_root);
+    CHECK(read_namespace_tree(root, store) == entries);
+    for (const auto& [path, entry] : entries) {
+        const auto found = namespace_tree_lookup(root, path, store);
+        REQUIRE(found.has_value());
+        CHECK(found->provenance == entry.provenance);
+    }
+    const auto stats = namespace_tree_stats(root, store);
+    CHECK(stats.entries == entries.size());
+    std::vector<ObjectId> nodes;
+    collect_namespace_tree_nodes(root, store, nodes);
+    CHECK(nodes.size() == stats.leaves + stats.branches + stats.extent_nodes);
+
+    // Taking the provenance away again gives back the original tree.
+    for (auto& [_, entry] : entries)
+        entry.provenance = {};
+    CHECK(build_namespace_tree(entries, store) == plain_root);
+}
+
 MACHA_TEST("namespace_tree", test_the_root_is_a_function_of_the_entry_set_and_nothing_else) {
     // History independence: nodes reaching the same namespace by different
     // insertions and deletions must produce the same root.
