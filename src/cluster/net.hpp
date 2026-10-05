@@ -62,8 +62,7 @@ enum class MessageType : uint16_t {
     ingest_job_action = 34,
     get_torrent_jobs = 35,
     torrent_job_action = 36,
-    propose_history_floor = 37,
-    commit_history_floor = 38,
+    // 37 and 38 are not in use.
     session_sync = 39,
     have_objects = 40,
     // CONTROL-plane counterpart of have_objects (which answers from

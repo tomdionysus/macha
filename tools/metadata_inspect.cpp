@@ -13,15 +13,6 @@
 using namespace macha;
 
 namespace {
-NodeId parse_node_id(const std::string& text) {
-    const auto bytes = unhex(text);
-    if (!bytes || bytes->size() != NodeId{}.bytes.size())
-        throw std::runtime_error("invalid witness NodeId: " + text);
-    NodeId out;
-    std::copy(bytes->begin(), bytes->end(), out.bytes.begin());
-    return out;
-}
-
 Hash256 parse_hash(const std::string& text) {
     const auto bytes = unhex(text);
     if (!bytes || bytes->size() != Hash256{}.bytes.size())

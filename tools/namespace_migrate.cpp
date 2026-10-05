@@ -8,9 +8,8 @@
 // serialised namespace, so a commit rewrites only the changed leaf and the
 // branches above it.
 //
-// Destructive and offline. It quarantines the checkpoint, journal, history,
-// heads and acceptance proof under a timestamped suffix and installs a head
-// with no ancestry. No extent is touched: paths, stat fields and ObjectIds are
+// Destructive and offline. It quarantines the checkpoint, journal, history
+// and heads under a timestamped suffix and installs a head with no ancestry. No extent is touched: paths, stat fields and ObjectIds are
 // copied unchanged.
 //
 // Run it on every node, all stopped and converged. The tree's shape depends on
@@ -276,8 +275,8 @@ int main(int argc, char** argv) {
                                            "macha-namespace-migrate"))
             throw std::runtime_error("the replica refused the migrated head");
 
-        std::cout << "installed. The previous checkpoint, journal, history, heads and acceptance\n"
-                     "proof are quarantined beside them with a .pre-migration.<ns> suffix.\n";
+        std::cout << "installed. The previous checkpoint, journal, history and heads are\n"
+                     "quarantined beside them with a .pre-migration.<ns> suffix.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "macha-namespace-migrate: " << error.what() << '\n';

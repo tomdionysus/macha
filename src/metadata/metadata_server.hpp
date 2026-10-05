@@ -18,7 +18,7 @@ class NodeRuntime;
 class PersistentBlockCache;
 
 // The serving side of this node's metadata replica: answers peers' metadata
-// requests, accepts and imports commits, and records history checkpoints.
+// requests, and accepts and imports commits.
 // Built once the replica has recovered, which applies the committed
 // snapshot's identity-reset tombstones before any metadata route answers;
 // binds its routes on construction and unbinds them on destruction (unbind

@@ -60,7 +60,7 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     MetadataServer& metadata_server_;
     DistributedStore* namespace_store_{};
     const TimeSource& time_;
-    // Guards no state: serialises mutations, repair and history checkpoints.
+    // Guards no state: serialises mutations, repair and history truncation.
     // Held across replica RPCs and metadata commits.
     IoMutex mutation_mutex_;
     // Guards no state: serialises the multi-head merge-and-publish branch of
@@ -170,18 +170,10 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
                                    std::span<const uint8_t> delta, FrameType);
     std::vector<std::pair<NodeInfo, MetadataAcceptance>> discover_accepted_heads(
         const std::vector<NodeInfo>&, FrameType);
-    // Full-roster discover_accepted_heads() for attempt_history_checkpoint():
-    // compaction must not proceed on a partial view. Returns nullopt if any
-    // participant is missing, errors, or does not recognise the request.
-    std::optional<std::vector<std::pair<NodeInfo, MetadataAcceptance>>>
-    discover_accepted_heads_required(const std::vector<NodeInfo>&, FrameType);
     bool replicate_accepted_head(const NodeInfo&, const MetadataRecord&,
                                  const MetadataAcceptance&, FrameType);
     // Offers a head this node already holds to the nodes present.
     void offer_accepted_head(const std::vector<NodeInfo>&, const MetadataRecord&, FrameType);
-    bool propose_history_floor_on(const NodeInfo&, const HistoryCheckpointProof&, FrameType);
-    bool commit_history_floor_on(const NodeInfo&, const Hash256& floor_hash, const Hash256& epoch,
-                                 FrameType);
 
     MetadataRecord mutate_impl(
         const std::function<void(MetadataSnapshot&, MetadataDelta*)>&, bool exact_delta,
@@ -273,12 +265,9 @@ class MetadataManager final : public MetadataView, public MetadataMaintenance {
     // Snapshot at the last causal stability horizon; for retention release only.
     std::optional<MetadataSnapshotView> retention_release_view() const;
     void repair_once();
-    // One propose/ack/commit round toward re-rooting local history. No-op
-    // unless size thresholds are met, there is one local accepted head, and
-    // every known participant is directly reachable. Thresholds are
-    // parameters so tests can force a round.
-    void attempt_history_checkpoint(size_t record_threshold = 256,
-                                    uint64_t byte_threshold = 64ULL * 1024 * 1024) override;
+    // Thresholds are parameters so tests can force it.
+    void truncate_history(size_t record_threshold = 256,
+                          uint64_t byte_threshold = 64ULL * 1024 * 1024) override;
     // Fetches each head flagged unreconstructable as a full body from a
     // reachable peer and re-anchors it locally. Returns heads repaired.
     size_t repair_unreconstructable_heads(FrameType frame_type = FrameType::control) override;
