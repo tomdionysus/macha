@@ -470,7 +470,6 @@ class FileSystem final : public PublicationTarget {
     Hash256 local_snapshot_hash_ MACHA_GUARDED_BY(local_snapshot_mutex_){};
     std::shared_ptr<const MetadataSnapshot> local_snapshot_cache_
         MACHA_GUARDED_BY(local_snapshot_mutex_);
-    MetadataSnapshot snap();
     void commit_write(WriteHandle&, const FsEntry&, uint64_t,
                       const std::vector<ExtentRef>&, FsEntry*,
                       std::optional<int64_t> mtime_override = {});
