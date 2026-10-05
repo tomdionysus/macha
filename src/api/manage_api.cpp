@@ -124,7 +124,19 @@ std::optional<std::pair<FsEntry, std::string>> current_hint_file(
     }
 }
 
-Json hint_json(FileSystem& fs, const CatalogueHint& hint) {
+// A current hint's file as the listing needs it: size and mtime. The media
+// index answers for a file kept under the hint's own path; any other spelling
+// takes the whole lookup.
+std::optional<FsEntry> current_hint_stat(FileSystem& fs, const CatalogueHint& hint) {
+    if (!hint.media_id.empty())
+        if (auto entry = fs.media_stat(hint.media_id, hint.path); entry && entry->size != 0)
+            return entry;
+    if (auto current = current_hint_file(fs, hint))
+        return std::move(current->first);
+    return {};
+}
+
+Json hint_json(const CatalogueHint& hint, const std::optional<FsEntry>& current) {
     Json::Object out;
     out["id"] = hint.id;
     out["path"] = hint.path;
@@ -133,9 +145,9 @@ Json hint_json(FileSystem& fs, const CatalogueHint& hint) {
     out["result"] = hint.result;
     out["attempts"] = static_cast<uint64_t>(hint.attempts);
     out["updated_unix_ms"] = hint.updated_unix_ms;
-    if (auto current = current_hint_file(fs, hint)) {
-        out["size"] = current->first.size;
-        out["mtime_ns"] = current->first.mtime_ns;
+    if (current) {
+        out["size"] = current->size;
+        out["mtime_ns"] = current->mtime_ns;
         out["current"] = true;
     } else {
         out["size"] = static_cast<uint64_t>(0);
@@ -143,6 +155,10 @@ Json hint_json(FileSystem& fs, const CatalogueHint& hint) {
         out["current"] = false;
     }
     return Json(std::move(out));
+}
+
+Json hint_json(FileSystem& fs, const CatalogueHint& hint) {
+    return hint_json(hint, current_hint_stat(fs, hint));
 }
 
 Json probe_json(const MediaProbeCandidate& candidate) {
@@ -752,8 +768,9 @@ HttpResponse ManageApi::dispatch(const HttpRequest& request) {
             Json::Array items;
             for (const auto& hint : hints_.list()) {
                 if (hint.state != CatalogueHintState::no_match || hint.media_id.empty()) continue;
-                if (!current_hint_file(fs_, hint)) continue;
-                items.push_back(hint_json(fs_, hint));
+                const auto current = current_hint_stat(fs_, hint);
+                if (!current) continue;
+                items.push_back(hint_json(hint, current));
             }
             // A file bound to more than one playable item, except the one
             // legitimate case: a multi-episode file, bound to several episodes

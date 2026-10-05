@@ -1707,6 +1707,8 @@ MACHA_TEST("filesystem_fuse", test_fuse_publication_scheduling) {
         CHECK(admission.should_yield(t0 + 1s));
         admission.finished(t0 + 1s);
         CHECK(!admission.can_start(t0 + 2s));
+        // A namespace batch is a bounded local commit: never held for a viewer.
+        CHECK(admission.namespace_can_start(t0 + 2s));
         const auto retry = admission.retry_after(t0 + 2s);
         REQUIRE(retry.has_value());
         CHECK(*retry > 0ms);

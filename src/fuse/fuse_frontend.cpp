@@ -899,12 +899,16 @@ struct FuseFrontend::State {
         fuse_namespace_origin = derive_fuse_namespace_origin(fs.node_id());
         if (!admission)
             throw std::invalid_argument("FUSE frontend requires a loader admission");
-        // A data loop may be sleeping with no timed wake.
+        // A data or namespace loop may be sleeping with no timed wake.
         admission->set_wake_callback([this] {
             {
                 Lock lock(data_queue_mutex);
             }
             data_cv.notify_all();
+            {
+                Lock lock(namespace_queue_mutex);
+            }
+            namespace_cv.notify_all();
         });
     }
 
@@ -3134,9 +3138,6 @@ struct FuseFrontend::State {
                     continue;
                 }
                 try {
-                    // Loader-class work, bounded and off the viewer/control
-                    // lanes; viewer activity never halts it.
-                    //
                     // A crash may leave an effect without its local marker: an
                     // identity batch asks the snapshot clock, a singleton
                     // checks the effect.
@@ -3162,22 +3163,16 @@ struct FuseFrontend::State {
                         const bool atomic = identity_batch && remaining.size() > 1;
                         FilesystemNamespaceBatchResult result;
                         try {
-                            wait_for_loader_admission(stop);
-                            try {
-                                if (atomic) {
-                                    if (!batch_journaled) {
-                                        journal_namespace_batch(identity.sequence, batch.size());
-                                        batch_journaled = true;
-                                    }
-                                    result = apply_namespace_backend(remaining, identity, true);
-                                } else {
-                                    result = apply_namespace_backend(remaining);
+                            wait_for_namespace_admission(stop);
+                            if (atomic) {
+                                if (!batch_journaled) {
+                                    journal_namespace_batch(identity.sequence, batch.size());
+                                    batch_journaled = true;
                                 }
-                            } catch (...) {
-                                finish_loader_admission();
-                                throw;
+                                result = apply_namespace_backend(remaining, identity, true);
+                            } else {
+                                result = apply_namespace_backend(remaining);
                             }
-                            finish_loader_admission();
                         } catch (const FsError& error) {
                             if (atomic && !retryable_backend_error(error)) {
                                 // An op was refused and nothing committed:
@@ -3401,6 +3396,16 @@ struct FuseFrontend::State {
             else
                 data_cv.wait(lock.native(), stop, admitted_or_stopping);
         }
+    }
+
+    void wait_for_namespace_admission(std::stop_token stop) {
+        Lock lock(namespace_queue_mutex);
+        namespace_cv.wait(lock.native(), stop, [&]() MACHA_REQUIRES(namespace_queue_mutex) {
+            return stopping.load(std::memory_order_relaxed) ||
+                   admission->namespace_can_start(Clock::now());
+        });
+        if (stop.stop_requested() || stopping.load(std::memory_order_relaxed))
+            throw FsError(EINTR, "FUSE publication stopping");
     }
 
     void finish_loader_admission() {

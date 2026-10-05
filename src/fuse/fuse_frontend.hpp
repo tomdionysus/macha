@@ -226,6 +226,11 @@ class LoaderAdmission {
     static constexpr ThreadSafety finished_safety = ThreadSafety::thread_safe;
     virtual void finished(TimePoint now) = 0;
 
+    // Whether a namespace batch may publish now. A wake follows a change.
+    static constexpr Waits namespace_can_start_waits = Waits::none;
+    static constexpr ThreadSafety namespace_can_start_safety = ThreadSafety::thread_safe;
+    virtual bool namespace_can_start(TimePoint now) = 0;
+
     // How long until can_start() may change with time alone: zero when it
     // may already, nullopt when only a wake can change it.
     static constexpr Waits retry_after_waits = Waits::none;
@@ -242,7 +247,9 @@ class LoaderAdmission {
 // Production admission: a viewer is active while the foreground clock, which
 // only HTTP playback advances, has moved within `publication_quiet`; loader
 // work then runs at its weighted share (WeightedLoaderService). Admission
-// changes only with time, so it never wakes.
+// changes only with time, so it never wakes. A namespace batch is one bounded
+// local commit, as any other caller's is, and is always admitted: the share
+// is of the bytes.
 class ViewerWeightedAdmission final : public LoaderAdmission {
     FileSystem& fs_;
     const std::chrono::milliseconds quiet_;
@@ -254,6 +261,7 @@ class ViewerWeightedAdmission final : public LoaderAdmission {
     ViewerWeightedAdmission(FileSystem&, const FuseConfig&);
 
     bool can_start(TimePoint now) override;
+    bool namespace_can_start(TimePoint) override { return true; }
     void started(TimePoint now, bool begin_service) override;
     void service_started(TimePoint now) override;
     bool should_yield(TimePoint now) override;

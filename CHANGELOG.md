@@ -1,5 +1,19 @@
 # Current release
 
+## 0.90.13 — the mount commits without waiting for a viewer (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**The mount's namespace commits are not held for a viewer.** A create,
+mkdir, rename or unlink through the mount waited, behind a file being played,
+for the loader's share of the node before its commit: about three seconds
+after the last playback request before the API saw it. A namespace batch is
+one bounded local commit, as an API caller's is, and publishes at once; the
+viewer's share paces the bytes.
+
+**The unmatched list checks each file once**, through the media index and a
+stat-only read, where it read every file's whole extent list twice.
+
 ## 0.90.12 — the survey, the path table and discovery follow the change (experiment)
 
 No wire, protocol, API or on-disk changes.
