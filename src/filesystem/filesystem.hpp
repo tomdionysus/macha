@@ -508,6 +508,10 @@ class FileSystem final : public PublicationTarget {
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
     // The media id of every file in this node's own head, in order.
     std::vector<std::string> media_ids();
+    // Every file of this node's own head that has content, as (path, media
+    // id) in path order, and the head they are of. From the index: no
+    // namespace walk once it is built.
+    std::vector<std::pair<std::string, std::string>> media_files(MetadataSnapshotView& of);
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
                                             WriteDurability = WriteDurability::immediate,
                                             uint64_t publication_pipeline_bytes = 0,

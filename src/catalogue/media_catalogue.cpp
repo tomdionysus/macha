@@ -2736,39 +2736,20 @@ size_t CatalogueScanner::request_media_rescan(const std::vector<std::string>& me
     std::vector<CatalogueHintSubmission> submissions;
 
     // Enqueue only the paths of the unbound media ids, never a full rescan.
-    std::optional<MetadataSnapshotView> available = fs_.available_snapshot_view();
-    std::optional<MetadataSnapshot> local;
-    const MetadataSnapshot* snapshot = nullptr;
-    if (available) {
-        snapshot = available->snapshot.get();
-    } else {
-        // Local metadata only, best effort: the safety scan corrects a stale replica.
-        try {
-            local = fs_.local_snapshot();
-            snapshot = &*local;
-        } catch (...) {
-            return 0;
-        }
-    }
-
-    auto rescan_nodes = fs_.namespace_nodes();
+    MetadataSnapshotView view;
+    const auto media_files = fs_.media_files(view);
     {
         Lock lock(config_mutex_);
-        for_each_namespace_entry(*snapshot, &rescan_nodes,
-                                 [&](const std::string& path, const FsEntry& entry)
-                                     MACHA_REQUIRES(config_mutex_) {
-            if (entry.type != EntryType::file)
-                return;
-            const auto media_id = file_media_id(entry);
+        for (const auto& [path, media_id] : media_files) {
             if (!wanted.contains(media_id))
-                return;
+                continue;
             std::string root;
             auto* provider = provider_for_path(path, root);
             if (!provider || !provider->accepts_path(path))
-                return;
+                continue;
             submissions.push_back({path, "manual", media_id,
                                    CatalogueHintPriority::manual_rescan});
-        });
+        }
     }
 
     const auto queued = hints_.submit_many(std::move(submissions)).size();
@@ -2947,30 +2928,66 @@ bool CatalogueScanner::stage_remote_artwork(
     ProviderMatch& match, const std::function<bool(std::string_view)>& locked,
     std::stop_token stop, size_t max_artwork_bytes,
     DistributedStore::DurabilityBatch& artwork_batch) {
+    struct Fetch {
+        const RemoteArtwork* art{};
+        CatalogueItem* target{};
+        std::optional<RemoteHttpResponse> response;
+        std::string error;
+    };
+    std::vector<Fetch> fetches;
     std::set<std::tuple<std::string, std::string, std::string>> fetched_remote_artwork;
     for (const auto& art : match.artwork) {
-        if (stop.stop_requested()) return false;
         if (!fetched_remote_artwork.emplace(art.item_id, art.role, art.url).second) continue;
         auto target = std::find_if(match.items.begin(), match.items.end(), [&](const auto& item) {
             return item.id == art.item_id;
         });
         if (target == match.items.end()) continue;
         if (locked(art.item_id)) continue;
+        fetches.push_back({&art, &*target, {}, {}});
+    }
+
+    // The images come down side by side; each is staged in the order asked.
+    constexpr size_t side_by_side = 4;
+    std::atomic_size_t next{};
+    const auto fetch = [&] {
+        for (auto i = next.fetch_add(1); i < fetches.size(); i = next.fetch_add(1)) {
+            if (stop.stop_requested()) return;
+            try {
+                fetches[i].response = http_->get(fetches[i].art->url, {}, max_artwork_bytes);
+            } catch (const std::exception& e) {
+                fetches[i].error = e.what();
+            }
+        }
+    };
+    {
+        std::vector<std::jthread> others;
+        for (size_t i = 1; i < std::min(side_by_side, fetches.size()); ++i)
+            others.emplace_back(fetch);
+        fetch();
+    }
+    if (stop.stop_requested()) return false;
+
+    for (auto& fetched : fetches) {
+        const auto& art = *fetched.art;
+        if (!fetched.response) {
+            Log::warn("catalogue artwork failed for " + art.item_id + ": " + fetched.error);
+            continue;
+        }
+        auto& response = *fetched.response;
+        if (response.status != 200 || response.body.empty()) continue;
+        auto mime = response.content_type;
+        if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
+        if (!mime.starts_with("image/")) continue;
         try {
-            auto response = http_->get(art.url, {}, max_artwork_bytes);
-            if (response.status != 200 || response.body.empty()) continue;
-            auto mime = response.content_type;
-            if (auto semi = mime.find(';'); semi != std::string::npos) mime.resize(semi);
-            if (!mime.starts_with("image/")) continue;
             auto staged = catalogue_.stage_artwork_deferred(
                 art.role, mime, response.body, artwork_batch);
-            const bool duplicate = std::any_of(
-                target->artwork.begin(), target->artwork.end(), [&](const auto& current) {
+            auto& artwork = fetched.target->artwork;
+            const bool duplicate =
+                std::any_of(artwork.begin(), artwork.end(), [&](const auto& current) {
                     return current.role == staged.role && current.id == staged.id;
                 });
-            if (!duplicate) target->artwork.push_back(std::move(staged));
+            if (!duplicate) artwork.push_back(std::move(staged));
         } catch (const std::exception& e) {
-            if (stop.stop_requested()) return false;
             Log::warn("catalogue artwork failed for " + art.item_id + ": " + e.what());
         }
     }
@@ -3767,11 +3784,13 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
 
     struct ProviderFile {
         CatalogueScanProvider* provider{};
-        std::string root;
-        std::string path;
-        FsEntry entry;
+        const std::string* path{};
+        const std::string* media_id{};
     };
-    const auto namespace_view = fs_.local_snapshot_view();
+    // Discovery reads the filesystem's media index, which follows each
+    // commit: one head, and no walk of the namespace.
+    MetadataSnapshotView namespace_view;
+    const auto media_files = fs_.media_files(namespace_view);
     const auto& namespace_snapshot = *namespace_view.snapshot;
     std::vector<ProviderFile> files;
     size_t roots_scanned = 0;
@@ -3780,13 +3799,20 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
         for (const auto& root : provider->roots()) {
             try {
                 auto scan_nodes = fs_.namespace_nodes();
-                auto root_files =
-                    catalogue_snapshot_files(root, namespace_snapshot, &scan_nodes, stop);
+                const auto normalized = normalize_path(root);
+                const auto root_entry =
+                    namespace_entry(namespace_snapshot, &scan_nodes, normalized, false);
+                if (!root_entry)
+                    throw FsError(ENOENT, "missing");
+                if (root_entry->type != EntryType::directory)
+                    throw FsError(ENOTDIR, "catalogue root is not a directory");
                 if (stop.stop_requested()) return 0;
                 ++roots_scanned;
-                for (auto& [path, entry] : root_files)
-                    files.push_back({provider, normalize_path(root),
-                                     std::move(path), std::move(entry)});
+                const auto prefix = normalized == "/" ? normalized : normalized + "/";
+                for (auto at = std::lower_bound(media_files.begin(), media_files.end(),
+                                                std::pair{prefix, std::string{}});
+                     at != media_files.end() && at->first.starts_with(prefix); ++at)
+                    files.push_back({provider, &at->first, &at->second});
             } catch (const FsError& e) {
                 if (e.code() != ENOENT) throw;
                 ++roots_unavailable;
@@ -3815,20 +3841,18 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
         : std::string{};
     for (const auto& file : files) {
         if (stop.stop_requested()) return 0;
-        if (!file.provider->accepts_path(file.path)) continue;
         // Zero-length files have no media id yet (often shells awaiting FUSE
-        // data); never put the shared empty-file hash in active_media_ids.
-        if (file.entry.size == 0) continue;
+        // data) and are not among the media files.
+        if (!file.provider->accepts_path(*file.path)) continue;
 
-        // Discovery takes the media id from FsEntry and never opens the file;
-        // probing is the hint consumer's.
-        const auto media_id = file_media_id(file.entry);
+        // Discovery never opens the file; probing is the hint consumer's.
+        const auto& media_id = *file.media_id;
         active_media_ids.insert(media_id);
 
         // Bound ids are skipped; changed bytes give a new id. Manual rescans
         // queue bound objects too.
         if (!bound.contains(media_id) || force)
-            submissions.push_back({file.path, std::string(hint_source),
+            submissions.push_back({*file.path, std::string(hint_source),
                                    unique_source_ref ? scan_ref : media_id,
                                    hint_priority});
     }
@@ -3844,12 +3868,9 @@ size_t CatalogueScanner::scan_once(std::stop_token stop, bool force,
                 if (media.starts_with("macha:") && !active_media_ids.contains(media))
                     vanished_media.insert(media);
         }
-        if (!vanished_media.empty()) {
-            auto nodes = fs_.namespace_nodes();
-            for (const auto& [path, entry] : catalogue_snapshot_files("/", namespace_snapshot, &nodes, stop))
-                if (entry.size) vanished_media.erase(file_media_id(entry));
-            if (stop.stop_requested()) return 0;
-        }
+        if (!vanished_media.empty())
+            for (const auto& [_, media_id] : media_files)
+                vanished_media.erase(media_id);
     }
 
     const auto ids = hints_.submit_many(std::move(submissions));
