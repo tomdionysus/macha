@@ -1327,10 +1327,22 @@ void collect_changed(const ObjectId& after, const std::optional<ObjectId>& befor
     out.push_back(after);
     const auto shape = read_shape(after, store);
     if (shape.leaf) {
-        // A changed leaf contributes all its extent spines; per-path
-        // comparison would tighten this but not make it safer.
+        // A changed leaf contributes the extent spines its counterpart did
+        // not already name: those are what the change introduced. With no
+        // readable counterpart leaf, all of them.
+        std::set<ObjectId> named;
+        if (before) {
+            try {
+                const auto old = read_shape(*before, store);
+                if (old.leaf)
+                    for (const auto& [_, extent_root] : old.entries)
+                        if (extent_root)
+                            named.insert(*extent_root);
+            } catch (const std::exception&) {
+            }
+        }
         for (const auto& [_, extent_root] : shape.entries)
-            if (extent_root)
+            if (extent_root && !named.contains(*extent_root))
                 collect_extent_spine(*extent_root, store, out);
         return;
     }

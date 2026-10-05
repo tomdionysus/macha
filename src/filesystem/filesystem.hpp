@@ -359,6 +359,24 @@ class FileSystem final : public PublicationTarget {
     // fix-up's logging.
     IoMutex open_writes_mutex_;
     std::vector<std::weak_ptr<WriteHandle>> open_writes_ MACHA_GUARDED_BY(open_writes_mutex_);
+    // Group commit of namespace batches. A batch that arrives while a commit
+    // is in flight waits in the queue; whoever commits next takes every
+    // waiting batch into its one metadata commit. A batch whose operations
+    // fail is undone within that commit and fails alone.
+    struct QueuedNamespaceBatch {
+        std::span<const FilesystemNamespaceMutation> operations;
+        bool atomic{};
+        FilesystemNamespaceBatchResult result;
+        std::exception_ptr error;
+        bool done{};
+    };
+    Mutex namespace_batch_queue_mutex_;
+    std::vector<QueuedNamespaceBatch*> namespace_batch_queue_
+        MACHA_GUARDED_BY(namespace_batch_queue_mutex_);
+    // Held across the metadata commit by the thread committing the queue.
+    IoMutex namespace_batch_commit_mutex_;
+    void apply_namespace_batch_to(QueuedNamespaceBatch&, NamespaceWorkingSet&, MetadataSnapshot&,
+                                  MetadataDelta&);
     // Cooperative cancellation of mount I/O at shutdown; extent transfers carry
     // it into DistributedStore.
     std::atomic_bool io_cancelled_{};

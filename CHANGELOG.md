@@ -1,5 +1,31 @@
 # Current release
 
+## 0.89.1 — bulk namespace changes share commits; claims stop asking about what is not there (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**Namespace operations that arrive together are committed together.** Each
+unlink, rename, mkdir or attribute change was its own metadata commit, and
+commits run one at a time, each waiting on the other node: 34 deletes sent
+at once answered after 12 to 76 seconds. Operations that arrive while a
+commit is in flight now wait in a queue, and whoever commits next takes
+every waiting operation into one commit. One that cannot apply (a path that
+is not there) is undone within that commit and fails alone. Batches with a
+mutation identity (the mount's journalled operations) are unchanged.
+
+**A commit no longer asks about objects no node present holds.** The claim
+step before a commit scans once for who holds each object. For an object
+the scan found on no node, it then tried to fetch it and asked each node
+again, one object at a time: two round trips per object. A change to files
+whose 212 extents live only on a node that is away took 51 seconds. Such an
+object is now reported unheld after the scan and nothing more is asked.
+
+**A commit claims the extent lists it wrote, not its neighbours'.** When a
+namespace tree leaf changed, the commit claimed the extent list of every
+file in that leaf, changed or not: about 280 objects for a one-file delete
+in a large directory. It now claims only the lists the leaf's counterpart
+did not already name.
+
 ## 0.89.0 — two heads merge from what they hold (experiment)
 
 A reconciliation no longer needs the common ancestor of the heads it joins,

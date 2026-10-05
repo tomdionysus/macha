@@ -247,6 +247,79 @@ MACHA_TEST("namespace_migration", test_every_write_records_where_it_came_from) {
     service.stop();
 }
 
+// Namespace operations that arrive while a commit is in flight are committed
+// together by the next one, on a map-held and on a tree-held namespace. One
+// that cannot apply fails alone and leaves the rest of its commit intact.
+MACHA_TEST("namespace_migration", test_operations_waiting_on_a_commit_share_the_next_one) {
+    TestCluster cluster;
+    auto config = cluster.node_config("group-commit");
+    make_solo(config);
+    NodeId node_id{};
+    const auto check_group = [&](Service& service, const std::string& root) {
+        auto& fs = service.filesystem();
+        fs.mkdir(root, 0755, getuid(), getgid());
+        constexpr int writers = 24;
+        for (int i = 0; i < writers; ++i)
+            fs.create_file(root + "/f" + std::to_string(i), 0644, getuid(), getgid());
+        const auto before = service.metadata_manager().snapshot_view().generation;
+
+        // A mutation that changes nothing holds the commit path while every
+        // unlink arrives; one unlink names a file that is not there.
+        TestGate held;
+        std::thread holder([&] {
+            (void)service.metadata_manager().mutate_delta(
+                [&](MetadataSnapshot&, MetadataDelta&) { held.enter_and_wait(); });
+        });
+        REQUIRE(held.wait_for_entries(1, 10s));
+        std::atomic_int started{0}, succeeded{0}, missing{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i <= writers; ++i)
+            threads.emplace_back([&, i] {
+                const auto path = i == writers ? root + "/not-there" : root + "/f" + std::to_string(i);
+                FilesystemNamespaceMutation op;
+                op.kind = FilesystemNamespaceMutation::Kind::unlink;
+                op.from = path;
+                ++started;
+                try {
+                    (void)fs.apply_namespace_batch({&op, 1});
+                    ++succeeded;
+                } catch (const FsError& error) {
+                    if (error.code() == ENOENT)
+                        ++missing;
+                }
+            });
+        REQUIRE(wait_until([&] { return started.load() == writers + 1; }, 10s));
+        std::this_thread::sleep_for(50ms); // every thread is now queued or blocked
+        held.open();
+        holder.join();
+        for (auto& thread : threads)
+            thread.join();
+
+        CHECK(succeeded.load() == writers);
+        CHECK(missing.load() == 1);
+        CHECK(fs.readdir(root).empty());
+        // The first to arrive committed alone; the rest shared one commit.
+        const auto after = service.metadata_manager().snapshot_view().generation;
+        CHECK(after - before <= 3);
+        CHECK(after - before >= 1);
+    };
+    {
+        Service service(config, cluster.keys(), test_durability_window);
+        service.start();
+        node_id = service.node().node_id();
+        REQUIRE(wait_metadata_writable(service));
+        check_group(service, "/map");
+        service.stop();
+    }
+    (void)migrate_state(config, cluster.keys(), {node_id});
+    Service service(config, cluster.keys(), test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    REQUIRE(service.metadata_manager().snapshot().namespace_root.has_value());
+    check_group(service, "/tree");
+    service.stop();
+}
+
 MACHA_TEST("namespace_migration", test_a_migrated_node_serves_and_writes_its_library) {
     // End to end on one node: write a library, stop, re-root onto the tree,
     // restart. Every read must match and the filesystem must stay writable.

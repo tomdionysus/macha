@@ -490,6 +490,47 @@ MACHA_FAST_TEST("rpc_cluster", test_store_put_replaces_a_replica_that_cannot_be_
     CHECK(bench.node.calls_of(MessageType::put_object, standby) == 1);
 }
 
+// Claiming objects that no node present holds costs the one batched presence
+// scan and nothing per object: they are reported unheld. An object the peer
+// does hold is claimed there.
+MACHA_FAST_TEST("rpc_cluster", test_store_claims_ask_nothing_more_about_objects_nobody_holds) {
+    StoreBench bench([](Config& c) { c.replication = 2; });
+    const auto held_bytes = pattern(256, 201);
+    const auto held = object_id(held_bytes);
+    std::mutex mutex;
+    std::map<MessageType, size_t> calls;
+    bench.node.add_peer(StoreBench::peer(), [&](MessageType type, const Bytes& request,
+                                                FrameType) {
+        {
+            std::lock_guard lock(mutex);
+            ++calls[type];
+        }
+        if (type == MessageType::have_objects) {
+            // Holds exactly `held`.
+            Reader reader(request);
+            const auto count = reader.u32();
+            Writer writer;
+            writer.u32(count);
+            for (uint32_t i = 0; i < count; ++i)
+                writer.u8(ObjectId{reader.fixed<32>()} == held ? 1 : 0);
+            return RpcMessage{MessageType::have_objects_reply, writer.take()};
+        }
+        return RpcMessage{MessageType::ok, {}};
+    });
+    auto store = bench.store();
+    std::vector<ObjectId> ids{held};
+    for (uint8_t i = 0; i < 40; ++i)
+        ids.push_back(object_id(pattern(128, i)));
+    const auto unheld = store->retain_data(ids, RetentionDot{bench.node.node_id(), 1});
+    CHECK(unheld.size() == 40);
+    CHECK(!std::binary_search(unheld.begin(), unheld.end(), held));
+    std::lock_guard lock(mutex);
+    CHECK(calls[MessageType::have_objects] == 1);
+    CHECK(calls[MessageType::get_object] == 0);
+    CHECK(calls[MessageType::have_object] == 0);
+    CHECK(calls[MessageType::retain_objects] == 1);
+}
+
 // A put whose second replica never answers returns on the local copy once
 // the peer has stalled, well inside the work's no-progress budget, and the
 // same put reaches the peer once it answers.
