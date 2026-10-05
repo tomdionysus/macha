@@ -79,6 +79,12 @@ class MetadataView {
     static constexpr Waits current_waits = Waits::none;
     virtual std::optional<MetadataSnapshotView> current() const = 0;
 
+    // This node's own head: every commit it has made or accepted, with no
+    // peer asked. With several heads, the one carrying this node's latest
+    // mutation. Reads the state device once after the head set moves.
+    static constexpr Waits local_waits = Waits::state_device | Waits::locks;
+    virtual MetadataSnapshotView local() = 0;
+
     // The snapshot at the newest generation known: the cache when current,
     // else read from the replicas. With a work context, the wait guard
     // refuses work that may not wait on the network.

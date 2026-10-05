@@ -1067,6 +1067,7 @@ struct SurveyCountingView final : MetadataView {
     MetadataSnapshotView view;
     std::atomic_uint surveys{};
     std::optional<MetadataSnapshotView> current() const override { return view; }
+    MetadataSnapshotView local() override { return view; }
     MetadataSnapshotView converged() override {
         ++surveys;
         return view;
@@ -2754,8 +2755,18 @@ MACHA_TEST("rpc_cluster", test_two_node_mutual_bootstrap_metadata_write_floor) {
     if (second_error)
         std::rethrow_exception(second_error);
 
-    CHECK(s1.filesystem().getattr("/from-node-2").type == EntryType::directory);
-    CHECK(s2.filesystem().getattr("/from-node-1").type == EntryType::directory);
+    // Each node answered from its own commit; the two then merge.
+    const auto sees = [](Service& service, const std::string& path) {
+        return wait_until([&] {
+            try {
+                return service.filesystem().getattr(path).type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }, 20s);
+    };
+    CHECK(sees(s1, "/from-node-2"));
+    CHECK(sees(s2, "/from-node-1"));
 
     s1.filesystem().mkdir("/media", 0755, getuid(), getgid());
     s1.filesystem().create_file("/media/two-replicas.bin", 0644, getuid(), getgid());
@@ -3602,8 +3613,10 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away
         return s1.local_state().data().valid(extent) && s2.local_state().data().valid(extent) &&
                s3->local_state().data().valid(extent);
     }));
-    // The accepted file reference has already installed a DATA claim.
+    // The accepted file reference installed a DATA claim here at once, and
+    // on the holders present once the commit reached them.
     CHECK(s1.local_state().retention().retained(RetentionClass::data, extent));
+    REQUIRE(s1.metadata_manager().wait_replicated(20s));
     CHECK(s2.local_state().retention().retained(RetentionClass::data, extent));
     CHECK(s3->local_state().retention().retained(RetentionClass::data, extent));
 
@@ -3627,6 +3640,7 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_file_touch_commits_while_a_holder_is_away
     };
     const auto touched = dot(s1);
     CHECK(touched > 0);
+    REQUIRE(s1.metadata_manager().wait_replicated(20s));
     CHECK(dot(s2) == touched);
 
     // The returning holder learns the change from the head.
@@ -4144,7 +4158,13 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         auto snapshot = m1.snapshot();
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 2);
-        CHECK(s2.filesystem().getattr("/after-grow").type == EntryType::directory);
+        CHECK(wait_until([&] {
+            try {
+                return s2.filesystem().getattr("/after-grow").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }, 20s));
 
         DistributedStore r1(s1.node(), s1.local_state(), s1.resources().activity, s1.resources().data, s1.resources().memory, s1.resources().events);
         DistributedStore r2(s2.node(), s2.local_state(), s2.resources().activity, s2.resources().data, s2.resources().memory, s2.resources().events);
@@ -4177,7 +4197,13 @@ MACHA_TEST("rpc_cluster", test_replication_policy_change_on_restart) {
         CHECK(snapshot.metadata_voters.empty());
         CHECK(snapshot.data_replication == 1);
         CHECK(snapshot.metadata_write_replicas_required == 1);
-        CHECK(s1.filesystem().getattr("/after-shrink").type == EntryType::directory);
+        CHECK(wait_until([&] {
+            try {
+                return s1.filesystem().getattr("/after-shrink").type == EntryType::directory;
+            } catch (...) {
+                return false;
+            }
+        }, 20s));
 
         auto reader = s2.filesystem().open_read("/policy.bin");
         Bytes output(input.size());
@@ -4400,6 +4426,22 @@ bool is_directory(Service& node, const std::string& path) {
     }
 }
 
+// A commit is answered by the node that made it; the others have it once it
+// reaches them.
+bool becomes_directory(Service& node, const std::string& path) {
+    return wait_until([&] { return is_directory(node, path); }, 20s);
+}
+
+bool file_arrives(Service& node, const std::string& path, uint64_t size) {
+    return wait_until([&] {
+        try {
+            return node.filesystem().getattr(path).size == size;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }, 20s);
+}
+
 Bytes read_whole(Service& node, const std::string& path, size_t size) {
     Bytes out(size);
     auto reader = node.filesystem().open_read(path);
@@ -4412,11 +4454,10 @@ Bytes read_whole(Service& node, const std::string& path, size_t size) {
     return out;
 }
 
-// Any node may found a virgin namespace (here the highest NodeId), and its
-// root is on every replica when the founding call returns. A node whose view
-// is warm sees another node's later commit as soon as it commits. A file
-// written through one node reads back whole through a second and at an
-// arbitrary offset through a third, as soon as the write commits.
+// Any node may found a virgin namespace (here the highest NodeId). The node
+// that commits sees its commit when the call returns; every other node has
+// it once it reaches them. A file written through one node reads back whole
+// through a second and at an arbitrary offset through a third.
 MACHA_HEAVY_TEST("rpc_cluster", test_a_durable_trio_founds_commits_and_reads_through_every_node) {
     DurableTrio trio;
     size_t founder = 0;
@@ -4424,16 +4465,20 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_durable_trio_founds_commits_and_reads_thr
         if (trio[i].node().node_id() > trio[founder].node().node_id())
             founder = i;
     trio[founder].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    CHECK(is_directory(trio[founder], "/media"));
     for (size_t i = 0; i < 3; ++i)
-        CHECK(is_directory(trio[i], "/media")); // and warms every view
+        REQUIRE(becomes_directory(trio[i], "/media"));
 
     const auto writer = (founder + 1) % 3;
     trio[writer].filesystem().mkdir("/media/new", 0755, getuid(), getgid());
+    CHECK(is_directory(trio[writer], "/media/new"));
     for (size_t i = 0; i < 3; ++i)
-        CHECK(is_directory(trio[i], "/media/new"));
+        REQUIRE(becomes_directory(trio[i], "/media/new"));
 
     const auto input = pattern(3 * 1024 * 1024 + 12345);
     (void)trio.write(0, "/media/movie.mkv", input);
+    REQUIRE(file_arrives(trio[1], "/media/movie.mkv", input.size()));
+    REQUIRE(file_arrives(trio[2], "/media/movie.mkv", input.size()));
     CHECK(read_whole(trio[1], "/media/movie.mkv", input.size()) == input);
     Bytes slice(333333);
     auto reader = trio[2].filesystem().open_read("/media/movie.mkv");
@@ -4441,15 +4486,16 @@ MACHA_HEAVY_TEST("rpc_cluster", test_a_durable_trio_founds_commits_and_reads_thr
     CHECK(std::equal(slice.begin(), slice.end(), input.begin() + 987654));
 }
 
-// Three nodes seeking two copies: losing one leaves the other two
-// committing, with the change on both when the call returns; a lone survivor
-// goes on committing.
+// Three nodes: losing one leaves the other two committing, each change
+// reaching the other; a lone survivor goes on committing.
 MACHA_HEAVY_TEST("rpc_cluster", test_metadata_commits_with_whichever_nodes_remain) {
     DurableTrio trio(2, 1);
     trio[0].filesystem().mkdir("/media", 0755, getuid(), getgid());
+    REQUIRE(becomes_directory(trio[1], "/media"));
     trio.stop(2);
     trio[1].filesystem().mkdir("/after-one-loss", 0755, getuid(), getgid());
-    CHECK(is_directory(trio[0], "/after-one-loss"));
+    CHECK(is_directory(trio[1], "/after-one-loss"));
+    CHECK(becomes_directory(trio[0], "/after-one-loss"));
     trio.stop(1);
     trio[0].filesystem().mkdir("/alone", 0755, getuid(), getgid());
     CHECK(is_directory(trio[0], "/alone"));
@@ -4979,10 +5025,13 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answ
     const auto peer = s2.node().node_id();
     links->stall(peer, MessageType::retain_objects);
     (void)s1.catalogue().upsert(item);
-    CHECK(links->stalled_calls() >= 1);
+    // The commit is claimed here before the caller is answered; the peer's
+    // claim is the replicator's, and it gives up on a peer that never answers.
     const auto alone = s1.metadata_manager().snapshot().catalogue_root;
     REQUIRE(alone.has_value());
     CHECK(s1.local_state().retention().retained(RetentionClass::control, *alone));
+    REQUIRE(s1.metadata_manager().wait_replicated(30s));
+    CHECK(links->stalled_calls() >= 1);
     CHECK(!s2.local_state().retention().retained(RetentionClass::control, *alone));
 
     links->release(peer);
@@ -4992,15 +5041,17 @@ MACHA_TEST("rpc_cluster", test_a_commit_is_claimed_here_when_the_peer_never_answ
     REQUIRE(root.has_value());
     CHECK(*root != *alone);
     CHECK(s1.local_state().retention().retained(RetentionClass::control, *root));
+    REQUIRE(s1.metadata_manager().wait_replicated(30s));
     CHECK(s2.local_state().retention().retained(RetentionClass::control, *root));
 
     s2.stop();
     s1.stop();
 }
 
-// A peer that stops answering commit calls costs one commit the stall time
-// and the next ones nothing: it is not asked again until it has had time to
-// be dropped or to recover, and then repair brings it up to date.
+// A peer that stops answering commit calls costs a caller nothing: the commit
+// is answered from this node. The replicator waits for the peer once, for the
+// stall time, and does not ask it again until it has had time to be dropped
+// or to recover; then repair brings it up to date.
 MACHA_TEST("rpc_cluster", test_a_peer_that_stalls_on_a_commit_is_not_waited_for_again) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
@@ -5039,21 +5090,17 @@ MACHA_TEST("rpc_cluster", test_a_peer_that_stalls_on_a_commit_is_not_waited_for_
     REQUIRE(sees(s2, "/established"));
 
     const auto peer = s2.node().node_id();
-    links->stall(peer, MessageType::put_metadata_commit);
-    const auto timed = [&](const std::string& path) {
-        const auto started = Clock::now();
-        s1.filesystem().mkdir(path, 0755, getuid(), getgid());
-        return Clock::now() - started;
-    };
-    const auto first = timed("/while-stalled");
-    CHECK(first >= 150ms);
-    CHECK(first < scaled(5s));
+    links->stall(peer, MessageType::accept_metadata_commit);
+    s1.filesystem().mkdir("/while-stalled", 0755, getuid(), getgid());
+    // Answered while the peer's call has not returned.
+    CHECK(s1.filesystem().getattr("/while-stalled").type == EntryType::directory);
+    REQUIRE(s1.metadata_manager().wait_replicated(scaled(5s)));
     const auto asked = links->stalled_calls();
     CHECK(asked >= 1);
-    const auto second = timed("/not-asked");
-    CHECK(second < first);
-    CHECK(links->stalled_calls() == asked);
+    s1.filesystem().mkdir("/not-asked", 0755, getuid(), getgid());
     CHECK(s1.filesystem().getattr("/not-asked").type == EntryType::directory);
+    REQUIRE(s1.metadata_manager().wait_replicated(scaled(5s)));
+    CHECK(links->stalled_calls() == asked);
 
     links->release(peer);
     CHECK(sees(s2, "/while-stalled"));

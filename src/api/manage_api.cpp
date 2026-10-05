@@ -587,10 +587,9 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
 }
 
 HttpResponse ManageApi::handle(const HttpRequest& request) {
-    // Management writes are serialised; with media-id verification below, two
-    // stale UI sessions cannot both resolve or delete the same exception.
-    std::optional<Lock> mutation_lock;
-    if (request.method != "GET") mutation_lock.emplace(mutation_mutex_);
+    // Management writes run concurrently and share commits. Each verifies the
+    // media id it was given, so two stale UI sessions cannot both resolve or
+    // delete the same exception.
     try {
         if (request.method == "GET" && request.path == "/api/v1/manage") {
             Json::Object resources;

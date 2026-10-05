@@ -251,16 +251,16 @@ void encode_leaf_entry(Writer& writer, const std::string& path, const FsEntry& e
     writer.fixed(build_extent_sequence(entry.extents, store, limits).bytes);
 }
 
-// Reads one leaf record. External extents are fetched for every entry when
-// `load_all`, otherwise only for the entry whose key equals `load_only_for`;
-// the decision follows the key parse, so a lookup pays nothing for entries it
-// walks past. `false` and empty is a stat-only read.
-std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const NamespaceNodeStore& store,
-                                                  bool load_all,
-                                                  std::string_view load_only_for = {}) {
+// Reads one leaf record. External extents are fetched only for an entry
+// whose key `want` accepts; the decision follows the key parse, so a reader
+// pays nothing for entries it walks past.
+template <typename Want>
+std::pair<std::string, FsEntry> decode_leaf_entry_when(Reader& reader,
+                                                       const NamespaceNodeStore& store,
+                                                       const Want& want) {
     std::pair<std::string, FsEntry> item;
     item.first = reader.string(8192);
-    const bool load_extents = load_all || (!load_only_for.empty() && item.first == load_only_for);
+    const bool load_extents = want(item.first);
     auto& entry = item.second;
     auto type = reader.u8();
     const bool provenance = (type & entry_type_with_provenance) != 0;
@@ -301,6 +301,16 @@ std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const Namespac
         throw DecodeError("bad namespace tree extent form");
     }
     return item;
+}
+
+// External extents for every entry when `load_all`, otherwise only for the
+// entry whose key equals `load_only_for`. `false` and empty is stat-only.
+std::pair<std::string, FsEntry> decode_leaf_entry(Reader& reader, const NamespaceNodeStore& store,
+                                                  bool load_all,
+                                                  std::string_view load_only_for = {}) {
+    return decode_leaf_entry_when(reader, store, [&](const std::string& key) {
+        return load_all || (!load_only_for.empty() && key == load_only_for);
+    });
 }
 
 } // namespace
@@ -483,7 +493,8 @@ void walk_subtree_prefix(const ObjectId& id, const NamespaceNodeStore& store,
     if (magic == leaf_magic) {
         const auto count = reader.u32();
         for (uint32_t i = 0; i < count; ++i) {
-            auto item = decode_leaf_entry(reader, store, true);
+            auto item = decode_leaf_entry_when(
+                reader, store, [&](const std::string& key) { return key.starts_with(prefix); });
             if (item.first.starts_with(prefix))
                 visit(item.first, item.second);
         }
@@ -884,6 +895,158 @@ void for_each_namespace_entry_with_prefix(const MetadataSnapshot& snapshot,
     walk_subtree_prefix(*snapshot.namespace_root, *store, prefix, prefix_upper_bound(prefix), visit);
 }
 
+namespace {
+// The stat-only entries at or after `from` in the leaf that would hold it, and
+// the first key of the leaf after: one descent.
+struct LeafRun {
+    std::vector<std::pair<std::string, FsEntry>> items;
+    std::optional<std::string> next;
+};
+
+LeafRun leaf_run_from(const ObjectId& root, const NamespaceNodeStore& store,
+                      std::string_view from) {
+    LeafRun run;
+    ObjectId current = root;
+    for (;;) {
+        auto encoded = store.get(current);
+        if (!encoded)
+            throw DecodeError("namespace tree node unavailable: " + to_string(current));
+        Reader reader(*encoded);
+        const auto magic = reader.fixed<4>();
+        if (magic == leaf_magic) {
+            const auto count = reader.u32();
+            for (uint32_t i = 0; i < count; ++i) {
+                auto item = decode_leaf_entry(reader, store, false);
+                if (item.first >= from)
+                    run.items.push_back(std::move(item));
+            }
+            reader.finish();
+            return run;
+        }
+        if (magic != branch_magic)
+            throw DecodeError("not a namespace tree node");
+        (void)reader.u8(); // level
+        const auto count = reader.u32();
+        if (!count)
+            throw DecodeError("namespace tree branch without children");
+        // The last child whose first key is <= from, else the first; the
+        // child after it bounds this subtree from above.
+        ObjectId chosen{};
+        bool have = false;
+        std::optional<std::string> after;
+        for (uint32_t i = 0; i < count; ++i) {
+            auto first_key = reader.string(8192);
+            ObjectId child{reader.fixed<32>()};
+            (void)reader.u64();
+            if (!have || first_key <= from) {
+                chosen = child;
+                have = true;
+                continue;
+            }
+            after = std::move(first_key);
+            break;
+        }
+        if (after)
+            run.next = std::move(after);
+        current = chosen;
+    }
+}
+} // namespace
+
+void scan_namespace(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                    std::string_view from, const NamespaceScanVisitor& visit) {
+    if (!snapshot.namespace_root) {
+        auto it = snapshot.entries.lower_bound(std::string(from));
+        while (it != snapshot.entries.end()) {
+            FsEntry stat = it->second;
+            stat.extents.clear();
+            auto step = visit(it->first, stat);
+            if (step.kind == NamespaceScanStep::Kind::stop)
+                return;
+            if (step.kind == NamespaceScanStep::Kind::seek) {
+                if (step.to <= it->first)
+                    throw std::logic_error("namespace scan sought backwards");
+                it = snapshot.entries.lower_bound(step.to);
+            } else {
+                ++it;
+            }
+        }
+        return;
+    }
+    if (!store)
+        throw DecodeError("namespace is a tree and no node store was supplied");
+    std::string cursor(from);
+    for (;;) {
+        auto run = leaf_run_from(*snapshot.namespace_root, *store, cursor);
+        bool sought = false;
+        for (size_t i = 0; i < run.items.size(); ++i) {
+            const auto& [path, stat] = run.items[i];
+            auto step = visit(path, stat);
+            if (step.kind == NamespaceScanStep::Kind::stop)
+                return;
+            if (step.kind != NamespaceScanStep::Kind::seek)
+                continue;
+            if (step.to <= path)
+                throw std::logic_error("namespace scan sought backwards");
+            // A target inside this leaf is reached by stepping over what
+            // lies before it; only one beyond the leaf costs a descent.
+            if (!run.next || step.to < *run.next) {
+                while (i + 1 < run.items.size() && run.items[i + 1].first < step.to)
+                    ++i;
+                continue;
+            }
+            cursor = std::move(step.to);
+            sought = true;
+            break;
+        }
+        if (sought)
+            continue;
+        if (!run.next)
+            return;
+        cursor = std::move(*run.next);
+    }
+}
+
+void for_each_namespace_child(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                              std::string_view directory, const NamespaceChildVisitor& visit) {
+    const auto prefix = directory == "/" ? std::string("/") : std::string(directory) + "/";
+    scan_namespace(snapshot, store, prefix, [&](const std::string& path, const FsEntry& stat) {
+        if (!path.starts_with(prefix))
+            return NamespaceScanStep::stop();
+        const std::string_view rest = std::string_view(path).substr(prefix.size());
+        if (rest.empty())
+            return NamespaceScanStep::next();
+        const auto slash = rest.find('/');
+        if (slash == std::string_view::npos) {
+            visit(std::string(rest), path, stat);
+            return NamespaceScanStep::next();
+        }
+        // Inside a child directory: everything beneath it is passed in one
+        // descent.
+        auto beyond = prefix_upper_bound(prefix + std::string(rest.substr(0, slash + 1)));
+        if (beyond.empty())
+            return NamespaceScanStep::stop();
+        return NamespaceScanStep::seek(std::move(beyond));
+    });
+}
+
+std::optional<std::string>
+first_namespace_path_under(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
+                           std::string_view directory,
+                           const std::function<bool(const std::string&)>& skip) {
+    const auto prefix = directory == "/" ? std::string("/") : std::string(directory) + "/";
+    std::optional<std::string> found;
+    scan_namespace(snapshot, store, prefix, [&](const std::string& path, const FsEntry&) {
+        if (!path.starts_with(prefix))
+            return NamespaceScanStep::stop();
+        if (path == directory || (skip && skip(path)))
+            return NamespaceScanStep::next();
+        found = path;
+        return NamespaceScanStep::stop();
+    });
+    return found;
+}
+
 void for_each_namespace_entry(const MetadataSnapshot& snapshot, const NamespaceNodeStore* store,
                               const NamespaceVisitor& visit) {
     if (!snapshot.namespace_root) {
@@ -1062,9 +1225,13 @@ void walk_stats(const ObjectId& id, const NamespaceNodeStore& store, NamespaceTr
 
 } // namespace
 
+void NamespaceWorkingSet::reload() {
+    erased_.clear();
+    erased_.insert(delta_.erase_entries.begin(), delta_.erase_entries.end());
+}
+
 bool NamespaceWorkingSet::erased(const std::string& path) const {
-    return std::find(delta_.erase_entries.begin(), delta_.erase_entries.end(), path) !=
-           delta_.erase_entries.end();
+    return erased_.contains(path);
 }
 
 std::optional<FsEntry> NamespaceWorkingSet::get(const std::string& path, bool with_extents) const {
@@ -1092,16 +1259,17 @@ bool NamespaceWorkingSet::contains(const std::string& path) const {
 void NamespaceWorkingSet::put(const std::string& path, const FsEntry& entry) {
     delta_.upsert_entries[path] = entry;
     // Recreating a path erased earlier in the batch drops its tombstone.
-    delta_.erase_entries.erase(
-        std::remove(delta_.erase_entries.begin(), delta_.erase_entries.end(), path),
-        delta_.erase_entries.end());
+    if (erased_.erase(path))
+        delta_.erase_entries.erase(
+            std::remove(delta_.erase_entries.begin(), delta_.erase_entries.end(), path),
+            delta_.erase_entries.end());
     if (!tree_backed_)
         snapshot_.entries[path] = entry;
 }
 
 void NamespaceWorkingSet::erase(const std::string& path) {
     delta_.upsert_entries.erase(path);
-    if (!erased(path))
+    if (erased_.insert(path).second)
         delta_.erase_entries.push_back(path);
     if (!tree_backed_)
         snapshot_.entries.erase(path);
@@ -1118,18 +1286,13 @@ bool path_under(const std::string& path, const std::string& root) {
 std::optional<std::string> NamespaceWorkingSet::first_path_under(
     const std::string& directory) const {
     // Overlay first: batch-created children count, batch-erased ones do not.
-    for (const auto& [path, _] : delta_.upsert_entries)
-        if (path != directory && path_under(path, directory))
-            return path;
-    std::optional<std::string> found;
     const auto prefix = directory == "/" ? std::string("/") : directory + "/";
-    for_each_namespace_entry_with_prefix(snapshot_, nodes_, prefix,
-                                         [&](const std::string& path, const FsEntry&) {
-                                             if (found || path == directory || erased(path))
-                                                 return;
-                                             found = path;
-                                         });
-    return found;
+    for (auto it = delta_.upsert_entries.lower_bound(prefix);
+         it != delta_.upsert_entries.end() && it->first.starts_with(prefix); ++it)
+        if (it->first != directory)
+            return it->first;
+    return first_namespace_path_under(snapshot_, nodes_, directory,
+                                      [&](const std::string& path) { return erased(path); });
 }
 
 std::vector<std::pair<std::string, FsEntry>> NamespaceWorkingSet::subtree(
