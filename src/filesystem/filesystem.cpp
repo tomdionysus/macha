@@ -2125,80 +2125,68 @@ std::optional<std::pair<std::string, FsEntry>> FileSystem::find_media(std::strin
         }
         return {};
     }
-    // Media ids are content-addressed, so a resolved id stays valid across
-    // generations: hits come from the indexing snapshot, and only a miss
-    // consults current metadata, keeping namespace churn out of playback.
-    {
-        Lock lock(media_index_mutex_);
-        if (media_index_valid_ && media_index_snapshot_) {
-            auto found = media_index_.find(std::string(id));
-            if (found != media_index_.end()) {
-                auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-                auto entry = namespace_entry(*media_index_snapshot_, &nodes, found->second);
-                if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
-                    return std::pair{found->second, *entry};
-            }
-        }
-    }
-
-    auto install_and_lookup = [&](const MetadataSnapshotView& view)
-        -> std::optional<std::pair<std::string, FsEntry>> {
-        Lock lock(media_index_mutex_);
-
-        // Another lookup may have indexed this id meanwhile.
-        if (media_index_valid_ && media_index_snapshot_) {
-            auto found = media_index_.find(std::string(id));
-            if (found != media_index_.end()) {
-                auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-                auto entry = namespace_entry(*media_index_snapshot_, &nodes, found->second);
-                if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
-                    return std::pair{found->second, *entry};
-            }
-            if (media_index_namespace_revision_ == view.namespace_revision)
-                return {};
-        }
-
-        std::map<std::string, std::string> next;
-        // Full pass with extents: file_media_id hashes the extent list.
-        auto index_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-        for_each_namespace_entry(*view.snapshot, &index_nodes,
-                                 [&](const std::string& path, const FsEntry& entry) {
+    // The index follows this node's own head: brought up to date from what
+    // differs between the tree it was built from and the tree now, so a
+    // lookup after a change costs the change, and no peer is asked.
+    const auto view = m_.local();
+    Lock lock(media_index_mutex_);
+    auto nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
+    const auto& root = view.snapshot->namespace_root;
+    const bool current = media_index_valid_ &&
+                         (root ? media_index_root_ == root
+                               : media_index_namespace_revision_ == view.namespace_revision &&
+                                     !media_index_root_);
+    if (!current) {
+        const auto add = [&](const std::string& path, const FsEntry& entry)
+                             MACHA_REQUIRES(media_index_mutex_) {
             if (entry.type != EntryType::file)
                 return;
-            next.emplace(file_media_id(entry), path);
-        });
-        media_index_ = std::move(next);
+            auto& paths = media_index_[file_media_id(entry)];
+            if (std::find(paths.begin(), paths.end(), path) == paths.end())
+                paths.push_back(path);
+        };
+        const auto drop = [&](const std::string& path, const FsEntry& entry)
+                              MACHA_REQUIRES(media_index_mutex_) {
+            if (entry.type != EntryType::file)
+                return;
+            const auto found = media_index_.find(file_media_id(entry));
+            if (found == media_index_.end())
+                return;
+            std::erase(found->second, path);
+            if (found->second.empty())
+                media_index_.erase(found);
+        };
+        if (media_index_valid_ && media_index_root_ && root) {
+            for (const auto& [path, difference] :
+                 diff_namespace_trees(*media_index_root_, *root, nodes)) {
+                if (difference.before)
+                    drop(path, *difference.before);
+                if (difference.after)
+                    add(path, *difference.after);
+            }
+        } else {
+            media_index_.clear();
+            // Full pass with extents: file_media_id hashes the extent list.
+            for_each_namespace_entry(*view.snapshot, &nodes, add);
+            Log::debug("filesystem media index built metadata_generation=" +
+                       std::to_string(view.generation) + " ids=" +
+                       std::to_string(media_index_.size()));
+        }
+        media_index_root_ = root;
         media_index_namespace_revision_ = view.namespace_revision;
         media_index_snapshot_ = view.snapshot;
         media_index_valid_ = true;
-        Log::debug("filesystem media index rebuilt namespace_revision=" +
-                   std::to_string(view.namespace_revision) + " metadata_generation=" +
-                   std::to_string(view.generation) + " files=" +
-                   std::to_string(media_index_.size()) + " source=memory");
-
-        auto found = media_index_.find(std::string(id));
-        if (found == media_index_.end())
-            return {};
-        auto lookup_nodes = ControlNamespaceNodeStore::for_reading(local_.control(), s_);
-        auto entry = namespace_entry(*media_index_snapshot_, &lookup_nodes, found->second);
-        if (!entry || entry->type != EntryType::file)
-            return {};
-        return std::pair{found->second, *entry};
-    };
-
-    // Try the decoded view before any quorum read. A hit is safe on a stale
-    // view (ids are content-derived); a miss is definitive only once the view
-    // has caught up with every generation this node knows of.
-    if (auto available = m_.current()) {
-        if (auto found = install_and_lookup(*available))
-            return found;
-        if (available->generation >= metadata_server_.known_generation())
-            return {};
     }
 
-    // Only a stale or missing view pays for the authoritative read.
-    const auto authoritative = m_.converged();
-    return install_and_lookup(authoritative);
+    const auto found = media_index_.find(std::string(id));
+    if (found == media_index_.end())
+        return {};
+    for (const auto& path : found->second) {
+        auto entry = namespace_entry(*media_index_snapshot_, &nodes, path);
+        if (entry && entry->type == EntryType::file && file_media_id(*entry) == id)
+            return std::pair{path, *entry};
+    }
+    return {};
 }
 
 std::shared_ptr<ReadHandle> FileSystem::open_read(const std::string& p) {

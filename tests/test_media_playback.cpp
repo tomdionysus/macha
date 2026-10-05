@@ -1822,6 +1822,10 @@ MACHA_TEST("media_playback", test_playback_performs_the_instruction_it_is_given)
         REQUIRE(pinned_response.stream->read(0, pinned_bytes) == pinned_bytes.size());
         CHECK(std::equal(pinned_bytes.begin(), pinned_bytes.end(), bytes.begin()));
         CHECK(session_call(*playback, "DELETE", session_id_of(by_path)).status == 204);
+        // The media id names content: with the file replaced it names nothing,
+        // and with the content back it resolves again.
+        CHECK(!node.filesystem().find_media(media_id).has_value());
+        CHECK(node.write("/media/test.mp4", bytes) == media_id);
 
         // A remux session advertises direct and honours an explicit switch back to it.
         auto remux = create_session(*playback, media_id, Json::Object{{"mode", "remux"}, {"container", "fmp4"}});
