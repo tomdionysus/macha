@@ -2,8 +2,8 @@
 
 *2026-10-05. Approved by the operator the same day ("implement the plan").*
 
-**Status, 2026-10-05: stage 1 built bar the items listed; stages 2 and 3
-begun. 0.90.9 on both nodes.**
+**Status, 2026-10-05: built. What is left below is measured small or waits on
+an API change. 0.90.13 on both nodes.**
 
 Measured on fi-1 (both nodes on the same build, the peer across the WAN):
 
@@ -15,6 +15,8 @@ Measured on fi-1 (both nodes on the same build, the peer across the WAN):
 | unmatched list, 711 items | 1.9 to 5.6 s | 0.28 s |
 | one unmatched item | slow (not timed) | 14 to 25 ms |
 | mount's refresh after a commit | whole tree, 0.37 s | what changed |
+| unmatched list, 409 hints (0.90.13) | | 0.06 s |
+| create or mkdir through the mount, seen by the API (0.90.13) | about 3 s with a viewer active | 0.1 to 0.2 s |
 
 Built:
 
@@ -50,6 +52,18 @@ Built:
   (0.90.8). The editor's provider calls run on four provider sets instead of
   queueing behind one lock (4.6; 0.90.9). The scanner's namespace check reads
   this node's own head (0.90.9).
+- **0.90.11 to 0.90.13**: a catalogue write encodes and claims only the
+  shards it touches (4.1); claim release is bounded per call (3.4); artwork
+  types and media bindings are indexed once per catalogue snapshot (4.10 in
+  part); the mount journals a descriptor and its operation under one barrier
+  and reclaims an inode by lookup (1.4, 2.8 in part). Catalogue discovery and
+  targeted rematch read the media index (3.6). A match downloads its artwork
+  four at a time (4.4) and artwork options are kept ten minutes (4.5). The
+  availability survey keeps a memo of what it settled and the path table can
+  follow the tree diff (3.2). The mount's namespace commits no longer wait for
+  the loader's share while a viewer is active, which held a create about 3 s
+  behind playback. The unmatched list checks each file through the media
+  index.
 - Measured on 0.90.7: ten namespace-only commits, then one maintenance pass
   ending with the availability survey about a minute later (seven round
   trips to the peer, 2,839 tree nodes asked), then idle under 1% of a core.
@@ -62,30 +76,27 @@ front of that, for batching. What the journal would still add for other
 callers is one fsync shared across more operations; it is not needed for the
 contract.
 
-Not built yet:
+Left, with why:
 
-- Read-your-writes between FUSE and other callers: an operation FUSE has
-  journalled and not yet published is not visible through the API until its
-  commit lands (now a local commit, so soon).
-- Ingest and data publications still commit one operation at a time (2.3);
-  each commit is now local.
-- The mount's inode reclaim still scans the path map (1.4), and its journal
-  fsyncs under its global lock (2.8).
-- The non-namespace snapshot per commit (2.6, 2.7): measured at a few
-  milliseconds on fi-1 with a 2.2 MB payload, so not pressing.
-- The scanner's `namespace_signature` still calls `converged()`.
-- The rest of stage 2: the availability survey and path table are still made
-  from the root after a roll-up (3.2); repair's pass restarts on a commit
-  (3.3); claim release scans every claim (3.4); tombstones mature one at a
-  time (3.5); the catalogue scan 10 s after any namespace commit (3.6). After
-  a commit on 0.90.5 the maintenance thread still ran for 20 to 30 s at about
-  20% of a core; what of that remains on 0.90.7 is to be measured.
-- The rest of stage 3: the catalogue's whole re-encode per write (4.1); a
-  match's artwork downloads in series (4.4: the test HTTP clients are not
-  safe to call concurrently, so this waits on them); artwork choice repeating
-  the options call (4.5); the hint store's whole-file rewrite per change
-  (4.9, small at 1,500 hints); per-request catalogue scans (4.10). A
-  multi-file match has not been measured on the cluster since 0.90.9.
+- The survey memo and the followed path table apply only while no peer's
+  holdings grow. On this cluster gbni-1 imports torrents all the time, so
+  every survey still asks from the root (2,834 tree nodes, 7 round trips) and
+  the table is walked. It is maintenance work, paced by its share; a peer's
+  holdings reporting what it gained would let the memo stand.
+- A restarted node answers no holdings question until its presence index has
+  warmed: 11.5 minutes on gbni-1 (701,257 objects). Its peer reports most of
+  the library unknown meanwhile.
+- Ingest and data publications commit one operation at a time (2.3): each is
+  a local commit of about 100 ms, so a 4 GiB copy spends about 7 s of its copy
+  time committing. Not worth a journal.
+- Repair after a commit (3.3) keeps its positions and runs one more pass;
+  tombstones mature one at a time (3.5); both are paced maintenance.
+- The non-namespace snapshot per commit (2.6, 2.7): a few milliseconds.
+- The hint store rewrites its file per change (4.9): 266 KB with 409 hints.
+- `GET /api/v1/catalogue/items` answers 6,764 items, 9.5 MB, in 0.23 s; it
+  ignores `limit`. Paging it is an API change for the clients to agree.
+- A multi-file match from the web client has not been measured since 0.90.9;
+  the deployed web bundle still gives up after 8 s.
 - A testing gap found and closed for what is built: a new test cluster keeps
   its namespace as a map, so service-level tests exercise the tree paths only
   where they migrate first (`tests/test_namespace_migration.cpp`). New
