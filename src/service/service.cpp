@@ -160,7 +160,9 @@ std::string_view Service::required_role(const HttpRequest& request) {
     // Everything else that changes state: catalogue matches, files, namespaces,
     // and cluster identity associations.
     if (mutating && (request.path.starts_with("/api/v1/manage") ||
-                     request.path.starts_with("/api/v1/catalogue")))
+                     request.path.starts_with("/api/v1/catalogue") ||
+                     request.path == "/api/v1/files" ||
+                     request.path.starts_with("/api/v1/files/")))
         return role_manager;
 
     // Reads, playback and cluster status.
@@ -370,7 +372,7 @@ HttpResponse Service::handle_http(const HttpRequest& request) {
                               "abandoned while writes are still landing");
         return {204, "application/json; charset=utf-8", {}, {}};
     }
-    if (request.path.starts_with("/api/v1/manage"))
+    if (request.path.starts_with("/api/v1/manage") || ManageApi::title_file_route(request))
         return services_->manage_api().handle(request);
     if (request.path == "/api/v1/files" || request.path.starts_with("/api/v1/files/"))
         return services_->files_api().handle(request);

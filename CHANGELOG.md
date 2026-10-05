@@ -1,5 +1,24 @@
 # Current release
 
+## 0.90.15 — a title's files: unmatch and delete (experiment)
+
+New API routes; nothing removed or changed. No wire, protocol or on-disk
+changes.
+
+**`DELETE /api/v1/catalogue/items/{id}/media/{media_id}` unmatches one file.**
+The binding goes and every file with that content is put in the unmatched
+list as it is, to be identified by hand: no provider is asked, and a scan
+does not reopen it.
+
+**`DELETE /api/v1/files/<path>` deletes one path; `DELETE
+/api/v1/files?hash=macha:<id>` deletes every path holding that content.**
+Content stays bound while any path holds it; once none does it is unbound at
+once.
+
+**An item left with nothing is removed by any of the three**, with each
+season, show, album or artist above it left with no children, whether the
+scanner or a person made it. Each call is one catalogue commit.
+
 ## 0.90.14 — a matched album's cover is not fetched again (experiment)
 
 No wire, protocol or on-disk changes. One API change in wording only.

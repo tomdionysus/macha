@@ -486,6 +486,34 @@ void CatalogueHintQueue::mark_no_match(std::string_view id, std::string provider
     changed_locked();
 }
 
+std::string CatalogueHintQueue::put_unmatched(std::string path, std::string media_id) {
+    path = normalize_path(std::move(path));
+    const auto now = now_ms();
+    Lock lock(mutex_);
+    auto& hint = hints_[path];
+    hint.id = hint_id_for_path(path);
+    hint.path = path;
+    if (!hint.created_unix_ms) hint.created_unix_ms = now;
+    hint.state = CatalogueHintState::no_match;
+    hint.attempts = 0;
+    hint.failures = 0;
+    hint.candidate_cursor = 0;
+    hint.ready_after_unix_ms = 0;
+    hint.provider.clear();
+    hint.media_id = std::move(media_id);
+    hint.catalogue_item_ids.clear();
+    hint.result = "unmatched_by_operator";
+    hint.error.clear();
+    hint.error_code.clear();
+    hint.origins = {{"operator", hint.media_id, CatalogueHintPriority::manual_rescan}};
+    recompute_priority(hint);
+    hint.updated_unix_ms = now;
+    mark_state_dirty_locked();
+    persist_dirty_state_locked(true);
+    changed_locked();
+    return hint.id;
+}
+
 void CatalogueHintQueue::advance_candidate(std::string_view id, size_t next_cursor) {
     Lock lock(mutex_);
     auto it = std::find_if(hints_.begin(), hints_.end(), [&](const auto& pair) { return pair.second.id == id; });

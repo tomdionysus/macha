@@ -1457,6 +1457,84 @@ CatalogueClearResult CatalogueManager::clear_metadata_with_media(
     return result;
 }
 
+CatalogueUnbindResult CatalogueManager::unbind_media(std::optional<std::string_view> item_id,
+                                                     std::string_view media_id,
+                                                     std::optional<uint64_t> expected_revision) {
+    TimedLock mutation_lock(mutation_mutex_, "catalogue.mutation");
+    refresh(false);
+    auto current = *current_snapshot();
+    std::optional<ObjectId> expected_root;
+    {
+        Lock lock(mutex_);
+        expected_root = cached_root_;
+    }
+
+    CatalogueUnbindResult result;
+    std::vector<std::string> unbound;
+    if (item_id) {
+        const auto found = current.items.find(std::string(*item_id));
+        if (found == current.items.end())
+            return result;
+        result.found = true;
+        if (expected_revision && found->second.revision != *expected_revision)
+            throw CatalogueConflict("catalogue item revision changed");
+        if (std::find(found->second.media_ids.begin(), found->second.media_ids.end(), media_id) ==
+            found->second.media_ids.end())
+            return result;
+        unbound.push_back(found->first);
+    } else {
+        result.found = true;
+        for (const auto& [id, item] : current.items)
+            if (std::find(item.media_ids.begin(), item.media_ids.end(), media_id) !=
+                item.media_ids.end())
+                unbound.push_back(id);
+        if (unbound.empty())
+            return result;
+    }
+    result.bound = true;
+
+    auto old_art = data_object_ids(current);
+    const auto now = wall_time_ns();
+    std::vector<std::string> emptied;
+    for (const auto& id : unbound) {
+        auto& item = current.items.at(id);
+        std::erase(item.media_ids, std::string(media_id));
+        ++item.revision;
+        item.updated_ns = now;
+        const bool leaf = item.kind == CatalogueKind::movie ||
+                          item.kind == CatalogueKind::episode ||
+                          item.kind == CatalogueKind::track;
+        if (leaf && item.media_ids.empty())
+            emptied.push_back(id);
+    }
+    // Each removal may leave its parent with no children: walk up from it.
+    while (!emptied.empty()) {
+        const auto id = emptied.back();
+        emptied.pop_back();
+        const auto found = current.items.find(id);
+        if (found == current.items.end())
+            continue;
+        const auto parent = found->second.parent_id;
+        current.items.erase(found);
+        result.removed_ids.push_back(id);
+        if (!parent)
+            continue;
+        const bool has_child =
+            std::any_of(current.items.begin(), current.items.end(), [&](const auto& pair) {
+                return pair.second.parent_id && *pair.second.parent_id == *parent;
+            });
+        const auto above = current.items.find(*parent);
+        if (!has_child && above != current.items.end() && above->second.media_ids.empty())
+            emptied.push_back(*parent);
+    }
+    commit(expected_root, current, old_art);
+    if (item_id)
+        if (const auto kept = current.items.find(std::string(*item_id)); kept != current.items.end())
+            result.item = kept->second;
+    std::sort(result.removed_ids.begin(), result.removed_ids.end());
+    return result;
+}
+
 size_t CatalogueManager::clear_metadata(std::string_view id,
                                         std::optional<uint64_t> expected_revision) {
     return clear_metadata_with_media(id, expected_revision).removed_items;
