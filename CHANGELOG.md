@@ -1,5 +1,20 @@
 # Current release
 
+## 0.90.9 — the metadata editor's provider calls run side by side (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**Provider calls no longer queue behind one another.** A provider search, the
+artwork options for a reference, the lookup a match makes and a release's
+track list each held one lock across the call out to the provider. Several
+matches sent together ran one at a time, and one slow answer held up every
+other editor request on the node. The editor now has four sets of providers
+and requests take them in turn. MusicBrainz requests still pass its shared
+rate gate, one a second.
+
+**The catalogue scanner reads this node's own head** when it checks whether
+the namespace has changed, and asks no peer.
+
 ## 0.90.8 — keyframe indexes survive a catalogue reload (experiment)
 
 No wire, protocol, API or on-disk changes.
