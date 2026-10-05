@@ -435,6 +435,7 @@ class FileSystem final : public PublicationTarget {
         MACHA_GUARDED_BY(media_index_mutex_);
     // The tree the index was built from, when the namespace is a tree.
     std::optional<ObjectId> media_index_root_ MACHA_GUARDED_BY(media_index_mutex_);
+    void refresh_media_index(const MetadataSnapshotView&) MACHA_REQUIRES(media_index_mutex_);
     // What the namespace refers to, one item per reference and in order, at
     // the tree it was last counted at. Guarded by maintenance_build_mutex_.
     struct NamespaceCensus {
@@ -506,6 +507,8 @@ class FileSystem final : public PublicationTarget {
                                           bool track_playback = true,
                                           FrameType frame_type = FrameType::foreground);
     std::optional<std::pair<std::string, FsEntry>> find_media(std::string_view);
+    // The media id of every file in this node's own head, in order.
+    std::vector<std::string> media_ids();
     std::shared_ptr<WriteHandle> open_write(const std::string&, bool, bool cache_puts = false,
                                             WriteDurability = WriteDurability::immediate,
                                             uint64_t publication_pipeline_bytes = 0,

@@ -120,18 +120,10 @@ void MediaInformationService::stop() {
 
 std::optional<std::pair<std::string, FsEntry>>
 MediaInformationService::source_for(std::string_view media_id) const {
-    auto view = fs_.available_snapshot_view();
-    if (!view) return {};
-    // file_media_id hashes the extent list, so this walk needs whole entries.
-    auto nodes = fs_.namespace_nodes();
-    std::optional<std::pair<std::string, FsEntry>> found;
-    for_each_namespace_entry(*view->snapshot, &nodes,
-                             [&](const std::string& path, const FsEntry& entry) {
-        if (found)
-            return;
-        if (entry.type == EntryType::file && entry.size && file_media_id(entry) == media_id)
-            found = std::pair{path, entry};
-    });
+    // The filesystem's index from media id to path: no walk.
+    auto found = fs_.find_media(media_id);
+    if (!found || found->second.type != EntryType::file || !found->second.size)
+        return {};
     return found;
 }
 
@@ -158,12 +150,11 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
     for (const auto& hint : existing) by_path.emplace(hint.path, hint);
     std::vector<CatalogueHintSubmission> submissions;
     size_t outstanding = 0;
-    auto nodes = fs_.namespace_nodes();
-    for_each_namespace_entry(*view->snapshot, &nodes,
-                             [&](const std::string& path, const FsEntry& entry) {
-        if (entry.type != EntryType::file || !entry.size) return;
-        const auto media_id = file_media_id(entry);
-        if (!wanted.contains(media_id)) return;
+    for (const auto& media_id : wanted) {
+        const auto source_file = source_for(media_id);
+        if (!source_file)
+            continue;
+        const auto& path = source_file->first;
         if (auto found = by_path.find(path); found != by_path.end()) {
             const auto& hint = found->second;
             const bool same = std::any_of(hint.origins.begin(), hint.origins.end(),
@@ -177,11 +168,11 @@ size_t MediaInformationService::request(const std::vector<std::string>& media_id
                     if (priority > hint.priority)
                         submissions.push_back({path, source, media_id, priority});
                 }
-                return;
+                continue;
             }
         }
         submissions.push_back({path, source, media_id, priority});
-    });
+    }
     outstanding += hints_.submit_many(std::move(submissions)).size();
     cv_.notify_all();
     return outstanding;
@@ -440,14 +431,10 @@ void MediaInformationService::request_prune() {
 }
 
 void MediaInformationService::prune() {
-    auto view = fs_.available_snapshot_view();
-    if (!view) return;
-    std::set<std::string> live;
-    auto nodes = fs_.namespace_nodes();
-    for_each_namespace_entry(*view->snapshot, &nodes, [&](const std::string&, const FsEntry& entry) {
-        if (entry.type == EntryType::file && entry.size)
-            live.insert(file_media_id(entry));
-    });
+    if (!fs_.available_snapshot_view()) return;
+    // The filesystem's media index names every file's id: no walk.
+    const auto ids = fs_.media_ids();
+    const std::set<std::string> live(ids.begin(), ids.end());
     const auto removed = catalogue_.prune_media_profiles(live);
     if (removed)
         Log::debug("media information pruned profiles=" + std::to_string(removed));
