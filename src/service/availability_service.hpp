@@ -153,6 +153,8 @@ class AvailabilityService {
 
     // The maintenance pass's own: what the last roll-up and survey saw.
     bool surveyed_{};
+    // The tree the last survey was of.
+    ObjectId surveyed_root_{};
     // The head the roll-up was built at: its namespace root, or its record
     // hash when the namespace is inline.
     Hash256 rolled_head_{};

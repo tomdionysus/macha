@@ -290,7 +290,12 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         Holdings next;
         next.losses = losses;
         if (tree_backed) {
-            next.rollup = HoldingsRollup::build(head_key, stored, held, pause);
+            // With nothing gained or lost here since the last roll-up, only
+            // the tree has moved: what the two trees share keeps its count.
+            const bool carry = holdings && !holdings->built && !lost &&
+                               storage_events == rolled_storage_events_;
+            next.rollup = HoldingsRollup::build(head_key, stored, held, pause,
+                                                carry ? &holdings->rollup : nullptr);
         } else {
             auto built = std::make_shared<MemoryNamespaceNodeStore>();
             const auto root = build_namespace_tree(head.snapshot->entries, *built);
@@ -340,7 +345,10 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
         grew = grew || peers[i].second > surveyed_peers_[i].second;
     }
     // What must be asked of the peers again, whatever it costs.
-    const bool must_ask = !surveyed_ || head_changed || lost ||
+    // The tree is asked about again once it has been rolled up, not while a
+    // roll-up of it is still due: until then the survey would be of the tree
+    // already surveyed.
+    const bool must_ask = !surveyed_ || rollup->root() != surveyed_root_ || lost ||
                           topology_events != surveyed_topology_events_ || !same_peers || shrank;
     const bool missing = surveyed_ && (!previous->survey.unavailable.empty() ||
                                       !previous->survey.unknown.empty());
@@ -455,6 +463,7 @@ bool AvailabilityService::refresh(const MetadataSnapshotView& head, Clock::time_
     }
     snapshot_.publish(std::move(next));
     surveyed_ = true;
+    surveyed_root_ = rollup->root();
     surveyed_topology_events_ = topology_events;
     surveyed_peers_ = std::move(peers);
     return true;
