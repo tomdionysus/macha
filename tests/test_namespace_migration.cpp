@@ -867,17 +867,23 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     auto nodes = ControlNamespaceNodeStore::for_commit(service.local_state().control(),
                                                        service.filesystem().store());
     const auto make_branch = [&](const std::string& directory, const FsEntry& disputed) {
+        // Each branch is another author's one mutation, stamped as a commit
+        // stamps what it writes.
+        const MetadataDot dot{random_node_id(), 1};
         MetadataDelta delta;
         delta.upsert_entries[directory] = make_directory(7);
         delta.upsert_entries["/disputed.bin"] = disputed;
+        for (auto& [path, entry] : delta.upsert_entries)
+            stamp_entry_provenance(entry, path, nullptr, dot);
         auto snapshot = base_snapshot;
         snapshot.namespace_root =
             apply_delta_to_namespace_tree(*base_snapshot.namespace_root, nodes, delta);
-        const auto sequence = ++snapshot.mutation_sequences[node_id];
+        snapshot.mutation_sequences[dot.author] = dot.sequence;
         std::vector<ObjectId> written;
         collect_namespace_tree_changes(base_snapshot.namespace_root, *snapshot.namespace_root,
                                        nodes, written);
-        claims.retain_batch(RetentionClass::control, written, RetentionDot{node_id, sequence});
+        claims.retain_batch(RetentionClass::control, written,
+                            RetentionDot{dot.author, dot.sequence});
 
         MetadataRecord branch;
         branch.generation = base.generation + 1;
@@ -915,23 +921,26 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     REQUIRE(merged.merge_parents.size() == 1);
     REQUIRE(merged.namespace_root.has_value());
     // A pure join: the clock is the branches', so any reconciler mints it.
-    CHECK(merged.mutation_sequences == left_snapshot.mutation_sequences);
+    auto joined = left_snapshot.mutation_sequences;
+    for (const auto& [author, sequence] : right_snapshot.mutation_sequences)
+        joined[author] = std::max(joined[author], sequence);
+    CHECK(merged.mutation_sequences == joined);
 
     const auto& primary = head.previous == left.hash ? left_snapshot : right_snapshot;
     std::vector<ObjectId> introduced;
     collect_namespace_tree_changes(primary.namespace_root, *merged.namespace_root,
                                    service.filesystem().namespace_nodes(), introduced);
     REQUIRE(!introduced.empty());
-    // The claim's dot: this node's, under whichever author id it holds now.
-    const auto claim_of = [&](const ObjectId& node) {
+    // The merge's claim on each: a dot of this node's, beyond the merged
+    // head's clock, so a release at this head keeps it.
+    const auto uncovered = [&](const ObjectId& node, const std::map<NodeId, uint64_t>& clock) {
         const auto held = claims.claims(RetentionClass::control, node);
-        REQUIRE(held.adds.size() == 1);
-        return MetadataDot{held.adds.begin()->first, held.adds.begin()->second};
+        return std::count_if(held.adds.begin(), held.adds.end(), [&](const auto& add) {
+            return !clock_covers(clock, MetadataDot{add.first, add.second});
+        });
     };
-    for (const auto& node : introduced) {
-        // Beyond this head's clock: a release at this head keeps it.
-        CHECK(!clock_covers(merged.mutation_sequences, claim_of(node)));
-    }
+    for (const auto& node : introduced)
+        CHECK(uncovered(node, merged.mutation_sequences) == 1);
     REQUIRE(!merged.conflicts.empty());
     for (const auto* entry : {&first, &second})
         for (const auto& extent : entry->extents)
@@ -941,7 +950,7 @@ MACHA_TEST("namespace_migration", test_a_merge_claims_what_it_introduces) {
     service.filesystem().mkdir("/after-merge", 0755, getuid(), getgid());
     const auto after = service.metadata_manager().snapshot();
     for (const auto& node : introduced)
-        CHECK(clock_covers(after.mutation_sequences, claim_of(node)));
+        CHECK(uncovered(node, after.mutation_sequences) == 0);
     CHECK(service.filesystem().getattr("/Films/left").type == EntryType::directory);
     CHECK(service.filesystem().getattr("/Films/right").type == EntryType::directory);
     service.stop();

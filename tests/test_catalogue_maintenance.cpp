@@ -49,6 +49,10 @@ struct FakeMetadataView final : MetadataView {
     uint64_t conflicts_superseded() const noexcept override { return 0; }
     uint64_t conflicts_resolved() const noexcept override { return 0; }
     MetadataHeadStanding head_standing() const noexcept override { return {}; }
+    std::optional<std::optional<ObjectId>>
+    common_ancestor_catalogue_root(const Hash256&, const Hash256&) const override {
+        return {};
+    }
     MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {

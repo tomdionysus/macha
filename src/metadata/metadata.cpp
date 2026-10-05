@@ -303,11 +303,19 @@ std::optional<ObjectId> optional_object(Reader& r) {
     return id;
 }
 
+// The kind byte carries this bit when the later alternative was installed.
+constexpr uint8_t conflict_later_installed = 0x80;
+
 void encode_conflict(Writer& w, const MetadataConflict& conflict) {
-    w.u8(static_cast<uint8_t>(conflict.kind));
+    w.u8(static_cast<uint8_t>(conflict.kind) |
+         (conflict.later_installed ? conflict_later_installed : 0));
     w.string(conflict.key);
     w.fixed(conflict.left_head.bytes);
     w.fixed(conflict.right_head.bytes);
+    if (conflict.later_installed) {
+        w.fixed(conflict.installed_dot.author.bytes);
+        w.u64(conflict.installed_dot.sequence);
+    }
     switch (conflict.kind) {
     case MetadataConflictKind::namespace_entry:
         optional_entry(w, conflict.base_entry);
@@ -324,7 +332,9 @@ void encode_conflict(Writer& w, const MetadataConflict& conflict) {
 
 MetadataConflict decode_conflict(Reader& r) {
     MetadataConflict conflict;
-    const auto kind = r.u8();
+    auto kind = r.u8();
+    conflict.later_installed = (kind & conflict_later_installed) != 0;
+    kind &= static_cast<uint8_t>(~conflict_later_installed);
     if (kind < static_cast<uint8_t>(MetadataConflictKind::namespace_entry) ||
         kind > static_cast<uint8_t>(MetadataConflictKind::catalogue_root))
         throw DecodeError("bad metadata conflict kind");
@@ -334,6 +344,10 @@ MetadataConflict decode_conflict(Reader& r) {
         throw DecodeError("empty metadata conflict key");
     conflict.left_head.bytes = r.fixed<32>();
     conflict.right_head.bytes = r.fixed<32>();
+    if (conflict.later_installed) {
+        conflict.installed_dot.author.bytes = r.fixed<16>();
+        conflict.installed_dot.sequence = r.u64();
+    }
     switch (conflict.kind) {
     case MetadataConflictKind::namespace_entry:
         conflict.base_entry = optional_entry(r);
@@ -659,19 +673,40 @@ bool same_content(const FsEntry& a, const FsEntry& b) {
            a.size == b.size && a.extents == b.extents;
 }
 
-size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
+std::optional<FsEntry> conflict_installed_entry(const MetadataConflict& conflict) {
+    // A merge of two heads puts the alternative it installed on the left.
+    return conflict.later_installed ? conflict.left_entry : conflict.base_entry;
+}
+
+std::optional<ObjectId> conflict_installed_catalogue_root(const MetadataConflict& conflict) {
+    return conflict.later_installed ? conflict.left_catalogue_root
+                                    : conflict.base_catalogue_root;
+}
+
+const FsEntry& later_entry(const FsEntry& a, const FsEntry& b) {
+    if (a.mtime_ns != b.mtime_ns)
+        return a.mtime_ns > b.mtime_ns ? a : b;
+    return a < b ? b : a;
+}
+
+size_t prune_superseded_conflicts(MetadataSnapshot& snapshot, const NamespaceLookup& lookup) {
     size_t pruned = 0;
     for (auto it = snapshot.conflicts.begin(); it != snapshot.conflicts.end();) {
         const auto& conflict = it->second;
         bool superseded = false;
         if (conflict.kind == MetadataConflictKind::namespace_entry) {
             std::optional<FsEntry> live;
-            if (auto found = snapshot.entries.find(conflict.key); found != snapshot.entries.end())
+            if (lookup)
+                live = lookup(conflict.key);
+            else if (auto found = snapshot.entries.find(conflict.key);
+                     found != snapshot.entries.end())
                 live = found->second;
-            // The merge installs the common ancestor; any other value is a decision.
-            superseded = live != conflict.base_entry;
-            // Identical alternatives need no decision; settle them as the merge does.
-            if (!superseded && conflict.left_entry && conflict.right_entry &&
+            // The merge left one value in place; any other is a decision.
+            superseded = live != conflict_installed_entry(conflict);
+            // Identical alternatives need no decision; a three-way merge's
+            // are settled here as that merge settles them.
+            if (!superseded && !lookup && !conflict.later_installed && conflict.left_entry &&
+                conflict.right_entry &&
                 same_content(*conflict.left_entry, *conflict.right_entry)) {
                 snapshot.entries[conflict.key] = (*conflict.left_entry < *conflict.right_entry)
                                                      ? *conflict.left_entry
@@ -679,7 +714,9 @@ size_t prune_superseded_conflicts(MetadataSnapshot& snapshot) {
                 superseded = true;
             }
         } else if (conflict.kind == MetadataConflictKind::catalogue_root) {
-            superseded = snapshot.catalogue_root != conflict.base_catalogue_root;
+            superseded = snapshot.catalogue_root != conflict_installed_catalogue_root(conflict) ||
+                         (conflict.later_installed &&
+                          snapshot.catalogue_dot != conflict.installed_dot);
         }
         if (superseded) {
             it = snapshot.conflicts.erase(it);
@@ -809,8 +846,11 @@ Bytes encode_snapshot(const MetadataSnapshot& s) {
     }
     if (torrent_state)
         encode_torrent_requests(w, s);
-    if (legacy_clock_state)
+    if (legacy_clock_state) {
         encode_clock(w, *s.legacy_clock);
+        w.fixed(s.catalogue_dot.author.bytes);
+        w.u64(s.catalogue_dot.sequence);
+    }
     return w.take();
 }
 Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
@@ -881,8 +921,11 @@ Bytes encode_snapshot_v14(const MetadataSnapshot& s) {
     w.u8(s.retention_baseline_complete ? 1 : 0);
     if (s.legacy_clock || !s.torrent_requests.empty())
         encode_torrent_requests(w, s);
-    if (s.legacy_clock)
+    if (s.legacy_clock) {
         encode_clock(w, *s.legacy_clock);
+        w.fixed(s.catalogue_dot.author.bytes);
+        w.u64(s.catalogue_dot.sequence);
+    }
     return w.take();
 }
 
@@ -986,8 +1029,11 @@ MetadataSnapshot decode_snapshot_v14(Reader& r, bool torrent_requests, bool lega
     s.retention_baseline_complete = baseline != 0;
     if (torrent_requests)
         decode_torrent_requests(r, s);
-    if (legacy_clock)
+    if (legacy_clock) {
         s.legacy_clock = decode_clock(r);
+        s.catalogue_dot.author.bytes = r.fixed<16>();
+        s.catalogue_dot.sequence = r.u64();
+    }
     r.finish();
     // No "/" check here: that needs a tree read, which belongs to the store's owner.
     return s;
@@ -1134,8 +1180,11 @@ MetadataSnapshot decode_snapshot(std::span<const uint8_t> d) {
     }
     if (v15)
         decode_torrent_requests(r, s);
-    if (v18)
+    if (v18) {
         s.legacy_clock = decode_clock(r);
+        s.catalogue_dot.author.bytes = r.fixed<16>();
+        s.catalogue_dot.sequence = r.u64();
+    }
     r.finish();
     auto x = s.entries.find("/");
     if (x == s.entries.end() || x->second.type != EntryType::directory)
@@ -1155,7 +1204,7 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
     static constexpr std::array<uint8_t, 8> magic_v10{'D', 'H', 'T', 'M', 'D', 'L', 'T', 'A'};
     // DLT10 is DLT9 with a content dot on every append and a trailing legacy
     // clock, written when a mutation carries either.
-    const bool v10 = delta.set_legacy_clock.has_value() ||
+    const bool v10 = delta.set_legacy_clock.has_value() || delta.set_catalogue_dot.has_value() ||
                      std::any_of(delta.append_entries.begin(), delta.append_entries.end(),
                                  [](const auto& item) { return bool(item.second.content); });
     const bool topology =
@@ -1280,6 +1329,11 @@ Bytes encode_metadata_delta(const MetadataDelta& delta) {
         w.u8(delta.set_legacy_clock.has_value());
         if (delta.set_legacy_clock)
             encode_clock(w, *delta.set_legacy_clock);
+        w.u8(delta.set_catalogue_dot.has_value());
+        if (delta.set_catalogue_dot) {
+            w.fixed(delta.set_catalogue_dot->author.bytes);
+            w.u64(delta.set_catalogue_dot->sequence);
+        }
     }
     return w.take();
 }
@@ -1506,6 +1560,15 @@ MetadataDelta decode_metadata_delta(std::span<const uint8_t> data) {
             throw DecodeError("bad metadata delta legacy clock flag");
         if (set)
             delta.set_legacy_clock = decode_clock(r);
+        const auto dot = r.u8();
+        if (dot > 1)
+            throw DecodeError("bad metadata delta catalogue dot flag");
+        if (dot) {
+            MetadataDot value;
+            value.author.bytes = r.fixed<16>();
+            value.sequence = r.u64();
+            delta.set_catalogue_dot = value;
+        }
     }
     r.finish();
     return delta;
@@ -1547,6 +1610,8 @@ std::optional<MetadataDelta> metadata_delta(const MetadataSnapshot& before,
             return {};
         delta.set_legacy_clock = after.legacy_clock;
     }
+    if (before.catalogue_dot != after.catalogue_dot)
+        delta.set_catalogue_dot = after.catalogue_dot;
 
     for (const auto& [path, value] : before.entries) {
         auto it = after.entries.find(path);
@@ -1697,6 +1762,8 @@ void apply_metadata_delta_in_place(MetadataSnapshot& out, const MetadataDelta& d
             throw DecodeError("metadata delta sets a legacy clock already set");
         out.legacy_clock = delta.set_legacy_clock;
     }
+    if (delta.set_catalogue_dot)
+        out.catalogue_dot = *delta.set_catalogue_dot;
     for (const auto& [node, sequence] : delta.mutation_sequences) {
         auto it = out.mutation_sequences.find(node);
         if (it != out.mutation_sequences.end() && sequence < it->second)

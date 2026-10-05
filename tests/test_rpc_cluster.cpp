@@ -1050,6 +1050,10 @@ struct SurveyCountingView final : MetadataView {
     uint64_t conflicts_superseded() const noexcept override { return 0; }
     uint64_t conflicts_resolved() const noexcept override { return 0; }
     MetadataHeadStanding head_standing() const noexcept override { return {}; }
+    std::optional<std::optional<ObjectId>>
+    common_ancestor_catalogue_root(const Hash256&, const Hash256&) const override {
+        return {};
+    }
     MetadataMutationTiming mutation_timing() const noexcept override { return {}; }
     Page<std::pair<std::string, FsEntry>, std::string>
     entries(const MetadataSnapshotView& v, Cursor<std::string> from, Budget& budget) override {
@@ -3032,13 +3036,13 @@ MACHA_TEST("rpc_cluster", test_service_same_generation_sibling_notice_triggers_r
     s1.stop();
 }
 
-// A second accepted head with no ancestor in common with this node's own
-// cannot be merged. It is set aside: the node goes on reading, writing and
-// releasing on its own head, and neither head is dropped.
-MACHA_TEST("rpc_cluster", test_a_head_that_cannot_be_merged_is_set_aside) {
+// A second accepted head from a history this node has never seen needs no
+// ancestor in common: the two heads are merged from what they hold, and
+// neither's entries are lost.
+MACHA_TEST("rpc_cluster", test_a_head_from_an_unknown_history_is_merged) {
     TestCluster cluster;
     const auto& keys = cluster.keys();
-    auto config = config_for(cluster.path() / "set-aside", cluster.keyfile(), free_port(), {});
+    auto config = config_for(cluster.path() / "unknown-history", cluster.keyfile(), free_port(), {});
     config.metadata_cache = std::chrono::milliseconds(0);
     BareNode node(config, keys);
     node.start();
@@ -3057,12 +3061,17 @@ MACHA_TEST("rpc_cluster", test_a_head_that_cannot_be_merged_is_set_aside) {
     const auto mine = node.metadata_replica().committed();
     REQUIRE(mine.generation > 1);
 
-    // A head from a history this node has never seen.
-    auto foreign_snapshot = decode_snapshot(mine.payload);
-    foreign_snapshot.entries.erase("/mine");
-    foreign_snapshot.entries["/theirs"] = directory();
-    foreign_snapshot.mutation_sequences.clear();
-    foreign_snapshot.mutation_sequences[random_node_id()] = 9;
+    // Another author's namespace, with nothing of this node's in its clock.
+    const MetadataDot theirs{random_node_id(), 9};
+    auto foreign_snapshot = decode_snapshot(genesis_metadata().payload);
+    foreign_snapshot.metadata_write_replicas_required = 1;
+    foreign_snapshot.extent_size = decode_snapshot(mine.payload).extent_size;
+    foreign_snapshot.data_replication = decode_snapshot(mine.payload).data_replication;
+    foreign_snapshot.legacy_clock.emplace();
+    foreign_snapshot.mutation_sequences[theirs.author] = theirs.sequence;
+    auto made = directory();
+    stamp_entry_provenance(made, "/theirs", nullptr, theirs);
+    foreign_snapshot.entries["/theirs"] = made;
     MetadataRecord foreign;
     foreign.generation = mine.generation + 7;
     foreign.previous = sha256(pattern(64, 201));
@@ -3073,32 +3082,77 @@ MACHA_TEST("rpc_cluster", test_a_head_that_cannot_be_merged_is_set_aside) {
     acceptance.generation = foreign.generation;
     acceptance.hash = foreign.hash;
     acceptance.required = 1;
-    acceptance.replicas = {random_node_id()};
+    acceptance.replicas = {theirs.author};
     REQUIRE(node.metadata_server().accept_commit(acceptance));
     REQUIRE(node.metadata_replica().accepted_heads().size() == 2);
 
+    const auto merged = metadata.snapshot();
+    CHECK(merged.entries.contains("/mine"));
+    CHECK(merged.entries.contains("/theirs"));
+    CHECK(merged.mutation_sequences.at(theirs.author) == theirs.sequence);
+    CHECK(node.metadata_replica().accepted_heads().size() == 1);
+    CHECK(metadata.head_standing().set_aside == 0);
+
+    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/more"] = directory(); });
+    CHECK(metadata.snapshot().entries.contains("/theirs"));
+    CHECK(metadata.snapshot().entries.contains("/more"));
+    node.stop();
+}
+
+// A second accepted head whose namespace no node present can supply cannot
+// be merged. It is set aside: the node goes on reading, writing and
+// releasing on its own head, and neither head is dropped.
+MACHA_TEST("rpc_cluster", test_a_head_that_cannot_be_merged_is_set_aside) {
+    TestCluster cluster;
+    const auto& keys = cluster.keys();
+    auto config = config_for(cluster.path() / "set-aside", cluster.keyfile(), free_port(), {});
+    config.metadata_cache = std::chrono::milliseconds(0);
+    Service service(config, keys, test_durability_window);
+    service.start();
+    REQUIRE(wait_metadata_writable(service));
+    auto& metadata = service.metadata_manager();
+    auto& replica = service.local_state().replica();
+    service.filesystem().mkdir("/mine", 0755, getuid(), getgid());
+    const auto mine = replica.committed();
+
+    // A tree-backed head whose tree nobody here holds.
+    auto foreign_snapshot = decode_snapshot(mine.payload);
+    foreign_snapshot.entries.clear();
+    foreign_snapshot.namespace_root = object_id(pattern(64, 77));
+    foreign_snapshot.mutation_sequences.clear();
+    foreign_snapshot.mutation_sequences[random_node_id()] = 9;
+    MetadataRecord foreign;
+    foreign.generation = mine.generation + 7;
+    foreign.previous = sha256(pattern(64, 201));
+    foreign.payload = encode_snapshot_v14(foreign_snapshot);
+    foreign.hash = metadata_hash(foreign.generation, foreign.previous, foreign.payload);
+    REQUIRE(replica.store_commit(foreign));
+    MetadataAcceptance acceptance;
+    acceptance.generation = foreign.generation;
+    acceptance.hash = foreign.hash;
+    acceptance.required = 1;
+    acceptance.replicas = {random_node_id()};
+    REQUIRE(service.metadata_server().accept_commit(acceptance));
+
     // Reads serve this node's own head.
-    const auto read = metadata.read_record();
-    CHECK(read.hash == mine.hash);
-    CHECK(metadata.head_standing().set_aside == 1);
-    CHECK(metadata.snapshot().entries.contains("/mine"));
-    CHECK(!metadata.snapshot().entries.contains("/theirs"));
+    REQUIRE(wait_until([&] { return metadata.head_standing().set_aside == 1; }, 10s));
+    CHECK(service.filesystem().getattr("/mine").type == EntryType::directory);
 
     // Writes extend it.
-    metadata.mutate([&](MetadataSnapshot& snapshot) { snapshot.entries["/more"] = directory(); });
+    service.filesystem().mkdir("/more", 0755, getuid(), getgid());
+    CHECK(service.filesystem().getattr("/more").type == EntryType::directory);
     const auto after = metadata.read_record();
-    CHECK(after.previous == mine.hash);
-    CHECK(metadata.snapshot().entries.contains("/more"));
+    CHECK(after.generation < foreign.generation);
 
     // Release has a head to follow, and the other head is still held.
     const auto release = metadata.retention_release_view();
     REQUIRE(release.has_value());
     CHECK(release->hash == after.hash);
-    const auto heads = node.metadata_replica().accepted_heads();
+    const auto heads = replica.accepted_heads();
     CHECK(heads.size() == 2);
     CHECK(std::any_of(heads.begin(), heads.end(),
                       [&](const MetadataRecord& head) { return head.hash == foreign.hash; }));
-    node.stop();
+    service.stop();
 }
 
 MACHA_TEST("rpc_cluster", test_concurrent_reads_during_divergence_produce_one_reconciliation) {

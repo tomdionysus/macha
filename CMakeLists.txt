@@ -319,6 +319,7 @@ set(MACHA_CORE_SOURCES
     src/cluster/distributed_store.cpp
     src/cluster/replica_selector.cpp
     src/metadata/metadata.cpp
+    src/metadata/metadata_merge.cpp
     src/metadata/namespace_tree.cpp
     src/metadata/namespace_control_store.cpp
     src/metadata/metadata_manager.cpp
@@ -607,6 +608,7 @@ if(MACHA_BUILD_TESTS)
         tests/test_presence.cpp
         tests/test_contract.cpp
         tests/test_absent_nodes.cpp
+        tests/test_metadata_merge.cpp
         tests/test_ledger_gates.cpp
         tests/test_horizon_builder.cpp
         tests/test_availability.cpp
