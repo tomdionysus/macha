@@ -37,6 +37,10 @@ std::string error_code(const Json& body) {
     return body.find("error")->find("code")->asString();
 }
 
+std::string error_message(const Json& body) {
+    return body.find("error")->find("message")->asString();
+}
+
 // A single node with what ManageApi and CatalogueScanner work on, built
 // directly: no Service, so no maintenance pass, scanner or HTTP server runs
 // beside the test.
@@ -744,8 +748,9 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
         CHECK(error_code(body) == "provider_not_found");
     }
     {
-        // MusicBrainz failing opens the gate's circuit: the next release is
-        // refused without a request.
+        // MusicBrainz failing makes the gate back off: the next release is
+        // refused without a request. The client is told the provider is
+        // unavailable, never why.
         auto http = std::make_unique<FakeHttpClient>();
         auto* http_ptr = http.get();
         http->add("musicbrainz.org/ws/2/release/", 503, "text/plain", "down");
@@ -757,6 +762,7 @@ MACHA_TEST("invariants", test_provider_release_tracks) {
             auto [status, body] = get(manage, tracks_path(id));
             CHECK(status == 503);
             CHECK(error_code(body) == "provider_unavailable");
+            CHECK(error_message(body) == "Provider unavailable");
         }
         CHECK(http_ptr->requests() == 1);
     }
