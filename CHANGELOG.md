@@ -1,5 +1,25 @@
 # Current release
 
+## 0.90.8 — keyframe indexes survive a catalogue reload (experiment)
+
+No wire, protocol, API or on-disk changes.
+
+**A catalogue loaded from its root keeps its keyframe indexes.** Loading a
+root copied the items and media profiles out of each shard and left the
+keyframe index records behind. A node that reloaded its catalogue (after a
+restart, or when another node's commit arrived) no longer had them, wrote its
+next commit without them, and never claimed the index objects. They are
+loaded with the rest.
+
+**A catalogue commit's claims read only the shards that changed.** Listing
+what a commit must claim loaded the old and the new catalogue in full, once
+for this node's claims and once for the peers'. It decodes only the shards
+the two roots do not share.
+
+**A catalogue write does not re-read artwork this node already holds.** Each
+newly referenced image was fetched whole to prove it existed, including one
+stored a moment before.
+
 ## 0.90.7 — a commit is not a storage change; refused writes are logged (experiment)
 
 No wire, protocol, API or on-disk changes.
