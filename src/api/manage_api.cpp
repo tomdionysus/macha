@@ -587,6 +587,25 @@ void ManageApi::identity_reset_audit_loop(std::stop_token stop) {
 }
 
 HttpResponse ManageApi::handle(const HttpRequest& request) {
+    auto response = dispatch(request);
+    // A write that was refused, and any request that failed here or
+    // upstream, says why in the journal: the answer's code and message.
+    if (response.status >= 500 || (response.status >= 400 && request.method != "GET")) {
+        const auto text = "manage API " + request.method + " " + request.path + " status=" +
+                          std::to_string(response.status) + " " +
+                          std::string(response.body.begin(),
+                                      response.body.begin() +
+                                          static_cast<std::ptrdiff_t>(
+                                              std::min<size_t>(response.body.size(), 300)));
+        if (response.status >= 500)
+            Log::warn(text);
+        else
+            Log::info(text);
+    }
+    return response;
+}
+
+HttpResponse ManageApi::dispatch(const HttpRequest& request) {
     // Management writes run concurrently and share commits. Each verifies the
     // media id it was given, so two stale UI sessions cannot both resolve or
     // delete the same exception.
@@ -1107,7 +1126,6 @@ HttpResponse ManageApi::handle(const HttpRequest& request) {
     } catch (const std::runtime_error& e) {
         return http_error(400, "bad_request", e.what());
     } catch (const std::exception& e) {
-        Log::warn("manage API failed: " + std::string(e.what()));
         return http_error(500, "internal_error", e.what());
     }
 }
