@@ -3207,6 +3207,19 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
             allowed += (allowed.empty() ? "" : ", ") + std::string(candidate);
         throw ProviderRequestError(400, "bad_role", "role must be " + allowed + " for this reference");
     }
+    // What the provider last offered for this reference and role is kept for
+    // a while: choosing one of the options asks for them again.
+    const auto number = [](const std::optional<int32_t>& value) {
+        return value ? std::to_string(*value) : std::string("-");
+    };
+    const auto key = std::string(ref) + "|" + std::string(role) + "|" + number(numbers.season) +
+                     "|" + number(numbers.episode);
+    {
+        Lock lock(artwork_options_mutex_);
+        const auto found = artwork_options_.find(key);
+        if (found != artwork_options_.end() && Clock::now() < found->second.first)
+            return found->second.second;
+    }
     const auto scan_provider = scan_provider_for(*parsed);
     auto& seat = editor_seat();
     Lock editor(seat.mutex);
@@ -3216,7 +3229,12 @@ std::vector<ArtworkOption> CatalogueScanner::artwork_options(std::string_view re
                                    parsed->provider + " is not configured for " +
                                        std::string(scan_provider));
     try {
-        return metadata->artwork_options(parsed->kind, parsed->id, role, numbers);
+        auto options = metadata->artwork_options(parsed->kind, parsed->id, role, numbers);
+        Lock lock(artwork_options_mutex_);
+        if (artwork_options_.size() >= artwork_options_max)
+            artwork_options_.clear();
+        artwork_options_[key] = {Clock::now() + artwork_options_kept, options};
+        return options;
     } catch (const ProviderRecordNotFound& e) {
         throw ProviderRequestError(404, "provider_not_found", e.what());
     } catch (const std::exception& e) {
