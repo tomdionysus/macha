@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <functional>
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -431,12 +432,23 @@ class CatalogueScanner {
     // Replaced only by reconfigure(), with the worker stopped: the worker
     // reads it under config_mutex_ and uses the providers outside it.
     std::vector<std::unique_ptr<CatalogueScanProvider>> providers_ MACHA_GUARDED_BY(config_mutex_);
-    // The editor's providers over the unbudgeted client, so an operator's
-    // request never waits on a scan's budget. One editor request at a time.
-    // Held across the editor's provider HTTP requests.
-    IoMutex editor_mutex_;
-    std::vector<std::unique_ptr<CatalogueScanProvider>> editor_providers_
-        MACHA_GUARDED_BY(editor_mutex_);
+    // The metadata editor's own providers, over the unbudgeted client so an
+    // operator's request never waits on a scan's budget. Several sets: a
+    // provider keeps unsynchronised caches, so a set serves one request at a
+    // time and its lock is held across the call out to the provider.
+    // Requests take the sets in turn, so one slow answer holds up one set,
+    // not the editor.
+    struct EditorSeat {
+        IoMutex mutex;
+        std::vector<std::unique_ptr<CatalogueScanProvider>> providers MACHA_GUARDED_BY(mutex);
+    };
+    static constexpr size_t editor_seats = 4;
+    std::array<EditorSeat, editor_seats> editor_seats_;
+    std::atomic_size_t next_editor_seat_{};
+    EditorSeat& editor_seat() noexcept {
+        return editor_seats_[next_editor_seat_.fetch_add(1, std::memory_order_relaxed) %
+                             editor_seats];
+    }
     std::shared_ptr<MusicBrainzGate> musicbrainz_gate_{std::make_shared<MusicBrainzGate>()};
     std::atomic_bool rescan_requested_{};
     // Owned by the instantiator's thread (start/stop/reconfigure).
@@ -474,9 +486,9 @@ class CatalogueScanner {
                               DistributedStore::DurabilityBatch& artwork_batch);
     // The editor's metadata provider for a scan provider ("movies", "tv",
     // "music") and a metadata provider name.
-    MetadataProvider* editor_metadata(std::string_view scan_provider,
-                                      std::string_view metadata_provider)
-        MACHA_REQUIRES(editor_mutex_);
+    static MetadataProvider* editor_metadata(
+        const std::vector<std::unique_ptr<CatalogueScanProvider>>& providers,
+        std::string_view scan_provider, std::string_view metadata_provider);
 
   public:
     // One hint against one namespace snapshot. A hint created after
