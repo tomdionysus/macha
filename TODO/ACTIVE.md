@@ -1,6 +1,6 @@
 # Active tasks
 
-Last updated: 2026-10-05, on `experiment/object-ledger-t5`. Both nodes run
+Last updated: 2026-10-06, on `develop`. Both nodes run
 0.90.16; see entry 1's plan for what each 0.90.x carries.
 
 This is the ordered list of open work. `COMPLETED.md` is the ledger of
@@ -49,32 +49,24 @@ fast and consistent locally on every path; the cluster converges behind.
   - `BACKLOG.md`: "The namespace does not meet its own scale target", "The
     catalogue materialises everything it has", "Scaling cliffs".
 
-## 2. The object ledger experiment: what is left
+## 2. The object ledger experiment: closed
 
-The experiment is the development line; `develop` is frozen at `75e6f98`.
-Spec: [object ledger and component model](2026-09-29-object-ledger-and-components-spec.md).
-Plan: [stage 0](2026-09-29-object-ledger-implementation-plan.md). Evidence:
-[`object-ledger-evidence/`](object-ledger-evidence/).
+Closed by the operator on 2026-10-06: "certainly using it is an order of
+magnitude better". Everything was merged to `develop` and `main` (both at
+`0c5492f`) and the experiment branches were deleted. The kill-criteria
+assessment against the 0.74.0 baseline was not made; the operator judged the
+result in use. Spec, plan and evidence stay in `TODO/` as the record.
 
-- T0 to T5 are built and merged into `-t5`. Absent-node tolerance
-  ([design](2026-10-05-absent-node-tolerance-design.md)) is built and
-  deployed: 0.88.0 (writes on the nodes present, own-clock deletion,
-  membership forgets) and 0.89.0 (entry provenance, the two-head merge,
-  protocol 23). 0.89.1 added a group commit of namespace batches and two
-  claim fixes.
-- **Entry 1 lands on this line** before the experiment is assessed. *An
-  assumption, for the operator to confirm.*
-- Left, as recorded 2026-10-04 (*carried*): a day on the cluster under
-  normal load on the final build; coverage of the composition root's
-  components; the T5 assessment and the merge of `-t5`; the operator's
-  decision on `develop`. The final sweep S (annotated lock wrappers, the
-  `*_for_tests` hooks) as far as it stands.
-- Open from the absent-node work: per-peer down state in the transport;
-  `fsync` without a deadline; the journal's `durability_poisoned` flag; a
-  count of DATA objects below their replication target; seven namespace
-  conflicts standing from before 0.89.0.
-- After the experiment: [cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md),
-  a proposal with six questions waiting on the operator.
+Still open from that work:
+
+- From the absent-node work: per-peer down state in the transport; `fsync`
+  without a deadline; the journal's `durability_poisoned` flag; a count of
+  DATA objects below their replication target; seven namespace conflicts
+  standing from before 0.89.0.
+- The final sweep S as far as it stands (annotated lock wrappers, the
+  `*_for_tests` hooks); coverage of the composition root's components.
+- [Cost-budgeted scheduling](2026-10-03-cost-budget-scheduling-spec.md), a
+  proposal with six questions waiting on the operator.
 
 ## Cluster state (2026-10-05)
 
