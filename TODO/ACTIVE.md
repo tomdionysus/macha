@@ -170,13 +170,22 @@ file.
 
 **Replication and repair** [1], *carried*
 
-- `repair_weight`: 5 against 95 today, 20 against 80 offered. Operator.
+- `repair_weight` 20 against `foreground_weight` 80, set in both nodes'
+  config (operator, 2026-10-05); the code default is still 95:5.
 - Say why a node counts itself busy (the pacer's active classes in status).
 - Log the resumed push position at INFO.
 - Measure 0.73.1's pipelined pushes on an idle node; step length on a busy
   HDD.
 
 **Features and API, agreed or waiting**
+
+- **Title files in the metadata editor** (operator, 2026-10-05): server
+  routes, one call per file. Unmatch unbinds a file and puts it straight in
+  the unmatched list, no automatic rematch; delete by path removes only that
+  path; delete by content hash removes every path holding it. Both delete a
+  title left with no files, and any season, show or album left empty,
+  manual or scanner-made. Announce to Core and every client before shipping.
+- **Paging on every list call** (operator, 2026-10-05); see entry 1's plan.
 
 - **Per-file readability** [4]: designed; the operator chooses where it
   goes. Two of its three uses are wire changes.
@@ -198,12 +207,9 @@ file.
 **Waiting on the operator** [6]
 
 - Metadata editor B: the choice of fields.
-- 317 directories under `/Movies` and `/Music` on gbni-1 that list empty
-  (`/root/empty-dirs.txt` there).
 - Torrent staging option A or B; stages 3 and 4 of the disk backend plan.
 - A `CONTRIBUTING.md` line: "A new gate may pace lower-class work; it may
   never stop it."
-- Deleting fi-1's old backend copy `/var/lib/macha/data.moved-20260929`.
 - The catalogue repair that runs twice per maintenance pass; the replica's
   applier lifetime; fi-1's USB power.
 

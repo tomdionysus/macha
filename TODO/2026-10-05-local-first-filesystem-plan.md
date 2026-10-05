@@ -78,29 +78,33 @@ contract.
 
 Left, with why:
 
-- The survey memo and the followed path table apply only while no peer's
-  holdings grow. On this cluster gbni-1 imports torrents all the time, so
-  every survey still asks from the root (2,834 tree nodes, 7 round trips) and
-  the table is walked. It is maintenance work, paced by its share; a peer's
-  holdings reporting what it gained would let the memo stand.
-- A restarted node answers no holdings question until its presence index has
-  warmed: 11.5 minutes on gbni-1 (701,257 objects). Its peer reports most of
-  the library unknown meanwhile.
-- Ingest and data publications commit one operation at a time (2.3): each is
-  a local commit of about 100 ms, so a 4 GiB copy spends about 7 s of its copy
-  time committing. Not worth a journal.
-- Repair after a commit (3.3) keeps its positions and runs one more pass;
-  tombstones mature one at a time (3.5); both are paced maintenance.
-- The non-namespace snapshot per commit (2.6, 2.7): a few milliseconds.
-- The hint store rewrites its file per change (4.9): 266 KB with 409 hints.
-- `GET /api/v1/catalogue/items` answers 6,764 items, 9.5 MB, in 0.23 s; it
-  ignores `limit`. Paging it is an API change for the clients to agree.
+- **Paging on every list call** (operator, 2026-10-05: "paging on all list
+  calls should be available"). `GET /api/v1/catalogue/items` answers 6,764
+  items, 9.5 MB, and ignores `limit`. An API change: announced to Core and
+  every client before it ships.
 - A multi-file match from the web client has not been measured since 0.90.9;
-  the deployed web bundle still gives up after 8 s.
+  the deployed web bundle gives up after 8 s. Redeploying it is the Client
+  session's job (operator); asked 2026-10-05.
 - A testing gap found and closed for what is built: a new test cluster keeps
   its namespace as a map, so service-level tests exercise the tree paths only
   where they migrate first (`tests/test_namespace_migration.cpp`). New
   tree-path work needs its test there.
+
+Further optimisation (measured small; operator 2026-10-05: not now, kept
+written down):
+
+- The survey memo and the followed path table apply only while no peer's
+  holdings grow. On this cluster gbni-1 imports torrents all the time, so
+  every survey still asks from the root (2,834 tree nodes, 7 round trips) and
+  the table is walked. A peer reporting what it gained would let the memo
+  stand. Left as it is (operator).
+- Ingest and data publications commit one operation at a time (2.3): each is
+  a local commit of about 100 ms, so a 4 GiB copy spends about 7 s of its copy
+  time committing.
+- Repair after a commit (3.3) keeps its positions and runs one more pass;
+  tombstones mature one at a time (3.5); both are paced maintenance.
+- The non-namespace snapshot per commit (2.6, 2.7): a few milliseconds.
+- The hint store rewrites its file per change (4.9): 266 KB with 409 hints.
 
 ## Why
 
